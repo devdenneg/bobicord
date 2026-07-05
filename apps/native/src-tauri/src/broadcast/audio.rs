@@ -4,25 +4,26 @@
 // исходящий видеопоток (иначе эхо/петля). Микрофон сюда не подключается вовсе
 // (инвариант 5) — это отдельный, WASAPI render-loopback путь.
 //
-// ИЗВЕСТНЫЙ БАГ (не пофикшен, изолирован): `activate_process_loopback_exclude_self()`
-// стабильно валит процесс STATUS_HEAP_CORRUPTION вскоре после успешного
-// ActivateAudioInterfaceAsync/GetActivateResult (воспроизводится через
-// `cargo run --example audio_smoke`, крэш переживает даже явные `drop(op)`/`drop(handler)`
-// до возврата — похоже на повреждение, отложенно детектящееся на следующей heap-операции,
-// а не на сам вызов). Проверено и ИСКЛЮЧЕНО как причина: отсутствие CoInitializeEx у
-// вызывающего потока (нашёл и починил отдельный баг в тестовом харнессе, не в этом файле);
-// IAgileObject — `#[implement]` уже агильный по умолчанию (windows-implement 0.60.2,
-// `agile: true` в ImplementAttributes), добавление отдельного `IAgileObject` в список
-// интерфейсов не компилируется и не нужно. Пайплайн видео (Э5 AC) не зависит от этого —
-// поток отключён по умолчанию в mod.rs (`RELAYAPP_ENABLE_AUDIO=1` чтобы включить и отлаживать).
-// Следующий шаг отладки: WinDbg/Application Verifier на реальном месте порчи, либо
-// переписать PROPVARIANT/BLOB-конструирование через сырые байты вместо вложенных union.
-
+// ИСТОРИЯ БАГА (пофикшен): `activate_process_loopback_exclude_self()` валил
+// процесс STATUS_HEAP_CORRUPTION вскоре после успешного GetActivateResult.
+// Причина — синхронизация с completion-хендлером через сырой Win32 `HANDLE`
+// (CreateEventW/SetEvent/WaitForSingleObject/CloseHandle): CloseHandle звался
+// сразу после разблокировки ожидающего потока, гоняясь с завершением самого
+// callback-вызова (`ActivateCompleted`) на thread-pool потоке — окно гонки,
+// в котором чужой поток мог обратиться к уже закрытому HANDLE. Сверено с
+// рабочей реализацией того же API в `wasapi-rs` (HEnquist/wasapi-rs,
+// `AudioClient::new_application_loopback_client`) — там синхронизация через
+// `Arc<(Mutex<bool>, Condvar)>` (никаких Win32-хендлов, некуда гоняться).
+// Заодно: `PROPVARIANT`/`AUDIOCLIENT_ACTIVATION_PARAMS` теперь явно `Pin`+
+// `ManuallyDrop` (как в wasapi-rs) — защита от случайного перемещения/лишнего
+// drop, хотя сам адрес и не двигался в прежнем коде.
+use std::mem::ManuallyDrop;
+use std::ops::Deref;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use windows::core::{implement, Interface, Ref, Result as WinResult, HRESULT};
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Media::Audio::{
     ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
     IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
@@ -32,19 +33,22 @@ use windows::Win32::Media::Audio::{
     PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
     WAVEFORMATEX,
 };
-use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PROPVARIANT_0_0, PROPVARIANT_0_0_0};
+use windows::Win32::System::Com::StructuredStorage::{
+    PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
+};
 use windows::Win32::System::Com::BLOB;
-use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject, INFINITE};
 use windows::Win32::System::Variant::VT_BLOB;
 
 #[implement(IActivateAudioInterfaceCompletionHandler)]
-struct CompletionHandler {
-    event: HANDLE,
-}
+struct CompletionHandler(Arc<(Mutex<bool>, Condvar)>);
 
 impl IActivateAudioInterfaceCompletionHandler_Impl for CompletionHandler_Impl {
     fn ActivateCompleted(&self, _op: Ref<IActivateAudioInterfaceAsyncOperation>) -> WinResult<()> {
-        unsafe { let _ = SetEvent(self.event); }
+        let (lock, cvar) = &*self.0;
+        let mut done = lock.lock().unwrap();
+        *done = true;
+        drop(done);
+        cvar.notify_one();
         Ok(())
     }
 }
@@ -61,28 +65,44 @@ unsafe fn activate_process_loopback_exclude_self() -> WinResult<IAudioClient> {
             },
         },
     };
+    let pinned_params = Pin::new(&mut params);
 
-    let mut prop = PROPVARIANT::default();
-    prop.Anonymous.Anonymous = std::mem::ManuallyDrop::new(PROPVARIANT_0_0 {
-        vt: VT_BLOB,
-        wReserved1: 0,
-        wReserved2: 0,
-        wReserved3: 0,
-        Anonymous: PROPVARIANT_0_0_0 {
-            blob: BLOB {
-                cbSize: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
-                pBlobData: &mut params as *mut _ as *mut u8,
-            },
+    let raw_prop = PROPVARIANT {
+        Anonymous: PROPVARIANT_0 {
+            Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
+                vt: VT_BLOB,
+                wReserved1: 0,
+                wReserved2: 0,
+                wReserved3: 0,
+                Anonymous: PROPVARIANT_0_0_0 {
+                    blob: BLOB {
+                        cbSize: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
+                        pBlobData: std::ptr::from_mut(pinned_params.get_mut()).cast(),
+                    },
+                },
+            }),
         },
-    });
+    };
+    let activation_prop = ManuallyDrop::new(raw_prop);
+    let pinned_prop = Pin::new(activation_prop.deref());
+    let activation_params = Some(std::ptr::from_ref(pinned_prop.get_ref()));
 
-    let event = CreateEventW(None, true, false, None)?;
-    let handler: IActivateAudioInterfaceCompletionHandler = CompletionHandler { event }.into();
+    let setup = Arc::new((Mutex::new(false), Condvar::new()));
+    let handler: IActivateAudioInterfaceCompletionHandler = CompletionHandler(setup.clone()).into();
 
-    let op = ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, &IAudioClient::IID, Some(&prop as *const _), &handler)?;
+    let op = ActivateAudioInterfaceAsync(
+        VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+        &IAudioClient::IID,
+        activation_params,
+        &handler,
+    )?;
 
-    WaitForSingleObject(event, INFINITE);
-    let _ = CloseHandle(event);
+    let (lock, cvar) = &*setup;
+    let mut done = lock.lock().unwrap();
+    while !*done {
+        done = cvar.wait(done).unwrap();
+    }
+    drop(done);
 
     let mut hr = HRESULT(0);
     let mut iface: Option<windows::core::IUnknown> = None;
@@ -153,14 +173,25 @@ pub fn run_capture_loop(stop: Arc<AtomicBool>, mut on_chunk: impl FnMut(OpusChun
     unsafe {
         eprintln!("[audio] activating...");
         let client = activate_process_loopback_exclude_self().map_err(|e| format!("activate loopback: {e}"))?;
-        eprintln!("[audio] activated, GetMixFormat...");
-        let fmt_ptr = client.GetMixFormat().map_err(|e| format!("GetMixFormat: {e}"))?;
-        let fmt = *fmt_ptr;
-        let src_rate = fmt.nSamplesPerSec;
-        let (ch, hz, bits, cbsz) = (fmt.nChannels, fmt.nSamplesPerSec, fmt.wBitsPerSample, fmt.cbSize);
-        eprintln!("[audio] mix format: {ch}ch {hz}Hz {bits}bit cbSize={cbsz}");
+        // Process-loopback IAudioClient (AudioSes!CMixerClient) не реализует GetMixFormat
+        // (возвращает E_NOTIMPL) — это задокументированное поведение этого режима, не баг.
+        // Формат для Initialize строим вручную: IEEE float стерео 48кГц, тот же, что и
+        // обычный shared-mode mix format на практике.
+        const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
+        let fmt = WAVEFORMATEX {
+            wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
+            nChannels: 2,
+            nSamplesPerSec: 48_000,
+            nAvgBytesPerSec: 48_000 * 2 * 4,
+            nBlockAlign: 2 * 4,
+            wBitsPerSample: 32,
+            cbSize: 0,
+        };
+        let (ch, hz, bits) = (fmt.nChannels, fmt.nSamplesPerSec, fmt.wBitsPerSample);
+        let src_rate = hz;
+        eprintln!("[audio] using format: {ch}ch {hz}Hz {bits}bit");
 
-        client.Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 10_000_000, 0, fmt_ptr, None)
+        client.Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 10_000_000, 0, &fmt, None)
             .map_err(|e| format!("IAudioClient::Initialize: {e}"))?;
         eprintln!("[audio] initialized, GetService...");
         let capture_client: IAudioCaptureClient = client.GetService().map_err(|e| format!("GetService: {e}"))?;

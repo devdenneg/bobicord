@@ -50,7 +50,7 @@ impl BroadcastHandle {
 /// Запускается из async Tauri-команды (уже внутри tokio-runtime — используем
 /// его `Handle` для записи сэмплов из энкодерного потока).
 pub async fn start(stream_id: String, ws_url: String, identity: String, monitor_index: usize) -> Result<BroadcastHandle, String> {
-    let (cap_handle, cap_stop, cap_rx) = capture::spawn_capture(monitor_index, WIDTH, HEIGHT)?;
+    let (cap_handle, cap_stop, cap_rx) = capture::spawn_capture(monitor_index, WIDTH, HEIGHT, FPS)?;
 
     let force_keyframe = Arc::new(AtomicBool::new(true));
     let (cmd_tx, evt_rx) = signaling::connect(ws_url, stream_id.clone(), identity);
@@ -77,6 +77,8 @@ pub async fn start(stream_id: String, ws_url: String, identity: String, monitor_
             Err(e) => { log::error!("encoder: init failed: {e}"); return; }
         };
         let frame_dur = Duration::from_secs_f64(1.0 / FPS as f64);
+        let mut fps_window_start = std::time::Instant::now();
+        let mut fps_window_count = 0u32;
         while !enc_stop2.load(Ordering::Relaxed) {
             let frame = match cap_rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(f) => f,
@@ -89,9 +91,16 @@ pub async fn start(stream_id: String, ws_url: String, identity: String, monitor_
                         let sample = Sample { data: Bytes::from(c.data), duration: frame_dur, ..Default::default() };
                         let track = video_track.clone();
                         rt_handle.block_on(async { let _ = track.write_sample(&sample).await; });
+                        fps_window_count += 1;
                     }
                 }
                 Err(e) => log::warn!("encoder: encode error: {e}"),
+            }
+            let elapsed = fps_window_start.elapsed();
+            if elapsed.as_secs() >= 2 {
+                log::info!("encoder: {:.1} fps sent to track", fps_window_count as f64 / elapsed.as_secs_f64());
+                fps_window_count = 0;
+                fps_window_start = std::time::Instant::now();
             }
         }
         log::info!("encoder thread stopped");
@@ -102,12 +111,10 @@ pub async fn start(stream_id: String, ws_url: String, identity: String, monitor_
     let rt_handle_audio = tokio::runtime::Handle::current();
     let _ = &audio_track;
     let audio_thread = std::thread::spawn(move || {
-        // Известный баг (изолирован, не пофикшен): activate_process_loopback_exclude_self()
-        // валит процесс heap corruption'ом (см. память сессии). Пока не включено по
-        // умолчанию — видео-путь (основной AC Э5) не должен от этого падать.
-        // Включить для отладки: RELAYAPP_ENABLE_AUDIO=1.
-        if std::env::var("RELAYAPP_ENABLE_AUDIO").is_err() {
-            log::warn!("audio: отключено (известный крэш в WASAPI process-loopback, см. TODO в audio.rs)");
+        // RELAYAPP_DISABLE_AUDIO=1 — аварийный выключатель для отладки видео-пути
+        // отдельно от звука; по умолчанию звук игры/системы идёт в стрим (см. audio.rs).
+        if std::env::var("RELAYAPP_DISABLE_AUDIO").is_ok() {
+            log::warn!("audio: отключено через RELAYAPP_DISABLE_AUDIO");
             while !audio_stop2.load(Ordering::Relaxed) { std::thread::sleep(Duration::from_millis(100)); }
             return;
         }

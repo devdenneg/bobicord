@@ -13,7 +13,7 @@ fn main() {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         MFStartup(MF_VERSION, MFSTARTUP_FULL | MFSTARTUP_NOSOCKET).expect("MFStartup");
     }
-    let (handle, stop, rx) = capture::spawn_capture(1, 1920, 1080).expect("spawn_capture");
+    let (handle, stop, rx) = capture::spawn_capture(1, 1920, 1080, 30).expect("spawn_capture");
     let force_keyframe = Arc::new(AtomicBool::new(true));
     let mut enc = H264Encoder::new(1920, 1080, 30, 6_000_000, force_keyframe).expect("encoder new");
     println!("encoder ready, capturing+encoding for 10s...");

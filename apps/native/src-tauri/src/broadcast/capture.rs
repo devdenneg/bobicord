@@ -41,6 +41,8 @@ pub struct ScreenCapture {
     max_width: u32,
     max_height: u32,
     scratch: Vec<u8>,
+    fps_window_start: Instant,
+    fps_window_count: u32,
 }
 
 impl GraphicsCaptureApiHandler for ScreenCapture {
@@ -54,6 +56,8 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
             max_width: ctx.flags.max_width,
             max_height: ctx.flags.max_height,
             scratch: Vec::new(),
+            fps_window_start: Instant::now(),
+            fps_window_count: 0,
         })
     }
 
@@ -85,6 +89,15 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
         let frame_out = Nv12Frame { data: self.scratch.clone(), width: out_w, height: out_h, captured_at: Instant::now() };
         if self.tx.try_send(frame_out).is_err() {
             log::debug!("capture: drop frame, encoder busy");
+        }
+
+        self.fps_window_count += 1;
+        let elapsed = self.fps_window_start.elapsed();
+        if elapsed.as_secs() >= 2 {
+            let fps = self.fps_window_count as f64 / elapsed.as_secs_f64();
+            log::info!("capture: {:.1} fps ({out_w}x{out_h}, source WGC frame rate)", fps);
+            self.fps_window_count = 0;
+            self.fps_window_start = Instant::now();
         }
         Ok(())
     }
@@ -167,6 +180,7 @@ pub fn spawn_capture(
     monitor_index: usize,
     max_width: u32,
     max_height: u32,
+    target_fps: u32,
 ) -> Result<(std::thread::JoinHandle<()>, Arc<AtomicBool>, crossbeam_channel::Receiver<Nv12Frame>), String> {
     let monitor = Monitor::from_index(monitor_index).map_err(|e| format!("monitor {monitor_index}: {e}"))?;
     let (tx, rx) = crossbeam_channel::bounded(2);
@@ -174,12 +188,18 @@ pub fn spawn_capture(
     let stop2 = stop.clone();
 
     let handle = std::thread::spawn(move || {
+        // Без троттлинга WGC отдаёт кадры с реальной частотой обновления монитора
+        // (может быть заметно выше target_fps) — лишняя нагрузка на CPU/энкодер и
+        // рассинхрон с `frame_dur`, которым RTP-сэмплы размечены в mod.rs.
+        let min_interval = MinimumUpdateIntervalSettings::Custom(
+            std::time::Duration::from_secs_f64(1.0 / target_fps.max(1) as f64),
+        );
         let settings = Settings::new(
             monitor,
-            CursorCaptureSettings::WithoutCursor,
+            CursorCaptureSettings::WithCursor,
             DrawBorderSettings::WithoutBorder,
             SecondaryWindowSettings::Default,
-            MinimumUpdateIntervalSettings::Default,
+            min_interval,
             DirtyRegionSettings::Default,
             ColorFormat::Bgra8,
             CaptureFlags { tx, stop: stop2, max_width, max_height },

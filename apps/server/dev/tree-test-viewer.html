@@ -12,6 +12,7 @@
   button { margin-top: 12px; padding: 8px 14px; cursor: pointer; }
   video { width: 480px; margin-top: 12px; background: #000; display: block; }
   #log { margin-top: 12px; white-space: pre-wrap; background: #000; padding: 8px; height: 220px; overflow-y: auto; border: 1px solid #333; }
+  #stats { margin-top: 12px; background: #000; padding: 8px; border: 1px solid #333; color: #6f6; }
   .err { color: #f66; }
 </style>
 </head>
@@ -30,6 +31,7 @@
 <button id="startBtn">▶ Смотреть</button>
 <button id="stopBtn" disabled>◼ Остановить</button>
 <video id="remote" autoplay playsinline></video>
+<div id="stats">нет статистики — жди подключения</div>
 <div id="log"></div>
 
 <script>
@@ -46,6 +48,42 @@ function log(msg, isErr) {
 let ws = null;
 let pc = null;
 let parentId = null;
+let statsTimer = null;
+let lastBytes = { video: 0, audio: 0 };
+let lastStatsAt = 0;
+
+function startStatsLoop() {
+  lastBytes = { video: 0, audio: 0 };
+  lastStatsAt = performance.now();
+  statsTimer = setInterval(async () => {
+    if (!pc) return;
+    const report = await pc.getStats();
+    const now = performance.now();
+    const dt = (now - lastStatsAt) / 1000;
+    let lines = [];
+    report.forEach((r) => {
+      if (r.type === 'inbound-rtp' && (r.kind === 'video' || r.kind === 'audio')) {
+        const kbps = dt > 0 ? Math.round(((r.bytesReceived - lastBytes[r.kind]) * 8 / 1000) / dt) : 0;
+        lastBytes[r.kind] = r.bytesReceived;
+        if (r.kind === 'video') {
+          lines.push(`video: ${r.frameWidth || '?'}x${r.frameHeight || '?'} @ ${r.framesPerSecond != null ? r.framesPerSecond.toFixed(1) : '?'}fps, ${kbps}kbps, decoded=${r.framesDecoded}, dropped=${r.framesDropped || 0}, jitter=${(r.jitter*1000).toFixed(0)}ms`);
+        } else {
+          lines.push(`audio: ${kbps}kbps, packetsReceived=${r.packetsReceived}, jitter=${(r.jitter*1000).toFixed(0)}ms, concealed=${r.concealedSamples || 0}`);
+        }
+      }
+      if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.nominated) {
+        lines.push(`rtt=${r.currentRoundTripTime != null ? Math.round(r.currentRoundTripTime * 1000) + 'ms' : '?'}`);
+      }
+    });
+    lastStatsAt = now;
+    $('stats').textContent = lines.length ? lines.join('\n') : 'нет inbound-rtp пока';
+  }, 1000);
+}
+
+function stopStatsLoop() {
+  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+  $('stats').textContent = 'нет статистики — жди подключения';
+}
 
 function preferH264(pc) {
   const caps = RTCRtpReceiver.getCapabilities && RTCRtpReceiver.getCapabilities('video');
@@ -64,7 +102,9 @@ async function onOffer(streamId, sdp) {
   pc.onconnectionstatechange = () => log('pc: ' + pc.connectionState);
   pc.ontrack = (e) => {
     log('ontrack: ' + e.track.kind);
-    if (e.track.kind === 'video') $('remote').srcObject = e.streams[0] || new MediaStream([e.track]);
+    // video и audio-трек делят один stream_id (peer.rs) — это один и тот же
+    // MediaStream в обоих вызовах, просто всегда переприсваиваем srcObject.
+    $('remote').srcObject = e.streams[0] || new MediaStream([e.track]);
   };
   await pc.setRemoteDescription({ type: 'offer', sdp });
   preferH264(pc);
@@ -72,6 +112,7 @@ async function onOffer(streamId, sdp) {
   await pc.setLocalDescription(answer);
   ws.send(JSON.stringify({ t: 'sdp', streamId, to: parentId, type: 'answer', sdp: pc.localDescription.sdp }));
   log('answered offer from ' + parentId);
+  startStatsLoop();
 }
 
 function start() {
@@ -106,6 +147,7 @@ function stop() {
   if (ws) { try { ws.send(JSON.stringify({ t: 'leave' })); } catch {} try { ws.close(); } catch {} ws = null; }
   if (pc) { pc.close(); pc = null; }
   $('remote').srcObject = null;
+  stopStatsLoop();
   $('startBtn').disabled = false;
   $('stopBtn').disabled = true;
   log('stopped');

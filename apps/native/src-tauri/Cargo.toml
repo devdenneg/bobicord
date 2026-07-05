@@ -14,6 +14,12 @@ rust-version = "1.82"
 name = "app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# Без этого dev-профиль (используется и в `tauri dev`) не тянет real-time
+# видео-пайплайн — BGRA->NV12 конверсия кадра на O0 сама по себе даёт
+# единицы-десятки мс/кадр, что душит захват до ~12fps ещё до энкодера/сети.
+[profile.dev]
+opt-level = 2
+
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
 

@@ -6,7 +6,7 @@ use std::time::Duration;
 fn main() {
     let monitors = capture::list_monitors();
     println!("monitors: {monitors:?}");
-    let (handle, stop, rx) = capture::spawn_capture(1, 1920, 1080).expect("spawn_capture");
+    let (handle, stop, rx) = capture::spawn_capture(1, 1920, 1080, 30).expect("spawn_capture");
     let mut n = 0;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {

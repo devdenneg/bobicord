@@ -23,8 +23,8 @@ async fn main() {
     println!("[smoke] starting broadcast stream_id={stream_id} ws_url={ws_url} monitor={monitor_index}");
     let handle = broadcast::start(stream_id, ws_url, identity, monitor_index).await.expect("start broadcast");
 
-    println!("[smoke] broadcasting for 90s — open tree-test-viewer.html now and click Смотреть");
-    tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+    println!("[smoke] broadcasting for 300s — open tree-test-viewer.html now and click Смотреть");
+    tokio::time::sleep(std::time::Duration::from_secs(300)).await;
 
     println!("[smoke] stopping");
     handle.stop().await;
