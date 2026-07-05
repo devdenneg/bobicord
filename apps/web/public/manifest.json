@@ -1,17 +1,16 @@
 {
-  "name": "Voice — голосовой чат",
-  "short_name": "Voice",
+  "name": "Bobicord",
+  "short_name": "Bobicord",
   "description": "Голос, чат и трансляции для своей команды",
   "id": "/",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "orientation": "any",
-  "background_color": "#0c0e13",
-  "theme_color": "#0c0e13",
+  "background_color": "#0b0c0f",
+  "theme_color": "#5865f2",
   "lang": "ru",
   "icons": [
-    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
-    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable" }
+    { "src": "/icon.png", "sizes": "440x430", "type": "image/png", "purpose": "any" }
   ]
 }

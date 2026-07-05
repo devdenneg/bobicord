@@ -57,6 +57,9 @@
   .brand{display:flex;align-items:center;gap:12px;margin-bottom:8px}
   .brand .logo{width:48px;height:48px;border-radius:14px;background:linear-gradient(135deg,#6366f1,#8b5cf6);display:flex;align-items:center;justify-content:center;flex:0 0 auto;box-shadow:0 8px 24px -6px rgba(99,102,241,.6),inset 0 1px 0 rgba(255,255,255,.25)}
   .brand .logo .ic{color:#fff;width:24px;height:24px}
+  .brand .logo-img{width:56px;height:56px;flex:0 0 auto;object-fit:contain;filter:drop-shadow(0 8px 22px rgba(99,102,241,.5))}
+  .pulse-logo{width:78px;height:78px;object-fit:contain;animation:logopulse 1.3s ease-in-out infinite;filter:drop-shadow(0 8px 26px rgba(99,102,241,.45))}
+  @keyframes logopulse{0%,100%{transform:scale(.9);opacity:.72}50%{transform:scale(1.06);opacity:1}}
   .card h1{margin:0;font-size:22px;font-weight:700;letter-spacing:-.02em;color:var(--txt-h)}
   .card .sub{margin:0 0 20px;color:var(--muted);font-size:14px;line-height:1.5}
   .row{margin-bottom:12px}

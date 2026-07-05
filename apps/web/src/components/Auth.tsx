@@ -1,7 +1,6 @@
 import { useRef, useState } from 'react';
 import { api, setToken } from '../api';
 import { useStore } from '../store';
-import { Icon } from '../Icon';
 
 export function Auth() {
   const [mode, setMode] = useState<'login' | 'register'>('login');
@@ -28,7 +27,7 @@ export function Auth() {
   return (
     <div id="auth" className="overlay">
       <div className="card" ref={cardRef}>
-        <div className="brand"><div className="logo"><Icon name="mic" /></div><h1>Voice</h1></div>
+        <div className="brand"><img className="logo-img" src="/icon.png" alt="Bobicord" /><h1>Bobicord</h1></div>
         <p className="sub">Голос, чат и трансляции — для своих.</p>
         <div className="tabs2">
           <button className={mode === 'login' ? 'active' : ''} onClick={() => { setMode('login'); setErr(''); }}>Вход</button>
