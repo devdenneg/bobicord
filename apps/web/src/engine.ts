@@ -104,6 +104,10 @@ export class Engine {
       }
     });
     this.videoT.onStreamStop((identity) => {
+      // Разрываем watch явно (idempotent, no-op если уже не смотрели) — иначе
+      // при обрыве вещателя <video> остаётся с последним кадром/чёрным экраном
+      // навсегда: без unwatch() PeerConnection и трек никто не закрывает.
+      this.videoT.unwatch(identity);
       this.watching.delete(identity); this.pendingWatch.delete(identity);
       this.sysMsg(`${this.nameOf(identity)} закончил трансляцию`);
       this.emit();

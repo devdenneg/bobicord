@@ -201,6 +201,17 @@ export class TreeVideoTransport implements VideoTransport {
         st.pc.addIceCandidate(msg.candidate).catch(() => {});
         break;
       }
+      case 'drop-peer': {
+        // Родитель (в т.ч. корень-вещатель) пропал. Если дерево ещё живо, следом
+        // придёт 'assign-parent' с новым родителем (или null, если некуда) — тот
+        // хендлер сам закроет старый PC. Если это конец вещания целиком, сервер
+        // это же сообщение шлёт КАЖДОМУ зрителю напрямую (не только через discovery
+        // 'stream-end') — закрываем свой watch-сокет сразу (onclose ниже уже делает
+        // полный teardown: PC+видео+карты), а не ждём: иначе <video> застревает
+        // на последнем кадре/чёрном экране навсегда, пока юзер не закроет вручную.
+        if (msg.peerId === st.parentId) { try { st.ws.close(); } catch { /**/ } }
+        break;
+      }
       case 'tree-info': {
         this.treeInfoByStream.set(streamId, {
           myDepth: msg.myDepth ?? 0,
