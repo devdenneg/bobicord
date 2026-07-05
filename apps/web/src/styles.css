@@ -331,14 +331,14 @@
   .pi .head:hover .mkick,.pi .mkick:focus-visible{opacity:1}
   .pi .mkick:hover{background:var(--red-fill);color:#fff}
   @media (hover:none){.pi .mkick{opacity:.7}}
-  .pi .chev{opacity:.28;transition:opacity var(--tr),transform var(--tr);color:var(--muted);flex:0 0 auto;width:20px;height:28px;display:flex;align-items:center;justify-content:center}
+  .pi .chev{opacity:.28;transition:opacity var(--tr),transform var(--tr);color:var(--muted);flex:0 0 auto;width:28px;height:28px;display:flex;align-items:center;justify-content:center}
   .pi.clickable .head:hover .chev{opacity:.8}.pi.open .chev{opacity:1;transform:rotate(180deg)}
-  .pi .micst{width:20px;height:28px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;color:var(--red);opacity:0;transition:opacity var(--tr)}
-  .pi .micst.off{opacity:1}.pi .micst .ic{font-size:15px}
+  .pi .micst{width:28px;height:28px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;color:var(--red)}
+  .pi .micst:not(.off){display:none}.pi .micst .ic{font-size:15px}
   /* строка громкости — плавно раскрывается/уезжает */
-  .pi .exp{display:flex;align-items:center;gap:10px;max-height:0;overflow:hidden;opacity:0;padding:0 8px 0 44px;transition:max-height .22s ease,opacity .18s ease,padding .22s ease}
-  .pi.open .exp{max-height:56px;opacity:1;padding:4px 8px 12px 44px}
-  .pi .exp > svg.ic{color:var(--muted);flex:0 0 auto;width:20px;font-size:17px}
+  .pi .exp{display:flex;align-items:center;gap:10px;max-height:0;overflow:hidden;opacity:0;padding:0 8px 0 8px;transition:max-height .22s ease,opacity .18s ease,padding .22s ease}
+  .pi.open .exp{max-height:56px;opacity:1;padding:4px 8px 12px 8px}
+  .pi .exp > svg.ic{color:var(--muted);flex:0 0 auto;font-size:18px}
   .pi .exp input[type=range]{flex:1;accent-color:var(--accent);height:5px;cursor:pointer;margin:0}
   .pi .exp .mut{flex:0 0 auto;width:28px;height:28px;padding:0;background:var(--panel3);border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--muted);transition:color var(--tr),background var(--tr)}
   .pi .exp .mut:hover{color:var(--txt)}

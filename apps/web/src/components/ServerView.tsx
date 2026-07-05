@@ -87,8 +87,8 @@ function VoiceParticipantRow({ m }: { m: Member }) {
             {pending ? <span className="spin" style={{ margin: 0, width: 13, height: 13 }} /> : <Icon name={watching ? 'eye-off' : 'eye'} />}
           </button>
         ) : null}
-        {remote ? <div className="chev" aria-hidden="true"><Icon name="chevron" sm /></div> : null}
         <div className={'micst' + (pr?.micMuted ? ' off' : '')} aria-label={pr?.micMuted ? 'Микрофон выключен' : undefined}><Icon name="mic-off" /></div>
+        {remote ? <div className="chev" aria-hidden="true"><Icon name="chevron" sm /></div> : null}
       </div>
       {remote ? (
         <div className="exp" id={rowId}>
