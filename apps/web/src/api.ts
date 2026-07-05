@@ -44,6 +44,7 @@ export const api = {
   getServer: (id: string) =>
     req<{ server: ServerDetail; members: Member[]; myRole: string }>('GET', '/servers/' + id),
   leaveServer: (id: string) => req<{ ok: boolean }>('POST', `/servers/${id}/leave`),
+  kickMember: (id: string, userId: string) => req<{ ok: boolean }>('POST', `/servers/${id}/kick`, { userId }),
   deleteServer: (id: string) => req<{ ok: boolean }>('DELETE', '/servers/' + id),
   setServerPassword: (id: string, password: string) =>
     req<{ ok: boolean; hasPassword: boolean }>('PUT', `/servers/${id}/password`, { password }),

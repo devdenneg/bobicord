@@ -6,13 +6,18 @@ const FILES = {
   mute: '/mute.wav',     // кто-то замутился
   system: '/system.wav', // системное уведомление (напр. надо обновиться)
 } as const;
+import { getSettings } from './settings';
+
 type SoundName = keyof typeof FILES;
 const cache: Partial<Record<SoundName, HTMLAudioElement>> = {};
 
 export function playSound(name: SoundName): void {
   try {
+    const vol = Math.max(0, Math.min(1, (getSettings().notifyVolume ?? 60) / 100));
+    if (vol <= 0) return;
     let a = cache[name];
-    if (!a) { a = new Audio(FILES[name]); a.volume = 0.5; cache[name] = a; }
+    if (!a) { a = new Audio(FILES[name]); cache[name] = a; }
+    a.volume = vol;
     a.currentTime = 0;
     a.play().catch(() => {});
   } catch { /* ignore */ }

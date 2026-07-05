@@ -55,6 +55,7 @@ export interface ChatMessage {
   sys: boolean;
   color?: number; // avatar color index of author
   img?: string; // attached image URL
+  ts?: number; // timestamp (ms)
 }
 
 export interface HistoryMessage {
@@ -81,4 +82,5 @@ export interface AudioSettings {
   pttKey: string;
   master: number;
   micVolume: number; // громкость микрофона в %, 100 = без изменений
+  notifyVolume: number; // громкость звуков-уведомлений в %
 }

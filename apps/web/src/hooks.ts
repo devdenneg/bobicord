@@ -3,7 +3,7 @@ import { getEngine } from './store';
 import type { Snapshot } from './engine';
 
 const EMPTY: Snapshot = {
-  connected: false, inVoice: false, deafened: false, localMicMuted: true, pttDown: false,
+  connected: false, reconnecting: false, inVoice: false, deafened: false, localMicMuted: true, pttDown: false,
   presence: {}, speaking: {}, streams: [], watching: {}, pending: {}, watchers: {}, messages: [], typing: [],
 };
 

@@ -18,6 +18,7 @@ export interface PeerState { online: boolean; inVoice: boolean; micMuted: boolea
 export interface StreamInfo { key: string; identity: string; isLocal: boolean }
 export interface Snapshot {
   connected: boolean;
+  reconnecting: boolean;
   inVoice: boolean;
   deafened: boolean;
   localMicMuted: boolean;
@@ -32,7 +33,7 @@ export interface Snapshot {
   typing: string[];
 }
 
-type EmoteListener = (streamerId: string, emoteId: string, by: string, x: number) => void;
+type EmoteListener = (streamerId: string, emoteId: string, by: string, x: number, size?: string) => void;
 
 interface EngineHooks {
   toast: (text: string, kind?: 'ok' | 'warn' | 'err' | 'info') => void;
@@ -50,8 +51,10 @@ export class Engine {
   private hooks: EngineHooks;
 
   inVoice = false;
+  private reconnecting = false;
   private deafened = false;
   private pttDown = false;
+  private watchTimers = new Map<string, number>();
 
   // mic pipeline: raw device -> gain (громкость/мут) -> published track
   private micRaw: MediaStream | null = null;
@@ -144,7 +147,7 @@ export class Engine {
     const watchers: Record<string, { name: string }[]> = {};
     this.streamWatchers.forEach((m, sid) => (watchers[sid] = [...m.values()].map((v) => ({ name: v.name }))));
     return {
-      connected: !!this.room, inVoice: this.inVoice, deafened: this.deafened,
+      connected: !!this.room, reconnecting: this.reconnecting, inVoice: this.inVoice, deafened: this.deafened,
       localMicMuted: this.localMicMuted(), pttDown: this.pttDown,
       presence, speaking, streams, watching, pending, watchers, messages: this.messages,
       typing: [...this.typingUsers].filter(([n, exp]) => exp > Date.now() && n !== this.me.displayName).map(([n]) => n),
@@ -164,6 +167,9 @@ export class Engine {
       .on(RoomEvent.ParticipantConnected, (p) => { this.hooks.peerJoined(p.identity); this.hooks.toast((p.name || p.identity) + ' в сети', 'ok'); this.emit(); })
       .on(RoomEvent.ParticipantDisconnected, (p) => { this.cleanupPeer(p.identity); this.emit(); })
       .on(RoomEvent.TrackMuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p !== this.room?.localParticipant) playSound('mute'); this.emit(); })
+      .on(RoomEvent.Reconnecting, () => { this.reconnecting = true; this.hooks.toast('Связь потеряна — переподключаюсь…', 'warn'); this.emit(); })
+      .on(RoomEvent.Reconnected, () => { this.reconnecting = false; this.hooks.toast('Связь восстановлена', 'ok'); this.emit(); })
+      .on(RoomEvent.Disconnected, () => { this.reconnecting = false; this.emit(); })
       .on(RoomEvent.TrackUnmuted, () => this.emit())
       .on(RoomEvent.TrackPublished, this.onRemotePub)
       .on(RoomEvent.TrackUnpublished, this.onRemoteUnpub)
@@ -215,7 +221,7 @@ export class Engine {
   /* ---------- VOICE join/leave ---------- */
   async joinVoice() {
     if (!this.room || this.inVoice) return;
-    this.inVoice = true; this.manualMute = false;
+    this.inVoice = true; this.manualMute = false; this.pttDown = false;
     try { await this.startMic(); }
     catch { this.inVoice = false; this.hooks.toast('Нет доступа к микрофону', 'err'); this.emit(); return; }
     this.room.remoteParticipants.forEach((p) => { const mp = p.getTrackPublication(Track.Source.Microphone); if (mp) { try { (mp as any).setSubscribed(true); } catch { /**/ } } });
@@ -226,7 +232,7 @@ export class Engine {
     await this.stopShare().catch(() => {});
     this.stopMic();
     this.room.remoteParticipants.forEach((p) => { const rp = p.getTrackPublication(Track.Source.Microphone); if (rp) { try { (rp as any).setSubscribed(false); } catch { /**/ } } this.detachAnalyser(p.identity); });
-    this.inVoice = false; this.deafened = false; this.manualMute = false;
+    this.inVoice = false; this.deafened = false; this.manualMute = false; this.pttDown = false;
     this.screenAudioEls.forEach((a) => (a.muted = false));
     this.emit();
   }
@@ -379,16 +385,21 @@ export class Engine {
     this.videoT.watch(identity);
     if (!localStorage.getItem('sprayTip')) { localStorage.setItem('sprayTip', '1'); this.hooks.toast('Кинь эмоут зрителям — 😃 в углу трансляции', 'info'); }
     this.emit();
-    setTimeout(() => {
+    const timer = window.setTimeout(() => {
+      this.watchTimers.delete(identity);
       if (this.pendingWatch.has(identity)) {
         this.pendingWatch.delete(identity); this.watching.delete(identity);
         this.videoT.unwatch(identity);
         this.hooks.toast('Не удалось подключиться к трансляции', 'err'); this.emit();
       }
     }, 10000);
+    this.watchTimers.set(identity, timer);
   }
   closeWatch(identity: string) {
-    this.watching.delete(identity);
+    this.watching.delete(identity); this.pendingWatch.delete(identity);
+    // Таймер watch() (10с "не удалось подключиться") иначе переживал явный закрытие —
+    // если закрыли до коннекта, он всё равно стрелял и повторно звал unwatch()+toast.
+    const t = this.watchTimers.get(identity); if (t) { clearTimeout(t); this.watchTimers.delete(identity); }
     this.videoT.unwatch(identity);
     const m = this.streamWatchers.get(identity); if (m) { m.delete(this.me.username); }
     this.dataSend({ t: 'watch', s: identity, id: this.me.username, n: this.me.displayName, on: false });
@@ -397,6 +408,7 @@ export class Engine {
 
   async share() {
     if (!this.inVoice) { this.hooks.toast('Сначала подключись к голосовому', 'warn'); return; }
+    if (!navigator.mediaDevices?.getDisplayMedia) { this.hooks.toast('Трансляция экрана не поддерживается на этом устройстве (нужен десктопный браузер)', 'warn'); return; }
     if (this.videoT.isBroadcasting(this.me.username)) { await this.stopShare(); this.hooks.toast('Трансляция остановлена'); return; }
     try {
       this.screenStream = await navigator.mediaDevices.getDisplayMedia({
@@ -441,10 +453,10 @@ export class Engine {
 
   /* ---------- emotes (spray) ---------- */
   onEmote(cb: EmoteListener) { this.emoteListeners.add(cb); return () => { this.emoteListeners.delete(cb); }; }
-  fling(streamerId: string, emote: Emote) {
+  fling(streamerId: string, emote: Emote, size?: string) {
     const x = Math.random();
-    this.emoteListeners.forEach((f) => f(streamerId, emote.id, this.me.displayName, x));
-    this.dataSend({ t: 'emote', s: streamerId, e: emote.id, by: this.me.displayName, x });
+    this.emoteListeners.forEach((f) => f(streamerId, emote.id, this.me.displayName, x, size));
+    this.dataSend({ t: 'emote', s: streamerId, e: emote.id, by: this.me.displayName, x, sz: size });
   }
 
   /* ---------- watchers presence ---------- */
@@ -480,16 +492,16 @@ export class Engine {
   async applyOutput() { if (!this.room) return; const out = getSettings().output; try { await this.room.switchActiveDevice('audiooutput', out || 'default'); } catch { /**/ } document.querySelectorAll('#audioSink audio').forEach((a) => { if ((a as any).setSinkId && out) (a as any).setSinkId(out).catch(() => {}); }); }
 
   /* ---------- chat ---------- */
-  private pushMsg(who: string | null, text: string, sys: boolean, color?: number, mineOverride?: boolean, img?: string) {
+  private pushMsg(who: string | null, text: string, sys: boolean, color?: number, mineOverride?: boolean, img?: string, ts?: number) {
     const mine = mineOverride !== undefined ? mineOverride : (!sys && who === this.me.displayName);
-    this.messages = [...this.messages, { id: msgSeq++, who, text, mine, sys, color, img }].slice(-500);
+    this.messages = [...this.messages, { id: msgSeq++, who, text, mine, sys, color, img, ts: ts ?? Date.now() }].slice(-500);
     this.emit();
   }
   sysMsg(text: string) { this.pushMsg(null, text, true); }
-  loadHistory(list: { uid: string; name: string; color: number; text: string; em: Record<string, string>; img?: string }[]) {
+  loadHistory(list: { uid: string; name: string; color: number; text: string; em: Record<string, string>; img?: string; ts?: number }[]) {
     this.messages = list.map((m) => {
       if (m.em) for (const k in m.em) this.onEmoteResolve?.(k, m.em[k]);
-      return { id: msgSeq++, who: m.name, text: m.text, mine: m.uid === this.me.id, sys: false, color: m.color, img: m.img };
+      return { id: msgSeq++, who: m.name, text: m.text, mine: m.uid === this.me.id, sys: false, color: m.color, img: m.img, ts: m.ts };
     });
     this.emit();
   }
@@ -516,7 +528,7 @@ export class Engine {
     try {
       const d = JSON.parse(new TextDecoder().decode(payload));
       if (d.t === 'chat') { if (d.em) for (const k in d.em) this.onEmoteResolve?.(k, d.em[k]); this.typingUsers.delete(d.name); this.pushMsg(d.name, d.text, false, d.color, false, d.img); playSound('msg'); }
-      else if (d.t === 'emote') this.emoteListeners.forEach((f) => f(d.s, d.e, d.by, d.x));
+      else if (d.t === 'emote') this.emoteListeners.forEach((f) => f(d.s, d.e, d.by, d.x, d.sz));
       else if (d.t === 'watch') { const m = this.wset(d.s); if (d.on) m.set(d.id, { name: d.n, ts: Date.now() }); else m.delete(d.id); this.emit(); }
       else if (d.t === 'typing') { if (d.name && d.name !== this.me.displayName) { this.typingUsers.set(d.name, Date.now() + 3500); this.emit(); setTimeout(() => this.pruneTyping(), 3600); } }
     } catch { /**/ }
