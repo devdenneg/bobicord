@@ -6,7 +6,7 @@ WORKDIR /app
 # до Э2) — видео уедет на старый SFU вместо P2P-дерева.
 ARG VITE_VIDEO_TRANSPORT=tree
 ENV VITE_VIDEO_TRANSPORT=$VITE_VIDEO_TRANSPORT
-COPY package.json package-lock.json ./
+COPY package.json ./
 RUN npm install
 COPY . .
 RUN npm run build
