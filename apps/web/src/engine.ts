@@ -3,7 +3,7 @@ import {
   type RemoteParticipant, type Participant, type TrackPublication, type RemoteTrack,
 } from 'livekit-client';
 import type { User, Member, ChatMessage, Emote } from './types';
-import { getSettings } from './settings';
+import { getSettings, setSettings } from './settings';
 import { emoteUrl } from './emotes';
 import { playSound } from './sounds';
 
@@ -201,7 +201,8 @@ export class Engine {
 
   /* ---------- MIC / DEAFEN / PTT ---------- */
   // шумодав/эхо/автогромкость всегда включены (дефолт для всех)
-  private micCapture() { const s = getSettings(); return { deviceId: s.input || undefined, echoCancellation: true, noiseSuppression: true, autoGainControl: true }; }
+  // deviceId через { exact } — иначе браузер игнорит выбор и берёт устройство по умолчанию
+  private micCapture() { const s = getSettings(); return { deviceId: s.input ? { exact: s.input } : undefined, echoCancellation: true, noiseSuppression: true, autoGainControl: true }; }
 
   // строим цепочку: устройство -> analyser(VAD) + gain -> published track
   private async startMic() {
@@ -239,9 +240,15 @@ export class Engine {
     try { this.micGain.gain.setTargetAtTime(target, this.micActx.currentTime, 0.015); } catch { this.micGain.gain.value = target; }
   }
   async reapplyMic() {
-    if (!this.room || !this.inVoice) return;
+    if (!this.room || !this.inVoice) { this.hooks.toast('Микрофон применится при подключении к голосовому'); return; }
     this.stopMic();
-    try { await this.startMic(); } catch { /**/ }
+    try { await this.startMic(); this.hooks.toast('Микрофон переключён', 'ok'); }
+    catch {
+      // выбранное устройство недоступно → откат на дефолтное
+      setSettings({ input: '' });
+      try { await this.startMic(); this.hooks.toast('Выбранный микрофон недоступен — включён дефолтный', 'warn'); }
+      catch { this.hooks.toast('Не удалось включить микрофон', 'err'); }
+    }
     this.emit();
   }
   async toggleMic() {
