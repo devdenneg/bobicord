@@ -9,6 +9,10 @@ apps/web/dist/
 .env
 livekit.yaml
 
+# vite local env (копируй из .env.local.example)
+.env.local
+.env.*.local
+
 # database / runtime data
 data/
 *.db
