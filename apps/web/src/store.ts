@@ -62,7 +62,7 @@ export const useStore = create<AppState>((set, get) => ({
         saveTimer = window.setTimeout(() => { api.putSettings(a.id, vols).catch(() => {}); }, 800);
       },
       peerJoined: (id) => { if (!get().members.some((m) => m.username === id)) get().refreshMembers(); },
-      persistMessage: (text, em) => { const a = get().active; if (a) api.postMessage(a.id, text, em).catch(() => {}); },
+      persistMessage: (text, em, image) => { const a = get().active; if (a) api.postMessage(a.id, text, em, image).catch(() => {}); },
     });
     engine.onEmoteResolve = (name, id) => emoteMap.set(name, id);
     set({ me: user });

@@ -1,5 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
 import { useStore, getEngine } from '../store';
+import { api } from '../api';
 import { useEngine } from '../hooks';
 import { Icon } from '../Icon';
 import { avColor, initial, prefersReducedMotion } from '../util';
@@ -8,10 +10,10 @@ import { EmotePicker } from './EmotePicker';
 import { getSettings, setSettings } from '../settings';
 import type { Emote, Member } from '../types';
 
-function Avatar({ name, ci, size = 32, dot, live }: { name: string; ci: number; size?: number; dot?: string; live?: boolean }) {
+function Avatar({ name, ci, url, size = 32, dot, live }: { name: string; ci: number; url?: string; size?: number; dot?: string; live?: boolean }) {
   return (
-    <div className="av" style={{ width: size, height: size, fontSize: size * 0.44, background: avColor(name, ci) }}>
-      {initial(name)}
+    <div className="av" style={{ width: size, height: size, fontSize: size * 0.44, background: url ? '#0000' : avColor(name, ci) }}>
+      {url ? <img className="avimg" src={url} alt="" /> : initial(name)}
       {dot ? <span className={'sdot ' + dot} /> : null}
       {live ? <span className="livebadge" /> : null}
     </div>
@@ -35,7 +37,7 @@ function VoiceParticipantRow({ m }: { m: Member }) {
   return (
     <div className={'pi' + (remote ? ' clickable' : '') + (streaming ? ' streaming' : '') + (speaking ? ' speaking' : '') + (open ? ' open' : '')} data-spk={m.username}>
       <div className="head" style={{ padding: '5px 6px' }} onClick={() => remote && setOpen((v) => !v)}>
-        <div className="av" style={{ width: 28, height: 28, fontSize: 12, background: avColor(m.displayName, m.avatarColor) }}>{initial(m.displayName)}</div>
+        <div className="av" style={{ width: 28, height: 28, fontSize: 12, background: m.avatarUrl ? '#0000' : avColor(m.displayName, m.avatarColor) }}>{m.avatarUrl ? <img className="avimg" src={m.avatarUrl} alt="" /> : initial(m.displayName)}</div>
         <div className="nm" style={{ fontSize: 13 }}>{m.displayName}{isLocal ? ' (ты)' : ''}</div>
         {remote ? <div className="chev">⌄</div> : null}
         <div className={'micst' + (pr?.micMuted ? ' off' : '')}><Icon name={pr?.micMuted ? 'mic-off' : 'mic'} /></div>
@@ -50,7 +52,7 @@ function VoiceParticipantRow({ m }: { m: Member }) {
         </div>
       ) : null}
       {remote && streaming ? (
-        <div className="watchrow" style={{ display: 'block', padding: '0 6px 8px 44px' }}>
+        <div className="watchrow" style={{ display: 'block', padding: '4px 8px 8px 8px' }}>
           <button className={'wbtn' + (watching ? ' open' : '')} disabled={pending}
             onClick={(e) => { e.stopPropagation(); watching ? E.closeWatch(m.username) : E.watch(m.username); }}>
             {pending ? <><span className="spin" />...</> : watching ? '◼ Закрыть трансляцию' : '▶ Смотреть трансляцию'}
@@ -111,7 +113,7 @@ function MemberRow({ m }: { m: Member }) {
   return (
     <div className={'pi ' + st + (streaming ? ' streaming' : '')} data-spk={m.username}>
       <div className="head">
-        <Avatar name={m.displayName} ci={m.avatarColor} dot={st} live={streaming} />
+        <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} dot={st} live={streaming} />
         <div className="nm">{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{m.username === me.username ? ' (ты)' : ''}</div>
       </div>
     </div>
@@ -147,6 +149,9 @@ function Chat() {
   const [pickAnchor, setPickAnchor] = useState<DOMRect | null | undefined>(undefined);
   const msgsRef = useRef<HTMLDivElement>(null);
   const emoBtnRef = useRef<HTMLButtonElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
+  const toast = useStore((s) => s.toast);
   const [pill, setPill] = useState(0);
   const atBottomRef = useRef(true);
 
@@ -164,6 +169,21 @@ function Chat() {
     setText('');
   }
 
+  async function sendImage(file: File) {
+    if (!file.type.startsWith('image/')) { toast('Можно только картинки', 'warn'); return; }
+    if (file.size > 10 * 1024 * 1024) { toast('Картинка больше 10 МБ', 'warn'); return; }
+    setUploading(true);
+    try {
+      const { url } = await api.uploadImage(file);
+      const t = text.trim();
+      const em: Record<string, string> = {};
+      t.split(/\s+/).forEach((w) => { if (emoteMap.has(w)) em[w] = emoteMap.get(w)!; });
+      E.sendChatWithEmotes(t, em, url);
+      setText('');
+    } catch (e: any) { toast(e?.message || 'Не удалось загрузить', 'err'); }
+    finally { setUploading(false); }
+  }
+
   return (
     <div id="chat">
       <div id="msgs" ref={msgsRef} onScroll={(e) => { const m = e.currentTarget; atBottomRef.current = m.scrollTop + m.clientHeight >= m.scrollHeight - 120; if (atBottomRef.current) setPill(0); }}>
@@ -175,9 +195,12 @@ function Chat() {
             return (
               <div className={'msg' + (m.sys ? ' sys' : '') + (m.mine ? ' me' : '')} key={m.id}>
                 {!m.sys ? <div className="who" style={{ color: avColor(m.who || '', m.color) }}>{m.who}</div> : null}
-                <div className={'tx' + (big ? ' big' : '')}>
-                  {m.sys ? m.text : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : <img key={i} className="emo" src={emoteUrl(p.emo)} alt={p.name} title={p.name} loading="lazy" decoding="async" />))}
-                </div>
+                {m.sys || m.text ? (
+                  <div className={'tx' + (big ? ' big' : '')}>
+                    {m.sys ? m.text : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : <img key={i} className="emo" src={emoteUrl(p.emo)} alt={p.name} title={p.name} loading="lazy" decoding="async" />))}
+                  </div>
+                ) : null}
+                {m.img ? <a className="msg-img-wrap" href={m.img} target="_blank" rel="noreferrer"><img className="msg-img" src={m.img} alt="" loading="lazy" /></a> : null}
               </div>
             );
           })}
@@ -187,7 +210,11 @@ function Chat() {
       <div className="chat-in">
         <button id="emoBtn" ref={emoBtnRef} className={'emo-toggle' + (pickAnchor !== undefined ? ' on' : '')} data-tip="7TV эмоуты"
           onClick={() => setPickAnchor((a) => (a === undefined ? emoBtnRef.current!.getBoundingClientRect() : undefined))}><Icon name="smile" /></button>
-        <input id="msgIn" placeholder="Сообщение..." maxLength={1000} value={text} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && send()} />
+        <button className="emo-toggle" data-tip="Прикрепить картинку (или Ctrl+V)" disabled={uploading} onClick={() => fileRef.current?.click()}>{uploading ? <span className="spin" /> : <Icon name="image" />}</button>
+        <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; if (f) sendImage(f); e.target.value = ''; }} />
+        <input id="msgIn" placeholder="Сообщение..." maxLength={1000} autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false} name="chat-message" value={text}
+          onPaste={(e) => { const items = e.clipboardData?.items; if (!items) return; for (let i = 0; i < items.length; i++) { if (items[i].type.startsWith('image/')) { const f = items[i].getAsFile(); if (f) { e.preventDefault(); sendImage(f); } break; } } }}
+          onChange={(e) => setText(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && send()} />
         <button id="sendBtn" className={text.trim() ? '' : 'empty'} data-tip="Отправить · Enter" onClick={send}><Icon name="send" /></button>
       </div>
       {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} onClose={() => setPickAnchor(undefined)}
@@ -297,12 +324,37 @@ function Channels() {
       <div className="ch-body"><VoiceCard /></div>
       {eng.inVoice ? <div className="voice-bar"><VoiceControls /></div> : null}
       <div className="user-panel">
-        <div className="up-av" onClick={() => setModal('profile')} style={{ background: avColor(me.displayName, me.avatarColor) }}>{initial(me.displayName)}</div>
+        <div className="up-av" onClick={() => setModal('profile')} style={{ background: me.avatarUrl ? '#0000' : avColor(me.displayName, me.avatarColor) }}>{me.avatarUrl ? <img className="avimg" src={me.avatarUrl} alt="" /> : initial(me.displayName)}</div>
         <div className="up-i" onClick={() => setModal('profile')}><b>{me.displayName}</b><span>В сети</span></div>
         <button className="up-btn" data-tip="Настройки звука" onClick={() => setModal('settings')}><Icon name="gear" sm /></button>
       </div>
     </div>
   );
+}
+
+function useResizable(key: string, def: number, min: number, max: number, edge: 'right' | 'left') {
+  const [w, setW] = useState<number>(() => {
+    const s = Number(localStorage.getItem(key));
+    return s >= min && s <= max ? s : def;
+  });
+  useEffect(() => { localStorage.setItem(key, String(w)); }, [key, w]);
+  const onDown = (e: ReactMouseEvent) => {
+    e.preventDefault();
+    const sx = e.clientX, sw = w;
+    const move = (ev: MouseEvent) => {
+      const d = edge === 'right' ? ev.clientX - sx : sx - ev.clientX;
+      setW(Math.min(max, Math.max(min, sw + d)));
+    };
+    const up = () => {
+      window.removeEventListener('mousemove', move);
+      window.removeEventListener('mouseup', up);
+      document.body.classList.remove('resizing');
+    };
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
+    document.body.classList.add('resizing');
+  };
+  return { w, onDown };
 }
 
 export function ServerView() {
@@ -313,10 +365,12 @@ export function ServerView() {
   const hasStreams = eng.streams.length > 0;
   const split = hasStreams && !minimized;
   useEffect(() => { if (!hasStreams) setMin(false); }, [hasStreams]);
+  const chan = useResizable('w:channels', 290, 270, 440, 'right');
+  const mem = useResizable('w:members', 244, 216, 400, 'left');
 
   return (
     <>
-      <section id="server" className={'on' + (mtab !== 'main' ? ' tab-' + mtab : '')}>
+      <section id="server" className={'on' + (mtab !== 'main' ? ' tab-' + mtab : '')} style={{ '--ch-w': chan.w + 'px', '--mem-w': mem.w + 'px' } as CSSProperties}>
         <Channels />
         <div id="main">
           <div className="srv-header">
@@ -329,6 +383,8 @@ export function ServerView() {
           </div>
         </div>
         <Members />
+        <div className="rz rz-ch" onMouseDown={chan.onDown} title="Потяни, чтобы изменить ширину" />
+        <div className="rz rz-mem" onMouseDown={mem.onDown} title="Потяни, чтобы изменить ширину" />
       </section>
       <div id="mtabs">
         <button className={mtab === 'channels' ? 'active' : ''} onClick={() => setMtab('channels')}><Icon name="speaker" />Голос</button>

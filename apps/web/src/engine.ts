@@ -30,7 +30,7 @@ interface EngineHooks {
   toast: (text: string, kind?: 'ok' | 'warn' | 'err' | 'info') => void;
   saveSettings: (vols: { users: Record<string, number>; streams: Record<string, number> }) => void;
   peerJoined: (identity: string) => void;
-  persistMessage: (text: string, em: Record<string, string>) => void;
+  persistMessage: (text: string, em: Record<string, string>, image?: string) => void;
 }
 
 let msgSeq = 1;
@@ -475,30 +475,30 @@ export class Engine {
   async applyOutput() { if (!this.room) return; const out = getSettings().output; try { await this.room.switchActiveDevice('audiooutput', out || 'default'); } catch { /**/ } document.querySelectorAll('#audioSink audio').forEach((a) => { if ((a as any).setSinkId && out) (a as any).setSinkId(out).catch(() => {}); }); }
 
   /* ---------- chat ---------- */
-  private pushMsg(who: string | null, text: string, sys: boolean, color?: number, mineOverride?: boolean) {
+  private pushMsg(who: string | null, text: string, sys: boolean, color?: number, mineOverride?: boolean, img?: string) {
     const mine = mineOverride !== undefined ? mineOverride : (!sys && who === this.me.displayName);
-    this.messages = [...this.messages, { id: msgSeq++, who, text, mine, sys, color }].slice(-500);
+    this.messages = [...this.messages, { id: msgSeq++, who, text, mine, sys, color, img }].slice(-500);
     this.emit();
   }
   sysMsg(text: string) { this.pushMsg(null, text, true); }
-  loadHistory(list: { uid: string; name: string; color: number; text: string; em: Record<string, string> }[]) {
+  loadHistory(list: { uid: string; name: string; color: number; text: string; em: Record<string, string>; img?: string }[]) {
     this.messages = list.map((m) => {
       if (m.em) for (const k in m.em) this.onEmoteResolve?.(k, m.em[k]);
-      return { id: msgSeq++, who: m.name, text: m.text, mine: m.uid === this.me.id, sys: false, color: m.color };
+      return { id: msgSeq++, who: m.name, text: m.text, mine: m.uid === this.me.id, sys: false, color: m.color, img: m.img };
     });
     this.emit();
   }
-  sendChatWithEmotes(text: string, em: Record<string, string>) {
-    if (!text.trim() || !this.room) return;
+  sendChatWithEmotes(text: string, em: Record<string, string>, img?: string) {
+    if ((!text.trim() && !img) || !this.room) return;
     const t = text.trim();
-    this.dataSend({ t: 'chat', name: this.me.displayName, text: t, em, color: this.me.avatarColor });
-    this.pushMsg(this.me.displayName, t, false, this.me.avatarColor, true);
-    this.hooks.persistMessage(t, em);
+    this.dataSend({ t: 'chat', name: this.me.displayName, text: t, em, color: this.me.avatarColor, img });
+    this.pushMsg(this.me.displayName, t, false, this.me.avatarColor, true, img);
+    this.hooks.persistMessage(t, em, img);
   }
   private onData = (payload: Uint8Array) => {
     try {
       const d = JSON.parse(new TextDecoder().decode(payload));
-      if (d.t === 'chat') { if (d.em) for (const k in d.em) this.onEmoteResolve?.(k, d.em[k]); this.pushMsg(d.name, d.text, false, d.color, false); playSound('msg'); }
+      if (d.t === 'chat') { if (d.em) for (const k in d.em) this.onEmoteResolve?.(k, d.em[k]); this.pushMsg(d.name, d.text, false, d.color, false, d.img); playSound('msg'); }
       else if (d.t === 'emote') this.emoteListeners.forEach((f) => f(d.s, d.e, d.by, d.x));
       else if (d.t === 'watch') { const m = this.wset(d.s); if (d.on) m.set(d.id, { name: d.n, ts: Date.now() }); else m.delete(d.id); this.emit(); }
     } catch { /**/ }

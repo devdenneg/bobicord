@@ -26,8 +26,17 @@ export const api = {
   login: (username: string, password: string) =>
     req<{ token: string; user: User }>('POST', '/login', { username, password }),
   me: () => req<{ user: User; servers: ServerSummary[] }>('GET', '/me'),
-  updateMe: (patch: { displayName?: string; bio?: string; avatarColor?: number }) =>
+  updateMe: (patch: { displayName?: string; bio?: string; avatarColor?: number; avatarUrl?: string }) =>
     req<{ user: User }>('PATCH', '/me', patch),
+  uploadImage: async (file: Blob): Promise<{ url: string }> => {
+    const headers: Record<string, string> = { 'Content-Type': file.type || 'application/octet-stream' };
+    if (token) headers['Authorization'] = 'Bearer ' + token;
+    const r = await fetch('/api/upload', { method: 'POST', headers, body: file });
+    let d: any = {};
+    try { d = await r.json(); } catch { /* ignore */ }
+    if (!r.ok) throw new Error(d?.error || 'Ошибка ' + r.status);
+    return d as { url: string };
+  },
   createServer: (name: string, password?: string) =>
     req<{ server: ServerSummary; invite: string }>('POST', '/servers', { name, password }),
   getServer: (id: string) =>
@@ -46,5 +55,5 @@ export const api = {
   putSettings: (id: string, data: any) => req<{ ok: boolean }>('PUT', `/servers/${id}/settings`, { data }),
   presence: (id: string) => req<{ online: string[] }>('GET', `/servers/${id}/presence`),
   getMessages: (id: string) => req<{ messages: HistoryMessage[] }>('GET', `/servers/${id}/messages`),
-  postMessage: (id: string, text: string, em: Record<string, string>) => req<{ ok: boolean }>('POST', `/servers/${id}/messages`, { text, em }),
+  postMessage: (id: string, text: string, em: Record<string, string>, image?: string) => req<{ ok: boolean }>('POST', `/servers/${id}/messages`, { text, em, image }),
 };

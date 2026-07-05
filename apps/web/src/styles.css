@@ -79,7 +79,7 @@
   /* server rail */
   #rail{background:var(--bg);display:flex;flex-direction:column;align-items:center;gap:8px;padding:12px 0;overflow-y:auto;overflow-x:hidden}
   #rail::-webkit-scrollbar{display:none}
-  .railbtn{width:48px;height:48px;border-radius:24px;background:var(--panel2);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:17px;color:var(--txt);position:relative;flex:0 0 auto;transition:border-radius var(--tr),background var(--tr);overflow:hidden;padding:0}
+  .railbtn{width:48px;height:48px;border-radius:24px;background:var(--panel2);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:17px;color:var(--txt);position:relative;flex:0 0 auto;transition:border-radius var(--tr),background var(--tr);padding:0}
   .railbtn:hover{border-radius:16px;background:var(--accent)}
   .railbtn.active{border-radius:16px}
   .railbtn.active::before{content:'';position:absolute;left:-12px;top:50%;transform:translateY(-50%);width:4px;height:34px;background:#fff;border-radius:0 4px 4px 0}
@@ -118,8 +118,16 @@
   .srv-card .sc-none{font-size:12px;color:var(--muted)}
 
   /* ---------- SERVER VIEW ---------- */
-  #server{display:none;grid-template-columns:232px 1fr 216px;height:100%;min-height:0}
+  #server{display:none;grid-template-columns:var(--ch-w,290px) 1fr var(--mem-w,244px);height:100%;min-height:0;position:relative}
   #server.on{display:grid}
+  .rz{position:absolute;top:0;bottom:0;width:11px;z-index:30;cursor:col-resize;touch-action:none}
+  .rz::after{content:'';position:absolute;top:0;bottom:0;left:50%;transform:translateX(-50%);width:2px;background:transparent;transition:background .15s}
+  .rz::before{content:'';position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:5px;height:38px;border-radius:4px;background:var(--panel4);box-shadow:inset 0 0 0 1px var(--line-2),0 1px 3px rgba(0,0,0,.4);transition:background .15s,height .15s}
+  .rz:hover::after,body.resizing .rz::after{background:var(--accent)}
+  .rz:hover::before,body.resizing .rz::before{background:var(--accent);height:46px}
+  .rz-ch{left:var(--ch-w,290px);transform:translateX(-50%)}
+  .rz-mem{right:var(--mem-w,244px);transform:translateX(50%)}
+  body.resizing{cursor:col-resize;user-select:none}
 
   /* left channel sidebar */
   #channels{background:var(--panel);border-right:1px solid var(--line-2);display:flex;flex-direction:column;min-height:0}
@@ -199,6 +207,9 @@
   .msg.sys .tx{background:transparent;color:var(--muted);font-size:12.5px;padding:2px 0;border-radius:0}
   .msg .tx img.emo{height:26px;vertical-align:-7px;margin:-2px 1px}
   .msg .tx.big img.emo{height:44px;vertical-align:-12px}
+  .msg-img-wrap{display:inline-block;margin-top:5px;max-width:min(340px,100%);border-radius:10px;overflow:hidden;border:1px solid var(--line-2);line-height:0}
+  .msg-img{display:block;max-width:100%;max-height:300px;object-fit:contain}
+  .avimg{width:100%;height:100%;object-fit:cover;border-radius:inherit;display:block}
   #chatEmpty{color:var(--muted);font-size:13px;text-align:center;margin:auto;line-height:1.6;padding:20px}
   #newpill{position:absolute;bottom:70px;left:50%;transform:translateX(-50%);background:var(--accent);color:#fff;font-size:12.5px;font-weight:600;padding:7px 14px;border-radius:9999px;box-shadow:var(--sh-2);display:none;z-index:5}
   #newpill.show{display:block}
@@ -254,7 +265,7 @@
   .pi .vlbl{font-size:11px;color:var(--muted);width:38px;text-align:right;flex:0 0 auto}
   .watchrow{display:none;padding:0 10px 8px 50px}
   .pi.streaming.online .watchrow{display:block}
-  .wbtn{width:100%;background:var(--accent);color:#fff;padding:7px;border-radius:8px;font-size:12.5px;font-weight:600}
+  .wbtn{width:100%;background:var(--accent);color:#fff;padding:8px;border-radius:8px;font-size:12.5px;font-weight:600;white-space:nowrap}
   .wbtn:hover{background:var(--accent-h)}.wbtn.open{background:var(--panel3);color:var(--txt)}
 
   /* modals */
@@ -308,6 +319,7 @@
     .railbtn{width:42px;height:42px}
     #server.on{grid-template-columns:1fr}
     #channels,#members{display:none}
+    .rz{display:none}
     #server.on.tab-channels #channels{display:flex}
     #server.on.tab-members #members{display:flex}
     #server.on.tab-channels #main,#server.on.tab-members #main{display:none}
