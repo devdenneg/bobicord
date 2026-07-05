@@ -53,6 +53,18 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
+      # держим docker-compose.yml на VPS в актуальном состоянии (.env/livekit.yaml не трогаем)
+      - name: Copy compose to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          source: docker-compose.yml
+          target: /opt/voice
+
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1
         with:
