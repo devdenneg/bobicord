@@ -224,6 +224,12 @@ function Chat() {
     else setPill((p) => p + 1);
   }, [eng.messages.length]);
 
+  // при открытии сервера — всегда в конец (к последним сообщениям)
+  useLayoutEffect(() => {
+    const el = msgsRef.current; if (el) { el.scrollTop = el.scrollHeight; atBottomRef.current = true; setPill(0); }
+    requestAnimationFrame(() => { const e2 = msgsRef.current; if (e2 && atBottomRef.current) e2.scrollTop = e2.scrollHeight; });
+  }, []);
+
   function send() {
     const t = text.trim(); if (!t) return;
     const em: Record<string, string> = {};
@@ -263,13 +269,21 @@ function Chat() {
                     {m.sys ? m.text : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : <img key={i} className="emo" src={emoteUrl(p.emo)} alt={p.name} title={p.name} loading="lazy" decoding="async" />))}
                   </div>
                 ) : null}
-                {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox(m.img!)}><img className="msg-img" src={m.img} alt="" loading="lazy" /></button> : null}
+                {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox(m.img!)}><img className="msg-img" src={m.img} alt="" loading="lazy" onLoad={() => { const el = msgsRef.current; if (el && atBottomRef.current) el.scrollTop = el.scrollHeight; }} /></button> : null}
               </div>
             );
           })}
         </div>
       </div>
       {pill > 0 ? <button id="newpill" className="show" onClick={() => { const m = msgsRef.current!; m.scrollTop = m.scrollHeight; setPill(0); atBottomRef.current = true; }}>↓ Новые сообщения ({pill})</button> : null}
+      {eng.typing.length > 0 ? (
+        <div className="typing-ind">
+          <span className="tdots"><i /><i /><i /></span>
+          {eng.typing.length === 1 ? `${eng.typing[0]} печатает…`
+            : eng.typing.length === 2 ? `${eng.typing[0]} и ${eng.typing[1]} печатают…`
+              : 'Несколько человек печатают…'}
+        </div>
+      ) : null}
       {updateReady ? (
         <div className="update-bar">
           <div className="ub-ic"><Icon name="refresh" /></div>
@@ -284,7 +298,7 @@ function Chat() {
         <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; if (f) sendImage(f); e.target.value = ''; }} />
         <input id="msgIn" placeholder="Сообщение..." maxLength={1000} autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false} name="chat-message" value={text}
           onPaste={(e) => { const items = e.clipboardData?.items; if (!items) return; for (let i = 0; i < items.length; i++) { if (items[i].type.startsWith('image/')) { const f = items[i].getAsFile(); if (f) { e.preventDefault(); sendImage(f); } break; } } }}
-          onChange={(e) => setText(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && send()} />
+          onChange={(e) => { setText(e.target.value); if (e.target.value.trim()) E.sendTyping(); }} onKeyDown={(e) => e.key === 'Enter' && send()} />
         <button id="sendBtn" className={text.trim() ? '' : 'empty'} data-tip="Отправить · Enter" onClick={send}><Icon name="send" /></button>
       </div>
       )}

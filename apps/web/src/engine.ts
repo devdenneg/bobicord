@@ -22,6 +22,7 @@ export interface Snapshot {
   pending: Record<string, true>;
   watchers: Record<string, { name: string }[]>;
   messages: ChatMessage[];
+  typing: string[];
 }
 
 type EmoteListener = (streamerId: string, emoteId: string, by: string, x: number) => void;
@@ -57,6 +58,8 @@ export class Engine {
   private pendingWatch = new Set<string>();
   private streamWatchers = new Map<string, Map<string, { name: string; ts: number }>>();
   private messages: ChatMessage[] = [];
+  private typingUsers = new Map<string, number>(); // displayName -> expiry ts
+  private lastTypingSent = 0;
 
   private analysers = new Map<string, { an: AnalyserNode; buf: Uint8Array; hold: number; src: MediaStreamAudioSourceNode }>();
   private spCtx: AudioContext | null = null;
@@ -116,6 +119,7 @@ export class Engine {
       connected: !!this.room, inVoice: this.inVoice, deafened: this.deafened,
       localMicMuted: this.localMicMuted(), pttDown: this.pttDown,
       presence, speaking, streams, watching, pending, watchers, messages: this.messages,
+      typing: [...this.typingUsers].filter(([n, exp]) => exp > Date.now() && n !== this.me.displayName).map(([n]) => n),
     };
   }
 
@@ -512,12 +516,25 @@ export class Engine {
     this.pushMsg(this.me.displayName, t, false, this.me.avatarColor, true, img);
     this.hooks.persistMessage(t, em, img);
   }
+  sendTyping() {
+    if (!this.room) return;
+    const now = Date.now();
+    if (now - this.lastTypingSent < 2200) return; // троттлинг
+    this.lastTypingSent = now;
+    this.dataSend({ t: 'typing', name: this.me.displayName });
+  }
+  private pruneTyping() {
+    const now = Date.now(); let ch = false;
+    this.typingUsers.forEach((exp, n) => { if (exp <= now) { this.typingUsers.delete(n); ch = true; } });
+    if (ch) this.emit();
+  }
   private onData = (payload: Uint8Array) => {
     try {
       const d = JSON.parse(new TextDecoder().decode(payload));
-      if (d.t === 'chat') { if (d.em) for (const k in d.em) this.onEmoteResolve?.(k, d.em[k]); this.pushMsg(d.name, d.text, false, d.color, false, d.img); playSound('msg'); }
+      if (d.t === 'chat') { if (d.em) for (const k in d.em) this.onEmoteResolve?.(k, d.em[k]); this.typingUsers.delete(d.name); this.pushMsg(d.name, d.text, false, d.color, false, d.img); playSound('msg'); }
       else if (d.t === 'emote') this.emoteListeners.forEach((f) => f(d.s, d.e, d.by, d.x));
       else if (d.t === 'watch') { const m = this.wset(d.s); if (d.on) m.set(d.id, { name: d.n, ts: Date.now() }); else m.delete(d.id); this.emit(); }
+      else if (d.t === 'typing') { if (d.name && d.name !== this.me.displayName) { this.typingUsers.set(d.name, Date.now() + 3500); this.emit(); setTimeout(() => this.pruneTyping(), 3600); } }
     } catch { /**/ }
   };
   onEmoteResolve: ((name: string, id: string) => void) | null = null;
