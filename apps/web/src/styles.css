@@ -157,6 +157,12 @@
   #content.split{grid-template-columns:1fr var(--chat-w,340px)}
   .rz-chat{right:var(--chat-w,340px);transform:translateX(50%)}
   @media(max-width:900px){#content.split{grid-template-columns:1fr}#content.split #chat{display:none}#content.split.show-chat #stage{display:none}#content.split.show-chat #chat{display:flex}}
+  .mob-chat-toggle{display:none}
+  @media(max-width:900px){
+    #content.split .mob-chat-toggle{display:inline-flex;align-items:center;gap:6px;position:absolute;left:50%;transform:translateX(-50%);bottom:66px;z-index:20;background:var(--accent);color:#fff;padding:9px 16px;border-radius:9999px;font-size:13px;font-weight:600;box-shadow:0 6px 18px rgba(0,0,0,.35)}
+    #content.split .mob-chat-toggle .ic{font-size:16px}
+    #content.split.show-chat .mob-chat-toggle{top:10px;bottom:auto;left:auto;right:10px;transform:none;background:rgba(0,0,0,.6)}
+  }
 
   /* stage (reused) */
   #stage{background:#090b0f;display:none;align-items:center;justify-content:center;min-height:0;padding:14px;position:relative}
@@ -218,6 +224,9 @@
   .msg.me{background:rgba(88,101,242,.09);border-left:3px solid var(--accent);border-radius:0 8px 8px 0;padding:5px 8px 5px 9px;margin:0 -4px}
   .msg.me .who{color:var(--accent-txt)}
   .msg.me .who::after{content:' · ты';color:var(--muted);font-weight:400;font-size:11px}
+  .msg .who .mtime{margin-left:7px;font-size:11px;font-weight:400;color:var(--muted)}
+  .msg .tx a.msg-link{color:var(--accent-txt);text-decoration:underline;text-underline-offset:2px;word-break:break-all}
+  .msg .tx a.msg-link:hover{opacity:.85}
   .msg.me .tx{background:rgba(88,101,242,.16)}
   .msg.sys .tx{background:transparent;color:var(--muted);font-size:12.5px;padding:2px 0;border-radius:0}
   .msg .tx img.emo{height:26px;vertical-align:-7px;margin:-2px 1px}
@@ -315,6 +324,11 @@
   .pi .watchbtn.on:hover{background:var(--red)}
   .pi .head:hover .watchbtn,.pi .watchbtn:focus-visible,.pi .watchbtn.on{opacity:1}
   @media (hover:none){.pi .watchbtn{opacity:.85}}
+  .pi .mkick{flex:0 0 auto;width:24px;height:24px;padding:0;display:flex;align-items:center;justify-content:center;border-radius:7px;background:transparent;color:var(--muted);opacity:0;transition:opacity var(--tr),background var(--tr),color var(--tr)}
+  .pi .mkick .ic{font-size:15px}
+  .pi .head:hover .mkick,.pi .mkick:focus-visible{opacity:1}
+  .pi .mkick:hover{background:var(--red-fill);color:#fff}
+  @media (hover:none){.pi .mkick{opacity:.7}}
   .pi .chev{opacity:.28;transition:opacity var(--tr),transform var(--tr);color:var(--muted);flex:0 0 auto;display:flex;align-items:center}
   .pi.clickable .head:hover .chev{opacity:.8}.pi.open .chev{opacity:1;transform:rotate(180deg)}
   .pi .micst{width:18px;flex:0 0 auto;display:flex;justify-content:center;color:var(--red);opacity:0;transition:opacity var(--tr)}

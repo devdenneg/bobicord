@@ -55,6 +55,7 @@ export interface ChatMessage {
   sys: boolean;
   color?: number; // avatar color index of author
   img?: string; // attached image URL
+  ts?: number; // timestamp (ms)
 }
 
 export interface HistoryMessage {

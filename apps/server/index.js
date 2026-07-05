@@ -13,6 +13,7 @@ app.use(express.json({ limit: '32kb' }));
 const KEY = process.env.LK_KEY;
 const SECRET = process.env.LK_SECRET;
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-secret-change';
+if (!process.env.SESSION_SECRET) console.warn('WARN: SESSION_SECRET не задан в env — использую дефолт. Задай его в .env на VPS для безопасности сессий.');
 const WS_URL = 'wss://138-16-170-21.sslip.io';
 const DATA_DIR = '/app/data';
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
@@ -196,7 +197,7 @@ app.patch('/api/me', requireAuth, (req, res) => {
 
 /* ---------------- IMAGE UPLOADS (avatars + chat, <=10MB) ---------------- */
 const MIME_EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' };
-app.use('/api/uploads', express.static(UPLOADS_DIR, { maxAge: '30d', immutable: true, index: false, fallthrough: false }));
+app.use('/api/uploads', express.static(UPLOADS_DIR, { maxAge: '30d', immutable: true, index: false, fallthrough: false, setHeaders: (res) => res.setHeader('X-Content-Type-Options', 'nosniff') }));
 app.post('/api/upload', requireAuth, express.raw({ type: Object.keys(MIME_EXT), limit: '10mb' }), (req, res) => {
   const ct = String(req.headers['content-type'] || '').split(';')[0].trim();
   const ext = MIME_EXT[ct];
@@ -232,6 +233,20 @@ app.get('/api/servers/:id', requireAuth, (req, res) => {
     JOIN users u ON u.id=m.user_id WHERE m.server_id=? ORDER BY (m.role='owner') DESC, u.display_name ASC`).all(s.id)
     .map(u => ({ id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '', bio: u.bio || '', role: u.role }));
   res.json({ server: { ...pubServer(s), memberCount: members.length }, members, myRole: roleOf(req.user.id, s.id) });
+});
+
+/* owner kicks a member */
+app.post('/api/servers/:id/kick', requireAuth, (req, res) => {
+  const s = db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id);
+  if (!s) return res.status(404).json({ error: 'нет' });
+  if (s.owner_id !== req.user.id) return res.status(403).json({ error: 'Только владелец' });
+  const uid = String(req.body.userId || '');
+  if (!uid || uid === s.owner_id) return res.status(400).json({ error: 'Нельзя' });
+  db.prepare('DELETE FROM memberships WHERE user_id=? AND server_id=?').run(uid, s.id);
+  db.prepare('DELETE FROM server_settings WHERE user_id=? AND server_id=?').run(uid, s.id);
+  const ku = db.prepare('SELECT username FROM users WHERE id=?').get(uid);
+  if (ku) { try { rsc.removeParticipant('srv:' + s.id, ku.username).catch(() => {}); } catch (e) {} }
+  res.json({ ok: true });
 });
 
 app.post('/api/servers/:id/leave', requireAuth, (req, res) => {
@@ -350,16 +365,6 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
     .run(sid, req.user.id, req.user.display_name, req.user.avatar_color, text, em, image, now);
   db.prepare('DELETE FROM messages WHERE server_id=? AND created<?').run(sid, now - WEEK_MS);
   res.json({ ok: true });
-});
-
-/* ---------- legacy compat: old room token (kept so старый клиент не падает во время перехода) ---------- */
-app.get('/api/token', requireAuth, async (req, res) => {
-  try {
-    const room = String(req.query.room || 'main').slice(0, 64) || 'main';
-    const at = new AccessToken(KEY, SECRET, { identity: req.user.username, name: req.user.display_name, ttl: '12h' });
-    at.addGrant({ roomJoin: true, room, canPublish: true, canSubscribe: true, canPublishData: true });
-    res.json({ token: await at.toJwt(), url: WS_URL, room, username: req.user.username });
-  } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
 app.get('/healthz', (req, res) => res.send('ok'));

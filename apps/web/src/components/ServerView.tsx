@@ -149,17 +149,29 @@ function VoiceControls() {
 function MemberRow({ m }: { m: Member }) {
   const eng = useEngine();
   const me = useStore((s) => s.me)!;
+  const active = useStore((s) => s.active);
+  const toast = useStore((s) => s.toast);
+  const refreshMembers = useStore((s) => s.refreshMembers);
   const pr = eng.presence[m.username];
   const st = pr?.inVoice ? 'voice' : pr?.online ? 'online' : 'offline';
   const streaming = pr?.streaming;
   const self = m.username === me.username;
+  const canKick = !!active && active.ownerId === me.id && !self && m.role !== 'owner';
   const hc = useHoverCard();
+  async function kick(e: React.MouseEvent) {
+    e.stopPropagation();
+    if (!active) return;
+    if (!window.confirm(`Выгнать ${m.displayName} с сервера?`)) return;
+    try { await api.kickMember(active.id, m.id); toast(`${m.displayName} выгнан`, 'ok'); refreshMembers(); }
+    catch (err: any) { toast(err?.message || 'Не удалось выгнать', 'err'); }
+  }
   return (
     <div className={'pi ' + st + (streaming ? ' streaming' : '')} data-spk={m.username}>
       <div className="head" ref={hc.ref} onMouseEnter={self ? undefined : hc.onEnter} onMouseLeave={self ? undefined : hc.onLeave}>
         <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} dot={st} />
         <div className="nm">{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div>
         {streaming ? <span className="livepill">LIVE</span> : null}
+        {canKick ? <button className="mkick" data-tip="Выгнать" onClick={kick}><Icon name="close" sm /></button> : null}
       </div>
       {!self && hc.rect ? <ProfileCard m={m} rect={hc.rect} /> : null}
     </div>
@@ -185,8 +197,16 @@ function Members() {
 }
 
 /* ---------- Chat ---------- */
-function renderRich(text: string): (string | { emo: string; name: string })[] {
-  return text.split(/(\s+)/).map((tok) => (emoteMap.has(tok) ? { emo: emoteMap.get(tok)!, name: tok } : tok));
+function renderRich(text: string): (string | { emo: string; name: string } | { link: string })[] {
+  return text.split(/(\s+)/).map((tok) => {
+    if (emoteMap.has(tok)) return { emo: emoteMap.get(tok)!, name: tok };
+    if (/^https?:\/\/[^\s]+$/i.test(tok)) return { link: tok };
+    return tok;
+  });
+}
+function fmtTime(ts?: number): string {
+  if (!ts) return '';
+  try { return new Date(ts).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }); } catch { return ''; }
 }
 function ImageLightbox({ src, onClose }: { src: string; onClose: () => void }) {
   useEffect(() => {
@@ -260,13 +280,15 @@ function Chat() {
           {eng.messages.length === 0 ? <div id="chatEmpty">Общий чат сервера. Пиши сюда — видят все участники онлайн.</div> : null}
           {eng.messages.map((m) => {
             const parts = m.sys ? null : renderRich(m.text);
-            const big = parts ? parts.every((p) => typeof p !== 'string' || !p.trim()) && parts.filter((p) => typeof p !== 'string').length <= 3 && parts.some((p) => typeof p !== 'string') : false;
+            const emoCount = parts ? parts.filter((p) => typeof p === 'object' && 'emo' in p).length : 0;
+            const hasLink = parts ? parts.some((p) => typeof p === 'object' && 'link' in p) : false;
+            const big = !!parts && !hasLink && emoCount >= 1 && emoCount <= 3 && parts.every((p) => typeof p !== 'string' || !p.trim());
             return (
               <div className={'msg' + (m.sys ? ' sys' : '') + (m.mine ? ' me' : '')} key={m.id}>
-                {!m.sys ? <div className="who" style={{ color: avColor(m.who || '', m.color) }}>{m.who}</div> : null}
+                {!m.sys ? <div className="who" style={{ color: avColor(m.who || '', m.color) }}>{m.who}{m.ts ? <span className="mtime">{fmtTime(m.ts)}</span> : null}</div> : null}
                 {m.sys || m.text ? (
                   <div className={'tx' + (big ? ' big' : '')}>
-                    {m.sys ? m.text : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : <img key={i} className="emo" src={emoteUrl(p.emo)} alt={p.name} title={p.name} loading="lazy" decoding="async" />))}
+                    {m.sys ? m.text : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : 'link' in p ? <a key={i} className="msg-link" href={p.link} target="_blank" rel="noreferrer">{p.link}</a> : <img key={i} className="emo" src={emoteUrl(p.emo)} alt={p.name} title={p.name} loading="lazy" decoding="async" />))}
                   </div>
                 ) : null}
                 {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox(m.img!)}><img className="msg-img" src={m.img} alt="" loading="lazy" onLoad={() => { const el = msgsRef.current; if (el && atBottomRef.current) el.scrollTop = el.scrollHeight; }} /></button> : null}
@@ -290,7 +312,7 @@ function Chat() {
           <div className="ub-txt"><b>Вышло обновление приложения</b><span>Обнови страницу, чтобы продолжить — <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd></span></div>
           <button className="ub-btn" onClick={() => location.reload()}><Icon name="refresh" sm />Обновить</button>
         </div>
-      ) : (
+      ) : null}
       <div className="chat-in">
         <button id="emoBtn" ref={emoBtnRef} className={'emo-toggle' + (pickAnchor !== undefined ? ' on' : '')} data-tip="7TV эмоуты"
           onClick={() => setPickAnchor((a) => (a === undefined ? emoBtnRef.current!.getBoundingClientRect() : undefined))}><Icon name="smile" /></button>
@@ -301,7 +323,6 @@ function Chat() {
           onChange={(e) => { setText(e.target.value); if (e.target.value.trim()) E.sendTyping(); }} onKeyDown={(e) => e.key === 'Enter' && send()} />
         <button id="sendBtn" className={text.trim() ? '' : 'empty'} data-tip="Отправить · Enter" onClick={send}><Icon name="send" /></button>
       </div>
-      )}
       {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} onClose={() => setPickAnchor(undefined)}
         onPick={(e: Emote) => { setText((t) => t + (t && !t.endsWith(' ') ? ' ' : '') + e.name + ' '); }} /> : null}
       {lightbox ? <ImageLightbox src={lightbox} onClose={() => setLightbox(null)} /> : null}
@@ -475,6 +496,8 @@ export function ServerView() {
   const chatW = useResizable('w:chat', 340, 260, 640, 'left');
   const [membersOpen, setMembersOpen] = useState(() => localStorage.getItem('membersOpen') !== '0');
   useEffect(() => { localStorage.setItem('membersOpen', membersOpen ? '1' : '0'); }, [membersOpen]);
+  const [showChat, setShowChat] = useState(false);
+  useEffect(() => { if (!split) setShowChat(false); }, [split]);
 
   return (
     <>
@@ -486,10 +509,11 @@ export function ServerView() {
             <button className={'hbtn' + (membersOpen ? ' on' : '')} data-tip={membersOpen ? 'Скрыть участников' : 'Показать участников'} onClick={() => setMembersOpen((v) => !v)}><Icon name="users" sm /></button>
             <button className="hbtn" data-tip="Пригласить" onClick={() => setModal('invite')}><Icon name="link" sm /></button>
           </div>
-          <div id="content" className={split ? 'split' : ''} style={{ '--chat-w': chatW.w + 'px' } as CSSProperties}>
+          <div id="content" className={(split ? 'split' : '') + (split && showChat ? ' show-chat' : '')} style={{ '--chat-w': chatW.w + 'px' } as CSSProperties}>
             <Stage minimized={minimized} setMin={setMin} />
             {split ? <div className="rz rz-chat" onMouseDown={chatW.onDown} title="Потяни — ширина чата" /> : null}
             <Chat />
+            {split ? <button className="mob-chat-toggle" onClick={() => setShowChat((v) => !v)}><Icon name={showChat ? 'screen' : 'chat'} sm />{showChat ? 'К трансляции' : 'Открыть чат'}</button> : null}
           </div>
         </div>
         <Members />

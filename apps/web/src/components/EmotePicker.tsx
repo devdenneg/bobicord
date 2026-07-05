@@ -8,6 +8,7 @@ export function EmotePicker({ anchor, onPick, onClose, sizePicker }: { anchor: D
   const [q, setQ] = useState('');
   const emoteSize = useStore((s) => s.emoteSize);
   const setEmoteSize = useStore((s) => s.setEmoteSize);
+  const [loaded, setLoaded] = useState(false);
   const pageRef = useRef(0); const moreRef = useRef(true); const loadingRef = useRef(false);
   const boxRef = useRef<HTMLDivElement>(null);
   const gridRef = useRef<HTMLDivElement>(null);
@@ -21,9 +22,10 @@ export function EmotePicker({ anchor, onPick, onClose, sizePicker }: { anchor: D
     moreRef.current = res.length >= 100;
     pageRef.current = page;
     setItems((prev) => (reset ? res : [...prev, ...res]));
+    if (reset) setLoaded(true);
   }, []);
 
-  useEffect(() => { moreRef.current = true; pageRef.current = 0; setItems([]); fetchPage(q, true); }, [q, fetchPage]);
+  useEffect(() => { moreRef.current = true; pageRef.current = 0; setItems([]); setLoaded(false); fetchPage(q, true); }, [q, fetchPage]);
   useEffect(() => {
     const onDown = (e: MouseEvent) => {
       if (boxRef.current && !boxRef.current.contains(e.target as Node) && !(e.target as HTMLElement).closest('#emoBtn') && !(e.target as HTMLElement).closest('.spray')) onClose();
@@ -60,7 +62,7 @@ export function EmotePicker({ anchor, onPick, onClose, sizePicker }: { anchor: D
         </div>
       ) : null}
       <div id="epickGrid" ref={gridRef} onScroll={(e) => { const g = e.currentTarget; if (g.scrollTop + g.clientHeight >= g.scrollHeight - 100) fetchPage(q, false); }}>
-        {items.length === 0 ? <div id="epickLoad">Загрузка...</div> :
+        {items.length === 0 ? <div id="epickLoad">{loaded ? 'Ничего не найдено' : 'Загрузка...'}</div> :
           items.map((e) => (
             <button className="emobtn" key={e.id} title={e.name} onClick={() => onPick(e)}>
               <img src={emoteUrlSm(e.id)} alt={e.name} loading="lazy" decoding="async" />
