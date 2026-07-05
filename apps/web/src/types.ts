@@ -81,4 +81,5 @@ export interface AudioSettings {
   pttKey: string;
   master: number;
   micVolume: number; // громкость микрофона в %, 100 = без изменений
+  notifyVolume: number; // громкость звуков-уведомлений в %
 }
