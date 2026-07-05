@@ -6,7 +6,8 @@ dist/
 apps/web/dist/
 
 # secrets & runtime config (копируй из *.example)
-.env
+.env*
+!.env*.example
 livekit.yaml
 
 # database / runtime data

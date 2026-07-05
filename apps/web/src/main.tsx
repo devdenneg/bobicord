@@ -5,9 +5,11 @@ import { App } from './App';
 import { useStore } from './store';
 import { api, getToken, setToken } from './api';
 import { loadGlobalEmotes } from './emotes';
+import { isTauri, pingNative } from './native';
 
 loadGlobalEmotes();
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+if (isTauri) pingNative().then((r) => console.log('[native] ipc bridge:', r)).catch(() => {});
 
 createRoot(document.getElementById('root')!).render(<StrictMode><App /></StrictMode>);
 

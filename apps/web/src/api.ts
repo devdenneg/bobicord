@@ -8,12 +8,14 @@ export function setToken(t: string | null) {
   else localStorage.removeItem('sess');
 }
 
+const API_BASE = (import.meta as any).env?.VITE_API_BASE_URL || '';
+
 async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = {};
   if (token) headers['Authorization'] = 'Bearer ' + token;
   const opt: RequestInit = { method, headers };
   if (body !== undefined) { headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
-  const r = await fetch('/api' + path, opt);
+  const r = await fetch(API_BASE + '/api' + path, opt);
   let d: any = {};
   try { d = await r.json(); } catch { /* ignore */ }
   if (!r.ok) throw new Error(d?.error || 'Ошибка ' + r.status);
