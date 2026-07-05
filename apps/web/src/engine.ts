@@ -390,14 +390,12 @@ export class Engine {
   async share() {
     if (!this.inVoice) { this.hooks.toast('Сначала подключись к голосовому', 'warn'); return; }
     if (this.screenStream || this.room!.localParticipant.isScreenShareEnabled) { await this.stopShare(); this.hooks.toast('Трансляция остановлена'); return; }
-    // restrictOwnAudio (Chrome 140+) вырезает звук ЭТОЙ вкладки (= голоса собеседников из наших <audio>) из системного захвата
-    const supRestrict = !!(navigator.mediaDevices.getSupportedConstraints() as any).restrictOwnAudio;
-    const audioC: any = { echoCancellation: false, noiseSuppression: false, autoGainControl: false, suppressLocalAudioPlayback: false };
-    if (supRestrict) audioC.restrictOwnAudio = true;
+    // ВАЖНО: echoCancellation:true — Chrome AEC вырезает голоса собеседников (WebRTC-эхо) из захваченного звука.
+    // Проверено историей: с AEC голоса не слышны на стриме; без AEC — просачиваются. НЕ отключать.
     try {
       this.screenStream = await navigator.mediaDevices.getDisplayMedia({
         video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60 }, displaySurface: 'browser' } as any,
-        audio: audioC,
+        audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false } as any,
         // @ts-ignore
         systemAudio: 'include', selfBrowserSurface: 'exclude',
       });
@@ -408,17 +406,14 @@ export class Engine {
     vt.addEventListener('ended', () => this.stopShare());
     const lvt = new LocalVideoTrack(vt);
     await this.room!.localParticipant.publishTrack(lvt, { source: Track.Source.ScreenShare, videoEncoding: { maxBitrate: 8_000_000, maxFramerate: 60 }, videoCodec: 'vp8', simulcast: false, degradationPreference: 'maintain-framerate' as any });
-    const surf = (vt.getSettings() as any).displaySurface || '';
     const at = this.screenStream.getAudioTracks()[0];
-    // публикуем звук с ЛЮБОГО surface. Вкладка = изолированный звук (голосов нет).
-    // Экран = системный звук, но restrictOwnAudio вырезает голоса собеседников (звук нашей вкладки).
+    // публикуем звук с любого surface; AEC (выше) убирает голоса собеседников
     if (at) {
       const lat = new LocalAudioTrack(at);
       await this.room!.localParticipant.publishTrack(lat, { source: Track.Source.ScreenShareAudio, dtx: false, red: true, audioPreset: AudioPresets.musicHighQualityStereo });
     }
     this.keepAliveOn();
     if (!at) this.hooks.toast('Трансляция без звука — при выборе поставь галку «Поделиться аудио»', 'warn');
-    else if (surf !== 'browser' && !supRestrict) this.hooks.toast('Трансляция со звуком. В Chrome <140 при шаре экрана могут быть слышны собеседники — обнови Chrome или шарь вкладку', 'warn');
     else this.hooks.toast('Трансляция запущена', 'ok');
     playSound('stream');
     this.emit();
