@@ -252,8 +252,10 @@ pub fn spawn_capture(
 
     let handle = std::thread::spawn(move || {
         // Без троттлинга WGC отдаёт кадры с реальной частотой обновления монитора
-        // (может быть заметно выше target_fps) — лишняя нагрузка на CPU/энкодер и
-        // рассинхрон с `frame_dur`, которым RTP-сэмплы размечены в mod.rs.
+        // (может быть заметно выше target_fps) — лишняя нагрузка на CPU/энкодер.
+        // RTP-сэмплы в mod.rs размечены реальным интервалом между `captured_at`,
+        // а не номинальным target_fps, так что неравномерная выдача WGC сама по
+        // себе к рассинхрону таймстемпов уже не приводит.
         let min_interval = MinimumUpdateIntervalSettings::Custom(
             std::time::Duration::from_secs_f64(1.0 / target_fps.max(1) as f64),
         );

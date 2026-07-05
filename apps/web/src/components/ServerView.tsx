@@ -411,6 +411,15 @@ function StreamTile({ streamKey, identity, isLocal }: { streamKey: string; ident
   const [prevVol, setPrevVol] = useState(100);
   const setVol = (v: number) => { setSvol(v); E.setStreamVol(identity, v / 100); };
   const toggleMute = () => { if (svol > 0) { setPrevVol(svol); setVol(0); } else setVol(prevVol || 100); };
+
+  // Звук p2p-трансляции (Э5) идёт прямо в тег <video> (единый MediaStream от
+  // transport'а), отдельного <audio>-элемента для него, в отличие от LiveKit-пути
+  // (screenAudioEls), нет — громкость/мут крутим на самом видео-элементе.
+  useEffect(() => {
+    const v = vidRef.current; if (!v) return;
+    v.muted = isLocal || eng.deafened || svol === 0;
+    v.volume = svol / 100;
+  }, [svol, isLocal, eng.deafened, streamKey]);
   const toggleFs = () => { document.fullscreenElement ? document.exitFullscreen() : wrapRef.current?.requestFullscreen().catch(() => {}); };
   const togglePip = () => { if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => {}); else vidRef.current?.requestPictureInPicture().catch(() => {}); };
 

@@ -120,12 +120,20 @@ pub async fn start(
         }
         // Энкодер создаём лениво, на первом реальном кадре: фактический размер
         // зависит от источника (окно почти никогда не равно max_width/max_height,
-        // scaled_dims не апскейлит) — MFT нельзя переинициализировать на лету,
-        // поэтому при смене размера кадр просто дропаем (см. ниже), а не крашим поток.
+        // scaled_dims не апскейлит). При смене размера (ресайз окна, DPI, снаппинг)
+        // MFT нельзя переинициализировать на лету — пересоздаём H264Encoder целиком
+        // (см. ниже), а не дропаем кадры навсегда: раньше после первого же ресайза
+        // энкодер замирал на старом разрешении и все дальнейшие кадры молча
+        // отбрасывались (зритель видел "1920x1044" и рваный fps — фактически
+        // почти все кадры терялись после первого ресайза окна).
         let frame_dur = Duration::from_secs_f64(1.0 / fps as f64);
         let mut fps_window_start = Instant::now();
         let mut fps_window_count = 0u32;
         let mut enc: Option<(encoder::H264Encoder, u32, u32)> = None;
+        // Реальное время между кадрами (а не номинальный frame_dur) — иначе RTP-таймстемпы
+        // расходятся с фактическим темпом захвата (WGC отдаёт кадры неравномерно), и
+        // зритель видит рваный fps даже когда энкодер стабильно поспевает.
+        let mut prev_captured_at: Option<Instant> = None;
         while !enc_stop2.load(Ordering::Relaxed) {
             let frame = match cap_rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(f) => f,
@@ -139,6 +147,12 @@ pub async fn start(
                     break;
                 }
             };
+            if let Some((_, w, h)) = &enc {
+                if frame.width != *w || frame.height != *h {
+                    log::info!("encoder: source resize {w}x{h} -> {}x{}, переинициализация MFT", frame.width, frame.height);
+                    enc = None;
+                }
+            }
             if enc.is_none() {
                 // Окно может отдать первый кадр 0x0 (сворачивается/ещё не отрисовано) —
                 // MFT такое не примет, просто ждём кадр с реальным размером вместо
@@ -148,7 +162,7 @@ pub async fn start(
                     continue;
                 }
                 match encoder::H264Encoder::new(frame.width, frame.height, fps, bitrate_bps, force_keyframe_enc.clone()) {
-                    Ok(e) => enc = Some((e, frame.width, frame.height)),
+                    Ok(e) => { force_keyframe_enc.store(true, Ordering::Relaxed); enc = Some((e, frame.width, frame.height)); }
                     Err(e) => {
                         log::error!("encoder: init failed: {e}");
                         let _ = shutdown_tx_enc.send(());
@@ -156,17 +170,18 @@ pub async fn start(
                     }
                 }
             }
-            let (encoder_ref, enc_w, enc_h) = enc.as_mut().expect("initialized above");
-            if frame.width != *enc_w || frame.height != *enc_h {
-                log::warn!("encoder: source resize {enc_w}x{enc_h} -> {}x{} не поддержан, кадр отброшен", frame.width, frame.height);
-                continue;
-            }
+            let (encoder_ref, _enc_w, _enc_h) = enc.as_mut().expect("initialized above");
+            let real_dur = match prev_captured_at {
+                Some(prev) => frame.captured_at.saturating_duration_since(prev).clamp(frame_dur / 4, Duration::from_secs(2)),
+                None => frame_dur,
+            };
+            prev_captured_at = Some(frame.captured_at);
             match encoder_ref.encode(&frame) {
                 Ok(chunks) => {
                     for c in chunks {
                         stats_enc.encoded_frames.fetch_add(1, Ordering::Relaxed);
                         stats_enc.encoded_bytes.fetch_add(c.data.len() as u64, Ordering::Relaxed);
-                        let sample = Sample { data: Bytes::from(c.data), duration: frame_dur, ..Default::default() };
+                        let sample = Sample { data: Bytes::from(c.data), duration: real_dur, ..Default::default() };
                         let track = video_track.clone();
                         rt_handle.block_on(async { let _ = track.write_sample(&sample).await; });
                         fps_window_count += 1;
@@ -297,7 +312,7 @@ async fn run_signaling_loop(
                 // Сервер сейчас (Э1) принимает и игнорирует stats — задел на Э8 ребаланс.
                 let _ = mgr.send_stats(to_child, meta.target_bitrate_bps);
             }
-            _ = shutdown_rx.recv() => { mgr.close_all().await; break; }
+            _ = shutdown_rx.recv() => { mgr.send_leave(); mgr.close_all().await; break; }
         }
     }
     mgr.close_all().await;

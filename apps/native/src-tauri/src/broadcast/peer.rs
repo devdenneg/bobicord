@@ -185,6 +185,14 @@ impl PeerManager {
         }
     }
 
+    /// Явный 'leave' серверу (Э5) — без него teardown зрителей зависел от
+    /// implicit-дропа `cmd_tx` (ws закрывался только когда PeerManager сам
+    /// дропнется в конце `run_signaling_loop`), из-за чего сервер узнавал об уходе
+    /// вещателя с задержкой, а <video> у зрителей мог зависнуть на последнем кадре.
+    pub fn send_leave(&self) {
+        let _ = self.cmd_tx.send(TreeCmd::Leave);
+    }
+
     pub fn child_count(&self) -> usize { self.children.len() }
     pub fn child_ids(&self) -> Vec<String> { self.children.keys().cloned().collect() }
 
