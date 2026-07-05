@@ -492,7 +492,7 @@ export function ServerView() {
             <Chat />
           </div>
         </div>
-        {membersOpen ? <Members /> : null}
+        <Members />
         <div className="rz rz-ch" onMouseDown={chan.onDown} title="Потяни, чтобы изменить ширину" />
         {membersOpen ? <div className="rz rz-mem" onMouseDown={mem.onDown} title="Потяни, чтобы изменить ширину" /> : null}
       </section>

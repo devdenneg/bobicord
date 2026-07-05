@@ -118,7 +118,8 @@
   .srv-card .sc-none{font-size:12px;color:var(--muted)}
 
   /* ---------- SERVER VIEW ---------- */
-  #server{display:none;grid-template-columns:var(--ch-w,290px) 1fr var(--mem-w,244px);height:100%;min-height:0;position:relative}
+  #server{display:none;grid-template-columns:var(--ch-w,290px) 1fr var(--mem-w,244px);height:100%;min-height:0;position:relative;transition:grid-template-columns .28s cubic-bezier(.4,0,.2,1)}
+  body.resizing #server{transition:none}
   #server.on{display:grid}
   .rz{position:absolute;top:0;bottom:0;width:11px;z-index:30;cursor:col-resize;touch-action:none}
   .rz::after{content:'';position:absolute;top:0;bottom:0;left:50%;transform:translateX(-50%);width:2px;background:transparent;transition:background .15s}
@@ -267,7 +268,7 @@
   .chat-in .emo-toggle:hover{background:var(--panel3);color:var(--txt)}.chat-in .emo-toggle.on{color:var(--accent-txt)}
 
   /* ---------- MEMBERS SIDEBAR ---------- */
-  #members{background:var(--panel);border-left:1px solid var(--line-2);display:flex;flex-direction:column;min-height:0}
+  #members{background:var(--panel);border-left:1px solid var(--line-2);display:flex;flex-direction:column;min-height:0;overflow:hidden}
   .m-sec{padding:14px 14px 6px;font-size:11.5px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--muted)}
   /* voice channel card */
   .voice-card{background:var(--bg2);border:1px solid var(--line-2);border-radius:var(--r-md);padding:10px;flex:0 0 auto}
