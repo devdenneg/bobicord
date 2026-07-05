@@ -215,7 +215,6 @@ function Chat() {
   const [uploading, setUploading] = useState(false);
   const toast = useStore((s) => s.toast);
   const updateReady = useStore((s) => s.updateReady);
-  const emoteSize = useStore((s) => s.emoteSize);
   const [pill, setPill] = useState(0);
   const atBottomRef = useRef(true);
 
@@ -257,7 +256,7 @@ function Chat() {
   return (
     <div id="chat">
       <div id="msgs" ref={msgsRef} onScroll={(e) => { const m = e.currentTarget; atBottomRef.current = m.scrollTop + m.clientHeight >= m.scrollHeight - 120; if (atBottomRef.current) setPill(0); }}>
-        <div className={'msgs-inner emo-' + emoteSize}>
+        <div className="msgs-inner">
           {eng.messages.length === 0 ? <div id="chatEmpty">Общий чат сервера. Пиши сюда — видят все участники онлайн.</div> : null}
           {eng.messages.map((m) => {
             const parts = m.sys ? null : renderRich(m.text);
@@ -303,7 +302,7 @@ function Chat() {
         <button id="sendBtn" className={text.trim() ? '' : 'empty'} data-tip="Отправить · Enter" onClick={send}><Icon name="send" /></button>
       </div>
       )}
-      {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} sizePicker onClose={() => setPickAnchor(undefined)}
+      {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} onClose={() => setPickAnchor(undefined)}
         onPick={(e: Emote) => { setText((t) => t + (t && !t.endsWith(' ') ? ' ' : '') + e.name + ' '); }} /> : null}
       {lightbox ? <ImageLightbox src={lightbox} onClose={() => setLightbox(null)} /> : null}
     </div>
@@ -316,8 +315,9 @@ function StreamTile({ streamKey, identity, isLocal }: { streamKey: string; ident
   const eng = useEngine();
   const me = useStore((s) => s.me)!;
   const members = useStore((s) => s.members);
+  const emoteSize = useStore((s) => s.emoteSize);
   const vidRef = useRef<HTMLVideoElement>(null);
-  const [floats, setFloats] = useState<{ id: number; url: string; by: string; x: number }[]>([]);
+  const [floats, setFloats] = useState<{ id: number; url: string; by: string; x: number; size?: string }[]>([]);
   const [stats, setStats] = useState('');
   const [pickAnchor, setPickAnchor] = useState<DOMRect | null | undefined>(undefined);
   const sprayRef = useRef<HTMLButtonElement>(null);
@@ -332,10 +332,10 @@ function StreamTile({ streamKey, identity, isLocal }: { streamKey: string; ident
     return () => { try { (track as any).detach(v); } catch { /**/ } };
   }, [streamKey, isLocal, E]);
 
-  useEffect(() => E.onEmote((sid, emoteId, by, x) => {
+  useEffect(() => E.onEmote((sid, emoteId, by, x, size) => {
     if (sid !== identity) return;
     const id = floatSeq.current++;
-    setFloats((f) => [...f.slice(-23), { id, url: emoteUrl(emoteId), by, x }]);
+    setFloats((f) => [...f.slice(-23), { id, url: emoteUrl(emoteId), by, x, size }]);
     setTimeout(() => setFloats((f) => f.filter((e) => e.id !== id)), 2800);
   }), [identity, E]);
 
@@ -360,7 +360,7 @@ function StreamTile({ streamKey, identity, isLocal }: { streamKey: string; ident
       <div className="lbl">🖥 {name}{isLocal ? ' (ты)' : ''}</div>
       <div className="emolayer">
         {floats.map((f) => (
-          <div className="floatEmo" key={f.id} style={{ left: Math.max(2, Math.min(92, f.x * 100)) + '%' }}>
+          <div className={'floatEmo em-' + (f.size || 'md')} key={f.id} style={{ left: Math.max(2, Math.min(92, f.x * 100)) + '%' }}>
             <img src={f.url} alt="" decoding="async" /><div className="ftag">{f.by}</div>
           </div>
         ))}
@@ -391,7 +391,7 @@ function StreamTile({ streamKey, identity, isLocal }: { streamKey: string; ident
         {!isLocal ? <button className="vb-btn danger" data-tip="Закрыть трансляцию" onClick={() => E.closeWatch(identity)}><Icon name="close" sm /></button> : null}
       </div>
       {isLocal && stats ? <div id="stats" style={{ display: 'block' }} dangerouslySetInnerHTML={{ __html: stats }} /> : null}
-      {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} onClose={() => setPickAnchor(undefined)} onPick={(em) => E.fling(identity, em)} /> : null}
+      {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} sizePicker onClose={() => setPickAnchor(undefined)} onPick={(em) => E.fling(identity, em, emoteSize)} /> : null}
     </div>
   );
 }

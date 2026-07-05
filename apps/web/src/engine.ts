@@ -25,7 +25,7 @@ export interface Snapshot {
   typing: string[];
 }
 
-type EmoteListener = (streamerId: string, emoteId: string, by: string, x: number) => void;
+type EmoteListener = (streamerId: string, emoteId: string, by: string, x: number, size?: string) => void;
 
 interface EngineHooks {
   toast: (text: string, kind?: 'ok' | 'warn' | 'err' | 'info') => void;
@@ -459,10 +459,10 @@ export class Engine {
 
   /* ---------- emotes (spray) ---------- */
   onEmote(cb: EmoteListener) { this.emoteListeners.add(cb); return () => { this.emoteListeners.delete(cb); }; }
-  fling(streamerId: string, emote: Emote) {
+  fling(streamerId: string, emote: Emote, size?: string) {
     const x = Math.random();
-    this.emoteListeners.forEach((f) => f(streamerId, emote.id, this.me.displayName, x));
-    this.dataSend({ t: 'emote', s: streamerId, e: emote.id, by: this.me.displayName, x });
+    this.emoteListeners.forEach((f) => f(streamerId, emote.id, this.me.displayName, x, size));
+    this.dataSend({ t: 'emote', s: streamerId, e: emote.id, by: this.me.displayName, x, sz: size });
   }
 
   /* ---------- watchers presence ---------- */
@@ -534,7 +534,7 @@ export class Engine {
     try {
       const d = JSON.parse(new TextDecoder().decode(payload));
       if (d.t === 'chat') { if (d.em) for (const k in d.em) this.onEmoteResolve?.(k, d.em[k]); this.typingUsers.delete(d.name); this.pushMsg(d.name, d.text, false, d.color, false, d.img); playSound('msg'); }
-      else if (d.t === 'emote') this.emoteListeners.forEach((f) => f(d.s, d.e, d.by, d.x));
+      else if (d.t === 'emote') this.emoteListeners.forEach((f) => f(d.s, d.e, d.by, d.x, d.sz));
       else if (d.t === 'watch') { const m = this.wset(d.s); if (d.on) m.set(d.id, { name: d.n, ts: Date.now() }); else m.delete(d.id); this.emit(); }
       else if (d.t === 'typing') { if (d.name && d.name !== this.me.displayName) { this.typingUsers.set(d.name, Date.now() + 3500); this.emit(); setTimeout(() => this.pruneTyping(), 3600); } }
     } catch { /**/ }
