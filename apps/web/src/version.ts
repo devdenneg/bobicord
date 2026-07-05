@@ -1,4 +1,5 @@
 import { useStore } from './store';
+import { playSound } from './sounds';
 
 // Детект нового деплоя: сравниваем хэш JS-бандла в index.html с текущим загруженным.
 // index.html отдаётся с no-store, при деплое хэш ассета меняется.
@@ -13,7 +14,7 @@ export function watchForUpdates() {
     try {
       const html = await (await fetch('/', { cache: 'no-store' })).text();
       const m = html.match(/\/assets\/index-[\w-]+\.js/);
-      if (m && m[0] !== cur) useStore.setState({ updateReady: true });
+      if (m && m[0] !== cur) { useStore.setState({ updateReady: true }); playSound('system'); }
     } catch { /* оффлайн — пропускаем */ }
   };
 

@@ -136,7 +136,7 @@ export class Engine {
       .on(RoomEvent.TrackUnsubscribed, this.onUnsub)
       .on(RoomEvent.ParticipantConnected, (p) => { this.hooks.peerJoined(p.identity); this.hooks.toast((p.name || p.identity) + ' в сети', 'ok'); this.emit(); })
       .on(RoomEvent.ParticipantDisconnected, (p) => { this.cleanupPeer(p.identity); this.emit(); })
-      .on(RoomEvent.TrackMuted, () => this.emit())
+      .on(RoomEvent.TrackMuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p !== this.room?.localParticipant) playSound('mute'); this.emit(); })
       .on(RoomEvent.TrackUnmuted, () => this.emit())
       .on(RoomEvent.LocalTrackPublished, this.onLocalPub)
       .on(RoomEvent.LocalTrackUnpublished, this.onLocalUnpub)
@@ -321,11 +321,12 @@ export class Engine {
     if (pub.source === Track.Source.Microphone) { if (this.inVoice) { try { (pub as any).setSubscribed(true); } catch { /**/ } if (!silent) playSound('join'); } this.emit(); }
     else if (pub.source === Track.Source.ScreenShare) {
       this.emit();
-      if (!silent) { this.sysMsg(`📺 ${p.name || p.identity} начал трансляцию — «▶ Смотреть» в списке`); playSound('stream'); this.hooks.toast((p.name || p.identity) + ' начал трансляцию', 'info'); }
+      if (!silent) { this.sysMsg(`📺 ${p.name || p.identity} начал трансляцию — «▶ Смотреть» в списке`); if (this.inVoice) playSound('stream'); this.hooks.toast((p.name || p.identity) + ' начал трансляцию', 'info'); }
     }
   };
   private onRemoteUnpub = (pub: TrackPublication, p: RemoteParticipant) => {
     if (pub.source === Track.Source.ScreenShare) { this.watching.delete(p.identity); this.pendingWatch.delete(p.identity); this.sysMsg(`${p.name || p.identity} закончил трансляцию`); }
+    else if (pub.source === Track.Source.Microphone && this.inVoice) playSound('leave'); // вышел из голосового
     this.emit();
   };
   private onSub = (track: RemoteTrack, pub: TrackPublication, p: RemoteParticipant) => {
