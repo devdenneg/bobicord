@@ -390,14 +390,16 @@ export class Engine {
   async share() {
     if (!this.inVoice) { this.hooks.toast('Сначала подключись к голосовому', 'warn'); return; }
     if (this.screenStream || this.room!.localParticipant.isScreenShareEnabled) { await this.stopShare(); this.hooks.toast('Трансляция остановлена'); return; }
+    // restrictOwnAudio (Chrome 140+) вырезает звук ЭТОЙ вкладки (= голоса собеседников из наших <audio>) из системного захвата
+    const supRestrict = !!(navigator.mediaDevices.getSupportedConstraints() as any).restrictOwnAudio;
+    const audioC: any = { echoCancellation: false, noiseSuppression: false, autoGainControl: false, suppressLocalAudioPlayback: false };
+    if (supRestrict) audioC.restrictOwnAudio = true;
     try {
       this.screenStream = await navigator.mediaDevices.getDisplayMedia({
         video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60 }, displaySurface: 'browser' } as any,
-        // звук БЕЗ обработки (AEC/шумодав/AGC ломают музыку); стерео 48кГц.
-        // systemAudio НЕ включаем — системный звук содержит голоса собеседников; берём только звук вкладки.
-        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2, sampleRate: 48000 } as any,
+        audio: audioC,
         // @ts-ignore
-        selfBrowserSurface: 'exclude',
+        systemAudio: 'include', selfBrowserSurface: 'exclude',
       });
     } catch { this.screenStream = null; return; }
     const vt = this.screenStream.getVideoTracks()[0];
@@ -408,17 +410,15 @@ export class Engine {
     await this.room!.localParticipant.publishTrack(lvt, { source: Track.Source.ScreenShare, videoEncoding: { maxBitrate: 8_000_000, maxFramerate: 60 }, videoCodec: 'vp8', simulcast: false, degradationPreference: 'maintain-framerate' as any });
     const surf = (vt.getSettings() as any).displaySurface || '';
     const at = this.screenStream.getAudioTracks()[0];
-    // Чистый звук БЕЗ голосов возможен ТОЛЬКО при шаре вкладки Chrome (звук вкладки изолирован).
-    // Окно/весь экран отдают системный звук — в нём слышно собеседников, поэтому его НЕ транслируем.
-    if (surf === 'browser' && at) {
+    // публикуем звук с ЛЮБОГО surface. Вкладка = изолированный звук (голосов нет).
+    // Экран = системный звук, но restrictOwnAudio вырезает голоса собеседников (звук нашей вкладки).
+    if (at) {
       const lat = new LocalAudioTrack(at);
       await this.room!.localParticipant.publishTrack(lat, { source: Track.Source.ScreenShareAudio, dtx: false, red: true, audioPreset: AudioPresets.musicHighQualityStereo });
-    } else if (at) {
-      try { at.stop(); } catch { /**/ }
     }
     this.keepAliveOn();
-    if (surf !== 'browser') this.hooks.toast('Звук идёт только при шаре ВКЛАДКИ Chrome (в звуке окна/экрана слышно собеседников). Расшарь вкладку + галка «Звук вкладки»', 'warn');
-    else if (!at) this.hooks.toast('Трансляция без звука — при выборе вкладки поставь галку «Звук вкладки»', 'warn');
+    if (!at) this.hooks.toast('Трансляция без звука — при выборе поставь галку «Поделиться аудио»', 'warn');
+    else if (surf !== 'browser' && !supRestrict) this.hooks.toast('Трансляция со звуком. В Chrome <140 при шаре экрана могут быть слышны собеседники — обнови Chrome или шарь вкладку', 'warn');
     else this.hooks.toast('Трансляция запущена', 'ok');
     playSound('stream');
     this.emit();

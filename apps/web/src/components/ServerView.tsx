@@ -410,7 +410,6 @@ function Channels() {
       <div className="ch-body"><VoiceCard /></div>
       {eng.inVoice ? <div className="voice-bar"><VoiceControls /></div> : null}
       <div className="user-panel">
-        <div className="up-av" onClick={() => setModal('profile')} style={{ background: me.avatarUrl ? '#0000' : avColor(me.displayName, me.avatarColor) }}>{me.avatarUrl ? <img className="avimg" src={me.avatarUrl} alt="" /> : initial(me.displayName)}</div>
         <div className="up-i" onClick={() => setModal('profile')}><b>{me.displayName}</b><span>В сети</span></div>
         <button className="up-btn" data-tip="Настройки звука" onClick={() => setModal('settings')}><Icon name="gear" sm /></button>
       </div>
