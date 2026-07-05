@@ -5,6 +5,7 @@ import { useStore, getEngine } from '../store';
 import { getSettings, setSettings } from '../settings';
 import { playSound } from '../sounds';
 import { Icon } from '../Icon';
+import { MicMeter } from './MicMeter';
 import { AV_COLORS, avColor, initial, keyLabel } from '../util';
 import type { AudioSettings, InvitePreview } from '../types';
 
@@ -179,7 +180,7 @@ function SettingsModal() {
     <div className="grp" style={{ border: 'none', marginTop: 8, paddingTop: 0 }}>
       <div className="gt"><Icon name="mic-sm" sm /> Микрофон</div>
       <div className="fld"><label>Устройство ввода</label><select value={s.input} onChange={(e) => upd({ input: e.target.value }, () => E?.reapplyMic())}><option value="">По умолчанию</option>{ins.map((d) => <option key={d.deviceId} value={d.deviceId}>{d.label || d.deviceId}</option>)}</select></div>
-      <div className="fld" style={{ marginTop: 10 }}><label>Громкость микрофона: {s.micVolume}%</label><input type="range" min={0} max={200} value={s.micVolume} onChange={(e) => upd({ micVolume: +e.target.value }, () => E?.applyMicVolume())} /></div>
+      <MicMeter />
       <div className="fld" style={{ marginTop: 10 }}><label>Режим передачи</label>
         <div className="seg"><button className={s.mode === 'voice' ? 'active' : ''} onClick={() => upd({ mode: 'voice' }, () => E?.onModeChanged())}>Активация голосом</button><button className={s.mode === 'ptt' ? 'active' : ''} onClick={() => upd({ mode: 'ptt' }, () => E?.onModeChanged())}>Push-to-Talk</button></div>
         {s.mode === 'ptt' ? <div className="ptt-hint">Удерживай <span className="kbd">{keyLabel(s.pttKey)}</span> · <button style={{ padding: '4px 10px', fontSize: 12 }} onClick={() => setBinding(true)}>{binding ? 'Нажми клавишу...' : 'Сменить'}</button></div> : null}

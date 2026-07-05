@@ -81,6 +81,7 @@ export interface AudioSettings {
   mode: 'voice' | 'ptt';
   pttKey: string;
   master: number;
-  micVolume: number; // громкость микрофона в %, 100 = без изменений
+  sensitivity: number; // порог чувствительности ввода, 0..100 (нормализованная dB-шкала)
+  sensitivityAuto: boolean; // авто-подбор порога по шумовому фону
   notifyVolume: number; // громкость звуков-уведомлений в %
 }
