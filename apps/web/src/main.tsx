@@ -7,11 +7,8 @@ import { api, getToken, setToken } from './api';
 import { loadGlobalEmotes } from './emotes';
 
 loadGlobalEmotes();
-// SW отключён: залипший service worker/кэш ронял Chrome на проде. Разрегистрируем всё и чистим кэши.
-if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.getRegistrations().then((rs) => rs.forEach((r) => r.unregister())).catch(() => {});
-}
-if ('caches' in window) { caches.keys().then((ks) => ks.forEach((k) => caches.delete(k))).catch(() => {}); }
+// SW для установки PWA. НЕ кэширует (кэш ранее ронял прод); старые кэши чистятся внутри sw.js.
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
 
 createRoot(document.getElementById('root')!).render(<StrictMode><App /></StrictMode>);
 
