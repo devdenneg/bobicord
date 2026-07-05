@@ -6,6 +6,7 @@ import { avColor, initial, prefersReducedMotion } from '../util';
 import { emoteMap, emoteUrl } from '../emotes';
 import { EmotePicker } from './EmotePicker';
 import { getSettings, setSettings } from '../settings';
+import { isTauri, listMonitors, startNativeBroadcast, stopNativeBroadcast } from '../native';
 import type { Emote, Member } from '../types';
 
 function Avatar({ name, ci, size = 32, dot, live }: { name: string; ci: number; size?: number; dot?: string; live?: boolean }) {
@@ -84,6 +85,48 @@ function VoiceCard() {
   );
 }
 
+/* Вещание — только из нативного клиента (Evolution-TZ Э5 / CLAUDE.md инвариант 2).
+   В браузере эта кнопка не рендерится вовсе; состояние держим локально — Rust-сторона
+   (apps/native/src-tauri/src/broadcast) пока не шлёт события обратно в webview. */
+function NativeBroadcastButton() {
+  const eng = useEngine();
+  const me = useStore((s) => s.me)!;
+  const [live, setLive] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function toggle() {
+    if (busy) return;
+    setBusy(true); setErr(null);
+    try {
+      if (live) {
+        await stopNativeBroadcast();
+        setLive(false);
+      } else {
+        const monitors = await listMonitors();
+        const monitorIndex = monitors[0]?.index ?? 0;
+        await startNativeBroadcast(me.username, me.username, monitorIndex);
+        setLive(true);
+      }
+    } catch (e: any) {
+      setErr(String(e?.message || e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!eng.inVoice) return null;
+  return (
+    <>
+      <button className={'cbtn' + (live ? ' danger-on' : '')} aria-pressed={live} disabled={busy}
+        data-tip={live ? 'Остановить трансляцию' : 'Начать трансляцию экрана'} onClick={toggle}>
+        <Icon name={live ? 'screen-stop' : 'screen'} sm />
+      </button>
+      {err ? <span className="err-inline" title={err}>⚠</span> : null}
+    </>
+  );
+}
+
 function VoiceControls() {
   const eng = useEngine();
   const E = getEngine()!;
@@ -95,7 +138,8 @@ function VoiceControls() {
     <div className="vc-controls">
       <button className={micClass} aria-pressed={muted} data-tip="Микрофон · M" onClick={() => E.toggleMic()}><Icon name={muted ? 'mic-off' : 'mic'} sm /></button>
       <button className={'cbtn' + (eng.deafened ? ' danger-on' : '')} aria-pressed={eng.deafened} data-tip="Заглушить · D" onClick={() => E.toggleDeaf()}><Icon name={eng.deafened ? 'head-off' : 'head'} sm /></button>
-      {/* Share screen button removed (Evolution-TZ Э2 / CLAUDE.md invariant 2): browser never broadcasts, native-only. */}
+      {/* Share screen button removed (Evolution-TZ Э2 / CLAUDE.md invariant 2): browser never broadcasts. Native-only replacement below. */}
+      {isTauri ? <NativeBroadcastButton /> : null}
       <button className="cbtn leave-v" data-tip="Выйти из голосового" onClick={() => E.leaveVoice()}><Icon name="leave" sm /></button>
     </div>
   );

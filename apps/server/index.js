@@ -356,6 +356,8 @@ app.get('/healthz', (req, res) => res.send('ok'));
  * gated on NODE_ENV as a second guard in case someone runs this file directly against prod data). */
 if (process.env.NODE_ENV !== 'production') {
   app.get('/dev/tree-test-publisher.html', (req, res) => res.sendFile(path.join(__dirname, 'dev', 'tree-test-publisher.html')));
+  // Э5: симметричный харнесс — браузер-зритель для проверки приёма от нативного вещателя.
+  app.get('/dev/tree-test-viewer.html', (req, res) => res.sendFile(path.join(__dirname, 'dev', 'tree-test-viewer.html')));
 }
 
 /* ---------- relay-дерево: WS-сигналинг на том же порту (Э1) ---------- */

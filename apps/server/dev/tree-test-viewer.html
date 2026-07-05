@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>tree-test-viewer (dev, Evolution-TZ Э5)</title>
+<style>
+  body { font: 13px/1.4 monospace; background: #111; color: #ddd; padding: 16px; max-width: 720px; }
+  h1 { font-size: 15px; color: #fff; }
+  p.note { color: #999; }
+  label { display: block; margin-top: 10px; }
+  input { width: 100%; box-sizing: border-box; padding: 6px; background: #222; color: #fff; border: 1px solid #444; }
+  button { margin-top: 12px; padding: 8px 14px; cursor: pointer; }
+  video { width: 480px; margin-top: 12px; background: #000; display: block; }
+  #log { margin-top: 12px; white-space: pre-wrap; background: #000; padding: 8px; height: 220px; overflow-y: auto; border: 1px solid #333; }
+  .err { color: #f66; }
+</style>
+</head>
+<body>
+<h1>tree-test-viewer — dev-only, Evolution-TZ Э5</h1>
+<p class="note">
+  Не часть продукта. Проверяет приём H.264 от нативного (Rust) вещателя дерева —
+  минимальная переpеализация <code>treeVideo.ts</code> (browser = лист, отвечает на offer).
+</p>
+<label>Session JWT (то же, что взял нативный смоук-тест)
+  <input id="token" placeholder="eyJ...">
+</label>
+<label>streamId (совпадает с identity, который передал нативный вещатель)
+  <input id="streamId" placeholder="native-smoketest">
+</label>
+<button id="startBtn">▶ Смотреть</button>
+<button id="stopBtn" disabled>◼ Остановить</button>
+<video id="remote" autoplay playsinline></video>
+<div id="log"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const logEl = $('log');
+function log(msg, isErr) {
+  const line = document.createElement('div');
+  if (isErr) line.className = 'err';
+  line.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+let ws = null;
+let pc = null;
+let parentId = null;
+
+function preferH264(pc) {
+  const caps = RTCRtpReceiver.getCapabilities && RTCRtpReceiver.getCapabilities('video');
+  const h264 = (caps && caps.codecs || []).filter((c) => c.mimeType.toLowerCase() === 'video/h264');
+  if (!h264.length) { log('нет getCapabilities — уйдёт как договорились в offer', true); return; }
+  pc.getTransceivers().forEach((t) => {
+    if (t.receiver && t.receiver.track && t.receiver.track.kind === 'video') {
+      try { t.setCodecPreferences(h264); } catch (e) { log('setCodecPreferences: ' + e, true); }
+    }
+  });
+}
+
+async function onOffer(streamId, sdp) {
+  pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+  pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ t: 'ice', streamId, to: parentId, candidate: e.candidate })); };
+  pc.onconnectionstatechange = () => log('pc: ' + pc.connectionState);
+  pc.ontrack = (e) => {
+    log('ontrack: ' + e.track.kind);
+    if (e.track.kind === 'video') $('remote').srcObject = e.streams[0] || new MediaStream([e.track]);
+  };
+  await pc.setRemoteDescription({ type: 'offer', sdp });
+  preferH264(pc);
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  ws.send(JSON.stringify({ t: 'sdp', streamId, to: parentId, type: 'answer', sdp: pc.localDescription.sdp }));
+  log('answered offer from ' + parentId);
+}
+
+function start() {
+  const token = $('token').value.trim();
+  const streamId = $('streamId').value.trim();
+  if (!token || !streamId) { log('нужен token и streamId', true); return; }
+
+  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  ws = new WebSocket(proto + location.host + '/tree?token=' + encodeURIComponent(token));
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ t: 'join', streamId, role: 'viewer', native: false, identity: 'test-viewer' }));
+    log('joined as viewer, streamId=' + streamId);
+  };
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.t === 'welcome') log('welcome, id=' + msg.id);
+    else if (msg.t === 'assign-parent') { parentId = msg.parentId; log('assign-parent: ' + parentId); }
+    else if (msg.t === 'sdp' && msg.type === 'offer' && msg.from === parentId) onOffer(streamId, msg.sdp);
+    else if (msg.t === 'ice' && msg.from === parentId && pc) pc.addIceCandidate(msg.candidate).catch((e) => log('addIceCandidate: ' + e, true));
+    else if (msg.t === 'drop-peer') log('drop-peer: ' + msg.peerId, true);
+    else if (msg.t === 'tree-info') log('tree-info: depth=' + msg.depth);
+  };
+  ws.onclose = () => log('ws closed');
+  ws.onerror = (e) => log('ws error ' + e, true);
+
+  $('startBtn').disabled = true;
+  $('stopBtn').disabled = false;
+}
+
+function stop() {
+  if (ws) { try { ws.send(JSON.stringify({ t: 'leave' })); } catch {} try { ws.close(); } catch {} ws = null; }
+  if (pc) { pc.close(); pc = null; }
+  $('remote').srcObject = null;
+  $('startBtn').disabled = false;
+  $('stopBtn').disabled = true;
+  log('stopped');
+}
+
+$('startBtn').onclick = start;
+$('stopBtn').onclick = stop;
+</script>
+</body>
+</html>
