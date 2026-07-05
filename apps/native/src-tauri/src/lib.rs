@@ -43,8 +43,17 @@ async fn start_broadcast(
   audio_target_pid: Option<u32>,
 ) -> Result<(), String> {
   let mut slot = state.0.lock().await;
-  if slot.is_some() {
-    return Err("уже вещаем".into());
+  if let Some(h) = slot.as_ref() {
+    if h.is_alive() {
+      return Err("уже вещаем".into());
+    }
+    // Предыдущая трансляция умерла сама (фатальный отказ энкодера/захвата) —
+    // фронт узнаёт об этом асинхронно и чистит стейт fire-and-forget
+    // (см. ServerView.tsx onBroadcastStopped), так что здесь можем догнать её
+    // раньше, чем тот вызов долетит: подчищаем зомби-хэндл сами, не отказываем.
+    if let Some(old) = slot.take() {
+      old.stop().await;
+    }
   }
   let config = broadcast::StreamConfig {
     max_width: max_width.clamp(320, 3840),

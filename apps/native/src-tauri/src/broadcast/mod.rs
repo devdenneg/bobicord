@@ -47,9 +47,19 @@ pub struct BroadcastHandle {
     audio_stop: Arc<AtomicBool>,
     shutdown_tx: mpsc::UnboundedSender<()>,
     threads: Vec<std::thread::JoinHandle<()>>,
+    /// Снимается run_signaling_loop сам, в конце (и при штатном стопе, и при
+    /// фатальном отказе энкодера/захвата) — до её появления `stop_broadcast`
+    /// с фронта был единственным способом снять "уже вещаем" с Tauri-состояния
+    /// после самостоятельной смерти потока, а он вызывается асинхронно и
+    /// fire-and-forget (см. ServerView.tsx onBroadcastStopped) — пользователь
+    /// успевал кликнуть "начать трансляцию" раньше, чем стейт реально очистится,
+    /// и получал спурьезный "уже вещаем" (отсюда "нужно стартануть раз 5").
+    alive: Arc<AtomicBool>,
 }
 
 impl BroadcastHandle {
+    pub fn is_alive(&self) -> bool { self.alive.load(Ordering::Relaxed) }
+
     pub async fn stop(mut self) {
         self.cap_stop.store(true, Ordering::Relaxed);
         self.enc_stop.store(true, Ordering::Relaxed);
@@ -246,8 +256,10 @@ pub async fn start(
         log::info!("audio thread stopped");
     });
 
+    let alive = Arc::new(AtomicBool::new(true));
+    let alive_loop = alive.clone();
     let meta = DebugMeta { stream_id, source_label, target_fps: fps, target_bitrate_bps: bitrate_bps };
-    tokio::spawn(run_signaling_loop(mgr, evt_rx, shutdown_rx, app, stats, meta));
+    tokio::spawn(run_signaling_loop(mgr, evt_rx, shutdown_rx, app, stats, meta, alive_loop));
 
     Ok(BroadcastHandle {
         cap_stop,
@@ -255,6 +267,7 @@ pub async fn start(
         audio_stop,
         shutdown_tx,
         threads: vec![cap_handle, encoder_thread, audio_thread],
+        alive,
     })
 }
 
@@ -290,6 +303,7 @@ async fn run_signaling_loop(
     app: Option<AppHandle>,
     stats: StatsHandle,
     meta: DebugMeta,
+    alive: Arc<AtomicBool>,
 ) {
     let mut stats_tick = tokio::time::interval(Duration::from_secs(2));
     let mut prev_at = Instant::now();
@@ -338,6 +352,7 @@ async fn run_signaling_loop(
         }
     }
     mgr.close_all().await;
+    alive.store(false, Ordering::Relaxed);
     if let Some(app) = &app { let _ = app.emit("relay-broadcast-stopped", &meta.stream_id); }
 }
 
