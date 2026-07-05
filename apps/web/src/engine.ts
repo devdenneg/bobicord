@@ -414,6 +414,11 @@ export class Engine {
 
   async getScreenStats(): Promise<string | null> { return this.videoT.getScreenStats(this.me.username); }
 
+  /** Позиция в дереве + живая RTP-статистика для дебаг-панели зрителя (Э2.1).
+   *  `null` для транспортов без дерева (LiveKit) — StreamTile просто не покажет панель. */
+  getTreeInfo(identity: string) { return this.videoT.getTreeInfo?.(identity) ?? null; }
+  async getWatchRtpStats(identity: string) { return (await this.videoT.getRtpStats?.(identity)) ?? null; }
+
   /* ---------- emotes (spray) ---------- */
   onEmote(cb: EmoteListener) { this.emoteListeners.add(cb); return () => { this.emoteListeners.delete(cb); }; }
   fling(streamerId: string, emote: Emote) {

@@ -1,5 +1,5 @@
 import type { Room } from 'livekit-client';
-import type { VideoTransport } from './videoTransport';
+import type { VideoTransport, TreeInfo, RtpStats } from './videoTransport';
 import { MediaStreamVideoHandle } from './videoTransport';
 import type { StreamInfo } from '../engine';
 import { getToken } from '../api';
@@ -35,6 +35,7 @@ interface WatchState {
   iceServers: RTCIceServer[];
 }
 
+
 function treeWsUrl(): string {
   const override = (import.meta as any).env?.VITE_TREE_WS_URL as string | undefined;
   const base = override || ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/tree');
@@ -63,6 +64,7 @@ export class TreeVideoTransport implements VideoTransport {
 
   private videoTracks = new Map<string, MediaStreamVideoHandle>();
   private streamInfoByKey = new Map<string, StreamInfo>();
+  private treeInfoByStream = new Map<string, TreeInfo>();
 
   private streamStartCbs = new Set<(identity: string, silent: boolean) => void>();
   private streamStopCbs = new Set<(identity: string) => void>();
@@ -143,12 +145,38 @@ export class TreeVideoTransport implements VideoTransport {
     try { st.ws.close(); } catch { /**/ }
     if (st.pc) { try { st.pc.close(); } catch { /**/ } }
     this.watches.delete(streamId);
+    this.treeInfoByStream.delete(streamId);
     this.delVideo(streamId);
   }
   private teardownWatch(streamId: string, st: WatchState) {
     if (st.pc) { try { st.pc.close(); } catch { /**/ } st.pc = null; }
     this.watches.delete(streamId);
+    this.treeInfoByStream.delete(streamId);
     this.delVideo(streamId);
+  }
+
+  /** Последний известный tree-info (позиция в дереве) для смотрибельного стрима. */
+  getTreeInfo(streamId: string): TreeInfo | null { return this.treeInfoByStream.get(streamId) || null; }
+
+  /** Живая RTP-статистика входящего видео (Э2.1 — дебаг-панель зрителя). `null`,
+   * если сейчас не смотрим этот стрим или ещё нет отчёта. */
+  async getRtpStats(streamId: string): Promise<RtpStats | null> {
+    const st = this.watches.get(streamId);
+    if (!st?.pc) return null;
+    let report: RTCStatsReport;
+    try { report = await st.pc.getStats(); } catch { return null; }
+    for (const stat of report.values()) {
+      if (stat.type === 'inbound-rtp' && stat.kind === 'video') {
+        return {
+          width: stat.frameWidth || 0,
+          height: stat.frameHeight || 0,
+          fps: stat.framesPerSecond || 0,
+          framesDropped: stat.framesDropped || 0,
+          packetsLost: stat.packetsLost || 0,
+        };
+      }
+    }
+    return null;
   }
 
   private onWatchMessage(streamId: string, st: WatchState, ev: MessageEvent) {
@@ -173,7 +201,15 @@ export class TreeVideoTransport implements VideoTransport {
         st.pc.addIceCandidate(msg.candidate).catch(() => {});
         break;
       }
-      // 'tree-info' — health telemetry, not needed for Э2 UI yet.
+      case 'tree-info': {
+        this.treeInfoByStream.set(streamId, {
+          myDepth: msg.myDepth ?? 0,
+          treeDepth: msg.depth ?? 0,
+          children: msg.children ?? 0,
+          health: msg.health || 'ok',
+        });
+        break;
+      }
     }
   }
 

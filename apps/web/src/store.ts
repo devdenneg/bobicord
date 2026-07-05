@@ -18,12 +18,14 @@ interface AppState {
   loadingServer: boolean;
   loadingServerId: string | null;
   toasts: Toast[];
-  modal: null | 'create' | 'join' | 'profile' | 'srvmenu' | 'invite' | 'settings';
+  modal: null | 'create' | 'join' | 'profile' | 'srvmenu' | 'invite' | 'settings' | 'broadcast';
   joinPrefill: string;
+  broadcastLive: boolean;
 
   toast: (text: string, kind?: ToastKind) => void;
   dismissToast: (id: number) => void;
   setModal: (m: AppState['modal'], prefill?: string) => void;
+  setBroadcastLive: (v: boolean) => void;
 
   afterAuth: (user: User) => Promise<void>;
   loadMe: () => Promise<void>;
@@ -40,7 +42,7 @@ let memberTimer: number | null = null;
 let toastSeq = 1;
 
 export const useStore = create<AppState>((set, get) => ({
-  view: 'loading', me: null, servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, toasts: [], modal: null, joinPrefill: '',
+  view: 'loading', me: null, servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, toasts: [], modal: null, joinPrefill: '', broadcastLive: false,
 
   toast: (text, kind) => {
     const id = toastSeq++;
@@ -49,6 +51,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
   setModal: (m, prefill) => set({ modal: m, joinPrefill: prefill ?? get().joinPrefill }),
+  setBroadcastLive: (v) => set({ broadcastLive: v }),
 
   setMe: (u) => { engine?.setMe(u); set({ me: u }); },
 

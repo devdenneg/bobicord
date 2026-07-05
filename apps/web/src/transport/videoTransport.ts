@@ -29,6 +29,25 @@ export class MediaStreamVideoHandle {
   }
 }
 
+/** Позиция листа/ретранслятора в relay-дереве (Evolution-TZ Э2.1 — дебаг-панель зрителя). */
+export interface TreeInfo {
+  /** Глубина ЭТОГО узла от вещателя (0 = сам вещатель, 1 = его прямой ребёнок...). */
+  myDepth: number;
+  /** Максимальная глубина всего дерева (общее здоровье, не личная позиция). */
+  treeDepth: number;
+  /** Сколько узлов ретранслируют через нас (у браузера всегда 0 — лист, инвариант 3). */
+  children: number;
+  health: string;
+}
+
+export interface RtpStats {
+  width: number;
+  height: number;
+  fps: number;
+  framesDropped: number;
+  packetsLost: number;
+}
+
 export interface VideoTransport {
   /** Wire room-event listeners. Call once, BEFORE `room.connect()`. */
   attach(room: Room, ctx: { me: string }): void;
@@ -45,6 +64,11 @@ export interface VideoTransport {
 
   watch(streamId: string): void;
   unwatch(streamId: string): void;
+
+  /** Только TreeVideoTransport (Э2.1) — позиция в дереве и живая RTP-статистика
+   *  для дебаг-панели зрителя. LiveKit-транспорт их не реализует (там SFU, нет дерева). */
+  getTreeInfo?(streamId: string): TreeInfo | null;
+  getRtpStats?(streamId: string): Promise<RtpStats | null>;
 
   getVideoTrack(key: string): LocalVideoTrack | RemoteTrack | MediaStreamVideoHandle | undefined;
   getStreams(): StreamInfo[];

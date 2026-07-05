@@ -16,6 +16,24 @@ use windows_capture::settings::{
     ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
+use windows_capture::window::Window;
+
+use super::stats::StatsHandle;
+
+/// Источник кадров: монитор целиком либо отдельное окно (Э5.1 — захват окна).
+/// `Window::from_raw_hwnd` ничего не валидирует сама по себе, так что перед
+/// спавном потока в `spawn_capture` делаем синхронную проверку хэндла.
+#[derive(serde::Deserialize, Clone, Copy, Debug)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum CaptureSource {
+    Monitor { index: usize },
+    Window { hwnd: isize },
+}
+
+/// Заголовок окна по HWND — для дебаг-панели (подпись источника трансляции).
+pub fn window_title(hwnd: isize) -> String {
+    Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void).title().unwrap_or_default()
+}
 
 /// Кадр в формате NV12 (Y-плоскость + перемежённая UV, 4:2:0) — то, что ждёт
 /// H.264 MFT на входе без внутренней цветоконвертации.
@@ -33,6 +51,7 @@ pub struct CaptureFlags {
     /// масштабируется вниз, если больше; апскейл никогда не делаем.
     pub max_width: u32,
     pub max_height: u32,
+    pub stats: StatsHandle,
 }
 
 pub struct ScreenCapture {
@@ -40,6 +59,7 @@ pub struct ScreenCapture {
     stop: Arc<AtomicBool>,
     max_width: u32,
     max_height: u32,
+    stats: StatsHandle,
     scratch: Vec<u8>,
     fps_window_start: Instant,
     fps_window_count: u32,
@@ -55,6 +75,7 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
             stop: ctx.flags.stop,
             max_width: ctx.flags.max_width,
             max_height: ctx.flags.max_height,
+            stats: ctx.flags.stats,
             scratch: Vec::new(),
             fps_window_start: Instant::now(),
             fps_window_count: 0,
@@ -84,11 +105,17 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
         }
         bgra_to_nv12_scaled(raw, src_w, src_h, row_pitch, out_w, out_h, &mut self.scratch);
 
+        self.stats.out_width.store(out_w, Ordering::Relaxed);
+        self.stats.out_height.store(out_h, Ordering::Relaxed);
+
         // Канал ограничен (см. spawn_capture) — если энкодер отстаёт, лучше
         // уронить кадр, чем копить задержку (инвариант «видео <= 3с»).
         let frame_out = Nv12Frame { data: self.scratch.clone(), width: out_w, height: out_h, captured_at: Instant::now() };
         if self.tx.try_send(frame_out).is_err() {
+            self.stats.capture_drops.fetch_add(1, Ordering::Relaxed);
             log::debug!("capture: drop frame, encoder busy");
+        } else {
+            self.stats.capture_frames.fetch_add(1, Ordering::Relaxed);
         }
 
         self.fps_window_count += 1;
@@ -174,15 +201,48 @@ pub fn list_monitors() -> Vec<(usize, String)> {
         .unwrap_or_default()
 }
 
-/// Запускает захват выбранного монитора в отдельном потоке (Capture::start блокирующий,
-/// требует свой COM-апартамент — не гонять на tokio-воркере). Возвращает флаг остановки.
+/// Список окон, доступных для захвата (видимые top-level, не наши же — см.
+/// `Window::is_valid`), с заголовком и именем процесса для UI выбора источника.
+pub fn list_windows() -> Vec<(isize, String, String)> {
+    Window::enumerate()
+        .map(|ws| {
+            ws.into_iter()
+                .filter_map(|w| {
+                    let title = w.title().ok()?;
+                    if title.trim().is_empty() {
+                        return None;
+                    }
+                    let process = w.process_name().unwrap_or_default();
+                    Some((w.as_raw_hwnd() as isize, title, process))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Запускает захват выбранного источника (монитор или окно) в отдельном потоке
+/// (Capture::start блокирующий, требует свой COM-апартамент — не гонять на
+/// tokio-воркере). Возвращает флаг остановки.
 pub fn spawn_capture(
-    monitor_index: usize,
+    source: CaptureSource,
     max_width: u32,
     max_height: u32,
     target_fps: u32,
+    stats: StatsHandle,
 ) -> Result<(std::thread::JoinHandle<()>, Arc<AtomicBool>, crossbeam_channel::Receiver<Nv12Frame>), String> {
-    let monitor = Monitor::from_index(monitor_index).map_err(|e| format!("monitor {monitor_index}: {e}"))?;
+    // Синхронная проверка перед спавном потока — чтобы неверный индекс/протухший
+    // HWND вернулись caller'у сразу как Err, а не молча уронили поток.
+    match source {
+        CaptureSource::Monitor { index } => {
+            Monitor::from_index(index).map_err(|e| format!("monitor {index}: {e}"))?;
+        }
+        CaptureSource::Window { hwnd } => {
+            Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void)
+                .title()
+                .map_err(|e| format!("window: {e}"))?;
+        }
+    }
+
     let (tx, rx) = crossbeam_channel::bounded(2);
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
@@ -194,17 +254,37 @@ pub fn spawn_capture(
         let min_interval = MinimumUpdateIntervalSettings::Custom(
             std::time::Duration::from_secs_f64(1.0 / target_fps.max(1) as f64),
         );
-        let settings = Settings::new(
-            monitor,
-            CursorCaptureSettings::WithCursor,
-            DrawBorderSettings::WithoutBorder,
-            SecondaryWindowSettings::Default,
-            min_interval,
-            DirtyRegionSettings::Default,
-            ColorFormat::Bgra8,
-            CaptureFlags { tx, stop: stop2, max_width, max_height },
-        );
-        if let Err(e) = ScreenCapture::start(settings) {
+        let flags = CaptureFlags { tx, stop: stop2, max_width, max_height, stats };
+        let result = match source {
+            CaptureSource::Monitor { index } => Monitor::from_index(index).map_err(|e| e.to_string()).and_then(|monitor| {
+                let settings = Settings::new(
+                    monitor,
+                    CursorCaptureSettings::WithCursor,
+                    DrawBorderSettings::WithoutBorder,
+                    SecondaryWindowSettings::Default,
+                    min_interval,
+                    DirtyRegionSettings::Default,
+                    ColorFormat::Bgra8,
+                    flags,
+                );
+                ScreenCapture::start(settings).map_err(|e| e.to_string())
+            }),
+            CaptureSource::Window { hwnd } => {
+                let window = Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void);
+                let settings = Settings::new(
+                    window,
+                    CursorCaptureSettings::WithCursor,
+                    DrawBorderSettings::WithoutBorder,
+                    SecondaryWindowSettings::Default,
+                    min_interval,
+                    DirtyRegionSettings::Default,
+                    ColorFormat::Bgra8,
+                    flags,
+                );
+                ScreenCapture::start(settings).map_err(|e| e.to_string())
+            }
+        };
+        if let Err(e) = result {
             log::error!("capture: {e}");
         }
     });

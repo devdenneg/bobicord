@@ -168,7 +168,7 @@ function attachTreeServer(httpServer, opts) {
     if (!info) return;
     for (const [pid, p] of peers) {
       if (p.streamId === streamId) {
-        send(pid, { t: 'tree-info', streamId, depth: info.depth, children: p.children.length, health: 'ok' });
+        send(pid, { t: 'tree-info', streamId, depth: info.depth, myDepth: p.depth, children: p.children.length, health: 'ok' });
       }
     }
   }

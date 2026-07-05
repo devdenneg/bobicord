@@ -6,7 +6,7 @@ import { avColor, initial, prefersReducedMotion } from '../util';
 import { emoteMap, emoteUrl } from '../emotes';
 import { EmotePicker } from './EmotePicker';
 import { getSettings, setSettings } from '../settings';
-import { isTauri, listMonitors, startNativeBroadcast, stopNativeBroadcast } from '../native';
+import { isTauri, onBroadcastStopped } from '../native';
 import type { Emote, Member } from '../types';
 
 function Avatar({ name, ci, size = 32, dot, live }: { name: string; ci: number; size?: number; dot?: string; live?: boolean }) {
@@ -86,44 +86,29 @@ function VoiceCard() {
 }
 
 /* Вещание — только из нативного клиента (Evolution-TZ Э5 / CLAUDE.md инвариант 2).
-   В браузере эта кнопка не рендерится вовсе; состояние держим локально — Rust-сторона
-   (apps/native/src-tauri/src/broadcast) пока не шлёт события обратно в webview. */
+   В браузере эта кнопка не рендерится вовсе. Конфиг источника/разрешения/битрейта
+   и живая дебаг-статистика — в BroadcastModal (открывается по клику, живёт в
+   глобальном сторе modal/broadcastLive, т.к. должна остаться открытой между
+   ре-рендерами и переживать переключение вкладок сервера). */
 function NativeBroadcastButton() {
   const eng = useEngine();
-  const me = useStore((s) => s.me)!;
-  const [live, setLive] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
+  const live = useStore((s) => s.broadcastLive);
 
-  async function toggle() {
-    if (busy) return;
-    setBusy(true); setErr(null);
-    try {
-      if (live) {
-        await stopNativeBroadcast();
-        setLive(false);
-      } else {
-        const monitors = await listMonitors();
-        const monitorIndex = monitors[0]?.index ?? 0;
-        await startNativeBroadcast(me.username, me.username, monitorIndex);
-        setLive(true);
-      }
-    } catch (e: any) {
-      setErr(String(e?.message || e));
-    } finally {
-      setBusy(false);
-    }
-  }
+  // Слушаем и когда модалка со статистикой закрыта — трансляция может
+  // завершиться сама (например источник-окно закрыли), стор должен это узнать.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    onBroadcastStopped(() => useStore.getState().setBroadcastLive(false)).then((u) => (unlisten = u));
+    return () => unlisten?.();
+  }, []);
 
   if (!eng.inVoice) return null;
   return (
-    <>
-      <button className={'cbtn' + (live ? ' danger-on' : '')} aria-pressed={live} disabled={busy}
-        data-tip={live ? 'Остановить трансляцию' : 'Начать трансляцию экрана'} onClick={toggle}>
-        <Icon name={live ? 'screen-stop' : 'screen'} sm />
-      </button>
-      {err ? <span className="err-inline" title={err}>⚠</span> : null}
-    </>
+    <button className={'cbtn' + (live ? ' danger-on' : '')} aria-pressed={live}
+      data-tip={live ? 'Трансляция идёт' : 'Начать трансляцию экрана'}
+      onClick={() => useStore.getState().setModal('broadcast')}>
+      <Icon name={live ? 'screen-stop' : 'screen'} sm />
+    </button>
   );
 }
 
@@ -282,10 +267,23 @@ function StreamTile({ streamKey, identity, isLocal }: { streamKey: string; ident
   }), [identity, E]);
 
   useEffect(() => {
-    if (!isLocal) return;
-    const t = setInterval(async () => { const s = await E.getScreenStats(); setStats(s || ''); }, 1500);
+    if (isLocal) {
+      const t = setInterval(async () => { const s = await E.getScreenStats(); setStats(s || ''); }, 1500);
+      return () => clearInterval(t);
+    }
+    // Зритель (лист/ретранслятор дерева, Э2.1): разрешение+fps+dropped из RTP-статистики
+    // входящего трека, позиция в дереве — из tree-info с сервера (см. treeVideo.ts).
+    const t = setInterval(async () => {
+      const rtp = await E.getWatchRtpStats(identity);
+      const tree = E.getTreeInfo(identity);
+      if (!rtp && !tree) { setStats(''); return; }
+      const parts: string[] = [];
+      if (rtp) parts.push(`${rtp.width}×${rtp.height} · ${rtp.fps.toFixed(0)} fps · дропы ${rtp.framesDropped}`);
+      if (tree) parts.push(`дерево: глубина ${tree.myDepth}${tree.children ? `, ретранслируешь на ${tree.children}` : ''}`);
+      setStats(parts.join('<br>'));
+    }, 2000);
     return () => clearInterval(t);
-  }, [isLocal, E]);
+  }, [isLocal, identity, E]);
 
   const watchers = eng.watchers[identity] || [];
   const [svol, setSvol] = useState(() => Math.round(E.streamVolOf(identity) * 100));
@@ -313,7 +311,7 @@ function StreamTile({ streamKey, identity, isLocal }: { streamKey: string; ident
           <button className="vclose" title="Закрыть трансляцию" onClick={() => E.closeWatch(identity)}>✕</button>
         </>
       ) : null}
-      {isLocal && stats ? <div id="stats" style={{ display: 'block' }} dangerouslySetInnerHTML={{ __html: stats }} /> : null}
+      {stats ? <div className="stats" dangerouslySetInnerHTML={{ __html: stats }} /> : null}
       {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} onClose={() => setPickAnchor(undefined)} onPick={(em) => E.fling(identity, em)} /> : null}
     </div>
   );

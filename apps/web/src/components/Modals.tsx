@@ -6,11 +6,8 @@ import { getSettings, setSettings } from '../settings';
 import { Icon } from '../Icon';
 import { AV_COLORS, avColor, initial, keyLabel } from '../util';
 import type { AudioSettings, InvitePreview } from '../types';
-
-function Backdrop({ children, onClose, label }: { children: React.ReactNode; onClose: () => void; label?: string }) {
-  useEffect(() => { const k = (e: KeyboardEvent) => e.key === 'Escape' && onClose(); window.addEventListener('keydown', k); return () => window.removeEventListener('keydown', k); }, [onClose]);
-  return <div className="modal show" onMouseDown={(e) => e.target === e.currentTarget && onClose()}><div className="box" role="dialog" aria-modal="true" aria-label={label}>{children}</div></div>;
-}
+import { Backdrop } from './Backdrop';
+import { BroadcastModal } from './BroadcastModal';
 
 function CreateModal() {
   const close = () => useStore.getState().setModal(null);
@@ -162,6 +159,7 @@ export function Modals() {
     case 'srvmenu': return <ServerMenuModal />;
     case 'invite': return <InviteModal />;
     case 'settings': return <SettingsModal />;
+    case 'broadcast': return <BroadcastModal />;
     default: return null;
   }
 }

@@ -8,24 +8,34 @@ pub mod capture;
 pub mod encoder;
 pub mod peer;
 pub mod signaling;
+pub mod stats;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::json;
+use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 use webrtc::media::Sample;
 use windows::Win32::Media::MediaFoundation::{MFStartup, MFSTARTUP_FULL, MFSTARTUP_NOSOCKET, MF_VERSION};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
-use self::signaling::TreeEvent;
+pub use capture::CaptureSource;
 
-const WIDTH: u32 = 1920;
-const HEIGHT: u32 = 1080;
-const FPS: u32 = 30;
-const BITRATE_BPS: u32 = 6_000_000;
+use self::signaling::TreeEvent;
+use self::stats::{SharedStats, StatsHandle};
+
+/// Конфиг стрима (Э5.1) — задаётся из UI перед стартом вместо прежних жёстких
+/// констант; `max_width`/`max_height` — верхняя граница (без апскейла, см.
+/// capture::scaled_dims), фактическое разрешение зависит от источника.
+pub struct StreamConfig {
+    pub max_width: u32,
+    pub max_height: u32,
+    pub fps: u32,
+    pub bitrate_bps: u32,
+}
 
 pub struct BroadcastHandle {
     cap_stop: Arc<AtomicBool>,
@@ -47,10 +57,33 @@ impl BroadcastHandle {
     }
 }
 
+fn describe_source(source: &CaptureSource) -> String {
+    match source {
+        CaptureSource::Monitor { index } => format!("Монитор {index}"),
+        CaptureSource::Window { hwnd } => {
+            let title = capture::window_title(*hwnd);
+            if title.is_empty() { "Окно".to_owned() } else { format!("Окно: {title}") }
+        }
+    }
+}
+
 /// Запускается из async Tauri-команды (уже внутри tokio-runtime — используем
-/// его `Handle` для записи сэмплов из энкодерного потока).
-pub async fn start(stream_id: String, ws_url: String, identity: String, monitor_index: usize) -> Result<BroadcastHandle, String> {
-    let (cap_handle, cap_stop, cap_rx) = capture::spawn_capture(monitor_index, WIDTH, HEIGHT, FPS)?;
+/// его `Handle` для записи сэмплов из энкодерного потока). `app: None` — режим
+/// e2e-смоука (examples/broadcast_smoke.rs), где нет запущенного Tauri-приложения
+/// и эмитить дебаг-события во фронтенд некому.
+pub async fn start(
+    app: Option<AppHandle>,
+    stream_id: String,
+    ws_url: String,
+    identity: String,
+    source: CaptureSource,
+    config: StreamConfig,
+) -> Result<BroadcastHandle, String> {
+    let StreamConfig { max_width, max_height, fps, bitrate_bps } = config;
+    let source_label = describe_source(&source);
+    let stats: StatsHandle = Arc::new(SharedStats::default());
+
+    let (cap_handle, cap_stop, cap_rx) = capture::spawn_capture(source, max_width, max_height, fps, stats.clone())?;
 
     let force_keyframe = Arc::new(AtomicBool::new(true));
     let (cmd_tx, evt_rx) = signaling::connect(ws_url, stream_id.clone(), identity);
@@ -63,6 +96,7 @@ pub async fn start(stream_id: String, ws_url: String, identity: String, monitor_
     let enc_stop2 = enc_stop.clone();
     let rt_handle = tokio::runtime::Handle::current();
     let force_keyframe_enc = force_keyframe.clone();
+    let stats_enc = stats.clone();
 
     let encoder_thread = std::thread::spawn(move || {
         unsafe {
@@ -72,22 +106,36 @@ pub async fn start(stream_id: String, ws_url: String, identity: String, monitor_
                 return;
             }
         }
-        let mut enc = match encoder::H264Encoder::new(WIDTH, HEIGHT, FPS, BITRATE_BPS, force_keyframe_enc) {
-            Ok(e) => e,
-            Err(e) => { log::error!("encoder: init failed: {e}"); return; }
-        };
-        let frame_dur = Duration::from_secs_f64(1.0 / FPS as f64);
-        let mut fps_window_start = std::time::Instant::now();
+        // Энкодер создаём лениво, на первом реальном кадре: фактический размер
+        // зависит от источника (окно почти никогда не равно max_width/max_height,
+        // scaled_dims не апскейлит) — MFT нельзя переинициализировать на лету,
+        // поэтому при смене размера кадр просто дропаем (см. ниже), а не крашим поток.
+        let frame_dur = Duration::from_secs_f64(1.0 / fps as f64);
+        let mut fps_window_start = Instant::now();
         let mut fps_window_count = 0u32;
+        let mut enc: Option<(encoder::H264Encoder, u32, u32)> = None;
         while !enc_stop2.load(Ordering::Relaxed) {
             let frame = match cap_rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(f) => f,
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             };
-            match enc.encode(&frame) {
+            if enc.is_none() {
+                match encoder::H264Encoder::new(frame.width, frame.height, fps, bitrate_bps, force_keyframe_enc.clone()) {
+                    Ok(e) => enc = Some((e, frame.width, frame.height)),
+                    Err(e) => { log::error!("encoder: init failed: {e}"); break; }
+                }
+            }
+            let (encoder_ref, enc_w, enc_h) = enc.as_mut().expect("initialized above");
+            if frame.width != *enc_w || frame.height != *enc_h {
+                log::warn!("encoder: source resize {enc_w}x{enc_h} -> {}x{} не поддержан, кадр отброшен", frame.width, frame.height);
+                continue;
+            }
+            match encoder_ref.encode(&frame) {
                 Ok(chunks) => {
                     for c in chunks {
+                        stats_enc.encoded_frames.fetch_add(1, Ordering::Relaxed);
+                        stats_enc.encoded_bytes.fetch_add(c.data.len() as u64, Ordering::Relaxed);
                         let sample = Sample { data: Bytes::from(c.data), duration: frame_dur, ..Default::default() };
                         let track = video_track.clone();
                         rt_handle.block_on(async { let _ = track.write_sample(&sample).await; });
@@ -100,7 +148,7 @@ pub async fn start(stream_id: String, ws_url: String, identity: String, monitor_
             if elapsed.as_secs() >= 2 {
                 log::info!("encoder: {:.1} fps sent to track", fps_window_count as f64 / elapsed.as_secs_f64());
                 fps_window_count = 0;
-                fps_window_start = std::time::Instant::now();
+                fps_window_start = Instant::now();
             }
         }
         log::info!("encoder thread stopped");
@@ -132,7 +180,8 @@ pub async fn start(stream_id: String, ws_url: String, identity: String, monitor_
     });
 
     let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_signaling_loop(mgr, evt_rx, shutdown_rx));
+    let meta = DebugMeta { stream_id, source_label, target_fps: fps, target_bitrate_bps: bitrate_bps };
+    tokio::spawn(run_signaling_loop(mgr, evt_rx, shutdown_rx, app, stats, meta));
 
     Ok(BroadcastHandle {
         cap_stop,
@@ -143,12 +192,42 @@ pub async fn start(stream_id: String, ws_url: String, identity: String, monitor_
     })
 }
 
+struct DebugMeta {
+    stream_id: String,
+    source_label: String,
+    target_fps: u32,
+    target_bitrate_bps: u32,
+}
+
+/// Снимок для дебаг-панели во фронтенде (Э5.1) — эмитится Tauri-событием
+/// `relay-broadcast-stats` каждый тик; поля camelCase под конвенцию JS-стороны.
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DebugSnapshot {
+    stream_id: String,
+    source: String,
+    width: u32,
+    height: u32,
+    target_fps: u32,
+    capture_fps: f64,
+    encoder_fps: f64,
+    dropped_frames: u64,
+    bitrate_target_bps: u32,
+    bitrate_actual_bps: f64,
+    children: usize,
+}
+
 async fn run_signaling_loop(
     mut mgr: peer::PeerManager,
     mut evt_rx: mpsc::UnboundedReceiver<TreeEvent>,
     mut shutdown_rx: mpsc::UnboundedReceiver<()>,
+    app: Option<AppHandle>,
+    stats: StatsHandle,
+    meta: DebugMeta,
 ) {
-    let mut stats_tick = tokio::time::interval(Duration::from_secs(3));
+    let mut stats_tick = tokio::time::interval(Duration::from_secs(2));
+    let mut prev_at = Instant::now();
+    let (mut prev_cap, mut prev_enc, mut prev_bytes) = (0u64, 0u64, 0u64);
     loop {
         tokio::select! {
             evt = evt_rx.recv() => {
@@ -162,18 +241,44 @@ async fn run_signaling_loop(
                 }
             }
             _ = stats_tick.tick() => {
+                let now = Instant::now();
+                let dt = now.duration_since(prev_at).as_secs_f64().max(0.001);
+                let cap = stats.capture_frames.load(Ordering::Relaxed);
+                let enc = stats.encoded_frames.load(Ordering::Relaxed);
+                let bytes = stats.encoded_bytes.load(Ordering::Relaxed);
+                let snapshot = DebugSnapshot {
+                    stream_id: meta.stream_id.clone(),
+                    source: meta.source_label.clone(),
+                    width: stats.out_width.load(Ordering::Relaxed),
+                    height: stats.out_height.load(Ordering::Relaxed),
+                    target_fps: meta.target_fps,
+                    capture_fps: (cap - prev_cap) as f64 / dt,
+                    encoder_fps: (enc - prev_enc) as f64 / dt,
+                    dropped_frames: stats.capture_drops.load(Ordering::Relaxed),
+                    bitrate_target_bps: meta.target_bitrate_bps,
+                    bitrate_actual_bps: (bytes - prev_bytes) as f64 * 8.0 / dt,
+                    children: mgr.child_count(),
+                };
+                prev_at = now; prev_cap = cap; prev_enc = enc; prev_bytes = bytes;
+                if let Some(app) = &app { let _ = app.emit("relay-broadcast-stats", &snapshot); }
+
                 let to_child: Vec<serde_json::Value> = mgr.child_ids().into_iter()
-                    .map(|id| json!({ "id": id, "bitrate": BITRATE_BPS, "rtt": 0, "loss": 0 }))
+                    .map(|id| json!({ "id": id, "bitrate": meta.target_bitrate_bps, "rtt": 0, "loss": 0 }))
                     .collect();
                 // Сервер сейчас (Э1) принимает и игнорирует stats — задел на Э8 ребаланс.
-                let _ = mgr.send_stats(to_child, BITRATE_BPS);
+                let _ = mgr.send_stats(to_child, meta.target_bitrate_bps);
             }
             _ = shutdown_rx.recv() => { mgr.close_all().await; break; }
         }
     }
     mgr.close_all().await;
+    if let Some(app) = &app { let _ = app.emit("relay-broadcast-stopped", &meta.stream_id); }
 }
 
 pub fn list_monitors() -> Vec<(usize, String)> {
     capture::list_monitors()
+}
+
+pub fn list_windows() -> Vec<(isize, String, String)> {
+    capture::list_windows()
 }

@@ -1,12 +1,16 @@
 // Bisect helper (not part of Э5 deliverable): exercises ONLY screen capture +
 // NV12 conversion, no MF encoder, to isolate which stage corrupts the heap.
 use app_lib::broadcast::capture;
+use app_lib::broadcast::stats::SharedStats;
+use std::sync::Arc;
 use std::time::Duration;
 
 fn main() {
     let monitors = capture::list_monitors();
     println!("monitors: {monitors:?}");
-    let (handle, stop, rx) = capture::spawn_capture(1, 1920, 1080, 30).expect("spawn_capture");
+    let source = capture::CaptureSource::Monitor { index: 1 };
+    let stats = Arc::new(SharedStats::default());
+    let (handle, stop, rx) = capture::spawn_capture(source, 1920, 1080, 30, stats).expect("spawn_capture");
     let mut n = 0;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
