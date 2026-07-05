@@ -8,6 +8,11 @@ import { emoteUrl } from './emotes';
 import { playSound } from './sounds';
 import type { VideoTransport } from './transport/videoTransport';
 import { LiveKitVideoTransport } from './transport/livekitVideo';
+import { TreeVideoTransport } from './transport/treeVideo';
+
+function makeVideoTransport(): VideoTransport {
+  return import.meta.env.VITE_VIDEO_TRANSPORT === 'tree' ? new TreeVideoTransport() : new LiveKitVideoTransport();
+}
 
 export interface PeerState { online: boolean; inVoice: boolean; micMuted: boolean; streaming: boolean }
 export interface StreamInfo { key: string; identity: string; isLocal: boolean }
@@ -53,7 +58,7 @@ export class Engine {
   private micGain: GainNode | null = null;
   private manualMute = false;
 
-  private videoT: VideoTransport = new LiveKitVideoTransport();
+  private videoT: VideoTransport = makeVideoTransport();
   private screenAudioEls = new Map<string, HTMLMediaElement>();
   private watching = new Set<string>();
   private pendingWatch = new Set<string>();
@@ -347,7 +352,9 @@ export class Engine {
   getVideoTrack(key: string) { return this.videoT.getVideoTrack(key); }
 
   watch(identity: string) {
-    const p = this.room?.remoteParticipants.get(identity); if (!p) return;
+    // no `this.room` participant guard here: a tree broadcaster (Э2) is a native peer,
+    // not a LiveKit room participant (voice and video are separate transports now) —
+    // existence is the VideoTransport's job (it no-ops safely on an unknown identity).
     this.watching.add(identity); this.pendingWatch.add(identity);
     this.videoT.watch(identity);
     if (!localStorage.getItem('sprayTip')) { localStorage.setItem('sprayTip', '1'); this.hooks.toast('Кинь эмоут зрителям — 😃 в углу трансляции', 'info'); }
@@ -361,7 +368,6 @@ export class Engine {
     }, 10000);
   }
   closeWatch(identity: string) {
-    const p = this.room?.remoteParticipants.get(identity); if (!p) return;
     this.watching.delete(identity);
     this.videoT.unwatch(identity);
     const m = this.streamWatchers.get(identity); if (m) { m.delete(this.me.username); }
@@ -384,7 +390,8 @@ export class Engine {
     try { await vt.applyConstraints({ frameRate: { ideal: 60, min: 30 } } as any); } catch { try { await vt.applyConstraints({ frameRate: { ideal: 60 } } as any); } catch { /**/ } }
     try { (vt as any).contentHint = 'motion'; } catch { /**/ }
     vt.addEventListener('ended', () => this.stopShare());
-    await this.videoT.startBroadcast(this.me.username, this.screenStream);
+    try { await this.videoT.startBroadcast(this.me.username, this.screenStream); }
+    catch { this.hooks.toast('Вещание доступно только из нативного приложения', 'err'); this.screenStream.getTracks().forEach((t) => t.stop()); this.screenStream = null; return; }
     if (!this.screenStream.getAudioTracks()[0]) this.hooks.toast('Звук экрана не захвачен — включи галку «Поделиться аудио»', 'warn');
     this.keepAliveOn();
     const surf = (vt.getSettings() as any).displaySurface || '';

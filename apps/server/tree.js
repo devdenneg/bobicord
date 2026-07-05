@@ -137,6 +137,13 @@ function attachTreeServer(httpServer, opts) {
     if (p && p.ws.readyState === p.ws.OPEN) { try { p.ws.send(JSON.stringify(obj)); } catch { /**/ } }
   }
 
+  // Э2: lightweight global discovery — lets a browser show a "live" badge / watch button
+  // for a stream it hasn't joined yet. Broadcast to every connected socket (viewers use a
+  // long-lived connection that never sends `join` just to listen for this).
+  function broadcastAll(obj) {
+    for (const [pid] of peers) send(pid, obj);
+  }
+
   function broadcastTreeInfo(streamId) {
     const info = mgr.info(streamId);
     if (!info) return;
@@ -161,6 +168,7 @@ function attachTreeServer(httpServer, opts) {
       send(id, { t: 'assign-parent', streamId, parentId: null });
     }
     broadcastTreeInfo(streamId);
+    if (role === 'broadcaster') broadcastAll({ t: 'stream-live', streamId, identity: node.identity, initial: false });
   }
 
   function onSignal(id, msg) {
@@ -177,6 +185,7 @@ function attachTreeServer(httpServer, opts) {
     const { reparented, dropped, broadcasterLost } = mgr.leave(p.streamId, id);
     if (broadcasterLost) {
       dropped.forEach((peerId) => send(peerId, { t: 'drop-peer', streamId: p.streamId, peerId: id }));
+      broadcastAll({ t: 'stream-end', streamId: p.streamId, identity: p.identity });
       return;
     }
     if (oldParentId) send(oldParentId, { t: 'drop-peer', streamId: p.streamId, peerId: id });
@@ -199,6 +208,11 @@ function attachTreeServer(httpServer, opts) {
     });
     ws.on('close', () => onLeave(id));
     send(id, { t: 'welcome', id, iceServers });
+    for (const [sid, t] of mgr.trees) {
+      if (!t.broadcasterId) continue;
+      const bnode = t.nodes.get(t.broadcasterId);
+      if (bnode) send(id, { t: 'stream-live', streamId: sid, identity: bnode.identity, initial: true });
+    }
   });
 
   return { mgr, peers, wss };

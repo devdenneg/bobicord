@@ -95,7 +95,7 @@ function VoiceControls() {
     <div className="vc-controls">
       <button className={micClass} aria-pressed={muted} data-tip="Микрофон · M" onClick={() => E.toggleMic()}><Icon name={muted ? 'mic-off' : 'mic'} sm /></button>
       <button className={'cbtn' + (eng.deafened ? ' danger-on' : '')} aria-pressed={eng.deafened} data-tip="Заглушить · D" onClick={() => E.toggleDeaf()}><Icon name={eng.deafened ? 'head-off' : 'head'} sm /></button>
-      <button className={'cbtn' + (E.isSharing() ? ' good-on' : '')} data-tip="Трансляция экрана" onClick={() => E.share()}><Icon name={E.isSharing() ? 'screen-stop' : 'screen'} sm /></button>
+      {/* Share screen button removed (Evolution-TZ Э2 / CLAUDE.md invariant 2): browser never broadcasts, native-only. */}
       <button className="cbtn leave-v" data-tip="Выйти из голосового" onClick={() => E.leaveVoice()}><Icon name="leave" sm /></button>
     </div>
   );
@@ -104,16 +104,28 @@ function VoiceControls() {
 /* ---------- Member list (right) — только инфо/статусы, без контролов ---------- */
 function MemberRow({ m }: { m: Member }) {
   const eng = useEngine();
+  const E = getEngine()!;
   const me = useStore((s) => s.me)!;
   const pr = eng.presence[m.username];
   const st = pr?.inVoice ? 'voice' : pr?.online ? 'online' : 'offline';
   const streaming = pr?.streaming;
+  const isLocal = m.username === me.username;
+  const watching = !!eng.watching[m.username];
+  const pending = !!eng.pending[m.username];
   return (
     <div className={'pi ' + st + (streaming ? ' streaming' : '')} data-spk={m.username}>
       <div className="head">
         <Avatar name={m.displayName} ci={m.avatarColor} dot={st} live={streaming} />
-        <div className="nm">{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{m.username === me.username ? ' (ты)' : ''}</div>
+        <div className="nm">{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{isLocal ? ' (ты)' : ''}</div>
       </div>
+      {!isLocal && streaming && !pr?.inVoice ? (
+        <div className="watchrow" style={{ display: 'block', padding: '0 6px 8px 44px' }}>
+          <button className={'wbtn' + (watching ? ' open' : '')} disabled={pending}
+            onClick={() => (watching ? E.closeWatch(m.username) : E.watch(m.username))}>
+            {pending ? <><span className="spin" />...</> : watching ? '◼ Закрыть трансляцию' : '▶ Смотреть трансляцию'}
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }

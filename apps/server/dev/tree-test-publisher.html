@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>tree-test-publisher (dev, Evolution-TZ Э2)</title>
+<style>
+  body { font: 13px/1.4 monospace; background: #111; color: #ddd; padding: 16px; max-width: 720px; }
+  h1 { font-size: 15px; color: #fff; }
+  p.note { color: #999; }
+  label { display: block; margin-top: 10px; }
+  input { width: 100%; box-sizing: border-box; padding: 6px; background: #222; color: #fff; border: 1px solid #444; }
+  button { margin-top: 12px; padding: 8px 14px; cursor: pointer; }
+  video { width: 320px; margin-top: 12px; background: #000; display: block; }
+  #log { margin-top: 12px; white-space: pre-wrap; background: #000; padding: 8px; height: 220px; overflow-y: auto; border: 1px solid #333; }
+  .err { color: #f66; }
+</style>
+</head>
+<body>
+<h1>tree-test-publisher — dev-only, Evolution-TZ Э2</h1>
+<p class="note">
+  Не часть продукта (см. CLAUDE.md: вещание — только из нативного клиента). Существует
+  только чтобы проверить приём H.264 браузером-зрителем из дерева, пока натива (Э5) нет.
+  Работает как «нативный» узел дерева (native:true) — публикует камеру как H.264 и
+  ретранслирует её напрямую своим детям (assign-child).<br>
+  Открывай на <code>http://localhost:3000/dev/tree-test-publisher.html</code> (localhost = secure context, getUserMedia работает без HTTPS).
+</p>
+<label>Session JWT (localStorage.getItem('sess') в вебе, залогинься сначала)
+  <input id="token" placeholder="eyJ...">
+</label>
+<label>streamId / identity (должен совпадать с username участника сервера, чтобы в вебе появилась плашка «live» и кнопка «Смотреть»)
+  <input id="streamId" placeholder="alice">
+</label>
+<button id="startBtn">▶ Начать вещание</button>
+<button id="stopBtn" disabled>◼ Остановить</button>
+<video id="preview" autoplay playsinline muted></video>
+<div id="log"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const logEl = $('log');
+function log(msg, isErr) {
+  const line = document.createElement('div');
+  if (isErr) line.className = 'err';
+  line.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+let ws = null;
+let localStream = null;
+const pcs = new Map(); // childId -> RTCPeerConnection
+
+function preferH264(pc) {
+  const caps = RTCRtpSender.getCapabilities && RTCRtpSender.getCapabilities('video');
+  const h264 = (caps && caps.codecs || []).filter((c) => c.mimeType.toLowerCase() === 'video/h264');
+  if (!h264.length) { log('браузер не даёт выбрать кодек через setCodecPreferences — уйдёт как есть', true); return; }
+  pc.getTransceivers().forEach((t) => {
+    if (!t.sender || !t.sender.track || t.sender.track.kind !== 'video') return;
+    try { t.setCodecPreferences(h264); } catch (e) { log('setCodecPreferences: ' + e, true); }
+  });
+}
+
+async function onAssignChild(streamId, childId) {
+  const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+  pcs.set(childId, pc);
+  localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+  pc.onicecandidate = (e) => {
+    if (!e.candidate) return;
+    ws.send(JSON.stringify({ t: 'ice', streamId, to: childId, candidate: e.candidate }));
+  };
+  pc.onconnectionstatechange = () => log('child ' + childId + ': ' + pc.connectionState);
+  preferH264(pc);
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  ws.send(JSON.stringify({ t: 'sdp', streamId, to: childId, type: 'offer', sdp: pc.localDescription.sdp }));
+  log('offer -> ' + childId);
+}
+
+function start() {
+  const token = $('token').value.trim();
+  const streamId = $('streamId').value.trim();
+  if (!token || !streamId) { log('нужен token и streamId', true); return; }
+
+  navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 }, audio: false }).then((stream) => {
+    localStream = stream;
+    $('preview').srcObject = stream;
+
+    const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    ws = new WebSocket(proto + location.host + '/tree?token=' + encodeURIComponent(token));
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ t: 'join', streamId, role: 'broadcaster', native: true, identity: streamId }));
+      log('joined as broadcaster, streamId=' + streamId);
+    };
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.t === 'welcome') log('welcome, id=' + msg.id);
+      else if (msg.t === 'assign-child') { log('assign-child: ' + msg.childId); onAssignChild(streamId, msg.childId); }
+      else if (msg.t === 'sdp' && msg.type === 'answer') {
+        const pc = pcs.get(msg.from);
+        if (pc) pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp }).catch((e) => log('setRemoteDescription: ' + e, true));
+      } else if (msg.t === 'ice') {
+        const pc = pcs.get(msg.from);
+        if (pc) pc.addIceCandidate(msg.candidate).catch((e) => log('addIceCandidate: ' + e, true));
+      } else if (msg.t === 'drop-peer') {
+        const pc = pcs.get(msg.peerId);
+        if (pc) { pc.close(); pcs.delete(msg.peerId); log('dropped child ' + msg.peerId); }
+      } else if (msg.t === 'tree-info') log('tree-info: depth=' + msg.depth + ' children=' + msg.children);
+    };
+    ws.onclose = () => log('ws closed');
+    ws.onerror = (e) => log('ws error ' + e, true);
+
+    $('startBtn').disabled = true;
+    $('stopBtn').disabled = false;
+  }).catch((e) => log('getUserMedia: ' + e, true));
+}
+
+function stop() {
+  if (ws) { try { ws.send(JSON.stringify({ t: 'leave' })); } catch {} try { ws.close(); } catch {} ws = null; }
+  pcs.forEach((pc) => pc.close()); pcs.clear();
+  if (localStream) { localStream.getTracks().forEach((t) => t.stop()); localStream = null; }
+  $('preview').srcObject = null;
+  $('startBtn').disabled = false;
+  $('stopBtn').disabled = true;
+  log('stopped');
+}
+
+$('startBtn').onclick = start;
+$('stopBtn').onclick = stop;
+</script>
+</body>
+</html>

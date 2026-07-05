@@ -337,6 +337,13 @@ app.get('/api/token', requireAuth, async (req, res) => {
 
 app.get('/healthz', (req, res) => res.send('ok'));
 
+/* ---------- Э2 dev-only harness: browser test-publisher for the relay tree ----------
+ * NOT part of prod (Dockerfile only COPYs index.js+tree.js, this file isn't in the image;
+ * gated on NODE_ENV as a second guard in case someone runs this file directly against prod data). */
+if (process.env.NODE_ENV !== 'production') {
+  app.get('/dev/tree-test-publisher.html', (req, res) => res.sendFile(path.join(__dirname, 'dev', 'tree-test-publisher.html')));
+}
+
 /* ---------- relay-дерево: WS-сигналинг на том же порту (Э1) ---------- */
 const server = http.createServer(app);
 attachTreeServer(server, { sessionSecret: SESSION_SECRET, path: '/tree' });
