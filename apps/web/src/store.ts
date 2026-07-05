@@ -17,6 +17,8 @@ interface AppState {
   members: Member[];
   loadingServer: boolean;
   loadingServerId: string | null;
+  updateReady: boolean;
+  emoteSize: 'sm' | 'md' | 'lg';
   toasts: Toast[];
   modal: null | 'create' | 'join' | 'profile' | 'srvmenu' | 'invite' | 'settings' | 'broadcast';
   joinPrefill: string;
@@ -35,6 +37,7 @@ interface AppState {
   refreshServers: () => Promise<void>;
   refreshMembers: () => Promise<void>;
   setMe: (u: User) => void;
+  setEmoteSize: (s: 'sm' | 'md' | 'lg') => void;
 }
 
 let memberTimer: number | null = null;
@@ -42,7 +45,7 @@ let memberTimer: number | null = null;
 let toastSeq = 1;
 
 export const useStore = create<AppState>((set, get) => ({
-  view: 'loading', me: null, servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, toasts: [], modal: null, joinPrefill: '', broadcastLive: false,
+  view: 'loading', me: null, servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, updateReady: false, emoteSize: (localStorage.getItem('emoteSize') as 'sm' | 'md' | 'lg') || 'md', toasts: [], modal: null, joinPrefill: '', broadcastLive: false,
 
   toast: (text, kind) => {
     const id = toastSeq++;
@@ -54,6 +57,7 @@ export const useStore = create<AppState>((set, get) => ({
   setBroadcastLive: (v) => set({ broadcastLive: v }),
 
   setMe: (u) => { engine?.setMe(u); set({ me: u }); },
+  setEmoteSize: (s) => { localStorage.setItem('emoteSize', s); set({ emoteSize: s }); },
 
   afterAuth: async (user) => {
     engine = new Engine(user, {
@@ -65,7 +69,7 @@ export const useStore = create<AppState>((set, get) => ({
         saveTimer = window.setTimeout(() => { api.putSettings(a.id, vols).catch(() => {}); }, 800);
       },
       peerJoined: (id) => { if (!get().members.some((m) => m.username === id)) get().refreshMembers(); },
-      persistMessage: (text, em) => { const a = get().active; if (a) api.postMessage(a.id, text, em).catch(() => {}); },
+      persistMessage: (text, em, image) => { const a = get().active; if (a) api.postMessage(a.id, text, em, image).catch(() => {}); },
     });
     engine.onEmoteResolve = (name, id) => emoteMap.set(name, id);
     set({ me: user });

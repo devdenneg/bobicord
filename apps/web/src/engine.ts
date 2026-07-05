@@ -3,7 +3,7 @@ import {
   type RemoteParticipant, type Participant, type TrackPublication, type RemoteTrack,
 } from 'livekit-client';
 import type { User, Member, ChatMessage, Emote } from './types';
-import { getSettings } from './settings';
+import { getSettings, setSettings } from './settings';
 import { emoteUrl } from './emotes';
 import { playSound } from './sounds';
 import type { VideoTransport } from './transport/videoTransport';
@@ -29,6 +29,7 @@ export interface Snapshot {
   pending: Record<string, true>;
   watchers: Record<string, { name: string }[]>;
   messages: ChatMessage[];
+  typing: string[];
 }
 
 type EmoteListener = (streamerId: string, emoteId: string, by: string, x: number) => void;
@@ -37,7 +38,7 @@ interface EngineHooks {
   toast: (text: string, kind?: 'ok' | 'warn' | 'err' | 'info') => void;
   saveSettings: (vols: { users: Record<string, number>; streams: Record<string, number> }) => void;
   peerJoined: (identity: string) => void;
-  persistMessage: (text: string, em: Record<string, string>) => void;
+  persistMessage: (text: string, em: Record<string, string>, image?: string) => void;
 }
 
 let msgSeq = 1;
@@ -64,6 +65,8 @@ export class Engine {
   private pendingWatch = new Set<string>();
   private streamWatchers = new Map<string, Map<string, { name: string; ts: number }>>();
   private messages: ChatMessage[] = [];
+  private typingUsers = new Map<string, number>(); // displayName -> expiry ts
+  private lastTypingSent = 0;
 
   private analysers = new Map<string, { an: AnalyserNode; buf: Uint8Array; hold: number; src: MediaStreamAudioSourceNode }>();
   private spCtx: AudioContext | null = null;
@@ -140,6 +143,7 @@ export class Engine {
       connected: !!this.room, inVoice: this.inVoice, deafened: this.deafened,
       localMicMuted: this.localMicMuted(), pttDown: this.pttDown,
       presence, speaking, streams, watching, pending, watchers, messages: this.messages,
+      typing: [...this.typingUsers].filter(([n, exp]) => exp > Date.now() && n !== this.me.displayName).map(([n]) => n),
     };
   }
 
@@ -155,9 +159,10 @@ export class Engine {
       .on(RoomEvent.TrackUnsubscribed, this.onUnsub)
       .on(RoomEvent.ParticipantConnected, (p) => { this.hooks.peerJoined(p.identity); this.hooks.toast((p.name || p.identity) + ' в сети', 'ok'); this.emit(); })
       .on(RoomEvent.ParticipantDisconnected, (p) => { this.cleanupPeer(p.identity); this.emit(); })
-      .on(RoomEvent.TrackMuted, () => this.emit())
+      .on(RoomEvent.TrackMuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p !== this.room?.localParticipant) playSound('mute'); this.emit(); })
       .on(RoomEvent.TrackUnmuted, () => this.emit())
       .on(RoomEvent.TrackPublished, this.onRemotePub)
+      .on(RoomEvent.TrackUnpublished, this.onRemoteUnpub)
       .on(RoomEvent.DataReceived, this.onData);
     await r.connect(url, token, { autoSubscribe: false });
     r.remoteParticipants.forEach((p) => p.trackPublications.forEach((pub) => this.onRemotePub(pub, p, true)));
@@ -224,7 +229,8 @@ export class Engine {
 
   /* ---------- MIC / DEAFEN / PTT ---------- */
   // шумодав/эхо/автогромкость всегда включены (дефолт для всех)
-  private micCapture() { const s = getSettings(); return { deviceId: s.input || undefined, echoCancellation: true, noiseSuppression: true, autoGainControl: true }; }
+  // deviceId через { exact } — иначе браузер игнорит выбор и берёт устройство по умолчанию
+  private micCapture() { const s = getSettings(); return { deviceId: s.input ? { exact: s.input } : undefined, echoCancellation: true, noiseSuppression: true, autoGainControl: true }; }
 
   // строим цепочку: устройство -> analyser(VAD) + gain -> published track
   private async startMic() {
@@ -262,9 +268,15 @@ export class Engine {
     try { this.micGain.gain.setTargetAtTime(target, this.micActx.currentTime, 0.015); } catch { this.micGain.gain.value = target; }
   }
   async reapplyMic() {
-    if (!this.room || !this.inVoice) return;
+    if (!this.room || !this.inVoice) { this.hooks.toast('Микрофон применится при подключении к голосовому'); return; }
     this.stopMic();
-    try { await this.startMic(); } catch { /**/ }
+    try { await this.startMic(); this.hooks.toast('Микрофон переключён', 'ok'); }
+    catch {
+      // выбранное устройство недоступно → откат на дефолтное
+      setSettings({ input: '' });
+      try { await this.startMic(); this.hooks.toast('Выбранный микрофон недоступен — включён дефолтный', 'warn'); }
+      catch { this.hooks.toast('Не удалось включить микрофон', 'err'); }
+    }
     this.emit();
   }
   async toggleMic() {
@@ -331,6 +343,10 @@ export class Engine {
   /* ---------- track events (mic/chat only — video-domain events live in VideoTransport) ---------- */
   private onRemotePub = (pub: TrackPublication, _p: RemoteParticipant, silent?: boolean) => {
     if (pub.source === Track.Source.Microphone) { if (this.inVoice) { try { (pub as any).setSubscribed(true); } catch { /**/ } if (!silent) playSound('join'); } this.emit(); }
+  };
+  private onRemoteUnpub = (pub: TrackPublication, p: RemoteParticipant) => {
+    if (pub.source === Track.Source.Microphone && this.inVoice) playSound('leave'); // вышел из голосового
+    this.emit();
   };
   private onSub = (track: RemoteTrack, pub: TrackPublication, p: RemoteParticipant) => {
     if (track.kind === Track.Kind.Audio) {
@@ -460,32 +476,45 @@ export class Engine {
   async applyOutput() { if (!this.room) return; const out = getSettings().output; try { await this.room.switchActiveDevice('audiooutput', out || 'default'); } catch { /**/ } document.querySelectorAll('#audioSink audio').forEach((a) => { if ((a as any).setSinkId && out) (a as any).setSinkId(out).catch(() => {}); }); }
 
   /* ---------- chat ---------- */
-  private pushMsg(who: string | null, text: string, sys: boolean, color?: number, mineOverride?: boolean) {
+  private pushMsg(who: string | null, text: string, sys: boolean, color?: number, mineOverride?: boolean, img?: string) {
     const mine = mineOverride !== undefined ? mineOverride : (!sys && who === this.me.displayName);
-    this.messages = [...this.messages, { id: msgSeq++, who, text, mine, sys, color }].slice(-500);
+    this.messages = [...this.messages, { id: msgSeq++, who, text, mine, sys, color, img }].slice(-500);
     this.emit();
   }
   sysMsg(text: string) { this.pushMsg(null, text, true); }
-  loadHistory(list: { uid: string; name: string; color: number; text: string; em: Record<string, string> }[]) {
+  loadHistory(list: { uid: string; name: string; color: number; text: string; em: Record<string, string>; img?: string }[]) {
     this.messages = list.map((m) => {
       if (m.em) for (const k in m.em) this.onEmoteResolve?.(k, m.em[k]);
-      return { id: msgSeq++, who: m.name, text: m.text, mine: m.uid === this.me.id, sys: false, color: m.color };
+      return { id: msgSeq++, who: m.name, text: m.text, mine: m.uid === this.me.id, sys: false, color: m.color, img: m.img };
     });
     this.emit();
   }
-  sendChatWithEmotes(text: string, em: Record<string, string>) {
-    if (!text.trim() || !this.room) return;
+  sendChatWithEmotes(text: string, em: Record<string, string>, img?: string) {
+    if ((!text.trim() && !img) || !this.room) return;
     const t = text.trim();
-    this.dataSend({ t: 'chat', name: this.me.displayName, text: t, em, color: this.me.avatarColor });
-    this.pushMsg(this.me.displayName, t, false, this.me.avatarColor, true);
-    this.hooks.persistMessage(t, em);
+    this.dataSend({ t: 'chat', name: this.me.displayName, text: t, em, color: this.me.avatarColor, img });
+    this.pushMsg(this.me.displayName, t, false, this.me.avatarColor, true, img);
+    this.hooks.persistMessage(t, em, img);
+  }
+  sendTyping() {
+    if (!this.room) return;
+    const now = Date.now();
+    if (now - this.lastTypingSent < 2200) return; // троттлинг
+    this.lastTypingSent = now;
+    this.dataSend({ t: 'typing', name: this.me.displayName });
+  }
+  private pruneTyping() {
+    const now = Date.now(); let ch = false;
+    this.typingUsers.forEach((exp, n) => { if (exp <= now) { this.typingUsers.delete(n); ch = true; } });
+    if (ch) this.emit();
   }
   private onData = (payload: Uint8Array) => {
     try {
       const d = JSON.parse(new TextDecoder().decode(payload));
-      if (d.t === 'chat') { if (d.em) for (const k in d.em) this.onEmoteResolve?.(k, d.em[k]); this.pushMsg(d.name, d.text, false, d.color, false); playSound('msg'); }
+      if (d.t === 'chat') { if (d.em) for (const k in d.em) this.onEmoteResolve?.(k, d.em[k]); this.typingUsers.delete(d.name); this.pushMsg(d.name, d.text, false, d.color, false, d.img); playSound('msg'); }
       else if (d.t === 'emote') this.emoteListeners.forEach((f) => f(d.s, d.e, d.by, d.x));
       else if (d.t === 'watch') { const m = this.wset(d.s); if (d.on) m.set(d.id, { name: d.n, ts: Date.now() }); else m.delete(d.id); this.emit(); }
+      else if (d.t === 'typing') { if (d.name && d.name !== this.me.displayName) { this.typingUsers.set(d.name, Date.now() + 3500); this.emit(); setTimeout(() => this.pruneTyping(), 3600); } }
     } catch { /**/ }
   };
   onEmoteResolve: ((name: string, id: string) => void) | null = null;

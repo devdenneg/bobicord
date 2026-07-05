@@ -3,6 +3,7 @@ export interface User {
   username: string;
   displayName: string;
   avatarColor: number;
+  avatarUrl?: string;
   bio: string;
 }
 
@@ -23,6 +24,8 @@ export interface Member {
   username: string;
   displayName: string;
   avatarColor: number;
+  avatarUrl?: string;
+  bio?: string;
   role: string;
 }
 
@@ -51,6 +54,7 @@ export interface ChatMessage {
   mine: boolean;
   sys: boolean;
   color?: number; // avatar color index of author
+  img?: string; // attached image URL
 }
 
 export interface HistoryMessage {
@@ -59,6 +63,7 @@ export interface HistoryMessage {
   color: number;
   text: string;
   em: Record<string, string>;
+  img?: string;
   ts: number;
 }
 

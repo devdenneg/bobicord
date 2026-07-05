@@ -60,24 +60,63 @@ function JoinModal() {
   </Backdrop>;
 }
 
+// кроп картинки в квадрат + даунскейл до size (для аватара)
+function cropSquare(file: File, size: number): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const src = URL.createObjectURL(file);
+    img.onload = () => {
+      const s = Math.min(img.width, img.height);
+      const c = document.createElement('canvas'); c.width = size; c.height = size;
+      const ctx = c.getContext('2d'); if (!ctx) { reject(new Error('canvas')); return; }
+      ctx.drawImage(img, (img.width - s) / 2, (img.height - s) / 2, s, s, 0, 0, size, size);
+      URL.revokeObjectURL(src);
+      c.toBlob((b) => (b ? resolve(b) : reject(new Error('canvas'))), 'image/jpeg', 0.9);
+    };
+    img.onerror = () => { URL.revokeObjectURL(src); reject(new Error('Не удалось прочитать картинку')); };
+    img.src = src;
+  });
+}
+
 function ProfileModal() {
   const close = () => useStore.getState().setModal(null);
   const me = useStore((s) => s.me)!;
-  const [dn, setDn] = useState(me.displayName); const [bio, setBio] = useState(me.bio || ''); const [color, setColor] = useState(me.avatarColor); const [err, setErr] = useState(''); const [busy, setBusy] = useState(false);
+  const [dn, setDn] = useState(me.displayName); const [bio, setBio] = useState(me.bio || ''); const [color, setColor] = useState(me.avatarColor);
+  const [avatarUrl, setAvatarUrl] = useState(me.avatarUrl || '');
+  const [err, setErr] = useState(''); const [busy, setBusy] = useState(false); const [uploading, setUploading] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
+  async function pickAvatar(file: File) {
+    if (!file.type.startsWith('image/')) { setErr('Можно только картинки'); return; }
+    if (file.size > 10 * 1024 * 1024) { setErr('Картинка больше 10 МБ'); return; }
+    setUploading(true); setErr('');
+    try { const blob = await cropSquare(file, 256); const { url } = await api.uploadImage(blob); setAvatarUrl(url); }
+    catch (e: any) { setErr(e?.message || 'Ошибка загрузки'); }
+    finally { setUploading(false); }
+  }
   async function save() {
     setBusy(true);
-    try { const d = await api.updateMe({ displayName: dn.trim(), bio, avatarColor: color }); useStore.getState().setMe(d.user); useStore.getState().refreshMembers(); useStore.getState().refreshServers(); close(); useStore.getState().toast('Профиль сохранён', 'ok'); }
+    try { const d = await api.updateMe({ displayName: dn.trim(), bio, avatarColor: color, avatarUrl }); useStore.getState().setMe(d.user); useStore.getState().refreshMembers(); useStore.getState().refreshServers(); close(); useStore.getState().toast('Профиль сохранён', 'ok'); }
     catch (e: any) { setErr(e.message); } finally { setBusy(false); }
   }
   return <Backdrop onClose={close} label="Профиль">
     <h2>Профиль</h2>
     <div className="fld" style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 18 }}>
-      <div className="me-mini" style={{ width: 64, height: 64, borderRadius: 20, fontSize: 26, background: avColor(dn, color) }}>{initial(dn)}</div>
-      <div><div style={{ fontSize: 12, color: 'var(--muted)' }}>@{me.username}</div><div style={{ fontWeight: 700, fontSize: 18, color: 'var(--txt-h)' }}>{dn}</div></div>
+      <div className="me-mini" style={{ width: 64, height: 64, borderRadius: 20, fontSize: 26, background: avatarUrl ? '#0000' : avColor(dn, color), overflow: 'hidden', position: 'relative', cursor: 'pointer' }} onClick={() => fileRef.current?.click()} title="Загрузить аватар">
+        {avatarUrl ? <img className="avimg" src={avatarUrl} alt="" /> : initial(dn)}
+        {uploading ? <span className="spin" style={{ position: 'absolute', inset: 0, margin: 'auto' }} /> : null}
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <div style={{ fontSize: 12, color: 'var(--muted)' }}>@{me.username}</div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button className="ghost" style={{ margin: 0, padding: '6px 12px', fontSize: 13, width: 'auto' }} disabled={uploading} onClick={() => fileRef.current?.click()}>{uploading ? 'Загрузка…' : 'Загрузить фото'}</button>
+          {avatarUrl ? <button className="ghost" style={{ margin: 0, padding: '6px 12px', fontSize: 13, width: 'auto', color: 'var(--red)' }} onClick={() => setAvatarUrl('')}>Убрать</button> : null}
+        </div>
+      </div>
+      <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; if (f) pickAvatar(f); e.target.value = ''; }} />
     </div>
     <div className="fld"><label>Отображаемое имя</label><input value={dn} maxLength={32} onChange={(e) => setDn(e.target.value)} /></div>
     <div className="fld"><label>О себе</label><textarea value={bio} maxLength={200} rows={2} placeholder="пара слов о себе" onChange={(e) => setBio(e.target.value)} /></div>
-    <div className="fld"><label>Цвет аватара</label><div className="colorpick">{AV_COLORS.map((c, i) => <div key={i} className={'cp' + (i === color ? ' sel' : '')} style={{ background: c }} onClick={() => setColor(i)} />)}</div></div>
+    <div className="fld"><label>Цвет аватара{avatarUrl ? ' (когда без фото)' : ''}</label><div className="colorpick">{AV_COLORS.map((c, i) => <div key={i} className={'cp' + (i === color ? ' sel' : '')} style={{ background: c }} onClick={() => setColor(i)} />)}</div></div>
     <div className="rowbtns"><button className="ghost" style={{ margin: 0, color: 'var(--red)' }} onClick={() => useStore.getState().logout()}>Выйти из аккаунта</button><button className="primary" style={{ margin: 0 }} disabled={busy} onClick={save}>Сохранить</button></div>
     <div className="err">{err}</div>
   </Backdrop>;

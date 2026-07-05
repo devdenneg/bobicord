@@ -1,5 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
 import { useStore, getEngine } from '../store';
+import { api } from '../api';
 import { useEngine } from '../hooks';
 import { Icon } from '../Icon';
 import { avColor, initial, prefersReducedMotion } from '../util';
@@ -9,12 +11,41 @@ import { getSettings, setSettings } from '../settings';
 import { isTauri, onBroadcastStopped } from '../native';
 import type { Emote, Member } from '../types';
 
-function Avatar({ name, ci, size = 32, dot, live }: { name: string; ci: number; size?: number; dot?: string; live?: boolean }) {
+function Avatar({ name, ci, url, size = 32, dot }: { name: string; ci: number; url?: string; size?: number; dot?: string }) {
   return (
-    <div className="av" style={{ width: size, height: size, fontSize: size * 0.44, background: avColor(name, ci) }}>
-      {initial(name)}
+    <div className="av" style={{ width: size, height: size, fontSize: size * 0.44, background: url ? '#0000' : avColor(name, ci) }}>
+      {url ? <img className="avimg" src={url} alt="" /> : initial(name)}
       {dot ? <span className={'sdot ' + dot} /> : null}
-      {live ? <span className="livebadge" /> : null}
+    </div>
+  );
+}
+
+/* ---------- Profile hover card ---------- */
+function useHoverCard() {
+  const [rect, setRect] = useState<DOMRect | null>(null);
+  const ref = useRef<HTMLDivElement>(null);
+  const t = useRef<number | undefined>(undefined);
+  const onEnter = () => { t.current = window.setTimeout(() => { if (ref.current) setRect(ref.current.getBoundingClientRect()); }, 320); };
+  const onLeave = () => { window.clearTimeout(t.current); setRect(null); };
+  useEffect(() => () => window.clearTimeout(t.current), []);
+  return { ref, rect, onEnter, onLeave };
+}
+
+function ProfileCard({ m, rect }: { m: Member; rect: DOMRect }) {
+  const me = useStore((s) => s.me);
+  const bio = ((me && m.username === me.username ? (me.bio || m.bio) : m.bio) || '').trim();
+  const onRight = rect.left < window.innerWidth / 2;
+  const top = Math.max(8, Math.min(rect.top - 6, window.innerHeight - 260));
+  const style: CSSProperties = onRight ? { left: rect.right + 10, top } : { right: window.innerWidth - rect.left + 10, top };
+  return (
+    <div className="pcard" style={style}>
+      <div className="pcard-av" style={{ background: m.avatarUrl ? '#0000' : avColor(m.displayName, m.avatarColor) }}>
+        {m.avatarUrl ? <img className="avimg" src={m.avatarUrl} alt="" /> : initial(m.displayName)}
+      </div>
+      <div className="pcard-name">{m.displayName}</div>
+      <div className="pcard-user">@{m.username}</div>
+      <div className="pcard-label">О себе</div>
+      <div className={'pcard-bio' + (bio ? '' : ' empty')}>{bio || 'Ничего не указано'}</div>
     </div>
   );
 }
@@ -33,31 +64,44 @@ function VoiceParticipantRow({ m }: { m: Member }) {
   const watching = !!eng.watching[m.username];
   const pending = !!eng.pending[m.username];
   const [vol, setVol] = useState(() => Math.round(E.userVolOf(m.username) * 100));
+  const talking = speaking && !pr?.micMuted;
+  const rowId = `vc-${m.username}`;
+  const hc = useHoverCard();
   return (
-    <div className={'pi' + (remote ? ' clickable' : '') + (streaming ? ' streaming' : '') + (speaking ? ' speaking' : '') + (open ? ' open' : '')} data-spk={m.username}>
-      <div className="head" style={{ padding: '5px 6px' }} onClick={() => remote && setOpen((v) => !v)}>
-        <div className="av" style={{ width: 28, height: 28, fontSize: 12, background: avColor(m.displayName, m.avatarColor) }}>{initial(m.displayName)}</div>
-        <div className="nm" style={{ fontSize: 13 }}>{m.displayName}{isLocal ? ' (ты)' : ''}</div>
-        {remote ? <div className="chev">⌄</div> : null}
-        <div className={'micst' + (pr?.micMuted ? ' off' : '')}><Icon name={pr?.micMuted ? 'mic-off' : 'mic'} /></div>
+    <div className={'pi' + (remote ? ' clickable' : '') + (streaming ? ' streaming' : '') + (talking ? ' speaking' : '') + (open ? ' open' : '')} data-spk={m.username}>
+      <div className="head"
+        ref={hc.ref} onMouseEnter={remote ? hc.onEnter : undefined} onMouseLeave={remote ? hc.onLeave : undefined}
+        role={remote ? 'button' : undefined} tabIndex={remote ? 0 : undefined}
+        aria-expanded={remote ? open : undefined} aria-controls={remote ? rowId : undefined}
+        onClick={() => remote && setOpen((v) => !v)}
+        onKeyDown={(e) => { if (remote && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); setOpen((v) => !v); } }}>
+        <div className="av" style={{ background: m.avatarUrl ? '#0000' : avColor(m.displayName, m.avatarColor) }}>
+          {m.avatarUrl ? <img className="avimg" src={m.avatarUrl} alt="" /> : initial(m.displayName)}
+        </div>
+        <div className="nm" title={m.displayName}>{m.displayName}{isLocal ? ' (ты)' : ''}</div>
+        {streaming ? <span className="livepill">LIVE</span> : null}
+        {remote && streaming ? (
+          <button className={'watchbtn' + (watching ? ' on' : '')} disabled={pending}
+            aria-label={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}
+            data-tip={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}
+            onClick={(e) => { e.stopPropagation(); watching ? E.closeWatch(m.username) : E.watch(m.username); }}>
+            {pending ? <span className="spin" style={{ margin: 0, width: 13, height: 13 }} /> : <Icon name={watching ? 'eye-off' : 'eye'} />}
+          </button>
+        ) : null}
+        {remote ? <div className="chev" aria-hidden="true"><Icon name="chevron" sm /></div> : null}
+        <div className={'micst' + (pr?.micMuted ? ' off' : '')} aria-label={pr?.micMuted ? 'Микрофон выключен' : undefined}><Icon name="mic-off" /></div>
       </div>
       {remote ? (
-        <div className="exp" style={{ display: open ? 'flex' : 'none', padding: '2px 6px 8px 44px' }}>
-          <input type="range" min={0} max={200} value={vol} aria-label="Громкость"
+        <div className="exp" id={rowId}>
+          <Icon name="speaker" sm />
+          <input type="range" min={0} max={200} value={vol} aria-label={`Громкость: ${m.displayName}`}
             onChange={(e) => { let v = +e.target.value; if (Math.abs(v - 100) < 4) v = 100; setVol(v); E.setUserVol(m.username, v / 100); }}
             onDoubleClick={() => { setVol(100); E.setUserVol(m.username, 1); }} />
           <span className="vlbl">{vol}%</span>
-          <button className={'mut' + (E.isMutedFor(m.username) ? ' on' : '')} aria-label="Заглушить" onClick={(e) => { e.stopPropagation(); E.toggleUserMute(m.username); }}><Icon name="mic-off" sm /></button>
+          <button className={'mut' + (E.isMutedFor(m.username) ? ' on' : '')} aria-label="Заглушить у себя" data-tip="Не слышать этого человека" onClick={(e) => { e.stopPropagation(); E.toggleUserMute(m.username); }}><Icon name="volume-off" sm /></button>
         </div>
       ) : null}
-      {remote && streaming ? (
-        <div className="watchrow" style={{ display: 'block', padding: '0 6px 8px 44px' }}>
-          <button className={'wbtn' + (watching ? ' open' : '')} disabled={pending}
-            onClick={(e) => { e.stopPropagation(); watching ? E.closeWatch(m.username) : E.watch(m.username); }}>
-            {pending ? <><span className="spin" />...</> : watching ? '◼ Закрыть трансляцию' : '▶ Смотреть трансляцию'}
-          </button>
-        </div>
-      ) : null}
+      {remote && hc.rect ? <ProfileCard m={m} rect={hc.rect} /> : null}
     </div>
   );
 }
@@ -138,23 +182,26 @@ function MemberRow({ m }: { m: Member }) {
   const pr = eng.presence[m.username];
   const st = pr?.inVoice ? 'voice' : pr?.online ? 'online' : 'offline';
   const streaming = pr?.streaming;
-  const isLocal = m.username === me.username;
+  const self = m.username === me.username;
   const watching = !!eng.watching[m.username];
   const pending = !!eng.pending[m.username];
+  const hc = useHoverCard();
   return (
     <div className={'pi ' + st + (streaming ? ' streaming' : '')} data-spk={m.username}>
-      <div className="head">
-        <Avatar name={m.displayName} ci={m.avatarColor} dot={st} live={streaming} />
-        <div className="nm">{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{isLocal ? ' (ты)' : ''}</div>
-      </div>
-      {!isLocal && streaming && !pr?.inVoice ? (
-        <div className="watchrow" style={{ display: 'block', padding: '0 6px 8px 44px' }}>
-          <button className={'wbtn' + (watching ? ' open' : '')} disabled={pending}
-            onClick={() => (watching ? E.closeWatch(m.username) : E.watch(m.username))}>
-            {pending ? <><span className="spin" />...</> : watching ? '◼ Закрыть трансляцию' : '▶ Смотреть трансляцию'}
+      <div className="head" ref={hc.ref} onMouseEnter={self ? undefined : hc.onEnter} onMouseLeave={self ? undefined : hc.onLeave}>
+        <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} dot={st} />
+        <div className="nm">{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div>
+        {streaming ? <span className="livepill">LIVE</span> : null}
+        {!self && streaming && !pr?.inVoice ? (
+          <button className={'watchbtn' + (watching ? ' on' : '')} disabled={pending}
+            aria-label={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}
+            data-tip={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}
+            onClick={(e) => { e.stopPropagation(); watching ? E.closeWatch(m.username) : E.watch(m.username); }}>
+            {pending ? <span className="spin" style={{ margin: 0, width: 13, height: 13 }} /> : <Icon name={watching ? 'eye-off' : 'eye'} />}
           </button>
-        </div>
-      ) : null}
+        ) : null}
+      </div>
+      {!self && hc.rect ? <ProfileCard m={m} rect={hc.rect} /> : null}
     </div>
   );
 }
@@ -181,13 +228,34 @@ function Members() {
 function renderRich(text: string): (string | { emo: string; name: string })[] {
   return text.split(/(\s+)/).map((tok) => (emoteMap.has(tok) ? { emo: emoteMap.get(tok)!, name: tok } : tok));
 }
+function ImageLightbox({ src, onClose }: { src: string; onClose: () => void }) {
+  useEffect(() => {
+    const k = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', k);
+    return () => window.removeEventListener('keydown', k);
+  }, [onClose]);
+  return (
+    <div className="lightbox" role="dialog" aria-modal="true" onClick={onClose}>
+      <button className="lb-close" aria-label="Закрыть" onClick={onClose}><Icon name="close" /></button>
+      <a className="lb-open" href={src} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>Открыть оригинал</a>
+      <img src={src} alt="" onClick={(e) => e.stopPropagation()} />
+    </div>
+  );
+}
+
 function Chat() {
   const eng = useEngine();
   const E = getEngine()!;
   const [text, setText] = useState('');
+  const [lightbox, setLightbox] = useState<string | null>(null);
   const [pickAnchor, setPickAnchor] = useState<DOMRect | null | undefined>(undefined);
   const msgsRef = useRef<HTMLDivElement>(null);
   const emoBtnRef = useRef<HTMLButtonElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
+  const toast = useStore((s) => s.toast);
+  const updateReady = useStore((s) => s.updateReady);
+  const emoteSize = useStore((s) => s.emoteSize);
   const [pill, setPill] = useState(0);
   const atBottomRef = useRef(true);
 
@@ -197,6 +265,12 @@ function Chat() {
     else setPill((p) => p + 1);
   }, [eng.messages.length]);
 
+  // при открытии сервера — всегда в конец (к последним сообщениям)
+  useLayoutEffect(() => {
+    const el = msgsRef.current; if (el) { el.scrollTop = el.scrollHeight; atBottomRef.current = true; setPill(0); }
+    requestAnimationFrame(() => { const e2 = msgsRef.current; if (e2 && atBottomRef.current) e2.scrollTop = e2.scrollHeight; });
+  }, []);
+
   function send() {
     const t = text.trim(); if (!t) return;
     const em: Record<string, string> = {};
@@ -205,10 +279,25 @@ function Chat() {
     setText('');
   }
 
+  async function sendImage(file: File) {
+    if (!file.type.startsWith('image/')) { toast('Можно только картинки', 'warn'); return; }
+    if (file.size > 10 * 1024 * 1024) { toast('Картинка больше 10 МБ', 'warn'); return; }
+    setUploading(true);
+    try {
+      const { url } = await api.uploadImage(file);
+      const t = text.trim();
+      const em: Record<string, string> = {};
+      t.split(/\s+/).forEach((w) => { if (emoteMap.has(w)) em[w] = emoteMap.get(w)!; });
+      E.sendChatWithEmotes(t, em, url);
+      setText('');
+    } catch (e: any) { toast(e?.message || 'Не удалось загрузить', 'err'); }
+    finally { setUploading(false); }
+  }
+
   return (
     <div id="chat">
       <div id="msgs" ref={msgsRef} onScroll={(e) => { const m = e.currentTarget; atBottomRef.current = m.scrollTop + m.clientHeight >= m.scrollHeight - 120; if (atBottomRef.current) setPill(0); }}>
-        <div className="msgs-inner">
+        <div className={'msgs-inner emo-' + emoteSize}>
           {eng.messages.length === 0 ? <div id="chatEmpty">Общий чат сервера. Пиши сюда — видят все участники онлайн.</div> : null}
           {eng.messages.map((m) => {
             const parts = m.sys ? null : renderRich(m.text);
@@ -216,23 +305,47 @@ function Chat() {
             return (
               <div className={'msg' + (m.sys ? ' sys' : '') + (m.mine ? ' me' : '')} key={m.id}>
                 {!m.sys ? <div className="who" style={{ color: avColor(m.who || '', m.color) }}>{m.who}</div> : null}
-                <div className={'tx' + (big ? ' big' : '')}>
-                  {m.sys ? m.text : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : <img key={i} className="emo" src={emoteUrl(p.emo)} alt={p.name} title={p.name} loading="lazy" decoding="async" />))}
-                </div>
+                {m.sys || m.text ? (
+                  <div className={'tx' + (big ? ' big' : '')}>
+                    {m.sys ? m.text : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : <img key={i} className="emo" src={emoteUrl(p.emo)} alt={p.name} title={p.name} loading="lazy" decoding="async" />))}
+                  </div>
+                ) : null}
+                {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox(m.img!)}><img className="msg-img" src={m.img} alt="" loading="lazy" onLoad={() => { const el = msgsRef.current; if (el && atBottomRef.current) el.scrollTop = el.scrollHeight; }} /></button> : null}
               </div>
             );
           })}
         </div>
       </div>
       {pill > 0 ? <button id="newpill" className="show" onClick={() => { const m = msgsRef.current!; m.scrollTop = m.scrollHeight; setPill(0); atBottomRef.current = true; }}>↓ Новые сообщения ({pill})</button> : null}
+      {eng.typing.length > 0 ? (
+        <div className="typing-ind">
+          <span className="tdots"><i /><i /><i /></span>
+          {eng.typing.length === 1 ? `${eng.typing[0]} печатает…`
+            : eng.typing.length === 2 ? `${eng.typing[0]} и ${eng.typing[1]} печатают…`
+              : 'Несколько человек печатают…'}
+        </div>
+      ) : null}
+      {updateReady ? (
+        <div className="update-bar">
+          <div className="ub-ic"><Icon name="refresh" /></div>
+          <div className="ub-txt"><b>Вышло обновление приложения</b><span>Обнови страницу, чтобы продолжить — <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd></span></div>
+          <button className="ub-btn" onClick={() => location.reload()}><Icon name="refresh" sm />Обновить</button>
+        </div>
+      ) : (
       <div className="chat-in">
         <button id="emoBtn" ref={emoBtnRef} className={'emo-toggle' + (pickAnchor !== undefined ? ' on' : '')} data-tip="7TV эмоуты"
           onClick={() => setPickAnchor((a) => (a === undefined ? emoBtnRef.current!.getBoundingClientRect() : undefined))}><Icon name="smile" /></button>
-        <input id="msgIn" placeholder="Сообщение..." maxLength={1000} value={text} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && send()} />
+        <button className="emo-toggle" data-tip="Прикрепить картинку (или Ctrl+V)" disabled={uploading} onClick={() => fileRef.current?.click()}>{uploading ? <span className="spin" /> : <Icon name="image" />}</button>
+        <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; if (f) sendImage(f); e.target.value = ''; }} />
+        <input id="msgIn" placeholder="Сообщение..." maxLength={1000} autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false} name="chat-message" value={text}
+          onPaste={(e) => { const items = e.clipboardData?.items; if (!items) return; for (let i = 0; i < items.length; i++) { if (items[i].type.startsWith('image/')) { const f = items[i].getAsFile(); if (f) { e.preventDefault(); sendImage(f); } break; } } }}
+          onChange={(e) => { setText(e.target.value); if (e.target.value.trim()) E.sendTyping(); }} onKeyDown={(e) => e.key === 'Enter' && send()} />
         <button id="sendBtn" className={text.trim() ? '' : 'empty'} data-tip="Отправить · Enter" onClick={send}><Icon name="send" /></button>
       </div>
-      {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} onClose={() => setPickAnchor(undefined)}
+      )}
+      {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} sizePicker onClose={() => setPickAnchor(undefined)}
         onPick={(e: Emote) => { setText((t) => t + (t && !t.endsWith(' ') ? ' ' : '') + e.name + ' '); }} /> : null}
+      {lightbox ? <ImageLightbox src={lightbox} onClose={() => setLightbox(null)} /> : null}
     </div>
   );
 }
@@ -287,9 +400,15 @@ function StreamTile({ streamKey, identity, isLocal }: { streamKey: string; ident
 
   const watchers = eng.watchers[identity] || [];
   const [svol, setSvol] = useState(() => Math.round(E.streamVolOf(identity) * 100));
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [prevVol, setPrevVol] = useState(100);
+  const setVol = (v: number) => { setSvol(v); E.setStreamVol(identity, v / 100); };
+  const toggleMute = () => { if (svol > 0) { setPrevVol(svol); setVol(0); } else setVol(prevVol || 100); };
+  const toggleFs = () => { document.fullscreenElement ? document.exitFullscreen() : wrapRef.current?.requestFullscreen().catch(() => {}); };
+  const togglePip = () => { if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => {}); else vidRef.current?.requestPictureInPicture().catch(() => {}); };
 
   return (
-    <div className="vwrap" onDoubleClick={(e) => { const w = e.currentTarget; document.fullscreenElement ? document.exitFullscreen() : w.requestFullscreen().catch(() => {}); }}>
+    <div className="vwrap" ref={wrapRef} onDoubleClick={toggleFs}>
       <video ref={vidRef} autoPlay playsInline />
       <div className="lbl">🖥 {name}{isLocal ? ' (ты)' : ''}</div>
       <div className="emolayer">
@@ -302,15 +421,28 @@ function StreamTile({ streamKey, identity, isLocal }: { streamKey: string; ident
       <div className="watchers">
         {watchers.slice(0, 4).map((w, i) => <div className="wa" key={i} style={{ background: avColor(w.name) }} title={w.name}>{initial(w.name)}</div>)}
         <div className="wc"><Icon name="eye" sm />{watchers.length}</div>
+        {watchers.length ? (
+          <div className="wtip">
+            <div className="wtip-h">Смотрят · {watchers.length}</div>
+            {watchers.map((w, i) => <div className="wtip-row" key={i}><span className="wtip-av" style={{ background: avColor(w.name) }}>{initial(w.name)}</span>{w.name}</div>)}
+          </div>
+        ) : null}
       </div>
       <button className="spray" ref={sprayRef} data-tip="Кинуть эмоут — увидят все зрители"
         onClick={(e) => { e.stopPropagation(); setPickAnchor((a) => (a === undefined ? sprayRef.current!.getBoundingClientRect() : undefined)); }}><Icon name="smile" sm /></button>
-      {!isLocal ? (
-        <>
-          <div className="vvol">🔊 <input type="range" min={0} max={100} value={svol} onChange={(e) => { setSvol(+e.target.value); E.setStreamVol(identity, +e.target.value / 100); }} /><span style={{ minWidth: 30, textAlign: 'right' }}>{svol}%</span></div>
-          <button className="vclose" title="Закрыть трансляцию" onClick={() => E.closeWatch(identity)}>✕</button>
-        </>
-      ) : null}
+      <div className="vbar" onDoubleClick={(e) => e.stopPropagation()}>
+        {!isLocal ? (
+          <>
+            <button className="vb-btn" data-tip={svol === 0 ? 'Включить звук' : 'Заглушить'} onClick={toggleMute}><Icon name={svol === 0 ? 'volume-off' : 'speaker'} sm /></button>
+            <input className="vb-vol" type="range" min={0} max={100} value={svol} onChange={(e) => setVol(+e.target.value)} />
+            <span className="vb-pct">{svol}%</span>
+          </>
+        ) : <span className="vb-lbl">🖥 Твоя трансляция</span>}
+        <div className="vb-sp" />
+        <button className="vb-btn" data-tip="Картинка-в-картинке" onClick={togglePip}><Icon name="pip" sm /></button>
+        <button className="vb-btn" data-tip="Во весь экран" onClick={toggleFs}><Icon name="fullscreen" sm /></button>
+        {!isLocal ? <button className="vb-btn danger" data-tip="Закрыть трансляцию" onClick={() => E.closeWatch(identity)}><Icon name="close" sm /></button> : null}
+      </div>
       {stats ? <div className="stats" dangerouslySetInnerHTML={{ __html: stats }} /> : null}
       {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} onClose={() => setPickAnchor(undefined)} onPick={(em) => E.fling(identity, em)} /> : null}
     </div>
@@ -351,12 +483,36 @@ function Channels() {
       <div className="ch-body"><VoiceCard /></div>
       {eng.inVoice ? <div className="voice-bar"><VoiceControls /></div> : null}
       <div className="user-panel">
-        <div className="up-av" onClick={() => setModal('profile')} style={{ background: avColor(me.displayName, me.avatarColor) }}>{initial(me.displayName)}</div>
         <div className="up-i" onClick={() => setModal('profile')}><b>{me.displayName}</b><span>В сети</span></div>
         <button className="up-btn" data-tip="Настройки звука" onClick={() => setModal('settings')}><Icon name="gear" sm /></button>
       </div>
     </div>
   );
+}
+
+function useResizable(key: string, def: number, min: number, max: number, edge: 'right' | 'left') {
+  const [w, setW] = useState<number>(() => {
+    const s = Number(localStorage.getItem(key));
+    return s >= min && s <= max ? s : def;
+  });
+  useEffect(() => { localStorage.setItem(key, String(w)); }, [key, w]);
+  const onDown = (e: ReactMouseEvent) => {
+    e.preventDefault();
+    const sx = e.clientX, sw = w;
+    const move = (ev: MouseEvent) => {
+      const d = edge === 'right' ? ev.clientX - sx : sx - ev.clientX;
+      setW(Math.min(max, Math.max(min, sw + d)));
+    };
+    const up = () => {
+      window.removeEventListener('mousemove', move);
+      window.removeEventListener('mouseup', up);
+      document.body.classList.remove('resizing');
+    };
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
+    document.body.classList.add('resizing');
+  };
+  return { w, onDown };
 }
 
 export function ServerView() {
@@ -367,22 +523,31 @@ export function ServerView() {
   const hasStreams = eng.streams.length > 0;
   const split = hasStreams && !minimized;
   useEffect(() => { if (!hasStreams) setMin(false); }, [hasStreams]);
+  const chan = useResizable('w:channels', 290, 270, 440, 'right');
+  const mem = useResizable('w:members', 244, 216, 400, 'left');
+  const chatW = useResizable('w:chat', 340, 260, 640, 'left');
+  const [membersOpen, setMembersOpen] = useState(() => localStorage.getItem('membersOpen') !== '0');
+  useEffect(() => { localStorage.setItem('membersOpen', membersOpen ? '1' : '0'); }, [membersOpen]);
 
   return (
     <>
-      <section id="server" className={'on' + (mtab !== 'main' ? ' tab-' + mtab : '')}>
+      <section id="server" className={'on' + (mtab !== 'main' ? ' tab-' + mtab : '')} style={{ '--ch-w': chan.w + 'px', '--mem-w': (membersOpen ? mem.w : 0) + 'px' } as CSSProperties}>
         <Channels />
         <div id="main">
           <div className="srv-header">
             <div className="hn"><Icon name="hash" sm /><span>общий</span></div>
+            <button className={'hbtn' + (membersOpen ? ' on' : '')} data-tip={membersOpen ? 'Скрыть участников' : 'Показать участников'} onClick={() => setMembersOpen((v) => !v)}><Icon name="users" sm /></button>
             <button className="hbtn" data-tip="Пригласить" onClick={() => setModal('invite')}><Icon name="link" sm /></button>
           </div>
-          <div id="content" className={split ? 'split' : ''}>
+          <div id="content" className={split ? 'split' : ''} style={{ '--chat-w': chatW.w + 'px' } as CSSProperties}>
             <Stage minimized={minimized} setMin={setMin} />
+            {split ? <div className="rz rz-chat" onMouseDown={chatW.onDown} title="Потяни — ширина чата" /> : null}
             <Chat />
           </div>
         </div>
-        <Members />
+        {membersOpen ? <Members /> : null}
+        <div className="rz rz-ch" onMouseDown={chan.onDown} title="Потяни, чтобы изменить ширину" />
+        {membersOpen ? <div className="rz rz-mem" onMouseDown={mem.onDown} title="Потяни, чтобы изменить ширину" /> : null}
       </section>
       <div id="mtabs">
         <button className={mtab === 'channels' ? 'active' : ''} onClick={() => setMtab('channels')}><Icon name="speaker" />Голос</button>

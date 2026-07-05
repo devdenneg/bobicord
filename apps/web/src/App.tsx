@@ -29,7 +29,7 @@ function Rail() {
         </button>
       ))}
       <button className="railbtn rail-add tip-l" data-tip="Создать / войти" onClick={() => setModal('create')}><Icon name="plus" /></button>
-      <button className="railbtn rail-me tip-l" data-tip="Профиль" style={{ background: avColor(me.displayName, me.avatarColor) }} onClick={() => setModal('profile')}>{initial(me.displayName)}</button>
+      <button className="railbtn rail-me tip-l" data-tip="Профиль" style={{ background: me.avatarUrl ? '#0000' : avColor(me.displayName, me.avatarColor) }} onClick={() => setModal('profile')}>{me.avatarUrl ? <img className="avimg" src={me.avatarUrl} alt="" /> : initial(me.displayName)}</button>
     </nav>
   );
 }
