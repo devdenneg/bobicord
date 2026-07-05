@@ -19,8 +19,8 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 use webrtc::media::Sample;
-use windows::Win32::Media::MediaFoundation::{MFStartup, MFSTARTUP_FULL, MFSTARTUP_NOSOCKET, MF_VERSION};
-use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+use windows::Win32::Media::MediaFoundation::{MFShutdown, MFStartup, MFSTARTUP_FULL, MFSTARTUP_NOSOCKET, MF_VERSION};
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
 pub use audio::AudioSource;
 pub use capture::CaptureSource;
@@ -45,7 +45,7 @@ pub struct BroadcastHandle {
     cap_stop: Arc<AtomicBool>,
     enc_stop: Arc<AtomicBool>,
     audio_stop: Arc<AtomicBool>,
-    shutdown_tx: mpsc::UnboundedSender<()>,
+    shutdown_tx: mpsc::UnboundedSender<Option<String>>,
     threads: Vec<std::thread::JoinHandle<()>>,
     /// Снимается run_signaling_loop сам, в конце (и при штатном стопе, и при
     /// фатальном отказе энкодера/захвата) — до её появления `stop_broadcast`
@@ -64,7 +64,7 @@ impl BroadcastHandle {
         self.cap_stop.store(true, Ordering::Relaxed);
         self.enc_stop.store(true, Ordering::Relaxed);
         self.audio_stop.store(true, Ordering::Relaxed);
-        let _ = self.shutdown_tx.send(());
+        let _ = self.shutdown_tx.send(None); // штатный стоп по кнопке — без причины
         for t in self.threads.drain(..) {
             let _ = tokio::task::spawn_blocking(move || t.join()).await;
         }
@@ -125,7 +125,7 @@ pub async fn start(
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             if let Err(e) = MFStartup(MF_VERSION, MFSTARTUP_FULL | MFSTARTUP_NOSOCKET) {
                 log::error!("encoder: MFStartup failed: {e}");
-                let _ = shutdown_tx_enc.send(());
+                let _ = shutdown_tx_enc.send(Some(format!("не удалось инициализировать Media Foundation: {e}")));
                 return;
             }
         }
@@ -161,7 +161,7 @@ pub async fn start(
                     // без этого сигнала сигналинг остался бы жить, а состояние вещания
                     // зависло бы навсегда ("уже вещаем" на повторном старте).
                     log::warn!("encoder: capture channel disconnected, stopping broadcast");
-                    let _ = shutdown_tx_enc.send(());
+                    let _ = shutdown_tx_enc.send(Some("захват прервался (окно/монитор пропали)".into()));
                     break;
                 }
             };
@@ -197,7 +197,7 @@ pub async fn start(
                     Ok(e) => { force_keyframe_enc.store(true, Ordering::Relaxed); enc = Some((e, frame.width, frame.height)); }
                     Err(e) => {
                         log::error!("encoder: init failed: {e}");
-                        let _ = shutdown_tx_enc.send(());
+                        let _ = shutdown_tx_enc.send(Some(format!("не удалось создать H264-энкодер: {e}")));
                         break;
                     }
                 }
@@ -229,6 +229,14 @@ pub async fn start(
             }
         }
         log::info!("encoder thread stopped");
+        // MFStartup — счётчик ссылок на весь MF-плейтформ процесса; без парного
+        // MFShutdown платформа (и, судя по всему, состояние аппаратного MFT-активатора)
+        // не освобождается между сессиями вещания в рамках одного процесса — второй
+        // старт в том же запуске приложения ловил рабочий, но "грязный" энкодер и падал
+        // почти сразу. drop(enc) — ДО shutdown: транспорт (COM Release внутри Drop
+        // H264Encoder) должен уйти раньше, чем платформа встанет.
+        drop(enc);
+        unsafe { let _ = MFShutdown(); CoUninitialize(); }
     });
 
     let audio_stop = Arc::new(AtomicBool::new(false));
@@ -299,7 +307,7 @@ struct DebugSnapshot {
 async fn run_signaling_loop(
     mut mgr: peer::PeerManager,
     mut evt_rx: mpsc::UnboundedReceiver<TreeEvent>,
-    mut shutdown_rx: mpsc::UnboundedReceiver<()>,
+    mut shutdown_rx: mpsc::UnboundedReceiver<Option<String>>,
     app: Option<AppHandle>,
     stats: StatsHandle,
     meta: DebugMeta,
@@ -308,6 +316,9 @@ async fn run_signaling_loop(
     let mut stats_tick = tokio::time::interval(Duration::from_secs(2));
     let mut prev_at = Instant::now();
     let (mut prev_cap, mut prev_enc, mut prev_bytes) = (0u64, 0u64, 0u64);
+    // Причина самостоятельной остановки — раньше фронт узнавал только "трансляция
+    // умерла", без "почему", и молча откатывался в форму настроек (см. StopInfo ниже).
+    let mut stop_reason: Option<String> = None;
     loop {
         tokio::select! {
             evt = evt_rx.recv() => {
@@ -317,7 +328,10 @@ async fn run_signaling_loop(
                     Some(TreeEvent::SdpAnswer { from, sdp }) => mgr.on_sdp_answer(from, sdp).await,
                     Some(TreeEvent::Ice { from, candidate }) => mgr.on_ice(from, candidate).await,
                     Some(TreeEvent::DropPeer { peer_id }) => mgr.on_drop_peer(peer_id).await,
-                    Some(TreeEvent::Closed) | None => break,
+                    Some(TreeEvent::Closed) | None => {
+                        stop_reason = Some("сигнальный канал с сервером оборвался".into());
+                        break;
+                    }
                 }
             }
             _ = stats_tick.tick() => {
@@ -348,12 +362,30 @@ async fn run_signaling_loop(
                 // Сервер сейчас (Э1) принимает и игнорирует stats — задел на Э8 ребаланс.
                 let _ = mgr.send_stats(to_child, meta.target_bitrate_bps);
             }
-            _ = shutdown_rx.recv() => { mgr.send_leave(); mgr.close_all().await; break; }
+            reason = shutdown_rx.recv() => {
+                stop_reason = reason.flatten();
+                mgr.send_leave();
+                mgr.close_all().await;
+                break;
+            }
         }
     }
     mgr.close_all().await;
     alive.store(false, Ordering::Relaxed);
-    if let Some(app) = &app { let _ = app.emit("relay-broadcast-stopped", &meta.stream_id); }
+    if let Some(app) = &app {
+        let info = StopInfo { stream_id: meta.stream_id.clone(), reason: stop_reason };
+        let _ = app.emit("relay-broadcast-stopped", &info);
+    }
+}
+
+#[derive(serde::Serialize)]
+struct StopInfo {
+    #[serde(rename = "streamId")]
+    stream_id: String,
+    /// `None` — штатный стоп по кнопке; `Some(...)` — трансляция умерла сама
+    /// (см. места `shutdown_tx.send(Some(...))` ниже), фронт показывает причину
+    /// вместо молчаливого отката в форму настроек.
+    reason: Option<String>,
 }
 
 pub fn list_monitors() -> Vec<(usize, String)> {

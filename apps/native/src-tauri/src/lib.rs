@@ -84,13 +84,18 @@ pub fn run() {
   tauri::Builder::default()
     .manage(BroadcastState(Mutex::new(None)))
     .setup(|app| {
-      if cfg!(debug_assertions) {
-        app.handle().plugin(
-          tauri_plugin_log::Builder::default()
-            .level(log::LevelFilter::Info)
-            .build(),
-        )?;
-      }
+      // Раньше висело за cfg!(debug_assertions) — в релизном билде (то, что реально
+      // ставят и тестируют) log::info!/warn!/error! по всему broadcast:: были
+      // молчаливым no-op: логгер вообще не регистрировался. Из "5 попыток стартовать"
+      // и "падает через секунду" нельзя было понять причину без пересборки в dev-режиме.
+      // Теперь плагин всегда активен — пишет в app_log_dir (см. tauri::path::app_log_dir,
+      // обычно %LOCALAPPDATA%\com.relayapp.desktop\logs\*.log) плюс stdout, если запущен
+      // из консоли.
+      app.handle().plugin(
+        tauri_plugin_log::Builder::default()
+          .level(log::LevelFilter::Info)
+          .build(),
+      )?;
       Ok(())
     })
     .invoke_handler(tauri::generate_handler![ping, list_monitors, list_windows, start_broadcast, stop_broadcast])

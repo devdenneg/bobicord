@@ -146,8 +146,12 @@ function NativeBroadcastButton() {
   // уже мертва.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    onBroadcastStopped(() => {
+    onBroadcastStopped((info) => {
       useStore.getState().setBroadcastLive(false);
+      // reason == null — штатный стоп по кнопке, тост не нужен. Иначе трансляция
+      // умерла сама (энкодер/захват/сигналинг) — раньше это било молча, юзер видел
+      // только откат в форму настроек без объяснения.
+      if (info.reason) useStore.getState().toast('Трансляция остановлена: ' + info.reason, 'err');
       stopNativeBroadcast().catch(() => {});
     }).then((u) => (unlisten = u));
     return () => unlisten?.();

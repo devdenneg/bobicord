@@ -56,9 +56,15 @@ export async function onBroadcastStats(cb: (stats: BroadcastStats) => void): Pro
   return unlisten;
 }
 
-export async function onBroadcastStopped(cb: (streamId: string) => void): Promise<() => void> {
+export interface BroadcastStopInfo {
+  streamId: string;
+  /** `null` — штатный стоп по кнопке; строка — трансляция умерла сама (см. mod.rs). */
+  reason: string | null;
+}
+
+export async function onBroadcastStopped(cb: (info: BroadcastStopInfo) => void): Promise<() => void> {
   const { listen } = await import('@tauri-apps/api/event');
-  const unlisten = await listen<string>('relay-broadcast-stopped', (e) => cb(e.payload));
+  const unlisten = await listen<BroadcastStopInfo>('relay-broadcast-stopped', (e) => cb(e.payload));
   return unlisten;
 }
 
