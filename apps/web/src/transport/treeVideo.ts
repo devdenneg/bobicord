@@ -3,6 +3,7 @@ import type { VideoTransport } from './videoTransport';
 import { MediaStreamVideoHandle } from './videoTransport';
 import type { StreamInfo } from '../engine';
 import { getToken } from '../api';
+import { detectSymmetricNat } from './natDetect';
 
 /**
  * P2P relay-tree implementation of VideoTransport (Evolution-TZ Э2).
@@ -24,11 +25,14 @@ import { getToken } from '../api';
  * into our SDP answer.
  */
 
+const DEFAULT_ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
+
 interface WatchState {
   ws: WebSocket;
   pc: RTCPeerConnection | null;
   parentId: string | null;
   closed: boolean;
+  iceServers: RTCIceServer[];
 }
 
 function treeWsUrl(): string {
@@ -54,6 +58,8 @@ export class TreeVideoTransport implements VideoTransport {
   private discoveryWs: WebSocket | null = null;
   private liveStreams = new Set<string>();
   private watches = new Map<string, WatchState>();
+  private iceServers: RTCIceServer[] = DEFAULT_ICE_SERVERS;
+  private natProbe: Promise<boolean> = Promise.resolve(false);
 
   private videoTracks = new Map<string, MediaStreamVideoHandle>();
   private streamInfoByKey = new Map<string, StreamInfo>();
@@ -67,6 +73,7 @@ export class TreeVideoTransport implements VideoTransport {
   attach(_room: Room, ctx: { me: string }) {
     this.me = ctx.me;
     this.closed = false;
+    this.natProbe = detectSymmetricNat();
     this.openDiscovery();
   }
   onRoomConnected() { /* discovery socket already syncs live-stream backlog on connect */ }
@@ -87,7 +94,9 @@ export class TreeVideoTransport implements VideoTransport {
     this.discoveryWs = ws;
     ws.onmessage = (ev) => {
       let msg: any; try { msg = JSON.parse(ev.data); } catch { return; }
-      if (msg.t === 'stream-live') {
+      if (msg.t === 'welcome') {
+        if (Array.isArray(msg.iceServers) && msg.iceServers.length) this.iceServers = msg.iceServers;
+      } else if (msg.t === 'stream-live') {
         if (!this.liveStreams.has(msg.identity)) {
           this.liveStreams.add(msg.identity);
           this.streamStartCbs.forEach((cb) => cb(msg.identity, !!msg.initial));
@@ -115,10 +124,13 @@ export class TreeVideoTransport implements VideoTransport {
     if (this.watches.has(streamId)) return;
     let ws: WebSocket;
     try { ws = new WebSocket(treeWsUrl()); } catch { return; }
-    const st: WatchState = { ws, pc: null, parentId: null, closed: false };
+    const st: WatchState = { ws, pc: null, parentId: null, closed: false, iceServers: this.iceServers };
     this.watches.set(streamId, st);
 
-    ws.onopen = () => { try { ws.send(JSON.stringify({ t: 'join', streamId, role: 'viewer', native: false, identity: this.me })); } catch { /**/ } };
+    ws.onopen = async () => {
+      const symmetricNat = await this.natProbe.catch(() => false);
+      try { ws.send(JSON.stringify({ t: 'join', streamId, role: 'viewer', native: false, identity: this.me, symmetricNat })); } catch { /**/ }
+    };
     ws.onmessage = (ev) => this.onWatchMessage(streamId, st, ev);
     ws.onclose = () => { if (!st.closed) this.teardownWatch(streamId, st); };
     ws.onerror = () => { try { ws.close(); } catch { /**/ } };
@@ -142,6 +154,10 @@ export class TreeVideoTransport implements VideoTransport {
   private onWatchMessage(streamId: string, st: WatchState, ev: MessageEvent) {
     let msg: any; try { msg = JSON.parse(ev.data); } catch { return; }
     switch (msg.t) {
+      case 'welcome': {
+        if (Array.isArray(msg.iceServers) && msg.iceServers.length) st.iceServers = msg.iceServers;
+        break;
+      }
       case 'assign-parent': {
         if (st.pc) { try { st.pc.close(); } catch { /**/ } st.pc = null; this.delVideo(streamId); }
         st.parentId = msg.parentId || null;
@@ -162,7 +178,7 @@ export class TreeVideoTransport implements VideoTransport {
   }
 
   private async onParentOffer(streamId: string, st: WatchState, sdp: string) {
-    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    const pc = new RTCPeerConnection({ iceServers: st.iceServers.length ? st.iceServers : DEFAULT_ICE_SERVERS });
     st.pc = pc;
     pc.onicecandidate = (e) => {
       if (!e.candidate || !st.parentId) return;

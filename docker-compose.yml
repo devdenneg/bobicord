@@ -17,10 +17,26 @@ services:
       - LK_SECRET=${LK_SECRET}
       - SESSION_SECRET=${SESSION_SECRET}
       - LK_WS_URL=${LK_WS_URL}
+      - TURN_SECRET=${TURN_SECRET}
+      - TURN_URLS=${TURN_URLS}
+      - TURN_TTL_SEC=${TURN_TTL_SEC:-600}
     volumes:
       - ./data:/app/data
     ports:
       - "127.0.0.1:3000:3000"
+
+  # STUN/TURN для P2P relay-дерева (Evolution-TZ Э3). host-сеть — coturn сам слушает
+  # 3478 (STUN/TURN) + min-port..max-port (relay). Секрет — только через env (CLAUDE.md).
+  coturn:
+    image: coturn/coturn:latest
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./coturn/turnserver.conf:/etc/turnserver.conf:ro
+    environment:
+      - TURN_SECRET=${TURN_SECRET}
+      - TURN_REALM=${TURN_REALM:-relayapp.local}
+    command: ["sh", "-c", "turnserver -c /etc/turnserver.conf --static-auth-secret=$${TURN_SECRET} --realm=$${TURN_REALM}"]
 
   caddy:
     # запечены статика фронта + Caddyfile

@@ -6,6 +6,7 @@
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { WebSocketServer } = require('ws');
+const { turnCredentials } = require('./turnCreds');
 
 const MAX_DEPTH = 4;          // инвариант CLAUDE.md: задержка видео <= 3с => глубина дерева <= 4
 const NATIVE_CAPACITY = 4;    // сколько детей держит нативный (нужен ретранслирующий) узел
@@ -29,7 +30,10 @@ class TreeManager {
   // Вещатель — это тоже нативный узел (браузер не вещает, инвариант 2), поэтому его
   // ёмкость такая же, как у любого нативного ретранслятора — иначе все зрители
   // цепляются прямо к корню и дерево никогда не ветвится.
+  // Симметричный NAT (Evolution-TZ Э3): узел за ним недостижим как relay-родитель для
+  // третьих сторон, даже если он нативный — всегда лист, capacity 0.
   capacityOf(node) {
+    if (node.symmetricNat) return 0;
     return node.native ? NATIVE_CAPACITY : BROWSER_CAPACITY;
   }
 
@@ -115,21 +119,36 @@ function attachTreeServer(httpServer, opts) {
   const {
     sessionSecret,
     path: wsPath = '/tree',
-    iceServers = [{ urls: 'stun:stun.l.google.com:19302' }],
+    stunServers = [{ urls: 'stun:stun.l.google.com:19302' }],
+    turnSecret = '',           // Evolution-TZ Э3: пусто = TURN отключён (только STUN, как раньше)
+    turnUrls = [],             // ['turn:host:3478', 'turn:host:3478?transport=tcp']
+    turnTtlSec = 600,          // короткий TTL временных TURN-креды
   } = opts;
 
   const wss = new WebSocketServer({ noServer: true });
   const mgr = new TreeManager();
   const peers = new Map(); // peerId -> node {id, ws, streamId, role, native, identity, parent, children, depth}
 
+  // Временные TURN-креды выдаются только авторизованным (Evolution-TZ Э3 AC) — привязаны
+  // к id из уже проверенного session-JWT, генерятся заново на каждое ws-подключение.
+  function iceServersFor(uid) {
+    if (!turnSecret || !turnUrls.length) return stunServers;
+    const { username, credential } = turnCredentials(turnSecret, uid, turnTtlSec);
+    return [...stunServers, ...turnUrls.map((urls) => ({ urls, username, credential }))];
+  }
+
   httpServer.on('upgrade', (req, socket, head) => {
     let url;
     try { url = new URL(req.url, 'http://internal'); } catch { socket.destroy(); return; }
     if (url.pathname !== wsPath) return; // не наш путь — оставляем другим upgrade-хендлерам
     const token = url.searchParams.get('token') || '';
-    try { jwt.verify(token, sessionSecret); }
+    let payload;
+    try { payload = jwt.verify(token, sessionSecret); }
     catch { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      ws.__uid = payload.id || payload.u || 'anon';
+      wss.emit('connection', ws, req);
+    });
   });
 
   function send(peerId, obj) {
@@ -155,10 +174,11 @@ function attachTreeServer(httpServer, opts) {
   }
 
   function onJoin(id, msg) {
-    const { streamId, role, native, identity } = msg;
+    const { streamId, role, native, identity, symmetricNat } = msg;
     if (!streamId || (role !== 'broadcaster' && role !== 'viewer')) return;
     const node = peers.get(id);
     node.streamId = streamId; node.role = role; node.native = !!native; node.identity = identity || id;
+    node.symmetricNat = !!symmetricNat;
     node.parent = null; node.children = []; node.depth = 0;
     const { parent } = mgr.join(streamId, node);
     if (parent) {
@@ -207,7 +227,7 @@ function attachTreeServer(httpServer, opts) {
       // msg.t === 'stats' — Э1: принимаем и игнорируем; BWE-ребаланс это Э8
     });
     ws.on('close', () => onLeave(id));
-    send(id, { t: 'welcome', id, iceServers });
+    send(id, { t: 'welcome', id, iceServers: iceServersFor(ws.__uid) });
     for (const [sid, t] of mgr.trees) {
       if (!t.broadcasterId) continue;
       const bnode = t.nodes.get(t.broadcasterId);

@@ -17,6 +17,10 @@ const SECRET = process.env.LK_SECRET;
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-secret-change';
 // вынесено в env (CLAUDE.md инвариант); дефолт — текущий прод-хост, для обратной совместимости
 const WS_URL = process.env.LK_WS_URL || 'wss://138-16-170-21.sslip.io';
+// coturn (Evolution-TZ Э3): TURN_SECRET пусто => TURN отключён, дереву достаётся только STUN
+const TURN_SECRET = process.env.TURN_SECRET || '';
+const TURN_URLS = (process.env.TURN_URLS || '').split(',').map((s) => s.trim()).filter(Boolean);
+const TURN_TTL_SEC = parseInt(process.env.TURN_TTL_SEC || '600', 10);
 const DATA_DIR = '/app/data';
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
 
@@ -346,5 +350,11 @@ if (process.env.NODE_ENV !== 'production') {
 
 /* ---------- relay-дерево: WS-сигналинг на том же порту (Э1) ---------- */
 const server = http.createServer(app);
-attachTreeServer(server, { sessionSecret: SESSION_SECRET, path: '/tree' });
+attachTreeServer(server, {
+  sessionSecret: SESSION_SECRET,
+  path: '/tree',
+  turnSecret: TURN_SECRET,
+  turnUrls: TURN_URLS,
+  turnTtlSec: TURN_TTL_SEC,
+});
 server.listen(3000, () => console.log('voice API (servers+sqlite) + tree ws on :3000'));
