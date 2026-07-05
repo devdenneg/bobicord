@@ -80,7 +80,7 @@ export function BroadcastModal() {
     return <Backdrop onClose={close} label="Трансляция">
       <h2><Icon name="screen" />Трансляция идёт</h2>
       {stats ? <div className="dbgstats">
-        <div><span>Источник</span><b>{stats.source}</b></div>
+        <div><span>Источник</span><b title={stats.source}>{stats.source}</b></div>
         <div><span>Разрешение</span><b>{stats.width}×{stats.height}</b></div>
         <div><span>Захват</span><b>{stats.captureFps.toFixed(1)} fps</b></div>
         <div><span>Кодер</span><b>{stats.encoderFps.toFixed(1)} / {stats.targetFps} fps</b></div>

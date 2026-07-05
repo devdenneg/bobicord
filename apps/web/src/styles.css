@@ -349,10 +349,10 @@
   .kbd{display:inline-block;background:var(--panel3);border:1px solid var(--line);border-bottom-width:2px;border-radius:6px;padding:1px 7px;font-size:12px;font-weight:600}
   .seg{display:flex;gap:4px;background:var(--panel2);padding:4px;border-radius:var(--r-sm)}
   .seg button{flex:1;background:transparent;color:var(--muted);padding:8px;font-size:13.5px}.seg button.active{background:var(--accent);color:#fff}
-  .dbgstats{display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;background:var(--panel2);border-radius:var(--r-sm);padding:12px 14px;margin-bottom:4px;font-variant-numeric:tabular-nums}
-  .dbgstats div{display:flex;justify-content:space-between;gap:8px;font-size:12.5px}
-  .dbgstats span{color:var(--muted)}
-  .dbgstats b{color:var(--txt-h);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .dbgstats{display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;background:var(--panel2);border-radius:var(--r-sm);padding:12px 14px;margin-bottom:4px;font-variant-numeric:tabular-nums;max-width:100%}
+  .dbgstats div{display:flex;justify-content:space-between;gap:8px;font-size:12.5px;min-width:0}
+  .dbgstats span{color:var(--muted);flex:0 0 auto}
+  .dbgstats b{color:var(--txt-h);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1 1 auto;text-align:right}
   .ptt-hint{font-size:12.5px;color:var(--muted);margin-top:6px}
   .invite-box{display:flex;gap:8px;margin-top:8px}
   .invite-box input{font-family:ui-monospace,monospace;font-size:13px}
