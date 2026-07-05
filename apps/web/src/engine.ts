@@ -34,6 +34,12 @@ export interface Snapshot {
 }
 
 type EmoteListener = (streamerId: string, emoteId: string, by: string, x: number, size?: string) => void;
+export type LevelListener = (level: number, open: boolean, threshold: number) => void;
+
+// шкала чувствительности ввода: rms(0..1) -> dB(-80..0) -> норм.уровень(0..1), сравнимый с порогом
+const MIN_DB = -50; // шкала подогнана под уже обработанный браузером сигнал (AGC/NS), а не под теоретический динамический диапазон
+function rmsToDb(rms: number): number { if (rms <= 0) return MIN_DB; return Math.max(MIN_DB, Math.min(0, 20 * Math.log10(rms))); }
+function dbToNorm(db: number): number { return Math.max(0, Math.min(1, (db - MIN_DB) / -MIN_DB)); }
 
 interface EngineHooks {
   toast: (text: string, kind?: 'ok' | 'warn' | 'err' | 'info') => void;
@@ -89,6 +95,20 @@ export class Engine {
   private emoteListeners = new Set<EmoteListener>();
   private subs = new Set<() => void>();
   private snap: Snapshot;
+
+  // VAD-гейт микрофона (режим "активация голосом"): передаём звук только выше порога чувствительности
+  private vadOpen = false;
+  private noiseFloorDb = MIN_DB + 20; // адаптивная оценка шумового фона для авто-режима
+
+  // живой индикатор уровня для настроек (работает и вне звонка — временный захват микрофона)
+  private levelListeners = new Set<LevelListener>();
+  private levelCtx: AudioContext | null = null;
+  private levelAnalyser: AnalyserNode | null = null;
+  private levelBuf: Uint8Array | null = null;
+  private levelSrc: MediaStreamAudioSourceNode | null = null;
+  private levelStream: MediaStream | null = null;
+  private levelRAF: number | null = null;
+  private levelHold = 0;
 
   constructor(me: User, hooks: EngineHooks) {
     this.me = me;
@@ -186,6 +206,8 @@ export class Engine {
     this.analysers.forEach((o) => { try { o.src.disconnect(); } catch { /**/ } });
     this.analysers.clear(); this.speakingSet.clear();
     if (this.spRAF) cancelAnimationFrame(this.spRAF); this.spRAF = null;
+    this.vadOpen = false;
+    this.stopLevelMeter();
     this.keepAliveOff();
     document.querySelectorAll('#audioSink audio').forEach((a) => a.remove());
     this.videoT.detach(); this.screenAudioEls.clear();
@@ -263,19 +285,78 @@ export class Engine {
     const p = this.micPub();
     if (p && p.track) { try { this.room?.localParticipant.unpublishTrack(p.track, true); } catch { /**/ } }
     this.detachAnalyser(this.me.username);
+    this.vadOpen = false;
     if (this.micRaw) { this.micRaw.getTracks().forEach((t) => t.stop()); this.micRaw = null; }
     if (this.micActx) { try { this.micActx.close(); } catch { /**/ } this.micActx = null; }
     this.micGain = null;
   }
-  // gain = громкость микрофона, 0 при муте/оглушении/PTT-не-нажат
+  // gain = 1 (передаём) либо 0 (мут/оглушение/PTT-не-нажат/ниже порога чувствительности)
   private applyGate() {
     if (!this.micGain || !this.micActx) return;
     const s = getSettings();
-    const vol = (s.micVolume ?? 100) / 100;
-    let target = vol;
+    let target = 1;
     if (this.manualMute || this.deafened) target = 0;
-    else if (s.mode === 'ptt' && !this.pttDown) target = 0;
+    else if (s.mode === 'ptt') target = this.pttDown ? 1 : 0;
+    else if (!this.vadOpen) target = 0; // "активация голосом": ниже порога чувствительности — не передаём
     try { this.micGain.gain.setTargetAtTime(target, this.micActx.currentTime, 0.015); } catch { this.micGain.gain.value = target; }
+  }
+  // текущий порог чувствительности (0..1), с учётом авто-режима
+  private thresholdNorm(): number {
+    const s = getSettings();
+    if (s.sensitivityAuto) return dbToNorm(this.noiseFloorDb + 9); // запас над шумовым фоном
+    return (s.sensitivity ?? 10) / 100;
+  }
+  // адаптивная оценка шумового фона: ВНИЗ инертно (реальный шум дрожит случайно от тика к тику — резкая
+  // реакция вниз заставляла порог дёргаться вслед за каждым микро-провалом), вверх ещё медленнее — короткая
+  // фраза (секунды) почти не сдвигает порог, а вот постоянный посторонний шум со временем всё же "выучивается"
+  private updateNoiseFloor(db: number) {
+    this.noiseFloorDb += (db - this.noiseFloorDb) * (db < this.noiseFloorDb ? 0.04 : 0.0015);
+    this.noiseFloorDb = Math.max(MIN_DB, Math.min(0, this.noiseFloorDb));
+  }
+  // ---------- живой индикатор уровня для настроек ----------
+  // В звонке данные уже шлёт локальный анализатор из spLoop. Вне звонка поднимаем временный захват микрофона.
+  onInputLevel(cb: LevelListener): () => void {
+    this.levelListeners.add(cb);
+    if (!this.inVoice && this.levelListeners.size === 1) this.startLevelMeter();
+    return () => { this.levelListeners.delete(cb); if (this.levelListeners.size === 0) this.stopLevelMeter(); };
+  }
+  private startLevelMeter() {
+    navigator.mediaDevices.getUserMedia({ audio: this.micCapture() }).then((stream) => {
+      if (this.levelListeners.size === 0 || this.inVoice) { stream.getTracks().forEach((t) => t.stop()); return; }
+      this.levelStream = stream;
+      try {
+        this.levelCtx = this.levelCtx || new AudioContext();
+        this.levelCtx.resume?.().catch(() => {});
+        this.levelSrc = this.levelCtx.createMediaStreamSource(stream);
+        this.levelAnalyser = this.levelCtx.createAnalyser();
+        this.levelAnalyser.fftSize = 512; this.levelAnalyser.smoothingTimeConstant = 0.5;
+        this.levelBuf = new Uint8Array(this.levelAnalyser.fftSize);
+        this.levelSrc.connect(this.levelAnalyser);
+        this.levelRAF = requestAnimationFrame(this.levelLoop);
+      } catch { /**/ }
+    }).catch(() => this.hooks.toast('Нет доступа к микрофону', 'err'));
+  }
+  private levelLoop = () => {
+    if (!this.levelAnalyser || !this.levelBuf) return;
+    this.levelAnalyser.getByteTimeDomainData(this.levelBuf as any);
+    let sum = 0; for (let i = 0; i < this.levelBuf.length; i++) { const v = (this.levelBuf[i] - 128) / 128; sum += v * v; }
+    const rms = Math.sqrt(sum / this.levelBuf.length);
+    const db = rmsToDb(rms);
+    const norm = dbToNorm(db);
+    const threshold = this.thresholdNorm();
+    const on = norm >= threshold;
+    if (on) this.levelHold = 24; else if (this.levelHold > 0) this.levelHold--;
+    const open = this.levelHold > 0 || on;
+    this.updateNoiseFloor(db);
+    this.levelListeners.forEach((f) => f(norm, open, threshold));
+    this.levelRAF = requestAnimationFrame(this.levelLoop);
+  };
+  private stopLevelMeter() {
+    if (this.levelRAF) cancelAnimationFrame(this.levelRAF); this.levelRAF = null;
+    if (this.levelSrc) { try { this.levelSrc.disconnect(); } catch { /**/ } this.levelSrc = null; }
+    this.levelAnalyser = null; this.levelBuf = null; this.levelHold = 0;
+    if (this.levelStream) { this.levelStream.getTracks().forEach((t) => t.stop()); this.levelStream = null; }
+    if (this.levelCtx) { try { this.levelCtx.close(); } catch { /**/ } this.levelCtx = null; }
   }
   async reapplyMic() {
     if (!this.room || !this.inVoice) { this.hooks.toast('Микрофон применится при подключении к голосовому'); return; }
@@ -313,7 +394,6 @@ export class Engine {
   pttPress() { if (getSettings().mode !== 'ptt' || !this.inVoice || this.deafened || this.pttDown) return; this.pttDown = true; this.applyGate(); this.emit(); }
   pttRelease() { if (getSettings().mode !== 'ptt' || !this.inVoice || !this.pttDown) return; this.pttDown = false; this.applyGate(); this.emit(); }
   onModeChanged() { if (!this.inVoice) return; this.pttDown = false; this.applyGate(); this.emit(); }
-  applyMicVolume() { this.applyGate(); }
 
   /* ---------- speaking ---------- */
   private attachAnalyser(username: string, mst: MediaStreamTrack) {
@@ -339,9 +419,22 @@ export class Engine {
       this.analysers.forEach((o, id) => {
         o.an.getByteTimeDomainData(o.buf as any);
         let sum = 0; for (let i = 0; i < o.buf.length; i++) { const v = (o.buf[i] - 128) / 128; sum += v * v; }
-        const rms = Math.sqrt(sum / o.buf.length); const on = rms > 0.018;
+        const rms = Math.sqrt(sum / o.buf.length);
+        const isMe = id === this.me.username;
+        let on: boolean, norm = 0, threshold = 0, db = 0;
+        if (isMe) {
+          db = rmsToDb(rms);
+          norm = dbToNorm(db);
+          threshold = this.thresholdNorm();
+          on = norm >= threshold;
+        } else on = rms > 0.018;
         if (on) o.hold = 8; else if (o.hold > 0) o.hold--;
         const spk = o.hold > 0 || on;
+        if (isMe) {
+          this.updateNoiseFloor(db); // подъём мед­ленный (см. updateNoiseFloor) — фраза его не продавит, а постоянный шум со временем перекроет
+          this.levelListeners.forEach((f) => f(norm, spk, threshold));
+          if (spk !== this.vadOpen) { this.vadOpen = spk; this.applyGate(); }
+        }
         if (spk && !this.speakingSet.has(id)) { this.speakingSet.add(id); changed = true; }
         else if (!spk && this.speakingSet.has(id)) { this.speakingSet.delete(id); changed = true; }
       });

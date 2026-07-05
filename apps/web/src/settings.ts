@@ -1,6 +1,6 @@
 import type { AudioSettings } from './types';
 
-const DEF: AudioSettings = { input: '', output: '', ns: true, ec: true, agc: true, mode: 'voice', pttKey: 'KeyV', master: 100, micVolume: 100, notifyVolume: 60 };
+const DEF: AudioSettings = { input: '', output: '', ns: true, ec: true, agc: true, mode: 'voice', pttKey: 'KeyV', master: 100, sensitivity: 10, sensitivityAuto: true, notifyVolume: 60 };
 let s: AudioSettings = { ...DEF, ...JSON.parse(localStorage.getItem('audioSettings') || '{}') };
 const subs = new Set<() => void>();
 
