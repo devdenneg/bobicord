@@ -15,6 +15,7 @@ export default defineConfig(({ mode, command }) => {
     plugins: [react()],
     build: { outDir: 'dist', sourcemap: false, chunkSizeWarningLimit: 1500 },
     server: {
+      host: '127.0.0.1', // IPv4-loopback явно (иначе Node на Windows биндит только IPv6 [::1] → refused)
       proxy: {
         // /api, /twirp на бэк; голос/LiveKit — напрямую по wss из токена
         '/api': { target, changeOrigin: true, secure: true },
