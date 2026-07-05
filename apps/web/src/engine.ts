@@ -390,11 +390,11 @@ export class Engine {
   async share() {
     if (!this.inVoice) { this.hooks.toast('Сначала подключись к голосовому', 'warn'); return; }
     if (this.screenStream || this.room!.localParticipant.isScreenShareEnabled) { await this.stopShare(); this.hooks.toast('Трансляция остановлена'); return; }
-    // Убираем голоса собеседников из захвата звука ДВУМЯ способами:
-    // 1) restrictOwnAudio (Chrome 140+) — нативно вырезает звук нашей вкладки (WebRTC <audio>) из системного захвата, полное качество.
-    // 2) echoCancellation:true — AEC как надёжная база (работает и на старом Chrome). Проверено: без него голоса просачиваются.
+    // Убираем голоса собеседников из захвата звука:
+    // restrictOwnAudio (Chrome 140+) — нативно вырезает звук нашей вкладки (WebRTC <audio>) БЕЗ ducking, полное качество.
+    // AEC включаем ТОЛЬКО как fallback на старом Chrome — он приглушает звук игры когда кто-то говорит (ducking).
     const supRestrict = !!(navigator.mediaDevices.getSupportedConstraints() as any).restrictOwnAudio;
-    const audioC: any = { echoCancellation: true, noiseSuppression: false, autoGainControl: false };
+    const audioC: any = { echoCancellation: !supRestrict, noiseSuppression: false, autoGainControl: false };
     if (supRestrict) audioC.restrictOwnAudio = true;
     try {
       this.screenStream = await navigator.mediaDevices.getDisplayMedia({
