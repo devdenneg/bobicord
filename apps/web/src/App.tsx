@@ -64,7 +64,7 @@ function Home() {
   const setModal = useStore((s) => s.setModal);
   return (
     <section id="home">
-      <div className="home-top"><h1>Привет, {me.displayName}!</h1>
+      <div className="home-top"><h1>Здарова, {me.displayName}!</h1>
         <button className="hbtn" style={{ background: 'var(--panel2)', padding: '8px 14px' }} onClick={() => setModal('profile')}>Профиль</button></div>
       <div className="home-inner">
         <div className="home-actions">
