@@ -1,0 +1,19 @@
+# замени домен на свой (или IP.sslip.io)
+138-16-170-21.sslip.io {
+	handle /rtc* {
+		reverse_proxy 127.0.0.1:7880
+	}
+	handle /twirp* {
+		reverse_proxy 127.0.0.1:7880
+	}
+	handle /api* {
+		reverse_proxy 127.0.0.1:3000
+	}
+	handle {
+		root * /opt/voice/web
+		header Cache-Control "no-store, no-cache, must-revalidate"
+		header Pragma "no-cache"
+		try_files {path} /index.html
+		file_server
+	}
+}

@@ -1,0 +1,36 @@
+services:
+  livekit:
+    image: livekit/livekit-server:latest
+    command: --config /etc/livekit.yaml
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      # своя копия livekit.example.yaml с реальными ключами (в .gitignore)
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+
+  token:
+    build: ./apps/server
+    restart: unless-stopped
+    environment:
+      - LK_KEY=${LK_KEY}
+      - LK_SECRET=${LK_SECRET}
+      - SESSION_SECRET=${SESSION_SECRET}
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "127.0.0.1:3000:3000"
+
+  caddy:
+    image: caddy:2
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # собранный фронт: npm run build в apps/web -> apps/web/dist
+      - ./apps/web/dist:/opt/voice/web:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

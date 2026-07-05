@@ -1,0 +1,17 @@
+{
+  "name": "Voice — голосовой чат",
+  "short_name": "Voice",
+  "description": "Голос, чат и трансляции для своей команды",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0c0e13",
+  "theme_color": "#0c0e13",
+  "lang": "ru",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable" }
+  ]
+}

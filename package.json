@@ -1,0 +1,14 @@
+{
+  "name": "voice",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Discord-подобный голос / чат / стриминг на LiveKit",
+  "scripts": {
+    "dev": "npm --prefix apps/web run dev",
+    "build": "npm --prefix apps/web run build",
+    "typecheck": "npm --prefix apps/web run typecheck",
+    "up": "docker compose up -d --build",
+    "down": "docker compose down",
+    "logs": "docker compose logs -f"
+  }
+}

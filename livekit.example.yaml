@@ -1,0 +1,12 @@
+port: 7880
+rtc:
+  tcp_port: 7881
+  interfaces:
+    includes: [ens3]          # сетевой интерфейс сервера (ip addr)
+  udp_port: 7882
+  node_ip: YOUR_SERVER_IP     # публичный IP VPS
+keys:
+  # ключ: секрет — ДОЛЖНЫ совпадать с LK_KEY / LK_SECRET в .env
+  APIxxxxxxxxxxxx: your_livekit_secret_here
+logging:
+  level: info

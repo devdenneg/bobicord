@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+apps/web/dist/
+
+# secrets & runtime config (копируй из *.example)
+.env
+livekit.yaml
+
+# database / runtime data
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# logs & os
+*.log
+.DS_Store
+Thumbs.db
+
+# editors
+.vscode/
+.idea/
