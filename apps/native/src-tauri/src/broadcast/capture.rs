@@ -202,8 +202,10 @@ pub fn list_monitors() -> Vec<(usize, String)> {
 }
 
 /// Список окон, доступных для захвата (видимые top-level, не наши же — см.
-/// `Window::is_valid`), с заголовком и именем процесса для UI выбора источника.
-pub fn list_windows() -> Vec<(isize, String, String)> {
+/// `Window::is_valid`), с заголовком, именем процесса и его PID — заголовок+имя
+/// для UI выбора источника видео, PID — для выбора источника аудио (Э5.2:
+/// process-loopback INCLUDE на процесс игры вместо ненадёжного EXCLUDE себя).
+pub fn list_windows() -> Vec<(isize, String, String, u32)> {
     Window::enumerate()
         .map(|ws| {
             ws.into_iter()
@@ -213,7 +215,8 @@ pub fn list_windows() -> Vec<(isize, String, String)> {
                         return None;
                     }
                     let process = w.process_name().unwrap_or_default();
-                    Some((w.as_raw_hwnd() as isize, title, process))
+                    let pid = w.process_id().unwrap_or(0);
+                    Some((w.as_raw_hwnd() as isize, title, process, pid))
                 })
                 .collect()
         })

@@ -20,8 +20,13 @@ interface SavedConfig {
   resolution: Resolution;
   fps: 30 | 60;
   bitrateMbps: 3 | 6 | 10;
+  /** exclude — весь звук кроме RelayApp (WASAPI EXCLUDE себя, не всегда надёжно
+   *  фильтрует наш многопроцессный WebView2, см. CLAUDE.md инвариант 6 и audio.rs).
+   *  include — только звук выбранного процесса (надёжнее). */
+  audioMode: 'exclude' | 'include';
+  audioPid: number | null;
 }
-const DEF_CONFIG: SavedConfig = { sourceKind: 'monitor', monitorIndex: 0, windowHwnd: null, resolution: '1080', fps: 30, bitrateMbps: 6 };
+const DEF_CONFIG: SavedConfig = { sourceKind: 'monitor', monitorIndex: 0, windowHwnd: null, resolution: '1080', fps: 30, bitrateMbps: 6, audioMode: 'exclude', audioPid: null };
 function loadConfig(): SavedConfig {
   try { return { ...DEF_CONFIG, ...JSON.parse(localStorage.getItem('bcastConfig') || '{}') }; } catch { return DEF_CONFIG; }
 }
@@ -58,7 +63,8 @@ export function BroadcastModal() {
       const source: CaptureSource = cfg.sourceKind === 'window' && cfg.windowHwnd != null
         ? { kind: 'window', hwnd: cfg.windowHwnd }
         : { kind: 'monitor', index: cfg.monitorIndex };
-      await startNativeBroadcast(me.username, me.username, { source, maxWidth: res.w, maxHeight: res.h, fps: cfg.fps, bitrateBps: cfg.bitrateMbps * 1_000_000 });
+      const audioTargetPid = cfg.audioMode === 'include' && cfg.audioPid != null ? cfg.audioPid : undefined;
+      await startNativeBroadcast(me.username, me.username, { source, maxWidth: res.w, maxHeight: res.h, fps: cfg.fps, bitrateBps: cfg.bitrateMbps * 1_000_000, audioTargetPid });
       saveConfig(cfg);
       useStore.getState().setBroadcastLive(true);
     } catch (e: any) { setErr(String(e?.message || e)); } finally { setBusy(false); }
@@ -124,9 +130,21 @@ export function BroadcastModal() {
     <div className="fld"><label>Битрейт</label>
       <div className="seg">{[3, 6, 10].map((b) => <button key={b} className={cfg.bitrateMbps === b ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, bitrateMbps: b as 3 | 6 | 10 }))}>{b} Мбит/с</button>)}</div>
     </div>
+    <div className="fld"><label>Звук</label>
+      <div className="seg">
+        <button className={cfg.audioMode === 'exclude' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, audioMode: 'exclude' }))}>Всё, кроме RelayApp</button>
+        <button className={cfg.audioMode === 'include' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, audioMode: 'include' }))}>Только процесс</button>
+      </div>
+      {cfg.audioMode === 'include'
+        ? <select style={{ marginTop: 8 }} value={cfg.audioPid ?? ''} onChange={(e) => setCfg((c) => ({ ...c, audioPid: +e.target.value }))}>
+            <option value="" disabled>Выбери процесс</option>
+            {windows.map((w) => <option key={w.hwnd} value={w.pid}>{w.title}{w.process ? ` — ${w.process}` : ''}</option>)}
+          </select>
+        : <p className="msub" style={{ margin: '8px 0 0' }}>Если слышен свой голос/чужие стримы в записи — переключи на «Только процесс» и выбери игру.</p>}
+    </div>
     <div className="rowbtns">
       <button className="ghost" style={{ margin: 0 }} onClick={close}>Отмена</button>
-      <button className="primary" style={{ margin: 0 }} disabled={busy || (cfg.sourceKind === 'window' && cfg.windowHwnd == null)} onClick={start}>Начать трансляцию</button>
+      <button className="primary" style={{ margin: 0 }} disabled={busy || (cfg.sourceKind === 'window' && cfg.windowHwnd == null) || (cfg.audioMode === 'include' && cfg.audioPid == null)} onClick={start}>Начать трансляцию</button>
     </div>
     <div className="err">{err}</div>
   </Backdrop>;

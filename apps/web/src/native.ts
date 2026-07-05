@@ -16,7 +16,7 @@ export async function listMonitors(): Promise<MonitorInfo[]> {
   return invoke<MonitorInfo[]>('list_monitors');
 }
 
-export interface WindowInfo { hwnd: number; title: string; process: string }
+export interface WindowInfo { hwnd: number; title: string; process: string; pid: number }
 
 export async function listWindows(): Promise<WindowInfo[]> {
   const { invoke } = await import('@tauri-apps/api/core');
@@ -31,6 +31,9 @@ export interface StreamConfig {
   maxHeight: number;
   fps: number;
   bitrateBps: number;
+  /** Э5.2: PID процесса для WASAPI INCLUDE (только его звук в стрим) — надёжнее,
+   *  чем EXCLUDE себя (см. CLAUDE.md инвариант 6). `undefined` = EXCLUDE-режим по умолчанию. */
+  audioTargetPid?: number;
 }
 
 export interface BroadcastStats {
@@ -74,6 +77,7 @@ export async function startNativeBroadcast(streamId: string, identity: string, c
   await invoke('start_broadcast', {
     streamId, wsUrl: treeWsUrl(), identity,
     source: config.source, maxWidth: config.maxWidth, maxHeight: config.maxHeight, fps: config.fps, bitrateBps: config.bitrateBps,
+    audioTargetPid: config.audioTargetPid ?? null,
   });
 }
 

@@ -15,7 +15,7 @@ fn main() {
         stop2.store(true, Ordering::Relaxed);
     });
     let mut n = 0u32;
-    let result = audio::run_capture_loop(stop, |chunk| {
+    let result = audio::run_capture_loop(stop, audio::AudioSource::ExcludeSelf, |chunk| {
         n += 1;
         if n % 25 == 0 { println!("chunk {n}: {} bytes", chunk.data.len()); }
     });

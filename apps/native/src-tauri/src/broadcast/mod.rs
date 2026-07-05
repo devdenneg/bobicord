@@ -22,6 +22,7 @@ use webrtc::media::Sample;
 use windows::Win32::Media::MediaFoundation::{MFStartup, MFSTARTUP_FULL, MFSTARTUP_NOSOCKET, MF_VERSION};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
+pub use audio::AudioSource;
 pub use capture::CaptureSource;
 
 use self::signaling::TreeEvent;
@@ -35,6 +36,9 @@ pub struct StreamConfig {
     pub max_height: u32,
     pub fps: u32,
     pub bitrate_bps: u32,
+    /// Э5.2: по умолчанию — исключить себя (EXCLUDE, см. историю бага в audio.rs);
+    /// `IncludeProcess(pid)` — надёжнее, если известен процесс игры/окна.
+    pub audio_source: AudioSource,
 }
 
 pub struct BroadcastHandle {
@@ -79,7 +83,7 @@ pub async fn start(
     source: CaptureSource,
     config: StreamConfig,
 ) -> Result<BroadcastHandle, String> {
-    let StreamConfig { max_width, max_height, fps, bitrate_bps } = config;
+    let StreamConfig { max_width, max_height, fps, bitrate_bps, audio_source } = config;
     let source_label = describe_source(&source);
     let stats: StatsHandle = Arc::new(SharedStats::default());
 
@@ -168,7 +172,7 @@ pub async fn start(
         }
         unsafe { let _ = windows::Win32::System::Com::CoInitializeEx(None, COINIT_MULTITHREADED); }
         let frame_dur = Duration::from_millis(20);
-        let result = audio::run_capture_loop(audio_stop2, |chunk| {
+        let result = audio::run_capture_loop(audio_stop2, audio_source, |chunk| {
             let sample = Sample { data: Bytes::from(chunk.data), duration: frame_dur, ..Default::default() };
             let track = audio_track.clone();
             rt_handle_audio.block_on(async { let _ = track.write_sample(&sample).await; });
@@ -279,6 +283,6 @@ pub fn list_monitors() -> Vec<(usize, String)> {
     capture::list_monitors()
 }
 
-pub fn list_windows() -> Vec<(isize, String, String)> {
+pub fn list_windows() -> Vec<(isize, String, String, u32)> {
     capture::list_windows()
 }

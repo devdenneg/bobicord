@@ -30,7 +30,8 @@ use windows::Win32::Media::Audio::{
     IAudioCaptureClient, IAudioClient, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_LOOPBACK, AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
     AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
-    PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+    PROCESS_LOOPBACK_MODE, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+    PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
     WAVEFORMATEX,
 };
 use windows::Win32::System::Com::StructuredStorage::{
@@ -53,15 +54,30 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for CompletionHandler_Impl {
     }
 }
 
-/// Активирует process-loopback IAudioClient, исключая наш собственный PID
-/// (и дочерние процессы) из захватываемого микса.
-unsafe fn activate_process_loopback_exclude_self() -> WinResult<IAudioClient> {
+/// Источник аудио (CLAUDE.md инвариант 6, второй вариант): вместо "исключить себя"
+/// (см. историю бага — EXCLUDE не всегда надёжно фильтрует наш собственный
+/// многопроцессный WebView2) — "включить только выбранную игру". `IncludeProcess`
+/// не зависит от того, правильно ли ОС проходит дерево нашего процесса: он просто
+/// не трогает ничего, кроме явно указанного PID и его дерева.
+#[derive(Clone, Copy)]
+pub enum AudioSource {
+    ExcludeSelf,
+    IncludeProcess(u32),
+}
+
+/// Активирует process-loopback IAudioClient: либо исключая наш процесс (и его
+/// дерево) из захватываемого микса, либо включая только указанный процесс.
+unsafe fn activate_process_loopback(source: AudioSource) -> WinResult<IAudioClient> {
+    let (target_pid, mode): (u32, PROCESS_LOOPBACK_MODE) = match source {
+        AudioSource::ExcludeSelf => (std::process::id(), PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE),
+        AudioSource::IncludeProcess(pid) => (pid, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE),
+    };
     let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
             ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
-                TargetProcessId: std::process::id(),
-                ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+                TargetProcessId: target_pid,
+                ProcessLoopbackMode: mode,
             },
         },
     };
@@ -167,12 +183,15 @@ pub struct OpusChunk {
 /// Захватывает системный звук (без нашего процесса) в отдельном потоке, кодирует
 /// в Opus 48kHz/stereo/20ms-фреймами, зовёт `on_chunk` на каждый готовый пакет.
 /// Поток блокирующий (WASAPI + COM) — не гонять на tokio-воркере.
-pub fn run_capture_loop(stop: Arc<AtomicBool>, mut on_chunk: impl FnMut(OpusChunk)) -> Result<(), String> {
+pub fn run_capture_loop(stop: Arc<AtomicBool>, source: AudioSource, mut on_chunk: impl FnMut(OpusChunk)) -> Result<(), String> {
     const FRAME_SAMPLES: usize = 960; // 20ms @ 48kHz
 
     unsafe {
-        eprintln!("[audio] activating...");
-        let client = activate_process_loopback_exclude_self().map_err(|e| format!("activate loopback: {e}"))?;
+        eprintln!("[audio] activating (source: {})...", match source {
+            AudioSource::ExcludeSelf => "exclude-self".to_string(),
+            AudioSource::IncludeProcess(pid) => format!("include-pid-{pid}"),
+        });
+        let client = activate_process_loopback(source).map_err(|e| format!("activate loopback: {e}"))?;
         // Process-loopback IAudioClient (AudioSes!CMixerClient) не реализует GetMixFormat
         // (возвращает E_NOTIMPL) — это задокументированное поведение этого режима, не баг.
         // Формат для Initialize строим вручную: IEEE float стерео 48кГц, тот же, что и

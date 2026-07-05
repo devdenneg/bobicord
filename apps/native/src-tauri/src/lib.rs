@@ -18,11 +18,11 @@ fn list_monitors() -> Vec<MonitorInfo> {
 }
 
 #[derive(serde::Serialize)]
-struct WindowInfo { hwnd: isize, title: String, process: String }
+struct WindowInfo { hwnd: isize, title: String, process: String, pid: u32 }
 
 #[tauri::command]
 fn list_windows() -> Vec<WindowInfo> {
-  broadcast::list_windows().into_iter().map(|(hwnd, title, process)| WindowInfo { hwnd, title, process }).collect()
+  broadcast::list_windows().into_iter().map(|(hwnd, title, process, pid)| WindowInfo { hwnd, title, process, pid }).collect()
 }
 
 struct BroadcastState(Mutex<Option<broadcast::BroadcastHandle>>);
@@ -39,6 +39,7 @@ async fn start_broadcast(
   max_height: u32,
   fps: u32,
   bitrate_bps: u32,
+  audio_target_pid: Option<u32>,
 ) -> Result<(), String> {
   let mut slot = state.0.lock().await;
   if slot.is_some() {
@@ -49,6 +50,10 @@ async fn start_broadcast(
     max_height: max_height.clamp(180, 2160),
     fps: fps.clamp(5, 60),
     bitrate_bps: bitrate_bps.clamp(500_000, 20_000_000),
+    audio_source: match audio_target_pid {
+      Some(pid) => broadcast::AudioSource::IncludeProcess(pid),
+      None => broadcast::AudioSource::ExcludeSelf,
+    },
   };
   let handle = broadcast::start(Some(app), stream_id, ws_url, identity, source, config).await?;
   *slot = Some(handle);

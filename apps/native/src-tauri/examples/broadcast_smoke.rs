@@ -20,7 +20,10 @@ async fn main() {
     println!("[smoke] monitors: {monitors:?}");
     let monitor_index = monitors.first().map(|(i, _)| *i).unwrap_or(0);
     let source = broadcast::CaptureSource::Monitor { index: monitor_index };
-    let config = broadcast::StreamConfig { max_width: 1920, max_height: 1080, fps: 30, bitrate_bps: 6_000_000 };
+    let config = broadcast::StreamConfig {
+        max_width: 1920, max_height: 1080, fps: 30, bitrate_bps: 6_000_000,
+        audio_source: broadcast::AudioSource::ExcludeSelf,
+    };
 
     println!("[smoke] starting broadcast stream_id={stream_id} ws_url={ws_url} monitor={monitor_index}");
     let handle = broadcast::start(None, stream_id, ws_url, identity, source, config).await.expect("start broadcast");
