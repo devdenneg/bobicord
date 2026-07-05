@@ -7,7 +7,7 @@ WORKDIR /app
 ARG VITE_VIDEO_TRANSPORT=tree
 ENV VITE_VIDEO_TRANSPORT=$VITE_VIDEO_TRANSPORT
 COPY package.json package-lock.json ./
-RUN npm ci
+RUN npm install
 COPY . .
 RUN npm run build
 
