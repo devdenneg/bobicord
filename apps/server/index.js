@@ -1,11 +1,13 @@
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
 const crypto = require('crypto');
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const Database = require('better-sqlite3');
 const { AccessToken, RoomServiceClient } = require('livekit-server-sdk');
+const { attachTreeServer } = require('./tree');
 
 const app = express();
 app.use(express.json({ limit: '32kb' }));
@@ -13,7 +15,8 @@ app.use(express.json({ limit: '32kb' }));
 const KEY = process.env.LK_KEY;
 const SECRET = process.env.LK_SECRET;
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-secret-change';
-const WS_URL = 'wss://138-16-170-21.sslip.io';
+// вынесено в env (CLAUDE.md инвариант); дефолт — текущий прод-хост, для обратной совместимости
+const WS_URL = process.env.LK_WS_URL || 'wss://138-16-170-21.sslip.io';
 const DATA_DIR = '/app/data';
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
 
@@ -333,4 +336,8 @@ app.get('/api/token', requireAuth, async (req, res) => {
 });
 
 app.get('/healthz', (req, res) => res.send('ok'));
-app.listen(3000, () => console.log('voice API (servers+sqlite) on :3000'));
+
+/* ---------- relay-дерево: WS-сигналинг на том же порту (Э1) ---------- */
+const server = http.createServer(app);
+attachTreeServer(server, { sessionSecret: SESSION_SECRET, path: '/tree' });
+server.listen(3000, () => console.log('voice API (servers+sqlite) + tree ws on :3000'));

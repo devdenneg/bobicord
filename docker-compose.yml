@@ -16,6 +16,7 @@ services:
       - LK_KEY=${LK_KEY}
       - LK_SECRET=${LK_SECRET}
       - SESSION_SECRET=${SESSION_SECRET}
+      - LK_WS_URL=${LK_WS_URL}
     volumes:
       - ./data:/app/data
     ports:

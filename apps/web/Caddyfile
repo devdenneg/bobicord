@@ -9,6 +9,9 @@
 	handle /api* {
 		reverse_proxy 127.0.0.1:3000
 	}
+	handle /tree* {
+		reverse_proxy 127.0.0.1:3000
+	}
 	handle {
 		root * /srv
 		header Cache-Control "no-store, no-cache, must-revalidate"
