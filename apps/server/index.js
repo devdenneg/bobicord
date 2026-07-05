@@ -228,9 +228,9 @@ app.get('/api/servers/:id', requireAuth, (req, res) => {
   if (!s) return res.status(404).json({ error: 'Сервер не найден' });
   if (!isMember(req.user.id, s.id)) return res.status(403).json({ error: 'Ты не участник этого сервера' });
   const members = db.prepare(`
-    SELECT u.id,u.username,u.display_name,u.avatar_color,u.avatar_url,m.role FROM memberships m
+    SELECT u.id,u.username,u.display_name,u.avatar_color,u.avatar_url,u.bio,m.role FROM memberships m
     JOIN users u ON u.id=m.user_id WHERE m.server_id=? ORDER BY (m.role='owner') DESC, u.display_name ASC`).all(s.id)
-    .map(u => ({ id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '', role: u.role }));
+    .map(u => ({ id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '', bio: u.bio || '', role: u.role }));
   res.json({ server: { ...pubServer(s), memberCount: members.length }, members, myRole: roleOf(req.user.id, s.id) });
 });
 
