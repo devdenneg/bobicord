@@ -382,7 +382,8 @@ export class Engine {
     try {
       this.screenStream = await navigator.mediaDevices.getDisplayMedia({
         video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60 }, displaySurface: 'browser' } as any,
-        audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false } as any,
+        // системный звук БЕЗ обработки (AEC/шумодав/AGC ломают музыку); стерео 48кГц
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2, sampleRate: 48000 } as any,
         // @ts-ignore
         systemAudio: 'include', selfBrowserSurface: 'exclude',
       });
@@ -394,7 +395,7 @@ export class Engine {
     const lvt = new LocalVideoTrack(vt);
     await this.room!.localParticipant.publishTrack(lvt, { source: Track.Source.ScreenShare, videoEncoding: { maxBitrate: 8_000_000, maxFramerate: 60 }, videoCodec: 'vp8', simulcast: false, degradationPreference: 'maintain-framerate' as any });
     const at = this.screenStream.getAudioTracks()[0];
-    if (at) { const lat = new LocalAudioTrack(at); await this.room!.localParticipant.publishTrack(lat, { source: Track.Source.ScreenShareAudio, dtx: false, red: false }); }
+    if (at) { const lat = new LocalAudioTrack(at); await this.room!.localParticipant.publishTrack(lat, { source: Track.Source.ScreenShareAudio, dtx: false, red: true, audioPreset: AudioPresets.musicHighQualityStereo }); }
     else this.hooks.toast('Звук экрана не захвачен — включи галку «Поделиться аудио»', 'warn');
     this.keepAliveOn();
     const surf = (vt.getSettings() as any).displaySurface || '';
