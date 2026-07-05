@@ -10,12 +10,41 @@ import { EmotePicker } from './EmotePicker';
 import { getSettings, setSettings } from '../settings';
 import type { Emote, Member } from '../types';
 
-function Avatar({ name, ci, url, size = 32, dot, live }: { name: string; ci: number; url?: string; size?: number; dot?: string; live?: boolean }) {
+function Avatar({ name, ci, url, size = 32, dot }: { name: string; ci: number; url?: string; size?: number; dot?: string }) {
   return (
     <div className="av" style={{ width: size, height: size, fontSize: size * 0.44, background: url ? '#0000' : avColor(name, ci) }}>
       {url ? <img className="avimg" src={url} alt="" /> : initial(name)}
       {dot ? <span className={'sdot ' + dot} /> : null}
-      {live ? <span className="livebadge" /> : null}
+    </div>
+  );
+}
+
+/* ---------- Profile hover card ---------- */
+function useHoverCard() {
+  const [rect, setRect] = useState<DOMRect | null>(null);
+  const ref = useRef<HTMLDivElement>(null);
+  const t = useRef<number | undefined>(undefined);
+  const onEnter = () => { t.current = window.setTimeout(() => { if (ref.current) setRect(ref.current.getBoundingClientRect()); }, 320); };
+  const onLeave = () => { window.clearTimeout(t.current); setRect(null); };
+  useEffect(() => () => window.clearTimeout(t.current), []);
+  return { ref, rect, onEnter, onLeave };
+}
+
+function ProfileCard({ m, rect }: { m: Member; rect: DOMRect }) {
+  const me = useStore((s) => s.me);
+  const bio = ((me && m.username === me.username ? (me.bio || m.bio) : m.bio) || '').trim();
+  const onRight = rect.left < window.innerWidth / 2;
+  const top = Math.max(8, Math.min(rect.top - 6, window.innerHeight - 260));
+  const style: CSSProperties = onRight ? { left: rect.right + 10, top } : { right: window.innerWidth - rect.left + 10, top };
+  return (
+    <div className="pcard" style={style}>
+      <div className="pcard-av" style={{ background: m.avatarUrl ? '#0000' : avColor(m.displayName, m.avatarColor) }}>
+        {m.avatarUrl ? <img className="avimg" src={m.avatarUrl} alt="" /> : initial(m.displayName)}
+      </div>
+      <div className="pcard-name">{m.displayName}</div>
+      <div className="pcard-user">@{m.username}</div>
+      <div className="pcard-label">О себе</div>
+      <div className={'pcard-bio' + (bio ? '' : ' empty')}>{bio || 'Ничего не указано'}</div>
     </div>
   );
 }
@@ -34,31 +63,44 @@ function VoiceParticipantRow({ m }: { m: Member }) {
   const watching = !!eng.watching[m.username];
   const pending = !!eng.pending[m.username];
   const [vol, setVol] = useState(() => Math.round(E.userVolOf(m.username) * 100));
+  const talking = speaking && !pr?.micMuted;
+  const rowId = `vc-${m.username}`;
+  const hc = useHoverCard();
   return (
-    <div className={'pi' + (remote ? ' clickable' : '') + (streaming ? ' streaming' : '') + (speaking ? ' speaking' : '') + (open ? ' open' : '')} data-spk={m.username}>
-      <div className="head" style={{ padding: '5px 6px' }} onClick={() => remote && setOpen((v) => !v)}>
-        <div className="av" style={{ width: 28, height: 28, fontSize: 12, background: m.avatarUrl ? '#0000' : avColor(m.displayName, m.avatarColor) }}>{m.avatarUrl ? <img className="avimg" src={m.avatarUrl} alt="" /> : initial(m.displayName)}</div>
-        <div className="nm" style={{ fontSize: 13 }}>{m.displayName}{isLocal ? ' (ты)' : ''}</div>
-        {remote ? <div className="chev">⌄</div> : null}
-        <div className={'micst' + (pr?.micMuted ? ' off' : '')}><Icon name={pr?.micMuted ? 'mic-off' : 'mic'} /></div>
+    <div className={'pi' + (remote ? ' clickable' : '') + (streaming ? ' streaming' : '') + (talking ? ' speaking' : '') + (open ? ' open' : '')} data-spk={m.username}>
+      <div className="head"
+        ref={hc.ref} onMouseEnter={remote ? hc.onEnter : undefined} onMouseLeave={remote ? hc.onLeave : undefined}
+        role={remote ? 'button' : undefined} tabIndex={remote ? 0 : undefined}
+        aria-expanded={remote ? open : undefined} aria-controls={remote ? rowId : undefined}
+        onClick={() => remote && setOpen((v) => !v)}
+        onKeyDown={(e) => { if (remote && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); setOpen((v) => !v); } }}>
+        <div className="av" style={{ background: m.avatarUrl ? '#0000' : avColor(m.displayName, m.avatarColor) }}>
+          {m.avatarUrl ? <img className="avimg" src={m.avatarUrl} alt="" /> : initial(m.displayName)}
+        </div>
+        <div className="nm" title={m.displayName}>{m.displayName}{isLocal ? ' (ты)' : ''}</div>
+        {streaming ? <span className="livepill">LIVE</span> : null}
+        {remote && streaming ? (
+          <button className={'watchbtn' + (watching ? ' on' : '')} disabled={pending}
+            aria-label={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}
+            data-tip={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}
+            onClick={(e) => { e.stopPropagation(); watching ? E.closeWatch(m.username) : E.watch(m.username); }}>
+            {pending ? <span className="spin" style={{ margin: 0, width: 13, height: 13 }} /> : <Icon name={watching ? 'eye-off' : 'eye'} />}
+          </button>
+        ) : null}
+        {remote ? <div className="chev" aria-hidden="true"><Icon name="chevron" sm /></div> : null}
+        <div className={'micst' + (pr?.micMuted ? ' off' : '')} aria-label={pr?.micMuted ? 'Микрофон выключен' : undefined}><Icon name="mic-off" /></div>
       </div>
       {remote ? (
-        <div className="exp" style={{ display: open ? 'flex' : 'none', padding: '2px 6px 8px 44px' }}>
-          <input type="range" min={0} max={200} value={vol} aria-label="Громкость"
+        <div className="exp" id={rowId}>
+          <Icon name="speaker" sm />
+          <input type="range" min={0} max={200} value={vol} aria-label={`Громкость: ${m.displayName}`}
             onChange={(e) => { let v = +e.target.value; if (Math.abs(v - 100) < 4) v = 100; setVol(v); E.setUserVol(m.username, v / 100); }}
             onDoubleClick={() => { setVol(100); E.setUserVol(m.username, 1); }} />
           <span className="vlbl">{vol}%</span>
-          <button className={'mut' + (E.isMutedFor(m.username) ? ' on' : '')} aria-label="Заглушить" onClick={(e) => { e.stopPropagation(); E.toggleUserMute(m.username); }}><Icon name="mic-off" sm /></button>
+          <button className={'mut' + (E.isMutedFor(m.username) ? ' on' : '')} aria-label="Заглушить у себя" data-tip="Не слышать этого человека" onClick={(e) => { e.stopPropagation(); E.toggleUserMute(m.username); }}><Icon name="volume-off" sm /></button>
         </div>
       ) : null}
-      {remote && streaming ? (
-        <div className="watchrow" style={{ display: 'block', padding: '4px 8px 8px 8px' }}>
-          <button className={'wbtn' + (watching ? ' open' : '')} disabled={pending}
-            onClick={(e) => { e.stopPropagation(); watching ? E.closeWatch(m.username) : E.watch(m.username); }}>
-            {pending ? <><span className="spin" />...</> : watching ? '◼ Закрыть трансляцию' : '▶ Смотреть трансляцию'}
-          </button>
-        </div>
-      ) : null}
+      {remote && hc.rect ? <ProfileCard m={m} rect={hc.rect} /> : null}
     </div>
   );
 }
@@ -110,12 +152,16 @@ function MemberRow({ m }: { m: Member }) {
   const pr = eng.presence[m.username];
   const st = pr?.inVoice ? 'voice' : pr?.online ? 'online' : 'offline';
   const streaming = pr?.streaming;
+  const self = m.username === me.username;
+  const hc = useHoverCard();
   return (
     <div className={'pi ' + st + (streaming ? ' streaming' : '')} data-spk={m.username}>
-      <div className="head">
-        <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} dot={st} live={streaming} />
-        <div className="nm">{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{m.username === me.username ? ' (ты)' : ''}</div>
+      <div className="head" ref={hc.ref} onMouseEnter={self ? undefined : hc.onEnter} onMouseLeave={self ? undefined : hc.onLeave}>
+        <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} dot={st} />
+        <div className="nm">{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div>
+        {streaming ? <span className="livepill">LIVE</span> : null}
       </div>
+      {!self && hc.rect ? <ProfileCard m={m} rect={hc.rect} /> : null}
     </div>
   );
 }
@@ -142,10 +188,26 @@ function Members() {
 function renderRich(text: string): (string | { emo: string; name: string })[] {
   return text.split(/(\s+)/).map((tok) => (emoteMap.has(tok) ? { emo: emoteMap.get(tok)!, name: tok } : tok));
 }
+function ImageLightbox({ src, onClose }: { src: string; onClose: () => void }) {
+  useEffect(() => {
+    const k = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', k);
+    return () => window.removeEventListener('keydown', k);
+  }, [onClose]);
+  return (
+    <div className="lightbox" role="dialog" aria-modal="true" onClick={onClose}>
+      <button className="lb-close" aria-label="Закрыть" onClick={onClose}><Icon name="close" /></button>
+      <a className="lb-open" href={src} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>Открыть оригинал</a>
+      <img src={src} alt="" onClick={(e) => e.stopPropagation()} />
+    </div>
+  );
+}
+
 function Chat() {
   const eng = useEngine();
   const E = getEngine()!;
   const [text, setText] = useState('');
+  const [lightbox, setLightbox] = useState<string | null>(null);
   const [pickAnchor, setPickAnchor] = useState<DOMRect | null | undefined>(undefined);
   const msgsRef = useRef<HTMLDivElement>(null);
   const emoBtnRef = useRef<HTMLButtonElement>(null);
@@ -200,7 +262,7 @@ function Chat() {
                     {m.sys ? m.text : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : <img key={i} className="emo" src={emoteUrl(p.emo)} alt={p.name} title={p.name} loading="lazy" decoding="async" />))}
                   </div>
                 ) : null}
-                {m.img ? <a className="msg-img-wrap" href={m.img} target="_blank" rel="noreferrer"><img className="msg-img" src={m.img} alt="" loading="lazy" /></a> : null}
+                {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox(m.img!)}><img className="msg-img" src={m.img} alt="" loading="lazy" /></button> : null}
               </div>
             );
           })}
@@ -219,6 +281,7 @@ function Chat() {
       </div>
       {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} onClose={() => setPickAnchor(undefined)}
         onPick={(e: Emote) => { setText((t) => t + (t && !t.endsWith(' ') ? ' ' : '') + e.name + ' '); }} /> : null}
+      {lightbox ? <ImageLightbox src={lightbox} onClose={() => setLightbox(null)} /> : null}
     </div>
   );
 }

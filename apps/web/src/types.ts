@@ -25,6 +25,7 @@ export interface Member {
   displayName: string;
   avatarColor: number;
   avatarUrl?: string;
+  bio?: string;
   role: string;
 }
 

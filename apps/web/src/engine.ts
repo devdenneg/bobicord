@@ -396,16 +396,18 @@ export class Engine {
     await this.room!.localParticipant.publishTrack(lvt, { source: Track.Source.ScreenShare, videoEncoding: { maxBitrate: 8_000_000, maxFramerate: 60 }, videoCodec: 'vp8', simulcast: false, degradationPreference: 'maintain-framerate' as any });
     const surf = (vt.getSettings() as any).displaySurface || '';
     const at = this.screenStream.getAudioTracks()[0];
-    if (surf === 'browser') {
-      // вкладка: звук вкладки чистый (голосов собеседников в нём нет) — публикуем
-      if (at) { const lat = new LocalAudioTrack(at); await this.room!.localParticipant.publishTrack(lat, { source: Track.Source.ScreenShareAudio, dtx: false, red: true, audioPreset: AudioPresets.musicHighQualityStereo }); }
+    // вкладка/окно = звук приложения (голосов собеседников нет); monitor (весь экран) = системный звук с голосами
+    const audioClean = surf === 'browser' || surf === 'window';
+    if (audioClean && at) {
+      const lat = new LocalAudioTrack(at);
+      await this.room!.localParticipant.publishTrack(lat, { source: Track.Source.ScreenShareAudio, dtx: false, red: true, audioPreset: AudioPresets.musicHighQualityStereo });
     } else if (at) {
-      // экран/окно: захвачен звук ВСЕЙ системы — в нём слышно собеседников, НЕ транслируем
-      try { at.stop(); } catch { /**/ }
+      try { at.stop(); } catch { /**/ } // весь экран: в системном звуке слышно собеседников — не транслируем
     }
     this.keepAliveOn();
-    if (surf === 'browser') this.hooks.toast(at ? 'Трансляция запущена' : 'Запущена без звука — при выборе вкладки ставь галку «Звук вкладки»', at ? 'ok' : 'warn');
-    else this.hooks.toast('Экран/окно: без звука (в системном слышно собеседников) и ~15fps. Для звука и 60fps — шарь «Вкладку Chrome»', 'warn');
+    if (surf === 'monitor') this.hooks.toast('Весь экран: звук не транслируется (в нём слышно собеседников). Для звука шарь ОКНО или вкладку', 'warn');
+    else if (!at) this.hooks.toast('Трансляция без звука — при выборе поставь галку «Звук»', 'warn');
+    else this.hooks.toast('Трансляция запущена', 'ok');
     playSound('stream');
     this.emit();
   }

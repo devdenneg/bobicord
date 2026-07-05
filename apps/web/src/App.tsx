@@ -82,7 +82,7 @@ function Home() {
 }
 
 function ServerLoader() {
-  return <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', background: 'var(--bg2)' }}><img src="/icon.png" alt="" className="pulse-logo" /></div>;
+  return <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', background: 'var(--bg2)' }}><span className="spin" style={{ width: 26, height: 26, margin: 0 }} /></div>;
 }
 
 export function App() {
