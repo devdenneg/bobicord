@@ -389,10 +389,11 @@ export class Engine {
     try {
       this.screenStream = await navigator.mediaDevices.getDisplayMedia({
         video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60 }, displaySurface: 'browser' } as any,
-        // системный звук БЕЗ обработки (AEC/шумодав/AGC ломают музыку); стерео 48кГц
+        // звук БЕЗ обработки (AEC/шумодав/AGC ломают музыку); стерео 48кГц.
+        // systemAudio НЕ включаем — системный звук содержит голоса собеседников; берём только звук вкладки.
         audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2, sampleRate: 48000 } as any,
         // @ts-ignore
-        systemAudio: 'include', selfBrowserSurface: 'exclude',
+        selfBrowserSurface: 'exclude',
       });
     } catch { this.screenStream = null; return; }
     const vt = this.screenStream.getVideoTracks()[0];
@@ -403,17 +404,17 @@ export class Engine {
     await this.room!.localParticipant.publishTrack(lvt, { source: Track.Source.ScreenShare, videoEncoding: { maxBitrate: 8_000_000, maxFramerate: 60 }, videoCodec: 'vp8', simulcast: false, degradationPreference: 'maintain-framerate' as any });
     const surf = (vt.getSettings() as any).displaySurface || '';
     const at = this.screenStream.getAudioTracks()[0];
-    // вкладка/окно = звук приложения (голосов собеседников нет); monitor (весь экран) = системный звук с голосами
-    const audioClean = surf === 'browser' || surf === 'window';
-    if (audioClean && at) {
+    // Чистый звук БЕЗ голосов возможен ТОЛЬКО при шаре вкладки Chrome (звук вкладки изолирован).
+    // Окно/весь экран отдают системный звук — в нём слышно собеседников, поэтому его НЕ транслируем.
+    if (surf === 'browser' && at) {
       const lat = new LocalAudioTrack(at);
       await this.room!.localParticipant.publishTrack(lat, { source: Track.Source.ScreenShareAudio, dtx: false, red: true, audioPreset: AudioPresets.musicHighQualityStereo });
     } else if (at) {
-      try { at.stop(); } catch { /**/ } // весь экран: в системном звуке слышно собеседников — не транслируем
+      try { at.stop(); } catch { /**/ }
     }
     this.keepAliveOn();
-    if (surf === 'monitor') this.hooks.toast('Весь экран: звук не транслируется (в нём слышно собеседников). Для звука шарь ОКНО или вкладку', 'warn');
-    else if (!at) this.hooks.toast('Трансляция без звука — при выборе поставь галку «Звук»', 'warn');
+    if (surf !== 'browser') this.hooks.toast('Звук идёт только при шаре ВКЛАДКИ Chrome (в звуке окна/экрана слышно собеседников). Расшарь вкладку + галка «Звук вкладки»', 'warn');
+    else if (!at) this.hooks.toast('Трансляция без звука — при выборе вкладки поставь галку «Звук вкладки»', 'warn');
     else this.hooks.toast('Трансляция запущена', 'ok');
     playSound('stream');
     this.emit();
