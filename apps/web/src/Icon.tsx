@@ -20,6 +20,8 @@ import EmojiEmotionsRounded from '@mui/icons-material/EmojiEmotionsRounded';
 import VisibilityRounded from '@mui/icons-material/VisibilityRounded';
 import VisibilityOffRounded from '@mui/icons-material/VisibilityOffRounded';
 import RefreshRounded from '@mui/icons-material/RefreshRounded';
+import FullscreenRounded from '@mui/icons-material/FullscreenRounded';
+import PictureInPictureAltRounded from '@mui/icons-material/PictureInPictureAltRounded';
 import VideocamRounded from '@mui/icons-material/VideocamRounded';
 import CheckRounded from '@mui/icons-material/CheckRounded';
 import WarningRounded from '@mui/icons-material/WarningRounded';
@@ -40,6 +42,7 @@ const MAP: Record<string, SvgIconComponent> = {
   warn: WarningRounded, image: ImageRounded,
   chevron: KeyboardArrowDownRounded, 'volume-off': VolumeOffRounded, close: CloseRounded,
   'eye-off': VisibilityOffRounded, refresh: RefreshRounded,
+  fullscreen: FullscreenRounded, pip: PictureInPictureAltRounded,
 };
 
 export function Icon({ name, sm }: { name: string; sm?: boolean }) {

@@ -215,6 +215,7 @@ function Chat() {
   const [uploading, setUploading] = useState(false);
   const toast = useStore((s) => s.toast);
   const updateReady = useStore((s) => s.updateReady);
+  const emoteSize = useStore((s) => s.emoteSize);
   const [pill, setPill] = useState(0);
   const atBottomRef = useRef(true);
 
@@ -256,7 +257,7 @@ function Chat() {
   return (
     <div id="chat">
       <div id="msgs" ref={msgsRef} onScroll={(e) => { const m = e.currentTarget; atBottomRef.current = m.scrollTop + m.clientHeight >= m.scrollHeight - 120; if (atBottomRef.current) setPill(0); }}>
-        <div className="msgs-inner">
+        <div className={'msgs-inner emo-' + emoteSize}>
           {eng.messages.length === 0 ? <div id="chatEmpty">Общий чат сервера. Пиши сюда — видят все участники онлайн.</div> : null}
           {eng.messages.map((m) => {
             const parts = m.sys ? null : renderRich(m.text);
@@ -302,7 +303,7 @@ function Chat() {
         <button id="sendBtn" className={text.trim() ? '' : 'empty'} data-tip="Отправить · Enter" onClick={send}><Icon name="send" /></button>
       </div>
       )}
-      {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} onClose={() => setPickAnchor(undefined)}
+      {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} sizePicker onClose={() => setPickAnchor(undefined)}
         onPick={(e: Emote) => { setText((t) => t + (t && !t.endsWith(' ') ? ' ' : '') + e.name + ' '); }} /> : null}
       {lightbox ? <ImageLightbox src={lightbox} onClose={() => setLightbox(null)} /> : null}
     </div>
@@ -346,9 +347,15 @@ function StreamTile({ streamKey, identity, isLocal }: { streamKey: string; ident
 
   const watchers = eng.watchers[identity] || [];
   const [svol, setSvol] = useState(() => Math.round(E.streamVolOf(identity) * 100));
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [prevVol, setPrevVol] = useState(100);
+  const setVol = (v: number) => { setSvol(v); E.setStreamVol(identity, v / 100); };
+  const toggleMute = () => { if (svol > 0) { setPrevVol(svol); setVol(0); } else setVol(prevVol || 100); };
+  const toggleFs = () => { document.fullscreenElement ? document.exitFullscreen() : wrapRef.current?.requestFullscreen().catch(() => {}); };
+  const togglePip = () => { if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => {}); else vidRef.current?.requestPictureInPicture().catch(() => {}); };
 
   return (
-    <div className="vwrap" onDoubleClick={(e) => { const w = e.currentTarget; document.fullscreenElement ? document.exitFullscreen() : w.requestFullscreen().catch(() => {}); }}>
+    <div className="vwrap" ref={wrapRef} onDoubleClick={toggleFs}>
       <video ref={vidRef} autoPlay playsInline />
       <div className="lbl">🖥 {name}{isLocal ? ' (ты)' : ''}</div>
       <div className="emolayer">
@@ -361,15 +368,28 @@ function StreamTile({ streamKey, identity, isLocal }: { streamKey: string; ident
       <div className="watchers">
         {watchers.slice(0, 4).map((w, i) => <div className="wa" key={i} style={{ background: avColor(w.name) }} title={w.name}>{initial(w.name)}</div>)}
         <div className="wc"><Icon name="eye" sm />{watchers.length}</div>
+        {watchers.length ? (
+          <div className="wtip">
+            <div className="wtip-h">Смотрят · {watchers.length}</div>
+            {watchers.map((w, i) => <div className="wtip-row" key={i}><span className="wtip-av" style={{ background: avColor(w.name) }}>{initial(w.name)}</span>{w.name}</div>)}
+          </div>
+        ) : null}
       </div>
       <button className="spray" ref={sprayRef} data-tip="Кинуть эмоут — увидят все зрители"
         onClick={(e) => { e.stopPropagation(); setPickAnchor((a) => (a === undefined ? sprayRef.current!.getBoundingClientRect() : undefined)); }}><Icon name="smile" sm /></button>
-      {!isLocal ? (
-        <>
-          <div className="vvol">🔊 <input type="range" min={0} max={100} value={svol} onChange={(e) => { setSvol(+e.target.value); E.setStreamVol(identity, +e.target.value / 100); }} /><span style={{ minWidth: 30, textAlign: 'right' }}>{svol}%</span></div>
-          <button className="vclose" title="Закрыть трансляцию" onClick={() => E.closeWatch(identity)}>✕</button>
-        </>
-      ) : null}
+      <div className="vbar" onDoubleClick={(e) => e.stopPropagation()}>
+        {!isLocal ? (
+          <>
+            <button className="vb-btn" data-tip={svol === 0 ? 'Включить звук' : 'Заглушить'} onClick={toggleMute}><Icon name={svol === 0 ? 'volume-off' : 'speaker'} sm /></button>
+            <input className="vb-vol" type="range" min={0} max={100} value={svol} onChange={(e) => setVol(+e.target.value)} />
+            <span className="vb-pct">{svol}%</span>
+          </>
+        ) : <span className="vb-lbl">🖥 Твоя трансляция</span>}
+        <div className="vb-sp" />
+        <button className="vb-btn" data-tip="Картинка-в-картинке" onClick={togglePip}><Icon name="pip" sm /></button>
+        <button className="vb-btn" data-tip="Во весь экран" onClick={toggleFs}><Icon name="fullscreen" sm /></button>
+        {!isLocal ? <button className="vb-btn danger" data-tip="Закрыть трансляцию" onClick={() => E.closeWatch(identity)}><Icon name="close" sm /></button> : null}
+      </div>
       {isLocal && stats ? <div id="stats" style={{ display: 'block' }} dangerouslySetInnerHTML={{ __html: stats }} /> : null}
       {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} onClose={() => setPickAnchor(undefined)} onPick={(em) => E.fling(identity, em)} /> : null}
     </div>
@@ -452,24 +472,29 @@ export function ServerView() {
   useEffect(() => { if (!hasStreams) setMin(false); }, [hasStreams]);
   const chan = useResizable('w:channels', 290, 270, 440, 'right');
   const mem = useResizable('w:members', 244, 216, 400, 'left');
+  const chatW = useResizable('w:chat', 340, 260, 640, 'left');
+  const [membersOpen, setMembersOpen] = useState(() => localStorage.getItem('membersOpen') !== '0');
+  useEffect(() => { localStorage.setItem('membersOpen', membersOpen ? '1' : '0'); }, [membersOpen]);
 
   return (
     <>
-      <section id="server" className={'on' + (mtab !== 'main' ? ' tab-' + mtab : '')} style={{ '--ch-w': chan.w + 'px', '--mem-w': mem.w + 'px' } as CSSProperties}>
+      <section id="server" className={'on' + (mtab !== 'main' ? ' tab-' + mtab : '')} style={{ '--ch-w': chan.w + 'px', '--mem-w': (membersOpen ? mem.w : 0) + 'px' } as CSSProperties}>
         <Channels />
         <div id="main">
           <div className="srv-header">
             <div className="hn"><Icon name="hash" sm /><span>общий</span></div>
+            <button className={'hbtn' + (membersOpen ? ' on' : '')} data-tip={membersOpen ? 'Скрыть участников' : 'Показать участников'} onClick={() => setMembersOpen((v) => !v)}><Icon name="users" sm /></button>
             <button className="hbtn" data-tip="Пригласить" onClick={() => setModal('invite')}><Icon name="link" sm /></button>
           </div>
-          <div id="content" className={split ? 'split' : ''}>
+          <div id="content" className={split ? 'split' : ''} style={{ '--chat-w': chatW.w + 'px' } as CSSProperties}>
             <Stage minimized={minimized} setMin={setMin} />
+            {split ? <div className="rz rz-chat" onMouseDown={chatW.onDown} title="Потяни — ширина чата" /> : null}
             <Chat />
           </div>
         </div>
-        <Members />
+        {membersOpen ? <Members /> : null}
         <div className="rz rz-ch" onMouseDown={chan.onDown} title="Потяни, чтобы изменить ширину" />
-        <div className="rz rz-mem" onMouseDown={mem.onDown} title="Потяни, чтобы изменить ширину" />
+        {membersOpen ? <div className="rz rz-mem" onMouseDown={mem.onDown} title="Потяни, чтобы изменить ширину" /> : null}
       </section>
       <div id="mtabs">
         <button className={mtab === 'channels' ? 'active' : ''} onClick={() => setMtab('channels')}><Icon name="speaker" />Голос</button>

@@ -18,6 +18,7 @@ interface AppState {
   loadingServer: boolean;
   loadingServerId: string | null;
   updateReady: boolean;
+  emoteSize: 'sm' | 'md' | 'lg';
   toasts: Toast[];
   modal: null | 'create' | 'join' | 'profile' | 'srvmenu' | 'invite' | 'settings';
   joinPrefill: string;
@@ -34,6 +35,7 @@ interface AppState {
   refreshServers: () => Promise<void>;
   refreshMembers: () => Promise<void>;
   setMe: (u: User) => void;
+  setEmoteSize: (s: 'sm' | 'md' | 'lg') => void;
 }
 
 let memberTimer: number | null = null;
@@ -41,7 +43,7 @@ let memberTimer: number | null = null;
 let toastSeq = 1;
 
 export const useStore = create<AppState>((set, get) => ({
-  view: 'loading', me: null, servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, updateReady: false, toasts: [], modal: null, joinPrefill: '',
+  view: 'loading', me: null, servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, updateReady: false, emoteSize: (localStorage.getItem('emoteSize') as 'sm' | 'md' | 'lg') || 'md', toasts: [], modal: null, joinPrefill: '',
 
   toast: (text, kind) => {
     const id = toastSeq++;
@@ -52,6 +54,7 @@ export const useStore = create<AppState>((set, get) => ({
   setModal: (m, prefill) => set({ modal: m, joinPrefill: prefill ?? get().joinPrefill }),
 
   setMe: (u) => { engine?.setMe(u); set({ me: u }); },
+  setEmoteSize: (s) => { localStorage.setItem('emoteSize', s); set({ emoteSize: s }); },
 
   afterAuth: async (user) => {
     engine = new Engine(user, {

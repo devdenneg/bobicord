@@ -1,10 +1,13 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { searchEmotes, emoteUrlSm } from '../emotes';
+import { useStore } from '../store';
 import type { Emote } from '../types';
 
-export function EmotePicker({ anchor, onPick, onClose }: { anchor: DOMRect | null; onPick: (e: Emote) => void; onClose: () => void }) {
+export function EmotePicker({ anchor, onPick, onClose, sizePicker }: { anchor: DOMRect | null; onPick: (e: Emote) => void; onClose: () => void; sizePicker?: boolean }) {
   const [items, setItems] = useState<Emote[]>([]);
   const [q, setQ] = useState('');
+  const emoteSize = useStore((s) => s.emoteSize);
+  const setEmoteSize = useStore((s) => s.setEmoteSize);
   const pageRef = useRef(0); const moreRef = useRef(true); const loadingRef = useRef(false);
   const boxRef = useRef<HTMLDivElement>(null);
   const gridRef = useRef<HTMLDivElement>(null);
@@ -40,11 +43,22 @@ export function EmotePicker({ anchor, onPick, onClose }: { anchor: DOMRect | nul
     : { right: 330, bottom: 72 };
 
   return (
-    <div id="epick" className="show" role="dialog" aria-modal="true" aria-label="7TV эмоуты" style={style} ref={boxRef}>
+    <div id="epick" className="show" role="dialog" aria-modal="true" aria-label="7TV эмоуты" style={style} ref={boxRef}
+      onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}>
       <div className="epick-h">
         <input placeholder="Поиск 7TV эмоутов..." autoFocus value={q} onChange={(e) => setQ(e.target.value)} />
         <button aria-label="Закрыть" onClick={onClose}>✕</button>
       </div>
+      {sizePicker ? (
+        <div className="epick-size">
+          <span>Размер</span>
+          {(['sm', 'md', 'lg'] as const).map((s) => (
+            <button key={s} className={emoteSize === s ? 'active' : ''} onClick={() => setEmoteSize(s)}>
+              {s === 'sm' ? 'S' : s === 'md' ? 'M' : 'L'}
+            </button>
+          ))}
+        </div>
+      ) : null}
       <div id="epickGrid" ref={gridRef} onScroll={(e) => { const g = e.currentTarget; if (g.scrollTop + g.clientHeight >= g.scrollHeight - 100) fetchPage(q, false); }}>
         {items.length === 0 ? <div id="epickLoad">Загрузка...</div> :
           items.map((e) => (
