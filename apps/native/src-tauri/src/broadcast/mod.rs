@@ -86,6 +86,12 @@ pub async fn start(
     let StreamConfig { max_width, max_height, fps, bitrate_bps, audio_source } = config;
     let source_label = describe_source(&source);
     let stats: StatsHandle = Arc::new(SharedStats::default());
+    // Создаём здесь (не в конце функции, как раньше) — encoder_thread должен уметь
+    // сам инициировать остановку всей трансляции при фатальной ошибке (MFStartup,
+    // отказ энкодера на 0x0-кадре и т.п.): раньше поток просто тихо `break`-ился,
+    // сигналинг оставался жить, а Tauri-состояние вещания зависало навсегда
+    // ("уже вещаем" на повторном старте) — фронтенд о смерти потока не узнавал.
+    let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
 
     let (cap_handle, cap_stop, cap_rx) = capture::spawn_capture(source, max_width, max_height, fps, stats.clone())?;
 
@@ -101,12 +107,14 @@ pub async fn start(
     let rt_handle = tokio::runtime::Handle::current();
     let force_keyframe_enc = force_keyframe.clone();
     let stats_enc = stats.clone();
+    let shutdown_tx_enc = shutdown_tx.clone();
 
     let encoder_thread = std::thread::spawn(move || {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             if let Err(e) = MFStartup(MF_VERSION, MFSTARTUP_FULL | MFSTARTUP_NOSOCKET) {
                 log::error!("encoder: MFStartup failed: {e}");
+                let _ = shutdown_tx_enc.send(());
                 return;
             }
         }
@@ -122,12 +130,30 @@ pub async fn start(
             let frame = match cap_rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(f) => f,
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    // Захват умер сам (окно закрыли, WGC-сессия оборвалась и т.п.) —
+                    // без этого сигнала сигналинг остался бы жить, а состояние вещания
+                    // зависло бы навсегда ("уже вещаем" на повторном старте).
+                    log::warn!("encoder: capture channel disconnected, stopping broadcast");
+                    let _ = shutdown_tx_enc.send(());
+                    break;
+                }
             };
             if enc.is_none() {
+                // Окно может отдать первый кадр 0x0 (сворачивается/ещё не отрисовано) —
+                // MFT такое не примет, просто ждём кадр с реальным размером вместо
+                // немедленного фатального отказа.
+                if frame.width == 0 || frame.height == 0 {
+                    log::debug!("encoder: skip 0x0 frame (source not ready yet)");
+                    continue;
+                }
                 match encoder::H264Encoder::new(frame.width, frame.height, fps, bitrate_bps, force_keyframe_enc.clone()) {
                     Ok(e) => enc = Some((e, frame.width, frame.height)),
-                    Err(e) => { log::error!("encoder: init failed: {e}"); break; }
+                    Err(e) => {
+                        log::error!("encoder: init failed: {e}");
+                        let _ = shutdown_tx_enc.send(());
+                        break;
+                    }
                 }
             }
             let (encoder_ref, enc_w, enc_h) = enc.as_mut().expect("initialized above");
@@ -183,7 +209,6 @@ pub async fn start(
         log::info!("audio thread stopped");
     });
 
-    let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
     let meta = DebugMeta { stream_id, source_label, target_fps: fps, target_bitrate_bps: bitrate_bps };
     tokio::spawn(run_signaling_loop(mgr, evt_rx, shutdown_rx, app, stats, meta));
 

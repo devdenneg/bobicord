@@ -8,7 +8,7 @@ import { avColor, initial, prefersReducedMotion } from '../util';
 import { emoteMap, emoteUrl } from '../emotes';
 import { EmotePicker } from './EmotePicker';
 import { getSettings, setSettings } from '../settings';
-import { isTauri, onBroadcastStopped } from '../native';
+import { isTauri, onBroadcastStopped, stopNativeBroadcast } from '../native';
 import type { Emote, Member } from '../types';
 
 function Avatar({ name, ci, url, size = 32, dot }: { name: string; ci: number; url?: string; size?: number; dot?: string }) {
@@ -139,10 +139,17 @@ function NativeBroadcastButton() {
   const live = useStore((s) => s.broadcastLive);
 
   // Слушаем и когда модалка со статистикой закрыта — трансляция может
-  // завершиться сама (например источник-окно закрыли), стор должен это узнать.
+  // завершиться сама (например источник-окно закрыли, или энкодер/захват упали
+  // фатально — mod.rs теперь шлёт это событие и в таких случаях тоже). Дополнительно
+  // форсируем stop_broadcast: он же снимает Tauri-состояние (BroadcastState),
+  // без этого повторный старт вечно отвечал бы «уже вещаем», даже когда трансляция
+  // уже мертва.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    onBroadcastStopped(() => useStore.getState().setBroadcastLive(false)).then((u) => (unlisten = u));
+    onBroadcastStopped(() => {
+      useStore.getState().setBroadcastLive(false);
+      stopNativeBroadcast().catch(() => {});
+    }).then((u) => (unlisten = u));
     return () => unlisten?.();
   }, []);
 
