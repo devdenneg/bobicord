@@ -4,7 +4,7 @@ import type { Snapshot } from './engine';
 
 const EMPTY: Snapshot = {
   connected: false, inVoice: false, deafened: false, localMicMuted: true, pttDown: false,
-  presence: {}, speaking: {}, streams: [], watching: {}, pending: {}, watchers: {}, messages: [],
+  presence: {}, speaking: {}, streams: [], watching: {}, pending: {}, watchers: {}, messages: [], typing: [],
 };
 
 export function useEngine(): Snapshot {
