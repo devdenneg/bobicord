@@ -6,7 +6,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows::core::{Interface, Result as WinResult};
 use windows::Win32::Media::MediaFoundation::*;
@@ -127,11 +127,15 @@ impl H264Encoder {
                 self.pump_events(&mut out)?;
                 // ...затем, если кредита на вход ещё нет, коротко ждём его (обычно
                 // он уже есть после первого кадра — MFT сам поддерживает конвейер).
-                let mut waited_ms = 0;
-                while self.need_input == 0 && waited_ms < 200 {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                // Шаг поллинга — 1000ns (1мкс), а не 1мс: раньше кредит мог появиться
+                // сразу после ухода в sleep и ждал до мс лишний раз — на low-latency
+                // пути это заметный джиттер. Бюджет ожидания (200мс) считаем по
+                // дедлайну, а не по числу итераций — иначе при таком мелком шаге
+                // он бы схлопнулся в 200мкс вместо 200мс.
+                let deadline = Instant::now() + Duration::from_millis(200);
+                while self.need_input == 0 && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_nanos(1000));
                     self.pump_events(&mut out)?;
-                    waited_ms += 1;
                 }
                 if self.need_input == 0 {
                     log::debug!("encoder: no NeedInput credit after 200ms, dropping frame");

@@ -80,6 +80,7 @@ pub async fn start(
     stream_id: String,
     ws_url: String,
     identity: String,
+    server_id: String,
     source: CaptureSource,
     config: StreamConfig,
 ) -> Result<BroadcastHandle, String> {
@@ -96,7 +97,7 @@ pub async fn start(
     let (cap_handle, cap_stop, cap_rx) = capture::spawn_capture(source, max_width, max_height, fps, stats.clone())?;
 
     let force_keyframe = Arc::new(AtomicBool::new(true));
-    let (cmd_tx, evt_rx) = signaling::connect(ws_url, stream_id.clone(), identity);
+    let (cmd_tx, evt_rx) = signaling::connect(ws_url, stream_id.clone(), identity, server_id);
 
     let mgr = peer::PeerManager::new(&stream_id, cmd_tx.clone(), force_keyframe.clone())?;
     let video_track = mgr.video_track.clone();
@@ -134,6 +135,13 @@ pub async fn start(
         // расходятся с фактическим темпом захвата (WGC отдаёт кадры неравномерно), и
         // зритель видит рваный fps даже когда энкодер стабильно поспевает.
         let mut prev_captured_at: Option<Instant> = None;
+        // Живое перетаскивание рамки окна отдаёт десятки разных промежуточных
+        // размеров в секунду — пересоздавать аппаратный MFT на каждый из них
+        // (полный Activate/SetInputType/SetOutputType хардварного энкодера)
+        // валило NVENC/AMF-сессию и роняло поток. Ждём, пока размер не
+        // стабилизируется на RESIZE_DEBOUNCE, и только тогда пересоздаём энкодер.
+        const RESIZE_DEBOUNCE: Duration = Duration::from_millis(400);
+        let mut pending_resize: Option<(u32, u32, Instant)> = None;
         while !enc_stop2.load(Ordering::Relaxed) {
             let frame = match cap_rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(f) => f,
@@ -149,8 +157,22 @@ pub async fn start(
             };
             if let Some((_, w, h)) = &enc {
                 if frame.width != *w || frame.height != *h {
-                    log::info!("encoder: source resize {w}x{h} -> {}x{}, переинициализация MFT", frame.width, frame.height);
-                    enc = None;
+                    let stable = match pending_resize {
+                        Some((pw, ph, at)) if pw == frame.width && ph == frame.height => at.elapsed() >= RESIZE_DEBOUNCE,
+                        _ => false,
+                    };
+                    if stable {
+                        log::info!("encoder: source resize {w}x{h} -> {}x{}, переинициализация MFT", frame.width, frame.height);
+                        enc = None;
+                        pending_resize = None;
+                    } else {
+                        if !matches!(pending_resize, Some((pw, ph, _)) if pw == frame.width && ph == frame.height) {
+                            pending_resize = Some((frame.width, frame.height, Instant::now()));
+                        }
+                        continue; // размер ещё "гуляет" — не трогаем энкодер, кадр дропаем
+                    }
+                } else {
+                    pending_resize = None; // источник вернулся к размеру энкодера
                 }
             }
             if enc.is_none() {

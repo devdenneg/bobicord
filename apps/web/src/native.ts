@@ -72,10 +72,10 @@ function treeWsUrl(): string {
   return base + (base.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
 }
 
-export async function startNativeBroadcast(streamId: string, identity: string, config: StreamConfig): Promise<void> {
+export async function startNativeBroadcast(streamId: string, identity: string, serverId: string, config: StreamConfig): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');
   await invoke('start_broadcast', {
-    streamId, wsUrl: treeWsUrl(), identity,
+    streamId, wsUrl: treeWsUrl(), identity, serverId,
     source: config.source, maxWidth: config.maxWidth, maxHeight: config.maxHeight, fps: config.fps, bitrateBps: config.bitrateBps,
     audioTargetPid: config.audioTargetPid ?? null,
   });

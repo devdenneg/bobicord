@@ -34,6 +34,7 @@ async fn start_broadcast(
   stream_id: String,
   ws_url: String,
   identity: String,
+  server_id: String,
   source: broadcast::CaptureSource,
   max_width: u32,
   max_height: u32,
@@ -55,7 +56,7 @@ async fn start_broadcast(
       None => broadcast::AudioSource::ExcludeSelf,
     },
   };
-  let handle = broadcast::start(Some(app), stream_id, ws_url, identity, source, config).await?;
+  let handle = broadcast::start(Some(app), stream_id, ws_url, identity, server_id, source, config).await?;
   *slot = Some(handle);
   Ok(())
 }

@@ -27,7 +27,7 @@ pub enum TreeCmd {
 /// Поднимает ws-соединение и держит его в отдельной tokio-задаче. Возвращает
 /// канал команд (на отправку) и канал событий (на приём) — остальной код
 /// (`peer.rs`) не трогает сериализацию протокола напрямую.
-pub fn connect(ws_url: String, stream_id: String, identity: String) -> (mpsc::UnboundedSender<TreeCmd>, mpsc::UnboundedReceiver<TreeEvent>) {
+pub fn connect(ws_url: String, stream_id: String, identity: String, server_id: String) -> (mpsc::UnboundedSender<TreeCmd>, mpsc::UnboundedReceiver<TreeEvent>) {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<TreeCmd>();
     let (evt_tx, evt_rx) = mpsc::unbounded_channel::<TreeEvent>();
 
@@ -48,6 +48,7 @@ pub fn connect(ws_url: String, stream_id: String, identity: String) -> (mpsc::Un
             "role": "broadcaster",
             "native": true,
             "identity": identity,
+            "serverId": server_id,
         });
         if write.send(Message::Text(join_msg.to_string().into())).await.is_err() {
             let _ = evt_tx.send(TreeEvent::Closed);

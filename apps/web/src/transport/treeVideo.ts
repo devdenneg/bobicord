@@ -55,6 +55,7 @@ function preferH264(pc: RTCPeerConnection) {
 
 export class TreeVideoTransport implements VideoTransport {
   private me = '';
+  private serverId = '';
   private closed = false;
   private discoveryWs: WebSocket | null = null;
   private liveStreams = new Set<string>();
@@ -72,8 +73,9 @@ export class TreeVideoTransport implements VideoTransport {
   private videoTrackRemovedCbs = new Set<(key: string) => void>();
 
   /* ---------- lifecycle ---------- */
-  attach(_room: Room, ctx: { me: string }) {
+  attach(_room: Room, ctx: { me: string; serverId: string }) {
     this.me = ctx.me;
+    this.serverId = ctx.serverId;
     this.closed = false;
     this.natProbe = detectSymmetricNat();
     this.openDiscovery();
@@ -94,6 +96,10 @@ export class TreeVideoTransport implements VideoTransport {
     let ws: WebSocket;
     try { ws = new WebSocket(treeWsUrl()); } catch { return; }
     this.discoveryWs = ws;
+    // Сервер узнаёт, в каком сервере (гильдии) мы сидим, только из этого сообщения —
+    // до него бэклог живых стримов не шлётся (см. tree.js onHello), а после join'а
+    // вещателя используется, чтобы не разослать stream-live/stream-end в чужие серверы.
+    ws.onopen = () => { try { ws.send(JSON.stringify({ t: 'hello', serverId: this.serverId })); } catch { /**/ } };
     ws.onmessage = (ev) => {
       let msg: any; try { msg = JSON.parse(ev.data); } catch { return; }
       if (msg.t === 'welcome') {
@@ -131,7 +137,7 @@ export class TreeVideoTransport implements VideoTransport {
 
     ws.onopen = async () => {
       const symmetricNat = await this.natProbe.catch(() => false);
-      try { ws.send(JSON.stringify({ t: 'join', streamId, role: 'viewer', native: false, identity: this.me, symmetricNat })); } catch { /**/ }
+      try { ws.send(JSON.stringify({ t: 'join', streamId, role: 'viewer', native: false, identity: this.me, symmetricNat, serverId: this.serverId })); } catch { /**/ }
     };
     ws.onmessage = (ev) => this.onWatchMessage(streamId, st, ev);
     ws.onclose = () => { if (!st.closed) this.teardownWatch(streamId, st); };

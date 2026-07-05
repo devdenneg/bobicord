@@ -156,11 +156,12 @@ function attachTreeServer(httpServer, opts) {
     if (p && p.ws.readyState === p.ws.OPEN) { try { p.ws.send(JSON.stringify(obj)); } catch { /**/ } }
   }
 
-  // Э2: lightweight global discovery — lets a browser show a "live" badge / watch button
-  // for a stream it hasn't joined yet. Broadcast to every connected socket (viewers use a
-  // long-lived connection that never sends `join` just to listen for this).
-  function broadcastAll(obj) {
-    for (const [pid] of peers) send(pid, obj);
+  // Э2: lightweight discovery — lets a browser show a "live" badge / watch button for a
+  // stream it hasn't joined yet. Scoped per server (гильдия), не глобально: иначе зритель
+  // в сервере A видел бы badge/мог смотреть стрим из сервера B, о котором вообще не должен
+  // знать (streamId = identity вещателя, никак не привязан к серверу сам по себе).
+  function broadcastToServer(serverId, obj) {
+    for (const [pid, p] of peers) if (p.serverId === serverId) send(pid, obj);
   }
 
   function broadcastTreeInfo(streamId) {
@@ -173,12 +174,26 @@ function attachTreeServer(httpServer, opts) {
     }
   }
 
+  // Discovery-сокет (браузер/натив, никогда не joins) сообщает свой сервер здесь —
+  // до этого сообщения бэклог живых стримов не шлём (см. wss.on('connection')).
+  function onHello(id, msg) {
+    const node = peers.get(id);
+    if (!node) return;
+    node.serverId = msg.serverId || null;
+    for (const [sid, t] of mgr.trees) {
+      if (!t.broadcasterId) continue;
+      const bnode = t.nodes.get(t.broadcasterId);
+      if (bnode && bnode.serverId === node.serverId) send(id, { t: 'stream-live', streamId: sid, identity: bnode.identity, initial: true });
+    }
+  }
+
   function onJoin(id, msg) {
-    const { streamId, role, native, identity, symmetricNat } = msg;
+    const { streamId, role, native, identity, symmetricNat, serverId } = msg;
     if (!streamId || (role !== 'broadcaster' && role !== 'viewer')) return;
     const node = peers.get(id);
     node.streamId = streamId; node.role = role; node.native = !!native; node.identity = identity || id;
     node.symmetricNat = !!symmetricNat;
+    node.serverId = serverId || node.serverId || null;
     node.parent = null; node.children = []; node.depth = 0;
     const { parent } = mgr.join(streamId, node);
     if (parent) {
@@ -188,7 +203,7 @@ function attachTreeServer(httpServer, opts) {
       send(id, { t: 'assign-parent', streamId, parentId: null });
     }
     broadcastTreeInfo(streamId);
-    if (role === 'broadcaster') broadcastAll({ t: 'stream-live', streamId, identity: node.identity, initial: false });
+    if (role === 'broadcaster') broadcastToServer(node.serverId, { t: 'stream-live', streamId, identity: node.identity, initial: false });
   }
 
   function onSignal(id, msg) {
@@ -205,7 +220,7 @@ function attachTreeServer(httpServer, opts) {
     const { reparented, dropped, broadcasterLost } = mgr.leave(p.streamId, id);
     if (broadcasterLost) {
       dropped.forEach((peerId) => send(peerId, { t: 'drop-peer', streamId: p.streamId, peerId: id }));
-      broadcastAll({ t: 'stream-end', streamId: p.streamId, identity: p.identity });
+      broadcastToServer(p.serverId, { t: 'stream-end', streamId: p.streamId, identity: p.identity });
       return;
     }
     if (oldParentId) send(oldParentId, { t: 'drop-peer', streamId: p.streamId, peerId: id });
@@ -218,21 +233,17 @@ function attachTreeServer(httpServer, opts) {
 
   wss.on('connection', (ws) => {
     const id = newPeerId();
-    peers.set(id, { id, ws, streamId: null, role: null, native: false, identity: id, parent: null, children: [], depth: 0 });
+    peers.set(id, { id, ws, streamId: null, role: null, native: false, identity: id, serverId: null, parent: null, children: [], depth: 0 });
     ws.on('message', (raw) => {
       let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
       if (msg.t === 'join') onJoin(id, msg);
       else if (msg.t === 'sdp' || msg.t === 'ice') onSignal(id, msg);
       else if (msg.t === 'leave') onLeave(id);
+      else if (msg.t === 'hello') onHello(id, msg);
       // msg.t === 'stats' — Э1: принимаем и игнорируем; BWE-ребаланс это Э8
     });
     ws.on('close', () => onLeave(id));
     send(id, { t: 'welcome', id, iceServers: iceServersFor(ws.__uid) });
-    for (const [sid, t] of mgr.trees) {
-      if (!t.broadcasterId) continue;
-      const bnode = t.nodes.get(t.broadcasterId);
-      if (bnode) send(id, { t: 'stream-live', streamId: sid, identity: bnode.identity, initial: true });
-    }
   });
 
   return { mgr, peers, wss };

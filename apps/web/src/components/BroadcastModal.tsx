@@ -35,6 +35,7 @@ function saveConfig(c: SavedConfig) { localStorage.setItem('bcastConfig', JSON.s
 export function BroadcastModal() {
   const close = () => useStore.getState().setModal(null);
   const me = useStore((s) => s.me)!;
+  const active = useStore((s) => s.active)!;
   const live = useStore((s) => s.broadcastLive);
   const [cfg, setCfg] = useState<SavedConfig>(loadConfig);
   const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
@@ -64,7 +65,7 @@ export function BroadcastModal() {
         ? { kind: 'window', hwnd: cfg.windowHwnd }
         : { kind: 'monitor', index: cfg.monitorIndex };
       const audioTargetPid = cfg.audioMode === 'include' && cfg.audioPid != null ? cfg.audioPid : undefined;
-      await startNativeBroadcast(me.username, me.username, { source, maxWidth: res.w, maxHeight: res.h, fps: cfg.fps, bitrateBps: cfg.bitrateMbps * 1_000_000, audioTargetPid });
+      await startNativeBroadcast(me.username, me.username, active.id, { source, maxWidth: res.w, maxHeight: res.h, fps: cfg.fps, bitrateBps: cfg.bitrateMbps * 1_000_000, audioTargetPid });
       saveConfig(cfg);
       useStore.getState().setBroadcastLive(true);
     } catch (e: any) { setErr(String(e?.message || e)); } finally { setBusy(false); }

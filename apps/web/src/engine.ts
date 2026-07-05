@@ -152,13 +152,13 @@ export class Engine {
   }
 
   /* ---------- connection ---------- */
-  async connect(url: string, token: string) {
+  async connect(url: string, token: string, serverId: string) {
     this.room = new Room({
       adaptiveStream: true, dynacast: true,
       publishDefaults: { dtx: true, red: true, simulcast: true, audioPreset: AudioPresets.musicHighQuality },
     });
     const r = this.room;
-    this.videoT.attach(r, { me: this.me.username });
+    this.videoT.attach(r, { me: this.me.username, serverId });
     r.on(RoomEvent.TrackSubscribed, this.onSub)
       .on(RoomEvent.TrackUnsubscribed, this.onUnsub)
       .on(RoomEvent.ParticipantConnected, (p) => { this.hooks.peerJoined(p.identity); this.hooks.toast((p.name || p.identity) + ' в сети', 'ok'); this.emit(); })

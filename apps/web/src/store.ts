@@ -104,7 +104,7 @@ export const useStore = create<AppState>((set, get) => ({
       try { const s = await api.getSettings(id); if (s.data && (s.data.users || s.data.streams)) engine?.setVols(s.data); } catch { /**/ }
       engine?.setMembers(d.members);
       const tk = await api.serverToken(id);
-      await engine?.connect(tk.url, tk.token);
+      await engine?.connect(tk.url, tk.token, id);
       // актуальный онлайн ДО показа
       try { const pres = await api.presence(id); engine?.setOnlineHint(pres.online); } catch { /**/ }
       // история чата (7 дней) ДО показа

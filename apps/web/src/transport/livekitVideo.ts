@@ -24,7 +24,7 @@ export class LiveKitVideoTransport implements VideoTransport {
   private videoTrackRemovedCbs = new Set<(key: string) => void>();
 
   /* ---------- lifecycle ---------- */
-  attach(room: Room, ctx: { me: string }) {
+  attach(room: Room, ctx: { me: string; serverId: string }) {
     this.room = room;
     this.me = ctx.me;
     room

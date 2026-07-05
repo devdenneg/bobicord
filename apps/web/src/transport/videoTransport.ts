@@ -50,7 +50,7 @@ export interface RtpStats {
 
 export interface VideoTransport {
   /** Wire room-event listeners. Call once, BEFORE `room.connect()`. */
-  attach(room: Room, ctx: { me: string }): void;
+  attach(room: Room, ctx: { me: string; serverId: string }): void;
   /** Replay already-published tracks (mirrors LiveKit's own late-subscribe pattern). Call AFTER `room.connect()` resolves. */
   onRoomConnected(): void;
   /** Unhook listeners + clear internal registries. Call from engine.disconnect(). */
