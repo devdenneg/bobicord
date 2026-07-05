@@ -1,11 +1,13 @@
 import {
-  Room, RoomEvent, Track, LocalVideoTrack, LocalAudioTrack, AudioPresets,
+  Room, RoomEvent, Track, LocalAudioTrack, AudioPresets,
   type RemoteParticipant, type Participant, type TrackPublication, type RemoteTrack,
 } from 'livekit-client';
 import type { User, Member, ChatMessage, Emote } from './types';
 import { getSettings } from './settings';
 import { emoteUrl } from './emotes';
 import { playSound } from './sounds';
+import type { VideoTransport } from './transport/videoTransport';
+import { LiveKitVideoTransport } from './transport/livekitVideo';
 
 export interface PeerState { online: boolean; inVoice: boolean; micMuted: boolean; streaming: boolean }
 export interface StreamInfo { key: string; identity: string; isLocal: boolean }
@@ -51,7 +53,7 @@ export class Engine {
   private micGain: GainNode | null = null;
   private manualMute = false;
 
-  private videoTracks = new Map<string, LocalVideoTrack | RemoteTrack>();
+  private videoT: VideoTransport = new LiveKitVideoTransport();
   private screenAudioEls = new Map<string, HTMLMediaElement>();
   private watching = new Set<string>();
   private pendingWatch = new Set<string>();
@@ -80,6 +82,24 @@ export class Engine {
   constructor(me: User, hooks: EngineHooks) {
     this.me = me;
     this.hooks = hooks;
+    this.videoT.onVideoTrack((_key, _track, identity, isLocal) => {
+      if (!isLocal) this.pendingWatch.delete(identity);
+      this.emit();
+    });
+    this.videoT.onVideoTrackRemoved(() => this.emit());
+    this.videoT.onStreamStart((identity, silent) => {
+      this.emit();
+      if (!silent) {
+        this.sysMsg(`📺 ${this.nameOf(identity)} начал трансляцию — «▶ Смотреть» в списке`);
+        playSound('stream');
+        this.hooks.toast(this.nameOf(identity) + ' начал трансляцию', 'info');
+      }
+    });
+    this.videoT.onStreamStop((identity) => {
+      this.watching.delete(identity); this.pendingWatch.delete(identity);
+      this.sysMsg(`${this.nameOf(identity)} закончил трансляцию`);
+      this.emit();
+    });
     this.snap = this.build();
   }
 
@@ -106,8 +126,7 @@ export class Engine {
     }
     const speaking: Record<string, boolean> = {};
     this.speakingSet.forEach((u) => (speaking[u] = true));
-    const streams: StreamInfo[] = [];
-    this.videoTracks.forEach((_t, key) => { const info = this.streamInfoByKey.get(key); if (info) streams.push(info); });
+    const streams: StreamInfo[] = this.videoT.getStreams();
     const watching: Record<string, true> = {}; this.watching.forEach((u) => (watching[u] = true));
     const pending: Record<string, true> = {}; this.pendingWatch.forEach((u) => (pending[u] = true));
     const watchers: Record<string, { name: string }[]> = {};
@@ -119,8 +138,6 @@ export class Engine {
     };
   }
 
-  private streamInfoByKey = new Map<string, StreamInfo>();
-
   /* ---------- connection ---------- */
   async connect(url: string, token: string) {
     this.room = new Room({
@@ -128,19 +145,18 @@ export class Engine {
       publishDefaults: { dtx: true, red: true, simulcast: true, audioPreset: AudioPresets.musicHighQuality },
     });
     const r = this.room;
+    this.videoT.attach(r, { me: this.me.username });
     r.on(RoomEvent.TrackSubscribed, this.onSub)
       .on(RoomEvent.TrackUnsubscribed, this.onUnsub)
       .on(RoomEvent.ParticipantConnected, (p) => { this.hooks.peerJoined(p.identity); this.hooks.toast((p.name || p.identity) + ' в сети', 'ok'); this.emit(); })
       .on(RoomEvent.ParticipantDisconnected, (p) => { this.cleanupPeer(p.identity); this.emit(); })
       .on(RoomEvent.TrackMuted, () => this.emit())
       .on(RoomEvent.TrackUnmuted, () => this.emit())
-      .on(RoomEvent.LocalTrackPublished, this.onLocalPub)
-      .on(RoomEvent.LocalTrackUnpublished, this.onLocalUnpub)
       .on(RoomEvent.TrackPublished, this.onRemotePub)
-      .on(RoomEvent.TrackUnpublished, this.onRemoteUnpub)
       .on(RoomEvent.DataReceived, this.onData);
     await r.connect(url, token, { autoSubscribe: false });
     r.remoteParticipants.forEach((p) => p.trackPublications.forEach((pub) => this.onRemotePub(pub, p, true)));
+    this.videoT.onRoomConnected();
     this.presenceTimer = window.setInterval(() => { this.announceWatch(); this.cleanupWatchers(); }, 3000);
     this.emit();
   }
@@ -152,7 +168,7 @@ export class Engine {
     if (this.spRAF) cancelAnimationFrame(this.spRAF); this.spRAF = null;
     this.keepAliveOff();
     document.querySelectorAll('#audioSink audio').forEach((a) => a.remove());
-    this.videoTracks.clear(); this.streamInfoByKey.clear(); this.screenAudioEls.clear();
+    this.videoT.detach(); this.screenAudioEls.clear();
     this.watching.clear(); this.pendingWatch.clear(); this.streamWatchers.clear();
     this.perMute.clear(); this.messages = [];
     if (this.micRaw) { this.micRaw.getTracks().forEach((t) => t.stop()); this.micRaw = null; }
@@ -175,8 +191,10 @@ export class Engine {
     return !!p.getTrackPublication(Track.Source.Microphone);
   }
   private isStreaming(username: string): boolean {
-    const p = this.partOf(username); return !!(p && p.getTrackPublication(Track.Source.ScreenShare));
+    if (username === this.me.username) return this.videoT.isBroadcasting(username);
+    return this.videoT.isRemoteBroadcasting(username);
   }
+  private nameOf(identity: string): string { const p = this.partOf(identity); return (p && p.name) || identity; }
   private localMicMuted(): boolean { return this.manualMute; }
   private micPub() { return this.room && this.room.localParticipant.getTrackPublication(Track.Source.Microphone); }
 
@@ -305,17 +323,9 @@ export class Engine {
     this.spRAF = this.analysers.size ? requestAnimationFrame(this.spLoop) : null;
   };
 
-  /* ---------- track events ---------- */
-  private onRemotePub = (pub: TrackPublication, p: RemoteParticipant, silent?: boolean) => {
+  /* ---------- track events (mic/chat only — video-domain events live in VideoTransport) ---------- */
+  private onRemotePub = (pub: TrackPublication, _p: RemoteParticipant, silent?: boolean) => {
     if (pub.source === Track.Source.Microphone) { if (this.inVoice) { try { (pub as any).setSubscribed(true); } catch { /**/ } if (!silent) playSound('join'); } this.emit(); }
-    else if (pub.source === Track.Source.ScreenShare) {
-      this.emit();
-      if (!silent) { this.sysMsg(`📺 ${p.name || p.identity} начал трансляцию — «▶ Смотреть» в списке`); playSound('stream'); this.hooks.toast((p.name || p.identity) + ' начал трансляцию', 'info'); }
-    }
-  };
-  private onRemoteUnpub = (pub: TrackPublication, p: RemoteParticipant) => {
-    if (pub.source === Track.Source.ScreenShare) { this.watching.delete(p.identity); this.pendingWatch.delete(p.identity); this.sysMsg(`${p.name || p.identity} закончил трансляцию`); }
-    this.emit();
   };
   private onSub = (track: RemoteTrack, pub: TrackPublication, p: RemoteParticipant) => {
     if (track.kind === Track.Kind.Audio) {
@@ -323,45 +333,29 @@ export class Engine {
       const out = getSettings().output; if ((a as any).setSinkId && out) (a as any).setSinkId(out).catch(() => {});
       if (pub.source === Track.Source.ScreenShareAudio) { this.screenAudioEls.set(p.identity, a); a.muted = this.deafened; a.volume = this.streamVolOf(p.identity); }
       else { this.applyVolumeByName(p.identity); this.attachAnalyser(p.identity, (track as any).mediaStreamTrack); }
-    } else if (track.kind === Track.Kind.Video) {
-      if (pub.source === Track.Source.ScreenShare) this.pendingWatch.delete(p.identity);
-      this.addVideo(pub.trackSid, track, p.identity, false);
     }
     this.emit();
   };
   private onUnsub = (track: RemoteTrack, pub: TrackPublication, p: RemoteParticipant) => {
     track.detach().forEach((el) => el.remove());
-    this.delVideo(pub.trackSid);
     if (pub.source === Track.Source.ScreenShareAudio) this.screenAudioEls.delete(p.identity);
     if (pub.source === Track.Source.Microphone) this.detachAnalyser(p.identity);
     this.emit();
   };
-  private onLocalPub = (pub: TrackPublication) => {
-    const track = pub.track;
-    if (track && track.kind === Track.Kind.Video) this.addVideo(pub.trackSid, track as LocalVideoTrack, this.me.username, true);
-    this.emit();
-  };
-  private onLocalUnpub = (pub: TrackPublication) => { if (pub.track) (pub.track as any).detach?.().forEach((el: HTMLElement) => el.remove()); this.delVideo(pub.trackSid); this.emit(); };
 
-  /* ---------- streams ---------- */
-  getVideoTrack(key: string) { return this.videoTracks.get(key); }
-  private addVideo(key: string, track: LocalVideoTrack | RemoteTrack, identity: string, isLocal: boolean) {
-    this.videoTracks.set(key, track);
-    this.streamInfoByKey.set(key, { key, identity, isLocal });
-  }
-  private delVideo(key: string) { this.videoTracks.delete(key); this.streamInfoByKey.delete(key); }
+  /* ---------- streams (thin facades over VideoTransport) ---------- */
+  getVideoTrack(key: string) { return this.videoT.getVideoTrack(key); }
 
   watch(identity: string) {
     const p = this.room?.remoteParticipants.get(identity); if (!p) return;
     this.watching.add(identity); this.pendingWatch.add(identity);
-    const v = p.getTrackPublication(Track.Source.ScreenShare), a = p.getTrackPublication(Track.Source.ScreenShareAudio);
-    [v, a].forEach((pub) => { if (pub) { try { (pub as any).setSubscribed(true); } catch { /**/ } } });
+    this.videoT.watch(identity);
     if (!localStorage.getItem('sprayTip')) { localStorage.setItem('sprayTip', '1'); this.hooks.toast('Кинь эмоут зрителям — 😃 в углу трансляции', 'info'); }
     this.emit();
     setTimeout(() => {
       if (this.pendingWatch.has(identity)) {
         this.pendingWatch.delete(identity); this.watching.delete(identity);
-        [v, a].forEach((pub) => { if (pub) { try { (pub as any).setSubscribed(false); } catch { /**/ } } });
+        this.videoT.unwatch(identity);
         this.hooks.toast('Не удалось подключиться к трансляции', 'err'); this.emit();
       }
     }, 10000);
@@ -369,8 +363,7 @@ export class Engine {
   closeWatch(identity: string) {
     const p = this.room?.remoteParticipants.get(identity); if (!p) return;
     this.watching.delete(identity);
-    const v = p.getTrackPublication(Track.Source.ScreenShare), a = p.getTrackPublication(Track.Source.ScreenShareAudio);
-    [v, a].forEach((pub) => { if (pub) { try { (pub as any).setSubscribed(false); } catch { /**/ } } });
+    this.videoT.unwatch(identity);
     const m = this.streamWatchers.get(identity); if (m) { m.delete(this.me.username); }
     this.dataSend({ t: 'watch', s: identity, id: this.me.username, n: this.me.displayName, on: false });
     this.emit();
@@ -378,7 +371,7 @@ export class Engine {
 
   async share() {
     if (!this.inVoice) { this.hooks.toast('Сначала подключись к голосовому', 'warn'); return; }
-    if (this.screenStream || this.room!.localParticipant.isScreenShareEnabled) { await this.stopShare(); this.hooks.toast('Трансляция остановлена'); return; }
+    if (this.videoT.isBroadcasting(this.me.username)) { await this.stopShare(); this.hooks.toast('Трансляция остановлена'); return; }
     try {
       this.screenStream = await navigator.mediaDevices.getDisplayMedia({
         video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60 }, displaySurface: 'browser' } as any,
@@ -391,11 +384,8 @@ export class Engine {
     try { await vt.applyConstraints({ frameRate: { ideal: 60, min: 30 } } as any); } catch { try { await vt.applyConstraints({ frameRate: { ideal: 60 } } as any); } catch { /**/ } }
     try { (vt as any).contentHint = 'motion'; } catch { /**/ }
     vt.addEventListener('ended', () => this.stopShare());
-    const lvt = new LocalVideoTrack(vt);
-    await this.room!.localParticipant.publishTrack(lvt, { source: Track.Source.ScreenShare, videoEncoding: { maxBitrate: 8_000_000, maxFramerate: 60 }, videoCodec: 'vp8', simulcast: false, degradationPreference: 'maintain-framerate' as any });
-    const at = this.screenStream.getAudioTracks()[0];
-    if (at) { const lat = new LocalAudioTrack(at); await this.room!.localParticipant.publishTrack(lat, { source: Track.Source.ScreenShareAudio, dtx: false, red: false }); }
-    else this.hooks.toast('Звук экрана не захвачен — включи галку «Поделиться аудио»', 'warn');
+    await this.videoT.startBroadcast(this.me.username, this.screenStream);
+    if (!this.screenStream.getAudioTracks()[0]) this.hooks.toast('Звук экрана не захвачен — включи галку «Поделиться аудио»', 'warn');
     this.keepAliveOn();
     const surf = (vt.getSettings() as any).displaySurface || '';
     if (surf === 'monitor' || surf === 'window') this.hooks.toast('Выбран экран/окно (~15fps). Для 60fps выбирай «Вкладка Chrome»', 'warn'); else this.hooks.toast('Трансляция запущена', 'ok');
@@ -404,35 +394,18 @@ export class Engine {
   }
   async stopShare() {
     if (!this.room) return;
-    const v = this.room.localParticipant.getTrackPublication(Track.Source.ScreenShare);
-    if (v && v.track) { try { await this.room.localParticipant.unpublishTrack(v.track, true); } catch { /**/ } }
-    const a = this.room.localParticipant.getTrackPublication(Track.Source.ScreenShareAudio);
-    if (a && a.track) { try { await this.room.localParticipant.unpublishTrack(a.track, true); } catch { /**/ } }
+    await this.videoT.stopBroadcast(this.me.username);
     if (this.screenStream) { this.screenStream.getTracks().forEach((t) => t.stop()); this.screenStream = null; }
     this.keepAliveOff();
     if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => {});
     this.emit();
   }
-  isSharing() { return !!(this.room && this.room.localParticipant.isScreenShareEnabled); }
+  isSharing() { return this.videoT.isBroadcasting(this.me.username); }
 
   private keepAliveOn() { try { this.keepCtx = this.keepCtx || new AudioContext(); if (this.keepOsc) return; this.keepOsc = this.keepCtx.createOscillator(); const g = this.keepCtx.createGain(); g.gain.value = 0.0004; this.keepOsc.frequency.value = 30; this.keepOsc.connect(g); g.connect(this.keepCtx.destination); this.keepOsc.start(); } catch { /**/ } }
   private keepAliveOff() { try { if (this.keepOsc) { this.keepOsc.stop(); this.keepOsc.disconnect(); this.keepOsc = null; } } catch { /**/ } }
 
-  async getScreenStats(): Promise<string | null> {
-    const pub = this.room?.localParticipant.getTrackPublication(Track.Source.ScreenShare);
-    if (!pub || !pub.track) return null;
-    try {
-      const rep = await (pub.track as any).getRTCStatsReport();
-      let o: any = null, rem: any = null, src: any = null;
-      rep.forEach((s: any) => { if (s.type === 'outbound-rtp' && s.kind === 'video') o = s; if (s.type === 'remote-inbound-rtp' && s.kind === 'video') rem = s; if (s.type === 'media-source' && s.kind === 'video') src = s; });
-      if (!o) return null;
-      const fps = Math.round(o.framesPerSecond || 0), res = (o.frameWidth || 0) + '×' + (o.frameHeight || 0);
-      const cap = src ? Math.round(src.framesPerSecond || 0) : null;
-      const loss = rem && rem.fractionLost != null ? (rem.fractionLost * 100).toFixed(1) + '%' : '—';
-      const rtt = rem && rem.roundTripTime != null ? Math.round(rem.roundTripTime * 1000) + 'ms' : '—';
-      return `${res} · ${fps}fps${cap != null ? ' (захв ' + cap + ')' : ''} · ${rtt} · потери ${loss}`;
-    } catch { return null; }
-  }
+  async getScreenStats(): Promise<string | null> { return this.videoT.getScreenStats(this.me.username); }
 
   /* ---------- emotes (spray) ---------- */
   onEmote(cb: EmoteListener) { this.emoteListeners.add(cb); return () => { this.emoteListeners.delete(cb); }; }
