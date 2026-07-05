@@ -10,10 +10,6 @@ import type { VideoTransport } from './transport/videoTransport';
 import { LiveKitVideoTransport } from './transport/livekitVideo';
 import { TreeVideoTransport } from './transport/treeVideo';
 
-function makeVideoTransport(): VideoTransport {
-  return import.meta.env.VITE_VIDEO_TRANSPORT === 'tree' ? new TreeVideoTransport() : new LiveKitVideoTransport();
-}
-
 export interface PeerState { online: boolean; inVoice: boolean; micMuted: boolean; streaming: boolean }
 export interface StreamInfo { key: string; identity: string; isLocal: boolean }
 export interface Snapshot {
@@ -68,7 +64,12 @@ export class Engine {
   private micGain: GainNode | null = null;
   private manualMute = false;
 
-  private videoT: VideoTransport = makeVideoTransport();
+  // Оба транспорта живут одновременно (не выбор build-флагом): нативный вещатель
+  // публикует только в дерево, браузер — только в LiveKit (старый путь, инвариант 2
+  // CLAUDE.md); зритель матчит транспорт по тому, откуда объявлен конкретный стрим
+  // (см. transportFor).
+  private liveKitT: VideoTransport = new LiveKitVideoTransport();
+  private treeT: VideoTransport = new TreeVideoTransport();
   private screenAudioEls = new Map<string, HTMLMediaElement>();
   private watching = new Set<string>();
   private pendingWatch = new Set<string>();
@@ -113,28 +114,33 @@ export class Engine {
   constructor(me: User, hooks: EngineHooks) {
     this.me = me;
     this.hooks = hooks;
-    this.videoT.onVideoTrack((_key, _track, identity, isLocal) => {
+    const onVideoTrack = (_key: string, _track: unknown, identity: string, isLocal: boolean) => {
       if (!isLocal) this.pendingWatch.delete(identity);
       this.emit();
-    });
-    this.videoT.onVideoTrackRemoved(() => this.emit());
-    this.videoT.onStreamStart((identity, silent) => {
+    };
+    const onStreamStart = (identity: string, silent: boolean) => {
       this.emit();
       if (!silent) {
         this.sysMsg(`📺 ${this.nameOf(identity)} начал трансляцию — «▶ Смотреть» в списке`);
         playSound('stream');
         this.hooks.toast(this.nameOf(identity) + ' начал трансляцию', 'info');
       }
-    });
-    this.videoT.onStreamStop((identity) => {
+    };
+    const onStreamStop = (identity: string) => {
       // Разрываем watch явно (idempotent, no-op если уже не смотрели) — иначе
       // при обрыве вещателя <video> остаётся с последним кадром/чёрным экраном
       // навсегда: без unwatch() PeerConnection и трек никто не закрывает.
-      this.videoT.unwatch(identity);
+      this.transportFor(identity).unwatch(identity);
       this.watching.delete(identity); this.pendingWatch.delete(identity);
       this.sysMsg(`${this.nameOf(identity)} закончил трансляцию`);
       this.emit();
-    });
+    };
+    for (const t of [this.liveKitT, this.treeT]) {
+      t.onVideoTrack(onVideoTrack as any);
+      t.onVideoTrackRemoved(() => this.emit());
+      t.onStreamStart(onStreamStart);
+      t.onStreamStop(onStreamStop);
+    }
     this.snap = this.build();
   }
 
@@ -161,7 +167,7 @@ export class Engine {
     }
     const speaking: Record<string, boolean> = {};
     this.speakingSet.forEach((u) => (speaking[u] = true));
-    const streams: StreamInfo[] = this.videoT.getStreams();
+    const streams: StreamInfo[] = [...this.liveKitT.getStreams(), ...this.treeT.getStreams()];
     const watching: Record<string, true> = {}; this.watching.forEach((u) => (watching[u] = true));
     const pending: Record<string, true> = {}; this.pendingWatch.forEach((u) => (pending[u] = true));
     const watchers: Record<string, { name: string }[]> = {};
@@ -181,7 +187,8 @@ export class Engine {
       publishDefaults: { dtx: true, red: true, simulcast: true, audioPreset: AudioPresets.musicHighQuality },
     });
     const r = this.room;
-    this.videoT.attach(r, { me: this.me.username, serverId });
+    this.liveKitT.attach(r, { me: this.me.username, serverId });
+    this.treeT.attach(r, { me: this.me.username, serverId });
     r.on(RoomEvent.TrackSubscribed, this.onSub)
       .on(RoomEvent.TrackUnsubscribed, this.onUnsub)
       .on(RoomEvent.ParticipantConnected, (p) => { this.hooks.peerJoined(p.identity); this.hooks.toast((p.name || p.identity) + ' в сети', 'ok'); this.emit(); })
@@ -196,7 +203,8 @@ export class Engine {
       .on(RoomEvent.DataReceived, this.onData);
     await r.connect(url, token, { autoSubscribe: false });
     r.remoteParticipants.forEach((p) => p.trackPublications.forEach((pub) => this.onRemotePub(pub, p, true)));
-    this.videoT.onRoomConnected();
+    this.liveKitT.onRoomConnected();
+    this.treeT.onRoomConnected();
     this.presenceTimer = window.setInterval(() => { this.announceWatch(); this.cleanupWatchers(); }, 3000);
     this.emit();
   }
@@ -210,7 +218,7 @@ export class Engine {
     this.stopLevelMeter();
     this.keepAliveOff();
     document.querySelectorAll('#audioSink audio').forEach((a) => a.remove());
-    this.videoT.detach(); this.screenAudioEls.clear();
+    this.liveKitT.detach(); this.treeT.detach(); this.screenAudioEls.clear();
     this.watching.clear(); this.pendingWatch.clear(); this.streamWatchers.clear();
     this.perMute.clear(); this.messages = [];
     if (this.micRaw) { this.micRaw.getTracks().forEach((t) => t.stop()); this.micRaw = null; }
@@ -233,8 +241,13 @@ export class Engine {
     return !!p.getTrackPublication(Track.Source.Microphone);
   }
   private isStreaming(username: string): boolean {
-    if (username === this.me.username) return this.videoT.isBroadcasting(username);
-    return this.videoT.isRemoteBroadcasting(username);
+    if (username === this.me.username) return this.liveKitT.isBroadcasting(username) || this.treeT.isBroadcasting(username);
+    return this.liveKitT.isRemoteBroadcasting(username) || this.treeT.isRemoteBroadcasting(username);
+  }
+  // Один стрим — один транспорт (не dual-publish): смотрим, откуда реально вещает
+  // identity, дерево или LiveKit-комната, и подключаемся тем же транспортом.
+  private transportFor(identity: string): VideoTransport {
+    return this.treeT.isRemoteBroadcasting(identity) ? this.treeT : this.liveKitT;
   }
   private nameOf(identity: string): string { const p = this.partOf(identity); return (p && p.name) || identity; }
   private localMicMuted(): boolean { return this.manualMute; }
@@ -468,21 +481,21 @@ export class Engine {
   };
 
   /* ---------- streams (thin facades over VideoTransport) ---------- */
-  getVideoTrack(key: string) { return this.videoT.getVideoTrack(key); }
+  getVideoTrack(key: string) { return this.liveKitT.getVideoTrack(key) ?? this.treeT.getVideoTrack(key); }
 
   watch(identity: string) {
     // no `this.room` participant guard here: a tree broadcaster (Э2) is a native peer,
     // not a LiveKit room participant (voice and video are separate transports now) —
     // existence is the VideoTransport's job (it no-ops safely on an unknown identity).
     this.watching.add(identity); this.pendingWatch.add(identity);
-    this.videoT.watch(identity);
+    this.transportFor(identity).watch(identity);
     if (!localStorage.getItem('sprayTip')) { localStorage.setItem('sprayTip', '1'); this.hooks.toast('Кинь эмоут зрителям — 😃 в углу трансляции', 'info'); }
     this.emit();
     const timer = window.setTimeout(() => {
       this.watchTimers.delete(identity);
       if (this.pendingWatch.has(identity)) {
         this.pendingWatch.delete(identity); this.watching.delete(identity);
-        this.videoT.unwatch(identity);
+        this.transportFor(identity).unwatch(identity);
         this.hooks.toast('Не удалось подключиться к трансляции', 'err'); this.emit();
       }
     }, 10000);
@@ -493,7 +506,7 @@ export class Engine {
     // Таймер watch() (10с "не удалось подключиться") иначе переживал явный закрытие —
     // если закрыли до коннекта, он всё равно стрелял и повторно звал unwatch()+toast.
     const t = this.watchTimers.get(identity); if (t) { clearTimeout(t); this.watchTimers.delete(identity); }
-    this.videoT.unwatch(identity);
+    this.transportFor(identity).unwatch(identity);
     const m = this.streamWatchers.get(identity); if (m) { m.delete(this.me.username); }
     this.dataSend({ t: 'watch', s: identity, id: this.me.username, n: this.me.displayName, on: false });
     this.emit();
@@ -502,7 +515,7 @@ export class Engine {
   async share() {
     if (!this.inVoice) { this.hooks.toast('Сначала подключись к голосовому', 'warn'); return; }
     if (!navigator.mediaDevices?.getDisplayMedia) { this.hooks.toast('Трансляция экрана не поддерживается на этом устройстве (нужен десктопный браузер)', 'warn'); return; }
-    if (this.videoT.isBroadcasting(this.me.username)) { await this.stopShare(); this.hooks.toast('Трансляция остановлена'); return; }
+    if (this.liveKitT.isBroadcasting(this.me.username)) { await this.stopShare(); this.hooks.toast('Трансляция остановлена'); return; }
     try {
       this.screenStream = await navigator.mediaDevices.getDisplayMedia({
         video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60 }, displaySurface: 'browser' } as any,
@@ -515,8 +528,8 @@ export class Engine {
     try { await vt.applyConstraints({ frameRate: { ideal: 60, min: 30 } } as any); } catch { try { await vt.applyConstraints({ frameRate: { ideal: 60 } } as any); } catch { /**/ } }
     try { (vt as any).contentHint = 'motion'; } catch { /**/ }
     vt.addEventListener('ended', () => this.stopShare());
-    try { await this.videoT.startBroadcast(this.me.username, this.screenStream); }
-    catch { this.hooks.toast('Вещание доступно только из нативного приложения', 'err'); this.screenStream.getTracks().forEach((t) => t.stop()); this.screenStream = null; return; }
+    try { await this.liveKitT.startBroadcast(this.me.username, this.screenStream); }
+    catch { this.hooks.toast('Не удалось начать трансляцию', 'err'); this.screenStream.getTracks().forEach((t) => t.stop()); this.screenStream = null; return; }
     if (!this.screenStream.getAudioTracks()[0]) this.hooks.toast('Звук экрана не захвачен — включи галку «Поделиться аудио»', 'warn');
     this.keepAliveOn();
     const surf = (vt.getSettings() as any).displaySurface || '';
@@ -526,23 +539,23 @@ export class Engine {
   }
   async stopShare() {
     if (!this.room) return;
-    await this.videoT.stopBroadcast(this.me.username);
+    await this.liveKitT.stopBroadcast(this.me.username);
     if (this.screenStream) { this.screenStream.getTracks().forEach((t) => t.stop()); this.screenStream = null; }
     this.keepAliveOff();
     if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => {});
     this.emit();
   }
-  isSharing() { return this.videoT.isBroadcasting(this.me.username); }
+  isSharing() { return this.liveKitT.isBroadcasting(this.me.username); }
 
   private keepAliveOn() { try { this.keepCtx = this.keepCtx || new AudioContext(); if (this.keepOsc) return; this.keepOsc = this.keepCtx.createOscillator(); const g = this.keepCtx.createGain(); g.gain.value = 0.0004; this.keepOsc.frequency.value = 30; this.keepOsc.connect(g); g.connect(this.keepCtx.destination); this.keepOsc.start(); } catch { /**/ } }
   private keepAliveOff() { try { if (this.keepOsc) { this.keepOsc.stop(); this.keepOsc.disconnect(); this.keepOsc = null; } } catch { /**/ } }
 
-  async getScreenStats(): Promise<string | null> { return this.videoT.getScreenStats(this.me.username); }
+  async getScreenStats(): Promise<string | null> { return this.liveKitT.getScreenStats(this.me.username); }
 
   /** Позиция в дереве + живая RTP-статистика для дебаг-панели зрителя (Э2.1).
    *  `null` для транспортов без дерева (LiveKit) — StreamTile просто не покажет панель. */
-  getTreeInfo(identity: string) { return this.videoT.getTreeInfo?.(identity) ?? null; }
-  async getWatchRtpStats(identity: string) { return (await this.videoT.getRtpStats?.(identity)) ?? null; }
+  getTreeInfo(identity: string) { return this.transportFor(identity).getTreeInfo?.(identity) ?? null; }
+  async getWatchRtpStats(identity: string) { return (await this.transportFor(identity).getRtpStats?.(identity)) ?? null; }
 
   /* ---------- emotes (spray) ---------- */
   onEmote(cb: EmoteListener) { this.emoteListeners.add(cb); return () => { this.emoteListeners.delete(cb); }; }

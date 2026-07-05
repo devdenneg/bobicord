@@ -167,6 +167,24 @@ function NativeBroadcastButton() {
   );
 }
 
+/* Веб-вещание — старый LiveKit-путь (VP8, через SFU), оставлен параллельно с
+   нативным P2P-деревом (см. CLAUDE.md инвариант 2 / docs/Evolution-TZ.md, решение
+   2026-07-06). Зритель сам определяет транспорт при `watch()` — тут ничего не меняем. */
+function ShareButton() {
+  const eng = useEngine();
+  const E = getEngine()!;
+  const me = useStore((s) => s.me)!;
+  if (!eng.inVoice) return null;
+  const live = !!eng.presence[me.username]?.streaming;
+  return (
+    <button className={'cbtn' + (live ? ' danger-on' : '')} aria-pressed={live}
+      data-tip={live ? 'Трансляция идёт' : 'Транслировать экран'}
+      onClick={() => E.share()}>
+      <Icon name={live ? 'screen-stop' : 'screen'} sm />
+    </button>
+  );
+}
+
 function VoiceControls() {
   const eng = useEngine();
   const E = getEngine()!;
@@ -178,8 +196,7 @@ function VoiceControls() {
     <div className="vc-controls">
       <button className={micClass} aria-pressed={muted} data-tip="Микрофон · M" onClick={() => E.toggleMic()}><Icon name={muted ? 'mic-off' : 'mic'} sm /></button>
       <button className={'cbtn' + (eng.deafened ? ' danger-on' : '')} aria-pressed={eng.deafened} data-tip="Заглушить · D" onClick={() => E.toggleDeaf()}><Icon name={eng.deafened ? 'head-off' : 'head'} sm /></button>
-      {/* Share screen button removed (Evolution-TZ Э2 / CLAUDE.md invariant 2): browser never broadcasts. Native-only replacement below. */}
-      {isTauri ? <NativeBroadcastButton /> : null}
+      {isTauri ? <NativeBroadcastButton /> : <ShareButton />}
       <button className="cbtn leave-v" data-tip="Выйти из голосового" onClick={() => E.leaveVoice()}><Icon name="leave" sm /></button>
     </div>
   );

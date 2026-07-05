@@ -62,6 +62,8 @@ Server→Client: welcome{id, iceServers}
 **Файлы.** `transport/treeVideo.ts`, `engine.ts`, `components/ServerView.tsx` (убрать кнопку стрима), dev-харнесс в `apps/server` или отдельном скрипте.
 **AC.** Браузерный зритель принимает H.264 из дерева от тест-паблишера; LiveKit для видео не используется; кнопки стрима в вебе нет; голос/чат работают.
 
+> **Решение (2026-07-06, после Э5).** Кнопка стрима в веб вернулась — `engine.share()` больше не dead code. Причина: у веба нет нативного захвата/энкода, а полностью убирать вещание из браузера юзер не хочет — старый LiveKit-путь (VP8, через SFU) остаётся жить **параллельно** с P2P-деревом, а не заменяется им. `engine.ts` держит оба `VideoTransport` (`liveKitT` + `treeT`) одновременно; зритель при `watch(identity)` определяет транспорт по тому, откуда объявлен стрим (`liveKitT.isRemoteBroadcasting`/`treeT.isRemoteBroadcasting`), а не билд-флагом `VITE_VIDEO_TRANSPORT` (упразднён). Native продолжает вещать только в дерево (Rust-пайплайн, Э5), браузер — только в LiveKit; один стрим никогда не идёт в оба транспорта разом (не dual-publish).
+
 ### Э3 — coturn + NAT
 **Задача.** Развернуть coturn (STUN+TURN), временные креды по JWT (`use-auth-secret`, короткий TTL), IPv6. На клиенте — определение симметричного NAT → пометка листом; лимит TURN.
 **Файлы.** `coturn/turnserver.conf`, `docker-compose.yml`, выдача креды в `apps/server`, `treeVideo.ts`.
