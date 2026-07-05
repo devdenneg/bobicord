@@ -45,28 +45,46 @@ npm run build          # -> apps/web/dist
 
 Бэк локально обычно не поднимают — работает в Docker на сервере. Фронт ходит на `/api` того же origin (в проде это caddy); для локальной работы против удалённого API добавь `server.proxy` в `apps/web/vite.config.ts`.
 
-## Деплой (VPS)
+## Деплой — CI/CD (GitHub Actions → GHCR → VPS)
 
-Требуется Docker + Docker Compose.
+**Любой push в `main` (от любого коллаборатора) деплоит всё приложение на прод.**
+Workflow `.github/workflows/deploy.yml`:
 
-1. Конфиги из шаблонов:
-   ```bash
-   cp .env.example .env
-   cp livekit.example.yaml livekit.yaml
-   ```
-2. Вписать в `.env` и `livekit.yaml`:
-   - `LK_KEY` / `LK_SECRET` — одинаковые в обоих файлах (блок `keys:` в livekit.yaml).
+1. Собирает Docker-образы `bobicord-server` и `bobicord-web` (caddy + собранный фронт + Caddyfile запечены внутрь).
+2. Пушит их в GitHub Container Registry (приватные).
+3. По SSH заходит на VPS: `docker compose pull && docker compose up -d`.
+
+Разработчику **не нужен** доступ к VPS или ключи — секреты живут в репо, Actions деплоит от их имени. Добавляй людей в **Settings → Collaborators** (роль Write) → они пушат в `main` → прод обновляется сам.
+
+### Секреты репозитория (Settings → Secrets and variables → Actions)
+
+| Секрет        | Значение                                             |
+|---------------|------------------------------------------------------|
+| `SSH_HOST`    | IP VPS                                                |
+| `SSH_USER`    | пользователь SSH (напр. `root`)                      |
+| `SSH_KEY`     | приватный deploy-ключ (пара — публичный на VPS)      |
+| `GHCR_TOKEN`  | GitHub PAT с `read:packages` (VPS тянет приватные образы) |
+
+### Разовая настройка VPS
+
+Требуется Docker + Docker Compose. На VPS в `/opt/voice` — **только** рантайм, без сорсов:
+
+```
+/opt/voice/
+├─ docker-compose.yml   # из репо (образы GHCR)
+├─ .env                 # секреты (LK_KEY/LK_SECRET/SESSION_SECRET)
+├─ livekit.yaml         # ключи LiveKit
+└─ data/                # SQLite (создаётся сам)
+```
+
+1. `cp .env.example .env` и `cp livekit.example.yaml livekit.yaml`, вписать ключи:
+   - `LK_KEY`/`LK_SECRET` — одинаковые в обоих файлах.
    - `SESSION_SECRET` — `openssl rand -hex 32`.
-   - в `livekit.yaml`: `node_ip` (публичный IP) и сетевой интерфейс.
-   - в `Caddyfile`: свой домен.
-3. Собрать фронт: `npm run build` (даёт `apps/web/dist`, монтируется в caddy).
-4. Поднять стек:
-   ```bash
-   docker compose up -d --build
-   ```
+   - в `livekit.yaml` — `node_ip` (публичный IP) и интерфейс; домен — в `apps/web/Caddyfile` (запекается в образ).
+2. `docker login ghcr.io -u devdenneg` (PAT с read:packages).
+3. Первый деплой запустит push в `main` (или Actions → Run workflow).
 
-Обновление фронта: `npm run build` → пересинкать `apps/web/dist` на сервер (caddy отдаёт с `no-cache`).
-Обновление бэка: `docker compose up -d --build token`.
+Локальная сборка образов (для отладки): `docker compose build` в корне не сработает — образы собираются в CI. Собрать фронт локально: `npm run build`.
 
 ## Порты
 
