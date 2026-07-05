@@ -410,14 +410,16 @@ export class Engine {
     vt.addEventListener('ended', () => this.stopShare());
     const lvt = new LocalVideoTrack(vt);
     await this.room!.localParticipant.publishTrack(lvt, { source: Track.Source.ScreenShare, videoEncoding: { maxBitrate: 8_000_000, maxFramerate: 60 }, videoCodec: 'vp8', simulcast: false, degradationPreference: 'maintain-framerate' as any });
+    const surf = (vt.getSettings() as any).displaySurface || '';
     const at = this.screenStream.getAudioTracks()[0];
-    // публикуем звук с любого surface; AEC (выше) убирает голоса собеседников
     if (at) {
       const lat = new LocalAudioTrack(at);
       await this.room!.localParticipant.publishTrack(lat, { source: Track.Source.ScreenShareAudio, dtx: false, red: true, audioPreset: AudioPresets.musicHighQualityStereo });
     }
     this.keepAliveOn();
     if (!at) this.hooks.toast('Трансляция без звука — при выборе поставь галку «Поделиться аудио»', 'warn');
+    // restrictOwnAudio (чистое вырезание голосов без ducking) работает ТОЛЬКО при захвате системного звука = «Весь экран».
+    else if (surf === 'window' && supRestrict) this.hooks.toast('Есть звук. Слышны голоса? Шарь «Весь экран» + «Звук системы» — тогда голоса режутся чисто (при окне не режутся)', 'warn');
     else this.hooks.toast('Трансляция запущена', 'ok');
     playSound('stream');
     this.emit();
