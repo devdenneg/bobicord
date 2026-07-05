@@ -19,6 +19,7 @@ import SendRounded from '@mui/icons-material/SendRounded';
 import EmojiEmotionsRounded from '@mui/icons-material/EmojiEmotionsRounded';
 import VisibilityRounded from '@mui/icons-material/VisibilityRounded';
 import VisibilityOffRounded from '@mui/icons-material/VisibilityOffRounded';
+import RefreshRounded from '@mui/icons-material/RefreshRounded';
 import VideocamRounded from '@mui/icons-material/VideocamRounded';
 import CheckRounded from '@mui/icons-material/CheckRounded';
 import WarningRounded from '@mui/icons-material/WarningRounded';
@@ -38,7 +39,7 @@ const MAP: Record<string, SvgIconComponent> = {
   eye: VisibilityRounded, cam: VideocamRounded, check: CheckRounded,
   warn: WarningRounded, image: ImageRounded,
   chevron: KeyboardArrowDownRounded, 'volume-off': VolumeOffRounded, close: CloseRounded,
-  'eye-off': VisibilityOffRounded,
+  'eye-off': VisibilityOffRounded, refresh: RefreshRounded,
 };
 
 export function Icon({ name, sm }: { name: string; sm?: boolean }) {

@@ -17,6 +17,7 @@ interface AppState {
   members: Member[];
   loadingServer: boolean;
   loadingServerId: string | null;
+  updateReady: boolean;
   toasts: Toast[];
   modal: null | 'create' | 'join' | 'profile' | 'srvmenu' | 'invite' | 'settings';
   joinPrefill: string;
@@ -40,7 +41,7 @@ let memberTimer: number | null = null;
 let toastSeq = 1;
 
 export const useStore = create<AppState>((set, get) => ({
-  view: 'loading', me: null, servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, toasts: [], modal: null, joinPrefill: '',
+  view: 'loading', me: null, servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, updateReady: false, toasts: [], modal: null, joinPrefill: '',
 
   toast: (text, kind) => {
     const id = toastSeq++;

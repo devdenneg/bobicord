@@ -214,6 +214,7 @@ function Chat() {
   const fileRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
   const toast = useStore((s) => s.toast);
+  const updateReady = useStore((s) => s.updateReady);
   const [pill, setPill] = useState(0);
   const atBottomRef = useRef(true);
 
@@ -269,6 +270,13 @@ function Chat() {
         </div>
       </div>
       {pill > 0 ? <button id="newpill" className="show" onClick={() => { const m = msgsRef.current!; m.scrollTop = m.scrollHeight; setPill(0); atBottomRef.current = true; }}>↓ Новые сообщения ({pill})</button> : null}
+      {updateReady ? (
+        <div className="update-bar">
+          <div className="ub-ic"><Icon name="refresh" /></div>
+          <div className="ub-txt"><b>Вышло обновление приложения</b><span>Обнови страницу, чтобы продолжить — <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd></span></div>
+          <button className="ub-btn" onClick={() => location.reload()}><Icon name="refresh" sm />Обновить</button>
+        </div>
+      ) : (
       <div className="chat-in">
         <button id="emoBtn" ref={emoBtnRef} className={'emo-toggle' + (pickAnchor !== undefined ? ' on' : '')} data-tip="7TV эмоуты"
           onClick={() => setPickAnchor((a) => (a === undefined ? emoBtnRef.current!.getBoundingClientRect() : undefined))}><Icon name="smile" /></button>
@@ -279,6 +287,7 @@ function Chat() {
           onChange={(e) => setText(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && send()} />
         <button id="sendBtn" className={text.trim() ? '' : 'empty'} data-tip="Отправить · Enter" onClick={send}><Icon name="send" /></button>
       </div>
+      )}
       {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} onClose={() => setPickAnchor(undefined)}
         onPick={(e: Emote) => { setText((t) => t + (t && !t.endsWith(' ') ? ' ' : '') + e.name + ' '); }} /> : null}
       {lightbox ? <ImageLightbox src={lightbox} onClose={() => setLightbox(null)} /> : null}

@@ -5,12 +5,14 @@ import { App } from './App';
 import { useStore } from './store';
 import { api, getToken, setToken } from './api';
 import { loadGlobalEmotes } from './emotes';
+import { watchForUpdates } from './version';
 
 loadGlobalEmotes();
 // SW для установки PWA. НЕ кэширует (кэш ранее ронял прод); старые кэши чистятся внутри sw.js.
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
 
 createRoot(document.getElementById('root')!).render(<StrictMode><App /></StrictMode>);
+watchForUpdates();
 
 // boot: resume session + handle invite deep-link
 (async function boot() {
