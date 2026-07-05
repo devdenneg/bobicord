@@ -228,7 +228,9 @@
   .msg .tx a.msg-link{color:var(--accent-txt);text-decoration:underline;text-underline-offset:2px;word-break:break-all}
   .msg .tx a.msg-link:hover{opacity:.85}
   .msg.me .tx{background:rgba(88,101,242,.16)}
-  .msg.sys .tx{background:transparent;color:var(--muted);font-size:12.5px;padding:2px 0;border-radius:0}
+  .msg.sys{opacity:.9}
+  .msg.sys .tx{background:transparent;color:var(--muted);font-size:12px;font-style:italic;letter-spacing:.2px;padding:1px 0;border-radius:0;display:flex;align-items:center;gap:8px}
+  .msg.sys .tx::before{content:'';flex:0 0 auto;width:5px;height:5px;border-radius:50%;background:var(--muted);opacity:.55}
   .msg .tx img.emo{height:26px;vertical-align:-7px;margin:-2px 1px}
   .msg .tx.big img.emo{height:44px;vertical-align:-12px}
   .msg-img-wrap{display:inline-block;margin-top:5px;max-width:min(340px,100%);border-radius:10px;overflow:hidden;border:1px solid var(--line-2);line-height:0;padding:0;background:none;cursor:zoom-in}

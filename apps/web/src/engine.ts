@@ -327,11 +327,11 @@ export class Engine {
     if (pub.source === Track.Source.Microphone) { if (this.inVoice) { try { (pub as any).setSubscribed(true); } catch { /**/ } if (!silent) playSound('join'); } this.emit(); }
     else if (pub.source === Track.Source.ScreenShare) {
       this.emit();
-      if (!silent) { this.sysMsg(`📺 ${p.name || p.identity} начал трансляцию — «▶ Смотреть» в списке`); if (this.inVoice) playSound('stream'); this.hooks.toast((p.name || p.identity) + ' начал трансляцию', 'info'); }
+      if (!silent) { this.sysMsg(`${p.name || p.identity} начал трансляцию`); if (this.inVoice) playSound('stream'); this.hooks.toast((p.name || p.identity) + ' начал трансляцию', 'info'); }
     }
   };
   private onRemoteUnpub = (pub: TrackPublication, p: RemoteParticipant) => {
-    if (pub.source === Track.Source.ScreenShare) { this.watching.delete(p.identity); this.pendingWatch.delete(p.identity); this.sysMsg(`${p.name || p.identity} закончил трансляцию`); }
+    if (pub.source === Track.Source.ScreenShare) { this.watching.delete(p.identity); this.pendingWatch.delete(p.identity); this.sysMsg(`${p.name || p.identity} завершил трансляцию`); }
     else if (pub.source === Track.Source.Microphone && this.inVoice) playSound('leave'); // вышел из голосового
     this.emit();
   };
