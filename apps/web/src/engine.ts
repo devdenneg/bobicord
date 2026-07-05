@@ -394,12 +394,18 @@ export class Engine {
     vt.addEventListener('ended', () => this.stopShare());
     const lvt = new LocalVideoTrack(vt);
     await this.room!.localParticipant.publishTrack(lvt, { source: Track.Source.ScreenShare, videoEncoding: { maxBitrate: 8_000_000, maxFramerate: 60 }, videoCodec: 'vp8', simulcast: false, degradationPreference: 'maintain-framerate' as any });
-    const at = this.screenStream.getAudioTracks()[0];
-    if (at) { const lat = new LocalAudioTrack(at); await this.room!.localParticipant.publishTrack(lat, { source: Track.Source.ScreenShareAudio, dtx: false, red: true, audioPreset: AudioPresets.musicHighQualityStereo }); }
-    else this.hooks.toast('Звук экрана не захвачен — включи галку «Поделиться аудио»', 'warn');
-    this.keepAliveOn();
     const surf = (vt.getSettings() as any).displaySurface || '';
-    if (surf === 'monitor' || surf === 'window') this.hooks.toast('Выбран экран/окно (~15fps). Для 60fps выбирай «Вкладка Chrome»', 'warn'); else this.hooks.toast('Трансляция запущена', 'ok');
+    const at = this.screenStream.getAudioTracks()[0];
+    if (surf === 'browser') {
+      // вкладка: звук вкладки чистый (голосов собеседников в нём нет) — публикуем
+      if (at) { const lat = new LocalAudioTrack(at); await this.room!.localParticipant.publishTrack(lat, { source: Track.Source.ScreenShareAudio, dtx: false, red: true, audioPreset: AudioPresets.musicHighQualityStereo }); }
+    } else if (at) {
+      // экран/окно: захвачен звук ВСЕЙ системы — в нём слышно собеседников, НЕ транслируем
+      try { at.stop(); } catch { /**/ }
+    }
+    this.keepAliveOn();
+    if (surf === 'browser') this.hooks.toast(at ? 'Трансляция запущена' : 'Запущена без звука — при выборе вкладки ставь галку «Звук вкладки»', at ? 'ok' : 'warn');
+    else this.hooks.toast('Экран/окно: без звука (в системном слышно собеседников) и ~15fps. Для звука и 60fps — шарь «Вкладку Chrome»', 'warn');
     playSound('stream');
     this.emit();
   }
