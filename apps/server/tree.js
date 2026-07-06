@@ -89,7 +89,12 @@ class TreeManager {
     const outBonus = Math.min(cand.availableOutgoing || 0, 20_000_000) / 1_000_000; // Мбит выхода
     const lossCost = (cand.linkLoss || 0) * 50;         // потери на входящем линке кандидата
     const rttCost = (cand.linkRtt || 0) / 20;
-    return depthCost + loadCost + lossCost + rttCost - outBonus;
+    // Симметричный NAT как РОДИТЕЛЬ = offerer через TURN-relay: работает только при живом TURN,
+    // выше задержка (двойной relay), хрупко. Штраф > стоимости уровня (250 > depth*100), чтобы
+    // не-симметричный узел даже на уровень глубже предпочитался — симметричный берём в родители
+    // лишь когда другого relay нет вовсе (тогда capacityOf уже гарантировал наличие TURN).
+    const natCost = cand.symmetricNat ? 250 : 0;
+    return depthCost + loadCost + lossCost + rttCost + natCost - outBonus;
   }
 
   // Best-peer: среди всех узлов дерева со свободной ёмкостью и depth+1 <= MAX_DEPTH выбираем
