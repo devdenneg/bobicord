@@ -7,6 +7,7 @@ pub mod audio;
 pub mod capture;
 pub mod encoder;
 pub mod peer;
+pub mod relay;
 pub mod signaling;
 pub mod stats;
 
@@ -39,6 +40,9 @@ pub struct StreamConfig {
     /// Э5.2: по умолчанию — исключить себя (EXCLUDE, см. историю бага в audio.rs);
     /// `IncludeProcess(pid)` — надёжнее, если известен процесс игры/окна.
     pub audio_source: AudioSource,
+    /// Э8: лимит прямых детей корня в дереве (задаётся вещателем в UI). Overflow-зрители
+    /// уходят глубже через relay-узлы. Ёмкость объявляется серверу в join (см. signaling).
+    pub max_direct_children: u32,
 }
 
 pub struct BroadcastHandle {
@@ -94,7 +98,7 @@ pub async fn start(
     source: CaptureSource,
     config: StreamConfig,
 ) -> Result<BroadcastHandle, String> {
-    let StreamConfig { max_width, max_height, fps, bitrate_bps, audio_source } = config;
+    let StreamConfig { max_width, max_height, fps, bitrate_bps, audio_source, max_direct_children } = config;
     let source_label = describe_source(&source);
     let stats: StatsHandle = Arc::new(SharedStats::default());
     // Создаём здесь (не в конце функции, как раньше) — encoder_thread должен уметь
@@ -107,7 +111,11 @@ pub async fn start(
     let (cap_handle, cap_stop, cap_rx) = capture::spawn_capture(source, max_width, max_height, fps, stats.clone())?;
 
     let force_keyframe = Arc::new(AtomicBool::new(true));
-    let (cmd_tx, evt_rx) = signaling::connect(ws_url, stream_id.clone(), identity, server_id);
+    let join = signaling::JoinParams {
+        stream_id: stream_id.clone(), identity, server_id,
+        role: "broadcaster", native: true, max_children: max_direct_children,
+    };
+    let (cmd_tx, evt_rx) = signaling::connect(ws_url, join);
 
     let mgr = peer::PeerManager::new(&stream_id, cmd_tx.clone(), force_keyframe.clone())?;
     let video_track = mgr.video_track.clone();
@@ -267,7 +275,7 @@ pub async fn start(
     let alive = Arc::new(AtomicBool::new(true));
     let alive_loop = alive.clone();
     let meta = DebugMeta { stream_id, source_label, target_fps: fps, target_bitrate_bps: bitrate_bps };
-    tokio::spawn(run_signaling_loop(mgr, evt_rx, shutdown_rx, app, stats, meta, alive_loop));
+    tokio::spawn(run_signaling_loop(mgr, evt_rx, shutdown_rx, app, stats, meta, alive_loop, force_keyframe.clone()));
 
     Ok(BroadcastHandle {
         cap_stop,
@@ -312,6 +320,7 @@ async fn run_signaling_loop(
     stats: StatsHandle,
     meta: DebugMeta,
     alive: Arc<AtomicBool>,
+    force_keyframe: Arc<AtomicBool>,
 ) {
     let mut stats_tick = tokio::time::interval(Duration::from_secs(2));
     let mut prev_at = Instant::now();
@@ -328,6 +337,10 @@ async fn run_signaling_loop(
                     Some(TreeEvent::SdpAnswer { from, sdp }) => mgr.on_sdp_answer(from, sdp).await,
                     Some(TreeEvent::Ice { from, candidate }) => mgr.on_ice(from, candidate).await,
                     Some(TreeEvent::DropPeer { peer_id }) => mgr.on_drop_peer(peer_id).await,
+                    // Э8: relay-узел ниже по дереву просит IDR для нового зрителя — форсим.
+                    Some(TreeEvent::RequestKeyframe) => force_keyframe.store(true, Ordering::Relaxed),
+                    // Корень не имеет родителя — эти события к нему не относятся.
+                    Some(TreeEvent::AssignParent { .. }) | Some(TreeEvent::SdpOffer { .. }) | Some(TreeEvent::Topology { .. }) => {}
                     Some(TreeEvent::Closed) | None => {
                         stop_reason = Some("сигнальный канал с сервером оборвался".into());
                         break;
