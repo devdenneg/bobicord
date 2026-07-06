@@ -13,7 +13,7 @@ const { turnCredentials } = require('./turnCreds');
 const MAX_DEPTH = 4;          // инвариант CLAUDE.md: задержка видео <= 3с => глубина дерева <= 4
 const NATIVE_CAPACITY = 4;    // дефолт для нативного relay-узла, если join не прислал maxChildren
 const BROWSER_CAPACITY = 0;   // дефолт для браузера: лист (пока treeVideo не пришлёт maxChildren>0)
-const MAX_CHILDREN_CAP = 8;   // жёсткий потолок на объявленную ёмкость (защита от абьюза)
+const MAX_CHILDREN_CAP = 10;  // жёсткий потолок на объявленную ёмкость (защита от абьюза; = максимум слайдера в UI)
 const REPARENT_COOLDOWN_MS = 10_000; // гистерезис авто-миграции — не мигрировать чаще
 
 // Э8 ABR: сервер держит целевой битрейт дерева и шлёт его корню (set-bitrate). Управление —

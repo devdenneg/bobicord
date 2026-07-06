@@ -68,7 +68,7 @@ async fn start_broadcast(
       Some(pid) => broadcast::AudioSource::IncludeProcess(pid),
       None => broadcast::AudioSource::ExcludeSelfViaInclude,
     },
-    max_direct_children: max_direct_children.unwrap_or(4).clamp(1, 8),
+    max_direct_children: max_direct_children.unwrap_or(4).clamp(1, 10),
   };
   let handle = broadcast::start(Some(app), stream_id, ws_url, identity, server_id, source, config).await?;
   *slot = Some(handle);
@@ -90,7 +90,7 @@ async fn start_watch(
 ) -> Result<(), String> {
   let mut slot = state.0.lock().await;
   if let Some(old) = slot.take() { old.stop(); }
-  let handle = broadcast::relay::start(Some(app), stream_id, ws_url, identity, server_id, max_children.unwrap_or(4).clamp(0, 8));
+  let handle = broadcast::relay::start(Some(app), stream_id, ws_url, identity, server_id, max_children.unwrap_or(4).clamp(0, 10));
   *slot = Some(handle);
   Ok(())
 }

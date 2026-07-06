@@ -19,8 +19,8 @@ interface SavedConfig {
   windowHwnd: number | null;
   resolution: Resolution;
   fps: 30 | 60;
-  bitrateMbps: 3 | 6 | 10;
-  /** Э8 ABR: авто-адаптация битрейта под сеть дерева. bitrateMbps при этом — потолок. */
+  bitrateKbps: number;
+  /** Э8 ABR: авто-адаптация битрейта под сеть дерева. bitrateKbps при этом — потолок. */
   autoBitrate: boolean;
   /** auto — звук следует за источником: окно → его процесс (INCLUDE, надёжно против
    *  эха голоса войса), монитор → всё кроме RelayApp (EXCLUDE себя). Ничего выбирать руками.
@@ -33,17 +33,20 @@ interface SavedConfig {
 // audioMode дефолтом 'auto': звук выбирается сам по источнику (окно → PID окна, монитор →
 // EXCLUDE себя), пользователю не нужно вручную указывать процесс. Ручной выбор остаётся
 // под «Дополнительно» на случай, когда нужен звук строго одного приложения.
-const DEF_CONFIG: SavedConfig = { sourceKind: 'monitor', monitorIndex: 0, windowHwnd: null, resolution: '1080', fps: 30, bitrateMbps: 6, autoBitrate: false, audioMode: 'auto', audioPid: null, maxDirectChildren: 2 };
-// Допустимые значения опций (UI-кнопки). Сохранённый в localStorage конфиг мог
-// содержать старые варианты (битрейт 15/20, 1 прямое подключение) — клампим, иначе
-// <select>/кнопки ни на что не мапятся, а на бэкенд уходит невалидное значение.
-const BITRATE_OPTS: (3 | 6 | 10)[] = [3, 6, 10];
-const DIRECT_OPTS = [2, 4, 6, 8];
+const DEF_CONFIG: SavedConfig = { sourceKind: 'monitor', monitorIndex: 0, windowHwnd: null, resolution: '1080', fps: 30, bitrateKbps: 6000, autoBitrate: false, audioMode: 'auto', audioPid: null, maxDirectChildren: 2 };
+// Диапазоны слайдеров. Сохранённый в localStorage конфиг мог содержать старые
+// пресеты (bitrateMbps 3/6/10, ранее 15/20; 1 прямое подключение) — мигрируем и
+// клампим, иначе на бэкенд уходит невалидное значение.
+const BITRATE_MIN_KBPS = 3000, BITRATE_MAX_KBPS = 10_000, BITRATE_STEP_KBPS = 1000;
+const DIRECT_MIN = 1, DIRECT_MAX = 10;
 function loadConfig(): SavedConfig {
   try {
-    const c: SavedConfig = { ...DEF_CONFIG, ...JSON.parse(localStorage.getItem('bcastConfig') || '{}') };
-    if (!BITRATE_OPTS.includes(c.bitrateMbps)) c.bitrateMbps = c.bitrateMbps > 10 ? 10 : DEF_CONFIG.bitrateMbps;
-    if (c.maxDirectChildren < 2) c.maxDirectChildren = 2;
+    const raw = JSON.parse(localStorage.getItem('bcastConfig') || '{}');
+    if (typeof raw.bitrateKbps !== 'number' && typeof raw.bitrateMbps === 'number') raw.bitrateKbps = raw.bitrateMbps * 1000;
+    delete raw.bitrateMbps;
+    const c: SavedConfig = { ...DEF_CONFIG, ...raw };
+    c.bitrateKbps = Math.min(BITRATE_MAX_KBPS, Math.max(BITRATE_MIN_KBPS, Math.round(c.bitrateKbps / BITRATE_STEP_KBPS) * BITRATE_STEP_KBPS));
+    c.maxDirectChildren = Math.min(DIRECT_MAX, Math.max(DIRECT_MIN, Math.round(c.maxDirectChildren)));
     return c;
   } catch { return DEF_CONFIG; }
 }
@@ -117,7 +120,7 @@ export function BroadcastModal() {
       const res = RES_MAP[cfg.resolution];
       const source = buildSource(cfg);
       const audioTargetPid = deriveAudioPid(cfg, windows);
-      await startNativeBroadcast(me.username, me.username, active.id, { source, maxWidth: res.w, maxHeight: res.h, fps: cfg.fps, bitrateBps: cfg.bitrateMbps * 1_000_000, autoBitrate: cfg.autoBitrate, audioTargetPid, maxDirectChildren: cfg.maxDirectChildren });
+      await startNativeBroadcast(me.username, me.username, active.id, { source, maxWidth: res.w, maxHeight: res.h, fps: cfg.fps, bitrateBps: cfg.bitrateKbps * 1000, autoBitrate: cfg.autoBitrate, audioTargetPid, maxDirectChildren: cfg.maxDirectChildren });
       saveConfig(cfg);
       useStore.getState().setBroadcastLive(true);
     } catch (e: any) { setErr(String(e?.message || e)); } finally { setBusy(false); }
@@ -204,8 +207,8 @@ export function BroadcastModal() {
         <button className={cfg.fps === 60 ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, fps: 60 }))}>60</button>
       </div>
     </div>
-    <div className="fld"><label>{cfg.autoBitrate ? 'Битрейт (макс.)' : 'Битрейт'}</label>
-      <div className="seg">{BITRATE_OPTS.map((b) => <button key={b} className={cfg.bitrateMbps === b ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, bitrateMbps: b }))}>{b} Мбит/с</button>)}</div>
+    <div className="fld"><label>{cfg.autoBitrate ? 'Битрейт (макс.)' : 'Битрейт'}: {cfg.bitrateKbps / 1000} Мбит/с</label>
+      <input type="range" min={BITRATE_MIN_KBPS} max={BITRATE_MAX_KBPS} step={BITRATE_STEP_KBPS} value={cfg.bitrateKbps} onChange={(e) => setCfg((c) => ({ ...c, bitrateKbps: +e.target.value }))} />
     </div>
     <div className="fld"><label>Автобитрейт</label>
       <div className="seg">
@@ -216,8 +219,8 @@ export function BroadcastModal() {
         ? 'Битрейт снижается автоматически под худший линк дерева (и восстанавливается). Значение выше — потолок.'
         : 'Битрейт фиксирован. При плохой сети у зрителей возможны потери/буферизация.'}</p>
     </div>
-    <div className="fld"><label>Прямых подключений</label>
-      <div className="seg">{DIRECT_OPTS.map((n) => <button key={n} className={cfg.maxDirectChildren === n ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, maxDirectChildren: n }))}>{n}</button>)}</div>
+    <div className="fld"><label>Прямых подключений: {cfg.maxDirectChildren}</label>
+      <input type="range" min={DIRECT_MIN} max={DIRECT_MAX} step={1} value={cfg.maxDirectChildren} onChange={(e) => setCfg((c) => ({ ...c, maxDirectChildren: +e.target.value }))} />
       <p className="msub" style={{ margin: '8px 0 0' }}>Сколько зрителей берут поток напрямую с тебя. Остальные — через ретранслирующих зрителей (дерево, глубже).</p>
     </div>
     <div className="fld"><label>Звук</label>
