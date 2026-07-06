@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Room } from 'livekit-client';
-import { api } from '../api';
+import { api, resolveUploadUrl } from '../api';
 import { useStore, getEngine } from '../store';
 import { getSettings, setSettings } from '../settings';
 import { THEMES, getTheme, setTheme } from '../theme';
@@ -105,7 +105,7 @@ function ProfileModal() {
     <h2>Профиль</h2>
     <div className="fld" style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 18 }}>
       <div className="me-mini" style={{ width: 64, height: 64, borderRadius: 20, fontSize: 26, background: avatarUrl ? '#0000' : avColor(dn, color), overflow: 'hidden', position: 'relative', cursor: 'pointer' }} onClick={() => fileRef.current?.click()} title="Загрузить аватар">
-        {avatarUrl ? <img className="avimg" src={avatarUrl} alt="" /> : initial(dn)}
+        {avatarUrl ? <img className="avimg" src={resolveUploadUrl(avatarUrl)} alt="" /> : initial(dn)}
         {uploading ? <span className="spin" style={{ position: 'absolute', inset: 0, margin: 'auto' }} /> : null}
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>

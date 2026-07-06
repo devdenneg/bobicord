@@ -10,6 +10,18 @@ export function setToken(t: string | null) {
 
 const API_BASE = (import.meta as any).env?.VITE_API_BASE_URL || '';
 
+// Сервер отдаёт относительные пути (`/api/uploads/<name>`, см. index.js) — в вебе это
+// корректно (Caddy проксирует тот же origin), но в Tauri вебвью грузит локальный bundle
+// со своим origin (tauri://localhost), относительный путь резолвится ТУДА, не на бэкенд.
+// Оставляем хранимое значение (avatarUrl/img) относительным (сервер валидирует именно
+// такой формат при записи, UPLOAD_RE) — префиксуем только для <img src> на рендере.
+export function resolveUploadUrl(u: string): string;
+export function resolveUploadUrl(u: string | undefined): string | undefined;
+export function resolveUploadUrl(u?: string): string | undefined {
+  if (!u || !API_BASE || /^https?:\/\//i.test(u)) return u;
+  return API_BASE + u;
+}
+
 async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = {};
   if (token) headers['Authorization'] = 'Bearer ' + token;
