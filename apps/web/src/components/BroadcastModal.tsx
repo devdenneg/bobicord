@@ -20,6 +20,8 @@ interface SavedConfig {
   resolution: Resolution;
   fps: 30 | 60;
   bitrateMbps: 3 | 6 | 10 | 15 | 20;
+  /** Э8 ABR: авто-адаптация битрейта под сеть дерева. bitrateMbps при этом — потолок. */
+  autoBitrate: boolean;
   /** exclude — весь звук кроме RelayApp (авто): нативно поднимается INCLUDE-loopback
    *  на каждый не-наш аудио-процесс с миксом, голос войса не протекает (см. audio.rs).
    *  include — только звук выбранного процесса (ручной override). */
@@ -32,7 +34,7 @@ interface SavedConfig {
 // без выбора процесса — перечисляет активные render-сессии, вычитает наши процессы и
 // микширует остальные. Для окна PID всё ещё подставляется автоматически (эффект ниже),
 // если юзер переключится на ручной 'include'.
-const DEF_CONFIG: SavedConfig = { sourceKind: 'monitor', monitorIndex: 0, windowHwnd: null, resolution: '1080', fps: 30, bitrateMbps: 6, audioMode: 'exclude', audioPid: null, maxDirectChildren: 4 };
+const DEF_CONFIG: SavedConfig = { sourceKind: 'monitor', monitorIndex: 0, windowHwnd: null, resolution: '1080', fps: 30, bitrateMbps: 6, autoBitrate: true, audioMode: 'exclude', audioPid: null, maxDirectChildren: 4 };
 function loadConfig(): SavedConfig {
   try { return { ...DEF_CONFIG, ...JSON.parse(localStorage.getItem('bcastConfig') || '{}') }; } catch { return DEF_CONFIG; }
 }
@@ -80,7 +82,7 @@ export function BroadcastModal() {
         ? { kind: 'window', hwnd: cfg.windowHwnd }
         : { kind: 'monitor', index: cfg.monitorIndex };
       const audioTargetPid = cfg.audioMode === 'include' && cfg.audioPid != null ? cfg.audioPid : undefined;
-      await startNativeBroadcast(me.username, me.username, active.id, { source, maxWidth: res.w, maxHeight: res.h, fps: cfg.fps, bitrateBps: cfg.bitrateMbps * 1_000_000, audioTargetPid, maxDirectChildren: cfg.maxDirectChildren });
+      await startNativeBroadcast(me.username, me.username, active.id, { source, maxWidth: res.w, maxHeight: res.h, fps: cfg.fps, bitrateBps: cfg.bitrateMbps * 1_000_000, autoBitrate: cfg.autoBitrate, audioTargetPid, maxDirectChildren: cfg.maxDirectChildren });
       saveConfig(cfg);
       useStore.getState().setBroadcastLive(true);
     } catch (e: any) { setErr(String(e?.message || e)); } finally { setBusy(false); }
@@ -143,8 +145,17 @@ export function BroadcastModal() {
         <button className={cfg.fps === 60 ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, fps: 60 }))}>60</button>
       </div>
     </div>
-    <div className="fld"><label>Битрейт</label>
+    <div className="fld"><label>{cfg.autoBitrate ? 'Битрейт (макс.)' : 'Битрейт'}</label>
       <div className="seg">{[3, 6, 10, 15, 20].map((b) => <button key={b} className={cfg.bitrateMbps === b ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, bitrateMbps: b as 3 | 6 | 10 | 15 | 20 }))}>{b} Мбит/с</button>)}</div>
+    </div>
+    <div className="fld"><label>Автобитрейт</label>
+      <div className="seg">
+        <button className={cfg.autoBitrate ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, autoBitrate: true }))}>Авто</button>
+        <button className={!cfg.autoBitrate ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, autoBitrate: false }))}>Фиксированный</button>
+      </div>
+      <p className="msub" style={{ margin: '8px 0 0' }}>{cfg.autoBitrate
+        ? 'Битрейт снижается автоматически под худший линк дерева (и восстанавливается). Значение выше — потолок.'
+        : 'Битрейт фиксирован. При плохой сети у зрителей возможны потери/буферизация.'}</p>
     </div>
     <div className="fld"><label>Прямых подключений</label>
       <div className="seg">{[2, 4, 6, 8].map((n) => <button key={n} className={cfg.maxDirectChildren === n ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, maxDirectChildren: n }))}>{n}</button>)}</div>

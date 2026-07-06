@@ -30,7 +30,10 @@ export interface StreamConfig {
   maxWidth: number;
   maxHeight: number;
   fps: number;
+  /** Э8: при autoBitrate — потолок ABR; иначе фиксированный битрейт. */
   bitrateBps: number;
+  /** Э8 ABR: авто-адаптация битрейта под сеть дерева (по умолчанию вкл). */
+  autoBitrate?: boolean;
   /** PID процесса для ручного WASAPI INCLUDE (только его звук в стрим). `undefined` =
    *  авто-режим «всё кроме RelayApp» (INCLUDE-клиент на каждый не-наш процесс + микс,
    *  см. audio.rs / CLAUDE.md инвариант 6). */
@@ -86,6 +89,7 @@ export async function startNativeBroadcast(streamId: string, identity: string, s
   await invoke('start_broadcast', {
     streamId, wsUrl: treeWsUrl(), identity, serverId,
     source: config.source, maxWidth: config.maxWidth, maxHeight: config.maxHeight, fps: config.fps, bitrateBps: config.bitrateBps,
+    autoBitrate: config.autoBitrate ?? true,
     audioTargetPid: config.audioTargetPid ?? null,
     maxDirectChildren: config.maxDirectChildren ?? null,
   });

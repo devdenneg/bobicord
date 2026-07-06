@@ -41,6 +41,7 @@ async fn start_broadcast(
   max_height: u32,
   fps: u32,
   bitrate_bps: u32,
+  auto_bitrate: Option<bool>,
   audio_target_pid: Option<u32>,
   max_direct_children: Option<u32>,
 ) -> Result<(), String> {
@@ -62,6 +63,7 @@ async fn start_broadcast(
     max_height: max_height.clamp(180, 2160),
     fps: fps.clamp(5, 60),
     bitrate_bps: bitrate_bps.clamp(500_000, 20_000_000),
+    auto_bitrate: auto_bitrate.unwrap_or(true),
     audio_source: match audio_target_pid {
       Some(pid) => broadcast::AudioSource::IncludeProcess(pid),
       None => broadcast::AudioSource::ExcludeSelfViaInclude,

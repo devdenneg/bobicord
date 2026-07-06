@@ -16,6 +16,19 @@ const BROWSER_CAPACITY = 0;   // дефолт для браузера: лист 
 const MAX_CHILDREN_CAP = 8;   // жёсткий потолок на объявленную ёмкость (защита от абьюза)
 const REPARENT_COOLDOWN_MS = 10_000; // гистерезис авто-миграции — не мигрировать чаще
 
+// Э8 ABR: сервер держит целевой битрейт дерева и шлёт его корню (set-bitrate). Управление —
+// loss/RTT-based AIMD по худшему линку дерева (истинный GCC-BWE в webrtc-rs незрел). Единый
+// passthrough-энкод: один медленный зритель тянет всех вниз — это компромисс, лечится репарентом.
+const ABR_FLOOR = 800_000;         // нижняя полка (совпадает с BITRATE_FLOOR в натив mod.rs)
+const ABR_DEFAULT_MAX = 6_000_000; // если вещатель не прислал maxBitrate (старый клиент)
+const ABR_TICK_MS = 2_000;         // темп пересчёта (совпадает со stats-тиком узлов)
+const ABR_LOSS_HI = 0.10;          // худший линк >10% потерь → быстрый спад
+const ABR_LOSS_LO = 0.02;          // <2% потерь и низкий RTT → медленная проба вверх
+const ABR_RTT_HI = 600;            // мс — порог деградации по задержке
+const ABR_RTT_LO = 300;            // мс — «здоровый» RTT для подъёма
+const ABR_DOWN = 0.85;             // мультипликативное снижение
+const ABR_HYSTERESIS = 0.05;       // не слать корню, пока изменение цели <5%
+
 function newPeerId() { return 'p_' + crypto.randomBytes(6).toString('hex'); }
 
 class Tree {
@@ -104,6 +117,7 @@ class TreeManager {
     if (node.role === 'broadcaster') {
       t.broadcasterId = node.id;
       node.parent = null; node.depth = 0;
+      t.targetBitrate = null; t.lastSentBitrate = 0; // сброс ABR под нового вещателя
       return { parent: null };
     }
     const parent = this.pickParent(t, node);
@@ -198,6 +212,37 @@ class TreeManager {
     }
     if (t.nodes.size === 0) this.trees.delete(streamId);
     return { reparented, dropped: [], broadcasterLost: false };
+  }
+
+  // Э8 ABR: пересчёт целевого битрейта дерева по худшему линку (loss/RTT-based AIMD).
+  // Каждый линк покрыт stats-репортом его родителя (broadcaster→прямые дети, relay→дети),
+  // так что скан linkLoss/linkRtt по всем узлам видит все линки. Возвращает
+  // {broadcasterId, bitrate}, если цель сменилась заметно (гистерезис), иначе null.
+  abrTick(streamId) {
+    const t = this.trees.get(streamId);
+    if (!t || !t.broadcasterId) return null;
+    const bc = t.nodes.get(t.broadcasterId);
+    if (!bc || !bc.abr) return null; // авто-адаптация выключена вещателем → статичный битрейт
+    const ceil = bc.maxBitrate > 0 ? bc.maxBitrate : ABR_DEFAULT_MAX;
+    if (t.targetBitrate == null) t.targetBitrate = ceil; // старт оптимистично с потолка
+    let worstLoss = 0, worstRtt = 0;
+    for (const n of t.nodes.values()) {
+      if ((n.linkLoss || 0) > worstLoss) worstLoss = n.linkLoss;
+      if ((n.linkRtt || 0) > worstRtt) worstRtt = n.linkRtt;
+    }
+    let target = t.targetBitrate;
+    if (worstLoss > ABR_LOSS_HI || worstRtt > ABR_RTT_HI) {
+      target = Math.max(ABR_FLOOR, Math.floor(target * ABR_DOWN));        // быстрый спад
+    } else if (worstLoss < ABR_LOSS_LO && worstRtt < ABR_RTT_LO) {
+      target = Math.min(ceil, target + Math.max(500_000, Math.floor(target * 0.08))); // проба вверх
+    }
+    t.targetBitrate = target;
+    const last = t.lastSentBitrate || 0;
+    if (last === 0 || Math.abs(target - last) / last > ABR_HYSTERESIS) {
+      t.lastSentBitrate = target;
+      return { broadcasterId: t.broadcasterId, bitrate: target };
+    }
+    return null;
   }
 
   maxDepth(t) { let m = 0; t.nodes.forEach((n) => { if (n.depth > m) m = n.depth; }); return m; }
@@ -315,13 +360,15 @@ function attachTreeServer(httpServer, opts) {
   }
 
   function onJoin(id, msg) {
-    const { streamId, role, native, identity, symmetricNat, serverId, maxChildren } = msg;
+    const { streamId, role, native, identity, symmetricNat, serverId, maxChildren, maxBitrate, abr } = msg;
     if (!streamId || (role !== 'broadcaster' && role !== 'viewer')) return;
     const node = peers.get(id);
     node.streamId = streamId; node.role = role; node.native = !!native; node.identity = identity || id;
     node.symmetricNat = !!symmetricNat;
     node.serverId = serverId || node.serverId || null;
     node.maxChildren = typeof maxChildren === 'number' ? maxChildren : undefined;
+    node.maxBitrate = typeof maxBitrate === 'number' ? maxBitrate : 0; // Э8 ABR: потолок вещателя
+    node.abr = !!abr;                                                  // Э8 ABR: авто-адаптация вкл
     node.parent = null; node.children = []; node.depth = 0;
     const { parent } = mgr.join(streamId, node);
     if (parent) {
@@ -405,7 +452,7 @@ function attachTreeServer(httpServer, opts) {
     peers.set(id, {
       id, ws, streamId: null, role: null, native: false, identity: id, serverId: null,
       parent: null, children: [], depth: 0,
-      maxChildren: undefined, availableOutgoing: 0, linkRtt: 0, linkLoss: 0, reparentCooldownUntil: 0,
+      maxChildren: undefined, maxBitrate: 0, abr: false, availableOutgoing: 0, linkRtt: 0, linkLoss: 0, reparentCooldownUntil: 0,
     });
     ws.on('message', (raw) => {
       let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
@@ -421,7 +468,16 @@ function attachTreeServer(httpServer, opts) {
     send(id, { t: 'welcome', id, iceServers: iceServersFor(ws.__uid) });
   });
 
-  return { mgr, peers, wss };
+  // Э8 ABR: раз в тик пересчитываем целевой битрейт каждого дерева и шлём корню, если сменился.
+  const abrTimer = setInterval(() => {
+    for (const streamId of mgr.trees.keys()) {
+      const cmd = mgr.abrTick(streamId);
+      if (cmd) send(cmd.broadcasterId, { t: 'set-bitrate', streamId, bps: cmd.bitrate });
+    }
+  }, ABR_TICK_MS);
+  abrTimer.unref?.(); // не держим процесс живым только ради ABR-тика
+
+  return { mgr, peers, wss, abrTimer };
 }
 
 module.exports = { attachTreeServer, TreeManager, MAX_DEPTH, NATIVE_CAPACITY, BROWSER_CAPACITY };

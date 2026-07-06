@@ -17,6 +17,7 @@ pub enum TreeEvent {
     SdpAnswer { from: String, sdp: String },  // от ребёнка (мы offerer)
     Ice { from: String, candidate: Value },
     RequestKeyframe,                           // сервер просит корень форснуть IDR
+    SetBitrate { bps: u32 },                   // Э8 ABR: сервер шлёт корню целевой битрейт под худший линк
     Topology { payload: Value },               // снимок дерева для UI (relay пробрасывает в webview)
     Closed,
 }
@@ -39,6 +40,11 @@ pub struct JoinParams {
     pub role: &'static str, // "broadcaster" | "viewer"
     pub native: bool,
     pub max_children: u32,
+    /// Э8 ABR: потолок битрейта, выбранный вещателем (макс). Сервер держит цель в
+    /// [FLOOR, max_bitrate]. У viewer/relay не значим (0).
+    pub max_bitrate: u32,
+    /// Э8 ABR: авто-адаптация включена. false → сервер не шлёт set-bitrate (статичный битрейт).
+    pub abr: bool,
 }
 
 /// Поднимает ws-соединение и держит его в отдельной tokio-задаче. Возвращает канал
@@ -66,6 +72,8 @@ pub fn connect(ws_url: String, join: JoinParams) -> (mpsc::UnboundedSender<TreeC
             "role": join.role,
             "native": join.native,
             "maxChildren": join.max_children,
+            "maxBitrate": join.max_bitrate,
+            "abr": join.abr,
             "identity": join.identity,
             "serverId": join.server_id,
         });
@@ -156,6 +164,7 @@ fn parse_event(v: &Value) -> Option<TreeEvent> {
             candidate: v.get("candidate")?.clone(),
         }),
         "request-keyframe" => Some(TreeEvent::RequestKeyframe),
+        "set-bitrate" => Some(TreeEvent::SetBitrate { bps: v.get("bps")?.as_u64()? as u32 }),
         "tree-topology" => Some(TreeEvent::Topology { payload: v.clone() }),
         _ => None,
     }

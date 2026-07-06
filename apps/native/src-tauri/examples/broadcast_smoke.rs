@@ -22,6 +22,7 @@ async fn main() {
     let source = broadcast::CaptureSource::Monitor { index: monitor_index };
     let config = broadcast::StreamConfig {
         max_width: 1920, max_height: 1080, fps: 30, bitrate_bps: 6_000_000,
+        auto_bitrate: true,
         audio_source: broadcast::AudioSource::ExcludeSelfViaInclude,
         max_direct_children: 4,
     };

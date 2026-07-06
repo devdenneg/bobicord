@@ -11,9 +11,13 @@ pub mod relay;
 pub mod signaling;
 pub mod stats;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Нижняя полка ABR (Evolution-TZ Э8): ниже неё качество бессмысленно, лучше рвать
+/// зрителя репарентом. Верхняя полка — выбранный вещателем битрейт (config.bitrate_bps).
+const BITRATE_FLOOR: u32 = 800_000;
 
 use bytes::Bytes;
 use serde_json::json;
@@ -36,7 +40,11 @@ pub struct StreamConfig {
     pub max_width: u32,
     pub max_height: u32,
     pub fps: u32,
+    /// Э8: при auto_bitrate=true — потолок ABR (сервер адаптирует вниз под худший линк);
+    /// при false — фиксированный битрейт (сервер не шлёт set-bitrate, см. join.abr).
     pub bitrate_bps: u32,
+    /// Э8 ABR: включить авто-адаптацию битрейта под сеть дерева.
+    pub auto_bitrate: bool,
     /// По умолчанию `ExcludeSelfViaInclude` — авто: INCLUDE-клиент на каждый не-наш
     /// аудио-процесс, микс (надёжно «всё кроме RelayApp», см. audio.rs).
     /// `IncludeProcess(pid)` — ручной override на один процесс.
@@ -99,8 +107,12 @@ pub async fn start(
     source: CaptureSource,
     config: StreamConfig,
 ) -> Result<BroadcastHandle, String> {
-    let StreamConfig { max_width, max_height, fps, bitrate_bps, audio_source, max_direct_children } = config;
+    let StreamConfig { max_width, max_height, fps, bitrate_bps, auto_bitrate, audio_source, max_direct_children } = config;
     let source_label = describe_source(&source);
+    // ABR (Э8): живая цель битрейта. Стартует с выбранного пользователем значения (оно же —
+    // потолок ceiling), сервер шлёт вниз set-bitrate под худший линк дерева. Читается
+    // энкодер-потоком, пишется signaling-циклом. bitrate_bps остаётся потолком для clamp.
+    let target_bitrate = Arc::new(AtomicU32::new(bitrate_bps));
     let stats: StatsHandle = Arc::new(SharedStats::default());
     // Создаём здесь (не в конце функции, как раньше) — encoder_thread должен уметь
     // сам инициировать остановку всей трансляции при фатальной ошибке (MFStartup,
@@ -115,6 +127,8 @@ pub async fn start(
     let join = signaling::JoinParams {
         stream_id: stream_id.clone(), identity, server_id,
         role: "broadcaster", native: true, max_children: max_direct_children,
+        max_bitrate: bitrate_bps, // потолок ABR = выбранный пользователем битрейт
+        abr: auto_bitrate,
     };
     let (cmd_tx, evt_rx) = signaling::connect(ws_url, join);
 
@@ -128,6 +142,7 @@ pub async fn start(
     let force_keyframe_enc = force_keyframe.clone();
     let stats_enc = stats.clone();
     let shutdown_tx_enc = shutdown_tx.clone();
+    let target_bitrate_enc = target_bitrate.clone();
 
     let encoder_thread = std::thread::spawn(move || {
         unsafe {
@@ -202,7 +217,10 @@ pub async fn start(
                     log::debug!("encoder: skip 0x0 frame (source not ready yet)");
                     continue;
                 }
-                match encoder::H264Encoder::new(frame.width, frame.height, fps, bitrate_bps, force_keyframe_enc.clone()) {
+                // Берём живую цель, не замороженный bitrate_bps: после ресайза окна MFT
+                // пересоздаётся и должен подхватить уже адаптированный ABR-битрейт.
+                let start_bitrate = target_bitrate_enc.load(Ordering::Relaxed);
+                match encoder::H264Encoder::new(frame.width, frame.height, fps, start_bitrate, force_keyframe_enc.clone()) {
                     Ok(e) => { force_keyframe_enc.store(true, Ordering::Relaxed); enc = Some((e, frame.width, frame.height)); }
                     Err(e) => {
                         log::error!("encoder: init failed: {e}");
@@ -212,6 +230,8 @@ pub async fn start(
                 }
             }
             let (encoder_ref, _enc_w, _enc_h) = enc.as_mut().expect("initialized above");
+            // ABR: подхватываем цель, присланную сервером (set_bitrate — no-op на неизменной).
+            encoder_ref.set_bitrate(target_bitrate_enc.load(Ordering::Relaxed));
             let real_dur = match prev_captured_at {
                 Some(prev) => frame.captured_at.saturating_duration_since(prev).clamp(frame_dur / 4, Duration::from_secs(2)),
                 None => frame_dur,
@@ -276,7 +296,7 @@ pub async fn start(
     let alive = Arc::new(AtomicBool::new(true));
     let alive_loop = alive.clone();
     let meta = DebugMeta { stream_id, source_label, target_fps: fps, target_bitrate_bps: bitrate_bps };
-    tokio::spawn(run_signaling_loop(mgr, evt_rx, shutdown_rx, app, stats, meta, alive_loop, force_keyframe.clone()));
+    tokio::spawn(run_signaling_loop(mgr, evt_rx, shutdown_rx, app, stats, meta, alive_loop, force_keyframe.clone(), target_bitrate));
 
     Ok(BroadcastHandle {
         cap_stop,
@@ -322,6 +342,7 @@ async fn run_signaling_loop(
     meta: DebugMeta,
     alive: Arc<AtomicBool>,
     force_keyframe: Arc<AtomicBool>,
+    target_bitrate: Arc<AtomicU32>,
 ) {
     let mut stats_tick = tokio::time::interval(Duration::from_secs(2));
     let mut prev_at = Instant::now();
@@ -340,6 +361,12 @@ async fn run_signaling_loop(
                     Some(TreeEvent::DropPeer { peer_id }) => mgr.on_drop_peer(peer_id).await,
                     // Э8: relay-узел ниже по дереву просит IDR для нового зрителя — форсим.
                     Some(TreeEvent::RequestKeyframe) => force_keyframe.store(true, Ordering::Relaxed),
+                    // Э8 ABR: сервер прислал целевой битрейт под худший линк дерева. Clamp
+                    // в [FLOOR, потолок] — сервер уже клампит, но не доверяем сети вслепую.
+                    Some(TreeEvent::SetBitrate { bps }) => {
+                        let clamped = bps.clamp(BITRATE_FLOOR, meta.target_bitrate_bps);
+                        target_bitrate.store(clamped, Ordering::Relaxed);
+                    }
                     // Корень не имеет родителя — эти события к нему не относятся.
                     Some(TreeEvent::AssignParent { .. }) | Some(TreeEvent::SdpOffer { .. }) | Some(TreeEvent::Topology { .. }) => {}
                     Some(TreeEvent::Closed) | None => {
@@ -363,18 +390,20 @@ async fn run_signaling_loop(
                     capture_fps: (cap - prev_cap) as f64 / dt,
                     encoder_fps: (enc - prev_enc) as f64 / dt,
                     dropped_frames: stats.capture_drops.load(Ordering::Relaxed),
-                    bitrate_target_bps: meta.target_bitrate_bps,
+                    bitrate_target_bps: target_bitrate.load(Ordering::Relaxed),
                     bitrate_actual_bps: (bytes - prev_bytes) as f64 * 8.0 / dt,
                     children: mgr.child_count(),
                 };
                 prev_at = now; prev_cap = cap; prev_enc = enc; prev_bytes = bytes;
                 if let Some(app) = &app { let _ = app.emit("relay-broadcast-stats", &snapshot); }
 
-                let to_child: Vec<serde_json::Value> = mgr.child_ids().into_iter()
-                    .map(|id| json!({ "id": id, "bitrate": meta.target_bitrate_bps, "rtt": 0, "loss": 0 }))
+                // Э8 ABR: реальные loss/rtt по каждому детскому линку (RTCP RR через get_stats) —
+                // сервер агрегирует worst-link по дереву и решает целевой битрейт. Раньше слали нули.
+                let cur_target = target_bitrate.load(Ordering::Relaxed);
+                let to_child: Vec<serde_json::Value> = mgr.link_stats().await.into_iter()
+                    .map(|(id, loss, rtt)| json!({ "id": id, "bitrate": cur_target, "rtt": rtt, "loss": loss }))
                     .collect();
-                // Сервер сейчас (Э1) принимает и игнорирует stats — задел на Э8 ребаланс.
-                let _ = mgr.send_stats(to_child, meta.target_bitrate_bps);
+                let _ = mgr.send_stats(to_child, cur_target);
             }
             reason = shutdown_rx.recv() => {
                 stop_reason = reason.flatten();
