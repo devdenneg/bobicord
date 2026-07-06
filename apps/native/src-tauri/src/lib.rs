@@ -18,11 +18,15 @@ fn list_monitors() -> Vec<MonitorInfo> {
 }
 
 #[derive(serde::Serialize)]
-struct WindowInfo { hwnd: isize, title: String, process: String, pid: u32 }
+struct WindowInfo { hwnd: isize, title: String, process: String, pid: u32, icon: Option<String> }
 
 #[tauri::command]
 fn list_windows() -> Vec<WindowInfo> {
-  broadcast::list_windows().into_iter().map(|(hwnd, title, process, pid)| WindowInfo { hwnd, title, process, pid }).collect()
+  // Иконка приложения (PNG base64) для каждого окна — показывается в пикере источника.
+  // WM_GETICON/иконка класса быстрые; медленный фолбэк на exe (SHGetFileInfo) редок.
+  broadcast::list_windows().into_iter()
+    .map(|(hwnd, title, process, pid)| WindowInfo { hwnd, title, process, pid, icon: broadcast::icon::window_icon_png_base64(hwnd, pid) })
+    .collect()
 }
 
 struct BroadcastState(Mutex<Option<broadcast::BroadcastHandle>>);

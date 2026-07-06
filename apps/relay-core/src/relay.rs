@@ -478,7 +478,7 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
     let finished = Arc::new(Notify::new());
     let fin = finished.clone();
 
-    let join = JoinParams { stream_id: stream_id.clone(), identity, server_id, role: "viewer", native: true, max_children, max_bitrate: 0, abr: false, virtual_relay };
+    let join = JoinParams { stream_id: stream_id.clone(), identity, server_id, role: "viewer", native: true, max_children, max_bitrate: 0, abr: false, virtual_relay, app_name: None, app_icon: None };
     let (cmd_tx, mut evt_rx) = signaling::connect(ws_url, join, reconnect);
 
     tokio::spawn(async move {
@@ -494,21 +494,40 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
         let mut last_reparent_ms: u64 = 0;
         // idle-exit: отсчёт с запуска (grace на первый assign-child = сам таймаут).
         let mut idle_since_ms: u64 = now_ms();
+        // Терминальный сирота (только натив, idle_exit=None): без родителя дольше таймаута =
+        // стрим кончился, а stream-end мы не получили (гонка/реконнект) — иначе upstream/webview
+        // PC и повисший кадр жили бы вечно: on_drop_peer для родителя no-op, watchdog лишь
+        // репарентит, а teardown ждёт stop_watch из webview, который тоже мог пропустить конец.
+        let mut orphan_since_ms: Option<u64> = None;
+        const ORPHAN_EXIT_MS: u64 = 20_000;
+        // true после break = конец стрима, а не явный Stop — сообщаем webview, чтобы он снёс watch.
+        let mut watch_ended = false;
         loop {
             tokio::select! {
                 evt = evt_rx.recv() => {
                     match evt {
                         Some(TreeEvent::Welcome { ice_servers }) => mgr.set_ice_servers(&ice_servers),
-                        Some(TreeEvent::AssignParent { parent_id }) => mgr.on_assign_parent(parent_id).await,
+                        Some(TreeEvent::AssignParent { parent_id }) => {
+                            orphan_since_ms = if parent_id.is_none() { Some(now_ms()) } else { None };
+                            mgr.on_assign_parent(parent_id).await;
+                        }
                         Some(TreeEvent::AssignChild { child_id }) => mgr.on_assign_child(child_id).await,
                         Some(TreeEvent::SdpOffer { from, sdp }) => mgr.on_parent_offer(from, sdp).await,
                         Some(TreeEvent::SdpAnswer { from, sdp }) => mgr.on_child_answer(from, sdp).await,
                         Some(TreeEvent::Ice { from, candidate }) => mgr.on_ice(from, candidate).await,
-                        Some(TreeEvent::DropPeer { peer_id }) => mgr.on_drop_peer(peer_id).await,
+                        Some(TreeEvent::DropPeer { peer_id }) => {
+                            // Дропнут наш родитель: либо следом придёт assign-parent (reparent),
+                            // либо это конец стрима — отсчитываем сиротский таймаут.
+                            if mgr.parent_id.as_deref() == Some(peer_id.as_str()) && orphan_since_ms.is_none() {
+                                orphan_since_ms = Some(now_ms());
+                            }
+                            mgr.on_drop_peer(peer_id).await;
+                        }
                         Some(TreeEvent::RequestKeyframe) => { /* relay не энкодит — игнор */ }
                         Some(TreeEvent::SetBitrate { .. }) => { /* relay не энкодит — битрейт задаёт корень */ }
                         Some(TreeEvent::Topology { payload }) => { if let Some(ui) = &mgr.ui { ui("relay-topology", payload); } }
-                        Some(TreeEvent::Release) => { log::info!("relay: vrelay-release от сервера — выходим"); break; }
+                        Some(TreeEvent::Release) => { log::info!("relay: vrelay-release от сервера — выходим"); watch_ended = true; break; }
+                        Some(TreeEvent::StreamEnd) => { log::info!("relay: stream-end от сервера — конец вещания, teardown"); watch_ended = true; break; }
                         // Рестарт сервера пережит: мы реджойнились свежим узлом, сервер сам
                         // пришлёт assign-parent (settleOrphans) — upstream пересоздастся. Старые
                         // child-PC живут, пока дети не пересоздадут соединения (sweep дочистит).
@@ -540,6 +559,18 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
                             let _ = mgr.cmd_tx.send(TreeCmd::RequestReparent { target: None });
                         }
                     }
+                    // Терминальный сирота (натив): родителя нет дольше ORPHAN_EXIT_MS — дерево
+                    // умерло (settleOrphans/vrelay дали бы родителя за секунды). Выходим и
+                    // сообщаем webview. Headless-агента не касается — у него idle_exit/Release.
+                    if idle_exit.is_none() {
+                        if let Some(t) = orphan_since_ms {
+                            if now_ms().saturating_sub(t) >= ORPHAN_EXIT_MS {
+                                log::warn!("relay: без родителя {}с — считаю стрим законченным, teardown", ORPHAN_EXIT_MS / 1000);
+                                watch_ended = true;
+                                break;
+                            }
+                        }
+                    }
                     // Idle-exit (headless): нет живых детей дольше таймаута — покидаем дерево,
                     // агент вернётся по следующему vrelay-activate.
                     if let Some(d) = idle_exit {
@@ -566,6 +597,11 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
         }
         let _ = mgr.cmd_tx.send(TreeCmd::Leave);
         mgr.close_all().await;
+        // Конец стрима определил Rust (stream-end/сирота), а не webview: говорим ему снести
+        // watch (nativeUnwatch → delVideo), иначе <video> остаётся с повисшим кадром.
+        if watch_ended {
+            if let Some(ui) = &mgr.ui { ui("relay-watch-ended", json!({ "streamId": mgr.stream_id })); }
+        }
         fin.notify_one();
     });
 

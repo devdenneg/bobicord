@@ -537,7 +537,7 @@ function attachTreeServer(httpServer, opts) {
     for (const [sid, t] of mgr.trees) {
       if (!t.broadcasterId) continue;
       const bnode = t.nodes.get(t.broadcasterId);
-      if (bnode && bnode.serverId === node.serverId) send(id, { t: 'stream-live', streamId: sid, identity: bnode.identity, initial: true });
+      if (bnode && bnode.serverId === node.serverId) send(id, { t: 'stream-live', streamId: sid, identity: bnode.identity, initial: true, appName: bnode.appName || null, appIcon: bnode.appIcon || null });
     }
   }
 
@@ -551,6 +551,10 @@ function attachTreeServer(httpServer, opts) {
     node.maxChildren = typeof maxChildren === 'number' ? maxChildren : undefined;
     node.maxBitrate = typeof maxBitrate === 'number' ? maxBitrate : 0; // Э8 ABR: потолок вещателя
     node.abr = !!abr;                                                  // Э8 ABR: авто-адаптация вкл
+    // Метаданные стримящегося приложения (иконка/имя окна) — только от вещателя; капы
+    // длины страхуют от абьюза (иконка — base64 PNG 32×32, штатно 1-3 КБ).
+    node.appName = role === 'broadcaster' && typeof msg.appName === 'string' ? msg.appName.slice(0, 120) : null;
+    node.appIcon = role === 'broadcaster' && typeof msg.appIcon === 'string' && msg.appIcon.length <= 24000 ? msg.appIcon : null;
     // Э9: флагу virtual верим только агенту с JWT-uid VRELAY_UID — обычный клиент не может
     // объявить себя «сервером» (получил бы приоритетный трафик и увидел бы vrelay-release).
     node.virtual = !!msg.virtual && node.ws.__uid === VRELAY_UID;
@@ -592,7 +596,7 @@ function attachTreeServer(httpServer, opts) {
         }
       }
     }
-    if (role === 'broadcaster') broadcastToServer(node.serverId, { t: 'stream-live', streamId, identity: node.identity, initial: false });
+    if (role === 'broadcaster') broadcastToServer(node.serverId, { t: 'stream-live', streamId, identity: node.identity, initial: false, appName: node.appName || null, appIcon: node.appIcon || null });
   }
 
   function onSignal(id, msg) {
@@ -747,6 +751,10 @@ function attachTreeServer(httpServer, opts) {
       tlog(`[${p.streamId}] дерево обрушено (ушёл вещатель), зрителей сброшено: ${dropped.length}`);
       dropped.forEach((peerId) => {
         send(peerId, { t: 'drop-peer', streamId: p.streamId, peerId: id });
+        // Конец вещания — терминальный сигнал и в watch-сокет: drop-peer ловят только
+        // зрители глубины 1 (у остальных parentId — id relay-узла, не вещателя), а
+        // discovery-stream-end зритель мог пропустить (окно реконнекта).
+        send(peerId, { t: 'stream-end', streamId: p.streamId, identity: p.identity });
         // Э9: виртуалу при обрушении дерева нужен явный release — drop-peer по каждому его
         // ребёнку сервер не шлёт, и без release он ждал бы своего idle-таймаута впустую.
         const dp = peers.get(peerId);

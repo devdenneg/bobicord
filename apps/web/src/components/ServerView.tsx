@@ -14,12 +14,13 @@ import { applyNativeUpdate } from '../nativeUpdate';
 import type { ChatMessage, Emote, Member, ReplyRef, Role } from '../types';
 import { PERM, hasPerm } from '../types';
 
-function Avatar({ name, ci, url, size = 32, dot, live }: { name: string; ci: number; url?: string; size?: number; dot?: string; live?: boolean }) {
+function Avatar({ name, ci, url, size = 32, dot, live, liveApp }: { name: string; ci: number; url?: string; size?: number; dot?: string; live?: boolean; liveApp?: { appName?: string; appIcon?: string } | null }) {
   return (
     <div className={'av' + (live ? ' live' : '')} style={{ width: size, height: size, fontSize: size * 0.44, background: url ? '#0000' : avColor(name, ci) }}>
       {url ? <img className="avimg" src={resolveUploadUrl(url)} alt="" /> : initial(name)}
       {dot ? <span className={'sdot ' + dot} /> : null}
-      {live ? <span className="av-live" title="В эфире">LIVE</span> : null}
+      {live ? <span className="av-live" title={liveApp?.appName ? `Стримит ${liveApp.appName}` : 'В эфире'}>LIVE</span> : null}
+      {live && liveApp?.appIcon ? <img src={`data:image/png;base64,${liveApp.appIcon}`} alt="" title={liveApp.appName ? `Стримит ${liveApp.appName}` : undefined} style={{ position: 'absolute', right: -3, bottom: -3, width: 14, height: 14, borderRadius: 3, border: '2px solid var(--bg-alt, #111)', objectFit: 'contain' }} /> : null}
     </div>
   );
 }
@@ -91,7 +92,10 @@ function VoiceParticipantRow({ m }: { m: Member }) {
         onKeyDown={(e) => { if (remote && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); setOpen((v) => !v); } }}>
         <div className={'av' + (streaming ? ' live' : '')} style={{ background: m.avatarUrl ? '#0000' : avColor(m.displayName, m.avatarColor) }}>
           {m.avatarUrl ? <img className="avimg" src={resolveUploadUrl(m.avatarUrl)} alt="" /> : initial(m.displayName)}
-          {streaming ? <span className="av-live" title="В эфире">LIVE</span> : null}
+          {(() => { const meta = streaming ? E.getStreamAppMeta(m.username) : null; return <>
+            {streaming ? <span className="av-live" title={meta?.appName ? `Стримит ${meta.appName}` : 'В эфире'}>LIVE</span> : null}
+            {streaming && meta?.appIcon ? <img src={`data:image/png;base64,${meta.appIcon}`} alt="" title={meta.appName ? `Стримит ${meta.appName}` : undefined} style={{ position: 'absolute', right: -3, bottom: -3, width: 14, height: 14, borderRadius: 3, border: '2px solid var(--bg-alt, #111)', objectFit: 'contain' }} /> : null}
+          </>; })()}
         </div>
         <div className="nm" title={m.displayName}>{m.displayName}{isLocal ? ' (ты)' : ''}</div>
         {remote && streaming ? (
@@ -289,7 +293,7 @@ function MemberRow({ m }: { m: Member }) {
   return (
     <div className={'pi ' + st + (streaming ? ' streaming' : '')} data-spk={m.username}>
       <div className="head" ref={hc.ref} onMouseEnter={self ? undefined : hc.onEnter} onMouseLeave={self ? undefined : hc.onLeave}>
-        <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} dot={st} live={streaming} />
+        <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} dot={st} live={streaming} liveApp={streaming ? E.getStreamAppMeta(m.username) : null} />
         <div className="nm" style={roleColorOf(m) ? { color: roleColorOf(m) } : undefined}>{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div>
         <MemberRoles roles={m.roles || []} />
         {!self && streaming && !pr?.inVoice ? (
@@ -777,7 +781,7 @@ function Chat() {
 }
 
 /* ---------- Stream stage ---------- */
-function StreamTile({ streamKey, identity, isLocal }: { streamKey: string; identity: string; isLocal: boolean }) {
+function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { streamKey: string; identity: string; isLocal: boolean; appName?: string; appIcon?: string }) {
   const E = getEngine()!;
   const eng = useEngine();
   const me = useStore((s) => s.me)!;
@@ -863,7 +867,12 @@ function StreamTile({ streamKey, identity, isLocal }: { streamKey: string; ident
   return (
     <div className="vwrap" ref={wrapRef} onDoubleClick={toggleFs}>
       <video ref={vidRef} autoPlay playsInline />
-      <div className="lbl">🖥 {name}{isLocal ? ' (ты)' : ''}</div>
+      <div className="lbl" title={appName ? `${name} · ${appName}` : name}>
+        {appIcon
+          ? <img src={`data:image/png;base64,${appIcon}`} width={16} height={16} style={{ borderRadius: 3, verticalAlign: 'text-bottom', marginRight: 4, objectFit: 'contain' }} alt="" />
+          : '🖥 '}
+        {name}{isLocal ? ' (ты)' : ''}
+      </div>
       {!isLocal ? <StreamSourceBadge identity={identity} /> : null}
       <div className="emolayer">
         {floats.map((f) => (
@@ -973,7 +982,7 @@ function Stage({ minimized, setMin }: { minimized: boolean; setMin: (v: boolean)
   const cls = 'n' + Math.min(streams.length, 2);
   const grid = (
     <div id="grid" className={streams.length >= 2 ? 'n2' : ''} style={{ display: streams.length ? 'grid' : 'none' }}>
-      {streams.map((s) => <StreamTile key={s.key} streamKey={s.key} identity={s.identity} isLocal={s.isLocal} />)}
+      {streams.map((s) => <StreamTile key={s.key} streamKey={s.key} identity={s.identity} isLocal={s.isLocal} appName={s.appName} appIcon={s.appIcon} />)}
     </div>
   );
   if (minimized) {

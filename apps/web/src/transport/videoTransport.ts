@@ -102,6 +102,10 @@ export interface VideoTransport {
   requestReparent?(streamId: string, targetId: string | null): void;
   onTopology?(cb: (streamId: string) => void): () => void;
 
+  /** Только TreeVideoTransport — метаданные приложения вещателя (иконка/имя окна из
+   *  stream-live). LiveKit не реализует: getDisplayMedia метаданных не даёт. */
+  getStreamMeta?(identity: string): { appName?: string; appIcon?: string } | null;
+
   getVideoTrack(key: string): LocalVideoTrack | RemoteTrack | MediaStreamVideoHandle | undefined;
   getStreams(): StreamInfo[];
 

@@ -20,6 +20,9 @@ pub enum TreeEvent {
     SetBitrate { bps: u32 },                   // Э8 ABR: сервер шлёт корню целевой битрейт под худший линк
     Topology { payload: Value },               // снимок дерева для UI (relay пробрасывает в webview)
     Release,                                   // Э9: сервер выселяет виртуальный relay (дренаж/обрушение дерева)
+    /// Конец вещания: сервер шлёт в watch-сокеты при обрушении дерева (ушёл вещатель).
+    /// Для viewer-relay терминально — teardown, не reconnect.
+    StreamEnd,
     /// WS пережил обрыв (рестарт сервера при деплое / сетевой блип): переподключились и
     /// послали join заново. Сервер выдал НОВЫЙ peer-id и пустое состояние — родитель/дети
     /// придут свежими assign-*; старые PC живут (медиа P2P, течёт мимо сервера), пока их
@@ -54,6 +57,10 @@ pub struct JoinParams {
     /// Э9: серверный виртуальный fallback-relay. Сервер верит флагу только при
     /// JWT-uid 'virtual-relay' (tree.js) — обычные клиенты шлют false.
     pub virtual_relay: bool,
+    /// Имя стримящегося приложения (окна) — только broadcaster, зрителям уходит в stream-live.
+    pub app_name: Option<String>,
+    /// Иконка приложения: PNG 32×32 base64 (без data-URI-префикса), 1-3 КБ.
+    pub app_icon: Option<String>,
 }
 
 const RECONNECT_BACKOFF_MAX_SEC: u64 = 15; // деплой рестартит сервер за секунды — догоняем быстро
@@ -100,6 +107,8 @@ pub fn connect(ws_url: String, join: JoinParams, reconnect: bool) -> (mpsc::Unbo
             "virtual": join.virtual_relay,
             "identity": join.identity,
             "serverId": join.server_id,
+            "appName": join.app_name,
+            "appIcon": join.app_icon,
         });
 
         let mut connects = 0u32; // сколько раз успешно джойнились (>=1 => дальше Rejoined)
@@ -228,6 +237,7 @@ fn parse_event(v: &Value) -> Option<TreeEvent> {
         "set-bitrate" => Some(TreeEvent::SetBitrate { bps: v.get("bps")?.as_u64()? as u32 }),
         "tree-topology" => Some(TreeEvent::Topology { payload: v.clone() }),
         "vrelay-release" => Some(TreeEvent::Release),
+        "stream-end" => Some(TreeEvent::StreamEnd),
         _ => None,
     }
 }

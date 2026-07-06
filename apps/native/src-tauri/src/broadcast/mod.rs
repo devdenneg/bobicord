@@ -6,6 +6,7 @@
 pub mod audio;
 pub mod capture;
 pub mod encoder;
+pub mod icon;
 pub mod peer;
 // relay-ядро и WS-сигналинг дерева вынесены в кросс-платформенный крейт relay-core
 // (Э9: общий код с headless-агентом vrelay). Реэкспорт сохраняет старые пути
@@ -277,12 +278,23 @@ pub async fn start(
     let cap_sup = Arc::new(std::sync::Mutex::new(cap_sup));
 
     let force_keyframe = Arc::new(AtomicBool::new(true));
+    // Метаданные приложения для зрителей (иконка + имя окна). Только для захвата окна;
+    // при захвате монитора приложение неопределимо (None — зритель покажет generic-глиф).
+    let (app_name, app_icon) = match source {
+        CaptureSource::Window { hwnd } => {
+            let (proc, pid) = capture::window_process_and_pid(hwnd);
+            let name = if proc.to_lowercase().ends_with(".exe") { proc[..proc.len() - 4].to_string() } else { proc };
+            (if name.is_empty() { None } else { Some(name) }, icon::window_icon_png_base64(hwnd, pid))
+        }
+        CaptureSource::Monitor { .. } => (None, None),
+    };
     let join = signaling::JoinParams {
         stream_id: stream_id.clone(), identity, server_id,
         role: "broadcaster", native: true, max_children: max_direct_children,
         max_bitrate: bitrate_bps, // потолок ABR = выбранный пользователем битрейт
         abr: auto_bitrate,
         virtual_relay: false,
+        app_name, app_icon,
     };
     // reconnect=true: деплой рестартит сервер — вещание переживает обрыв WS (реджойн),
     // энкод/захват не прерываются, зрители переджойнятся сами.
@@ -535,8 +547,9 @@ async fn run_signaling_loop(
                     // трупы дочистит sweep в stats-тике.
                     Some(TreeEvent::Rejoined) => log::warn!("broadcast: сигналинг реджойнился — жду переподключение зрителей"),
                     // Корень не имеет родителя — эти события к нему не относятся.
-                    // Release (Э9) адресован виртуальному relay — корню-вещателю не приходит.
-                    Some(TreeEvent::AssignParent { .. }) | Some(TreeEvent::SdpOffer { .. }) | Some(TreeEvent::Topology { .. }) | Some(TreeEvent::Release) => {}
+                    // Release (Э9) адресован виртуальному relay, StreamEnd — зрителям;
+                    // корню-вещателю ни то, ни другое не приходит.
+                    Some(TreeEvent::AssignParent { .. }) | Some(TreeEvent::SdpOffer { .. }) | Some(TreeEvent::Topology { .. }) | Some(TreeEvent::Release) | Some(TreeEvent::StreamEnd) => {}
                     Some(TreeEvent::Closed) | None => {
                         stop_reason = Some("сигнальный канал с сервером оборвался".into());
                         break;

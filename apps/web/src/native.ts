@@ -16,7 +16,8 @@ export async function listMonitors(): Promise<MonitorInfo[]> {
   return invoke<MonitorInfo[]>('list_monitors');
 }
 
-export interface WindowInfo { hwnd: number; title: string; process: string; pid: number }
+/** `icon` — PNG 32×32 в base64 (без data-URI-префикса) или null, если не извлеклась. */
+export interface WindowInfo { hwnd: number; title: string; process: string; pid: number; icon: string | null }
 
 export async function listWindows(): Promise<WindowInfo[]> {
   const { invoke } = await import('@tauri-apps/api/core');
@@ -150,5 +151,13 @@ export async function onNativeWatchIce(cb: (streamId: string, candidate: any) =>
 export async function onNativeTopology(cb: (payload: any) => void): Promise<() => void> {
   const { listen } = await import('@tauri-apps/api/event');
   const un = await listen<any>('relay-topology', (e) => cb(e.payload));
+  return un;
+}
+/** Rust-relay сам определил конец стрима (сирота без родителя >20с, см. relay.rs) —
+ *  webview должен снести watch (nativeUnwatch), иначе повисший кадр. Страховка на случай,
+ *  когда discovery-сокет webview пропустил stream-end. */
+export async function onNativeWatchEnded(cb: (streamId: string) => void): Promise<() => void> {
+  const { listen } = await import('@tauri-apps/api/event');
+  const un = await listen<{ streamId: string }>('relay-watch-ended', (e) => cb(e.payload.streamId));
   return un;
 }

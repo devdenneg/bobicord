@@ -166,11 +166,13 @@ version = "0.1.0"
 dependencies = [
  "audiopus",
  "audiopus_sys 0.2.2",
+ "base64 0.22.1",
  "bytes",
  "crossbeam-channel",
  "env_logger",
  "futures-util",
  "log",
+ "png 0.17.16",
  "relay-core",
  "serde",
  "serde_json",
