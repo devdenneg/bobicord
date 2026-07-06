@@ -79,7 +79,10 @@ export async function onBroadcastStopped(cb: (info: BroadcastStopInfo) => void):
 /// bundle грузится без reverse-proxy), плюс session-JWT в query.
 function treeWsUrl(): string {
   const override = (import.meta as any).env?.VITE_TREE_WS_URL as string | undefined;
-  const base = override || ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/tree');
+  // В нативе location.host = tauri://localhost (нет reverse-proxy) — тот же дефолт на
+  // прод-сервер, что и API_BASE в api.ts (см. там). Явный VITE_TREE_WS_URL переопределяет.
+  const nativeDefault = isTauri ? 'wss://138-16-170-21.sslip.io/tree' : null;
+  const base = override || nativeDefault || ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/tree');
   const token = getToken() || '';
   return base + (base.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
 }

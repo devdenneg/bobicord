@@ -8,7 +8,15 @@ export function setToken(t: string | null) {
   else localStorage.removeItem('sess');
 }
 
-const API_BASE = (import.meta as any).env?.VITE_API_BASE_URL || '';
+// Прод-бэкенд по умолчанию для НАТИВНОЙ сборки: вебвью Tauri грузит локальный bundle
+// с origin tauri://localhost, поэтому относительный `/api` резолвится в сам bundle
+// (Tauri отдаёт index.html на любой не-ассетный путь → 200 HTML → JSON.parse падает →
+// пустой ответ → me/servers undefined → краш на home). В вебе origin тот же, что и бэк
+// (Caddy), поэтому база пустая. Явный VITE_API_BASE_URL переопределяет оба случая.
+// Тот же приём, что и treeWsUrl() в native.ts для ws-дерева.
+const IS_TAURI = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+const PROD_API = 'https://138-16-170-21.sslip.io';
+const API_BASE = (import.meta as any).env?.VITE_API_BASE_URL || (IS_TAURI ? PROD_API : '');
 
 // Сервер отдаёт относительные пути (`/api/uploads/<name>`, см. index.js) — в вебе это
 // корректно (Caddy проксирует тот же origin), но в Tauri вебвью грузит локальный bundle
@@ -29,8 +37,12 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
   if (body !== undefined) { headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
   const r = await fetch(API_BASE + '/api' + path, opt);
   let d: any = {};
-  try { d = await r.json(); } catch { /* ignore */ }
+  let parsed = false;
+  try { d = await r.json(); parsed = true; } catch { /* ignore */ }
   if (!r.ok) throw new Error(d?.error || 'Ошибка ' + r.status);
+  // 200, но тело не JSON (напр. index.html при неверном API_BASE в нативе) — падаем
+  // громко, а не отдаём {} наверх (иначе me/servers undefined → белый экран на home).
+  if (!parsed) throw new Error('Некорректный ответ сервера (' + path + ')');
   return d as T;
 }
 
@@ -45,7 +57,7 @@ export const api = {
   uploadImage: async (file: Blob): Promise<{ url: string }> => {
     const headers: Record<string, string> = { 'Content-Type': file.type || 'application/octet-stream' };
     if (token) headers['Authorization'] = 'Bearer ' + token;
-    const r = await fetch('/api/upload', { method: 'POST', headers, body: file });
+    const r = await fetch(API_BASE + '/api/upload', { method: 'POST', headers, body: file });
     let d: any = {};
     try { d = await r.json(); } catch { /* ignore */ }
     if (!r.ok) throw new Error(d?.error || 'Ошибка ' + r.status);
