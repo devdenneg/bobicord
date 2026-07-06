@@ -5,6 +5,7 @@ const FILES = {
   leave: '/leave.wav',   // кто-то вышел из голосового (нисходящий)
   mute: '/mute.wav',     // кто-то замутился
   system: '/system.wav', // системное уведомление (напр. надо обновиться)
+  mention: '/mention.wav', // тебя упомянули (@ник)
 } as const;
 import { getSettings } from './settings';
 

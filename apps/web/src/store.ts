@@ -20,7 +20,7 @@ interface AppState {
   updateReady: boolean;
   emoteSize: 'sm' | 'md' | 'lg';
   toasts: Toast[];
-  modal: null | 'create' | 'join' | 'profile' | 'srvmenu' | 'invite' | 'settings' | 'broadcast';
+  modal: null | 'create' | 'join' | 'profile' | 'srvmenu' | 'invite' | 'srvsettings' | 'settings' | 'broadcast';
   joinPrefill: string;
   broadcastLive: boolean;
 
@@ -36,6 +36,7 @@ interface AppState {
   goHome: () => void;
   refreshServers: () => Promise<void>;
   refreshMembers: () => Promise<void>;
+  refreshServer: () => Promise<void>;
   setMe: (u: User) => void;
   setEmoteSize: (s: 'sm' | 'md' | 'lg') => void;
 }
@@ -86,6 +87,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
   refreshServers: async () => { try { const d = await api.me(); set({ servers: d.servers }); } catch { /**/ } },
   refreshMembers: async () => { const a = get().active; if (!a) return; try { const d = await api.getServer(a.id); set({ members: d.members }); engine?.setMembers(d.members); } catch { /**/ } },
+  refreshServer: async () => { const a = get().active; if (!a) return; try { const d = await api.getServer(a.id); set({ members: d.members, active: { ...d.server, myRole: d.myRole, myPerms: d.myPerms } }); engine?.setMembers(d.members); } catch { /**/ } },
 
   logout: () => { engine?.disconnect(); setToken(null); location.reload(); },
 
@@ -97,7 +99,7 @@ export const useStore = create<AppState>((set, get) => ({
     set({ view: 'server', loadingServer: true, loadingServerId: id, active: null, members: [] });
     try {
       const d = await api.getServer(id);
-      const active: ServerDetail = d.server;
+      const active: ServerDetail = { ...d.server, myRole: d.myRole, myPerms: d.myPerms };
       // грузим сохранённые громкости ДО показа (иначе слайдеры = 100%)
       const cache = JSON.parse(localStorage.getItem('srvset:' + id) || 'null');
       if (cache) engine?.setVols(cache);

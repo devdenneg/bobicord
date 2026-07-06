@@ -7,12 +7,32 @@ export interface User {
   bio: string;
 }
 
+// права роли (битовая маска, синхронно с server/index.js PERM)
+export const PERM = { MANAGE_SERVER: 1, MANAGE_ROLES: 2, MANAGE_MEMBERS: 4, MANAGE_MESSAGES: 8, CREATE_INVITE: 16 } as const;
+export const PERM_LIST: { key: keyof typeof PERM; label: string; hint: string }[] = [
+  { key: 'MANAGE_SERVER', label: 'Управление сервером', hint: 'Менять название, описание, обложку' },
+  { key: 'MANAGE_ROLES', label: 'Управление ролями', hint: 'Создавать роли и назначать их' },
+  { key: 'MANAGE_MEMBERS', label: 'Выгонять участников', hint: 'Кикать с сервера' },
+  { key: 'MANAGE_MESSAGES', label: 'Модерация чата', hint: 'Чистить чат, команды' },
+  { key: 'CREATE_INVITE', label: 'Приглашать', hint: 'Создавать ссылки-приглашения' },
+];
+export const hasPerm = (perms: number, flag: number) => (perms & flag) === flag;
+
+export interface Role {
+  id: string;
+  name: string;
+  color: string; // '#rrggbb' или '' (наследует)
+  permissions: number;
+  position: number;
+}
+
 export interface ServerSummary {
   id: string;
   name: string;
   ownerId: string;
   iconColor: number;
-  hasPassword: boolean;
+  iconUrl?: string;
+  description?: string;
   role: string;
   memberCount: number;
   online?: string[];
@@ -27,6 +47,7 @@ export interface Member {
   avatarUrl?: string;
   bio?: string;
   role: string;
+  roles?: Role[];
 }
 
 export interface ServerDetail {
@@ -34,13 +55,16 @@ export interface ServerDetail {
   name: string;
   ownerId: string;
   iconColor: number;
-  hasPassword: boolean;
+  iconUrl?: string;
+  description?: string;
   memberCount: number;
   myRole: string;
+  myPerms?: number;
+  roles?: Role[];
 }
 
 export interface InvitePreview {
-  server: { id: string; name: string; iconColor: number; memberCount: number; hasPassword: boolean };
+  server: { id: string; name: string; iconColor: number; memberCount: number };
   requiresPassword: boolean;
 }
 
@@ -56,6 +80,7 @@ export interface ChatMessage {
   color?: number; // avatar color index of author
   img?: string; // attached image URL
   ts?: number; // timestamp (ms)
+  mention?: boolean; // упоминает меня (@ник)
 }
 
 export interface HistoryMessage {

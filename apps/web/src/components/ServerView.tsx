@@ -9,7 +9,8 @@ import { emoteMap, emoteUrl } from '../emotes';
 import { EmotePicker } from './EmotePicker';
 import { getSettings, setSettings } from '../settings';
 import { isTauri, onBroadcastStopped, stopNativeBroadcast } from '../native';
-import type { Emote, Member } from '../types';
+import type { Emote, Member, Role } from '../types';
+import { PERM, hasPerm } from '../types';
 
 function Avatar({ name, ci, url, size = 32, dot }: { name: string; ci: number; url?: string; size?: number; dot?: string }) {
   return (
@@ -42,13 +43,24 @@ function ProfileCard({ m, rect }: { m: Member; rect: DOMRect }) {
       <div className="pcard-av" style={{ background: m.avatarUrl ? '#0000' : avColor(m.displayName, m.avatarColor) }}>
         {m.avatarUrl ? <img className="avimg" src={resolveUploadUrl(m.avatarUrl)} alt="" /> : initial(m.displayName)}
       </div>
-      <div className="pcard-name">{m.displayName}</div>
+      <div className="pcard-name">{m.displayName}{m.role === 'owner' ? <span className="rl" title="Владелец">👑</span> : null}</div>
       <div className="pcard-user">@{m.username}</div>
+      {m.roles && m.roles.length ? (<>
+        <div className="pcard-label">Роли</div>
+        <div className="pcard-roles">{m.roles.map((r) => <span key={r.id} className="role-chip on" style={{ background: r.color || 'var(--accent)', borderColor: r.color || 'var(--accent)' }}>{r.name}</span>)}</div>
+      </>) : null}
       <div className="pcard-label">О себе</div>
       <div className={'pcard-bio' + (bio ? '' : ' empty')}>{bio || 'Ничего не указано'}</div>
     </div>
   );
 }
+
+// цвет ника по высшей роли (роли отсортированы по position DESC на сервере)
+function roleColorOf(m: Member): string | undefined {
+  const r = (m.roles || []).find((x) => x.color);
+  return r?.color || undefined;
+}
+function topRole(m: Member): Role | undefined { return (m.roles || [])[0]; }
 
 /* ---------- Voice channel participant row (LEFT, with controls) ---------- */
 function VoiceParticipantRow({ m }: { m: Member }) {
@@ -229,7 +241,8 @@ function MemberRow({ m }: { m: Member }) {
     <div className={'pi ' + st + (streaming ? ' streaming' : '')} data-spk={m.username}>
       <div className="head" ref={hc.ref} onMouseEnter={self ? undefined : hc.onEnter} onMouseLeave={self ? undefined : hc.onLeave}>
         <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} dot={st} />
-        <div className="nm">{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div>
+        <div className="nm" style={roleColorOf(m) ? { color: roleColorOf(m) } : undefined}>{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div>
+        {topRole(m) ? <span className="role-badge" style={{ background: (topRole(m)!.color || 'var(--panel3)') + '22', color: topRole(m)!.color || 'var(--muted)', borderColor: (topRole(m)!.color || 'var(--line-2)') + '55' }}>{topRole(m)!.name}</span> : null}
         {!self && streaming && !pr?.inVoice ? (
           <button className={'watchbtn' + (watching ? ' on' : '')} disabled={pending}
             aria-label={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}
@@ -265,10 +278,11 @@ function Members() {
 }
 
 /* ---------- Chat ---------- */
-function renderRich(text: string): (string | { emo: string; name: string } | { link: string })[] {
+function renderRich(text: string): (string | { emo: string; name: string } | { link: string } | { mention: string })[] {
   return text.split(/(\s+)/).map((tok) => {
     if (emoteMap.has(tok)) return { emo: emoteMap.get(tok)!, name: tok };
     if (/^https?:\/\/[^\s]+$/i.test(tok)) return { link: tok };
+    if (/^@[^\s@]{1,32}$/.test(tok)) return { mention: tok };
     return tok;
   });
 }
@@ -304,6 +318,7 @@ function Chat() {
   const [uploading, setUploading] = useState(false);
   const toast = useStore((s) => s.toast);
   const updateReady = useStore((s) => s.updateReady);
+  const me = useStore((s) => s.me)!;
   const [pill, setPill] = useState(0);
   const [atBottom, setAtBottom] = useState(true);
   const atBottomRef = useRef(true);
@@ -332,8 +347,23 @@ function Chat() {
     return () => ro.disconnect();
   }, [scrollToBottom]);
 
+  async function runCommand(raw: string) {
+    const active = useStore.getState().active;
+    const [cmd] = raw.slice(1).split(/\s+/);
+    const c = (cmd || '').toLowerCase();
+    const canMod = !!active && (active.myRole === 'owner' || hasPerm(active.myPerms || 0, PERM.MANAGE_MESSAGES));
+    if (c === 'help') {
+      E.sysMsg('Команды: /clear — очистить чат (нужна модерация), /help — эта справка. Упоминание: @ник (или @all).');
+    } else if (c === 'clear') {
+      if (!active || !canMod) { toast('Нет прав на очистку чата', 'warn'); return; }
+      try { await api.clearChat(active.id); E.clearMessages(me.displayName); } catch (e: any) { toast(e?.message || 'Ошибка', 'err'); }
+    } else {
+      E.sysMsg(`Неизвестная команда: /${c}. Напиши /help для списка.`);
+    }
+  }
   function send() {
     const t = text.trim(); if (!t) return;
+    if (t.startsWith('/')) { runCommand(t); setText(''); return; }
     const em: Record<string, string> = {};
     t.split(/\s+/).forEach((w) => { if (emoteMap.has(w)) em[w] = emoteMap.get(w)!; });
     E.sendChatWithEmotes(t, em);
@@ -366,11 +396,11 @@ function Chat() {
             const hasLink = parts ? parts.some((p) => typeof p === 'object' && 'link' in p) : false;
             const big = !!parts && !hasLink && emoCount >= 1 && emoCount <= 3 && parts.every((p) => typeof p !== 'string' || !p.trim());
             return (
-              <div className={'msg' + (m.sys ? ' sys' : '') + (m.mine ? ' me' : '')} key={m.id}>
+              <div className={'msg' + (m.sys ? ' sys' : '') + (m.mine ? ' me' : '') + (m.mention ? ' mentioned' : '')} key={m.id}>
                 {!m.sys ? <div className="who" style={{ color: avColor(m.who || '', m.color) }}>{m.who}{m.ts ? <span className="mtime">{fmtTime(m.ts)}</span> : null}</div> : null}
                 {m.sys || m.text ? (
                   <div className={'tx' + (big ? ' big' : '')}>
-                    {m.sys ? m.text : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : 'link' in p ? <a key={i} className="msg-link" href={p.link} target="_blank" rel="noreferrer">{p.link}</a> : <img key={i} className="emo" src={emoteUrl(p.emo)} alt={p.name} title={p.name} loading="lazy" decoding="async" />))}
+                    {m.sys ? m.text : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : 'link' in p ? <a key={i} className="msg-link" href={p.link} target="_blank" rel="noreferrer">{p.link}</a> : 'mention' in p ? <span key={i} className="mention-tag">{p.mention}</span> : <img key={i} className="emo" src={emoteUrl(p.emo)} alt={p.name} title={p.name} loading="lazy" decoding="async" />))}
                   </div>
                 ) : null}
                 {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox(m.img!)}><img className="msg-img" src={resolveUploadUrl(m.img)} alt="" loading="lazy" onLoad={() => { const el = msgsRef.current; if (el && atBottomRef.current) el.scrollTop = el.scrollHeight; }} /></button> : null}

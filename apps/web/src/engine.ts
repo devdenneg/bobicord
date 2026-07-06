@@ -598,18 +598,37 @@ export class Engine {
   async applyOutput() { if (!this.room) return; const out = getSettings().output; try { await this.room.switchActiveDevice('audiooutput', out || 'default'); } catch { /**/ } document.querySelectorAll('#audioSink audio').forEach((a) => { if ((a as any).setSinkId && out) (a as any).setSinkId(out).catch(() => {}); }); }
 
   /* ---------- chat ---------- */
+  // упоминание меня: @username / @displayName / @everyone|@all|@все
+  textMentionsMe(text: string): boolean {
+    if (!text) return false;
+    if (/@(everyone|all|все)\b/i.test(text)) return true;
+    const low = text.toLowerCase();
+    const u = (this.me.username || '').toLowerCase();
+    const d = (this.me.displayName || '').toLowerCase();
+    let m: RegExpExecArray | null; const re = /@([^\s@]+)/g;
+    while ((m = re.exec(low))) { if (m[1] === u || m[1] === d) return true; }
+    return !!d && low.includes('@' + d);
+  }
   private pushMsg(who: string | null, text: string, sys: boolean, color?: number, mineOverride?: boolean, img?: string, ts?: number) {
     const mine = mineOverride !== undefined ? mineOverride : (!sys && who === this.me.displayName);
-    this.messages = [...this.messages, { id: msgSeq++, who, text, mine, sys, color, img, ts: ts ?? Date.now() }].slice(-500);
+    const mention = !sys && !mine && this.textMentionsMe(text);
+    this.messages = [...this.messages, { id: msgSeq++, who, text, mine, sys, color, img, ts: ts ?? Date.now(), mention }].slice(-500);
     this.emit();
   }
   sysMsg(text: string) { this.pushMsg(null, text, true); }
   loadHistory(list: { uid: string; name: string; color: number; text: string; em: Record<string, string>; img?: string; ts?: number }[]) {
     this.messages = list.map((m) => {
       if (m.em) for (const k in m.em) this.onEmoteResolve?.(k, m.em[k]);
-      return { id: msgSeq++, who: m.name, text: m.text, mine: m.uid === this.me.id, sys: false, color: m.color, img: m.img, ts: m.ts };
+      return { id: msgSeq++, who: m.name, text: m.text, mine: m.uid === this.me.id, sys: false, color: m.color, img: m.img, ts: m.ts, mention: m.uid !== this.me.id && this.textMentionsMe(m.text) };
     });
     this.emit();
+  }
+  // очистка чата (админ): локально + всем; сервер уже почищен вызывающей стороной
+  clearMessages(byName?: string) {
+    this.messages = [];
+    this.dataSend({ t: 'clear', by: byName || this.me.displayName });
+    this.emit();
+    this.sysMsg((byName || this.me.displayName) + ' очистил чат');
   }
   sendChatWithEmotes(text: string, em: Record<string, string>, img?: string) {
     if ((!text.trim() && !img) || !this.room) return;
@@ -633,7 +652,8 @@ export class Engine {
   private onData = (payload: Uint8Array) => {
     try {
       const d = JSON.parse(new TextDecoder().decode(payload));
-      if (d.t === 'chat') { if (d.em) for (const k in d.em) this.onEmoteResolve?.(k, d.em[k]); this.typingUsers.delete(d.name); this.pushMsg(d.name, d.text, false, d.color, false, d.img); playSound('msg'); }
+      if (d.t === 'chat') { if (d.em) for (const k in d.em) this.onEmoteResolve?.(k, d.em[k]); this.typingUsers.delete(d.name); const mentioned = this.textMentionsMe(d.text); this.pushMsg(d.name, d.text, false, d.color, false, d.img); playSound(mentioned ? 'mention' : 'msg'); if (mentioned) this.hooks.toast(`${d.name} упомянул тебя`, 'info'); }
+      else if (d.t === 'clear') { this.messages = []; this.emit(); this.sysMsg((d.by || 'Админ') + ' очистил чат'); }
       else if (d.t === 'emote') this.emoteListeners.forEach((f) => f(d.s, d.e, d.by, d.x, d.sz));
       else if (d.t === 'watch') { const m = this.wset(d.s); if (d.on) m.set(d.id, { name: d.n, ts: Date.now() }); else m.delete(d.id); this.emit(); }
       else if (d.t === 'typing') { if (d.name && d.name !== this.me.displayName) { this.typingUsers.set(d.name, Date.now() + 3500); this.emit(); setTimeout(() => this.pruneTyping(), 3600); } }

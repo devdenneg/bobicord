@@ -91,16 +91,36 @@ CREATE TABLE IF NOT EXISTS messages(
   image TEXT NOT NULL DEFAULT '',
   created INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS roles(
+  id TEXT PRIMARY KEY,
+  server_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  color TEXT NOT NULL DEFAULT '',
+  permissions INTEGER NOT NULL DEFAULT 0,
+  position INTEGER NOT NULL DEFAULT 0,
+  created INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS member_roles(
+  server_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  role_id TEXT NOT NULL,
+  PRIMARY KEY(server_id, user_id, role_id)
+);
 CREATE INDEX IF NOT EXISTS idx_msg_server ON messages(server_id, created);
 CREATE INDEX IF NOT EXISTS idx_mem_server ON memberships(server_id);
 CREATE INDEX IF NOT EXISTS idx_mem_user ON memberships(user_id);
 CREATE INDEX IF NOT EXISTS idx_inv_server ON invites(server_id);
+CREATE INDEX IF NOT EXISTS idx_roles_server ON roles(server_id);
+CREATE INDEX IF NOT EXISTS idx_mroles ON member_roles(server_id, user_id);
 `);
 
 /* add new columns to pre-existing DBs (idempotent — throws if column exists) */
 for (const sql of [
   "ALTER TABLE users ADD COLUMN avatar_url TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE messages ADD COLUMN image TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE servers ADD COLUMN description TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE servers ADD COLUMN icon_url TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE invites ADD COLUMN expires INTEGER NOT NULL DEFAULT 0",
 ]) { try { db.exec(sql); } catch (e) { /* column already exists */ } }
 
 /* one-time migration of legacy users.json -> users table */
@@ -151,10 +171,24 @@ async function onlineIn(serverId) {
 }
 const pubUser = u => ({ id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '', bio: u.bio });
 const UPLOAD_RE = /^\/api\/uploads\/[a-zA-Z0-9._-]+$/; // локальный путь к загрузке
-const pubServer = s => ({ id: s.id, name: s.name, ownerId: s.owner_id, iconColor: s.icon_color, hasPassword: !!s.password_hash });
+const pubServer = s => ({ id: s.id, name: s.name, ownerId: s.owner_id, iconColor: s.icon_color, iconUrl: s.icon_url || '', description: s.description || '' });
 function isMember(uid, sid) { return !!db.prepare('SELECT 1 FROM memberships WHERE user_id=? AND server_id=?').get(uid, sid); }
 function memberCount(sid) { return db.prepare('SELECT COUNT(*) c FROM memberships WHERE server_id=?').get(sid).c; }
 function roleOf(uid, sid) { const r = db.prepare('SELECT role FROM memberships WHERE user_id=? AND server_id=?').get(uid, sid); return r ? r.role : null; }
+
+/* ---- права (битовая маска; задел на будущее — часть уже проверяется) ---- */
+const PERM = { MANAGE_SERVER: 1, MANAGE_ROLES: 2, MANAGE_MEMBERS: 4, MANAGE_MESSAGES: 8, CREATE_INVITE: 16 };
+const ALL_PERMS = Object.values(PERM).reduce((a, b) => a | b, 0);
+const isOwner = (uid, sid) => { const s = db.prepare('SELECT owner_id FROM servers WHERE id=?').get(sid); return !!s && s.owner_id === uid; };
+function permsOf(uid, sid) {
+  if (isOwner(uid, sid)) return ALL_PERMS;
+  const rows = db.prepare('SELECT r.permissions p FROM member_roles mr JOIN roles r ON r.id=mr.role_id WHERE mr.server_id=? AND mr.user_id=?').all(sid, uid);
+  return rows.reduce((a, r) => a | (r.p || 0), 0);
+}
+const can = (uid, sid, perm) => (permsOf(uid, sid) & perm) === perm;
+const pubRole = r => ({ id: r.id, name: r.name, color: r.color || '', permissions: r.permissions || 0, position: r.position || 0 });
+function rolesOfServer(sid) { return db.prepare('SELECT * FROM roles WHERE server_id=? ORDER BY position DESC, created ASC').all(sid).map(pubRole); }
+function rolesOfMember(sid, uid) { return db.prepare('SELECT r.* FROM member_roles mr JOIN roles r ON r.id=mr.role_id WHERE mr.server_id=? AND mr.user_id=? ORDER BY r.position DESC').all(sid, uid).map(pubRole); }
 
 /* ---------------- AUTH ---------------- */
 app.post('/api/register', (req, res) => {
@@ -226,19 +260,26 @@ app.post('/api/upload', requireAuth, express.raw({ type: Object.keys(MIME_EXT), 
 });
 
 /* ---------------- SERVERS ---------------- */
+const INVITE_TTL = 30 * 60 * 1000; // приглашение живёт 30 минут
+function makeInvite(sid, uid) {
+  const code = inviteCode();
+  const expires = Date.now() + INVITE_TTL;
+  db.prepare('INSERT INTO invites(code,server_id,requires_password,created_by,created,expires) VALUES(?,?,0,?,?,?)').run(code, sid, uid, Date.now(), expires);
+  return { code, expires };
+}
+
 app.post('/api/servers', requireAuth, (req, res) => {
   const name = String(req.body.name || '').trim().slice(0, 40);
-  const pass = String(req.body.password || '');
   if (name.length < 2) return res.status(400).json({ error: 'Название сервера минимум 2 символа' });
   const id = newId('s');
   const now = Date.now();
+  // все серверы приватны — попасть можно только по приглашению (пароли убраны)
   db.prepare('INSERT INTO servers(id,name,owner_id,icon_color,password_hash,created) VALUES(?,?,?,?,?,?)')
-    .run(id, name, req.user.id, hashColor(name), pass ? bcrypt.hashSync(pass, 10) : null, now);
+    .run(id, name, req.user.id, hashColor(name), null, now);
   db.prepare('INSERT INTO memberships(user_id,server_id,role,joined) VALUES(?,?,?,?)').run(req.user.id, id, 'owner', now);
-  const code = inviteCode();
-  db.prepare('INSERT INTO invites(code,server_id,requires_password,created_by,created) VALUES(?,?,?,?,?)').run(code, id, 0, req.user.id, now);
+  const inv = makeInvite(id, req.user.id);
   const s = db.prepare('SELECT * FROM servers WHERE id=?').get(id);
-  res.json({ server: { ...pubServer(s), role: 'owner', memberCount: 1 }, invite: code });
+  res.json({ server: { ...pubServer(s), role: 'owner', memberCount: 1 }, invite: inv.code, inviteExpires: inv.expires });
 });
 
 app.get('/api/servers/:id', requireAuth, (req, res) => {
@@ -248,18 +289,19 @@ app.get('/api/servers/:id', requireAuth, (req, res) => {
   const members = db.prepare(`
     SELECT u.id,u.username,u.display_name,u.avatar_color,u.avatar_url,u.bio,m.role FROM memberships m
     JOIN users u ON u.id=m.user_id WHERE m.server_id=? ORDER BY (m.role='owner') DESC, u.display_name ASC`).all(s.id)
-    .map(u => ({ id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '', bio: u.bio || '', role: u.role }));
-  res.json({ server: { ...pubServer(s), memberCount: members.length }, members, myRole: roleOf(req.user.id, s.id) });
+    .map(u => ({ id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '', bio: u.bio || '', role: u.role, roles: rolesOfMember(s.id, u.id) }));
+  res.json({ server: { ...pubServer(s), memberCount: members.length, roles: rolesOfServer(s.id) }, members, myRole: roleOf(req.user.id, s.id), myPerms: permsOf(req.user.id, s.id) });
 });
 
 /* owner kicks a member */
 app.post('/api/servers/:id/kick', requireAuth, (req, res) => {
   const s = db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id);
   if (!s) return res.status(404).json({ error: 'нет' });
-  if (s.owner_id !== req.user.id) return res.status(403).json({ error: 'Только владелец' });
+  if (!can(req.user.id, s.id, PERM.MANAGE_MEMBERS)) return res.status(403).json({ error: 'Нет прав' });
   const uid = String(req.body.userId || '');
   if (!uid || uid === s.owner_id) return res.status(400).json({ error: 'Нельзя' });
   db.prepare('DELETE FROM memberships WHERE user_id=? AND server_id=?').run(uid, s.id);
+  db.prepare('DELETE FROM member_roles WHERE user_id=? AND server_id=?').run(uid, s.id);
   db.prepare('DELETE FROM server_settings WHERE user_id=? AND server_id=?').run(uid, s.id);
   const ku = db.prepare('SELECT username FROM users WHERE id=?').get(uid);
   if (ku) { try { rsc.removeParticipant('srv:' + s.id, ku.username).catch(() => {}); } catch (e) {} }
@@ -281,59 +323,118 @@ app.delete('/api/servers/:id', requireAuth, (req, res) => {
   db.prepare('DELETE FROM memberships WHERE server_id=?').run(s.id);
   db.prepare('DELETE FROM invites WHERE server_id=?').run(s.id);
   db.prepare('DELETE FROM server_settings WHERE server_id=?').run(s.id);
+  db.prepare('DELETE FROM roles WHERE server_id=?').run(s.id);
+  db.prepare('DELETE FROM member_roles WHERE server_id=?').run(s.id);
+  db.prepare('DELETE FROM messages WHERE server_id=?').run(s.id);
   db.prepare('DELETE FROM servers WHERE id=?').run(s.id);
   res.json({ ok: true });
 });
 
-/* server password (owner sets/changes) */
-app.put('/api/servers/:id/password', requireAuth, (req, res) => {
+/* owner/manage-server: правка названия/описания/обложки */
+app.patch('/api/servers/:id', requireAuth, (req, res) => {
   const s = db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id);
   if (!s) return res.status(404).json({ error: 'нет' });
-  if (s.owner_id !== req.user.id) return res.status(403).json({ error: 'Только владелец' });
-  const pass = String(req.body.password || '');
-  db.prepare('UPDATE servers SET password_hash=? WHERE id=?').run(pass ? bcrypt.hashSync(pass, 10) : null, s.id);
-  res.json({ ok: true, hasPassword: !!pass });
+  if (!can(req.user.id, s.id, PERM.MANAGE_SERVER)) return res.status(403).json({ error: 'Нет прав' });
+  const name = req.body.name != null ? String(req.body.name).trim().slice(0, 40) : null;
+  const desc = req.body.description != null ? String(req.body.description).slice(0, 300) : null;
+  const ic = req.body.iconColor != null ? (parseInt(req.body.iconColor, 10) % 8 + 8) % 8 : null;
+  let iu = null;
+  if (req.body.iconUrl != null) { const v = String(req.body.iconUrl); if (v === '' || UPLOAD_RE.test(v)) iu = v; else return res.status(400).json({ error: 'Неверная обложка' }); }
+  if (name !== null && name.length < 2) return res.status(400).json({ error: 'Название минимум 2 символа' });
+  db.prepare('UPDATE servers SET name=COALESCE(?,name), description=COALESCE(?,description), icon_color=COALESCE(?,icon_color), icon_url=COALESCE(?,icon_url) WHERE id=?')
+    .run(name, desc, ic, iu, s.id);
+  const ns = db.prepare('SELECT * FROM servers WHERE id=?').get(s.id);
+  res.json({ server: { ...pubServer(ns), memberCount: memberCount(s.id) } });
 });
 
-/* ---------------- INVITES ---------------- */
+/* ---------------- INVITES (только приглашение, 30 мин) ---------------- */
 app.post('/api/servers/:id/invites', requireAuth, (req, res) => {
   const s = db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id);
   if (!s) return res.status(404).json({ error: 'нет' });
   if (!isMember(req.user.id, s.id)) return res.status(403).json({ error: 'нет' });
-  const reqPass = req.body.requiresPassword ? 1 : 0;
-  if (reqPass && !s.password_hash) return res.status(400).json({ error: 'Сначала задай пароль сервера' });
-  // переиспользуем существующий инвайт того же типа
-  let inv = db.prepare('SELECT * FROM invites WHERE server_id=? AND requires_password=?').get(s.id, reqPass);
-  if (!inv) {
-    const code = inviteCode();
-    db.prepare('INSERT INTO invites(code,server_id,requires_password,created_by,created) VALUES(?,?,?,?,?)').run(code, s.id, reqPass, req.user.id, Date.now());
-    inv = { code, requires_password: reqPass };
-  }
-  res.json({ code: inv.code, requiresPassword: !!reqPass });
+  // любой участник может пригласить; каждый раз новая ссылка, старые истекают сами через 30 мин
+  const inv = makeInvite(s.id, req.user.id);
+  res.json({ code: inv.code, expires: inv.expires });
 });
 
 app.get('/api/invites/:code', (req, res) => {
   const inv = db.prepare('SELECT * FROM invites WHERE code=?').get(req.params.code);
-  if (!inv) return res.status(404).json({ error: 'Приглашение не найдено или устарело' });
+  if (!inv || (inv.expires && inv.expires < Date.now())) return res.status(404).json({ error: 'Приглашение не найдено или устарело' });
   const s = db.prepare('SELECT * FROM servers WHERE id=?').get(inv.server_id);
   if (!s) return res.status(404).json({ error: 'Сервер удалён' });
-  res.json({ server: { ...pubServer(s), memberCount: memberCount(s.id) }, requiresPassword: !!inv.requires_password });
+  res.json({ server: { ...pubServer(s), memberCount: memberCount(s.id) }, requiresPassword: false });
 });
 
 app.post('/api/invites/:code/join', requireAuth, (req, res) => {
   const inv = db.prepare('SELECT * FROM invites WHERE code=?').get(req.params.code);
-  if (!inv) return res.status(404).json({ error: 'Приглашение не найдено' });
+  if (!inv || (inv.expires && inv.expires < Date.now())) return res.status(404).json({ error: 'Приглашение устарело — попроси новое' });
   const s = db.prepare('SELECT * FROM servers WHERE id=?').get(inv.server_id);
   if (!s) return res.status(404).json({ error: 'Сервер удалён' });
   if (!isMember(req.user.id, s.id)) {
-    if (inv.requires_password) {
-      const pass = String(req.body.password || '');
-      if (!s.password_hash || !bcrypt.compareSync(pass, s.password_hash)) return res.status(403).json({ error: 'Неверный пароль сервера' });
-    }
     db.prepare('INSERT OR IGNORE INTO memberships(user_id,server_id,role,joined) VALUES(?,?,?,?)').run(req.user.id, s.id, 'member', Date.now());
     db.prepare('UPDATE invites SET uses=uses+1 WHERE code=?').run(inv.code);
   }
   res.json({ server: { ...pubServer(s), role: roleOf(req.user.id, s.id), memberCount: memberCount(s.id) } });
+});
+
+/* ---------------- ROLES (кастомные роли + назначение) ---------------- */
+function validColor(c) { return typeof c === 'string' && /^#[0-9a-fA-F]{6}$/.test(c) ? c : ''; }
+app.get('/api/servers/:id/roles', requireAuth, (req, res) => {
+  if (!isMember(req.user.id, req.params.id)) return res.status(403).json({ error: 'нет' });
+  res.json({ roles: rolesOfServer(req.params.id) });
+});
+app.post('/api/servers/:id/roles', requireAuth, (req, res) => {
+  const sid = req.params.id;
+  if (!can(req.user.id, sid, PERM.MANAGE_ROLES)) return res.status(403).json({ error: 'Нет прав' });
+  const name = String(req.body.name || '').trim().slice(0, 24);
+  if (name.length < 1) return res.status(400).json({ error: 'Название роли не может быть пустым' });
+  const color = validColor(req.body.color);
+  const perms = (parseInt(req.body.permissions, 10) || 0) & ALL_PERMS;
+  const maxPos = db.prepare('SELECT COALESCE(MAX(position),0) p FROM roles WHERE server_id=?').get(sid).p;
+  const id = newId('r');
+  db.prepare('INSERT INTO roles(id,server_id,name,color,permissions,position,created) VALUES(?,?,?,?,?,?,?)').run(id, sid, name, color, perms, maxPos + 1, Date.now());
+  res.json({ role: pubRole(db.prepare('SELECT * FROM roles WHERE id=?').get(id)) });
+});
+app.patch('/api/servers/:id/roles/:rid', requireAuth, (req, res) => {
+  const sid = req.params.id;
+  if (!can(req.user.id, sid, PERM.MANAGE_ROLES)) return res.status(403).json({ error: 'Нет прав' });
+  const r = db.prepare('SELECT * FROM roles WHERE id=? AND server_id=?').get(req.params.rid, sid);
+  if (!r) return res.status(404).json({ error: 'Роль не найдена' });
+  const name = req.body.name != null ? String(req.body.name).trim().slice(0, 24) : null;
+  if (name !== null && name.length < 1) return res.status(400).json({ error: 'Название роли не может быть пустым' });
+  const color = req.body.color != null ? validColor(req.body.color) : null;
+  const perms = req.body.permissions != null ? ((parseInt(req.body.permissions, 10) || 0) & ALL_PERMS) : null;
+  const pos = req.body.position != null ? (parseInt(req.body.position, 10) || 0) : null;
+  db.prepare('UPDATE roles SET name=COALESCE(?,name), color=COALESCE(?,color), permissions=COALESCE(?,permissions), position=COALESCE(?,position) WHERE id=?')
+    .run(name, color, perms, pos, r.id);
+  res.json({ role: pubRole(db.prepare('SELECT * FROM roles WHERE id=?').get(r.id)) });
+});
+app.delete('/api/servers/:id/roles/:rid', requireAuth, (req, res) => {
+  const sid = req.params.id;
+  if (!can(req.user.id, sid, PERM.MANAGE_ROLES)) return res.status(403).json({ error: 'Нет прав' });
+  db.prepare('DELETE FROM roles WHERE id=? AND server_id=?').run(req.params.rid, sid);
+  db.prepare('DELETE FROM member_roles WHERE role_id=? AND server_id=?').run(req.params.rid, sid);
+  res.json({ ok: true });
+});
+app.put('/api/servers/:id/members/:uid/roles', requireAuth, (req, res) => {
+  const sid = req.params.id;
+  if (!can(req.user.id, sid, PERM.MANAGE_ROLES)) return res.status(403).json({ error: 'Нет прав' });
+  const uid = req.params.uid;
+  if (!isMember(uid, sid)) return res.status(404).json({ error: 'Не участник' });
+  const ids = Array.isArray(req.body.roleIds) ? req.body.roleIds.map(String) : [];
+  const valid = new Set(db.prepare('SELECT id FROM roles WHERE server_id=?').all(sid).map(r => r.id));
+  db.prepare('DELETE FROM member_roles WHERE server_id=? AND user_id=?').run(sid, uid);
+  const ins = db.prepare('INSERT OR IGNORE INTO member_roles(server_id,user_id,role_id) VALUES(?,?,?)');
+  for (const rid of ids) if (valid.has(rid)) ins.run(sid, uid, rid);
+  res.json({ roles: rolesOfMember(sid, uid) });
+});
+
+/* ---------------- ADMIN: очистка чата ---------------- */
+app.post('/api/servers/:id/clear', requireAuth, (req, res) => {
+  const sid = req.params.id;
+  if (!can(req.user.id, sid, PERM.MANAGE_MESSAGES)) return res.status(403).json({ error: 'Нет прав' });
+  db.prepare('DELETE FROM messages WHERE server_id=?').run(sid);
+  res.json({ ok: true });
 });
 
 /* ---------------- LIVEKIT TOKEN (per server) ---------------- */

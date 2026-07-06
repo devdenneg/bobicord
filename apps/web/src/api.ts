@@ -1,4 +1,4 @@
-import type { User, ServerSummary, Member, ServerDetail, InvitePreview, HistoryMessage } from './types';
+import type { User, ServerSummary, Member, ServerDetail, InvitePreview, HistoryMessage, Role } from './types';
 
 let token: string | null = localStorage.getItem('sess');
 export const getToken = () => token;
@@ -51,20 +51,26 @@ export const api = {
     if (!r.ok) throw new Error(d?.error || 'Ошибка ' + r.status);
     return d as { url: string };
   },
-  createServer: (name: string, password?: string) =>
-    req<{ server: ServerSummary; invite: string }>('POST', '/servers', { name, password }),
+  createServer: (name: string) =>
+    req<{ server: ServerSummary; invite: string; inviteExpires: number }>('POST', '/servers', { name }),
   getServer: (id: string) =>
-    req<{ server: ServerDetail; members: Member[]; myRole: string }>('GET', '/servers/' + id),
+    req<{ server: ServerDetail; members: Member[]; myRole: string; myPerms: number }>('GET', '/servers/' + id),
+  patchServer: (id: string, patch: { name?: string; description?: string; iconColor?: number; iconUrl?: string }) =>
+    req<{ server: ServerDetail }>('PATCH', '/servers/' + id, patch),
   leaveServer: (id: string) => req<{ ok: boolean }>('POST', `/servers/${id}/leave`),
   kickMember: (id: string, userId: string) => req<{ ok: boolean }>('POST', `/servers/${id}/kick`, { userId }),
   deleteServer: (id: string) => req<{ ok: boolean }>('DELETE', '/servers/' + id),
-  setServerPassword: (id: string, password: string) =>
-    req<{ ok: boolean; hasPassword: boolean }>('PUT', `/servers/${id}/password`, { password }),
-  createInvite: (id: string, requiresPassword: boolean) =>
-    req<{ code: string; requiresPassword: boolean }>('POST', `/servers/${id}/invites`, { requiresPassword }),
+  createInvite: (id: string) =>
+    req<{ code: string; expires: number }>('POST', `/servers/${id}/invites`),
   invitePreview: (code: string) => req<InvitePreview>('GET', '/invites/' + encodeURIComponent(code)),
-  joinInvite: (code: string, password?: string) =>
-    req<{ server: ServerSummary }>('POST', `/invites/${encodeURIComponent(code)}/join`, { password }),
+  joinInvite: (code: string) =>
+    req<{ server: ServerSummary }>('POST', `/invites/${encodeURIComponent(code)}/join`),
+  getRoles: (id: string) => req<{ roles: Role[] }>('GET', `/servers/${id}/roles`),
+  createRole: (id: string, r: { name: string; color: string; permissions: number }) => req<{ role: Role }>('POST', `/servers/${id}/roles`, r),
+  updateRole: (id: string, rid: string, patch: Partial<{ name: string; color: string; permissions: number; position: number }>) => req<{ role: Role }>('PATCH', `/servers/${id}/roles/${rid}`, patch),
+  deleteRole: (id: string, rid: string) => req<{ ok: boolean }>('DELETE', `/servers/${id}/roles/${rid}`),
+  setMemberRoles: (id: string, userId: string, roleIds: string[]) => req<{ roles: Role[] }>('PUT', `/servers/${id}/members/${userId}/roles`, { roleIds }),
+  clearChat: (id: string) => req<{ ok: boolean }>('POST', `/servers/${id}/clear`),
   serverToken: (id: string) => req<{ token: string; url: string; room: string }>('GET', `/servers/${id}/token`),
   getSettings: (id: string) => req<{ data: any }>('GET', `/servers/${id}/settings`),
   putSettings: (id: string, data: any) => req<{ ok: boolean }>('PUT', `/servers/${id}/settings`, { data }),

@@ -25,8 +25,8 @@ function Rail() {
       <div className="rail-sep" />
       {servers.map((s) => (
         <button key={s.id} className={'railbtn tip-l' + (activeId === s.id ? ' active' : '')} data-tip={s.name}
-          style={{ background: avColor(s.name, s.iconColor) }} onClick={() => openServer(s.id)}>
-          {initial(s.name)}{s.onlineCount ? <span className="dot green" /> : null}
+          style={{ background: s.iconUrl ? '#0000' : avColor(s.name, s.iconColor) }} onClick={() => openServer(s.id)}>
+          {s.iconUrl ? <img className="avimg" src={resolveUploadUrl(s.iconUrl)} alt="" /> : initial(s.name)}{s.onlineCount ? <span className="dot green" /> : null}
         </button>
       ))}
       <button className="railbtn rail-add tip-l" data-tip="Создать / войти" onClick={() => setModal('create')}><Icon name="plus" /></button>
@@ -40,7 +40,7 @@ function ServerCard({ s, onOpen }: { s: ServerSummary; onOpen: () => void }) {
   return (
     <button className="srv-card" onClick={onOpen}>
       <div className="sc-h">
-        <div className="sc-ic" style={{ background: avColor(s.name, s.iconColor) }}>{initial(s.name)}</div>
+        <div className="sc-ic" style={{ background: s.iconUrl ? '#0000' : avColor(s.name, s.iconColor), overflow: 'hidden' }}>{s.iconUrl ? <img className="avimg" src={resolveUploadUrl(s.iconUrl)} alt="" /> : initial(s.name)}</div>
         <div style={{ minWidth: 0 }}>
           <div className="sc-nm">{s.name}</div>
           <div className="sc-sub">{s.memberCount} участник(ов){s.role === 'owner' ? ' · владелец' : ''}</div>
