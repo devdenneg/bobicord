@@ -10,7 +10,9 @@ fn main() {
     println!("monitors: {monitors:?}");
     let source = capture::CaptureSource::Monitor { index: 1 };
     let stats = Arc::new(SharedStats::default());
-    let (handle, stop, rx) = capture::spawn_capture(source, 1920, 1080, 30, stats).expect("spawn_capture");
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (mut sup, rx) = capture::CaptureSupervisor::new(1920, 1080, 30, stats, shutdown_tx);
+    sup.start(source).expect("start capture");
     let mut n = 0;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
@@ -19,8 +21,7 @@ fn main() {
             Err(_) => println!("(no frame yet)"),
         }
     }
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    sup.stop();
     drop(rx);
-    let _ = handle.join();
     println!("done, {n} frames");
 }

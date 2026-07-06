@@ -324,30 +324,37 @@ pub fn list_windows() -> Vec<(isize, String, String, u32)> {
         .unwrap_or_default()
 }
 
-/// Запускает захват выбранного источника (монитор или окно) в отдельном потоке
-/// (Capture::start блокирующий, требует свой COM-апартамент — не гонять на
-/// tokio-воркере). Возвращает флаг остановки.
-pub fn spawn_capture(
-    source: CaptureSource,
-    max_width: u32,
-    max_height: u32,
-    target_fps: u32,
-    stats: StatsHandle,
-) -> Result<(std::thread::JoinHandle<()>, Arc<AtomicBool>, crossbeam_channel::Receiver<Nv12Frame>), String> {
-    // Синхронная проверка перед спавном потока — чтобы неверный индекс/протухший
-    // HWND вернулись caller'у сразу как Err, а не молча уронили поток.
+/// Синхронная проверка источника до спавна потока — чтобы неверный индекс/протухший
+/// HWND вернулись caller'у сразу как Err, а не молча уронили сессию.
+fn validate_source(source: &CaptureSource) -> Result<(), String> {
     match source {
         CaptureSource::Monitor { index } => {
-            Monitor::from_index(index).map_err(|e| format!("monitor {index}: {e}"))?;
+            Monitor::from_index(*index).map_err(|e| format!("monitor {index}: {e}"))?;
         }
         CaptureSource::Window { hwnd } => {
-            Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void)
+            Window::from_raw_hwnd(*hwnd as *mut std::ffi::c_void)
                 .title()
                 .map_err(|e| format!("window: {e}"))?;
         }
     }
+    Ok(())
+}
 
-    let (tx, rx) = crossbeam_channel::bounded(2);
+/// Одна WGC-сессия захвата выбранного источника в отдельном потоке (Capture::start
+/// блокирующий, требует свой COM-апартамент — не гонять на tokio-воркере). Питает
+/// переданный `tx` (клон канала супервайзера — сам канал переживает смену сессии).
+/// Если сессия завершилась НЕ по нашему `stop` (окно закрыли, все попытки старта
+/// провалились), шлёт `shutdown_tx` — иначе после развязки канала от жизни сессии
+/// (см. CaptureSupervisor) энкодер не узнал бы о смерти источника.
+fn spawn_session(
+    source: CaptureSource,
+    tx: Sender<Nv12Frame>,
+    max_width: u32,
+    max_height: u32,
+    target_fps: u32,
+    stats: StatsHandle,
+    shutdown_tx: tokio::sync::mpsc::UnboundedSender<Option<String>>,
+) -> (std::thread::JoinHandle<()>, Arc<AtomicBool>) {
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
 
@@ -369,9 +376,12 @@ pub fn spawn_capture(
         // каждую попытку (Settings::new забирает их по значению).
         const START_ATTEMPTS: u32 = 5;
         let mut last_err = String::new();
+        // true = сессия завершилась штатно по нашему `stop` (свитч/стоп), не сама.
+        let mut clean_stop = false;
         for attempt in 1..=START_ATTEMPTS {
             if stop2.load(Ordering::Relaxed) {
-                return; // остановили до успешного старта
+                clean_stop = true;
+                break; // остановили до успешного старта
             }
             let min_interval = MinimumUpdateIntervalSettings::Custom(
                 std::time::Duration::from_secs_f64(0.5 / target_fps.max(1) as f64),
@@ -414,9 +424,13 @@ pub fn spawn_capture(
                 }
             };
             match result {
-                // Ok = сессия отработала и штатно завершилась (стоп по кнопке) —
-                // выходим, ретраить нечего.
-                Ok(()) => return,
+                // Ok = сессия отработала и штатно завершилась. Если это мы попросили
+                // (stop взведён — свитч/стоп) — чисто; иначе источник пропал сам
+                // (окно закрыли) — надо уведомить оркестратор.
+                Ok(()) => {
+                    clean_stop = stop2.load(Ordering::Relaxed);
+                    break;
+                }
                 Err(e) => {
                     last_err = e;
                     log::warn!("capture: попытка старта {attempt}/{START_ATTEMPTS} не удалась: {last_err}");
@@ -426,8 +440,84 @@ pub fn spawn_capture(
                 }
             }
         }
-        log::error!("capture: старт не удался после {START_ATTEMPTS} попыток: {last_err}");
+        if !clean_stop && !stop2.load(Ordering::Relaxed) {
+            if !last_err.is_empty() {
+                log::error!("capture: старт не удался после {START_ATTEMPTS} попыток: {last_err}");
+            }
+            let _ = shutdown_tx.send(Some("захват прервался (окно/монитор пропали)".into()));
+        }
     });
 
-    Ok((handle, stop, rx))
+    (handle, stop)
+}
+
+/// Держит один живой канал `Nv12Frame` на всю трансляцию и переключает под ним
+/// WGC-сессии (смена монитора/окна на лету, Э5.3). Ключ: `tx` удерживается здесь,
+/// а каждой сессии выдаётся клон — завершение сессии при свитче НЕ дисконнектит
+/// канал, энкодер просто ждёт первый кадр новой сессии (recv_timeout), не убивая
+/// трансляцию и не трогая WebRTC-треки/дерево.
+pub struct CaptureSupervisor {
+    tx: Sender<Nv12Frame>,
+    max_width: u32,
+    max_height: u32,
+    target_fps: u32,
+    stats: StatsHandle,
+    shutdown_tx: tokio::sync::mpsc::UnboundedSender<Option<String>>,
+    cur: Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)>,
+}
+
+impl CaptureSupervisor {
+    /// Создаёт канал (bounded(2) — как раньше: отставший энкодер роняет кадр, а не
+    /// копит задержку) и возвращает приёмник для энкодерного потока.
+    pub fn new(
+        max_width: u32,
+        max_height: u32,
+        target_fps: u32,
+        stats: StatsHandle,
+        shutdown_tx: tokio::sync::mpsc::UnboundedSender<Option<String>>,
+    ) -> (Self, crossbeam_channel::Receiver<Nv12Frame>) {
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        (
+            Self { tx, max_width, max_height, target_fps, stats, shutdown_tx, cur: None },
+            rx,
+        )
+    }
+
+    /// Запускает сессию для источника. Ошибка валидации возвращается синхронно
+    /// (текущая сессия, если была, не трогается — вызывать после stop_current).
+    pub fn start(&mut self, source: CaptureSource) -> Result<(), String> {
+        validate_source(&source)?;
+        let session = spawn_session(
+            source,
+            self.tx.clone(),
+            self.max_width,
+            self.max_height,
+            self.target_fps,
+            self.stats.clone(),
+            self.shutdown_tx.clone(),
+        );
+        self.cur = Some(session);
+        Ok(())
+    }
+
+    fn stop_current(&mut self) {
+        if let Some((handle, stop)) = self.cur.take() {
+            stop.store(true, Ordering::Relaxed);
+            let _ = handle.join();
+        }
+    }
+
+    /// Смена источника на лету: валидируем новый ДО остановки текущего (при
+    /// ошибке текущая сессия продолжает жить), затем гасим старую и стартуем новую.
+    pub fn switch(&mut self, source: CaptureSource) -> Result<(), String> {
+        validate_source(&source)?;
+        self.stop_current();
+        self.start(source)
+    }
+
+    /// Полный останов: гасит текущую сессию и джойнит её поток. `tx` дропается
+    /// вместе с супервайзером (энкодер получит Disconnected как бэкап к enc_stop).
+    pub fn stop(&mut self) {
+        self.stop_current();
+    }
 }

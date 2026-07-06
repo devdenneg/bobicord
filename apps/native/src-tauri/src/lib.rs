@@ -121,6 +121,22 @@ async fn watch_reparent(state: tauri::State<'_, WatchState>, target: Option<Stri
   Ok(())
 }
 
+// Э5.3: смена источника видео (и звука) на лету — без остановки трансляции, дерево
+// зрителей и WebRTC-треки живут дальше. audio_target_pid маппится как в start_broadcast.
+#[tauri::command]
+async fn set_broadcast_source(
+  state: tauri::State<'_, BroadcastState>,
+  source: broadcast::CaptureSource,
+  audio_target_pid: Option<u32>,
+) -> Result<(), String> {
+  let slot = state.0.lock().await;
+  let h = slot.as_ref().ok_or("не вещаем")?;
+  h.set_source(source, match audio_target_pid {
+    Some(pid) => broadcast::AudioSource::IncludeProcess(pid),
+    None => broadcast::AudioSource::ExcludeSelfViaInclude,
+  }).await
+}
+
 #[tauri::command]
 async fn stop_broadcast(state: tauri::State<'_, BroadcastState>) -> Result<(), String> {
   let handle = state.0.lock().await.take();
@@ -152,7 +168,7 @@ pub fn run() {
       )?;
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![ping, list_monitors, list_windows, start_broadcast, stop_broadcast, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent])
+    .invoke_handler(tauri::generate_handler![ping, list_monitors, list_windows, start_broadcast, set_broadcast_source, stop_broadcast, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }

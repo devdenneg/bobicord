@@ -95,6 +95,13 @@ export async function startNativeBroadcast(streamId: string, identity: string, s
   });
 }
 
+/** Э5.3: смена источника (и звука) на лету — без остановки трансляции, дерево зрителей
+ *  и WebRTC-треки живут дальше. `audioTargetPid` undefined = WASAPI EXCLUDE-режим. */
+export async function setNativeBroadcastSource(source: CaptureSource, audioTargetPid?: number): Promise<void> {
+  const { invoke } = await import('@tauri-apps/api/core');
+  await invoke('set_broadcast_source', { source, audioTargetPid: audioTargetPid ?? null });
+}
+
 export async function stopNativeBroadcast(): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');
   await invoke('stop_broadcast');
