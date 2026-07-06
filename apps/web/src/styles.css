@@ -101,6 +101,8 @@
   .tabs2 button{flex:1;background:transparent;color:var(--muted);padding:9px;font-weight:500}
   .tabs2 button.active{background:var(--accent);color:#fff}
   .link{background:none;color:var(--accent-txt);padding:8px 0;width:100%;font-size:13.5px}
+  .dl-fab{position:fixed;right:20px;bottom:20px;width:52px;height:52px;border-radius:50%;background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center;box-shadow:0 6px 20px -4px rgba(88,101,242,.6);z-index:40;text-decoration:none;transition:transform .12s ease,background .12s ease}
+  .dl-fab:hover{background:var(--accent-h);transform:translateY(-2px)}
   .link:hover{background:none;text-decoration:underline}
 
   /* ---------- APP SHELL ---------- */

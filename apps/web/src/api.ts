@@ -77,4 +77,14 @@ export const api = {
   presence: (id: string) => req<{ online: string[] }>('GET', `/servers/${id}/presence`),
   getMessages: (id: string) => req<{ messages: HistoryMessage[] }>('GET', `/servers/${id}/messages`),
   postMessage: (id: string, text: string, em: Record<string, string>, image?: string) => req<{ ok: boolean }>('POST', `/servers/${id}/messages`, { text, em, image }),
+  // публичный (без auth) — свежий билд натива для кнопки скачивания в вебе; 404 если билда нет
+  appLatest: async (): Promise<{ version: string; url: string } | null> => {
+    try {
+      const r = await fetch(API_BASE + '/api/app/latest');
+      if (!r.ok) return null;
+      const d = await r.json();
+      const url = d?.platforms?.['windows-x86_64']?.url;
+      return url ? { version: d.version, url } : null;
+    } catch { return null; }
+  },
 };

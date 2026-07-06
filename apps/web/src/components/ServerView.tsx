@@ -9,6 +9,7 @@ import { emoteMap, emoteUrl } from '../emotes';
 import { EmotePicker } from './EmotePicker';
 import { getSettings, setSettings } from '../settings';
 import { isTauri, onBroadcastStopped, stopNativeBroadcast } from '../native';
+import { applyNativeUpdate } from '../nativeUpdate';
 import type { Emote, Member, Role } from '../types';
 import { PERM, hasPerm } from '../types';
 
@@ -354,6 +355,8 @@ function Chat() {
   const me = useStore((s) => s.me)!;
   const members = useStore((s) => s.members);
   const activeId = useStore((s) => s.active?.id);
+  const nativeUpdate = useStore((s) => s.nativeUpdate);
+  const [updating, setUpdating] = useState(false);
   const [pill, setPill] = useState(0);
   const [atBottom, setAtBottom] = useState(true);
   const atBottomRef = useRef(true);
@@ -520,6 +523,15 @@ function Chat() {
           <div className="ub-ic"><Icon name="refresh" /></div>
           <div className="ub-txt"><b>Вышло обновление приложения</b><span>Обнови страницу, чтобы продолжить — <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd></span></div>
           <button className="ub-btn" onClick={() => location.reload()}><Icon name="refresh" sm />Обновить</button>
+        </div>
+      ) : null}
+      {nativeUpdate ? (
+        <div className="update-bar">
+          <div className="ub-ic"><Icon name="refresh" /></div>
+          <div className="ub-txt"><b>Доступна версия {nativeUpdate.version}</b><span>{updating ? 'Скачиваю и устанавливаю — приложение перезапустится…' : 'Обновить нативное приложение до свежей версии'}</span></div>
+          <button className="ub-btn" disabled={updating} onClick={async () => { setUpdating(true); try { await applyNativeUpdate(); } catch (e: any) { setUpdating(false); toast('Не удалось обновить: ' + (e?.message || e), 'err'); } }}>
+            {updating ? <span className="spin" /> : <Icon name="refresh" sm />}Установить
+          </button>
         </div>
       ) : null}
       {acOpen ? (
