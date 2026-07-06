@@ -197,7 +197,18 @@ export class TreeVideoTransport implements VideoTransport {
     // Fallback: если welcome не пришёл за 1.5с — джойнимся всё равно (guard не даст дубль).
     ws.onopen = () => { setTimeout(() => this.sendWatchJoin(streamId, st), 1500); };
     ws.onmessage = (ev) => this.onWatchMessage(streamId, st, ev);
-    ws.onclose = () => { if (!st.closed) this.teardownWatch(streamId, st); };
+    ws.onclose = () => {
+      if (st.closed) return;
+      this.teardownWatch(streamId, st);
+      // Ре-watch: сокет оборвался (сеть/рестарт/heartbeat-terminate), но стрим ещё жив —
+      // переподключаемся. Дискавери-сокет снимет liveStreams при stream-end, тогда ретрай
+      // сам заглохнет (guard). Не дублируем, если watch уже пересоздан.
+      if (!this.closed && this.liveStreams.has(streamId)) {
+        setTimeout(() => {
+          if (!this.closed && !this.watches.has(streamId) && !this.nativeWatches.has(streamId) && this.liveStreams.has(streamId)) this.watch(streamId);
+        }, 3000);
+      }
+    };
     ws.onerror = () => { try { ws.close(); } catch { /**/ } };
   }
 
@@ -339,6 +350,19 @@ export class TreeVideoTransport implements VideoTransport {
     pc.onicecandidate = (e) => {
       if (!e.candidate || !st.parentId) return;
       try { st.ws.send(JSON.stringify({ t: 'ice', streamId, to: st.parentId, candidate: e.candidate })); } catch { /**/ }
+    };
+    // Обрыв upstream при живом WS: сервер об этом не узнает, картинка фризит. Просим
+    // reparent — сервер даст другого родителя или реаттачит к тому же (свежий PC). failed
+    // сразу; disconnected может само восстановиться (ICE), даём 5с.
+    pc.onconnectionstatechange = () => {
+      if (st.closed || st.pc !== pc) return;
+      if (pc.connectionState === 'failed') this.requestReparent(streamId, null);
+      else if (pc.connectionState === 'disconnected') {
+        setTimeout(() => {
+          if (!st.closed && st.pc === pc && (pc.connectionState === 'disconnected' || pc.connectionState === 'failed'))
+            this.requestReparent(streamId, null);
+        }, 5000);
+      }
     };
     pc.ontrack = (e) => {
       if (e.track.kind === 'audio') {
