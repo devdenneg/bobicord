@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
 import { useStore, getEngine } from '../store';
 import { api, resolveUploadUrl } from '../api';
@@ -305,19 +305,32 @@ function Chat() {
   const toast = useStore((s) => s.toast);
   const updateReady = useStore((s) => s.updateReady);
   const [pill, setPill] = useState(0);
+  const [atBottom, setAtBottom] = useState(true);
   const atBottomRef = useRef(true);
+  const setBottom = (v: boolean) => { atBottomRef.current = v; setAtBottom(v); };
 
-  useLayoutEffect(() => {
+  const scrollToBottom = useCallback(() => {
     const el = msgsRef.current; if (!el) return;
-    if (atBottomRef.current) { el.scrollTop = el.scrollHeight; setPill(0); }
-    else setPill((p) => p + 1);
-  }, [eng.messages.length]);
-
-  // при открытии сервера — всегда в конец (к последним сообщениям)
-  useLayoutEffect(() => {
-    const el = msgsRef.current; if (el) { el.scrollTop = el.scrollHeight; atBottomRef.current = true; setPill(0); }
-    requestAnimationFrame(() => { const e2 = msgsRef.current; if (e2 && atBottomRef.current) e2.scrollTop = e2.scrollHeight; });
+    el.scrollTop = el.scrollHeight;
+    atBottomRef.current = true; setAtBottom(true); setPill(0);
   }, []);
+
+  // новые сообщения: если внизу — доскроллить, иначе счётчик непрочитанных
+  useLayoutEffect(() => {
+    if (atBottomRef.current) scrollToBottom();
+    else setPill((p) => p + 1);
+  }, [eng.messages.length, scrollToBottom]);
+
+  // при открытии сервера — в конец; держим прижатым к низу пока подгружаются
+  // картинки/link-превью (ResizeObserver), иначе поздний контент оставляет чат не внизу
+  useLayoutEffect(() => {
+    scrollToBottom();
+    const inner = msgsRef.current?.querySelector('.msgs-inner');
+    if (!inner) return;
+    const ro = new ResizeObserver(() => { if (atBottomRef.current) { const el = msgsRef.current; if (el) el.scrollTop = el.scrollHeight; } });
+    ro.observe(inner);
+    return () => ro.disconnect();
+  }, [scrollToBottom]);
 
   function send() {
     const t = text.trim(); if (!t) return;
@@ -344,7 +357,7 @@ function Chat() {
 
   return (
     <div id="chat">
-      <div id="msgs" ref={msgsRef} onScroll={(e) => { const m = e.currentTarget; atBottomRef.current = m.scrollTop + m.clientHeight >= m.scrollHeight - 120; if (atBottomRef.current) setPill(0); }}>
+      <div id="msgs" ref={msgsRef} onScroll={(e) => { const m = e.currentTarget; const b = m.scrollTop + m.clientHeight >= m.scrollHeight - 120; setBottom(b); if (b) setPill(0); }}>
         <div className="msgs-inner">
           {eng.messages.length === 0 ? <div id="chatEmpty">Общий чат сервера. Пиши сюда — видят все участники онлайн.</div> : null}
           {eng.messages.map((m) => {
@@ -366,7 +379,7 @@ function Chat() {
           })}
         </div>
       </div>
-      {pill > 0 ? <button id="newpill" className="show" onClick={() => { const m = msgsRef.current!; m.scrollTop = m.scrollHeight; setPill(0); atBottomRef.current = true; }}>↓ Новые сообщения ({pill})</button> : null}
+      {!atBottom ? <button id="scrollbtn" aria-label="Прокрутить вниз" data-tip="К последним" onClick={scrollToBottom}><Icon name="chevron" />{pill > 0 ? <span className="sb-badge">{pill > 99 ? '99+' : pill}</span> : null}</button> : null}
       {eng.typing.length > 0 ? (
         <div className="typing-ind">
           <span className="tdots"><i /><i /><i /></span>

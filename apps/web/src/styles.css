@@ -300,8 +300,12 @@
   @keyframes tbounce{0%,60%,100%{transform:translateY(0);opacity:.45}30%{transform:translateY(-4px);opacity:1}}
   .avimg{width:100%;height:100%;object-fit:cover;border-radius:inherit;display:block}
   #chatEmpty{color:var(--muted);font-size:13px;text-align:center;margin:auto;line-height:1.6;padding:20px}
-  #newpill{position:absolute;bottom:70px;left:50%;transform:translateX(-50%);background:var(--accent);color:#fff;font-size:12.5px;font-weight:600;padding:7px 14px;border-radius:9999px;box-shadow:var(--sh-2);display:none;z-index:5}
-  #newpill.show{display:block}
+  #scrollbtn{position:absolute;right:18px;bottom:80px;width:42px;height:42px;padding:0;border-radius:50%;background:var(--panel3);color:var(--txt);display:flex;align-items:center;justify-content:center;box-shadow:var(--sh-2);z-index:5;transform-origin:center bottom;animation:sbIn .24s cubic-bezier(.34,1.56,.64,1)}
+  #scrollbtn:hover{background:var(--panel4);color:var(--txt-h);transform:translateY(-1px)}
+  #scrollbtn:active{transform:translateY(0)}
+  #scrollbtn .ic{font-size:24px}
+  #scrollbtn .sb-badge{position:absolute;top:-3px;right:-3px;min-width:18px;height:18px;padding:0 5px;border-radius:9999px;background:var(--accent);color:#fff;font-size:10.5px;font-weight:800;display:flex;align-items:center;justify-content:center;box-shadow:0 0 0 2px var(--panel)}
+  @keyframes sbIn{from{opacity:0;transform:translateY(10px) scale(.8)}to{opacity:1;transform:none}}
   .chat-in{display:flex;gap:8px;padding:12px;border-top:1px solid var(--line-2)}
   .chat-in #sendBtn{background:var(--accent);color:#fff;flex:0 0 auto;width:44px;display:flex;align-items:center;justify-content:center;padding:0;border-radius:var(--r-sm);transition:opacity .15s,background .15s}
   .chat-in #sendBtn:hover{background:var(--accent-h)}.chat-in #sendBtn.empty{opacity:.45;pointer-events:none}
