@@ -2,7 +2,7 @@ import {
   Room, RoomEvent, Track, LocalAudioTrack, AudioPresets,
   type RemoteParticipant, type Participant, type TrackPublication, type RemoteTrack,
 } from 'livekit-client';
-import type { User, Member, ChatMessage, Emote, HistoryMessage } from './types';
+import type { User, Member, ChatMessage, Emote, HistoryMessage, ReplyRef } from './types';
 import { getSettings, setSettings } from './settings';
 import { emoteUrl } from './emotes';
 import { playSound } from './sounds';
@@ -44,7 +44,7 @@ interface EngineHooks {
   toast: (text: string, kind?: 'ok' | 'warn' | 'err' | 'info') => void;
   saveSettings: (vols: { users: Record<string, number>; streams: Record<string, number> }) => void;
   peerJoined: (identity: string) => void;
-  persistMessage: (text: string, em: Record<string, string>, image?: string) => void;
+  persistMessage: (text: string, em: Record<string, string>, image?: string, reply?: ReplyRef) => void;
 }
 
 let msgSeq = 1;
@@ -638,10 +638,15 @@ export class Engine {
     }
     return false;
   }
-  private pushMsg(who: string | null, text: string, sys: boolean, color?: number, mineOverride?: boolean, img?: string, ts?: number) {
+  // ответ адресован мне? → уведомление/подсветка как при теге (@ник)
+  private replyToMe(reply?: ReplyRef): boolean {
+    if (!reply) return false;
+    return (!!reply.uid && reply.uid === this.me.id) || reply.author === this.me.displayName;
+  }
+  private pushMsg(who: string | null, text: string, sys: boolean, color?: number, mineOverride?: boolean, img?: string, ts?: number, uid?: string, reply?: ReplyRef) {
     const mine = mineOverride !== undefined ? mineOverride : (!sys && who === this.me.displayName);
-    const mention = !sys && !mine && this.textMentionsMe(text);
-    const next = [...this.messages, { id: msgSeq++, who, text, mine, sys, color, img, ts: ts ?? Date.now(), mention }];
+    const mention = !sys && !mine && (this.textMentionsMe(text) || this.replyToMe(reply));
+    const next = [...this.messages, { id: msgSeq++, uid, who, text, mine, sys, color, img, ts: ts ?? Date.now(), mention, reply }];
     // кап на память сессии; срез идёт с НАЧАЛА, поэтому копим trimmedFront — компонент на столько же
     // поднимет firstItemIndex virtuoso, иначе якорь скролла рассинхронится и контент прыгнет.
     const CAP = 1000;
@@ -653,7 +658,7 @@ export class Engine {
   private mapHistory(list: HistoryMessage[]): ChatMessage[] {
     return list.map((m) => {
       if (m.em) for (const k in m.em) this.onEmoteResolve?.(k, m.em[k]);
-      return { id: msgSeq++, sid: m.id, who: m.name, text: m.text, mine: m.uid === this.me.id, sys: false, color: m.color, img: m.img, ts: m.ts, mention: m.uid !== this.me.id && this.textMentionsMe(m.text) };
+      return { id: msgSeq++, sid: m.id, uid: m.uid, who: m.name, text: m.text, mine: m.uid === this.me.id, sys: false, color: m.color, img: m.img, ts: m.ts, mention: m.uid !== this.me.id && (this.textMentionsMe(m.text) || this.replyToMe(m.reply)), reply: m.reply };
     });
   }
   // начальная страница истории (последние N) — заменяет весь чат, ставит курсор на самое старое
@@ -680,14 +685,14 @@ export class Engine {
     this.emit();
     this.sysMsg((byName || this.me.displayName) + ' очистил чат');
   }
-  sendChatWithEmotes(text: string, em: Record<string, string>, img?: string) {
+  sendChatWithEmotes(text: string, em: Record<string, string>, img?: string, reply?: ReplyRef) {
     if (!text.trim() && !img) return;
     const t = text.trim();
     // realtime-раздача только при поднятой комнате; локальный эхо + persist работают и без неё —
     // в окне фоновой докрутки connect (сразу после входа в сервер) сообщение не теряется, ложится в БД.
-    if (this.room) this.dataSend({ t: 'chat', name: this.me.displayName, text: t, em, color: this.me.avatarColor, img });
-    this.pushMsg(this.me.displayName, t, false, this.me.avatarColor, true, img);
-    this.hooks.persistMessage(t, em, img);
+    if (this.room) this.dataSend({ t: 'chat', name: this.me.displayName, text: t, em, color: this.me.avatarColor, img, uid: this.me.id, reply });
+    this.pushMsg(this.me.displayName, t, false, this.me.avatarColor, true, img, undefined, this.me.id, reply);
+    this.hooks.persistMessage(t, em, img, reply);
   }
   sendTyping() {
     if (!this.room) return;
@@ -704,7 +709,7 @@ export class Engine {
   private onData = (payload: Uint8Array) => {
     try {
       const d = JSON.parse(new TextDecoder().decode(payload));
-      if (d.t === 'chat') { if (d.em) for (const k in d.em) this.onEmoteResolve?.(k, d.em[k]); this.typingUsers.delete(d.name); const mentioned = this.textMentionsMe(d.text); this.pushMsg(d.name, d.text, false, d.color, false, d.img); playSound(mentioned ? 'mention' : 'msg'); if (mentioned) this.hooks.toast(`${d.name} упомянул тебя`, 'info'); }
+      if (d.t === 'chat') { if (d.em) for (const k in d.em) this.onEmoteResolve?.(k, d.em[k]); this.typingUsers.delete(d.name); const repliedToMe = this.replyToMe(d.reply); const mentioned = this.textMentionsMe(d.text) || repliedToMe; this.pushMsg(d.name, d.text, false, d.color, false, d.img, undefined, d.uid, d.reply); playSound(mentioned ? 'mention' : 'msg'); if (mentioned) this.hooks.toast(repliedToMe ? `${d.name} ответил тебе` : `${d.name} упомянул тебя`, 'info'); }
       else if (d.t === 'clear') { this.messages = []; this.emit(); this.sysMsg((d.by || 'Админ') + ' очистил чат'); }
       else if (d.t === 'emote') this.emoteListeners.forEach((f) => f(d.s, d.e, d.by, d.x, d.sz));
       else if (d.t === 'watch') { const m = this.wset(d.s); if (d.on) m.set(d.id, { name: d.n, ts: Date.now() }); else m.delete(d.id); this.emit(); }

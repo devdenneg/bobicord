@@ -102,7 +102,7 @@ export const api = {
     const q = qs.toString();
     return req<{ messages: HistoryMessage[]; hasMore: boolean }>('GET', `/servers/${id}/messages${q ? '?' + q : ''}`);
   },
-  postMessage: (id: string, text: string, em: Record<string, string>, image?: string) => req<{ ok: boolean }>('POST', `/servers/${id}/messages`, { text, em, image }),
+  postMessage: (id: string, text: string, em: Record<string, string>, image?: string, reply?: import('./types').ReplyRef) => req<{ ok: boolean }>('POST', `/servers/${id}/messages`, { text, em, image, reply }),
   // публичный (без auth) — свежий билд натива для кнопки скачивания в вебе; 404 если билда нет
   appLatest: async (): Promise<{ version: string; url: string } | null> => {
     try {

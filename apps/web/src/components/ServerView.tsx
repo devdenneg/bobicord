@@ -11,7 +11,7 @@ import { EmotePicker } from './EmotePicker';
 import { getSettings, setSettings } from '../settings';
 import { isTauri, onBroadcastStopped, stopNativeBroadcast } from '../native';
 import { applyNativeUpdate } from '../nativeUpdate';
-import type { Emote, Member, Role } from '../types';
+import type { ChatMessage, Emote, Member, ReplyRef, Role } from '../types';
 import { PERM, hasPerm } from '../types';
 
 function Avatar({ name, ci, url, size = 32, dot }: { name: string; ci: number; url?: string; size?: number; dot?: string }) {
@@ -416,6 +416,8 @@ function Chat() {
   const nativeUpdate = useStore((s) => s.nativeUpdate);
   const [updating, setUpdating] = useState(false);
   const messages = eng.messages;
+  const [replyTo, setReplyTo] = useState<ChatMessage | null>(null); // на какое сообщение отвечаем
+  const [flashId, setFlashId] = useState<number | null>(null);      // подсветка оригинала при переходе по цитате
 
   // --- виртуальный список чата (react-virtuoso) ---
   const virtuosoRef = useRef<VirtuosoHandle>(null);
@@ -442,7 +444,7 @@ function Chat() {
   // смена сервера: сброс состояния виртуального списка (Virtuoso ремонтится по key={activeId})
   useLayoutEffect(() => {
     setFirstItemIndex(VIRT_BASE_INDEX);
-    setPill(0); setAtBottom(true); atBottomRef.current = true;
+    setPill(0); setAtBottom(true); atBottomRef.current = true; setReplyTo(null);
     prevLastId.current = null; prevTrim.current = 0; loadingOlder.current = false; setOlderBusy(false);
     // не даём startReached стрельнуть догрузкой прямо на маунте (пока идёт scroll-to-bottom и оседание)
     olderReady.current = false;
@@ -488,6 +490,22 @@ function Chat() {
     finally { loadingOlder.current = false; setOlderBusy(false); }
   }, [E, activeId]);
 
+  // --- reply (ответ на сообщение) ---
+  const buildReplyRef = (m: ChatMessage): ReplyRef => ({ author: m.who || '', text: (m.text || '').slice(0, 160), uid: m.uid, sid: m.sid, img: !!m.img });
+  const startReply = useCallback((m: ChatMessage) => {
+    setReplyTo(m);
+    requestAnimationFrame(() => document.getElementById('msgIn')?.focus());
+  }, []);
+  // переход к оригиналу по клику на цитату (если он сейчас загружен) + короткая подсветка
+  const jumpToReply = useCallback((r: ReplyRef) => {
+    if (r.sid == null) return;
+    const idx = messages.findIndex((mm) => mm.sid === r.sid);
+    if (idx < 0) return;
+    virtuosoRef.current?.scrollToIndex({ index: idx, align: 'center', behavior: 'smooth' });
+    setFlashId(messages[idx].id);
+  }, [messages]);
+  useEffect(() => { if (flashId == null) return; const t = window.setTimeout(() => setFlashId(null), 1300); return () => clearTimeout(t); }, [flashId]);
+
   async function runCommand(raw: string) {
     const active = useStore.getState().active;
     const [cmd] = raw.slice(1).split(/\s+/);
@@ -507,8 +525,8 @@ function Chat() {
     if (t.startsWith('/')) { runCommand(t); setText(''); return; }
     const em: Record<string, string> = {};
     t.split(/\s+/).forEach((w) => { if (emoteMap.has(w)) em[w] = emoteMap.get(w)!; });
-    E.sendChatWithEmotes(t, em);
-    setText('');
+    E.sendChatWithEmotes(t, em, undefined, replyTo ? buildReplyRef(replyTo) : undefined);
+    setText(''); setReplyTo(null);
   }
 
   async function sendImage(file: File) {
@@ -520,8 +538,8 @@ function Chat() {
       const t = text.trim();
       const em: Record<string, string> = {};
       t.split(/\s+/).forEach((w) => { if (emoteMap.has(w)) em[w] = emoteMap.get(w)!; });
-      E.sendChatWithEmotes(t, em, url);
-      setText('');
+      E.sendChatWithEmotes(t, em, url, replyTo ? buildReplyRef(replyTo) : undefined);
+      setText(''); setReplyTo(null);
     } catch (e: any) { toast(e?.message || 'Не удалось загрузить', 'err'); }
     finally { setUploading(false); }
   }
@@ -577,6 +595,7 @@ function Chat() {
       if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); acceptAc(Math.min(mIdx, acLen - 1)); return; }
       if (e.key === 'Escape') { e.preventDefault(); setMention(null); setText((t) => (slashMode ? t + ' ' : t)); return; }
     }
+    if (e.key === 'Escape' && replyTo) { e.preventDefault(); setReplyTo(null); return; }
     if (e.key === 'Enter') send();
   }
 
@@ -593,9 +612,26 @@ function Chat() {
     const author = m.who ? byName.get(m.who) : undefined;
     const aRoles = author?.roles || [];
     const nameColor = (author && roleColorOf(author)) || avColor(m.who || '', m.color);
+    // цитата исходного сообщения (reply) — над автором, кликабельна если оригинал загружен
+    let replyQuote: JSX.Element | null = null;
+    if (m.reply) {
+      const rAuthor = byName.get(m.reply.author);
+      const rColor = (rAuthor && roleColorOf(rAuthor)) || avColor(m.reply.author, rAuthor?.avatarColor ?? 0);
+      const jumpable = m.reply.sid != null;
+      const rep = m.reply;
+      replyQuote = (
+        <button className={'reply-quote' + (jumpable ? ' jumpable' : '')} disabled={!jumpable} onClick={jumpable ? () => jumpToReply(rep) : undefined}>
+          <Icon name="reply" sm />
+          <span className="rq-author" style={{ color: rColor }}>{rep.author}</span>
+          <span className="rq-text">{rep.text || (rep.img ? '🖼 изображение' : '')}</span>
+        </button>
+      );
+    }
     return (
       <div className="virt-row">
-        <div className={'msg' + (m.sys ? ' sys' : '') + (m.mine ? ' me' : '') + (m.mention ? ' mentioned' : '')}>
+        {!m.sys ? <button className="msg-reply-btn" data-tip="Ответить" onMouseDown={(e) => e.preventDefault()} onClick={() => startReply(m)}><Icon name="reply" sm /></button> : null}
+        <div className={'msg' + (m.sys ? ' sys' : '') + (m.mine ? ' me' : '') + (m.mention ? ' mentioned' : '') + (m.id === flashId ? ' flash' : '')}>
+          {replyQuote}
           {!m.sys ? <div className="who" style={{ color: nameColor }}>{m.who}{aRoles.length ? <span className="who-roles">{aRoles.map((r) => <span key={r.id} className="who-role" style={{ background: (r.color || 'var(--panel3)') + '22', color: r.color || 'var(--muted)', borderColor: (r.color || 'var(--line-2)') + '55' }}>{r.name}</span>)}</span> : null}{m.ts ? <span className="mtime">{fmtTime(m.ts)}</span> : null}</div> : null}
           {m.sys || m.text ? (
             <div className={'tx' + (big ? ' big' : '')}>
@@ -676,6 +712,14 @@ function Chat() {
                 <span className="mpop-nm">{x.displayName}</span>
                 {!x.everyone && x.username.toLowerCase() !== x.displayName.toLowerCase() ? <span className="mpop-u">@{x.username}</span> : null}
               </button>))}
+        </div>
+      ) : null}
+      {replyTo ? (
+        <div className="reply-bar">
+          <Icon name="reply" sm />
+          <span className="rb-to">Ответ <b style={{ color: (byName.get(replyTo.who || '') && roleColorOf(byName.get(replyTo.who || '')!)) || avColor(replyTo.who || '', replyTo.color) }}>{replyTo.who}</b></span>
+          <span className="rb-text">{replyTo.text || (replyTo.img ? '🖼 изображение' : '')}</span>
+          <button className="rb-close" data-tip="Отменить · Esc" onClick={() => setReplyTo(null)}><Icon name="close" sm /></button>
         </div>
       ) : null}
       <div className="chat-in">

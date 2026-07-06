@@ -70,9 +70,19 @@ export interface InvitePreview {
 export type ToastKind = 'ok' | 'warn' | 'err' | 'info';
 export interface Toast { id: number; text: string; kind: ToastKind }
 
+// ссылка на исходное сообщение при ответе (reply)
+export interface ReplyRef {
+  author: string;  // displayName автора исходного сообщения
+  text: string;    // короткий сниппет исходного текста ('' если только картинка)
+  uid?: string;    // user id автора — для адресного уведомления (ответ = как тег)
+  sid?: number;    // id строки в БД исходного — для перехода к оригиналу
+  img?: boolean;   // в исходном была картинка
+}
+
 export interface ChatMessage {
   id: number; // локальный монотонный ключ (React key), НЕ id строки в БД
   sid?: number; // id строки в БД (курсор пагинации) — есть только у сообщений из истории
+  uid?: string; // user id автора (для reply-таргетинга/подсветки), null у системных
   who: string | null; // null = system
   text: string;
   mine: boolean;
@@ -80,7 +90,8 @@ export interface ChatMessage {
   color?: number; // avatar color index of author
   img?: string; // attached image URL
   ts?: number; // timestamp (ms)
-  mention?: boolean; // упоминает меня (@ник)
+  mention?: boolean; // упоминает меня (@ник) ИЛИ ответ на моё сообщение
+  reply?: ReplyRef; // это ответ на другое сообщение
 }
 
 export interface HistoryMessage {
@@ -92,6 +103,7 @@ export interface HistoryMessage {
   em: Record<string, string>;
   img?: string;
   ts: number;
+  reply?: ReplyRef;
 }
 
 export interface Emote { id: string; name: string }

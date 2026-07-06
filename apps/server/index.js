@@ -122,6 +122,7 @@ CREATE INDEX IF NOT EXISTS idx_mroles ON member_roles(server_id, user_id);
 for (const sql of [
   "ALTER TABLE users ADD COLUMN avatar_url TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE messages ADD COLUMN image TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE messages ADD COLUMN reply_to TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE servers ADD COLUMN description TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE servers ADD COLUMN icon_url TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE invites ADD COLUMN expires INTEGER NOT NULL DEFAULT 0",
@@ -476,13 +477,13 @@ app.get('/api/servers/:id/messages', requireAuth, (req, res) => {
   const minTs = Date.now() - WEEK_MS;
   // берём limit+1, чтобы понять, есть ли ещё более старые сообщения (hasMore)
   const rows = before > 0
-    ? db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,created FROM messages WHERE server_id=? AND created>? AND id<? ORDER BY id DESC LIMIT ?').all(sid, minTs, before, limit + 1)
-    : db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,created FROM messages WHERE server_id=? AND created>? ORDER BY id DESC LIMIT ?').all(sid, minTs, limit + 1);
+    ? db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,reply_to,created FROM messages WHERE server_id=? AND created>? AND id<? ORDER BY id DESC LIMIT ?').all(sid, minTs, before, limit + 1)
+    : db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,reply_to,created FROM messages WHERE server_id=? AND created>? ORDER BY id DESC LIMIT ?').all(sid, minTs, limit + 1);
   const hasMore = rows.length > limit;
   const page = rows.slice(0, limit).reverse(); // ASC: старые → новые (как рисуем в чате)
   res.json({
     hasMore,
-    messages: page.map(r => ({ id: r.id, uid: r.user_id, name: r.display_name, color: r.avatar_color, text: r.text, em: JSON.parse(r.emotes || '{}'), img: r.image || '', ts: r.created })),
+    messages: page.map(r => ({ id: r.id, uid: r.user_id, name: r.display_name, color: r.avatar_color, text: r.text, em: JSON.parse(r.emotes || '{}'), img: r.image || '', reply: r.reply_to ? JSON.parse(r.reply_to) : undefined, ts: r.created })),
   });
 });
 app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
@@ -492,9 +493,20 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
   const image = (() => { const v = String(req.body.image || ''); return UPLOAD_RE.test(v) ? v : ''; })();
   if (!text.trim() && !image) return res.status(400).json({ error: 'пусто' });
   const em = JSON.stringify(req.body.em || {}).slice(0, 4000);
+  // reply-ссылка на исходное сообщение (санитайзим, ограничиваем размер)
+  const replyTo = (() => {
+    const rp = req.body.reply;
+    if (!rp || typeof rp !== 'object') return '';
+    const author = String(rp.author || '').slice(0, 80);
+    if (!author) return '';
+    const clean = { author, text: String(rp.text || '').slice(0, 160), img: !!rp.img };
+    if (rp.uid) clean.uid = String(rp.uid).slice(0, 64);
+    if (Number.isFinite(rp.sid)) clean.sid = rp.sid;
+    return JSON.stringify(clean).slice(0, 500);
+  })();
   const now = Date.now();
-  db.prepare('INSERT INTO messages(server_id,user_id,display_name,avatar_color,text,emotes,image,created) VALUES(?,?,?,?,?,?,?,?)')
-    .run(sid, req.user.id, req.user.display_name, req.user.avatar_color, text, em, image, now);
+  db.prepare('INSERT INTO messages(server_id,user_id,display_name,avatar_color,text,emotes,image,reply_to,created) VALUES(?,?,?,?,?,?,?,?,?)')
+    .run(sid, req.user.id, req.user.display_name, req.user.avatar_color, text, em, image, replyTo, now);
   db.prepare('DELETE FROM messages WHERE server_id=? AND created<?').run(sid, now - WEEK_MS);
   res.json({ ok: true });
 });
