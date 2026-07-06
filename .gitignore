@@ -4,6 +4,9 @@ node_modules/
 # build output
 dist/
 apps/web/dist/
+# rust build artifacts (src-tauri/target игнорится своим .gitignore, эти — новые крейты)
+apps/relay-core/target/
+apps/relay/target/
 
 # secrets & runtime config (копируй из *.example)
 .env*

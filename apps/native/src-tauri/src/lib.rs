@@ -90,7 +90,19 @@ async fn start_watch(
 ) -> Result<(), String> {
   let mut slot = state.0.lock().await;
   if let Some(old) = slot.take() { old.stop(); }
-  let handle = broadcast::relay::start(Some(app), stream_id, ws_url, identity, server_id, max_children.unwrap_or(4).clamp(0, 10));
+  // UiSink: relay-ядро (relay-core) не знает про Tauri — события webview (relay-watch-offer/
+  // -ice, relay-topology) уходят через колбэк-обёртку над app.emit.
+  let ui: broadcast::relay::UiSink = {
+    use tauri::Emitter;
+    std::sync::Arc::new(move |evt: &str, payload: serde_json::Value| { let _ = app.emit(evt, payload); })
+  };
+  let handle = broadcast::relay::start(Some(ui), broadcast::relay::RelayConfig {
+    stream_id, ws_url, identity, server_id,
+    max_children: max_children.unwrap_or(4).clamp(0, 10),
+    virtual_relay: false,
+    available_outgoing: 8_000_000,
+    idle_exit: None, // натив смотрит стрим сам — уходим только по Stop
+  });
   *slot = Some(handle);
   Ok(())
 }

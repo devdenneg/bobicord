@@ -1,9 +1,10 @@
-// Нативный relay-viewer (Evolution-TZ Э8): Rust держит upstream-соединение к родителю в
-// дереве, принимает H.264/Opus RTP и БЕЗ транскода (passthrough) фанаутит его:
+// Relay-viewer (Evolution-TZ Э8/Э9): держит upstream-соединение к родителю в дереве,
+// принимает H.264/Opus RTP и БЕЗ транскода (passthrough) фанаутит его:
 //  - прямым детям в дереве (downstream PC, мы offerer) — многоуровневый ретрим;
-//  - локальному webview этого же приложения (через Tauri IPC) — для показа пользователю.
+//  - локальному UI хоста (через UiSink, в нативе — Tauri IPC) — для показа пользователю.
 // Так натив = приоритетный passthrough-relay (инвариант 4 сохранён — нет перекодирования),
-// в отличие от браузерного транскод-relay (treeVideo.ts).
+// в отличие от браузерного транскод-relay (treeVideo.ts). Headless-агент (apps/relay, Э9)
+// использует то же ядро с ui=None и idle_exit.
 //
 // Keyframe: relay сам IDR не генерит (не энкодит) — при подключении нового ребёнка просит
 // keyframe у корня через сервер (request-keyframe -> tree.js -> broadcaster force IDR).
@@ -14,8 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
 use webrtc::api::{APIBuilder, API};
@@ -35,12 +35,34 @@ use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 use webrtc::track::track_local::{TrackLocal, TrackLocalWriter};
 use webrtc::track::track_remote::TrackRemote;
 
-use super::signaling::{self, JoinParams, TreeCmd, TreeEvent};
+use crate::link::{now_ms, parse_ice_server, read_link_stats, H264_FMTP};
+use crate::signaling::{self, JoinParams, TreeCmd, TreeEvent};
 
-const H264_FMTP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
+/// Сток UI-событий хоста: (event, payload). В нативе — обёртка над `AppHandle::emit`
+/// (события relay-watch-offer/-ice/relay-topology для webview); None — headless, локальный
+/// показ не поднимается.
+pub type UiSink = Arc<dyn Fn(&str, Value) + Send + Sync>;
 
-/// Управляющие сообщения в relay-цикл от Tauri-команд (сигналинг локального webview PC
-/// приходит из JS через invoke; остановка — из stop_watch).
+/// Конфиг запуска relay-viewer.
+pub struct RelayConfig {
+    pub stream_id: String,
+    pub ws_url: String,
+    pub identity: String,
+    pub server_id: String,
+    pub max_children: u32,
+    /// Э9: серверный виртуальный fallback-relay (уходит в join как "virtual": true).
+    pub virtual_relay: bool,
+    /// Что репортить серверу как availableOutgoing в stats (скоринг best-peer).
+    pub available_outgoing: u32,
+    /// Some(d): выйти из дерева, если нет живых детей дольше d (headless-агент). Живость —
+    /// по состоянию PC, не по наличию в map: при обрушении дерева (ушёл вещатель) сервер
+    /// не шлёт drop-peer на каждого ребёнка, map остаётся непустым. None — натив (webview
+    /// смотрит стрим, уходим только по Stop).
+    pub idle_exit: Option<Duration>,
+}
+
+/// Управляющие сообщения в relay-цикл от хоста (в нативе — Tauri-команды: сигналинг
+/// локального webview PC приходит из JS через invoke; остановка — из stop_watch).
 pub enum RelayControl {
     WebviewAnswer { sdp: String },
     WebviewIce { candidate: Value },
@@ -50,6 +72,7 @@ pub enum RelayControl {
 
 pub struct RelayHandle {
     ctrl_tx: mpsc::UnboundedSender<RelayControl>,
+    finished: Arc<Notify>,
 }
 
 impl RelayHandle {
@@ -58,6 +81,9 @@ impl RelayHandle {
     pub fn webview_ice(&self, candidate: Value) { let _ = self.ctrl_tx.send(RelayControl::WebviewIce { candidate }); }
     pub fn request_reparent(&self, target: Option<String>) { let _ = self.ctrl_tx.send(RelayControl::RequestReparent { target }); }
     pub fn stop(&self) { let _ = self.ctrl_tx.send(RelayControl::Stop); }
+    /// Завершение relay-цикла (leave отправлен, PC закрыты). Один ожидающий: notify_one
+    /// хранит один пермит, так что notified() сработает и если цикл кончился раньше await.
+    pub fn finished(&self) -> Arc<Notify> { self.finished.clone() }
 }
 
 struct RelayManager {
@@ -70,7 +96,7 @@ struct RelayManager {
     children: HashMap<String, Arc<RTCPeerConnection>>,
     webview: Option<Arc<RTCPeerConnection>>,
     cmd_tx: mpsc::UnboundedSender<TreeCmd>,
-    app: Option<AppHandle>,
+    ui: Option<UiSink>,
     stream_id: String,
     /// Момент последнего RequestKeyframe по PLI (мс) — rate-limit против шторма PLI детей.
     last_kf_ms: Arc<AtomicU64>,
@@ -87,7 +113,7 @@ const UP_DISCONNECTED: u8 = 2;
 const UP_FAILED: u8 = 3;
 
 impl RelayManager {
-    fn new(stream_id: String, cmd_tx: mpsc::UnboundedSender<TreeCmd>, app: Option<AppHandle>) -> Result<Self, String> {
+    fn new(stream_id: String, cmd_tx: mpsc::UnboundedSender<TreeCmd>, ui: Option<UiSink>) -> Result<Self, String> {
         let mut m = MediaEngine::default();
         m.register_codec(
             RTCRtpCodecParameters {
@@ -142,7 +168,7 @@ impl RelayManager {
             children: HashMap::new(),
             webview: None,
             cmd_tx,
-            app,
+            ui,
             stream_id,
             last_kf_ms: Arc::new(AtomicU64::new(0)),
             upstream_state: Arc::new(AtomicU8::new(0)),
@@ -219,7 +245,7 @@ impl RelayManager {
         // ещё жив, сервер не узнает об обрыве — зритель фризит навсегда. Watchdog в
         // stats_tick прочитает это и попросит reparent. Мы answerer, restart_ice не применим.
         self.upstream_state.store(0, Ordering::Relaxed);
-        self.upstream_since_ms.store(super::peer::now_ms(), Ordering::Relaxed);
+        self.upstream_since_ms.store(now_ms(), Ordering::Relaxed);
         let up_state = self.upstream_state.clone();
         let up_since = self.upstream_since_ms.clone();
         pc.on_peer_connection_state_change(Box::new(move |s| {
@@ -231,7 +257,7 @@ impl RelayManager {
                 _ => 0,
             };
             up_state.store(code, Ordering::Relaxed);
-            up_since.store(super::peer::now_ms(), Ordering::Relaxed);
+            up_since.store(now_ms(), Ordering::Relaxed);
             Box::pin(async {})
         }));
 
@@ -269,7 +295,7 @@ impl RelayManager {
                                 || a.downcast_ref::<FullIntraRequest>().is_some()
                         });
                         if want_idr {
-                            let now = super::peer::now_ms();
+                            let now = now_ms();
                             if now.saturating_sub(last_kf.load(Ordering::Relaxed)) >= 1000 {
                                 last_kf.store(now, Ordering::Relaxed);
                                 let _ = cmd_tx.send(TreeCmd::RequestKeyframe);
@@ -354,9 +380,18 @@ impl RelayManager {
         if let Some(old) = self.upstream.take() { let _ = old.close().await; }
     }
 
-    // ---- webview (локальный показ через Tauri IPC; мы offerer) ----
+    /// Живые downstream-дети (транспорт не умер). Для idle-exit headless-агента: map может
+    /// держать трупы (обрушение дерева не шлёт drop-peer каждому ребёнку).
+    fn live_children(&self) -> usize {
+        self.children.values().filter(|pc| matches!(
+            pc.connection_state(),
+            RTCPeerConnectionState::New | RTCPeerConnectionState::Connecting | RTCPeerConnectionState::Connected
+        )).count()
+    }
+
+    // ---- webview (локальный показ через UiSink; мы offerer). Headless (ui=None) — не поднимаем. ----
     async fn start_webview(&mut self) {
-        if self.webview.is_some() { return; }
+        if self.ui.is_none() || self.webview.is_some() { return; }
         let pc = match self.make_downstream().await { Some(pc) => pc, None => return };
         // Локальный показ тоже должен получить IDR когда встанет транспорт (иначе чёрный
         // экран у самого вещателя-ретранслятора до следующего случайного keyframe).
@@ -367,16 +402,16 @@ impl RelayManager {
             }
             Box::pin(async {})
         }));
-        let app = self.app.clone();
+        let ui = self.ui.clone();
         let sid = self.stream_id.clone();
         pc.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
-            let app = app.clone();
+            let ui = ui.clone();
             let sid = sid.clone();
             Box::pin(async move {
-                if let (Some(cand), Some(app)) = (c, app) {
+                if let (Some(cand), Some(ui)) = (c, ui) {
                     if let Ok(init) = cand.to_json() {
                         if let Ok(val) = serde_json::to_value(&init) {
-                            let _ = app.emit("relay-watch-ice", json!({ "streamId": sid, "candidate": val }));
+                            ui("relay-watch-ice", json!({ "streamId": sid, "candidate": val }));
                         }
                     }
                 }
@@ -385,8 +420,8 @@ impl RelayManager {
         match pc.create_offer(None).await {
             Ok(offer) => {
                 if let Err(e) = pc.set_local_description(offer.clone()).await { log::error!("relay: webview set_local: {e}"); return; }
-                if let Some(app) = &self.app {
-                    let _ = app.emit("relay-watch-offer", json!({ "streamId": self.stream_id, "sdp": offer.sdp }));
+                if let Some(ui) = &self.ui {
+                    ui("relay-watch-offer", json!({ "streamId": self.stream_id, "sdp": offer.sdp }));
                 }
             }
             Err(e) => { log::error!("relay: webview create_offer: {e}"); return; }
@@ -415,40 +450,22 @@ impl RelayManager {
     }
 }
 
-fn parse_ice_server(v: &Value) -> Option<RTCIceServer> {
-    let urls: Vec<String> = match v.get("urls")? {
-        Value::String(s) => vec![s.clone()],
-        Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(|s| s.to_owned())).collect(),
-        _ => return None,
-    };
-    Some(RTCIceServer {
-        urls,
-        username: v.get("username").and_then(|x| x.as_str()).unwrap_or_default().to_owned(),
-        credential: v.get("credential").and_then(|x| x.as_str()).unwrap_or_default().to_owned(),
-        ..Default::default()
-    })
-}
-
 /// Запускает relay-viewer: подключается к дереву как `role:viewer, native:true`, поднимает
-/// локальный webview-показ, ретранслирует детям. Возвращает RelayHandle для управления
-/// (сигналинг webview из JS, стоп). `app: None` — режим смоука (без Tauri-эмита событий).
-pub fn start(
-    app: Option<AppHandle>,
-    stream_id: String,
-    ws_url: String,
-    identity: String,
-    server_id: String,
-    max_children: u32,
-) -> RelayHandle {
+/// локальный показ (только при ui=Some), ретранслирует детям. Возвращает RelayHandle для
+/// управления (сигналинг webview из JS, стоп, ожидание завершения).
+pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
+    let RelayConfig { stream_id, ws_url, identity, server_id, max_children, virtual_relay, available_outgoing, idle_exit } = cfg;
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<RelayControl>();
+    let finished = Arc::new(Notify::new());
+    let fin = finished.clone();
 
-    let join = JoinParams { stream_id: stream_id.clone(), identity, server_id, role: "viewer", native: true, max_children, max_bitrate: 0, abr: false };
+    let join = JoinParams { stream_id: stream_id.clone(), identity, server_id, role: "viewer", native: true, max_children, max_bitrate: 0, abr: false, virtual_relay };
     let (cmd_tx, mut evt_rx) = signaling::connect(ws_url, join);
 
     tokio::spawn(async move {
-        let mut mgr = match RelayManager::new(stream_id, cmd_tx, app) {
+        let mut mgr = match RelayManager::new(stream_id, cmd_tx, ui) {
             Ok(m) => m,
-            Err(e) => { log::error!("relay: init: {e}"); return; }
+            Err(e) => { log::error!("relay: init: {e}"); fin.notify_one(); return; }
         };
         // Локальный показ поднимаем сразу — offer уедет в webview, тот ответит через ctrl.
         mgr.start_webview().await;
@@ -456,6 +473,8 @@ pub fn start(
         let mut stats_tick = tokio::time::interval(Duration::from_secs(2));
         // Cooldown авто-reparent по обрыву upstream (не чаще 10с — совпадает с серверным).
         let mut last_reparent_ms: u64 = 0;
+        // idle-exit: отсчёт с запуска (grace на первый assign-child = сам таймаут).
+        let mut idle_since_ms: u64 = now_ms();
         loop {
             tokio::select! {
                 evt = evt_rx.recv() => {
@@ -469,7 +488,8 @@ pub fn start(
                         Some(TreeEvent::DropPeer { peer_id }) => mgr.on_drop_peer(peer_id).await,
                         Some(TreeEvent::RequestKeyframe) => { /* relay не энкодит — игнор */ }
                         Some(TreeEvent::SetBitrate { .. }) => { /* relay не энкодит — битрейт задаёт корень */ }
-                        Some(TreeEvent::Topology { payload }) => { if let Some(app) = &mgr.app { let _ = app.emit("relay-topology", payload); } }
+                        Some(TreeEvent::Topology { payload }) => { if let Some(ui) = &mgr.ui { ui("relay-topology", payload); } }
+                        Some(TreeEvent::Release) => { log::info!("relay: vrelay-release от сервера — выходим"); break; }
                         Some(TreeEvent::Closed) | None => break,
                     }
                 }
@@ -487,7 +507,7 @@ pub fn start(
                     // answerer, restart_ice не применим — сервер даст нового/того же родителя).
                     if mgr.upstream.is_some() {
                         let st = mgr.upstream_state.load(Ordering::Relaxed);
-                        let now = super::peer::now_ms();
+                        let now = now_ms();
                         let since = mgr.upstream_since_ms.load(Ordering::Relaxed);
                         let bad = st == UP_FAILED || (st == UP_DISCONNECTED && now.saturating_sub(since) >= 6000);
                         if bad && now.saturating_sub(last_reparent_ms) >= 10_000 {
@@ -496,13 +516,23 @@ pub fn start(
                             let _ = mgr.cmd_tx.send(TreeCmd::RequestReparent { target: None });
                         }
                     }
+                    // Idle-exit (headless): нет живых детей дольше таймаута — покидаем дерево,
+                    // агент вернётся по следующему vrelay-activate.
+                    if let Some(d) = idle_exit {
+                        if mgr.live_children() > 0 {
+                            idle_since_ms = now_ms();
+                        } else if now_ms().saturating_sub(idle_since_ms) >= d.as_millis() as u64 {
+                            log::info!("relay: нет живых детей {}с — idle-exit", d.as_secs());
+                            break;
+                        }
+                    }
                     // Э8: реальные loss/rtt по каждому детскому линку (RTCP RR через get_stats) —
                     // сервер агрегирует worst-link по дереву (ABR-битрейт вещателю) и кормит ими
                     // best-peer скоринг репарента. Раньше слали нули (заглушка).
-                    let out = if max_children > 0 { 8_000_000 } else { 0 };
+                    let out = if max_children > 0 { available_outgoing } else { 0 };
                     let mut to_child: Vec<Value> = Vec::with_capacity(mgr.children.len());
                     for (id, pc) in &mgr.children {
-                        if let Some((loss, rtt)) = super::peer::read_link_stats(pc).await {
+                        if let Some((loss, rtt)) = read_link_stats(pc).await {
                             to_child.push(json!({ "id": id, "bitrate": 0, "rtt": rtt, "loss": loss }));
                         }
                     }
@@ -512,7 +542,8 @@ pub fn start(
         }
         let _ = mgr.cmd_tx.send(TreeCmd::Leave);
         mgr.close_all().await;
+        fin.notify_one();
     });
 
-    RelayHandle { ctrl_tx }
+    RelayHandle { ctrl_tx, finished }
 }

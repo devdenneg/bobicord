@@ -19,6 +19,7 @@ pub enum TreeEvent {
     RequestKeyframe,                           // сервер просит корень форснуть IDR
     SetBitrate { bps: u32 },                   // Э8 ABR: сервер шлёт корню целевой битрейт под худший линк
     Topology { payload: Value },               // снимок дерева для UI (relay пробрасывает в webview)
+    Release,                                   // Э9: сервер выселяет виртуальный relay (дренаж/обрушение дерева)
     Closed,
 }
 
@@ -45,6 +46,9 @@ pub struct JoinParams {
     pub max_bitrate: u32,
     /// Э8 ABR: авто-адаптация включена. false → сервер не шлёт set-bitrate (статичный битрейт).
     pub abr: bool,
+    /// Э9: серверный виртуальный fallback-relay. Сервер верит флагу только при
+    /// JWT-uid 'virtual-relay' (tree.js) — обычные клиенты шлют false.
+    pub virtual_relay: bool,
 }
 
 /// Поднимает ws-соединение и держит его в отдельной tokio-задаче. Возвращает канал
@@ -74,6 +78,7 @@ pub fn connect(ws_url: String, join: JoinParams) -> (mpsc::UnboundedSender<TreeC
             "maxChildren": join.max_children,
             "maxBitrate": join.max_bitrate,
             "abr": join.abr,
+            "virtual": join.virtual_relay,
             "identity": join.identity,
             "serverId": join.server_id,
         });
@@ -172,6 +177,7 @@ fn parse_event(v: &Value) -> Option<TreeEvent> {
         "request-keyframe" => Some(TreeEvent::RequestKeyframe),
         "set-bitrate" => Some(TreeEvent::SetBitrate { bps: v.get("bps")?.as_u64()? as u32 }),
         "tree-topology" => Some(TreeEvent::Topology { payload: v.clone() }),
+        "vrelay-release" => Some(TreeEvent::Release),
         _ => None,
     }
 }

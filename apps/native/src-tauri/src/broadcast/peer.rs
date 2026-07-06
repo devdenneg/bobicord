@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
@@ -24,35 +23,14 @@ use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType};
-use webrtc::stats::StatsReportType;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
 use super::signaling::TreeCmd;
-
-/// Качество линка к пиру из RTCP RR (Evolution-TZ Э8 ABR + best-peer). `get_stats()` даёт
-/// `RemoteInboundRTP` — взгляд отправителя на приём удалённой стороны. webrtc-rs уже
-/// нормализует: `fraction_lost` = raw/255 (доля 0..1), `round_trip_time` — в МИЛЛИСЕКУНДАХ
-/// (не секундах, см. interceptor/stats/interceptor.rs). Берём худшее по видео+аудио (один
-/// сетевой путь) — консервативно для ABR. `None`, пока не пришёл первый RR (нет RemoteInboundRTP).
-pub async fn read_link_stats(pc: &RTCPeerConnection) -> Option<(f64, f64)> {
-    let report = pc.get_stats().await;
-    let mut loss = 0.0_f64;
-    let mut rtt = 0.0_f64;
-    let mut seen = false;
-    for stat in report.reports.values() {
-        if let StatsReportType::RemoteInboundRTP(r) = stat {
-            seen = true;
-            if r.fraction_lost.is_finite() { loss = loss.max(r.fraction_lost); }
-            if let Some(t) = r.round_trip_time { if t.is_finite() { rtt = rtt.max(t); } }
-        }
-    }
-    seen.then_some((loss, rtt))
-}
-
-/// H.264 baseline, packetization-mode=1, без B-кадров (инвариант CLAUDE.md 4) —
-/// та же профильная строка, что фиксирует `MF_MT_MPEG2_PROFILE` энкодера.
-const H264_FMTP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
+// Общие хелперы (read_link_stats/now_ms/parse_ice_server/H264_FMTP) вынесены в relay-core
+// (link.rs) — общий код с relay-ядром и headless-агентом. Реэкспорт сохраняет старые пути.
+pub use relay_core::link::{now_ms, read_link_stats};
+use relay_core::link::{parse_ice_server, H264_FMTP};
 
 pub struct PeerManager {
     api: API,
@@ -65,11 +43,6 @@ pub struct PeerManager {
     /// Момент последнего форса IDR по PLI (мс от эпохи) — rate-limit против шторма
     /// PLI от N детей (без него каждый зритель с потерями держал бы сплошные IDR).
     last_pli_ms: Arc<AtomicU64>,
-}
-
-/// Текущее время в мс — для rate-limit PLI (грубая метка, монотонность не критична).
-pub(crate) fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 impl PeerManager {
@@ -287,18 +260,4 @@ impl PeerManager {
     pub fn send_stats(&self, to_child: Vec<Value>, available_outgoing: u32) -> Result<(), String> {
         self.cmd_tx.send(TreeCmd::Stats { to_child, available_outgoing }).map_err(|e| e.to_string())
     }
-}
-
-fn parse_ice_server(v: &Value) -> Option<RTCIceServer> {
-    let urls: Vec<String> = match v.get("urls")? {
-        Value::String(s) => vec![s.clone()],
-        Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(|s| s.to_owned())).collect(),
-        _ => return None,
-    };
-    Some(RTCIceServer {
-        urls,
-        username: v.get("username").and_then(|x| x.as_str()).unwrap_or_default().to_owned(),
-        credential: v.get("credential").and_then(|x| x.as_str()).unwrap_or_default().to_owned(),
-        ..Default::default()
-    })
 }

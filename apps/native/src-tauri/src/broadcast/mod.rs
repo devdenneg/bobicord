@@ -7,8 +7,10 @@ pub mod audio;
 pub mod capture;
 pub mod encoder;
 pub mod peer;
-pub mod relay;
-pub mod signaling;
+// relay-ядро и WS-сигналинг дерева вынесены в кросс-платформенный крейт relay-core
+// (Э9: общий код с headless-агентом vrelay). Реэкспорт сохраняет старые пути
+// broadcast::relay::* / broadcast::signaling::* для lib.rs и этого модуля.
+pub use relay_core::{relay, signaling};
 pub mod stats;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -280,6 +282,7 @@ pub async fn start(
         role: "broadcaster", native: true, max_children: max_direct_children,
         max_bitrate: bitrate_bps, // потолок ABR = выбранный пользователем битрейт
         abr: auto_bitrate,
+        virtual_relay: false,
     };
     let (cmd_tx, evt_rx) = signaling::connect(ws_url, join);
 
@@ -525,7 +528,8 @@ async fn run_signaling_loop(
                         ladder.apply(clamped);
                     }
                     // Корень не имеет родителя — эти события к нему не относятся.
-                    Some(TreeEvent::AssignParent { .. }) | Some(TreeEvent::SdpOffer { .. }) | Some(TreeEvent::Topology { .. }) => {}
+                    // Release (Э9) адресован виртуальному relay — корню-вещателю не приходит.
+                    Some(TreeEvent::AssignParent { .. }) | Some(TreeEvent::SdpOffer { .. }) | Some(TreeEvent::Topology { .. }) | Some(TreeEvent::Release) => {}
                     Some(TreeEvent::Closed) | None => {
                         stop_reason = Some("сигнальный канал с сервером оборвался".into());
                         break;

@@ -1,0 +1,17 @@
+# Кросс-платформенное ядро relay-viewer P2P-дерева (Э8/Э9): WS-сигналинг + passthrough
+# RTP-фанаут. Используется нативом (Tauri, apps/native) и headless-агентом vrelay
+# (apps/relay) — поэтому здесь НЕТ tauri/windows-зависимостей. Версии общих крейтов
+# держать 1:1 с apps/native/src-tauri/Cargo.toml (один target-кэш, один Cargo.lock).
+[package]
+name = "relay-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+
+[dependencies]
+serde_json = "1.0"
+log = "0.4"
+webrtc = "0.17.1"
+tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3.32"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
