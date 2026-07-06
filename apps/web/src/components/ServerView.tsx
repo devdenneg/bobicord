@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
+import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { useStore, getEngine } from '../store';
 import { api, resolveUploadUrl } from '../api';
 import { useEngine } from '../hooks';
@@ -375,13 +376,28 @@ const COMMANDS: { name: string; desc: string }[] = [
   { name: 'help', desc: 'Список команд' },
 ];
 
+// Базовый индекс для virtuoso firstItemIndex: при догрузке старых сообщений его уменьшаем
+// на кол-во добавленных сверху — так virtuoso держит якорь скролла на месте (prepend-паттерн).
+const VIRT_BASE_INDEX = 1_000_000;
+
+// Шапка списка чата: спиннер во время догрузки старых сообщений / метка начала истории.
+// Определена на уровне модуля (стабильная ссылка) — иначе virtuoso ремонтит её на каждый рендер.
+function ChatOlderHeader({ context }: { context?: { busy?: boolean; hasMore?: boolean } }) {
+  return (
+    <div className="virt-head">
+      {context?.busy ? <span className="spin" style={{ width: 16, height: 16, margin: 0 }} />
+        : context && !context.hasMore ? <span className="virt-head-end">Начало истории</span> : null}
+    </div>
+  );
+}
+function ChatFooter() { return <div style={{ height: 12 }} />; }
+
 function Chat() {
   const eng = useEngine();
   const E = getEngine()!;
   const [text, setText] = useState('');
   const [lightbox, setLightbox] = useState<string | null>(null);
   const [pickAnchor, setPickAnchor] = useState<DOMRect | null | undefined>(undefined);
-  const msgsRef = useRef<HTMLDivElement>(null);
   const emoBtnRef = useRef<HTMLButtonElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
@@ -392,42 +408,62 @@ function Chat() {
   const activeId = useStore((s) => s.active?.id);
   const nativeUpdate = useStore((s) => s.nativeUpdate);
   const [updating, setUpdating] = useState(false);
-  const [pill, setPill] = useState(0);
+  const messages = eng.messages;
+
+  // --- виртуальный список чата (react-virtuoso) ---
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const [pill, setPill] = useState(0);            // счётчик непрочитанных (пока не внизу)
   const [atBottom, setAtBottom] = useState(true);
   const atBottomRef = useRef(true);
-  const settleRef = useRef(0); // до этого времени игнорим scroll-события и жёстко держим низ
-  const setBottom = (v: boolean) => { atBottomRef.current = v; setAtBottom(v); };
+  const [firstItemIndex, setFirstItemIndex] = useState(VIRT_BASE_INDEX); // якорь для prepend
+  const [olderBusy, setOlderBusy] = useState(false); // идёт догрузка старых
+  const loadingOlder = useRef(false);                // защита от повторного startReached
+  const prevLastId = useRef<number | null>(null);    // id последнего сообщения — детект append vs prepend
   // автокомплит упоминаний (@ник)
   const [mention, setMention] = useState<{ q: string; start: number } | null>(null);
   const [mIdx, setMIdx] = useState(0);
+  const popRef = useRef<HTMLDivElement>(null); // контейнер попапа автокомплита — для скролла выделения
 
-  const pinBottom = useCallback(() => { const el = msgsRef.current; if (el) el.scrollTop = el.scrollHeight; }, []);
+  const onAtBottom = useCallback((b: boolean) => { atBottomRef.current = b; setAtBottom(b); }, []);
   const scrollToBottom = useCallback(() => {
-    pinBottom(); atBottomRef.current = true; setAtBottom(true); setPill(0);
-  }, [pinBottom]);
+    setPill(0);
+    virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'smooth' });
+  }, []);
 
-  // новые сообщения: если внизу — доскроллить, иначе счётчик непрочитанных
+  // смена сервера: сброс состояния виртуального списка (Virtuoso ремонтится по key={activeId})
   useLayoutEffect(() => {
-    if (atBottomRef.current) scrollToBottom();
-    else setPill((p) => p + 1);
-  }, [eng.messages.length, scrollToBottom]);
+    setFirstItemIndex(VIRT_BASE_INDEX);
+    setPill(0); setAtBottom(true); atBottomRef.current = true;
+    prevLastId.current = null; loadingOlder.current = false; setOlderBusy(false);
+  }, [activeId]);
 
-  // открытие/смена сервера: прижать к низу и «оседать» 1.8с, пока догружаются
-  // картинки/link-превью (иначе layout-сдвиг ставит atBottom=false раньше, чем добьём вниз)
-  useLayoutEffect(() => {
-    settleRef.current = Date.now() + 1800;
-    scrollToBottom();
-    requestAnimationFrame(scrollToBottom);
-  }, [activeId, scrollToBottom]);
+  // счётчик непрочитанных: растёт только на append нового сообщения, когда мы не внизу.
+  // prepend старых меняет messages[0], но не последний id → счётчик не трогает.
+  useEffect(() => {
+    const last = messages.length ? messages[messages.length - 1].id : null;
+    if (prevLastId.current !== null && last !== prevLastId.current && !atBottomRef.current) {
+      setPill((p) => p + 1);
+    }
+    prevLastId.current = last;
+  }, [messages]);
+  useEffect(() => { if (atBottom) setPill(0); }, [atBottom]);
 
-  // ResizeObserver: пока внизу ИЛИ идёт «оседание» — до-прижимаем к низу при любом росте высоты
-  useLayoutEffect(() => {
-    const inner = msgsRef.current?.querySelector('.msgs-inner');
-    if (!inner) return;
-    const ro = new ResizeObserver(() => { if (atBottomRef.current || Date.now() < settleRef.current) pinBottom(); });
-    ro.observe(inner);
-    return () => ro.disconnect();
-  }, [pinBottom]);
+  // догрузка более старых сообщений при скролле к верху (курсорная пагинация)
+  const loadOlder = useCallback(async () => {
+    if (loadingOlder.current || !E.chatHasMore) return;
+    const cursor = E.chatOldestCursor;
+    if (cursor == null || !activeId) return;
+    loadingOlder.current = true; setOlderBusy(true);
+    try {
+      const h = await api.getMessages(activeId, cursor, 30);
+      const count = h.messages.length;
+      // сначала сдвигаем базовый индекс, затем растим данные — оба апдейта в одном тике
+      // (React 18 батчит), virtuoso держит позицию скролла на прежнем сообщении.
+      if (count > 0) setFirstItemIndex((f) => f - count);
+      E.prependHistory(h.messages, h.hasMore);
+    } catch { /**/ }
+    finally { loadingOlder.current = false; setOlderBusy(false); }
+  }, [E, activeId]);
 
   async function runCommand(raw: string) {
     const active = useStore.getState().active;
@@ -471,18 +507,23 @@ function Chat() {
   const slashMode = /^\/[a-zа-я]*$/i.test(text);
   const cmdQuery = slashMode ? text.slice(1).toLowerCase() : '';
   const cmdCands = slashMode ? COMMANDS.filter((c) => c.name.startsWith(cmdQuery)) : [];
-  const mCands: { username: string; displayName: string; avatarColor: number; everyone?: boolean }[] = (() => {
+  const mCands: { username: string; displayName: string; avatarColor: number; avatarUrl?: string; everyone?: boolean }[] = (() => {
     if (!mention || slashMode) return [];
     const q = mention.q.toLowerCase();
     const list = members
       .filter((x) => x.username !== me.username && (x.username.toLowerCase().includes(q) || x.displayName.toLowerCase().includes(q)))
       .slice(0, 8)
-      .map((x) => ({ username: x.username, displayName: x.displayName, avatarColor: x.avatarColor, everyone: false }));
-    if (q === '' || ['все', 'all', 'everyone'].some((w) => w.startsWith(q))) list.unshift({ username: 'все', displayName: 'Все участники', avatarColor: 0, everyone: true });
+      .map((x) => ({ username: x.username, displayName: x.displayName, avatarColor: x.avatarColor, avatarUrl: x.avatarUrl, everyone: false }));
+    if (q === '' || ['все', 'all', 'everyone'].some((w) => w.startsWith(q))) list.unshift({ username: 'все', displayName: 'Все участники', avatarColor: 0, avatarUrl: undefined, everyone: true });
     return list.slice(0, 8);
   })();
   const acLen = slashMode ? cmdCands.length : mCands.length;
   const acOpen = acLen > 0;
+  // при навигации стрелками держим выделенную строку в видимой части попапа (он скроллится)
+  useEffect(() => {
+    if (!acOpen) return;
+    popRef.current?.querySelector<HTMLElement>('.mpop-row.sel')?.scrollIntoView({ block: 'nearest' });
+  }, [mIdx, acOpen]);
   function detectMention(value: string, caret: number) {
     const m = value.slice(0, caret).match(/(?:^|\s)@([^\s@]{0,32})$/);
     return m ? { q: m[1], start: caret - m[1].length - 1 } : null;
@@ -503,7 +544,9 @@ function Chat() {
   function focusEnd(pos: number) {
     requestAnimationFrame(() => { const el = document.getElementById('msgIn') as HTMLInputElement | null; if (el) { el.focus(); el.setSelectionRange(pos, pos); } });
   }
-  function acceptAc(i: number) { if (slashMode) insertCommand(cmdCands[i].name); else insertMention(mCands[i].username); }
+  // тегаем по Нику (displayName), а не по логину; для @everyone — служебный токен 'все'
+  const mentionToken = (x: { username: string; displayName: string; everyone?: boolean }) => (x.everyone ? x.username : x.displayName);
+  function acceptAc(i: number) { if (slashMode) insertCommand(cmdCands[i].name); else insertMention(mentionToken(mCands[i])); }
   function onComposerKey(e: React.KeyboardEvent<HTMLInputElement>) {
     if (acOpen) {
       if (e.key === 'ArrowDown') { e.preventDefault(); setMIdx((i) => (i + 1) % acLen); return; }
@@ -517,33 +560,55 @@ function Chat() {
   const mentionNames = (() => { const s = new Set<string>(); for (const mm of members) { s.add(mm.username.toLowerCase()); s.add(mm.displayName.toLowerCase()); } ['все', 'all', 'everyone'].forEach((w) => s.add(w)); return s; })();
   const byName = new Map(members.map((mm) => [mm.displayName, mm] as const));
 
-  return (
-    <div id="chat">
-      <div id="msgs" ref={msgsRef} onScroll={(e) => { if (Date.now() < settleRef.current) return; const m = e.currentTarget; const b = m.scrollTop + m.clientHeight >= m.scrollHeight - 120; setBottom(b); if (b) setPill(0); }}>
-        <div className="msgs-inner">
-          {eng.messages.length === 0 ? <div id="chatEmpty">Общий чат сервера. Пиши сюда — видят все участники онлайн.</div> : null}
-          {eng.messages.map((m) => {
-            const parts = m.sys ? null : renderRich(m.text, mentionNames);
-            const emoCount = parts ? parts.filter((p) => typeof p === 'object' && 'emo' in p).length : 0;
-            const hasLink = parts ? parts.some((p) => typeof p === 'object' && 'link' in p) : false;
-            const big = !!parts && !hasLink && emoCount >= 1 && emoCount <= 3 && parts.every((p) => typeof p !== 'string' || !p.trim());
-            const author = m.who ? byName.get(m.who) : undefined;
-            const aRoles = author?.roles || [];
-            const nameColor = (author && roleColorOf(author)) || avColor(m.who || '', m.color);
-            return (
-              <div className={'msg' + (m.sys ? ' sys' : '') + (m.mine ? ' me' : '') + (m.mention ? ' mentioned' : '')} key={m.id}>
-                {!m.sys ? <div className="who" style={{ color: nameColor }}>{m.who}{aRoles.length ? <span className="who-roles">{aRoles.map((r) => <span key={r.id} className="who-role" style={{ background: (r.color || 'var(--panel3)') + '22', color: r.color || 'var(--muted)', borderColor: (r.color || 'var(--line-2)') + '55' }}>{r.name}</span>)}</span> : null}{m.ts ? <span className="mtime">{fmtTime(m.ts)}</span> : null}</div> : null}
-                {m.sys || m.text ? (
-                  <div className={'tx' + (big ? ' big' : '')}>
-                    {m.sys ? m.text : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : 'link' in p ? <a key={i} className="msg-link" href={p.link} target="_blank" rel="noreferrer">{p.link}</a> : 'mention' in p ? <span key={i} className="mention-tag">{p.mention}</span> : <img key={i} className="emo" src={emoteUrl(p.emo)} alt={p.name} title={p.name} loading="lazy" decoding="async" />))}
-                  </div>
-                ) : null}
-                {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox(m.img!)}><img className="msg-img" src={resolveUploadUrl(m.img)} alt="" loading="lazy" onLoad={() => { const el = msgsRef.current; if (el && (atBottomRef.current || Date.now() < settleRef.current)) el.scrollTop = el.scrollHeight; }} /></button> : null}
-              </div>
-            );
-          })}
+  // рендер одного сообщения (используется как itemContent virtuoso). Обёртка .virt-row даёт
+  // горизонтальные отступы и межстрочный зазор — раньше это делал .msgs-inner{gap;padding}.
+  const renderMessage = (m: typeof messages[number]) => {
+    const parts = m.sys ? null : renderRich(m.text, mentionNames);
+    const emoCount = parts ? parts.filter((p) => typeof p === 'object' && 'emo' in p).length : 0;
+    const hasLink = parts ? parts.some((p) => typeof p === 'object' && 'link' in p) : false;
+    const big = !!parts && !hasLink && emoCount >= 1 && emoCount <= 3 && parts.every((p) => typeof p !== 'string' || !p.trim());
+    const author = m.who ? byName.get(m.who) : undefined;
+    const aRoles = author?.roles || [];
+    const nameColor = (author && roleColorOf(author)) || avColor(m.who || '', m.color);
+    return (
+      <div className="virt-row">
+        <div className={'msg' + (m.sys ? ' sys' : '') + (m.mine ? ' me' : '') + (m.mention ? ' mentioned' : '')}>
+          {!m.sys ? <div className="who" style={{ color: nameColor }}>{m.who}{aRoles.length ? <span className="who-roles">{aRoles.map((r) => <span key={r.id} className="who-role" style={{ background: (r.color || 'var(--panel3)') + '22', color: r.color || 'var(--muted)', borderColor: (r.color || 'var(--line-2)') + '55' }}>{r.name}</span>)}</span> : null}{m.ts ? <span className="mtime">{fmtTime(m.ts)}</span> : null}</div> : null}
+          {m.sys || m.text ? (
+            <div className={'tx' + (big ? ' big' : '')}>
+              {m.sys ? m.text : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : 'link' in p ? <a key={i} className="msg-link" href={p.link} target="_blank" rel="noreferrer">{p.link}</a> : 'mention' in p ? <span key={i} className="mention-tag">{p.mention}</span> : <img key={i} className="emo" src={emoteUrl(p.emo)} alt={p.name} title={p.name} loading="lazy" decoding="async" />))}
+            </div>
+          ) : null}
+          {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox(m.img!)}><img className="msg-img" src={resolveUploadUrl(m.img)} alt="" loading="lazy" /></button> : null}
         </div>
       </div>
+    );
+  };
+
+  return (
+    <div id="chat">
+      {messages.length === 0 ? (
+        <div id="msgs"><div className="msgs-inner"><div id="chatEmpty">Общий чат сервера. Пиши сюда — видят все участники онлайн.</div></div></div>
+      ) : (
+        <Virtuoso
+          key={activeId}
+          ref={virtuosoRef}
+          className="virt-msgs"
+          data={messages}
+          firstItemIndex={firstItemIndex}
+          initialTopMostItemIndex={messages.length - 1}
+          alignToBottom
+          startReached={loadOlder}
+          followOutput={(bottom) => (bottom ? 'auto' : false)}
+          atBottomThreshold={120}
+          atBottomStateChange={onAtBottom}
+          increaseViewportBy={{ top: 600, bottom: 400 }}
+          computeItemKey={(_, m) => m.id}
+          context={{ busy: olderBusy, hasMore: eng.chatHasMore }}
+          components={{ Header: ChatOlderHeader, Footer: ChatFooter }}
+          itemContent={(_, m) => renderMessage(m)}
+        />
+      )}
       {!atBottom ? <button id="scrollbtn" aria-label="Прокрутить вниз" data-tip="К последним" onClick={scrollToBottom}><Icon name="chevron" />{pill > 0 ? <span className="sb-badge">{pill > 99 ? '99+' : pill}</span> : null}</button> : null}
       {eng.typing.length > 0 ? (
         <div className="typing-ind">
@@ -570,7 +635,7 @@ function Chat() {
         </div>
       ) : null}
       {acOpen ? (
-        <div className="mention-pop" role="listbox">
+        <div className="mention-pop" role="listbox" ref={popRef}>
           <div className="mpop-h">{slashMode ? 'Команды' : 'Упомянуть'}</div>
           {slashMode
             ? cmdCands.map((c, i) => (
@@ -578,9 +643,12 @@ function Chat() {
                 <span className="mpop-cmd">/{c.name}</span><span className="mpop-desc">{c.desc}</span>
               </button>))
             : mCands.map((x, i) => (
-              <button key={x.username} className={'mpop-row' + (i === mIdx ? ' sel' : '')} onMouseDown={(e) => { e.preventDefault(); insertMention(x.username); }} onMouseEnter={() => setMIdx(i)}>
-                <span className="mpop-av" style={{ background: x.everyone ? 'var(--accent)' : avColor(x.displayName, x.avatarColor) }}>{x.everyone ? '@' : initial(x.displayName)}</span>
-                <span className="mpop-nm">{x.displayName}</span>{!x.everyone ? <span className="mpop-u">@{x.username}</span> : null}
+              <button key={x.username} className={'mpop-row' + (i === mIdx ? ' sel' : '')} onMouseDown={(e) => { e.preventDefault(); insertMention(mentionToken(x)); }} onMouseEnter={() => setMIdx(i)}>
+                <span className="mpop-av" style={{ background: x.everyone ? 'var(--accent)' : (x.avatarUrl ? '#0000' : avColor(x.displayName, x.avatarColor)) }}>
+                  {x.everyone ? '@' : x.avatarUrl ? <img className="avimg" src={resolveUploadUrl(x.avatarUrl)} alt="" /> : initial(x.displayName)}
+                </span>
+                <span className="mpop-nm">{x.displayName}</span>
+                {!x.everyone && x.username.toLowerCase() !== x.displayName.toLowerCase() ? <span className="mpop-u">@{x.username}</span> : null}
               </button>))}
         </div>
       ) : null}

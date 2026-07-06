@@ -71,7 +71,8 @@ export type ToastKind = 'ok' | 'warn' | 'err' | 'info';
 export interface Toast { id: number; text: string; kind: ToastKind }
 
 export interface ChatMessage {
-  id: number;
+  id: number; // локальный монотонный ключ (React key), НЕ id строки в БД
+  sid?: number; // id строки в БД (курсор пагинации) — есть только у сообщений из истории
   who: string | null; // null = system
   text: string;
   mine: boolean;
@@ -83,6 +84,7 @@ export interface ChatMessage {
 }
 
 export interface HistoryMessage {
+  id?: number; // id строки в БД — курсор пагинации (before=<id>)
   uid: string;
   name: string;
   color: number;

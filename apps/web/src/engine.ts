@@ -2,7 +2,7 @@ import {
   Room, RoomEvent, Track, LocalAudioTrack, AudioPresets,
   type RemoteParticipant, type Participant, type TrackPublication, type RemoteTrack,
 } from 'livekit-client';
-import type { User, Member, ChatMessage, Emote } from './types';
+import type { User, Member, ChatMessage, Emote, HistoryMessage } from './types';
 import { getSettings, setSettings } from './settings';
 import { emoteUrl } from './emotes';
 import { playSound } from './sounds';
@@ -26,6 +26,7 @@ export interface Snapshot {
   pending: Record<string, true>;
   watchers: Record<string, { name: string }[]>;
   messages: ChatMessage[];
+  chatHasMore: boolean; // есть ли ещё более старые сообщения для догрузки вверх
   typing: string[];
 }
 
@@ -75,6 +76,8 @@ export class Engine {
   private pendingWatch = new Set<string>();
   private streamWatchers = new Map<string, Map<string, { name: string; ts: number }>>();
   private messages: ChatMessage[] = [];
+  private chatMore = false; // есть ли ещё более старые сообщения на сервере (пагинация вверх)
+  private oldestSid: number | null = null; // DB-id самого старого загруженного сообщения = курсор для before
   private typingUsers = new Map<string, number>(); // displayName -> expiry ts
   private lastTypingSent = 0;
 
@@ -152,6 +155,9 @@ export class Engine {
   setVols(v: { users?: Record<string, number>; streams?: Record<string, number> }) {
     this.VOLS.users = v.users || {}; this.VOLS.streams = v.streams || {};
   }
+  // состояние пагинации чата (для UI/догрузки старых сообщений)
+  get chatHasMore() { return this.chatMore; }
+  get chatOldestCursor() { return this.oldestSid; }
 
   /* ---------- subscription (useSyncExternalStore) ---------- */
   subscribe = (cb: () => void) => { this.subs.add(cb); return () => { this.subs.delete(cb); }; };
@@ -177,7 +183,7 @@ export class Engine {
     return {
       connected: !!this.room, reconnecting: this.reconnecting, inVoice: this.inVoice, deafened: this.deafened,
       localMicMuted: this.localMicMuted(), pttDown: this.pttDown,
-      presence, speaking, streams, watching, pending, watchers, messages: this.messages,
+      presence, speaking, streams, watching, pending, watchers, messages: this.messages, chatHasMore: this.chatMore,
       typing: [...this.typingUsers].filter(([n, exp]) => exp > Date.now() && n !== this.me.displayName).map(([n]) => n),
     };
   }
@@ -222,7 +228,7 @@ export class Engine {
     document.querySelectorAll('#audioSink audio').forEach((a) => a.remove());
     this.liveKitT.detach(); this.treeT.detach(); this.screenAudioEls.clear();
     this.watching.clear(); this.pendingWatch.clear(); this.streamWatchers.clear();
-    this.perMute.clear(); this.messages = [];
+    this.perMute.clear(); this.messages = []; this.chatMore = false; this.oldestSid = null;
     if (this.micRaw) { this.micRaw.getTracks().forEach((t) => t.stop()); this.micRaw = null; }
     if (this.micActx) { try { this.micActx.close(); } catch { /**/ } this.micActx = null; }
     this.micGain = null;
@@ -623,11 +629,26 @@ export class Engine {
     this.emit();
   }
   sysMsg(text: string) { this.pushMsg(null, text, true); }
-  loadHistory(list: { uid: string; name: string; color: number; text: string; em: Record<string, string>; img?: string; ts?: number }[]) {
-    this.messages = list.map((m) => {
+  private mapHistory(list: HistoryMessage[]): ChatMessage[] {
+    return list.map((m) => {
       if (m.em) for (const k in m.em) this.onEmoteResolve?.(k, m.em[k]);
-      return { id: msgSeq++, who: m.name, text: m.text, mine: m.uid === this.me.id, sys: false, color: m.color, img: m.img, ts: m.ts, mention: m.uid !== this.me.id && this.textMentionsMe(m.text) };
+      return { id: msgSeq++, sid: m.id, who: m.name, text: m.text, mine: m.uid === this.me.id, sys: false, color: m.color, img: m.img, ts: m.ts, mention: m.uid !== this.me.id && this.textMentionsMe(m.text) };
     });
+  }
+  // начальная страница истории (последние N) — заменяет весь чат, ставит курсор на самое старое
+  loadHistory(list: HistoryMessage[], hasMore = false) {
+    this.messages = this.mapHistory(list);
+    this.chatMore = hasMore;
+    this.oldestSid = list.length ? (list[0].id ?? null) : null; // list в ASC-порядке, [0] — самое старое
+    this.emit();
+  }
+  // догрузка более старых сообщений при скролле вверх — prepend в начало, курсор сдвигается назад
+  prependHistory(list: HistoryMessage[], hasMore: boolean) {
+    this.chatMore = hasMore;
+    if (list.length) {
+      this.messages = [...this.mapHistory(list), ...this.messages];
+      this.oldestSid = list[0].id ?? this.oldestSid;
+    }
     this.emit();
   }
   // очистка чата (админ): локально + всем; сервер уже почищен вызывающей стороной
@@ -638,9 +659,11 @@ export class Engine {
     this.sysMsg((byName || this.me.displayName) + ' очистил чат');
   }
   sendChatWithEmotes(text: string, em: Record<string, string>, img?: string) {
-    if ((!text.trim() && !img) || !this.room) return;
+    if (!text.trim() && !img) return;
     const t = text.trim();
-    this.dataSend({ t: 'chat', name: this.me.displayName, text: t, em, color: this.me.avatarColor, img });
+    // realtime-раздача только при поднятой комнате; локальный эхо + persist работают и без неё —
+    // в окне фоновой докрутки connect (сразу после входа в сервер) сообщение не теряется, ложится в БД.
+    if (this.room) this.dataSend({ t: 'chat', name: this.me.displayName, text: t, em, color: this.me.avatarColor, img });
     this.pushMsg(this.me.displayName, t, false, this.me.avatarColor, true, img);
     this.hooks.persistMessage(t, em, img);
   }

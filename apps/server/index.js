@@ -110,6 +110,7 @@ CREATE TABLE IF NOT EXISTS member_roles(
   PRIMARY KEY(server_id, user_id, role_id)
 );
 CREATE INDEX IF NOT EXISTS idx_msg_server ON messages(server_id, created);
+CREATE INDEX IF NOT EXISTS idx_msg_server_id ON messages(server_id, id);
 CREATE INDEX IF NOT EXISTS idx_mem_server ON memberships(server_id);
 CREATE INDEX IF NOT EXISTS idx_mem_user ON memberships(user_id);
 CREATE INDEX IF NOT EXISTS idx_inv_server ON invites(server_id);
@@ -470,9 +471,19 @@ const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 app.get('/api/servers/:id/messages', requireAuth, (req, res) => {
   const sid = req.params.id;
   if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
-  const rows = db.prepare('SELECT user_id,display_name,avatar_color,text,emotes,image,created FROM messages WHERE server_id=? AND created>? ORDER BY created DESC LIMIT 100')
-    .all(sid, Date.now() - WEEK_MS).reverse();
-  res.json({ messages: rows.map(r => ({ uid: r.user_id, name: r.display_name, color: r.avatar_color, text: r.text, em: JSON.parse(r.emotes || '{}'), img: r.image || '', ts: r.created })) });
+  const limit = Math.min(60, Math.max(1, parseInt(req.query.limit, 10) || 30));
+  const before = parseInt(req.query.before, 10) || 0; // курсор: id, СТАРШЕ которого грузим (0 = последняя страница)
+  const minTs = Date.now() - WEEK_MS;
+  // берём limit+1, чтобы понять, есть ли ещё более старые сообщения (hasMore)
+  const rows = before > 0
+    ? db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,created FROM messages WHERE server_id=? AND created>? AND id<? ORDER BY id DESC LIMIT ?').all(sid, minTs, before, limit + 1)
+    : db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,created FROM messages WHERE server_id=? AND created>? ORDER BY id DESC LIMIT ?').all(sid, minTs, limit + 1);
+  const hasMore = rows.length > limit;
+  const page = rows.slice(0, limit).reverse(); // ASC: старые → новые (как рисуем в чате)
+  res.json({
+    hasMore,
+    messages: page.map(r => ({ id: r.id, uid: r.user_id, name: r.display_name, color: r.avatar_color, text: r.text, em: JSON.parse(r.emotes || '{}'), img: r.image || '', ts: r.created })),
+  });
 });
 app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
   const sid = req.params.id;

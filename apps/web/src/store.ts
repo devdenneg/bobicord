@@ -100,37 +100,50 @@ export const useStore = create<AppState>((set, get) => ({
     // показываем лоадер (рейл остаётся), ничего частичного не рисуем
     set({ view: 'server', loadingServer: true, loadingServerId: id, active: null, members: [] });
     try {
-      const d = await api.getServer(id);
-      const active: ServerDetail = { ...d.server, myRole: d.myRole, myPerms: d.myPerms };
-      // грузим сохранённые громкости ДО показа (иначе слайдеры = 100%)
+      // сохранённые громкости из localStorage — синхронно, до сети (иначе слайдеры = 100%)
       const cache = JSON.parse(localStorage.getItem('srvset:' + id) || 'null');
       if (cache) engine?.setVols(cache);
-      try { const s = await api.getSettings(id); if (s.data && (s.data.users || s.data.streams)) engine?.setVols(s.data); } catch { /**/ }
-      engine?.setMembers(d.members);
-      const tk = await api.serverToken(id);
-      await engine?.connect(tk.url, tk.token, id);
-      // актуальный онлайн ДО показа
-      try { const pres = await api.presence(id); engine?.setOnlineHint(pres.online); } catch { /**/ }
-      // история чата (7 дней) ДО показа
-      let hist: import('./types').HistoryMessage[] = [];
-      try { const h = await api.getMessages(id); hist = h.messages; } catch { /**/ }
+      // КРИТИЧНОЕ для первой отрисовки — параллельно (один round-trip вместо цепочки):
+      // инфо сервера + история чата (страница) + громкости + онлайн. Тяжёлый WebRTC-connect
+      // к комнате НЕ здесь — он уходит в фон после показа (см. ниже).
+      const [d, hist, settings, pres] = await Promise.all([
+        api.getServer(id),
+        api.getMessages(id, undefined, 30).catch(() => ({ messages: [], hasMore: false })),
+        api.getSettings(id).catch(() => null),
+        api.presence(id).catch(() => null),
+      ]);
       if (get().loadingServerId !== id) return; // юзер уже переключился
-      engine?.loadHistory(hist);
-      if (hist.length === 0) engine?.sysMsg('Ты на сервере «' + active.name + '». Чат доступен сразу — голос по кнопке «Подключиться».');
-      // ВСЁ загружено → показываем сервер
+      const active: ServerDetail = { ...d.server, myRole: d.myRole, myPerms: d.myPerms };
+      if (settings?.data && (settings.data.users || settings.data.streams)) engine?.setVols(settings.data);
+      engine?.setMembers(d.members);
+      if (pres) engine?.setOnlineHint(pres.online);
+      engine?.loadHistory(hist.messages, hist.hasMore);
+      if (hist.messages.length === 0) engine?.sysMsg('Ты на сервере «' + active.name + '». Чат доступен сразу — голос по кнопке «Подключиться».');
+      // ВСЁ критичное готово → показываем сервер немедленно (не ждём комнату)
       set({ active, members: d.members, loadingServer: false, loadingServerId: null });
-      const poll = async () => {
-        if (get().active?.id !== id) return;
-        try {
-          const [srv, pres] = await Promise.all([api.getServer(id), api.presence(id)]);
-          set({ members: srv.members }); engine?.setMembers(srv.members); engine?.setOnlineHint(pres.online);
-        } catch { /**/ }
-      };
-      memberTimer = window.setInterval(poll, 5000);
       if (!localStorage.getItem('onboardedSrv')) {
         localStorage.setItem('onboardedSrv', '1');
         engine?.sysMsg('👋 Ты в чате, но НЕ в голосовом. Нажми «Подключиться», чтобы говорить. Справа — кто в сети и кто в голосовом.');
       }
+      // WebRTC-коннект к комнате (realtime-чат/голос/пресенс) — В ФОНЕ, не блокирует отрисовку
+      (async () => {
+        try {
+          const tk = await api.serverToken(id);
+          if (get().active?.id !== id) return; // уже ушли с сервера
+          await engine?.connect(tk.url, tk.token, id);
+          if (get().active?.id !== id) engine?.disconnect(); // успели уйти, пока коннектились
+        } catch {
+          if (get().active?.id === id) get().toast('Realtime-связь не поднялась — обнови страницу', 'warn');
+        }
+      })();
+      const poll = async () => {
+        if (get().active?.id !== id) return;
+        try {
+          const [srv, prs] = await Promise.all([api.getServer(id), api.presence(id)]);
+          set({ members: srv.members }); engine?.setMembers(srv.members); engine?.setOnlineHint(prs.online);
+        } catch { /**/ }
+      };
+      memberTimer = window.setInterval(poll, 5000);
     } catch (e: any) { set({ loadingServer: false, loadingServerId: null }); get().toast(e.message, 'err'); get().goHome(); }
   },
 

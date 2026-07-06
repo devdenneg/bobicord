@@ -94,7 +94,14 @@ export const api = {
   getSettings: (id: string) => req<{ data: any }>('GET', `/servers/${id}/settings`),
   putSettings: (id: string, data: any) => req<{ ok: boolean }>('PUT', `/servers/${id}/settings`, { data }),
   presence: (id: string) => req<{ online: string[] }>('GET', `/servers/${id}/presence`),
-  getMessages: (id: string) => req<{ messages: HistoryMessage[] }>('GET', `/servers/${id}/messages`),
+  // курсорная пагинация: before = id строки, старше которой грузить (undefined = последняя страница)
+  getMessages: (id: string, before?: number, limit?: number) => {
+    const qs = new URLSearchParams();
+    if (before) qs.set('before', String(before));
+    if (limit) qs.set('limit', String(limit));
+    const q = qs.toString();
+    return req<{ messages: HistoryMessage[]; hasMore: boolean }>('GET', `/servers/${id}/messages${q ? '?' + q : ''}`);
+  },
   postMessage: (id: string, text: string, em: Record<string, string>, image?: string) => req<{ ok: boolean }>('POST', `/servers/${id}/messages`, { text, em, image }),
   // публичный (без auth) — свежий билд натива для кнопки скачивания в вебе; 404 если билда нет
   appLatest: async (): Promise<{ version: string; url: string } | null> => {
