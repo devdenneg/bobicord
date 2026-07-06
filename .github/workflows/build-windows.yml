@@ -10,6 +10,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # полная история — иначе git rev-list --count HEAD = 1 (shallow) → версия всегда 0.1.1
 
       - uses: actions/setup-node@v4
         with:
@@ -43,6 +45,12 @@ jobs:
           f=apps/native/src-tauri/tauri.conf.json
           tmp=$(mktemp); jq --arg v "${{ steps.ver.outputs.v }}" '.version=$v' "$f" > "$tmp" && mv "$tmp" "$f"
 
+      # Быстрый фейл, если Cargo.lock рассинхронён с манифестами: иначе Tauri молча
+      # пере-локает при сборке, что инвалидирует ключ rust-cache и даёт холодный билд.
+      - name: Verify lockfile
+        working-directory: apps/native/src-tauri
+        run: cargo update --locked --workspace --dry-run
+
       # Собирает фронт (beforeBuildCommand в tauri.conf.json) и упаковывает MSI+NSIS
       # (bundle.targets: "all") + updater-артефакты (createUpdaterArtifacts: true →
       # *-setup.exe + *-setup.exe.sig, подписанные minisign-ключом из секретов).
@@ -51,6 +59,11 @@ jobs:
         run: npm run build --prefix apps/native
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+          # Абсолютные URL для натив-webview: location.host = tauri.localhost (bundle без
+          # reverse-proxy), поэтому REST/WS дерева указываем на прод явно. Vite впекает
+          # VITE_-префиксные из process.env в beforeBuildCommand-сборку веба.
+          VITE_TREE_WS_URL: wss://138-16-170-21.sslip.io/tree
+          VITE_API_BASE_URL: https://138-16-170-21.sslip.io
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
@@ -71,8 +84,35 @@ jobs:
             "platforms": { "windows-x86_64": { "signature": "$sig", "url": "https://138-16-170-21.sslip.io/api/app/$(basename "$exe")" } } }
           EOF
 
-      # Заливаем на VPS в том, смонтированный в server (/app/data/releases). rm:true чистит
-      # старые exe — клиент всегда берёт url из свежего latest.json. SSH-секреты — как в deploy.yml.
+      # Payload (exe + latest.json) отдаём как артефакт — заливку на VPS делает
+      # отдельный job `upload` на ubuntu (appleboy/scp-action — Docker-контейнер-экшен,
+      # НЕ работает на windows-раннере: "Container action is only supported on Linux").
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-payload
+          path: out/*
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RelayApp-windows
+          path: |
+            apps/native/src-tauri/target/release/bundle/msi/*.msi
+            apps/native/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+  # Заливка на VPS в том, смонтированный в server (/app/data/releases). Отдельный
+  # ubuntu-job, т.к. scp-action контейнерный (на windows не запускается). rm:true чистит
+  # старые exe — клиент всегда берёт url из свежего latest.json. SSH-секреты — как в deploy.yml.
+  upload:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-payload
+          path: out
+
       - name: Upload to VPS
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -83,11 +123,3 @@ jobs:
           target: /opt/voice/data/releases
           strip_components: 1
           rm: true
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: RelayApp-windows
-          path: |
-            apps/native/src-tauri/target/release/bundle/msi/*.msi
-            apps/native/src-tauri/target/release/bundle/nsis/*.exe
-          if-no-files-found: error

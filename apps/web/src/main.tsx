@@ -7,7 +7,7 @@ import { api, getToken, setToken } from './api';
 import { loadGlobalEmotes } from './emotes';
 import { isTauri, pingNative } from './native';
 import { watchForUpdates } from './version';
-import { checkNativeUpdate } from './nativeUpdate';
+import { checkNativeUpdate, startNativeUpdatePolling } from './nativeUpdate';
 import { applyStoredTheme } from './theme';
 
 applyStoredTheme(); // применить сохранённую тему до первого рендера
@@ -18,7 +18,8 @@ if (isTauri) pingNative().then((r) => console.log('[native] ipc bridge:', r)).ca
 
 createRoot(document.getElementById('root')!).render(<StrictMode><App /></StrictMode>);
 watchForUpdates();
-checkNativeUpdate();
+checkNativeUpdate(); // разовая проверка на старте
+startNativeUpdatePolling(30_000); // + поллинг раз в 30с, стоп после первой находки
 
 // boot: resume session + handle invite deep-link
 (async function boot() {

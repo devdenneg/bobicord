@@ -21,10 +21,31 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType};
+use webrtc::stats::StatsReportType;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
 use super::signaling::TreeCmd;
+
+/// Качество линка к пиру из RTCP RR (Evolution-TZ Э8 ABR + best-peer). `get_stats()` даёт
+/// `RemoteInboundRTP` — взгляд отправителя на приём удалённой стороны. webrtc-rs уже
+/// нормализует: `fraction_lost` = raw/255 (доля 0..1), `round_trip_time` — в МИЛЛИСЕКУНДАХ
+/// (не секундах, см. interceptor/stats/interceptor.rs). Берём худшее по видео+аудио (один
+/// сетевой путь) — консервативно для ABR. `None`, пока не пришёл первый RR (нет RemoteInboundRTP).
+pub async fn read_link_stats(pc: &RTCPeerConnection) -> Option<(f64, f64)> {
+    let report = pc.get_stats().await;
+    let mut loss = 0.0_f64;
+    let mut rtt = 0.0_f64;
+    let mut seen = false;
+    for stat in report.reports.values() {
+        if let StatsReportType::RemoteInboundRTP(r) = stat {
+            seen = true;
+            if r.fraction_lost.is_finite() { loss = loss.max(r.fraction_lost); }
+            if let Some(t) = r.round_trip_time { if t.is_finite() { rtt = rtt.max(t); } }
+        }
+    }
+    seen.then_some((loss, rtt))
+}
 
 /// H.264 baseline, packetization-mode=1, без B-кадров (инвариант CLAUDE.md 4) —
 /// та же профильная строка, что фиксирует `MF_MT_MPEG2_PROFILE` энкодера.
@@ -206,6 +227,18 @@ impl PeerManager {
 
     pub fn child_count(&self) -> usize { self.children.len() }
     pub fn child_ids(&self) -> Vec<String> { self.children.keys().cloned().collect() }
+
+    /// `(child_id, loss 0..1, rtt_ms)` по каждому прямому ребёнку — отчёт серверу для ABR
+    /// и best-peer скоринга. Дети без RR (соединение ещё поднимается) пропускаются.
+    pub async fn link_stats(&self) -> Vec<(String, f64, f64)> {
+        let mut out = Vec::with_capacity(self.children.len());
+        for (id, pc) in &self.children {
+            if let Some((loss, rtt)) = read_link_stats(pc).await {
+                out.push((id.clone(), loss, rtt));
+            }
+        }
+        out
+    }
 
     pub fn send_stats(&self, to_child: Vec<Value>, available_outgoing: u32) -> Result<(), String> {
         self.cmd_tx.send(TreeCmd::Stats { to_child, available_outgoing }).map_err(|e| e.to_string())

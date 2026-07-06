@@ -11,15 +11,20 @@ pub mod relay;
 pub mod signaling;
 pub mod stats;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Нижняя полка ABR (Evolution-TZ Э8): ниже неё качество бессмысленно, лучше рвать
+/// зрителя репарентом. Верхняя полка — выбранный вещателем битрейт (config.bitrate_bps).
+const BITRATE_FLOOR: u32 = 800_000;
 
 use bytes::Bytes;
 use serde_json::json;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 use webrtc::media::Sample;
+use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use windows::Win32::Media::MediaFoundation::{MFShutdown, MFStartup, MFSTARTUP_FULL, MFSTARTUP_NOSOCKET, MF_VERSION};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
@@ -36,7 +41,11 @@ pub struct StreamConfig {
     pub max_width: u32,
     pub max_height: u32,
     pub fps: u32,
+    /// Э8: при auto_bitrate=true — потолок ABR (сервер адаптирует вниз под худший линк);
+    /// при false — фиксированный битрейт (сервер не шлёт set-bitrate, см. join.abr).
     pub bitrate_bps: u32,
+    /// Э8 ABR: включить авто-адаптацию битрейта под сеть дерева.
+    pub auto_bitrate: bool,
     /// По умолчанию `ExcludeSelfViaInclude` — авто: INCLUDE-клиент на каждый не-наш
     /// аудио-процесс, микс (надёжно «всё кроме RelayApp», см. audio.rs).
     /// `IncludeProcess(pid)` — ручной override на один процесс.
@@ -47,11 +56,20 @@ pub struct StreamConfig {
 }
 
 pub struct BroadcastHandle {
-    cap_stop: Arc<AtomicBool>,
     enc_stop: Arc<AtomicBool>,
-    audio_stop: Arc<AtomicBool>,
     shutdown_tx: mpsc::UnboundedSender<Option<String>>,
+    /// Только энкодерный поток. Захват и аудио джойнятся через свои супервайзеры
+    /// (у них своя жизнь сессий — смена источника на лету, Э5.3).
     threads: Vec<std::thread::JoinHandle<()>>,
+    /// Держит канал захвата и переключает под ним WGC-сессии (смена монитора/окна
+    /// без пересоздания дерева/треков).
+    cap_sup: Arc<std::sync::Mutex<capture::CaptureSupervisor>>,
+    /// Держит аудио-трек и переключает под ним WASAPI-сессии (звук следует за источником).
+    audio_sup: Arc<std::sync::Mutex<AudioSupervisor>>,
+    /// Форс IDR после свитча — чтобы новый контент декодировался у зрителей сразу.
+    force_keyframe: Arc<AtomicBool>,
+    /// Подпись источника для дебаг-панели; обновляется при смене источника на лету.
+    source_label: Arc<std::sync::Mutex<String>>,
     /// Снимается run_signaling_loop сам, в конце (и при штатном стопе, и при
     /// фатальном отказе энкодера/захвата) — до её появления `stop_broadcast`
     /// с фронта был единственным способом снять "уже вещаем" с Tauri-состояния
@@ -65,14 +83,96 @@ pub struct BroadcastHandle {
 impl BroadcastHandle {
     pub fn is_alive(&self) -> bool { self.alive.load(Ordering::Relaxed) }
 
+    /// Смена источника видео (и звука) на лету без пересоздания дерева/треков (Э5.3).
+    /// Валидация нового источника — синхронно внутри `switch`; при ошибке текущая
+    /// трансляция продолжается на старом источнике.
+    pub async fn set_source(&self, source: CaptureSource, audio: AudioSource) -> Result<(), String> {
+        let cs = self.cap_sup.clone();
+        // spawn_blocking: switch джойнит поток старой WGC-сессии — нельзя на tokio-воркере.
+        tokio::task::spawn_blocking(move || cs.lock().unwrap().switch(source))
+            .await
+            .map_err(|e| format!("switch join: {e}"))??;
+        let a = self.audio_sup.clone();
+        let _ = tokio::task::spawn_blocking(move || a.lock().unwrap().switch(audio)).await;
+        *self.source_label.lock().unwrap() = describe_source(&source);
+        self.force_keyframe.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
     pub async fn stop(mut self) {
-        self.cap_stop.store(true, Ordering::Relaxed);
+        {
+            let cs = self.cap_sup.clone();
+            let _ = tokio::task::spawn_blocking(move || cs.lock().unwrap().stop()).await;
+        }
+        {
+            let a = self.audio_sup.clone();
+            let _ = tokio::task::spawn_blocking(move || a.lock().unwrap().stop()).await;
+        }
         self.enc_stop.store(true, Ordering::Relaxed);
-        self.audio_stop.store(true, Ordering::Relaxed);
         let _ = self.shutdown_tx.send(None); // штатный стоп по кнопке — без причины
         for t in self.threads.drain(..) {
             let _ = tokio::task::spawn_blocking(move || t.join()).await;
         }
+    }
+}
+
+/// Одна WASAPI-сессия захвата звука в отдельном потоке (COM/WASAPI блокирующие —
+/// не гонять на tokio-воркере). Пишет в переданный трек. См. AudioSupervisor.
+fn spawn_audio_session(
+    source: AudioSource,
+    track: Arc<TrackLocalStaticSample>,
+    rt: tokio::runtime::Handle,
+) -> (std::thread::JoinHandle<()>, Arc<AtomicBool>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let handle = std::thread::spawn(move || {
+        // RELAYAPP_DISABLE_AUDIO=1 — аварийный выключатель для отладки видео-пути
+        // отдельно от звука; по умолчанию звук игры/системы идёт в стрим (см. audio.rs).
+        if std::env::var("RELAYAPP_DISABLE_AUDIO").is_ok() {
+            log::warn!("audio: отключено через RELAYAPP_DISABLE_AUDIO");
+            while !stop2.load(Ordering::Relaxed) { std::thread::sleep(Duration::from_millis(100)); }
+            return;
+        }
+        unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
+        let frame_dur = Duration::from_millis(20);
+        let result = audio::run_capture_loop(stop2, source, |chunk| {
+            let sample = Sample { data: Bytes::from(chunk.data), duration: frame_dur, ..Default::default() };
+            let track = track.clone();
+            rt.block_on(async { let _ = track.write_sample(&sample).await; });
+        });
+        if let Err(e) = result {
+            log::error!("audio: capture loop failed: {e}");
+        }
+        log::info!("audio thread stopped");
+    });
+    (handle, stop)
+}
+
+/// Держит аудио-трек на всю трансляцию и переключает под ним WASAPI-сессии — звук
+/// следует за источником видео (монитор -> ExcludeSelf, окно -> его PID) и меняется
+/// при смене источника на лету, не трогая трек/дерево.
+struct AudioSupervisor {
+    track: Arc<TrackLocalStaticSample>,
+    rt: tokio::runtime::Handle,
+    cur: Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)>,
+}
+
+impl AudioSupervisor {
+    fn start(&mut self, source: AudioSource) {
+        self.cur = Some(spawn_audio_session(source, self.track.clone(), self.rt.clone()));
+    }
+    fn stop_current(&mut self) {
+        if let Some((handle, stop)) = self.cur.take() {
+            stop.store(true, Ordering::Relaxed);
+            let _ = handle.join();
+        }
+    }
+    fn switch(&mut self, source: AudioSource) {
+        self.stop_current();
+        self.start(source);
+    }
+    fn stop(&mut self) {
+        self.stop_current();
     }
 }
 
@@ -99,8 +199,13 @@ pub async fn start(
     source: CaptureSource,
     config: StreamConfig,
 ) -> Result<BroadcastHandle, String> {
-    let StreamConfig { max_width, max_height, fps, bitrate_bps, audio_source, max_direct_children } = config;
-    let source_label = describe_source(&source);
+    let StreamConfig { max_width, max_height, fps, bitrate_bps, auto_bitrate, audio_source, max_direct_children } = config;
+    // Разделяемая подпись источника — обновляется при смене источника на лету (set_source).
+    let source_label = Arc::new(std::sync::Mutex::new(describe_source(&source)));
+    // ABR (Э8): живая цель битрейта. Стартует с выбранного пользователем значения (оно же —
+    // потолок ceiling), сервер шлёт вниз set-bitrate под худший линк дерева. Читается
+    // энкодер-потоком, пишется signaling-циклом. bitrate_bps остаётся потолком для clamp.
+    let target_bitrate = Arc::new(AtomicU32::new(bitrate_bps));
     let stats: StatsHandle = Arc::new(SharedStats::default());
     // Создаём здесь (не в конце функции, как раньше) — encoder_thread должен уметь
     // сам инициировать остановку всей трансляции при фатальной ошибке (MFStartup,
@@ -109,12 +214,18 @@ pub async fn start(
     // ("уже вещаем" на повторном старте) — фронтенд о смерти потока не узнавал.
     let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
 
-    let (cap_handle, cap_stop, cap_rx) = capture::spawn_capture(source, max_width, max_height, fps, stats.clone())?;
+    // Захват через супервайзер: он держит канал, под которым можно менять WGC-сессии
+    // (монитор/окно) на лету — энкодер и WebRTC-треки этого не замечают (Э5.3).
+    let (mut cap_sup, cap_rx) = capture::CaptureSupervisor::new(max_width, max_height, fps, stats.clone(), shutdown_tx.clone());
+    cap_sup.start(source)?; // синхронная валидация источника — ошибка уйдёт caller'у сразу
+    let cap_sup = Arc::new(std::sync::Mutex::new(cap_sup));
 
     let force_keyframe = Arc::new(AtomicBool::new(true));
     let join = signaling::JoinParams {
         stream_id: stream_id.clone(), identity, server_id,
         role: "broadcaster", native: true, max_children: max_direct_children,
+        max_bitrate: bitrate_bps, // потолок ABR = выбранный пользователем битрейт
+        abr: auto_bitrate,
     };
     let (cmd_tx, evt_rx) = signaling::connect(ws_url, join);
 
@@ -128,6 +239,7 @@ pub async fn start(
     let force_keyframe_enc = force_keyframe.clone();
     let stats_enc = stats.clone();
     let shutdown_tx_enc = shutdown_tx.clone();
+    let target_bitrate_enc = target_bitrate.clone();
 
     let encoder_thread = std::thread::spawn(move || {
         unsafe {
@@ -202,7 +314,10 @@ pub async fn start(
                     log::debug!("encoder: skip 0x0 frame (source not ready yet)");
                     continue;
                 }
-                match encoder::H264Encoder::new(frame.width, frame.height, fps, bitrate_bps, force_keyframe_enc.clone()) {
+                // Берём живую цель, не замороженный bitrate_bps: после ресайза окна MFT
+                // пересоздаётся и должен подхватить уже адаптированный ABR-битрейт.
+                let start_bitrate = target_bitrate_enc.load(Ordering::Relaxed);
+                match encoder::H264Encoder::new(frame.width, frame.height, fps, start_bitrate, force_keyframe_enc.clone()) {
                     Ok(e) => { force_keyframe_enc.store(true, Ordering::Relaxed); enc = Some((e, frame.width, frame.height)); }
                     Err(e) => {
                         log::error!("encoder: init failed: {e}");
@@ -212,6 +327,8 @@ pub async fn start(
                 }
             }
             let (encoder_ref, _enc_w, _enc_h) = enc.as_mut().expect("initialized above");
+            // ABR: подхватываем цель, присланную сервером (set_bitrate — no-op на неизменной).
+            encoder_ref.set_bitrate(target_bitrate_enc.load(Ordering::Relaxed));
             let real_dur = match prev_captured_at {
                 Some(prev) => frame.captured_at.saturating_duration_since(prev).clamp(frame_dur / 4, Duration::from_secs(2)),
                 None => frame_dur,
@@ -248,49 +365,36 @@ pub async fn start(
         unsafe { let _ = MFShutdown(); CoUninitialize(); }
     });
 
-    let audio_stop = Arc::new(AtomicBool::new(false));
-    let audio_stop2 = audio_stop.clone();
-    let rt_handle_audio = tokio::runtime::Handle::current();
-    let _ = &audio_track;
-    let audio_thread = std::thread::spawn(move || {
-        // RELAYAPP_DISABLE_AUDIO=1 — аварийный выключатель для отладки видео-пути
-        // отдельно от звука; по умолчанию звук игры/системы идёт в стрим (см. audio.rs).
-        if std::env::var("RELAYAPP_DISABLE_AUDIO").is_ok() {
-            log::warn!("audio: отключено через RELAYAPP_DISABLE_AUDIO");
-            while !audio_stop2.load(Ordering::Relaxed) { std::thread::sleep(Duration::from_millis(100)); }
-            return;
-        }
-        unsafe { let _ = windows::Win32::System::Com::CoInitializeEx(None, COINIT_MULTITHREADED); }
-        let frame_dur = Duration::from_millis(20);
-        let result = audio::run_capture_loop(audio_stop2, audio_source, |chunk| {
-            let sample = Sample { data: Bytes::from(chunk.data), duration: frame_dur, ..Default::default() };
-            let track = audio_track.clone();
-            rt_handle_audio.block_on(async { let _ = track.write_sample(&sample).await; });
-        });
-        if let Err(e) = result {
-            log::error!("audio: capture loop failed: {e}");
-        }
-        log::info!("audio thread stopped");
-    });
+    // Аудио через супервайзер: держит трек, под ним меняются WASAPI-сессии (звук
+    // следует за источником и переключается на лету вместе с видео).
+    let mut audio_sup = AudioSupervisor {
+        track: audio_track,
+        rt: tokio::runtime::Handle::current(),
+        cur: None,
+    };
+    audio_sup.start(audio_source);
+    let audio_sup = Arc::new(std::sync::Mutex::new(audio_sup));
 
     let alive = Arc::new(AtomicBool::new(true));
     let alive_loop = alive.clone();
-    let meta = DebugMeta { stream_id, source_label, target_fps: fps, target_bitrate_bps: bitrate_bps };
-    tokio::spawn(run_signaling_loop(mgr, evt_rx, shutdown_rx, app, stats, meta, alive_loop, force_keyframe.clone()));
+    let meta = DebugMeta { stream_id, source_label: source_label.clone(), target_fps: fps, target_bitrate_bps: bitrate_bps };
+    tokio::spawn(run_signaling_loop(mgr, evt_rx, shutdown_rx, app, stats, meta, alive_loop, force_keyframe.clone(), target_bitrate));
 
     Ok(BroadcastHandle {
-        cap_stop,
         enc_stop,
-        audio_stop,
         shutdown_tx,
-        threads: vec![cap_handle, encoder_thread, audio_thread],
+        threads: vec![encoder_thread],
+        cap_sup,
+        audio_sup,
+        force_keyframe,
+        source_label,
         alive,
     })
 }
 
 struct DebugMeta {
     stream_id: String,
-    source_label: String,
+    source_label: Arc<std::sync::Mutex<String>>,
     target_fps: u32,
     target_bitrate_bps: u32,
 }
@@ -322,13 +426,16 @@ async fn run_signaling_loop(
     meta: DebugMeta,
     alive: Arc<AtomicBool>,
     force_keyframe: Arc<AtomicBool>,
+    target_bitrate: Arc<AtomicU32>,
 ) {
     let mut stats_tick = tokio::time::interval(Duration::from_secs(2));
     let mut prev_at = Instant::now();
     let (mut prev_cap, mut prev_enc, mut prev_bytes) = (0u64, 0u64, 0u64);
     // Причина самостоятельной остановки — раньше фронт узнавал только "трансляция
     // умерла", без "почему", и молча откатывался в форму настроек (см. StopInfo ниже).
-    let mut stop_reason: Option<String> = None;
+    // Присваивается только на выходных ветках (break), поэтому без инициализатора —
+    // иначе `None` был бы мёртвым присваиванием (warning unused_assignments).
+    let stop_reason: Option<String>;
     loop {
         tokio::select! {
             evt = evt_rx.recv() => {
@@ -340,6 +447,12 @@ async fn run_signaling_loop(
                     Some(TreeEvent::DropPeer { peer_id }) => mgr.on_drop_peer(peer_id).await,
                     // Э8: relay-узел ниже по дереву просит IDR для нового зрителя — форсим.
                     Some(TreeEvent::RequestKeyframe) => force_keyframe.store(true, Ordering::Relaxed),
+                    // Э8 ABR: сервер прислал целевой битрейт под худший линк дерева. Clamp
+                    // в [FLOOR, потолок] — сервер уже клампит, но не доверяем сети вслепую.
+                    Some(TreeEvent::SetBitrate { bps }) => {
+                        let clamped = bps.clamp(BITRATE_FLOOR, meta.target_bitrate_bps);
+                        target_bitrate.store(clamped, Ordering::Relaxed);
+                    }
                     // Корень не имеет родителя — эти события к нему не относятся.
                     Some(TreeEvent::AssignParent { .. }) | Some(TreeEvent::SdpOffer { .. }) | Some(TreeEvent::Topology { .. }) => {}
                     Some(TreeEvent::Closed) | None => {
@@ -356,25 +469,27 @@ async fn run_signaling_loop(
                 let bytes = stats.encoded_bytes.load(Ordering::Relaxed);
                 let snapshot = DebugSnapshot {
                     stream_id: meta.stream_id.clone(),
-                    source: meta.source_label.clone(),
+                    source: meta.source_label.lock().unwrap().clone(),
                     width: stats.out_width.load(Ordering::Relaxed),
                     height: stats.out_height.load(Ordering::Relaxed),
                     target_fps: meta.target_fps,
                     capture_fps: (cap - prev_cap) as f64 / dt,
                     encoder_fps: (enc - prev_enc) as f64 / dt,
                     dropped_frames: stats.capture_drops.load(Ordering::Relaxed),
-                    bitrate_target_bps: meta.target_bitrate_bps,
+                    bitrate_target_bps: target_bitrate.load(Ordering::Relaxed),
                     bitrate_actual_bps: (bytes - prev_bytes) as f64 * 8.0 / dt,
                     children: mgr.child_count(),
                 };
                 prev_at = now; prev_cap = cap; prev_enc = enc; prev_bytes = bytes;
                 if let Some(app) = &app { let _ = app.emit("relay-broadcast-stats", &snapshot); }
 
-                let to_child: Vec<serde_json::Value> = mgr.child_ids().into_iter()
-                    .map(|id| json!({ "id": id, "bitrate": meta.target_bitrate_bps, "rtt": 0, "loss": 0 }))
+                // Э8 ABR: реальные loss/rtt по каждому детскому линку (RTCP RR через get_stats) —
+                // сервер агрегирует worst-link по дереву и решает целевой битрейт. Раньше слали нули.
+                let cur_target = target_bitrate.load(Ordering::Relaxed);
+                let to_child: Vec<serde_json::Value> = mgr.link_stats().await.into_iter()
+                    .map(|(id, loss, rtt)| json!({ "id": id, "bitrate": cur_target, "rtt": rtt, "loss": loss }))
                     .collect();
-                // Сервер сейчас (Э1) принимает и игнорирует stats — задел на Э8 ребаланс.
-                let _ = mgr.send_stats(to_child, meta.target_bitrate_bps);
+                let _ = mgr.send_stats(to_child, cur_target);
             }
             reason = shutdown_rx.recv() => {
                 stop_reason = reason.flatten();

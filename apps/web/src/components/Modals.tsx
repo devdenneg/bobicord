@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Room } from 'livekit-client';
-import { api, resolveUploadUrl } from '../api';
+import { api, resolveUploadUrl, webOrigin } from '../api';
 import { useStore, getEngine } from '../store';
 import { getSettings, setSettings } from '../settings';
 import { THEMES, getTheme, setTheme } from '../theme';
@@ -152,7 +152,7 @@ function InviteModal() {
   const [link, setLink] = useState(''); const [expires, setExpires] = useState(0); const [busy, setBusy] = useState(false); const [left, setLeft] = useState('');
   async function gen() {
     setBusy(true);
-    try { const d = await api.createInvite(active.id); setLink(location.origin + '/?invite=' + d.code); setExpires(d.expires); }
+    try { const d = await api.createInvite(active.id); setLink(webOrigin() + '/?invite=' + d.code); setExpires(d.expires); }
     catch (e: any) { useStore.getState().toast(e.message, 'err'); } finally { setBusy(false); }
   }
   useEffect(() => { gen(); /* eslint-disable-next-line */ }, [active.id]);

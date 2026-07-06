@@ -356,7 +356,7 @@ pub fn start(
 ) -> RelayHandle {
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<RelayControl>();
 
-    let join = JoinParams { stream_id: stream_id.clone(), identity, server_id, role: "viewer", native: true, max_children };
+    let join = JoinParams { stream_id: stream_id.clone(), identity, server_id, role: "viewer", native: true, max_children, max_bitrate: 0, abr: false };
     let (cmd_tx, mut evt_rx) = signaling::connect(ws_url, join);
 
     tokio::spawn(async move {
@@ -380,6 +380,7 @@ pub fn start(
                         Some(TreeEvent::Ice { from, candidate }) => mgr.on_ice(from, candidate).await,
                         Some(TreeEvent::DropPeer { peer_id }) => mgr.on_drop_peer(peer_id).await,
                         Some(TreeEvent::RequestKeyframe) => { /* relay не энкодит — игнор */ }
+                        Some(TreeEvent::SetBitrate { .. }) => { /* relay не энкодит — битрейт задаёт корень */ }
                         Some(TreeEvent::Topology { payload }) => { if let Some(app) = &mgr.app { let _ = app.emit("relay-topology", payload); } }
                         Some(TreeEvent::Closed) | None => break,
                     }
@@ -393,10 +394,16 @@ pub fn start(
                     }
                 }
                 _ = stats_tick.tick() => {
-                    // Задел на само-репарент по деградации (Э8): здесь читать webrtc-stats
-                    // upstream (loss/rtt), при устойчивой деградации слать RequestReparent{None}.
+                    // Э8: реальные loss/rtt по каждому детскому линку (RTCP RR через get_stats) —
+                    // сервер агрегирует worst-link по дереву (ABR-битрейт вещателю) и кормит ими
+                    // best-peer скоринг репарента. Раньше слали нули (заглушка).
                     let out = if max_children > 0 { 8_000_000 } else { 0 };
-                    let to_child: Vec<Value> = mgr.children.keys().map(|id| json!({"id": id, "bitrate": 0, "rtt": 0, "loss": 0})).collect();
+                    let mut to_child: Vec<Value> = Vec::with_capacity(mgr.children.len());
+                    for (id, pc) in &mgr.children {
+                        if let Some((loss, rtt)) = super::peer::read_link_stats(pc).await {
+                            to_child.push(json!({ "id": id, "bitrate": 0, "rtt": rtt, "loss": loss }));
+                        }
+                    }
                     let _ = mgr.cmd_tx.send(TreeCmd::Stats { to_child, available_outgoing: out });
                 }
             }

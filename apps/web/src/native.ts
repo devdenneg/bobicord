@@ -30,7 +30,10 @@ export interface StreamConfig {
   maxWidth: number;
   maxHeight: number;
   fps: number;
+  /** Э8: при autoBitrate — потолок ABR; иначе фиксированный битрейт. */
   bitrateBps: number;
+  /** Э8 ABR: авто-адаптация битрейта под сеть дерева (по умолчанию вкл). */
+  autoBitrate?: boolean;
   /** PID процесса для ручного WASAPI INCLUDE (только его звук в стрим). `undefined` =
    *  авто-режим «всё кроме RelayApp» (INCLUDE-клиент на каждый не-наш процесс + микс,
    *  см. audio.rs / CLAUDE.md инвариант 6). */
@@ -76,7 +79,10 @@ export async function onBroadcastStopped(cb: (info: BroadcastStopInfo) => void):
 /// bundle грузится без reverse-proxy), плюс session-JWT в query.
 function treeWsUrl(): string {
   const override = (import.meta as any).env?.VITE_TREE_WS_URL as string | undefined;
-  const base = override || ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/tree');
+  // В нативе location.host = tauri://localhost (нет reverse-proxy) — тот же дефолт на
+  // прод-сервер, что и API_BASE в api.ts (см. там). Явный VITE_TREE_WS_URL переопределяет.
+  const nativeDefault = isTauri ? 'wss://138-16-170-21.sslip.io/tree' : null;
+  const base = override || nativeDefault || ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/tree');
   const token = getToken() || '';
   return base + (base.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
 }
@@ -86,9 +92,17 @@ export async function startNativeBroadcast(streamId: string, identity: string, s
   await invoke('start_broadcast', {
     streamId, wsUrl: treeWsUrl(), identity, serverId,
     source: config.source, maxWidth: config.maxWidth, maxHeight: config.maxHeight, fps: config.fps, bitrateBps: config.bitrateBps,
+    autoBitrate: config.autoBitrate ?? true,
     audioTargetPid: config.audioTargetPid ?? null,
     maxDirectChildren: config.maxDirectChildren ?? null,
   });
+}
+
+/** Э5.3: смена источника (и звука) на лету — без остановки трансляции, дерево зрителей
+ *  и WebRTC-треки живут дальше. `audioTargetPid` undefined = WASAPI EXCLUDE-режим. */
+export async function setNativeBroadcastSource(source: CaptureSource, audioTargetPid?: number): Promise<void> {
+  const { invoke } = await import('@tauri-apps/api/core');
+  await invoke('set_broadcast_source', { source, audioTargetPid: audioTargetPid ?? null });
 }
 
 export async function stopNativeBroadcast(): Promise<void> {

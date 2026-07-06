@@ -2,7 +2,7 @@
 // encoder, no webrtc/signaling/tokio at all, to isolate the remaining crash.
 use app_lib::broadcast::capture;
 use app_lib::broadcast::encoder::H264Encoder;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 use windows::Win32::Media::MediaFoundation::{MFStartup, MFSTARTUP_FULL, MFSTARTUP_NOSOCKET, MF_VERSION};
@@ -15,7 +15,9 @@ fn main() {
     }
     let source = capture::CaptureSource::Monitor { index: 1 };
     let stats = Arc::new(app_lib::broadcast::stats::SharedStats::default());
-    let (handle, stop, rx) = capture::spawn_capture(source, 1920, 1080, 30, stats).expect("spawn_capture");
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (mut sup, rx) = capture::CaptureSupervisor::new(1920, 1080, 30, stats, shutdown_tx);
+    sup.start(source).expect("start capture");
     let force_keyframe = Arc::new(AtomicBool::new(true));
     let mut enc = H264Encoder::new(1920, 1080, 30, 6_000_000, force_keyframe).expect("encoder new");
     println!("encoder ready, capturing+encoding for 10s...");
@@ -33,8 +35,7 @@ fn main() {
             Err(_) => println!("(no frame)"),
         }
     }
-    stop.store(true, Ordering::Relaxed);
+    sup.stop();
     drop(rx);
-    let _ = handle.join();
     println!("done, {n} frames encoded");
 }

@@ -16,6 +16,19 @@ const BROWSER_CAPACITY = 0;   // дефолт для браузера: лист 
 const MAX_CHILDREN_CAP = 8;   // жёсткий потолок на объявленную ёмкость (защита от абьюза)
 const REPARENT_COOLDOWN_MS = 10_000; // гистерезис авто-миграции — не мигрировать чаще
 
+// Э8 ABR: сервер держит целевой битрейт дерева и шлёт его корню (set-bitrate). Управление —
+// loss/RTT-based AIMD по худшему линку дерева (истинный GCC-BWE в webrtc-rs незрел). Единый
+// passthrough-энкод: один медленный зритель тянет всех вниз — это компромисс, лечится репарентом.
+const ABR_FLOOR = 800_000;         // нижняя полка (совпадает с BITRATE_FLOOR в натив mod.rs)
+const ABR_DEFAULT_MAX = 6_000_000; // если вещатель не прислал maxBitrate (старый клиент)
+const ABR_TICK_MS = 2_000;         // темп пересчёта (совпадает со stats-тиком узлов)
+const ABR_LOSS_HI = 0.10;          // худший линк >10% потерь → быстрый спад
+const ABR_LOSS_LO = 0.02;          // <2% потерь и низкий RTT → медленная проба вверх
+const ABR_RTT_HI = 600;            // мс — порог деградации по задержке
+const ABR_RTT_LO = 300;            // мс — «здоровый» RTT для подъёма
+const ABR_DOWN = 0.85;             // мультипликативное снижение
+const ABR_HYSTERESIS = 0.05;       // не слать корню, пока изменение цели <5%
+
 function newPeerId() { return 'p_' + crypto.randomBytes(6).toString('hex'); }
 
 class Tree {
@@ -23,7 +36,9 @@ class Tree {
 }
 
 class TreeManager {
-  constructor() { this.trees = new Map(); }
+  // turnEnabled: с TURN симметричный NAT НЕ рубит relay-ёмкость (обе стороны берут
+  // relay-кандидаты, узел достижим как offerer). Без TURN — симметричный узел лист.
+  constructor(turnEnabled = false) { this.trees = new Map(); this.turnEnabled = turnEnabled; }
 
   tree(streamId) {
     let t = this.trees.get(streamId);
@@ -37,7 +52,7 @@ class TreeManager {
   // и браузер-relay сообщают свою ёмкость сами), с потолком MAX_CHILDREN_CAP. Fallback на
   // старые константы, если maxChildren не пришёл (обратная совместимость).
   capacityOf(node) {
-    if (node.symmetricNat) return 0;
+    if (node.symmetricNat && !this.turnEnabled) return 0; // без TURN симметричный = лист
     if (typeof node.maxChildren === 'number') return Math.max(0, Math.min(node.maxChildren, MAX_CHILDREN_CAP));
     return node.native ? NATIVE_CAPACITY : BROWSER_CAPACITY;
   }
@@ -74,7 +89,12 @@ class TreeManager {
     const outBonus = Math.min(cand.availableOutgoing || 0, 20_000_000) / 1_000_000; // Мбит выхода
     const lossCost = (cand.linkLoss || 0) * 50;         // потери на входящем линке кандидата
     const rttCost = (cand.linkRtt || 0) / 20;
-    return depthCost + loadCost + lossCost + rttCost - outBonus;
+    // Симметричный NAT как РОДИТЕЛЬ = offerer через TURN-relay: работает только при живом TURN,
+    // выше задержка (двойной relay), хрупко. Штраф > стоимости уровня (250 > depth*100), чтобы
+    // не-симметричный узел даже на уровень глубже предпочитался — симметричный берём в родители
+    // лишь когда другого relay нет вовсе (тогда capacityOf уже гарантировал наличие TURN).
+    const natCost = cand.symmetricNat ? 250 : 0;
+    return depthCost + loadCost + lossCost + rttCost + natCost - outBonus;
   }
 
   // Best-peer: среди всех узлов дерева со свободной ёмкостью и depth+1 <= MAX_DEPTH выбираем
@@ -104,6 +124,7 @@ class TreeManager {
     if (node.role === 'broadcaster') {
       t.broadcasterId = node.id;
       node.parent = null; node.depth = 0;
+      t.targetBitrate = null; t.lastSentBitrate = 0; // сброс ABR под нового вещателя
       return { parent: null };
     }
     const parent = this.pickParent(t, node);
@@ -200,6 +221,64 @@ class TreeManager {
     return { reparented, dropped: [], broadcasterLost: false };
   }
 
+  // Сироты: зрители, джойнившиеся когда свободного родителя не было (pickParent -> null,
+  // parent=null, не вещатель) — раньше висели навсегда, т.к. leave() репарентит только детей
+  // ушедшего, а не глобальных сирот. Вызывается после join/leave/reparent (ёмкость могла
+  // появиться). Многопроходно: разместив relay-способного сироту, он сам даёт слот следующему
+  // — так дерево ветвится (кейс лимита прямых=1, где 2-й зритель обязан идти через 1-го).
+  // Возвращает [{node, parentId}] для рассылки assign-parent/assign-child.
+  placeOrphans(streamId) {
+    const t = this.trees.get(streamId);
+    if (!t || !t.broadcasterId) return [];
+    const placed = [];
+    let progress = true;
+    while (progress) {
+      progress = false;
+      for (const node of t.nodes.values()) {
+        if (node.id === t.broadcasterId || node.parent) continue;
+        const parent = this.pickParent(t, node);
+        if (!parent) continue;
+        node.parent = parent.id;
+        node.depth = parent.depth + 1;
+        parent.children.push(node.id);
+        placed.push({ node, parentId: parent.id });
+        progress = true;
+      }
+    }
+    return placed;
+  }
+
+  // Э8 ABR: пересчёт целевого битрейта дерева по худшему линку (loss/RTT-based AIMD).
+  // Каждый линк покрыт stats-репортом его родителя (broadcaster→прямые дети, relay→дети),
+  // так что скан linkLoss/linkRtt по всем узлам видит все линки. Возвращает
+  // {broadcasterId, bitrate}, если цель сменилась заметно (гистерезис), иначе null.
+  abrTick(streamId) {
+    const t = this.trees.get(streamId);
+    if (!t || !t.broadcasterId) return null;
+    const bc = t.nodes.get(t.broadcasterId);
+    if (!bc || !bc.abr) return null; // авто-адаптация выключена вещателем → статичный битрейт
+    const ceil = bc.maxBitrate > 0 ? bc.maxBitrate : ABR_DEFAULT_MAX;
+    if (t.targetBitrate == null) t.targetBitrate = ceil; // старт оптимистично с потолка
+    let worstLoss = 0, worstRtt = 0;
+    for (const n of t.nodes.values()) {
+      if ((n.linkLoss || 0) > worstLoss) worstLoss = n.linkLoss;
+      if ((n.linkRtt || 0) > worstRtt) worstRtt = n.linkRtt;
+    }
+    let target = t.targetBitrate;
+    if (worstLoss > ABR_LOSS_HI || worstRtt > ABR_RTT_HI) {
+      target = Math.max(ABR_FLOOR, Math.floor(target * ABR_DOWN));        // быстрый спад
+    } else if (worstLoss < ABR_LOSS_LO && worstRtt < ABR_RTT_LO) {
+      target = Math.min(ceil, target + Math.max(500_000, Math.floor(target * 0.08))); // проба вверх
+    }
+    t.targetBitrate = target;
+    const last = t.lastSentBitrate || 0;
+    if (last === 0 || Math.abs(target - last) / last > ABR_HYSTERESIS) {
+      t.lastSentBitrate = target;
+      return { broadcasterId: t.broadcasterId, bitrate: target };
+    }
+    return null;
+  }
+
   maxDepth(t) { let m = 0; t.nodes.forEach((n) => { if (n.depth > m) m = n.depth; }); return m; }
   info(streamId) {
     const t = this.trees.get(streamId);
@@ -243,7 +322,7 @@ function attachTreeServer(httpServer, opts) {
   } = opts;
 
   const wss = new WebSocketServer({ noServer: true });
-  const mgr = new TreeManager();
+  const mgr = new TreeManager(!!(turnSecret && turnUrls.length));
   const peers = new Map(); // peerId -> node {id, ws, streamId, role, native, identity, parent, children, depth, maxChildren, stats...}
 
   // Временные TURN-креды выдаются только авторизованным (Evolution-TZ Э3 AC) — привязаны
@@ -281,6 +360,18 @@ function attachTreeServer(httpServer, opts) {
     for (const [pid, p] of peers) if (p.serverId === serverId) send(pid, obj);
   }
 
+  // Размещает зависших сирот (см. mgr.placeOrphans) и рассылает им assign-parent, их новым
+  // родителям — assign-child. Дёргается после каждого изменения топологии, где могла
+  // появиться ёмкость (новый узел вошёл, кто-то ушёл/переехал).
+  function settleOrphans(streamId) {
+    const placed = mgr.placeOrphans(streamId);
+    for (const { node, parentId } of placed) {
+      send(node.id, { t: 'assign-parent', streamId, parentId });
+      send(parentId, { t: 'assign-child', streamId, childId: node.id });
+    }
+    if (placed.length) { broadcastTreeInfo(streamId); broadcastTopology(streamId); }
+  }
+
   function broadcastTreeInfo(streamId) {
     const info = mgr.info(streamId);
     if (!info) return;
@@ -315,13 +406,15 @@ function attachTreeServer(httpServer, opts) {
   }
 
   function onJoin(id, msg) {
-    const { streamId, role, native, identity, symmetricNat, serverId, maxChildren } = msg;
+    const { streamId, role, native, identity, symmetricNat, serverId, maxChildren, maxBitrate, abr } = msg;
     if (!streamId || (role !== 'broadcaster' && role !== 'viewer')) return;
     const node = peers.get(id);
     node.streamId = streamId; node.role = role; node.native = !!native; node.identity = identity || id;
     node.symmetricNat = !!symmetricNat;
     node.serverId = serverId || node.serverId || null;
     node.maxChildren = typeof maxChildren === 'number' ? maxChildren : undefined;
+    node.maxBitrate = typeof maxBitrate === 'number' ? maxBitrate : 0; // Э8 ABR: потолок вещателя
+    node.abr = !!abr;                                                  // Э8 ABR: авто-адаптация вкл
     node.parent = null; node.children = []; node.depth = 0;
     const { parent } = mgr.join(streamId, node);
     if (parent) {
@@ -332,6 +425,9 @@ function attachTreeServer(httpServer, opts) {
     }
     broadcastTreeInfo(streamId);
     broadcastTopology(streamId);
+    // Новый узел мог дать ёмкость (relay-способный зритель) или это вернувшийся вещатель —
+    // размещаем зависших сирот. Для вещателя это подхватывает зрителей, ждавших стрим.
+    settleOrphans(streamId);
     if (role === 'broadcaster') broadcastToServer(node.serverId, { t: 'stream-live', streamId, identity: node.identity, initial: false });
   }
 
@@ -368,6 +464,7 @@ function attachTreeServer(httpServer, opts) {
     if (res.newParentId) send(res.newParentId, { t: 'assign-child', streamId: p.streamId, childId: id });
     broadcastTreeInfo(p.streamId);
     broadcastTopology(p.streamId);
+    settleOrphans(p.streamId); // ручная миграция могла освободить слот — подхватываем сирот
   }
 
   // Э8: relay-узел (натив passthrough) не энкодит и сам IDR не сделает — при подключении
@@ -398,6 +495,7 @@ function attachTreeServer(httpServer, opts) {
     });
     broadcastTreeInfo(p.streamId);
     broadcastTopology(p.streamId);
+    settleOrphans(p.streamId); // ушедший освободил ёмкость — подхватываем сирот
   }
 
   wss.on('connection', (ws) => {
@@ -405,7 +503,7 @@ function attachTreeServer(httpServer, opts) {
     peers.set(id, {
       id, ws, streamId: null, role: null, native: false, identity: id, serverId: null,
       parent: null, children: [], depth: 0,
-      maxChildren: undefined, availableOutgoing: 0, linkRtt: 0, linkLoss: 0, reparentCooldownUntil: 0,
+      maxChildren: undefined, maxBitrate: 0, abr: false, availableOutgoing: 0, linkRtt: 0, linkLoss: 0, reparentCooldownUntil: 0,
     });
     ws.on('message', (raw) => {
       let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
@@ -421,7 +519,16 @@ function attachTreeServer(httpServer, opts) {
     send(id, { t: 'welcome', id, iceServers: iceServersFor(ws.__uid) });
   });
 
-  return { mgr, peers, wss };
+  // Э8 ABR: раз в тик пересчитываем целевой битрейт каждого дерева и шлём корню, если сменился.
+  const abrTimer = setInterval(() => {
+    for (const streamId of mgr.trees.keys()) {
+      const cmd = mgr.abrTick(streamId);
+      if (cmd) send(cmd.broadcasterId, { t: 'set-bitrate', streamId, bps: cmd.bitrate });
+    }
+  }, ABR_TICK_MS);
+  abrTimer.unref?.(); // не держим процесс живым только ради ABR-тика
+
+  return { mgr, peers, wss, abrTimer };
 }
 
 module.exports = { attachTreeServer, TreeManager, MAX_DEPTH, NATIVE_CAPACITY, BROWSER_CAPACITY };

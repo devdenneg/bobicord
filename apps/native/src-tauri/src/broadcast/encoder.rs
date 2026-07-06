@@ -26,13 +26,15 @@ pub struct H264Encoder {
     is_async: bool,
     need_input: u32,
     codec_api: Option<ICodecAPI>,
-    width: u32,
-    height: u32,
     fps: u32,
     start: Instant,
     output_provides_samples: bool,
     output_sample_size: u32,
     force_keyframe: Arc<AtomicBool>,
+    /// Текущий целевой средний битрейт — чтобы `set_bitrate` пропускал no-op (ABR шлёт
+    /// цель каждый тик, но реально меняется она редко). Меняется на лету через ICodecAPI
+    /// без пересоздания MFT.
+    current_bitrate: u32,
 }
 
 unsafe impl Send for H264Encoder {}
@@ -100,14 +102,28 @@ impl H264Encoder {
                 is_async,
                 need_input: 0,
                 codec_api,
-                width,
-                height,
                 fps,
                 start: Instant::now(),
                 output_provides_samples: provides,
                 output_sample_size: stream_info.cbSize,
                 force_keyframe,
+                current_bitrate: bitrate_bps,
             })
+        }
+    }
+
+    /// ABR (Evolution-TZ Э8): смена целевого битрейта на живом MFT без пересоздания —
+    /// `CODECAPI_AVEncCommonMeanBitRate` уважается аппаратными энкодерами (NVENC/AMF/QSV)
+    /// во время кодирования (тот же путь ICodecAPI::SetValue, что и force-keyframe ниже).
+    /// CBR-режим сохраняется — меняется только целевая полка. No-op на неизменной цели.
+    pub fn set_bitrate(&mut self, bps: u32) {
+        if bps == self.current_bitrate { return; }
+        match &self.codec_api {
+            Some(api) => match unsafe { api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &VARIANT::from(bps)) } {
+                Ok(()) => { self.current_bitrate = bps; log::info!("encoder: bitrate -> {:.1} Мбит/с", bps as f64 / 1_000_000.0); }
+                Err(e) => log::warn!("encoder: set_bitrate {bps} failed: {e}"),
+            },
+            None => log::debug!("encoder: нет ICodecAPI — рантайм-смена битрейта недоступна"),
         }
     }
 

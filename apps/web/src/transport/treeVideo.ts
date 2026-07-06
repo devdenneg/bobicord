@@ -56,12 +56,17 @@ interface WatchState {
   children: Map<string, RTCPeerConnection>; // downstream (к нашим детям) — мы offerer
   pendingChildren: Set<string>;   // assign-child пришёл раньше, чем появился трек
   maxChildren: number;
+  joined: boolean;                // join уже отправлен (шлём после welcome — см. sendWatchJoin)
 }
 
 
 function treeWsUrl(): string {
   const override = (import.meta as any).env?.VITE_TREE_WS_URL as string | undefined;
-  const base = override || ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/tree');
+  // В нативе location.host = tauri.localhost (bundle без reverse-proxy) — фолбэк на прод-сервер,
+  // тот же, что nativeWsUrl в native.ts. Без него discovery/viewer-сокеты webview шли бы в
+  // tauri.localhost → liveStreams пуст → активные стримы и LIVE-бейджи не видны в натив-приложении.
+  const nativeDefault = isTauri ? 'wss://138-16-170-21.sslip.io/tree' : null;
+  const base = override || nativeDefault || ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/tree');
   const token = getToken() || '';
   return base + (base.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
 }
@@ -77,6 +82,20 @@ function preferH264(pc: RTCPeerConnection) {
     if (!isVideo) return;
     try { t.setCodecPreferences(h264); } catch { /**/ }
   });
+}
+
+// Может ли этот браузер ЭНКОДИТЬ H.264 (инвариант 4 — трек детям идёт в H.264). Relay-хоп
+// заставляет узел энкодить (serveChild=offerer+preferH264); часть Android-устройств (напр.
+// Huawei/Kirin) H.264 декодят (смотреть могут), но НЕ энкодят — как relay-родитель они дают
+// чёрный экран ребёнку. `RTCRtpSender.getCapabilities` перечисляет именно SEND-кодеки, поэтому
+// отсутствие H.264 тут = не можем быть relay-родителем. Неизвестно (нет API) → считаем что можем
+// (не переужесточать десктопы). Только decode (preferH264 через Receiver) для этого не годится.
+function canEncodeH264(): boolean {
+  try {
+    const caps = (window as any).RTCRtpSender?.getCapabilities?.('video');
+    if (!caps || !Array.isArray(caps.codecs)) return true; // не интроспектируется — не режем
+    return caps.codecs.some((c: any) => (c.mimeType || '').toLowerCase() === 'video/h264');
+  } catch { return true; }
 }
 
 export class TreeVideoTransport implements VideoTransport {
@@ -169,20 +188,39 @@ export class TreeVideoTransport implements VideoTransport {
     try { ws = new WebSocket(treeWsUrl()); } catch { return; }
     const st: WatchState = {
       ws, pc: null, parentId: null, closed: false, iceServers: this.iceServers,
-      recvVideo: null, recvAudio: null, children: new Map(), pendingChildren: new Set(), maxChildren: 0,
+      recvVideo: null, recvAudio: null, children: new Map(), pendingChildren: new Set(), maxChildren: 0, joined: false,
     };
     this.watches.set(streamId, st);
 
-    ws.onopen = async () => {
-      const symmetricNat = await this.natProbe.catch(() => false);
-      // В Tauri видео/relay держит Rust (native passthrough) — webview только рендерит,
-      // детей не обслуживает. В браузере — небольшой транскод-relay (0 при симметричном NAT).
-      st.maxChildren = (isTauri || symmetricNat) ? 0 : BROWSER_RELAY_CAPACITY;
-      try { ws.send(JSON.stringify({ t: 'join', streamId, role: 'viewer', native: false, maxChildren: st.maxChildren, identity: this.me, symmetricNat, serverId: this.serverId })); } catch { /**/ }
-    };
+    // join шлём НЕ в onopen, а после welcome (см. sendWatchJoin): welcome несёт актуальные
+    // iceServers, и только зная, есть ли TURN, можно решить ёмкость relay при симметричном NAT.
+    // Fallback: если welcome не пришёл за 1.5с — джойнимся всё равно (guard не даст дубль).
+    ws.onopen = () => { setTimeout(() => this.sendWatchJoin(streamId, st), 1500); };
     ws.onmessage = (ev) => this.onWatchMessage(streamId, st, ev);
     ws.onclose = () => { if (!st.closed) this.teardownWatch(streamId, st); };
     ws.onerror = () => { try { ws.close(); } catch { /**/ } };
+  }
+
+  // Отправка join после welcome. Ёмкость relay при симметричном NAT: обычно 0 (узел
+  // недостижим как offerer для третьей стороны через srflx), НО с TURN обе стороны берут
+  // relay-кандидаты — симметричный узел релеить может, поэтому при наличии TURN ёмкость не
+  // зануляем. В Tauri relay держит Rust — webview детей не обслуживает (0). Сервер применяет
+  // ту же логику к symmetricNat (tree.js capacityOf), поэтому шлём и флаг, и maxChildren.
+  private async sendWatchJoin(streamId: string, st: WatchState) {
+    if (st.joined || st.closed) return;
+    st.joined = true;
+    const symmetricNat = await this.natProbe.catch(() => false);
+    if (st.closed) return;
+    const hasTurn = st.iceServers.some((s) => {
+      const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
+      return urls.some((u) => /^turns?:/i.test(u || ''));
+    });
+    // Relay-родитель обязан энкодить H.264 (см. canEncodeH264): устройства, которые H.264 только
+    // декодят (Huawei/часть Android), остаются листом — смотреть могут, детей брать нет, иначе
+    // ребёнок получает чёрный экран (соединение встаёт, но энкодер не выдаёт кадры).
+    const cantRelay = isTauri || (symmetricNat && !hasTurn) || !canEncodeH264();
+    st.maxChildren = cantRelay ? 0 : BROWSER_RELAY_CAPACITY;
+    try { st.ws.send(JSON.stringify({ t: 'join', streamId, role: 'viewer', native: false, maxChildren: st.maxChildren, identity: this.me, symmetricNat, serverId: this.serverId })); } catch { /**/ }
   }
   unwatch(streamId: string) {
     const nst = this.nativeWatches.get(streamId);
@@ -240,6 +278,7 @@ export class TreeVideoTransport implements VideoTransport {
     switch (msg.t) {
       case 'welcome': {
         if (Array.isArray(msg.iceServers) && msg.iceServers.length) st.iceServers = msg.iceServers;
+        this.sendWatchJoin(streamId, st); // join только теперь — знаем iceServers (есть ли TURN)
         break;
       }
       case 'assign-parent': {
