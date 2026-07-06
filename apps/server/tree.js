@@ -36,7 +36,9 @@ class Tree {
 }
 
 class TreeManager {
-  constructor() { this.trees = new Map(); }
+  // turnEnabled: с TURN симметричный NAT НЕ рубит relay-ёмкость (обе стороны берут
+  // relay-кандидаты, узел достижим как offerer). Без TURN — симметричный узел лист.
+  constructor(turnEnabled = false) { this.trees = new Map(); this.turnEnabled = turnEnabled; }
 
   tree(streamId) {
     let t = this.trees.get(streamId);
@@ -50,7 +52,7 @@ class TreeManager {
   // и браузер-relay сообщают свою ёмкость сами), с потолком MAX_CHILDREN_CAP. Fallback на
   // старые константы, если maxChildren не пришёл (обратная совместимость).
   capacityOf(node) {
-    if (node.symmetricNat) return 0;
+    if (node.symmetricNat && !this.turnEnabled) return 0; // без TURN симметричный = лист
     if (typeof node.maxChildren === 'number') return Math.max(0, Math.min(node.maxChildren, MAX_CHILDREN_CAP));
     return node.native ? NATIVE_CAPACITY : BROWSER_CAPACITY;
   }
@@ -214,6 +216,33 @@ class TreeManager {
     return { reparented, dropped: [], broadcasterLost: false };
   }
 
+  // Сироты: зрители, джойнившиеся когда свободного родителя не было (pickParent -> null,
+  // parent=null, не вещатель) — раньше висели навсегда, т.к. leave() репарентит только детей
+  // ушедшего, а не глобальных сирот. Вызывается после join/leave/reparent (ёмкость могла
+  // появиться). Многопроходно: разместив relay-способного сироту, он сам даёт слот следующему
+  // — так дерево ветвится (кейс лимита прямых=1, где 2-й зритель обязан идти через 1-го).
+  // Возвращает [{node, parentId}] для рассылки assign-parent/assign-child.
+  placeOrphans(streamId) {
+    const t = this.trees.get(streamId);
+    if (!t || !t.broadcasterId) return [];
+    const placed = [];
+    let progress = true;
+    while (progress) {
+      progress = false;
+      for (const node of t.nodes.values()) {
+        if (node.id === t.broadcasterId || node.parent) continue;
+        const parent = this.pickParent(t, node);
+        if (!parent) continue;
+        node.parent = parent.id;
+        node.depth = parent.depth + 1;
+        parent.children.push(node.id);
+        placed.push({ node, parentId: parent.id });
+        progress = true;
+      }
+    }
+    return placed;
+  }
+
   // Э8 ABR: пересчёт целевого битрейта дерева по худшему линку (loss/RTT-based AIMD).
   // Каждый линк покрыт stats-репортом его родителя (broadcaster→прямые дети, relay→дети),
   // так что скан linkLoss/linkRtt по всем узлам видит все линки. Возвращает
@@ -288,7 +317,7 @@ function attachTreeServer(httpServer, opts) {
   } = opts;
 
   const wss = new WebSocketServer({ noServer: true });
-  const mgr = new TreeManager();
+  const mgr = new TreeManager(!!(turnSecret && turnUrls.length));
   const peers = new Map(); // peerId -> node {id, ws, streamId, role, native, identity, parent, children, depth, maxChildren, stats...}
 
   // Временные TURN-креды выдаются только авторизованным (Evolution-TZ Э3 AC) — привязаны
@@ -324,6 +353,18 @@ function attachTreeServer(httpServer, opts) {
   // знать (streamId = identity вещателя, никак не привязан к серверу сам по себе).
   function broadcastToServer(serverId, obj) {
     for (const [pid, p] of peers) if (p.serverId === serverId) send(pid, obj);
+  }
+
+  // Размещает зависших сирот (см. mgr.placeOrphans) и рассылает им assign-parent, их новым
+  // родителям — assign-child. Дёргается после каждого изменения топологии, где могла
+  // появиться ёмкость (новый узел вошёл, кто-то ушёл/переехал).
+  function settleOrphans(streamId) {
+    const placed = mgr.placeOrphans(streamId);
+    for (const { node, parentId } of placed) {
+      send(node.id, { t: 'assign-parent', streamId, parentId });
+      send(parentId, { t: 'assign-child', streamId, childId: node.id });
+    }
+    if (placed.length) { broadcastTreeInfo(streamId); broadcastTopology(streamId); }
   }
 
   function broadcastTreeInfo(streamId) {
@@ -379,6 +420,9 @@ function attachTreeServer(httpServer, opts) {
     }
     broadcastTreeInfo(streamId);
     broadcastTopology(streamId);
+    // Новый узел мог дать ёмкость (relay-способный зритель) или это вернувшийся вещатель —
+    // размещаем зависших сирот. Для вещателя это подхватывает зрителей, ждавших стрим.
+    settleOrphans(streamId);
     if (role === 'broadcaster') broadcastToServer(node.serverId, { t: 'stream-live', streamId, identity: node.identity, initial: false });
   }
 
@@ -415,6 +459,7 @@ function attachTreeServer(httpServer, opts) {
     if (res.newParentId) send(res.newParentId, { t: 'assign-child', streamId: p.streamId, childId: id });
     broadcastTreeInfo(p.streamId);
     broadcastTopology(p.streamId);
+    settleOrphans(p.streamId); // ручная миграция могла освободить слот — подхватываем сирот
   }
 
   // Э8: relay-узел (натив passthrough) не энкодит и сам IDR не сделает — при подключении
@@ -445,6 +490,7 @@ function attachTreeServer(httpServer, opts) {
     });
     broadcastTreeInfo(p.streamId);
     broadcastTopology(p.streamId);
+    settleOrphans(p.streamId); // ушедший освободил ёмкость — подхватываем сирот
   }
 
   wss.on('connection', (ws) => {
