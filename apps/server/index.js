@@ -513,6 +513,12 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
 
 app.get('/healthz', (req, res) => res.send('ok'));
 
+// Диагностика прод-обрывов: упавший промис/исключение раньше могли молча ронять процесс
+// (docker перезапускал, причина терялась, если логи контейнера пересоздавались) — фиксируем
+// стек явно. uncaughtException НЕ глушим (процесс должен упасть и перезапуститься чистым).
+process.on('unhandledRejection', (e) => console.error('[fatal] unhandledRejection:', e));
+process.on('uncaughtException', (e) => { console.error('[fatal] uncaughtException:', e); process.exit(1); });
+
 /* ---------- РЕЛИЗЫ НАТИВА: updater-манифест + установщик (публично, без auth) ----------
  * CI (build-windows.yml) заливает *-setup.exe + latest.json в RELEASES_DIR.
  * latest.json — updater-эндпоинт для Tauri (plugins.updater.endpoints); сам exe качают

@@ -54,6 +54,11 @@ const VRELAY_TARGET = 'vrelay';    // сентинел targetParentId в request
 
 function newPeerId() { return 'p_' + crypto.randomBytes(6).toString('hex'); }
 
+// Лог жизненного цикла дерева (join/leave/reparent/heartbeat/ABR/vrelay) в stdout →
+// docker compose logs token. Объём низкий (только события топологии, не stats/ice) —
+// всегда включён: прод-обрывы иначе недиагностируемы (раньше тут не было НИ ОДНОЙ строки).
+function tlog(msg) { console.log(`[tree] ${msg}`); }
+
 class Tree {
   constructor(streamId) { this.streamId = streamId; this.nodes = new Map(); this.broadcasterId = null; }
 }
@@ -332,7 +337,7 @@ class TreeManager {
     const last = t.lastSentBitrate || 0;
     if (last === 0 || Math.abs(target - last) / last > ABR_HYSTERESIS) {
       t.lastSentBitrate = target;
-      return { broadcasterId: t.broadcasterId, bitrate: target };
+      return { broadcasterId: t.broadcasterId, bitrate: target, worstLoss, worstRtt };
     }
     return null;
   }
@@ -399,7 +404,7 @@ function attachTreeServer(httpServer, opts) {
     const token = url.searchParams.get('token') || '';
     let payload;
     try { payload = jwt.verify(token, sessionSecret); }
-    catch { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
+    catch (e) { tlog(`ws 401 (${e.message}) from ${req.socket.remoteAddress}`); socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
     wss.handleUpgrade(req, socket, head, (ws) => {
       ws.__uid = payload.id || payload.u || 'anon';
       wss.emit('connection', ws, req);
@@ -435,9 +440,10 @@ function attachTreeServer(httpServer, opts) {
     if (t.vrelayActivateAt && now - t.vrelayActivateAt < VRELAY_ACTIVATE_TIMEOUT_MS) return true;
     let agent = null;
     for (const p of peers.values()) if (p.isVrelayAgent && p.ws.readyState === p.ws.OPEN) { agent = p; break; }
-    if (!agent) return false;
+    if (!agent) { tlog(`[${streamId}] фолбэк нужен, но агент vrelay не подключён`); return false; }
     const bc = t.nodes.get(t.broadcasterId);
     t.vrelayActivateAt = now;
+    tlog(`[${streamId}] vrelay-activate -> агент ${agent.id}`);
     send(agent.id, { t: 'vrelay-activate', streamId, serverId: bc ? bc.serverId : null });
     return true;
   }
@@ -463,6 +469,7 @@ function attachTreeServer(httpServer, opts) {
     }
     if (victimId == null) return; // у корня нет детей => есть слот => placeOrphans справится сам
     const victim = t.nodes.get(victimId);
+    tlog(`[${streamId}] виртуал ${virt.id} сирота (дерево забито) — выселяю жертву ${victimId} (${victim.identity}) из-под корня`);
     bc.children = bc.children.filter((cid) => cid !== victimId);
     victim.parent = null; victim.depth = 0;
     send(t.broadcasterId, { t: 'drop-peer', streamId, peerId: victimId });
@@ -487,6 +494,7 @@ function attachTreeServer(httpServer, opts) {
       const t = mgr.trees.get(streamId);
       const parent = t && t.nodes.get(parentId);
       if (parent && parent.virtual) node.reparentCooldownUntil = now + DRAIN_COOLDOWN_MS;
+      tlog(`[${streamId}] сирота ${node.id} (${node.identity}) -> parent ${parentId}`);
       send(node.id, { t: 'assign-parent', streamId, parentId });
       send(parentId, { t: 'assign-child', streamId, childId: node.id });
     }
@@ -549,6 +557,7 @@ function attachTreeServer(httpServer, opts) {
     node.vrelayPinned = false;
     node.parent = null; node.children = []; node.depth = 0;
     const { parent } = mgr.join(streamId, node);
+    tlog(`[${streamId}] join ${id} ${role} identity=${node.identity} native=${node.native}${node.virtual ? ' VIRTUAL' : ''} cap=${mgr.capacityOf(node)} symNat=${node.symmetricNat} -> ${role === 'broadcaster' ? 'корень' : parent ? `parent ${parent.id} (depth ${node.depth})` : 'СИРОТА (нет кандидатов)'}`);
     if (parent) {
       if (parent.virtual) node.reparentCooldownUntil = Date.now() + DRAIN_COOLDOWN_MS;
       send(id, { t: 'assign-parent', streamId, parentId: parent.id });
@@ -616,6 +625,7 @@ function attachTreeServer(httpServer, opts) {
   // Рассылка успешной миграции (общая для ручного/авто reparent, дренажа и vrelay-путей):
   // старому родителю drop-peer, узлу assign-parent, новому родителю assign-child.
   function applyReparent(streamId, nodeId, res) {
+    tlog(`[${streamId}] reparent ${nodeId}: ${res.oldParentId || '-'} -> ${res.newParentId}`);
     if (res.oldParentId) send(res.oldParentId, { t: 'drop-peer', streamId, peerId: nodeId });
     send(nodeId, { t: 'assign-parent', streamId, parentId: res.newParentId });
     if (res.newParentId) send(res.newParentId, { t: 'assign-child', streamId, childId: nodeId });
@@ -673,12 +683,14 @@ function attachTreeServer(httpServer, opts) {
         const parent = t && t.nodes.get(p.parent);
         if (parent && (!p.reparentCooldownUntil || now >= p.reparentCooldownUntil)) {
           p.reparentCooldownUntil = now + REPARENT_COOLDOWN_MS;
+          tlog(`[${p.streamId}] reattach ${id} (${p.identity}) к тому же родителю ${p.parent} (ICE-restart, no-candidate)`);
           send(p.parent, { t: 'drop-peer', streamId: p.streamId, peerId: id });      // родитель закрывает старый child-PC
           send(id, { t: 'assign-parent', streamId: p.streamId, parentId: p.parent }); // узел сбрасывает upstream, ждёт offer
           send(p.parent, { t: 'assign-child', streamId: p.streamId, childId: id });   // родитель поднимает свежий PC + offer
           return;
         }
       }
+      tlog(`[${p.streamId}] reparent-denied ${id} (${p.identity}) target=${msg.targetParentId || 'auto'} reason=${res.reason}`);
       send(id, { t: 'reparent-denied', streamId: p.streamId, reason: res.reason }); return;
     }
     // Pin «через сервер» живёт, пока зритель сам не мигрировал; ручной выбор виртуала
@@ -696,6 +708,7 @@ function attachTreeServer(httpServer, opts) {
     if (!p || p.ws.__uid !== VRELAY_UID) return;
     p.isVrelayAgent = true;
     p.vrelayCapacity = typeof msg.capacity === 'number' ? msg.capacity : 8;
+    tlog(`агент vrelay подключён: ${id} capacity=${p.vrelayCapacity}`);
     // Агент (пере)подключился — деревья могли ждать фолбэк (сироты/ручные запросы).
     for (const [sid, t] of mgr.trees) {
       if (!t.broadcasterId || findVirtual(t)) continue;
@@ -721,15 +734,17 @@ function attachTreeServer(httpServer, opts) {
     send(t.broadcasterId, { t: 'request-keyframe', streamId: p.streamId });
   }
 
-  function onLeave(id) {
+  function onLeave(id, reason = 'leave') {
     const p = peers.get(id);
     if (!p || !p.streamId) { peers.delete(id); return; }
     peers.delete(id);
+    tlog(`[${p.streamId}] leave ${id} (${p.identity}${p.role === 'broadcaster' ? ', ВЕЩАТЕЛЬ' : ''}${p.virtual ? ', VIRTUAL' : ''}) причина: ${reason}; детей: ${p.children.length}`);
     const oldParentId = p.parent;
     const pendingTree = mgr.trees.get(p.streamId);
     if (pendingTree && pendingTree.vrelayPending) pendingTree.vrelayPending.delete(id); // Э9: ушедший не ждёт vrelay
     const { reparented, dropped, broadcasterLost } = mgr.leave(p.streamId, id);
     if (broadcasterLost) {
+      tlog(`[${p.streamId}] дерево обрушено (ушёл вещатель), зрителей сброшено: ${dropped.length}`);
       dropped.forEach((peerId) => {
         send(peerId, { t: 'drop-peer', streamId: p.streamId, peerId: id });
         // Э9: виртуалу при обрушении дерева нужен явный release — drop-peer по каждому его
@@ -766,14 +781,16 @@ function attachTreeServer(httpServer, opts) {
       let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
       if (msg.t === 'join') onJoin(id, msg);
       else if (msg.t === 'sdp' || msg.t === 'ice') onSignal(id, msg);
-      else if (msg.t === 'leave') onLeave(id);
+      else if (msg.t === 'leave') onLeave(id, 'явный leave');
       else if (msg.t === 'hello') onHello(id, msg);
       else if (msg.t === 'stats') onStats(id, msg);
       else if (msg.t === 'request-reparent') onRequestReparent(id, msg);
       else if (msg.t === 'request-keyframe') onRequestKeyframe(id);
       else if (msg.t === 'vrelay-hello') onVrelayHello(id, msg);
     });
-    ws.on('close', () => onLeave(id));
+    // code 1006 = грязный обрыв TCP (без close-фрейма): краш клиента, потеря сети,
+    // heartbeat-terminate (см. hbTimer — он логирует свой terminate отдельно).
+    ws.on('close', (code) => onLeave(id, `ws close code=${code}`));
     send(id, { t: 'welcome', id, iceServers: iceServersFor(ws.__uid) });
   });
 
@@ -781,7 +798,10 @@ function attachTreeServer(httpServer, opts) {
   const abrTimer = setInterval(() => {
     for (const streamId of mgr.trees.keys()) {
       const cmd = mgr.abrTick(streamId);
-      if (cmd) send(cmd.broadcasterId, { t: 'set-bitrate', streamId, bps: cmd.bitrate });
+      if (cmd) {
+        tlog(`[${streamId}] ABR -> ${Math.round(cmd.bitrate / 1000)} kbps (worst loss=${(cmd.worstLoss * 100).toFixed(1)}% rtt=${Math.round(cmd.worstRtt)}ms)`);
+        send(cmd.broadcasterId, { t: 'set-bitrate', streamId, bps: cmd.bitrate });
+      }
     }
   }, ABR_TICK_MS);
   abrTimer.unref?.(); // не держим процесс живым только ради ABR-тика
@@ -822,7 +842,10 @@ function attachTreeServer(httpServer, opts) {
         for (const cid of n.children) { const c = t.nodes.get(cid); if (c && !c.virtual) used++; } // слот виртуала освободится с его уходом
         free += Math.max(0, mgr.capacityOf(n) - used);
       }
-      if (free >= virt.children.length) send(virt.id, { t: 'vrelay-release', streamId });
+      if (free >= virt.children.length) {
+        tlog(`[${streamId}] дренаж R2: живой ёмкости хватает (${free} >= ${virt.children.length}) — vrelay-release ${virt.id}`);
+        send(virt.id, { t: 'vrelay-release', streamId });
+      }
     }
   }, DRAIN_TICK_MS);
   drainTimer.unref?.();
@@ -835,7 +858,11 @@ function attachTreeServer(httpServer, opts) {
     for (const [, p] of peers) {
       const ws = p.ws;
       if (!ws || ws.readyState !== ws.OPEN) continue;
-      if (ws.isAlive === false) { try { ws.terminate(); } catch { /**/ } continue; }
+      if (ws.isAlive === false) {
+        tlog(`heartbeat timeout ${p.id} (${p.identity}${p.streamId ? `, stream ${p.streamId}` : ''}) — terminate`);
+        try { ws.terminate(); } catch { /**/ }
+        continue;
+      }
       ws.isAlive = false;
       try { ws.ping(); } catch { /**/ }
     }
