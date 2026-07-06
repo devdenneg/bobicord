@@ -43,6 +43,12 @@ jobs:
           f=apps/native/src-tauri/tauri.conf.json
           tmp=$(mktemp); jq --arg v "${{ steps.ver.outputs.v }}" '.version=$v' "$f" > "$tmp" && mv "$tmp" "$f"
 
+      # Быстрый фейл, если Cargo.lock рассинхронён с манифестами: иначе Tauri молча
+      # пере-локает при сборке, что инвалидирует ключ rust-cache и даёт холодный билд.
+      - name: Verify lockfile
+        working-directory: apps/native/src-tauri
+        run: cargo update --locked --workspace --dry-run
+
       # Собирает фронт (beforeBuildCommand в tauri.conf.json) и упаковывает MSI+NSIS
       # (bundle.targets: "all") + updater-артефакты (createUpdaterArtifacts: true →
       # *-setup.exe + *-setup.exe.sig, подписанные minisign-ключом из секретов).
