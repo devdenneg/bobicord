@@ -212,9 +212,9 @@ export class Engine {
         const vc = this.voiceHint[m.username]; if (vc) voiceChannels[m.username] = vc;
       }
     }
-    // стримы видит только тот, кто в том же голосовом канале, что и вещатель (своё превью — всегда)
-    const streams: StreamInfo[] = [...this.liveKitT.getStreams(), ...this.treeT.getStreams()].filter((s) =>
-      s.isLocal || (!!this.currentVc && this.voiceChannelOf(s.identity) === this.currentVc));
+    // стримы (screenshare) смотрятся server-wide, независимо от голосового канала: по каналам
+    // изолирован только звук микрофона. Иначе нельзя было бы смотреть трансляцию не заходя в её канал.
+    const streams: StreamInfo[] = [...this.liveKitT.getStreams(), ...this.treeT.getStreams()];
     const watching: Record<string, true> = {}; this.watching.forEach((u) => (watching[u] = true));
     const pending: Record<string, true> = {}; this.pendingWatch.forEach((u) => (pending[u] = true));
     const watchers: Record<string, { name: string; color: number; avatarUrl?: string }[]> = {};
@@ -250,15 +250,9 @@ export class Engine {
       .on(RoomEvent.ConnectionQualityChanged, (q, p) => { if (p === r.localParticipant) { this.connQuality = mapQuality(q); this.emit(); } })
       .on(RoomEvent.TrackPublished, this.onRemotePub)
       .on(RoomEvent.TrackUnpublished, this.onRemoteUnpub)
-      // пир сменил голосовой канал (атрибут vc) → пере-подписаться/отписаться от микрофона;
-      // если ушёл из моего канала, а я смотрел его стрим — закрываем watch (иначе трафик идёт впустую)
-      .on(RoomEvent.ParticipantAttributesChanged, (_changed, p) => {
-        if (p !== r.localParticipant) {
-          this.reconcilePeerAudio(p as Participant);
-          if (this.watching.has(p.identity) && this.voiceChannelOf(p.identity) !== this.currentVc) this.closeWatch(p.identity);
-        }
-        this.emit();
-      })
+      // пир сменил голосовой канал (атрибут vc) → пере-подписаться/отписаться от его микрофона
+      // (стримы server-wide и watch не трогаем — смотреть можно из любого канала)
+      .on(RoomEvent.ParticipantAttributesChanged, (_changed, p) => { if (p !== r.localParticipant) this.reconcilePeerAudio(p as Participant); this.emit(); })
       .on(RoomEvent.DataReceived, this.onData);
     await r.connect(url, token, { autoSubscribe: false });
     this.roomReady = true; // комната реально поднялась — можно снимать скелетоны голосового/сцены
@@ -355,7 +349,6 @@ export class Engine {
   // перейти в другой голосовой канал того же сервера: микрофон остаётся, меняются подписки и стримы
   async switchVoice(channelId: string) {
     if (!this.room || !this.inVoice || this.currentVc === channelId) return;
-    [...this.watching].forEach((id) => this.closeWatch(id)); // стримы привязаны к каналу — уходим из них
     this.currentVc = channelId;
     try { await this.room.localParticipant.setAttributes({ vc: channelId }); } catch { /**/ }
     this.reconcileAllAudio();
@@ -366,7 +359,6 @@ export class Engine {
     if (!this.room || !this.inVoice) return;
     this.stopConnPoll();
     await this.stopShare().catch(() => {});
-    [...this.watching].forEach((id) => this.closeWatch(id));
     this.stopMic();
     this.room.remoteParticipants.forEach((p) => { const rp = p.getTrackPublication(Track.Source.Microphone); if (rp) { try { (rp as any).setSubscribed(false); } catch { /**/ } } this.detachAnalyser(p.identity); });
     try { await this.room.localParticipant.setAttributes({ vc: '' }); } catch { /**/ }
