@@ -20,19 +20,19 @@ interface SavedConfig {
   resolution: Resolution;
   fps: 30 | 60;
   bitrateMbps: 3 | 6 | 10 | 15 | 20;
-  /** exclude — весь звук кроме RelayApp (WASAPI EXCLUDE себя, не всегда надёжно
-   *  фильтрует наш многопроцессный WebView2, см. CLAUDE.md инвариант 6 и audio.rs).
-   *  include — только звук выбранного процесса (надёжнее). */
+  /** exclude — весь звук кроме RelayApp (авто): нативно поднимается INCLUDE-loopback
+   *  на каждый не-наш аудио-процесс с миксом, голос войса не протекает (см. audio.rs).
+   *  include — только звук выбранного процесса (ручной override). */
   audioMode: 'exclude' | 'include';
   audioPid: number | null;
   /** Э8: лимит прямых зрителей корня; остальные уходят глубже через relay-узлы. */
   maxDirectChildren: number;
 }
-// audioMode дефолтом 'include': EXCLUDE недетерминирован кросс-машинно (WebView2 рендерит
-// голос войса в отдельном audio-сабпроцессе, который не всегда в дереве нашего процесса —
-// на части ПК голос протекает в стрим). INCLUDE(pid игры) от этого не зависит. Для захвата
-// окна PID подставляется автоматически (см. эффект ниже); для монитора — выбор процесса.
-const DEF_CONFIG: SavedConfig = { sourceKind: 'monitor', monitorIndex: 0, windowHwnd: null, resolution: '1080', fps: 30, bitrateMbps: 6, audioMode: 'include', audioPid: null, maxDirectChildren: 4 };
+// audioMode дефолтом 'exclude' (авто): нативный захват теперь надёжно исключает RelayApp
+// без выбора процесса — перечисляет активные render-сессии, вычитает наши процессы и
+// микширует остальные. Для окна PID всё ещё подставляется автоматически (эффект ниже),
+// если юзер переключится на ручной 'include'.
+const DEF_CONFIG: SavedConfig = { sourceKind: 'monitor', monitorIndex: 0, windowHwnd: null, resolution: '1080', fps: 30, bitrateMbps: 6, audioMode: 'exclude', audioPid: null, maxDirectChildren: 4 };
 function loadConfig(): SavedConfig {
   try { return { ...DEF_CONFIG, ...JSON.parse(localStorage.getItem('bcastConfig') || '{}') }; } catch { return DEF_CONFIG; }
 }
@@ -152,7 +152,7 @@ export function BroadcastModal() {
     </div>
     <div className="fld"><label>Звук</label>
       <div className="seg">
-        <button className={cfg.audioMode === 'exclude' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, audioMode: 'exclude' }))}>Всё, кроме RelayApp</button>
+        <button className={cfg.audioMode === 'exclude' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, audioMode: 'exclude' }))}>Всё, кроме RelayApp (авто)</button>
         <button className={cfg.audioMode === 'include' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, audioMode: 'include' }))}>Только процесс</button>
       </div>
       {cfg.audioMode === 'include'
@@ -165,7 +165,7 @@ export function BroadcastModal() {
               ? <p className="msub" style={{ margin: '8px 0 0' }}>Звук берётся из процесса захватываемого окна — голос войса в стрим не попадёт.</p>
               : <p className="msub" style={{ margin: '8px 0 0' }}>Захват экрана: выбери процесс игры — только его звук уйдёт в стрим (надёжно против эха голоса).</p>}
           </>
-        : <p className="msub" style={{ margin: '8px 0 0' }}>⚠ «Всё кроме RelayApp» на части ПК всё равно пропускает голос войса в запись (ограничение WebView2). Надёжно — «Только процесс».</p>}
+        : <p className="msub" style={{ margin: '8px 0 0' }}>В стрим уходит звук всех приложений/игр, кроме самого RelayApp (голос войса не попадёт). «Только процесс» — на случай, если нужен звук строго одного приложения.</p>}
     </div>
     <div className="rowbtns">
       <button className="ghost" style={{ margin: 0 }} onClick={close}>Отмена</button>

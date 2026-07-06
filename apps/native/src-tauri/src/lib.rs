@@ -64,7 +64,7 @@ async fn start_broadcast(
     bitrate_bps: bitrate_bps.clamp(500_000, 20_000_000),
     audio_source: match audio_target_pid {
       Some(pid) => broadcast::AudioSource::IncludeProcess(pid),
-      None => broadcast::AudioSource::ExcludeSelf,
+      None => broadcast::AudioSource::ExcludeSelfViaInclude,
     },
     max_direct_children: max_direct_children.unwrap_or(4).clamp(1, 8),
   };

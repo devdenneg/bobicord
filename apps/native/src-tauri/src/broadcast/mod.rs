@@ -37,8 +37,9 @@ pub struct StreamConfig {
     pub max_height: u32,
     pub fps: u32,
     pub bitrate_bps: u32,
-    /// Э5.2: по умолчанию — исключить себя (EXCLUDE, см. историю бага в audio.rs);
-    /// `IncludeProcess(pid)` — надёжнее, если известен процесс игры/окна.
+    /// По умолчанию `ExcludeSelfViaInclude` — авто: INCLUDE-клиент на каждый не-наш
+    /// аудио-процесс, микс (надёжно «всё кроме RelayApp», см. audio.rs).
+    /// `IncludeProcess(pid)` — ручной override на один процесс.
     pub audio_source: AudioSource,
     /// Э8: лимит прямых детей корня в дереве (задаётся вещателем в UI). Overflow-зрители
     /// уходят глубже через relay-узлы. Ёмкость объявляется серверу в join (см. signaling).

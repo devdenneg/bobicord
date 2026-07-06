@@ -31,8 +31,9 @@ export interface StreamConfig {
   maxHeight: number;
   fps: number;
   bitrateBps: number;
-  /** Э5.2: PID процесса для WASAPI INCLUDE (только его звук в стрим) — надёжнее,
-   *  чем EXCLUDE себя (см. CLAUDE.md инвариант 6). `undefined` = EXCLUDE-режим по умолчанию. */
+  /** PID процесса для ручного WASAPI INCLUDE (только его звук в стрим). `undefined` =
+   *  авто-режим «всё кроме RelayApp» (INCLUDE-клиент на каждый не-наш процесс + микс,
+   *  см. audio.rs / CLAUDE.md инвариант 6). */
   audioTargetPid?: number;
   /** Э8: лимит прямых детей корня в дереве (overflow-зрители уходят глубже через relay). */
   maxDirectChildren?: number;
