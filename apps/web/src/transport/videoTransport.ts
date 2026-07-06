@@ -48,6 +48,26 @@ export interface RtpStats {
   packetsLost: number;
 }
 
+/** Узел relay-дерева (Э8) — для UI «у кого беру стрим» и ручного выбора пира. */
+export interface TreeNode {
+  id: string;
+  identity: string;
+  parentId: string | null;
+  depth: number;
+  children: number;
+  capacity: number;
+  native: boolean;
+  broadcaster: boolean;
+  availableOutgoing: number;
+  rtt: number;
+  loss: number;
+}
+export interface TreeTopology {
+  /** id ЭТОГО узла в дереве (себя подсветить в UI). */
+  you: string | null;
+  nodes: TreeNode[];
+}
+
 export interface VideoTransport {
   /** Wire room-event listeners. Call once, BEFORE `room.connect()`. */
   attach(room: Room, ctx: { me: string; serverId: string }): void;
@@ -69,6 +89,13 @@ export interface VideoTransport {
    *  для дебаг-панели зрителя. LiveKit-транспорт их не реализует (там SFU, нет дерева). */
   getTreeInfo?(streamId: string): TreeInfo | null;
   getRtpStats?(streamId: string): Promise<RtpStats | null>;
+
+  /** Только TreeVideoTransport (Э8) — топология дерева, текущий родитель и ручной
+   *  выбор пира зрителем. LiveKit не реализует. */
+  getTopology?(streamId: string): TreeTopology | null;
+  getParentId?(streamId: string): string | null;
+  requestReparent?(streamId: string, targetId: string | null): void;
+  onTopology?(cb: (streamId: string) => void): () => void;
 
   getVideoTrack(key: string): LocalVideoTrack | RemoteTrack | MediaStreamVideoHandle | undefined;
   getStreams(): StreamInfo[];

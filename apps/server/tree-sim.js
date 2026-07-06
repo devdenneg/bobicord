@@ -28,17 +28,23 @@ async function main() {
   function connect(role, native) {
     return new Promise((resolve) => {
       const ws = new WebSocket(url);
-      const c = { ws, id: null, native, role, depth: null };
+      const c = { ws, id: null, native, role, depth: null, topology: null, denied: null };
+      // Э8: натив объявляет ёмкость relay (4), браузер — лист (0)
+      const maxChildren = native ? 4 : 0;
       ws.on('message', (raw) => {
         const msg = JSON.parse(raw.toString());
         if (msg.t === 'welcome') {
           c.id = msg.id;
-          ws.send(JSON.stringify({ t: 'join', streamId, role, native, identity: role + '-' + c.id }));
+          ws.send(JSON.stringify({ t: 'join', streamId, role, native, maxChildren, identity: role + '-' + c.id }));
           resolve(c);
         } else if (msg.t === 'assign-parent') {
           c.parentId = msg.parentId;
         } else if (msg.t === 'tree-info') {
           c.depth = msg.depth;
+        } else if (msg.t === 'tree-topology') {
+          c.topology = msg.nodes;
+        } else if (msg.t === 'reparent-denied') {
+          c.denied = msg.reason;
         }
       });
       clients.push(c);
@@ -92,6 +98,28 @@ async function main() {
     if (!ok || dt > 2000) { console.error('[sim] FAIL: reparent не уложился в AC'); process.exitCode = 1; }
   } else {
     console.log('[sim] нет внутреннего узла с детьми — дерево слишком плоское для этого теста (увеличь N)');
+  }
+
+  // Э8: ручной выбор пира зрителем — берём viewer, находим в его топологии свободный
+  // узел (не он сам, не его текущий родитель, есть ёмкость) и просим переезд к нему.
+  const mover = viewers.find((v) => v.ws.readyState === WebSocket.OPEN && v.topology && v.parentId);
+  if (mover) {
+    const target = mover.topology.find((n) =>
+      n.id !== mover.id && n.id !== mover.parentId && n.children < n.capacity && n.parentId !== mover.id);
+    if (target) {
+      console.log(`[sim] ручной reparent: ${mover.id} -> ${target.id}`);
+      const before = mover.parentId;
+      mover.ws.send(JSON.stringify({ t: 'request-reparent', streamId, targetParentId: target.id }));
+      await new Promise((r) => setTimeout(r, 400));
+      if (mover.parentId === target.id) {
+        console.log(`[sim] ручной reparent OK: ${before} -> ${mover.parentId}`);
+      } else {
+        console.error(`[sim] FAIL: ручной reparent не применён (parent=${mover.parentId}, denied=${mover.denied})`);
+        process.exitCode = 1;
+      }
+    } else {
+      console.log('[sim] нет свободного узла для ручного reparent (дерево заполнено)');
+    }
   }
 
   clients.forEach((c) => { try { c.ws.close(); } catch { /**/ } });

@@ -19,14 +19,20 @@ interface SavedConfig {
   windowHwnd: number | null;
   resolution: Resolution;
   fps: 30 | 60;
-  bitrateMbps: 3 | 6 | 10;
-  /** exclude — весь звук кроме RelayApp (WASAPI EXCLUDE себя, не всегда надёжно
-   *  фильтрует наш многопроцессный WebView2, см. CLAUDE.md инвариант 6 и audio.rs).
-   *  include — только звук выбранного процесса (надёжнее). */
+  bitrateMbps: 3 | 6 | 10 | 15 | 20;
+  /** exclude — весь звук кроме RelayApp (авто): нативно поднимается INCLUDE-loopback
+   *  на каждый не-наш аудио-процесс с миксом, голос войса не протекает (см. audio.rs).
+   *  include — только звук выбранного процесса (ручной override). */
   audioMode: 'exclude' | 'include';
   audioPid: number | null;
+  /** Э8: лимит прямых зрителей корня; остальные уходят глубже через relay-узлы. */
+  maxDirectChildren: number;
 }
-const DEF_CONFIG: SavedConfig = { sourceKind: 'monitor', monitorIndex: 0, windowHwnd: null, resolution: '1080', fps: 30, bitrateMbps: 6, audioMode: 'exclude', audioPid: null };
+// audioMode дефолтом 'exclude' (авто): нативный захват теперь надёжно исключает RelayApp
+// без выбора процесса — перечисляет активные render-сессии, вычитает наши процессы и
+// микширует остальные. Для окна PID всё ещё подставляется автоматически (эффект ниже),
+// если юзер переключится на ручной 'include'.
+const DEF_CONFIG: SavedConfig = { sourceKind: 'monitor', monitorIndex: 0, windowHwnd: null, resolution: '1080', fps: 30, bitrateMbps: 6, audioMode: 'exclude', audioPid: null, maxDirectChildren: 4 };
 function loadConfig(): SavedConfig {
   try { return { ...DEF_CONFIG, ...JSON.parse(localStorage.getItem('bcastConfig') || '{}') }; } catch { return DEF_CONFIG; }
 }
@@ -57,6 +63,15 @@ export function BroadcastModal() {
     return () => unStats?.();
   }, [live]);
 
+  // Автопривязка audio-PID к захватываемому окну: при захвате окна надёжный INCLUDE — это
+  // звук того же процесса, что и картинка. Синхронизируем, когда выбрано окно (или подгрузился
+  // список окон под сохранённый hwnd), чтобы пользователю не приходилось выбирать процесс дважды.
+  useEffect(() => {
+    if (cfg.sourceKind !== 'window' || cfg.windowHwnd == null) return;
+    const w = windows.find((x) => x.hwnd === cfg.windowHwnd);
+    if (w && cfg.audioPid !== w.pid) setCfg((c) => ({ ...c, audioPid: w.pid }));
+  }, [cfg.sourceKind, cfg.windowHwnd, windows]);
+
   async function start() {
     setBusy(true); setErr('');
     try {
@@ -65,7 +80,7 @@ export function BroadcastModal() {
         ? { kind: 'window', hwnd: cfg.windowHwnd }
         : { kind: 'monitor', index: cfg.monitorIndex };
       const audioTargetPid = cfg.audioMode === 'include' && cfg.audioPid != null ? cfg.audioPid : undefined;
-      await startNativeBroadcast(me.username, me.username, active.id, { source, maxWidth: res.w, maxHeight: res.h, fps: cfg.fps, bitrateBps: cfg.bitrateMbps * 1_000_000, audioTargetPid });
+      await startNativeBroadcast(me.username, me.username, active.id, { source, maxWidth: res.w, maxHeight: res.h, fps: cfg.fps, bitrateBps: cfg.bitrateMbps * 1_000_000, audioTargetPid, maxDirectChildren: cfg.maxDirectChildren });
       saveConfig(cfg);
       useStore.getState().setBroadcastLive(true);
     } catch (e: any) { setErr(String(e?.message || e)); } finally { setBusy(false); }
@@ -112,7 +127,7 @@ export function BroadcastModal() {
           </select>
         </div>
       : <div className="fld"><label>Окно</label>
-          <select value={cfg.windowHwnd ?? ''} onChange={(e) => setCfg((c) => ({ ...c, windowHwnd: +e.target.value }))}>
+          <select value={cfg.windowHwnd ?? ''} onChange={(e) => { const hwnd = +e.target.value; const w = windows.find((x) => x.hwnd === hwnd); setCfg((c) => ({ ...c, windowHwnd: hwnd, audioPid: w ? w.pid : c.audioPid })); }}>
             <option value="" disabled>Выбери окно</option>
             {windows.map((w) => <option key={w.hwnd} value={w.hwnd}>{w.title}{w.process ? ` — ${w.process}` : ''}</option>)}
           </select>
@@ -129,19 +144,28 @@ export function BroadcastModal() {
       </div>
     </div>
     <div className="fld"><label>Битрейт</label>
-      <div className="seg">{[3, 6, 10].map((b) => <button key={b} className={cfg.bitrateMbps === b ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, bitrateMbps: b as 3 | 6 | 10 }))}>{b} Мбит/с</button>)}</div>
+      <div className="seg">{[3, 6, 10, 15, 20].map((b) => <button key={b} className={cfg.bitrateMbps === b ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, bitrateMbps: b as 3 | 6 | 10 | 15 | 20 }))}>{b} Мбит/с</button>)}</div>
+    </div>
+    <div className="fld"><label>Прямых подключений</label>
+      <div className="seg">{[2, 4, 6, 8].map((n) => <button key={n} className={cfg.maxDirectChildren === n ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, maxDirectChildren: n }))}>{n}</button>)}</div>
+      <p className="msub" style={{ margin: '8px 0 0' }}>Сколько зрителей берут поток напрямую с тебя. Остальные — через ретранслирующих зрителей (дерево, глубже).</p>
     </div>
     <div className="fld"><label>Звук</label>
       <div className="seg">
-        <button className={cfg.audioMode === 'exclude' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, audioMode: 'exclude' }))}>Всё, кроме RelayApp</button>
+        <button className={cfg.audioMode === 'exclude' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, audioMode: 'exclude' }))}>Всё, кроме RelayApp (авто)</button>
         <button className={cfg.audioMode === 'include' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, audioMode: 'include' }))}>Только процесс</button>
       </div>
       {cfg.audioMode === 'include'
-        ? <select style={{ marginTop: 8 }} value={cfg.audioPid ?? ''} onChange={(e) => setCfg((c) => ({ ...c, audioPid: +e.target.value }))}>
-            <option value="" disabled>Выбери процесс</option>
-            {windows.map((w) => <option key={w.hwnd} value={w.pid}>{w.title}{w.process ? ` — ${w.process}` : ''}</option>)}
-          </select>
-        : <p className="msub" style={{ margin: '8px 0 0' }}>Если слышен свой голос/чужие стримы в записи — переключи на «Только процесс» и выбери игру.</p>}
+        ? <>
+            <select style={{ marginTop: 8 }} value={cfg.audioPid ?? ''} onChange={(e) => setCfg((c) => ({ ...c, audioPid: +e.target.value }))}>
+              <option value="" disabled>Выбери процесс</option>
+              {windows.map((w) => <option key={w.hwnd} value={w.pid}>{w.title}{w.process ? ` — ${w.process}` : ''}</option>)}
+            </select>
+            {cfg.sourceKind === 'window'
+              ? <p className="msub" style={{ margin: '8px 0 0' }}>Звук берётся из процесса захватываемого окна — голос войса в стрим не попадёт.</p>
+              : <p className="msub" style={{ margin: '8px 0 0' }}>Захват экрана: выбери процесс игры — только его звук уйдёт в стрим (надёжно против эха голоса).</p>}
+          </>
+        : <p className="msub" style={{ margin: '8px 0 0' }}>В стрим уходит звук всех приложений/игр, кроме самого RelayApp (голос войса не попадёт). «Только процесс» — на случай, если нужен звук строго одного приложения.</p>}
     </div>
     <div className="rowbtns">
       <button className="ghost" style={{ margin: 0 }} onClick={close}>Отмена</button>

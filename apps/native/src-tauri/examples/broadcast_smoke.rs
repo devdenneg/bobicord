@@ -22,11 +22,13 @@ async fn main() {
     let source = broadcast::CaptureSource::Monitor { index: monitor_index };
     let config = broadcast::StreamConfig {
         max_width: 1920, max_height: 1080, fps: 30, bitrate_bps: 6_000_000,
-        audio_source: broadcast::AudioSource::ExcludeSelf,
+        audio_source: broadcast::AudioSource::ExcludeSelfViaInclude,
+        max_direct_children: 4,
     };
 
     println!("[smoke] starting broadcast stream_id={stream_id} ws_url={ws_url} monitor={monitor_index}");
-    let handle = broadcast::start(None, stream_id, ws_url, identity, source, config).await.expect("start broadcast");
+    let server_id = "smoke".to_string();
+    let handle = broadcast::start(None, stream_id, ws_url, identity, server_id, source, config).await.expect("start broadcast");
 
     println!("[smoke] broadcasting for 300s — open tree-test-viewer.html now and click Смотреть");
     tokio::time::sleep(std::time::Duration::from_secs(300)).await;

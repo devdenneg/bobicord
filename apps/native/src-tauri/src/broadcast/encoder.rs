@@ -83,6 +83,9 @@ impl H264Encoder {
                 let _ = api.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &VARIANT::from(0i32));
                 let _ = api.SetValue(&CODECAPI_AVEncCommonLowLatency, &VARIANT::from(true));
                 let _ = api.SetValue(&CODECAPI_AVEncCommonQualityVsSpeed, &VARIANT::from(100u32));
+                // CBR вместо дефолтного VBR — статичный битрейт (не плавает с содержимым сцены),
+                // предсказуемая нагрузка на дерево/TURN.
+                let _ = api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &VARIANT::from(eAVEncCommonRateControlMode_CBR.0));
             }
 
             let stream_info = transform.GetOutputStreamInfo(0).map_err(|e| format!("GetOutputStreamInfo: {e}"))?;
@@ -296,12 +299,37 @@ unsafe fn find_hardware_h264_encoder() -> WinResult<IMFTransform> {
 
     if !activates_ptr.is_null() && count > 0 {
         let activates = std::slice::from_raw_parts(activates_ptr, count as usize);
+        // Кандидат, требующий D3D (MF_SA_D3D11_AWARE/MF_SA_D3D_AWARE) — обычно
+        // Intel QuickSync-подобный MFT — без подключённого IMFDXGIDeviceManager
+        // (мы его не создаём, весь пайплайн на CPU-памяти, см. capture.rs) откажет
+        // на SetOutputType/SetInputType с MF_E_UNSUPPORTED_D3D_TYPE (0xC00D6D76).
+        // Пропускаем такие, берём первый MFT, который берёт system-memory сэмплы
+        // (обычно NVENC-подобный) — это то, что реально проверено E2E.
+        let is_d3d_aware = |a: &IMFActivate| {
+            a.GetUINT32(&MF_SA_D3D11_AWARE).unwrap_or(0) != 0 || a.GetUINT32(&MF_SA_D3D_AWARE).unwrap_or(0) != 0
+        };
         for (i, act) in activates.iter().enumerate() {
             if let Some(a) = act {
+                if is_d3d_aware(a) { continue; }
                 if let Ok(t) = a.ActivateObject::<IMFTransform>() {
                     picked = Some(t);
                     picked_index = Some(i);
                     break;
+                }
+            }
+        }
+        // Ни одного не-D3D-aware кандидата не нашлось (например, только встроенная
+        // Intel-графика без дискретной) — берём первый попавшийся D3D-aware как
+        // раньше; без D3D-manager он, скорее всего, тоже упадёт на SetOutputType,
+        // но так хотя бы не молчим о самой аппаратной кодировке как таковой.
+        if picked.is_none() {
+            for (i, act) in activates.iter().enumerate() {
+                if let Some(a) = act {
+                    if let Ok(t) = a.ActivateObject::<IMFTransform>() {
+                        picked = Some(t);
+                        picked_index = Some(i);
+                        break;
+                    }
                 }
             }
         }

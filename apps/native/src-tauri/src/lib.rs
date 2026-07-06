@@ -26,6 +26,7 @@ fn list_windows() -> Vec<WindowInfo> {
 }
 
 struct BroadcastState(Mutex<Option<broadcast::BroadcastHandle>>);
+struct WatchState(Mutex<Option<broadcast::relay::RelayHandle>>);
 
 #[tauri::command]
 async fn start_broadcast(
@@ -41,6 +42,7 @@ async fn start_broadcast(
   fps: u32,
   bitrate_bps: u32,
   audio_target_pid: Option<u32>,
+  max_direct_children: Option<u32>,
 ) -> Result<(), String> {
   let mut slot = state.0.lock().await;
   if let Some(h) = slot.as_ref() {
@@ -62,11 +64,58 @@ async fn start_broadcast(
     bitrate_bps: bitrate_bps.clamp(500_000, 20_000_000),
     audio_source: match audio_target_pid {
       Some(pid) => broadcast::AudioSource::IncludeProcess(pid),
-      None => broadcast::AudioSource::ExcludeSelf,
+      None => broadcast::AudioSource::ExcludeSelfViaInclude,
     },
+    max_direct_children: max_direct_children.unwrap_or(4).clamp(1, 8),
   };
   let handle = broadcast::start(Some(app), stream_id, ws_url, identity, server_id, source, config).await?;
   *slot = Some(handle);
+  Ok(())
+}
+
+// Э8: нативный relay-viewer. Rust держит upstream к родителю в дереве, ретранслирует детям
+// (passthrough) и показывает поток в этом webview через IPC (события relay-watch-offer/-ice,
+// команды watch_answer/watch_ice). Один активный watch за раз (как и broadcast).
+#[tauri::command]
+async fn start_watch(
+  app: tauri::AppHandle,
+  state: tauri::State<'_, WatchState>,
+  stream_id: String,
+  ws_url: String,
+  identity: String,
+  server_id: String,
+  max_children: Option<u32>,
+) -> Result<(), String> {
+  let mut slot = state.0.lock().await;
+  if let Some(old) = slot.take() { old.stop(); }
+  let handle = broadcast::relay::start(Some(app), stream_id, ws_url, identity, server_id, max_children.unwrap_or(4).clamp(0, 8));
+  *slot = Some(handle);
+  Ok(())
+}
+
+#[tauri::command]
+async fn stop_watch(state: tauri::State<'_, WatchState>) -> Result<(), String> {
+  if let Some(h) = state.0.lock().await.take() { h.stop(); }
+  Ok(())
+}
+
+// Ответ webview на локальный offer relay-показа (см. relay-watch-offer).
+#[tauri::command]
+async fn watch_answer(state: tauri::State<'_, WatchState>, sdp: String) -> Result<(), String> {
+  if let Some(h) = state.0.lock().await.as_ref() { h.webview_answer(sdp); }
+  Ok(())
+}
+
+#[tauri::command]
+async fn watch_ice(state: tauri::State<'_, WatchState>, candidate: serde_json::Value) -> Result<(), String> {
+  if let Some(h) = state.0.lock().await.as_ref() { h.webview_ice(candidate); }
+  Ok(())
+}
+
+// Э8: ручной выбор пира зрителем из UI дерева (target=Some) или авто-миграция (target=None).
+#[tauri::command]
+async fn watch_reparent(state: tauri::State<'_, WatchState>, target: Option<String>) -> Result<(), String> {
+  if let Some(h) = state.0.lock().await.as_ref() { h.request_reparent(target); }
   Ok(())
 }
 
@@ -83,6 +132,7 @@ async fn stop_broadcast(state: tauri::State<'_, BroadcastState>) -> Result<(), S
 pub fn run() {
   tauri::Builder::default()
     .manage(BroadcastState(Mutex::new(None)))
+    .manage(WatchState(Mutex::new(None)))
     .setup(|app| {
       // Раньше висело за cfg!(debug_assertions) — в релизном билде (то, что реально
       // ставят и тестируют) log::info!/warn!/error! по всему broadcast:: были
@@ -98,7 +148,7 @@ pub fn run() {
       )?;
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![ping, list_monitors, list_windows, start_broadcast, stop_broadcast])
+    .invoke_handler(tauri::generate_handler![ping, list_monitors, list_windows, start_broadcast, stop_broadcast, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }
