@@ -102,6 +102,7 @@ async fn start_watch(
     virtual_relay: false,
     available_outgoing: 8_000_000,
     idle_exit: None, // натив смотрит стрим сам — уходим только по Stop
+    reconnect: true, // рестарт сервера (деплой) не рвёт просмотр
   });
   *slot = Some(handle);
   Ok(())

@@ -116,6 +116,7 @@ async fn activate(cfg: &Arc<Cfg>, streams: &Streams, stream_id: &str, server_id:
         virtual_relay: true,
         available_outgoing: cfg.available_outgoing,
         idle_exit: Some(cfg.idle),
+        reconnect: false, // сессия гаснет с WS; агент переактивируется по vrelay-activate
     });
     let fin = handle.finished();
     map.insert(stream_id.to_string(), handle);

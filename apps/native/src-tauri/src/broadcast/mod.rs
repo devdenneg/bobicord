@@ -284,7 +284,9 @@ pub async fn start(
         abr: auto_bitrate,
         virtual_relay: false,
     };
-    let (cmd_tx, evt_rx) = signaling::connect(ws_url, join);
+    // reconnect=true: деплой рестартит сервер — вещание переживает обрыв WS (реджойн),
+    // энкод/захват не прерываются, зрители переджойнятся сами.
+    let (cmd_tx, evt_rx) = signaling::connect(ws_url, join, true);
 
     let mgr = peer::PeerManager::new(&stream_id, cmd_tx.clone(), force_keyframe.clone())?;
     let video_track = mgr.video_track.clone();
@@ -527,6 +529,11 @@ async fn run_signaling_loop(
                         // (стабильность важнее чёткости; см. QualityLadder).
                         ladder.apply(clamped);
                     }
+                    // Рестарт сервера пережит: реджойнились свежим корнем, старое дерево
+                    // сервер потерял — зрители переджойнятся и придут свежими assign-child.
+                    // Старые child-PC стримят дальше (P2P), пока зритель не пересоздастся;
+                    // трупы дочистит sweep в stats-тике.
+                    Some(TreeEvent::Rejoined) => log::warn!("broadcast: сигналинг реджойнился — жду переподключение зрителей"),
                     // Корень не имеет родителя — эти события к нему не относятся.
                     // Release (Э9) адресован виртуальному relay — корню-вещателю не приходит.
                     Some(TreeEvent::AssignParent { .. }) | Some(TreeEvent::SdpOffer { .. }) | Some(TreeEvent::Topology { .. }) | Some(TreeEvent::Release) => {}
@@ -560,6 +567,7 @@ async fn run_signaling_loop(
                 prev_at = now; prev_cap = cap; prev_enc = enc; prev_bytes = bytes;
                 if let Some(app) = &app { let _ = app.emit("relay-broadcast-stats", &snapshot); }
 
+                mgr.sweep_dead().await; // трупы child-PC (после реджойна drop-peer не придёт)
                 // Э8 ABR: реальные loss/rtt по каждому детскому линку (RTCP RR через get_stats) —
                 // сервер агрегирует worst-link по дереву и решает целевой битрейт. Раньше слали нули.
                 let cur_target = target_bitrate.load(Ordering::Relaxed);

@@ -245,6 +245,21 @@ impl PeerManager {
     pub fn child_count(&self) -> usize { self.children.len() }
     pub fn child_ids(&self) -> Vec<String> { self.children.keys().cloned().collect() }
 
+    /// Чистка мёртвых child-PC (Failed/Closed). После реджойна сигналинга (рестарт
+    /// сервера) старые дети не получат drop-peer — их новые инкарнации под новыми
+    /// peer-id; старый PC умирает сам, когда зритель пересоздал соединение.
+    pub async fn sweep_dead(&mut self) {
+        let dead: Vec<String> = self.children.iter()
+            .filter(|(_, pc)| matches!(pc.connection_state(), RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed))
+            .map(|(id, _)| id.clone()).collect();
+        for id in dead {
+            if let Some(pc) = self.children.remove(&id) {
+                log::info!("peer {id}: мёртвый PC (failed/closed) — чищу");
+                let _ = pc.close().await;
+            }
+        }
+    }
+
     /// `(child_id, loss 0..1, rtt_ms)` по каждому прямому ребёнку — отчёт серверу для ABR
     /// и best-peer скоринга. Дети без RR (соединение ещё поднимается) пропускаются.
     pub async fn link_stats(&self) -> Vec<(String, f64, f64)> {

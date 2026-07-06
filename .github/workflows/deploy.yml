@@ -3,6 +3,18 @@ name: deploy
 on:
   push:
     branches: [main]
+    # Деплоим только когда менялось что-то серверное/вебовое: пересоздание контейнера
+    # token рвёт все WS relay-дерева (стримы падают) — чисто нативные коммиты не должны
+    # ронять прод. Нужен внеплановый деплой — workflow_dispatch.
+    paths:
+      - apps/server/**
+      - apps/web/**
+      - apps/relay/**
+      - apps/relay-core/**
+      - docker-compose.yml
+      - coturn/**
+      - .github/workflows/deploy.yml
+      - .dockerignore
   workflow_dispatch:
 
 env:

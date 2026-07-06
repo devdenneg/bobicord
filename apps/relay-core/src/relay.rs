@@ -59,6 +59,9 @@ pub struct RelayConfig {
     /// не шлёт drop-peer на каждого ребёнка, map остаётся непустым. None — натив (webview
     /// смотрит стрим, уходим только по Stop).
     pub idle_exit: Option<Duration>,
+    /// Переживать обрыв WS (деплой/рестарт сервера): реконнект + реджойн, см. signaling.
+    /// true у натива (вещатель/relay-viewer), false у vrelay-сессий (агент переактивируется).
+    pub reconnect: bool,
 }
 
 /// Управляющие сообщения в relay-цикл от хоста (в нативе — Tauri-команды: сигналинг
@@ -389,6 +392,22 @@ impl RelayManager {
         )).count()
     }
 
+    /// Чистка мёртвых child-PC (Failed/Closed). После реджойна (рестарт сервера) старые
+    /// дети никогда не получат drop-peer — их новые инкарнации живут под новыми peer-id,
+    /// а старый PC умирает сам, когда ребёнок пересоздал соединение. Disconnected не
+    /// трогаем — может восстановиться.
+    async fn sweep_dead_children(&mut self) {
+        let dead: Vec<String> = self.children.iter()
+            .filter(|(_, pc)| matches!(pc.connection_state(), RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed))
+            .map(|(id, _)| id.clone()).collect();
+        for id in dead {
+            if let Some(pc) = self.children.remove(&id) {
+                log::info!("relay: ребёнок {id} мёртв (failed/closed) — чищу PC");
+                let _ = pc.close().await;
+            }
+        }
+    }
+
     // ---- webview (локальный показ через UiSink; мы offerer). Headless (ui=None) — не поднимаем. ----
     async fn start_webview(&mut self) {
         if self.ui.is_none() || self.webview.is_some() { return; }
@@ -454,13 +473,13 @@ impl RelayManager {
 /// локальный показ (только при ui=Some), ретранслирует детям. Возвращает RelayHandle для
 /// управления (сигналинг webview из JS, стоп, ожидание завершения).
 pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
-    let RelayConfig { stream_id, ws_url, identity, server_id, max_children, virtual_relay, available_outgoing, idle_exit } = cfg;
+    let RelayConfig { stream_id, ws_url, identity, server_id, max_children, virtual_relay, available_outgoing, idle_exit, reconnect } = cfg;
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<RelayControl>();
     let finished = Arc::new(Notify::new());
     let fin = finished.clone();
 
     let join = JoinParams { stream_id: stream_id.clone(), identity, server_id, role: "viewer", native: true, max_children, max_bitrate: 0, abr: false, virtual_relay };
-    let (cmd_tx, mut evt_rx) = signaling::connect(ws_url, join);
+    let (cmd_tx, mut evt_rx) = signaling::connect(ws_url, join, reconnect);
 
     tokio::spawn(async move {
         let mut mgr = match RelayManager::new(stream_id, cmd_tx, ui) {
@@ -490,6 +509,10 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
                         Some(TreeEvent::SetBitrate { .. }) => { /* relay не энкодит — битрейт задаёт корень */ }
                         Some(TreeEvent::Topology { payload }) => { if let Some(ui) = &mgr.ui { ui("relay-topology", payload); } }
                         Some(TreeEvent::Release) => { log::info!("relay: vrelay-release от сервера — выходим"); break; }
+                        // Рестарт сервера пережит: мы реджойнились свежим узлом, сервер сам
+                        // пришлёт assign-parent (settleOrphans) — upstream пересоздастся. Старые
+                        // child-PC живут, пока дети не пересоздадут соединения (sweep дочистит).
+                        Some(TreeEvent::Rejoined) => log::warn!("relay: сигналинг реджойнился — жду свежий assign-parent"),
                         Some(TreeEvent::Closed) | None => break,
                     }
                 }
@@ -502,6 +525,7 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
                     }
                 }
                 _ = stats_tick.tick() => {
+                    mgr.sweep_dead_children().await;
                     // Watchdog upstream: ICE упал (Failed сразу / Disconnected дольше 6с), а WS
                     // жив — сервер не знает об обрыве, зритель фризит. Просим reparent (мы
                     // answerer, restart_ice не применим — сервер даст нового/того же родителя).
