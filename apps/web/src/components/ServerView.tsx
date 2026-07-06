@@ -141,9 +141,6 @@ function VoiceChannels() {
         <span>Голосовые каналы</span>
         <span className="vchans-count">{channels.length}/5</span>
       </div>
-      {!eng.roomReady && channels.length === 0 ? (
-        <div className="vchan"><div className="vchan-h"><span className="sk-line" style={{ width: '55%', height: 11 }} /></div></div>
-      ) : null}
       {channels.map((c) => (
         <VoiceChannelItem key={c.id} channel={c} canManage={canManage} canDelete={canManage && channels.length > 1} mine={myVc === c.id}
           membersInChannel={members.filter((m) => eng.voiceChannels[m.username] === c.id)} />

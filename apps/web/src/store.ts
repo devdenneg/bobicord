@@ -66,7 +66,7 @@ function startMemberPoll(id: string) {
       const [srv, prs] = await Promise.all([api.getServer(id), api.presence(id)]);
       const cur = useStore.getState().active;
       useStore.setState({ members: srv.members, active: cur && cur.id === id ? { ...cur, channels: srv.server.channels } : cur });
-      engine?.setMembers(srv.members); engine?.setOnlineHint(prs.online);
+      engine?.setMembers(srv.members); engine?.setOnlineHint(prs.online); engine?.setVoiceHint(prs.voice || {});
     } catch { /**/ }
   };
   memberTimer = window.setInterval(poll, 5000);
@@ -156,7 +156,7 @@ export const useStore = create<AppState>((set, get) => ({
       const [srv, pres] = await Promise.all([api.getServer(id), api.presence(id).catch(() => null)]);
       if (get().connectedServerId !== id || get().view !== 'server') return;
       set({ members: srv.members, active: { ...srv.server, myRole: srv.myRole, myPerms: srv.myPerms } });
-      engine?.setMembers(srv.members); if (pres) engine?.setOnlineHint(pres.online);
+      engine?.setMembers(srv.members); if (pres) { engine?.setOnlineHint(pres.online); engine?.setVoiceHint(pres.voice || {}); }
     } catch { /**/ }
   },
 
@@ -180,7 +180,7 @@ export const useStore = create<AppState>((set, get) => ({
       const active: ServerDetail = { ...d.server, myRole: d.myRole, myPerms: d.myPerms };
       if (settings?.data && (settings.data.users || settings.data.streams)) engine?.setVols(settings.data);
       engine?.setMembers(d.members);
-      if (pres) engine?.setOnlineHint(pres.online);
+      if (pres) { engine?.setOnlineHint(pres.online); engine?.setVoiceHint(pres.voice || {}); }
       engine?.loadHistory(hist.messages, hist.hasMore);
       if (hist.messages.length === 0) engine?.sysMsg('Ты на сервере «' + active.name + '». Чат доступен сразу — голос по кнопке «Подключиться».');
       // ВСЁ критичное готово → показываем сервер немедленно (не ждём комнату)

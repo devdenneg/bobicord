@@ -97,7 +97,7 @@ export const api = {
   serverToken: (id: string) => req<{ token: string; url: string; room: string }>('GET', `/servers/${id}/token`),
   getSettings: (id: string) => req<{ data: any }>('GET', `/servers/${id}/settings`),
   putSettings: (id: string, data: any) => req<{ ok: boolean }>('PUT', `/servers/${id}/settings`, { data }),
-  presence: (id: string) => req<{ online: string[] }>('GET', `/servers/${id}/presence`),
+  presence: (id: string) => req<{ online: string[]; voice?: Record<string, string> }>('GET', `/servers/${id}/presence`),
   // курсорная пагинация: before = id строки, старше которой грузить (undefined = последняя страница)
   getMessages: (id: string, before?: number, limit?: number) => {
     const qs = new URLSearchParams();

@@ -182,6 +182,17 @@ async function onlineIn(serverId) {
   try { const ps = await rsc.listParticipants('srv:' + serverId); return ps.map(p => p.identity); }
   catch (e) { return []; }
 }
+// online-состав + карта {identity: channelId} (кто в каком голосовом канале) из participant-атрибута vc.
+// Отдаём это в /presence, чтобы состав голосовых каналов был виден сразу на загрузке — не дожидаясь,
+// пока у зрителя локально поднимется LiveKit-комната.
+async function voiceStateIn(serverId) {
+  try {
+    const ps = await rsc.listParticipants('srv:' + serverId);
+    const online = [], voice = {};
+    for (const p of ps) { online.push(p.identity); const vc = p.attributes && p.attributes.vc; if (vc) voice[p.identity] = vc; }
+    return { online, voice };
+  } catch (e) { return { online: [], voice: {} }; }
+}
 const pubUser = u => ({ id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '', bio: u.bio });
 const UPLOAD_RE = /^\/api\/uploads\/[a-zA-Z0-9._-]+$/; // локальный путь к загрузке
 const pubServer = s => ({ id: s.id, name: s.name, ownerId: s.owner_id, iconColor: s.icon_color, iconUrl: s.icon_url || '', description: s.description || '' });
@@ -250,7 +261,7 @@ app.get('/api/me', requireAuth, async (req, res) => {
 /* live presence for one server's member list (names online right now) */
 app.get('/api/servers/:id/presence', requireAuth, async (req, res) => {
   if (!isMember(req.user.id, req.params.id)) return res.status(403).json({ error: 'нет' });
-  res.json({ online: await onlineIn(req.params.id) });
+  res.json(await voiceStateIn(req.params.id));
 });
 
 app.patch('/api/me', requireAuth, (req, res) => {

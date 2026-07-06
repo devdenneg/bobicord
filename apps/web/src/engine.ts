@@ -118,6 +118,7 @@ export class Engine {
   VOLS = { users: {} as Record<string, number>, streams: {} as Record<string, number> };
   private perMute = new Set<string>();
   private onlineHint = new Set<string>();
+  private voiceHint: Record<string, string> = {}; // серверный хинт {username: channelId}: состав голосовых до подъёма локальной комнаты
 
   private emoteListeners = new Set<EmoteListener>();
   private subs = new Set<() => void>();
@@ -175,6 +176,7 @@ export class Engine {
   setMe(me: User) { this.me = me; }
   setMembers(m: Member[]) { this.members = m; this.emit(); }
   setOnlineHint(ids: string[]) { this.onlineHint = new Set(ids); this.emit(); }
+  setVoiceHint(v: Record<string, string>) { this.voiceHint = v || {}; this.emit(); }
   setVols(v: { users?: Record<string, number>; streams?: Record<string, number> }) {
     this.VOLS.users = v.users || {}; this.VOLS.streams = v.streams || {};
   }
@@ -198,11 +200,17 @@ export class Engine {
     }
     const speaking: Record<string, boolean> = {};
     this.speakingSet.forEach((u) => (speaking[u] = true));
-    // кто в каком голосовом канале (по participant-атрибуту vc; для себя — currentVc)
+    // кто в каком голосовом канале. Комната поднялась и пир виден локально → доверяем локальному
+    // состоянию (attr vc / микрофон). Иначе (комната ещё в фоне / пира нет локально) — серверный хинт
+    // из /presence, чтобы состав каналов был виден сразу, без пустого мигания на загрузке.
     const voiceChannels: Record<string, string> = {};
     for (const m of this.members) {
-      const vc = this.voiceChannelOf(m.username);
-      if (vc && this.isInVoice(m.username)) voiceChannels[m.username] = vc;
+      const p = this.partOf(m.username);
+      if (this.roomReady && p) {
+        if (this.isInVoice(m.username)) { const vc = this.voiceChannelOf(m.username) || this.voiceHint[m.username]; if (vc) voiceChannels[m.username] = vc; }
+      } else {
+        const vc = this.voiceHint[m.username]; if (vc) voiceChannels[m.username] = vc;
+      }
     }
     // стримы видит только тот, кто в том же голосовом канале, что и вещатель (своё превью — всегда)
     const streams: StreamInfo[] = [...this.liveKitT.getStreams(), ...this.treeT.getStreams()].filter((s) =>
