@@ -71,8 +71,35 @@ jobs:
             "platforms": { "windows-x86_64": { "signature": "$sig", "url": "https://138-16-170-21.sslip.io/api/app/$(basename "$exe")" } } }
           EOF
 
-      # Заливаем на VPS в том, смонтированный в server (/app/data/releases). rm:true чистит
-      # старые exe — клиент всегда берёт url из свежего latest.json. SSH-секреты — как в deploy.yml.
+      # Payload (exe + latest.json) отдаём как артефакт — заливку на VPS делает
+      # отдельный job `upload` на ubuntu (appleboy/scp-action — Docker-контейнер-экшен,
+      # НЕ работает на windows-раннере: "Container action is only supported on Linux").
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-payload
+          path: out/*
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RelayApp-windows
+          path: |
+            apps/native/src-tauri/target/release/bundle/msi/*.msi
+            apps/native/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+  # Заливка на VPS в том, смонтированный в server (/app/data/releases). Отдельный
+  # ubuntu-job, т.к. scp-action контейнерный (на windows не запускается). rm:true чистит
+  # старые exe — клиент всегда берёт url из свежего latest.json. SSH-секреты — как в deploy.yml.
+  upload:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-payload
+          path: out
+
       - name: Upload to VPS
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -83,11 +110,3 @@ jobs:
           target: /opt/voice/data/releases
           strip_components: 1
           rm: true
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: RelayApp-windows
-          path: |
-            apps/native/src-tauri/target/release/bundle/msi/*.msi
-            apps/native/src-tauri/target/release/bundle/nsis/*.exe
-          if-no-files-found: error
