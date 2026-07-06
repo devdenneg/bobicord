@@ -88,9 +88,11 @@
   .card{background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-lg);padding:30px;width:min(400px,94vw);box-shadow:var(--sh-3),var(--hair);animation:popIn .2s cubic-bezier(.2,.8,.4,1)}
   .card.shake{animation:shake .3s}
   .brand{display:flex;align-items:center;gap:12px;margin-bottom:8px}
-  .brand .logo{width:48px;height:48px;border-radius:14px;background:linear-gradient(135deg,#6366f1,#8b5cf6);display:flex;align-items:center;justify-content:center;flex:0 0 auto;box-shadow:0 8px 24px -6px rgba(99,102,241,.6),inset 0 1px 0 rgba(255,255,255,.25)}
+  .brand .logo{width:48px;height:48px;border-radius:14px;display:flex;align-items:center;justify-content:center;flex:0 0 auto;box-shadow:0 8px 24px -6px rgba(139,92,246,.6)}
+  .brand .logo img{width:100%;height:100%;border-radius:14px;display:block}
   .brand .logo .ic{color:#fff;font-size:24px}
   .card h1{margin:0;font-size:22px;font-weight:700;letter-spacing:-.02em;color:var(--txt-h)}
+  .wordmark{font-family:'Arial Black','Segoe UI',Impact,system-ui,sans-serif;font-weight:900;font-size:26px;text-transform:uppercase;letter-spacing:.14em;background:linear-gradient(135deg,#22d3ee,#a855f7);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;color:transparent}
   .card .sub{margin:0 0 20px;color:var(--muted);font-size:14px;line-height:1.5}
   .row{margin-bottom:12px}
   .row label{display:block;font-size:12px;font-weight:600;letter-spacing:.3px;color:var(--muted);margin:0 0 6px;text-transform:uppercase}

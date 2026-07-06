@@ -1,6 +1,6 @@
 {
-  "name": "Voice — голосовой чат",
-  "short_name": "Voice",
+  "name": "РИЛЭЙ",
+  "short_name": "РИЛЭЙ",
   "description": "Голос, чат и трансляции для своей команды",
   "id": "/",
   "start_url": "/",
@@ -11,7 +11,9 @@
   "theme_color": "#0c0e13",
   "lang": "ru",
   "icons": [
-    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
-    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable" }
+    { "src": "/icon-128.png", "sizes": "128x128", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-256.png", "sizes": "256x256", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
   ]
 }
