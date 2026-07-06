@@ -10,6 +10,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # полная история — иначе git rev-list --count HEAD = 1 (shallow) → версия всегда 0.1.1
 
       - uses: actions/setup-node@v4
         with:
