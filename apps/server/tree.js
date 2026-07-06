@@ -37,6 +37,21 @@ const STATS_TTL_MS = 10_000;       // linkLoss/linkRtt старше — счит
 const KF_FORWARD_MIN_MS = 1000;    // rate-limit проброса request-keyframe к корню на ДЕРЕВО: IDR дорог
                                    // (100-300КБ спайк всем зрителям), N relay-узлов иначе суммируются
 
+// Э9 — виртуальный серверный fallback-relay (vrelay): headless-агент на VPS, джойнится в
+// дерево как viewer с ёмкостью и passthrough-ретранслирует. Строго фолбэк: живые пиры
+// всегда предпочитаются (VIRTUAL_COST), активация только когда сироты без кандидатов
+// (или зритель явно попросил «через сервер»), дренаж уводит детей на живые пиры.
+const VIRTUAL_COST = 1000;         // штраф виртуала в scoreParent: потолок score живого кандидата
+                                   // ~740 (depth<=300 + natCost 250 + load 40 + loss 50 + rtt ~100),
+                                   // 1000 гарантирует проигрыш ЛЮБОМУ живому relay, но виртуал
+                                   // остаётся единственным кандидатом, когда живых нет
+const VIRTUAL_CHILDREN_CAP = 16;   // кап ёмкости виртуала (датацентр — выше пользовательского MAX_CHILDREN_CAP)
+const DRAIN_TICK_MS = 5000;        // темп дренажа детей виртуала на живые пиры
+const DRAIN_COOLDOWN_MS = 15_000;  // гистерезис: свежепосаженного под виртуала не дёргаем сразу
+const VRELAY_ACTIVATE_TIMEOUT_MS = 15_000; // активация «в полёте»: не слать повторный activate, пока не истёк
+const VRELAY_UID = 'virtual-relay'; // JWT-uid агента: флагу virtual в join верим только при нём
+const VRELAY_TARGET = 'vrelay';    // сентинел targetParentId в request-reparent = «хочу через сервер»
+
 function newPeerId() { return 'p_' + crypto.randomBytes(6).toString('hex'); }
 
 class Tree {
@@ -60,6 +75,8 @@ class TreeManager {
   // и браузер-relay сообщают свою ёмкость сами), с потолком MAX_CHILDREN_CAP. Fallback на
   // старые константы, если maxChildren не пришёл (обратная совместимость).
   capacityOf(node) {
+    // Э9: виртуал — серверный процесс без NAT, кап у него свой (выше пользовательского).
+    if (node.virtual) return Math.max(0, Math.min(typeof node.maxChildren === 'number' ? node.maxChildren : 8, VIRTUAL_CHILDREN_CAP));
     if (node.symmetricNat && !this.turnEnabled) return 0; // без TURN симметричный = лист
     if (typeof node.maxChildren === 'number') return Math.max(0, Math.min(node.maxChildren, MAX_CHILDREN_CAP));
     return node.native ? NATIVE_CAPACITY : BROWSER_CAPACITY;
@@ -88,6 +105,20 @@ class TreeManager {
     return h;
   }
 
+  // Узел связан с корнем (цепочка parent доводит до вещателя)? Сироты (parent=null) и
+  // повисшие цепочки НЕ годятся в родители: depth у них 0 и скоринг считал бы их лучшими,
+  // а зритель под ними не получил бы медиа (нет upstream к корню). Особенно бьёт по Э9:
+  // виртуал, вошедший в забитое дерево, сам сирота — без этой проверки placeOrphans
+  // сажал под него зрителей в никуда.
+  attachedToRoot(t, node) {
+    let cur = node, hops = 0;
+    while (cur && hops++ <= t.nodes.size) {
+      if (cur.id === t.broadcasterId) return true;
+      cur = cur.parent ? t.nodes.get(cur.parent) : null;
+    }
+    return false;
+  }
+
   // Скоринг кандидата в родители (меньше — лучше). Приоритеты: меньшая глубина (латентность),
   // затем меньшая загрузка и лучшее качество (больше свободного выхода, меньше loss/rtt).
   scoreParent(cand) {
@@ -102,7 +133,9 @@ class TreeManager {
     // не-симметричный узел даже на уровень глубже предпочитался — симметричный берём в родители
     // лишь когда другого relay нет вовсе (тогда capacityOf уже гарантировал наличие TURN).
     const natCost = cand.symmetricNat ? 250 : 0;
-    return depthCost + loadCost + lossCost + rttCost + natCost - outBonus;
+    // Э9: виртуал (серверный fallback) проигрывает любому живому relay — см. VIRTUAL_COST.
+    const virtualCost = cand.virtual ? VIRTUAL_COST : 0;
+    return depthCost + loadCost + lossCost + rttCost + natCost + virtualCost - outBonus;
   }
 
   // Best-peer: среди всех узлов дерева со свободной ёмкостью и depth+1 <= MAX_DEPTH выбираем
@@ -120,6 +153,7 @@ class TreeManager {
       if (banned.has(cand.id)) continue;
       if (cand.children.length >= this.capacityOf(cand)) continue;
       if (cand.depth + 1 + height > MAX_DEPTH) continue;
+      if (!this.attachedToRoot(t, cand)) continue; // сирота/повисшая цепочка — не родитель
       const s = this.scoreParent(cand);
       if (s < bestScore) { bestScore = s; best = cand; }
     }
@@ -176,6 +210,7 @@ class TreeManager {
       const banned = this.descendants(t, nodeId);
       if (targetId === nodeId || banned.has(targetId)) return { ok: false, reason: 'cycle' };
       if (target.children.length >= this.capacityOf(target)) return { ok: false, reason: 'full' };
+      if (!this.attachedToRoot(t, target)) return { ok: false, reason: 'target-detached' }; // сирота — медиа не течёт
       const height = this.subtreeHeight(t, nodeId);
       if (target.depth + 1 + height > MAX_DEPTH) return { ok: false, reason: 'too-deep' };
     } else {
@@ -321,6 +356,7 @@ class TreeManager {
       children: n.children.length,
       capacity: this.capacityOf(n),
       native: !!n.native,
+      virtual: !!n.virtual,
       broadcaster: n.id === t.broadcasterId,
       availableOutgoing: n.availableOutgoing || 0,
       rtt: n.linkRtt || 0,
@@ -383,16 +419,85 @@ function attachTreeServer(httpServer, opts) {
     for (const [pid, p] of peers) if (p.serverId === serverId) send(pid, obj);
   }
 
+  // ---------- Э9: виртуальный fallback-relay ----------
+  function findVirtual(t) {
+    for (const n of t.nodes.values()) if (n.virtual) return n;
+    return null;
+  }
+
+  // Просит агента vrelay заджойниться в дерево. true = виртуал есть/активация уже в полёте/
+  // отправлена; false = агента нет (фолбэк недоступен).
+  function requestVrelayActivation(streamId) {
+    const t = mgr.trees.get(streamId);
+    if (!t || !t.broadcasterId) return false;
+    if (findVirtual(t)) return true;
+    const now = Date.now();
+    if (t.vrelayActivateAt && now - t.vrelayActivateAt < VRELAY_ACTIVATE_TIMEOUT_MS) return true;
+    let agent = null;
+    for (const p of peers.values()) if (p.isVrelayAgent && p.ws.readyState === p.ws.OPEN) { agent = p; break; }
+    if (!agent) return false;
+    const bc = t.nodes.get(t.broadcasterId);
+    t.vrelayActivateAt = now;
+    send(agent.id, { t: 'vrelay-activate', streamId, serverId: bc ? bc.serverId : null });
+    return true;
+  }
+
+  // Э9: виртуал вошёл в забитое дерево (нет свободного слота нигде) и повис сиротой —
+  // фолбэк не сработал бы именно тогда, когда нужен. Выселяем «жертву» из-под корня:
+  // отцепляем одного не-виртуального ребёнка вещателя (drop-peer), сажаем виртуала в
+  // освободившийся слот, жертва (с поддеревом) уезжает под виртуала через settleOrphans.
+  function ensureVirtualAttached(streamId) {
+    const t = mgr.trees.get(streamId);
+    if (!t || !t.broadcasterId) return;
+    const virt = findVirtual(t);
+    if (!virt || virt.parent) return;
+    const bc = t.nodes.get(t.broadcasterId);
+    if (!bc) return;
+    // Жертва — предпочтительно лист (не тащить поддерево), иначе первый попавшийся.
+    let victimId = null;
+    for (const cid of bc.children) {
+      const c = t.nodes.get(cid);
+      if (!c || c.virtual) continue;
+      if (victimId == null) victimId = cid;
+      if (!c.children.length) { victimId = cid; break; }
+    }
+    if (victimId == null) return; // у корня нет детей => есть слот => placeOrphans справится сам
+    const victim = t.nodes.get(victimId);
+    bc.children = bc.children.filter((cid) => cid !== victimId);
+    victim.parent = null; victim.depth = 0;
+    send(t.broadcasterId, { t: 'drop-peer', streamId, peerId: victimId });
+    virt.parent = bc.id; virt.depth = 1; bc.children.push(virt.id);
+    mgr.updateSubtreeDepth(t, virt.id);
+    send(virt.id, { t: 'assign-parent', streamId, parentId: bc.id });
+    send(bc.id, { t: 'assign-child', streamId, childId: virt.id });
+    settleOrphans(streamId); // жертва сядет под виртуала (единственный кандидат со слотом)
+    if (victim.parent) mgr.updateSubtreeDepth(t, victimId); // placeOrphans не пересчитывает глубины поддерева
+    broadcastTreeInfo(streamId);
+    broadcastTopology(streamId);
+  }
+
   // Размещает зависших сирот (см. mgr.placeOrphans) и рассылает им assign-parent, их новым
   // родителям — assign-child. Дёргается после каждого изменения топологии, где могла
   // появиться ёмкость (новый узел вошёл, кто-то ушёл/переехал).
   function settleOrphans(streamId) {
     const placed = mgr.placeOrphans(streamId);
+    const now = Date.now();
     for (const { node, parentId } of placed) {
+      // Свежепосаженного под виртуала не дёргаем дренажом сразу (анти-болтанка).
+      const t = mgr.trees.get(streamId);
+      const parent = t && t.nodes.get(parentId);
+      if (parent && parent.virtual) node.reparentCooldownUntil = now + DRAIN_COOLDOWN_MS;
       send(node.id, { t: 'assign-parent', streamId, parentId });
       send(parentId, { t: 'assign-child', streamId, childId: node.id });
     }
     if (placed.length) { broadcastTreeInfo(streamId); broadcastTopology(streamId); }
+    // Э9: сироты остались (кандидатов нет вовсе) — будим виртуальный fallback-relay.
+    const t = mgr.trees.get(streamId);
+    if (t && t.broadcasterId && !findVirtual(t)) {
+      for (const n of t.nodes.values()) {
+        if (n.id !== t.broadcasterId && !n.parent) { requestVrelayActivation(streamId); break; }
+      }
+    }
   }
 
   function broadcastTreeInfo(streamId) {
@@ -438,9 +543,14 @@ function attachTreeServer(httpServer, opts) {
     node.maxChildren = typeof maxChildren === 'number' ? maxChildren : undefined;
     node.maxBitrate = typeof maxBitrate === 'number' ? maxBitrate : 0; // Э8 ABR: потолок вещателя
     node.abr = !!abr;                                                  // Э8 ABR: авто-адаптация вкл
+    // Э9: флагу virtual верим только агенту с JWT-uid VRELAY_UID — обычный клиент не может
+    // объявить себя «сервером» (получил бы приоритетный трафик и увидел бы vrelay-release).
+    node.virtual = !!msg.virtual && node.ws.__uid === VRELAY_UID;
+    node.vrelayPinned = false;
     node.parent = null; node.children = []; node.depth = 0;
     const { parent } = mgr.join(streamId, node);
     if (parent) {
+      if (parent.virtual) node.reparentCooldownUntil = Date.now() + DRAIN_COOLDOWN_MS;
       send(id, { t: 'assign-parent', streamId, parentId: parent.id });
       send(parent.id, { t: 'assign-child', streamId, childId: id });
     } else {
@@ -451,6 +561,28 @@ function attachTreeServer(httpServer, opts) {
     // Новый узел мог дать ёмкость (relay-способный зритель) или это вернувшийся вещатель —
     // размещаем зависших сирот. Для вещателя это подхватывает зрителей, ждавших стрим.
     settleOrphans(streamId);
+    // Э9: виртуал вошёл — активация состоялась; выполняем отложенные ручные запросы
+    // «через сервер» (зрители, попросившие vrelay до его джойна).
+    if (node.virtual) {
+      const t = mgr.trees.get(streamId);
+      if (t) {
+        t.vrelayActivateAt = 0;
+        ensureVirtualAttached(streamId); // дерево могло быть забито — выселяем жертву из-под корня
+        if (t.vrelayPending && t.vrelayPending.size) {
+          const now = Date.now();
+          const attached = mgr.attachedToRoot(t, node);
+          for (const pid of t.vrelayPending) {
+            const pn = t.nodes.get(pid);
+            if (!pn) continue;
+            if (!attached) { send(pid, { t: 'reparent-denied', streamId, reason: 'no-vrelay' }); continue; }
+            if (pn.parent === id) { pn.vrelayPinned = true; continue; }
+            const res = mgr.reparent(streamId, pid, id, now);
+            if (res.ok) { pn.vrelayPinned = true; applyReparent(streamId, pid, res); }
+          }
+          t.vrelayPending.clear();
+        }
+      }
+    }
     if (role === 'broadcaster') broadcastToServer(node.serverId, { t: 'stream-live', streamId, identity: node.identity, initial: false });
   }
 
@@ -481,11 +613,52 @@ function attachTreeServer(httpServer, opts) {
     }
   }
 
+  // Рассылка успешной миграции (общая для ручного/авто reparent, дренажа и vrelay-путей):
+  // старому родителю drop-peer, узлу assign-parent, новому родителю assign-child.
+  function applyReparent(streamId, nodeId, res) {
+    if (res.oldParentId) send(res.oldParentId, { t: 'drop-peer', streamId, peerId: nodeId });
+    send(nodeId, { t: 'assign-parent', streamId, parentId: res.newParentId });
+    if (res.newParentId) send(res.newParentId, { t: 'assign-child', streamId, childId: nodeId });
+    broadcastTreeInfo(streamId);
+    broadcastTopology(streamId);
+    settleOrphans(streamId); // миграция могла освободить слот — подхватываем сирот
+  }
+
+  // Э9: зритель явно попросил «смотреть через сервер» (targetParentId='vrelay'). Виртуал
+  // уже в дереве — обычный ручной reparent на него; нет — будим агента и запоминаем
+  // запрос (исполнится в onJoin виртуала). Pin защищает от дренажа: раз выбрал сам —
+  // не уводим обратно, пока сам не мигрирует.
+  function onRequestVrelay(id) {
+    const p = peers.get(id);
+    if (!p || !p.streamId) return;
+    const t = mgr.trees.get(p.streamId);
+    if (!t || !t.broadcasterId) return;
+    let virt = findVirtual(t);
+    const now = Date.now();
+    if (virt && !mgr.attachedToRoot(t, virt)) { ensureVirtualAttached(p.streamId); virt = findVirtual(t); }
+    if (virt && mgr.attachedToRoot(t, virt)) {
+      if (p.parent === virt.id) { p.vrelayPinned = true; return; }
+      const res = mgr.reparent(p.streamId, id, virt.id, now);
+      if (!res.ok) { send(id, { t: 'reparent-denied', streamId: p.streamId, reason: res.reason }); return; }
+      p.vrelayPinned = true;
+      applyReparent(p.streamId, id, res);
+      return;
+    }
+    if (!requestVrelayActivation(p.streamId)) {
+      send(id, { t: 'reparent-denied', streamId: p.streamId, reason: 'no-vrelay' });
+      return;
+    }
+    if (!t.vrelayPending) t.vrelayPending = new Set();
+    t.vrelayPending.add(id);
+  }
+
   // Э8: узел просит миграцию. targetParentId — ручной выбор зрителя из дерева (жёсткая
   // валидация в mgr.reparent); отсутствует — авто по деградации (best-peer + cooldown).
+  // Э9: targetParentId='vrelay' — запрос «через сервер» (см. onRequestVrelay).
   function onRequestReparent(id, msg) {
     const p = peers.get(id);
     if (!p || !p.streamId) return;
+    if (msg.targetParentId === VRELAY_TARGET) return onRequestVrelay(id);
     const now = Date.now();
     const res = mgr.reparent(p.streamId, id, msg.targetParentId || null, now);
     if (!res.ok) {
@@ -508,12 +681,28 @@ function attachTreeServer(httpServer, opts) {
       }
       send(id, { t: 'reparent-denied', streamId: p.streamId, reason: res.reason }); return;
     }
-    if (res.oldParentId) send(res.oldParentId, { t: 'drop-peer', streamId: p.streamId, peerId: id });
-    send(id, { t: 'assign-parent', streamId: p.streamId, parentId: res.newParentId });
-    if (res.newParentId) send(res.newParentId, { t: 'assign-child', streamId: p.streamId, childId: id });
-    broadcastTreeInfo(p.streamId);
-    broadcastTopology(p.streamId);
-    settleOrphans(p.streamId); // ручная миграция могла освободить слот — подхватываем сирот
+    // Pin «через сервер» живёт, пока зритель сам не мигрировал; ручной выбор виртуала
+    // по его peer-id из панели дерева — тоже осознанный выбор, пиним.
+    const t = mgr.trees.get(p.streamId);
+    const newParent = t && t.nodes.get(res.newParentId);
+    p.vrelayPinned = !!(newParent && newParent.virtual && msg.targetParentId);
+    applyReparent(p.streamId, id, res);
+  }
+
+  // Э9: control-сокет агента vrelay представился. Гейт по JWT-uid — как у флага virtual
+  // в join. Агент никогда не joins этим сокетом (стримы — на отдельных WS).
+  function onVrelayHello(id, msg) {
+    const p = peers.get(id);
+    if (!p || p.ws.__uid !== VRELAY_UID) return;
+    p.isVrelayAgent = true;
+    p.vrelayCapacity = typeof msg.capacity === 'number' ? msg.capacity : 8;
+    // Агент (пере)подключился — деревья могли ждать фолбэк (сироты/ручные запросы).
+    for (const [sid, t] of mgr.trees) {
+      if (!t.broadcasterId || findVirtual(t)) continue;
+      let needs = !!(t.vrelayPending && t.vrelayPending.size);
+      if (!needs) for (const n of t.nodes.values()) { if (n.id !== t.broadcasterId && !n.parent) { needs = true; break; } }
+      if (needs) requestVrelayActivation(sid);
+    }
   }
 
   // Э8: relay-узел (натив passthrough) не энкодит и сам IDR не сделает — при подключении
@@ -537,9 +726,17 @@ function attachTreeServer(httpServer, opts) {
     if (!p || !p.streamId) { peers.delete(id); return; }
     peers.delete(id);
     const oldParentId = p.parent;
+    const pendingTree = mgr.trees.get(p.streamId);
+    if (pendingTree && pendingTree.vrelayPending) pendingTree.vrelayPending.delete(id); // Э9: ушедший не ждёт vrelay
     const { reparented, dropped, broadcasterLost } = mgr.leave(p.streamId, id);
     if (broadcasterLost) {
-      dropped.forEach((peerId) => send(peerId, { t: 'drop-peer', streamId: p.streamId, peerId: id }));
+      dropped.forEach((peerId) => {
+        send(peerId, { t: 'drop-peer', streamId: p.streamId, peerId: id });
+        // Э9: виртуалу при обрушении дерева нужен явный release — drop-peer по каждому его
+        // ребёнку сервер не шлёт, и без release он ждал бы своего idle-таймаута впустую.
+        const dp = peers.get(peerId);
+        if (dp && dp.virtual) send(peerId, { t: 'vrelay-release', streamId: p.streamId });
+      });
       broadcastToServer(p.serverId, { t: 'stream-end', streamId: p.streamId, identity: p.identity });
       return;
     }
@@ -574,6 +771,7 @@ function attachTreeServer(httpServer, opts) {
       else if (msg.t === 'stats') onStats(id, msg);
       else if (msg.t === 'request-reparent') onRequestReparent(id, msg);
       else if (msg.t === 'request-keyframe') onRequestKeyframe(id);
+      else if (msg.t === 'vrelay-hello') onVrelayHello(id, msg);
     });
     ws.on('close', () => onLeave(id));
     send(id, { t: 'welcome', id, iceServers: iceServersFor(ws.__uid) });
@@ -587,6 +785,47 @@ function attachTreeServer(httpServer, opts) {
     }
   }, ABR_TICK_MS);
   abrTimer.unref?.(); // не держим процесс живым только ради ABR-тика
+
+  // Э9: дренаж виртуала — живые пиры всегда предпочтительнее серверного фолбэка.
+  // R1 (мягкий): <=1 ребёнка за тик на дерево уводим на живого кандидата (авто-reparent
+  // сам исключит виртуала как текущего родителя). Pinned («через сервер» руками) и
+  // свежепосаженные (cooldown) не трогаются.
+  // R2 (выселение): R1 никого не увёл, но живой ёмкости хватает на всех детей виртуала —
+  // шлём vrelay-release: штатный mgr.leave() сам репарентит детей. Лечит дедлок «виртуал
+  // занял единственный слот корня, пришедшему нативу некуда сесть, виртуал не пустеет».
+  const drainTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [streamId, t] of mgr.trees) {
+      const virt = findVirtual(t);
+      if (!virt || !virt.children.length) continue;
+      let moved = false;
+      for (const cid of [...virt.children]) {
+        const child = t.nodes.get(cid);
+        if (!child || child.vrelayPinned) continue;
+        if (child.reparentCooldownUntil && now < child.reparentCooldownUntil) continue;
+        const res = mgr.reparent(streamId, cid, null, now);
+        if (res.ok) {
+          child.reparentCooldownUntil = now + DRAIN_COOLDOWN_MS;
+          applyReparent(streamId, cid, res);
+          moved = true;
+          break;
+        }
+      }
+      if (moved) continue;
+      let pinned = false;
+      for (const cid of virt.children) { const c = t.nodes.get(cid); if (c && c.vrelayPinned) { pinned = true; break; } }
+      if (pinned) continue;
+      let free = 0;
+      for (const n of t.nodes.values()) {
+        if (n.virtual) continue;
+        let used = 0;
+        for (const cid of n.children) { const c = t.nodes.get(cid); if (c && !c.virtual) used++; } // слот виртуала освободится с его уходом
+        free += Math.max(0, mgr.capacityOf(n) - used);
+      }
+      if (free >= virt.children.length) send(virt.id, { t: 'vrelay-release', streamId });
+    }
+  }, DRAIN_TICK_MS);
+  drainTimer.unref?.();
 
   // Heartbeat-пинг: непришедший pong за один интервал (~HEARTBEAT_MS) => terminate =>
   // ws 'close' => onLeave репарентит поддерево. Браузерный WebSocket и tokio-tungstenite
@@ -603,7 +842,7 @@ function attachTreeServer(httpServer, opts) {
   }, HEARTBEAT_MS);
   hbTimer.unref?.();
 
-  return { mgr, peers, wss, abrTimer, hbTimer };
+  return { mgr, peers, wss, abrTimer, hbTimer, drainTimer };
 }
 
 module.exports = { attachTreeServer, TreeManager, MAX_DEPTH, NATIVE_CAPACITY, BROWSER_CAPACITY };
