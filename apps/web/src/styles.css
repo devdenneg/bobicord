@@ -317,8 +317,14 @@
   .voice-card .vc-h .ic{font-size:16px}
   .vc-list{display:flex;flex-direction:column;gap:2px;margin-bottom:8px}
   .vc-empty{font-size:12.5px;color:var(--muted);padding:6px 6px 10px;text-align:center}
-  .vc-join{width:100%;background:var(--green);color:#fff;font-weight:600;padding:10px;display:flex;align-items:center;justify-content:center;gap:8px}
-  .vc-join:hover{background:#2cb765}
+  .vc-join{position:relative;overflow:hidden;width:100%;color:#fff;font-weight:700;letter-spacing:.2px;padding:12px;border-radius:10px;display:flex;align-items:center;justify-content:center;gap:8px;background:linear-gradient(180deg,color-mix(in srgb,var(--green) 84%,#fff),var(--green));box-shadow:0 4px 14px -5px color-mix(in srgb,var(--green) 65%,transparent),inset 0 1px 0 rgba(255,255,255,.22);transition:transform var(--tr),box-shadow var(--tr),filter var(--tr)}
+  .vc-join:hover{filter:brightness(1.07);transform:translateY(-2px);box-shadow:0 10px 26px -6px color-mix(in srgb,var(--green) 72%,transparent),inset 0 1px 0 rgba(255,255,255,.28)}
+  .vc-join:active{transform:translateY(0);filter:brightness(.98);box-shadow:0 3px 9px -5px color-mix(in srgb,var(--green) 60%,transparent)}
+  .vc-join .ic{transition:transform var(--tr)}
+  .vc-join:hover .ic{transform:scale(1.15) rotate(-4deg)}
+  .vc-join::before{content:'';position:absolute;top:0;left:-60%;width:45%;height:100%;background:linear-gradient(100deg,transparent,rgba(255,255,255,.38),transparent);transform:skewX(-18deg);pointer-events:none}
+  .vc-join:hover::before{animation:sheen .75s ease}
+  @keyframes sheen{from{left:-60%}to{left:135%}}
   .voice-bar{flex:0 0 auto;background:var(--bg2);border-top:1px solid var(--line-2);padding:8px 6px}
   .vc-controls{display:flex;gap:7px;justify-content:center}
   .vc-controls .cbtn{width:40px;height:40px;flex:0 0 auto;border-radius:50%;display:flex;align-items:center;justify-content:center;background:var(--panel3);padding:0;box-shadow:var(--sh-1)}
@@ -349,7 +355,10 @@
   .pi .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;font-weight:500}
   .pi.offline .nm{color:var(--muted)}
   .pi .nm .rl{color:var(--yellow);font-size:11px;margin-left:5px}
-  .pi .livepill{flex:0 0 auto;background:var(--red);color:#fff;font-size:10px;font-weight:800;letter-spacing:.3px;text-transform:uppercase;height:20px;display:inline-flex;align-items:center;padding:0 8px;border-radius:9999px}
+  .pi .livepill{flex:0 0 auto;background:var(--red);color:#fff;font-size:10px;font-weight:800;letter-spacing:.4px;text-transform:uppercase;height:20px;display:inline-flex;align-items:center;gap:5px;padding:0 9px 0 8px;border-radius:9999px;position:relative;box-shadow:0 0 10px -2px rgba(242,63,67,.55);animation:liveBreath 2.4s ease-in-out infinite}
+  .pi .livepill::before{content:'';width:5px;height:5px;border-radius:50%;background:#fff;box-shadow:0 0 6px 1px rgba(255,255,255,.8);animation:liveBlink 1.5s ease-in-out infinite}
+  @keyframes liveBreath{0%,100%{box-shadow:0 0 8px -2px rgba(242,63,67,.5)}50%{box-shadow:0 0 17px 0 rgba(242,63,67,.85)}}
+  @keyframes liveBlink{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.8)}}
   .pi .watchbtn{flex:0 0 auto;width:28px;height:28px;padding:0;display:flex;align-items:center;justify-content:center;border-radius:8px;background:var(--panel3);color:var(--txt);opacity:0;transition:opacity var(--tr),background var(--tr),color var(--tr)}
   .pi .watchbtn .ic{font-size:15px}
   .pi .watchbtn:hover{background:var(--accent);color:#fff}
@@ -365,7 +374,7 @@
   .pi .chev{opacity:.28;transition:opacity var(--tr),transform var(--tr);color:var(--muted);flex:0 0 auto;width:28px;height:28px;display:flex;align-items:center;justify-content:center}
   .pi.clickable .head:hover .chev{opacity:.8}.pi.open .chev{opacity:1;transform:rotate(180deg)}
   .pi .micst{width:28px;height:28px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;color:var(--red)}
-  .pi .micst:not(.off){display:none}.pi .micst .ic{font-size:15px}
+  .pi .micst:not(.off){visibility:hidden}.pi .micst .ic{font-size:15px}
   /* строка громкости — плавно раскрывается/уезжает */
   .pi .exp{display:flex;align-items:center;gap:10px;max-height:0;overflow:hidden;opacity:0;padding:0 8px 0 8px;transition:max-height .22s ease,opacity .18s ease,padding .22s ease}
   .pi.open .exp{max-height:56px;opacity:1;padding:4px 8px 12px 8px}

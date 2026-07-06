@@ -230,7 +230,6 @@ function MemberRow({ m }: { m: Member }) {
       <div className="head" ref={hc.ref} onMouseEnter={self ? undefined : hc.onEnter} onMouseLeave={self ? undefined : hc.onLeave}>
         <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} dot={st} />
         <div className="nm">{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div>
-        {streaming ? <span className="livepill">LIVE</span> : null}
         {!self && streaming && !pr?.inVoice ? (
           <button className={'watchbtn' + (watching ? ' on' : '')} disabled={pending}
             aria-label={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}
@@ -240,6 +239,7 @@ function MemberRow({ m }: { m: Member }) {
           </button>
         ) : null}
         {canKick ? <button className="mkick" data-tip="Выгнать" onClick={kick}><Icon name="close" sm /></button> : null}
+        {streaming ? <span className="livepill">LIVE</span> : null}
       </div>
       {!self && hc.rect ? <ProfileCard m={m} rect={hc.rect} /> : null}
     </div>
