@@ -518,10 +518,18 @@ app.get('/healthz', (req, res) => res.send('ok'));
  * latest.json — updater-эндпоинт для Tauri (plugins.updater.endpoints); сам exe качают
  * и updater'ом, и с лендинга в вебе. /api/app/latest — то же, но для UI (может дать 404). */
 app.get('/api/app/latest', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
   try { res.json(JSON.parse(fs.readFileSync(path.join(RELEASES_DIR, 'latest.json'), 'utf8'))); }
   catch (e) { res.status(404).json({ error: 'билд ещё не собран' }); }
 });
-app.use('/api/app', express.static(RELEASES_DIR, { index: false, setHeaders: (r) => r.setHeader('X-Content-Type-Options', 'nosniff') }));
+app.use('/api/app', express.static(RELEASES_DIR, {
+  index: false,
+  setHeaders: (r, filePath) => {
+    r.setHeader('X-Content-Type-Options', 'nosniff');
+    // Манифест никогда не кэшировать (WebView/прокси): иначе updater видит стейл-версию.
+    if (filePath.endsWith('latest.json')) r.setHeader('Cache-Control', 'no-store');
+  },
+}));
 
 /* ---------- Э2 dev-only harness: browser test-publisher for the relay tree ----------
  * NOT part of prod (Dockerfile only COPYs index.js+tree.js, this file isn't in the image;
