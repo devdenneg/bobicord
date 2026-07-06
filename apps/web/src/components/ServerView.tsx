@@ -133,8 +133,15 @@ function VoiceCard() {
       <div className="vc-h"><Icon name="speaker" />Голосовой канал</div>
       <div className="vc-list">
         {inVoiceMembers.map((m) => <VoiceParticipantRow m={m} key={m.username} />)}
+        {/* комната поднимается в фоне — вместо мигания «Никого» показываем скелетон, пока не знаем состав */}
+        {!eng.roomReady && inVoiceMembers.length === 0 ? (
+          <>
+            <div className="vc-sk-row"><span className="sk-av" /><span className="sk-line" style={{ width: '58%' }} /></div>
+            <div className="vc-sk-row"><span className="sk-av" /><span className="sk-line" style={{ width: '42%' }} /></div>
+          </>
+        ) : null}
       </div>
-      {inVoiceMembers.length === 0 ? <div className="vc-empty">Никого в голосовом</div> : null}
+      {eng.roomReady && inVoiceMembers.length === 0 ? <div className="vc-empty">Никого в голосовом</div> : null}
       {!inVoice
         ? <button className="vc-join" onClick={() => E.joinVoice()}><Icon name="mic" sm />Подключиться</button>
         : null}
@@ -418,7 +425,9 @@ function Chat() {
   const [firstItemIndex, setFirstItemIndex] = useState(VIRT_BASE_INDEX); // якорь для prepend
   const [olderBusy, setOlderBusy] = useState(false); // идёт догрузка старых
   const loadingOlder = useRef(false);                // защита от повторного startReached
+  const olderReady = useRef(false);                  // гейт: не грузить старое, пока вход не устаканился
   const prevLastId = useRef<number | null>(null);    // id последнего сообщения — детект append vs prepend
+  const prevTrim = useRef(0);                         // сколько среза уже учтено в firstItemIndex
   // автокомплит упоминаний (@ник)
   const [mention, setMention] = useState<{ q: string; start: number } | null>(null);
   const [mIdx, setMIdx] = useState(0);
@@ -434,7 +443,11 @@ function Chat() {
   useLayoutEffect(() => {
     setFirstItemIndex(VIRT_BASE_INDEX);
     setPill(0); setAtBottom(true); atBottomRef.current = true;
-    prevLastId.current = null; loadingOlder.current = false; setOlderBusy(false);
+    prevLastId.current = null; prevTrim.current = 0; loadingOlder.current = false; setOlderBusy(false);
+    // не даём startReached стрельнуть догрузкой прямо на маунте (пока идёт scroll-to-bottom и оседание)
+    olderReady.current = false;
+    const t = window.setTimeout(() => { olderReady.current = true; }, 700);
+    return () => clearTimeout(t);
   }, [activeId]);
 
   // счётчик непрочитанных: растёт только на append нового сообщения, когда мы не внизу.
@@ -448,14 +461,24 @@ function Chat() {
   }, [messages]);
   useEffect(() => { if (atBottom) setPill(0); }, [atBottom]);
 
+  // срез сообщений с начала (кап памяти в engine) сдвигает данные вперёд — поднимаем firstItemIndex
+  // на столько же, иначе якорь virtuoso рассинхронится. useLayoutEffect — до отрисовки, без мелькания.
+  useLayoutEffect(() => {
+    const t = eng.chatTrimmed;
+    if (t !== prevTrim.current) { setFirstItemIndex((f) => f + (t - prevTrim.current)); prevTrim.current = t; }
+  }, [eng.chatTrimmed]);
+
   // догрузка более старых сообщений при скролле к верху (курсорная пагинация)
   const loadOlder = useCallback(async () => {
-    if (loadingOlder.current || !E.chatHasMore) return;
+    if (loadingOlder.current || !olderReady.current || !E.chatHasMore) return;
     const cursor = E.chatOldestCursor;
-    if (cursor == null || !activeId) return;
+    const reqId = activeId;
+    if (cursor == null || !reqId) return;
     loadingOlder.current = true; setOlderBusy(true);
     try {
-      const h = await api.getMessages(activeId, cursor, 30);
+      const h = await api.getMessages(reqId, cursor, 30);
+      // за время запроса могли переключить сервер — не вклеиваем чужую страницу в чужой чат
+      if (useStore.getState().active?.id !== reqId) return;
       const count = h.messages.length;
       // сначала сдвигаем базовый индекс, затем растим данные — оба апдейта в одном тике
       // (React 18 батчит), virtuoso держит позицию скролла на прежнем сообщении.
@@ -610,14 +633,17 @@ function Chat() {
         />
       )}
       {!atBottom ? <button id="scrollbtn" aria-label="Прокрутить вниз" data-tip="К последним" onClick={scrollToBottom}><Icon name="chevron" />{pill > 0 ? <span className="sb-badge">{pill > 99 ? '99+' : pill}</span> : null}</button> : null}
-      {eng.typing.length > 0 ? (
-        <div className="typing-ind">
-          <span className="tdots"><i /><i /><i /></span>
-          {eng.typing.length === 1 ? `${eng.typing[0]} печатает…`
-            : eng.typing.length === 2 ? `${eng.typing[0]} и ${eng.typing[1]} печатают…`
-              : 'Несколько человек печатают…'}
-        </div>
-      ) : null}
+      {/* лейн печатающих зарезервирован всегда (min-height) — badge не наслаивается на последнее сообщение */}
+      <div className="typing-ind" aria-live="polite">
+        {eng.typing.length > 0 ? (
+          <>
+            <span className="tdots"><i /><i /><i /></span>
+            {eng.typing.length === 1 ? `${eng.typing[0]} печатает…`
+              : eng.typing.length === 2 ? `${eng.typing[0]} и ${eng.typing[1]} печатают…`
+                : 'Несколько человек печатают…'}
+          </>
+        ) : null}
+      </div>
       {updateReady ? (
         <div className="update-bar">
           <div className="ub-ic"><Icon name="refresh" /></div>

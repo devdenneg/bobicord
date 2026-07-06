@@ -14,6 +14,7 @@ export interface PeerState { online: boolean; inVoice: boolean; micMuted: boolea
 export interface StreamInfo { key: string; identity: string; isLocal: boolean }
 export interface Snapshot {
   connected: boolean;
+  roomReady: boolean; // комната реально поднялась (после await connect), а не просто создан объект Room
   reconnecting: boolean;
   inVoice: boolean;
   deafened: boolean;
@@ -27,6 +28,7 @@ export interface Snapshot {
   watchers: Record<string, { name: string }[]>;
   messages: ChatMessage[];
   chatHasMore: boolean; // есть ли ещё более старые сообщения для догрузки вверх
+  chatTrimmed: number; // накопленное число срезанных с начала сообщений (для коррекции якоря virtuoso)
   typing: string[];
 }
 
@@ -54,6 +56,7 @@ export class Engine {
   private hooks: EngineHooks;
 
   inVoice = false;
+  private roomReady = false; // true только после успешного await r.connect() (не просто наличие объекта Room)
   private reconnecting = false;
   private deafened = false;
   private pttDown = false;
@@ -78,6 +81,7 @@ export class Engine {
   private messages: ChatMessage[] = [];
   private chatMore = false; // есть ли ещё более старые сообщения на сервере (пагинация вверх)
   private oldestSid: number | null = null; // DB-id самого старого загруженного сообщения = курсор для before
+  private trimmedFront = 0; // сколько сообщений суммарно срезано с НАЧАЛА (для якоря virtuoso: срез спереди → firstItemIndex += N)
   private typingUsers = new Map<string, number>(); // displayName -> expiry ts
   private lastTypingSent = 0;
 
@@ -181,9 +185,9 @@ export class Engine {
     const watchers: Record<string, { name: string }[]> = {};
     this.streamWatchers.forEach((m, sid) => (watchers[sid] = [...m.values()].map((v) => ({ name: v.name }))));
     return {
-      connected: !!this.room, reconnecting: this.reconnecting, inVoice: this.inVoice, deafened: this.deafened,
+      connected: !!this.room, roomReady: this.roomReady, reconnecting: this.reconnecting, inVoice: this.inVoice, deafened: this.deafened,
       localMicMuted: this.localMicMuted(), pttDown: this.pttDown,
-      presence, speaking, streams, watching, pending, watchers, messages: this.messages, chatHasMore: this.chatMore,
+      presence, speaking, streams, watching, pending, watchers, messages: this.messages, chatHasMore: this.chatMore, chatTrimmed: this.trimmedFront,
       typing: [...this.typingUsers].filter(([n, exp]) => exp > Date.now() && n !== this.me.displayName).map(([n]) => n),
     };
   }
@@ -210,6 +214,7 @@ export class Engine {
       .on(RoomEvent.TrackUnpublished, this.onRemoteUnpub)
       .on(RoomEvent.DataReceived, this.onData);
     await r.connect(url, token, { autoSubscribe: false });
+    this.roomReady = true; // комната реально поднялась — можно снимать скелетоны голосового/сцены
     r.remoteParticipants.forEach((p) => p.trackPublications.forEach((pub) => this.onRemotePub(pub, p, true)));
     this.liveKitT.onRoomConnected();
     this.treeT.onRoomConnected();
@@ -228,11 +233,11 @@ export class Engine {
     document.querySelectorAll('#audioSink audio').forEach((a) => a.remove());
     this.liveKitT.detach(); this.treeT.detach(); this.screenAudioEls.clear();
     this.watching.clear(); this.pendingWatch.clear(); this.streamWatchers.clear();
-    this.perMute.clear(); this.messages = []; this.chatMore = false; this.oldestSid = null;
+    this.perMute.clear(); this.messages = []; this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0;
     if (this.micRaw) { this.micRaw.getTracks().forEach((t) => t.stop()); this.micRaw = null; }
     if (this.micActx) { try { this.micActx.close(); } catch { /**/ } this.micActx = null; }
     this.micGain = null;
-    this.inVoice = false; this.deafened = false; this.manualMute = false; this.screenStream = null;
+    this.inVoice = false; this.roomReady = false; this.deafened = false; this.manualMute = false; this.screenStream = null;
     if (this.room) { try { this.room.disconnect(); } catch { /**/ } }
     this.room = null; this.emit();
   }
@@ -620,12 +625,28 @@ export class Engine {
     const d = (this.me.displayName || '').toLowerCase();
     let m: RegExpExecArray | null; const re = /@([^\s@]+)/g;
     while ((m = re.exec(low))) { if (m[1] === u || m[1] === d) return true; }
-    return !!d && low.includes('@' + d);
+    // многословный Ник (с пробелом) regex выше обрывает на пробеле — проверяем всю строку,
+    // но с ГРАНИЦЕЙ токена, иначе @Ян ложно матчит @Янина (substring). Однословные Ники уже
+    // покрыты точным сравнением в цикле, поэтому фолбэк нужен только для Ников с пробелом.
+    if (d.includes(' ')) {
+      const needle = '@' + d;
+      for (let i = low.indexOf(needle); i !== -1; i = low.indexOf(needle, i + 1)) {
+        const before = i === 0 ? '' : low[i - 1];
+        const after = low[i + needle.length];
+        if ((i === 0 || /\s/.test(before)) && (after === undefined || /[\s.,!?:;)»"']/.test(after))) return true;
+      }
+    }
+    return false;
   }
   private pushMsg(who: string | null, text: string, sys: boolean, color?: number, mineOverride?: boolean, img?: string, ts?: number) {
     const mine = mineOverride !== undefined ? mineOverride : (!sys && who === this.me.displayName);
     const mention = !sys && !mine && this.textMentionsMe(text);
-    this.messages = [...this.messages, { id: msgSeq++, who, text, mine, sys, color, img, ts: ts ?? Date.now(), mention }].slice(-500);
+    const next = [...this.messages, { id: msgSeq++, who, text, mine, sys, color, img, ts: ts ?? Date.now(), mention }];
+    // кап на память сессии; срез идёт с НАЧАЛА, поэтому копим trimmedFront — компонент на столько же
+    // поднимет firstItemIndex virtuoso, иначе якорь скролла рассинхронится и контент прыгнет.
+    const CAP = 1000;
+    if (next.length > CAP) { this.trimmedFront += next.length - CAP; this.messages = next.slice(next.length - CAP); }
+    else this.messages = next;
     this.emit();
   }
   sysMsg(text: string) { this.pushMsg(null, text, true); }
@@ -640,6 +661,7 @@ export class Engine {
     this.messages = this.mapHistory(list);
     this.chatMore = hasMore;
     this.oldestSid = list.length ? (list[0].id ?? null) : null; // list в ASC-порядке, [0] — самое старое
+    this.trimmedFront = 0; // новая история — счётчик среза сбрасывается (компонент тоже обнулит prevTrim)
     this.emit();
   }
   // догрузка более старых сообщений при скролле вверх — prepend в начало, курсор сдвигается назад

@@ -259,6 +259,29 @@
   .virt-row .msg{animation:none}          /* иначе msgIn проигрывается на каждом въезде строки в вьюпорт */
   .virt-head{display:flex;align-items:center;justify-content:center;min-height:14px;padding:10px 0 4px}
   .virt-head-end{font-size:11px;color:var(--muted);opacity:.55}
+  /* ---- скелетоны загрузки (плавный переход вместо блёклого спиннера / прыжков дозагрузки) ---- */
+  @keyframes skShimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+  .sk-line,.sk-av,.sk-bubble{background:linear-gradient(90deg,var(--panel2) 25%,var(--panel3) 50%,var(--panel2) 75%);background-size:200% 100%;animation:skShimmer 1.5s ease-in-out infinite;border-radius:6px}
+  @media (prefers-reduced-motion: reduce){.sk-line,.sk-av,.sk-bubble{animation:none}}
+  .sk-line{height:10px}
+  .sk-av{width:32px;height:32px;border-radius:50%;flex:0 0 auto}
+  .sk-bubble{height:34px;border-radius:4px 12px 12px 12px}
+  .srv-sk{flex:1;display:flex;min-width:0;height:100%;background:var(--bg2);overflow:hidden}
+  .srv-sk .sk-col{display:flex;flex-direction:column;gap:12px;padding:14px;flex:0 0 auto}
+  .srv-sk .sk-ch{background:var(--panel);border-right:1px solid var(--line-2)}
+  .srv-sk .sk-mem{background:var(--panel);border-left:1px solid var(--line-2)}
+  .srv-sk .sk-main{flex:1;min-width:0;padding:0;gap:0}
+  .srv-sk .sk-title{height:11px}
+  .srv-sk .sk-voicecard{display:flex;flex-direction:column;gap:12px;padding:12px;border:1px solid var(--line-2);border-radius:12px}
+  .srv-sk .sk-vrow{display:flex;align-items:center;gap:10px}
+  .srv-sk .sk-header{height:49px;border-bottom:1px solid var(--line-2);display:flex;align-items:center;padding:0 16px;flex:0 0 auto}
+  .srv-sk .sk-chat{flex:1;display:flex;flex-direction:column;justify-content:flex-end;gap:14px;padding:14px;min-height:0}
+  .srv-sk .sk-msg{display:flex;flex-direction:column;gap:6px}
+  .srv-sk .sk-who{height:9px}
+  .srv-sk .sk-composer{padding:12px;border-top:1px solid var(--line-2);flex:0 0 auto}
+  .srv-sk .sk-composer .sk-line{height:42px;border-radius:8px}
+  .vc-sk-row{display:flex;align-items:center;gap:8px;padding:6px 4px}
+  .vc-sk-row .sk-av{width:26px;height:26px}
   .msg{animation:msgIn .14s ease-out}
   .msg .who{font-size:13px;font-weight:600;color:var(--accent-txt);margin-bottom:3px}
   .msg .tx{font-size:14px;background:var(--panel2);padding:8px 12px;border-radius:4px 12px 12px 12px;display:inline-block;max-width:100%;word-break:break-word;line-height:1.45}

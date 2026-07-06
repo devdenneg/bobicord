@@ -3,8 +3,8 @@ import { getEngine } from './store';
 import type { Snapshot } from './engine';
 
 const EMPTY: Snapshot = {
-  connected: false, reconnecting: false, inVoice: false, deafened: false, localMicMuted: true, pttDown: false,
-  presence: {}, speaking: {}, streams: [], watching: {}, pending: {}, watchers: {}, messages: [], chatHasMore: false, typing: [],
+  connected: false, roomReady: false, reconnecting: false, inVoice: false, deafened: false, localMicMuted: true, pttDown: false,
+  presence: {}, speaking: {}, streams: [], watching: {}, pending: {}, watchers: {}, messages: [], chatHasMore: false, chatTrimmed: 0, typing: [],
 };
 
 export function useEngine(): Snapshot {

@@ -83,8 +83,43 @@ function Home() {
   );
 }
 
-function ServerLoader() {
-  return <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', background: 'var(--bg2)' }}><span className="spin" style={{ width: 26, height: 26, margin: 0 }} /></div>;
+// Скелетон сервера вместо блёклого спиннера: повторяет форму реального лэйаута
+// (каналы · чат · участники), чтобы переход «загрузка → контент» был плавным, без прыжка.
+// Ширины берём из тех же localStorage-ключей, что и настоящий ServerView (иначе колонки скакнут).
+function ServerSkeleton() {
+  const chW = +(localStorage.getItem('w:channels') || 290);
+  const memW = +(localStorage.getItem('w:members') || 244);
+  const memOpen = localStorage.getItem('membersOpen') !== '0';
+  const rows = (n: number) => Array.from({ length: n });
+  return (
+    <div className="srv-sk" aria-busy="true" aria-label="Загрузка сервера">
+      <div className="sk-col sk-ch" style={{ width: chW }}>
+        <div className="sk-line sk-title" style={{ width: '55%' }} />
+        <div className="sk-voicecard">
+          <div className="sk-line" style={{ width: '58%' }} />
+          {rows(3).map((_, i) => <div className="sk-vrow" key={i}><span className="sk-av" /><span className="sk-line" style={{ width: `${48 + (i % 3) * 14}%` }} /></div>)}
+        </div>
+      </div>
+      <div className="sk-col sk-main">
+        <div className="sk-header"><span className="sk-line" style={{ width: 90 }} /></div>
+        <div className="sk-chat">
+          {rows(8).map((_, i) => (
+            <div className="sk-msg" key={i}>
+              <span className="sk-line sk-who" style={{ width: 66 + (i % 4) * 24 }} />
+              <span className="sk-bubble" style={{ width: `${36 + ((i * 41) % 46)}%` }} />
+            </div>
+          ))}
+        </div>
+        <div className="sk-composer"><span className="sk-line" /></div>
+      </div>
+      {memOpen ? (
+        <div className="sk-col sk-mem" style={{ width: memW }}>
+          <div className="sk-line sk-title" style={{ width: '45%' }} />
+          {rows(7).map((_, i) => <div className="sk-vrow" key={i}><span className="sk-av" /><span className="sk-line" style={{ width: `${44 + (i % 4) * 13}%` }} /></div>)}
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 export function App() {
@@ -122,7 +157,7 @@ export function App() {
       ) : view === 'auth' ? <Auth /> : (
         <div id="app" className="on">
           <Rail />
-          {view === 'home' ? <Home /> : (loadingServer ? <ServerLoader /> : <ServerView />)}
+          {view === 'home' ? <Home /> : (loadingServer ? <ServerSkeleton /> : <ServerView />)}
         </div>
       )}
       <Modals />
