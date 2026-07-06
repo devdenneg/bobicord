@@ -6,7 +6,7 @@ import { getToken } from '../api';
 import { detectSymmetricNat } from './natDetect';
 import {
   isTauri, startNativeWatch, stopNativeWatch, nativeWatchAnswer, nativeWatchIce, nativeWatchReparent,
-  onNativeWatchOffer, onNativeWatchIce, onNativeTopology,
+  onNativeWatchOffer, onNativeWatchIce, onNativeTopology, onNativeWatchEnded,
 } from '../native';
 
 // Ёмкость нативного relay (passthrough) — сколько зрителей он ретранслирует. Rust держит
@@ -18,6 +18,9 @@ interface NativeWatchState {
   unlisten: Array<() => void>;
   closed: boolean;
 }
+
+/** Метаданные приложения вещателя (окно): доходят в stream-live/бэклоге. */
+export interface StreamMeta { appName?: string; appIcon?: string }
 
 /**
  * P2P relay-tree implementation of VideoTransport (Evolution-TZ Э2/Э8).
@@ -104,7 +107,8 @@ export class TreeVideoTransport implements VideoTransport {
   private serverId = '';
   private closed = false;
   private discoveryWs: WebSocket | null = null;
-  private liveStreams = new Set<string>();
+  /** Живые стримы гильдии + метаданные приложения из stream-live (иконка/имя — Э-icon). */
+  private liveStreams = new Map<string, StreamMeta>();
   private watches = new Map<string, WatchState>();
   private iceServers: RTCIceServer[] = DEFAULT_ICE_SERVERS;
   private natProbe: Promise<boolean> = Promise.resolve(false);
@@ -150,22 +154,45 @@ export class TreeVideoTransport implements VideoTransport {
     let ws: WebSocket;
     try { ws = new WebSocket(treeWsUrl()); } catch { return; }
     this.discoveryWs = ws;
-    // Сервер узнаёт, в каком сервере (гильдии) мы сидим, только из этого сообщения —
+    // Сверка после (ре)коннекта: stream-end, пришедший пока сокет лежал (3с окно реконнекта),
+    // потерян навсегда — бэклог при re-hello объявляет только ЖИВЫЕ стримы. Всё, что не
+    // переобъявлено за 2с после hello, считаем закончившимся и сносим тем же путём.
+    const announced = new Set<string>();
+    ws.onopen = () => {
+      try { ws.send(JSON.stringify({ t: 'hello', serverId: this.serverId })); } catch { /**/ }
+      setTimeout(() => {
+        if (this.closed || this.discoveryWs !== ws) return;
+        for (const identity of [...this.liveStreams.keys()]) {
+          if (announced.has(identity)) continue;
+          this.unwatch(identity);
+          this.liveStreams.delete(identity);
+          this.streamStopCbs.forEach((cb) => cb(identity));
+        }
+      }, 2000);
+    };
+    // Сервер узнаёт, в каком сервере (гильдии) мы сидим, только из hello —
     // до него бэклог живых стримов не шлётся (см. tree.js onHello), а после join'а
     // вещателя используется, чтобы не разослать stream-live/stream-end в чужие серверы.
-    ws.onopen = () => { try { ws.send(JSON.stringify({ t: 'hello', serverId: this.serverId })); } catch { /**/ } };
     ws.onmessage = (ev) => {
       let msg: any; try { msg = JSON.parse(ev.data); } catch { return; }
       if (msg.t === 'welcome') {
         if (Array.isArray(msg.iceServers) && msg.iceServers.length) this.iceServers = msg.iceServers;
       } else if (msg.t === 'stream-live') {
-        if (!this.liveStreams.has(msg.identity)) {
-          this.liveStreams.add(msg.identity);
-          this.streamStartCbs.forEach((cb) => cb(msg.identity, !!msg.initial));
-        }
+        announced.add(msg.identity);
+        const fresh = !this.liveStreams.has(msg.identity);
+        // meta обновляем и для уже известного стрима — повторный announce после rejoin вещателя
+        this.liveStreams.set(msg.identity, { appName: msg.appName || undefined, appIcon: msg.appIcon || undefined });
+        if (fresh) this.streamStartCbs.forEach((cb) => cb(msg.identity, !!msg.initial));
       } else if (msg.t === 'stream-end') {
-        this.liveStreams.delete(msg.identity);
-        this.streamStopCbs.forEach((cb) => cb(msg.identity));
+        // unwatch ДО удаления из liveStreams: engine.onStreamStop роутит unwatch через
+        // transportFor → isRemoteBroadcasting; если запись уже удалена, он уйдёт в LiveKit
+        // (no-op) и tree-watch (PC/relay) останется жить с повисшим кадром. Сносим свой
+        // watch сами — teardown не зависит от порядка колбэков (idempotent, no-op если
+        // не смотрели; в Tauri уходит в nativeUnwatch → Rust close_all).
+        this.unwatch(msg.identity);
+        // Гард по факту удаления: тот же конец стрима может прийти и по discovery-stream-end,
+        // и по relay-watch-ended (натив) — без гарда «закончил трансляцию» напечаталось бы дважды.
+        if (this.liveStreams.delete(msg.identity)) this.streamStopCbs.forEach((cb) => cb(msg.identity));
       }
     };
     ws.onclose = () => { if (this.discoveryWs === ws) this.discoveryWs = null; if (!this.closed) setTimeout(() => this.openDiscovery(), 3000); };
@@ -392,6 +419,13 @@ export class TreeVideoTransport implements VideoTransport {
         if (msg.peerId === st.parentId) { try { st.ws.close(); } catch { /**/ } }
         break;
       }
+      case 'stream-end': {
+        // Ремень-и-подтяжки: при обрушении дерева сервер шлёт stream-end и в watch-сокеты
+        // (drop-peer выше ловит только глубину 1 — parentId зрителя глубже это id relay-узла,
+        // не вещателя). onclose сделает полный teardown.
+        try { st.ws.close(); } catch { /**/ }
+        break;
+      }
       case 'tree-info': {
         this.treeInfoByStream.set(streamId, {
           myDepth: msg.myDepth ?? 0,
@@ -494,10 +528,18 @@ export class TreeVideoTransport implements VideoTransport {
     const offCb = (sid: string, sdp: string) => { if (sid === streamId && !st.closed) this.onNativeOffer(streamId, st, sdp); };
     const iceCb = (sid: string, candidate: any) => { if (sid === streamId && st.pc && candidate) st.pc.addIceCandidate(candidate).catch(() => {}); };
     const topoCb = (payload: any) => { if (payload && payload.streamId === streamId) this.setTopology(streamId, { you: payload.you ?? null, nodes: payload.nodes || [] }); };
+    // Rust-relay сам понял, что стрим кончился (сирота >20с) — сносим watch и объявляем
+    // конец, даже если discovery-сокет webview пропустил stream-end.
+    const endCb = (sid: string) => {
+      if (sid !== streamId || st.closed) return;
+      this.unwatch(streamId);
+      if (this.liveStreams.delete(streamId)) this.streamStopCbs.forEach((cb) => cb(streamId));
+    };
     try {
       st.unlisten.push(await onNativeWatchOffer(offCb));
       st.unlisten.push(await onNativeWatchIce(iceCb));
       st.unlisten.push(await onNativeTopology(topoCb));
+      st.unlisten.push(await onNativeWatchEnded(endCb));
     } catch { /**/ }
     if (st.closed) { st.unlisten.forEach((u) => { try { u(); } catch { /**/ } }); return; }
     try { await startNativeWatch(streamId, this.me, this.serverId, NATIVE_RELAY_CAPACITY); }
@@ -558,9 +600,12 @@ export class TreeVideoTransport implements VideoTransport {
     this.videoTracks.forEach((_t, key) => { const info = this.streamInfoByKey.get(key); if (info) out.push(info); });
     return out;
   }
+  /** Метаданные приложения вещателя (из stream-live); null для незнакомого identity. */
+  getStreamMeta(identity: string): StreamMeta | null { return this.liveStreams.get(identity) || null; }
   private addVideo(key: string, handle: MediaStreamVideoHandle, identity: string, isLocal: boolean) {
+    const meta = this.liveStreams.get(identity);
     this.videoTracks.set(key, handle);
-    this.streamInfoByKey.set(key, { key, identity, isLocal });
+    this.streamInfoByKey.set(key, { key, identity, isLocal, appName: meta?.appName, appIcon: meta?.appIcon });
     this.videoTrackCbs.forEach((cb) => cb(key, handle, identity, isLocal));
   }
   private delVideo(key: string) {

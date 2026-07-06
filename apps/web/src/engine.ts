@@ -11,7 +11,7 @@ import { LiveKitVideoTransport } from './transport/livekitVideo';
 import { TreeVideoTransport } from './transport/treeVideo';
 
 export interface PeerState { online: boolean; inVoice: boolean; micMuted: boolean; streaming: boolean }
-export interface StreamInfo { key: string; identity: string; isLocal: boolean }
+export interface StreamInfo { key: string; identity: string; isLocal: boolean; appName?: string; appIcon?: string }
 export type VoiceQuality = 'excellent' | 'good' | 'poor' | 'lost' | 'unknown';
 export interface Snapshot {
   connected: boolean;
@@ -95,6 +95,10 @@ export class Engine {
   private treeT: VideoTransport = new TreeVideoTransport();
   private screenAudioEls = new Map<string, HTMLMediaElement>();
   private watching = new Set<string>();
+  // Транспорт, которым РЕАЛЬНО открыт watch. transportFor смотрит на «кто сейчас объявлен
+  // вещающим» — это состояние меняется под активным watch (напр. stream-end уже удалил
+  // запись из liveStreams) и роутинг уезжает не в тот транспорт. Пин снимает весь класс.
+  private watchT = new Map<string, VideoTransport>();
   private pendingWatch = new Set<string>();
   private streamWatchers = new Map<string, Map<string, { name: string; color: number; avatarUrl?: string; ts: number }>>();
   private messages: ChatMessage[] = [];
@@ -158,6 +162,7 @@ export class Engine {
       // при обрыве вещателя <video> остаётся с последним кадром/чёрным экраном
       // навсегда: без unwatch() PeerConnection и трек никто не закрывает.
       this.transportFor(identity).unwatch(identity);
+      this.watchT.delete(identity);
       this.watching.delete(identity); this.pendingWatch.delete(identity);
       this.sysMsg(`${this.nameOf(identity)} закончил трансляцию`);
       this.emit();
@@ -277,7 +282,7 @@ export class Engine {
     this.keepAliveOff();
     document.querySelectorAll('#audioSink audio').forEach((a) => a.remove());
     this.liveKitT.detach(); this.treeT.detach(); this.screenAudioEls.clear();
-    this.watching.clear(); this.pendingWatch.clear(); this.streamWatchers.clear();
+    this.watching.clear(); this.pendingWatch.clear(); this.watchT.clear(); this.streamWatchers.clear();
     this.perMute.clear(); this.messages = []; this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0;
     if (this.micRaw) { this.micRaw.getTracks().forEach((t) => t.stop()); this.micRaw = null; }
     if (this.micActx) { try { this.micActx.close(); } catch { /**/ } this.micActx = null; }
@@ -321,8 +326,9 @@ export class Engine {
   }
   // Один стрим — один транспорт (не dual-publish): смотрим, откуда реально вещает
   // identity, дерево или LiveKit-комната, и подключаемся тем же транспортом.
+  // Для уже открытого watch приоритет у пина (watchT) — объявление могло уже пропасть.
   private transportFor(identity: string): VideoTransport {
-    return this.treeT.isRemoteBroadcasting(identity) ? this.treeT : this.liveKitT;
+    return this.watchT.get(identity) ?? (this.treeT.isRemoteBroadcasting(identity) ? this.treeT : this.liveKitT);
   }
   private nameOf(identity: string): string { const p = this.partOf(identity); return (p && p.name) || identity; }
   private localMicMuted(): boolean { return this.manualMute; }
@@ -616,7 +622,9 @@ export class Engine {
     // not a LiveKit room participant (voice and video are separate transports now) —
     // existence is the VideoTransport's job (it no-ops safely on an unknown identity).
     this.watching.add(identity); this.pendingWatch.add(identity);
-    this.transportFor(identity).watch(identity);
+    const t = this.transportFor(identity);
+    this.watchT.set(identity, t); // пин: unwatch/статы пойдут в тот же транспорт, даже если объявление пропадёт
+    t.watch(identity);
     if (!localStorage.getItem('sprayTip')) { localStorage.setItem('sprayTip', '1'); this.hooks.toast('Кинь эмоут зрителям — 😃 в углу трансляции', 'info'); }
     this.emit();
     const timer = window.setTimeout(() => {
@@ -624,6 +632,7 @@ export class Engine {
       if (this.pendingWatch.has(identity)) {
         this.pendingWatch.delete(identity); this.watching.delete(identity);
         this.transportFor(identity).unwatch(identity);
+        this.watchT.delete(identity);
         this.hooks.toast('Не удалось подключиться к трансляции', 'err'); this.emit();
       }
     }, 10000);
@@ -635,6 +644,7 @@ export class Engine {
     // если закрыли до коннекта, он всё равно стрелял и повторно звал unwatch()+toast.
     const t = this.watchTimers.get(identity); if (t) { clearTimeout(t); this.watchTimers.delete(identity); }
     this.transportFor(identity).unwatch(identity);
+    this.watchT.delete(identity);
     const m = this.streamWatchers.get(identity); if (m) { m.delete(this.me.username); }
     this.dataSend({ t: 'watch', s: identity, id: this.me.username, n: this.me.displayName, on: false });
     this.emit();
@@ -685,6 +695,10 @@ export class Engine {
   getTreeInfo(identity: string) { return this.transportFor(identity).getTreeInfo?.(identity) ?? null; }
   async getWatchRtpStats(identity: string) { return (await this.transportFor(identity).getRtpStats?.(identity)) ?? null; }
 
+  /** Метаданные приложения вещателя (иконка/имя окна) — только tree-стримы;
+   *  LiveKit (браузерная шара) метаданных не имеет → null (generic-глиф в UI). */
+  getStreamAppMeta(identity: string) { return this.treeT.getStreamMeta?.(identity) ?? null; }
+
   /** Э8: топология дерева стрима + текущий родитель + ручной выбор пира (для UI пикера). */
   getStreamTopology(identity: string) { return this.transportFor(identity).getTopology?.(identity) ?? null; }
   getStreamParentId(identity: string) { return this.transportFor(identity).getParentId?.(identity) ?? null; }
@@ -710,7 +724,7 @@ export class Engine {
   }
   private wset(sid: string) { let m = this.streamWatchers.get(sid); if (!m) { m = new Map(); this.streamWatchers.set(sid, m); } return m; }
   private cleanupWatchers() { const now = Date.now(); let ch = false; this.streamWatchers.forEach((m) => m.forEach((v, wid) => { if (now - v.ts > 9000) { m.delete(wid); ch = true; } })); if (ch) this.emit(); }
-  private cleanupPeer(id: string) { this.streamWatchers.delete(id); this.streamWatchers.forEach((m) => m.delete(id)); this.detachAnalyser(id); this.watching.delete(id); this.pendingWatch.delete(id); }
+  private cleanupPeer(id: string) { this.streamWatchers.delete(id); this.streamWatchers.forEach((m) => m.delete(id)); this.detachAnalyser(id); this.watching.delete(id); this.pendingWatch.delete(id); this.watchT.delete(id); }
 
   /* ---------- volumes ---------- */
   streamVolOf(id: string) { return this.VOLS.streams[id] !== undefined ? this.VOLS.streams[id] : 1; }

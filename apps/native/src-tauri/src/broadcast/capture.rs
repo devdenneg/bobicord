@@ -35,6 +35,13 @@ pub fn window_title(hwnd: isize) -> String {
     Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void).title().unwrap_or_default()
 }
 
+/// Имя процесса (напр. "notepad.exe") и его PID по HWND — для метаданных стрима
+/// (имя приложения зрителям + PID для извлечения иконки exe, см. icon.rs).
+pub fn window_process_and_pid(hwnd: isize) -> (String, u32) {
+    let w = Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void);
+    (w.process_name().unwrap_or_default(), w.process_id().unwrap_or(0))
+}
+
 /// Кадр в формате NV12 (Y-плоскость + перемежённая UV, 4:2:0) — то, что ждёт
 /// H.264 MFT на входе без внутренней цветоконвертации.
 pub struct Nv12Frame {

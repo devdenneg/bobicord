@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useStore } from '../store';
 import { Icon } from '../Icon';
 import { Backdrop } from './Backdrop';
@@ -68,6 +68,57 @@ function deriveAudioPid(cfg: SavedConfig, windows: WindowInfo[]): number | undef
   if (cfg.sourceKind === 'window' && cfg.windowHwnd != null)
     return windows.find((x) => x.hwnd === cfg.windowHwnd)?.pid;
   return undefined; // монитор в auto = EXCLUDE себя
+}
+
+/** base64 PNG иконки окна в data-URI (без префикса приходит из Rust) или null. */
+function iconSrc(icon: string | null | undefined): string | null {
+  return icon ? `data:image/png;base64,${icon}` : null;
+}
+
+/** Иконка приложения 18px или generic-глиф, если иконки нет. */
+function AppIcon({ icon, size = 18 }: { icon: string | null | undefined; size?: number }) {
+  const src = iconSrc(icon);
+  return src
+    ? <img src={src} width={size} height={size} style={{ borderRadius: 3, flexShrink: 0, objectFit: 'contain' }} alt="" />
+    : <span style={{ width: size, height: size, flexShrink: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', opacity: 0.6 }}><Icon name="screen" /></span>;
+}
+
+/** Пикер окна с иконками. Нативный <select> картинки в опциях не умеет — кастомный
+ *  листбокс: кнопка-триггер (иконка+заголовок) + выпадающий скроллируемый список.
+ *  Закрытие по клику вне/Escape. */
+function WindowPicker({ windows, value, onPick }: { windows: WindowInfo[]; value: number | null; onPick: (hwnd: number) => void }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const sel = windows.find((w) => w.hwnd === value) || null;
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('mousedown', onDoc);
+    document.addEventListener('keydown', onKey);
+    return () => { document.removeEventListener('mousedown', onDoc); document.removeEventListener('keydown', onKey); };
+  }, [open]);
+
+  return <div ref={ref} style={{ position: 'relative' }}>
+    <button type="button" className="wpick-trigger" onClick={() => setOpen((o) => !o)}
+      style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 8, textAlign: 'left', padding: '8px 10px', background: 'var(--input-bg, #1e1f22)', border: '1px solid var(--border, #333)', borderRadius: 8, color: 'inherit', cursor: 'pointer' }}>
+      {sel ? <><AppIcon icon={sel.icon} /><span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{sel.title}{sel.process ? ` — ${sel.process}` : ''}</span></>
+           : <span style={{ flex: 1, opacity: 0.6 }}>Выбери окно</span>}
+      <span style={{ opacity: 0.5, flexShrink: 0 }}>▾</span>
+    </button>
+    {open && <div role="listbox" className="wpick-list"
+      style={{ position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 20, marginTop: 4, maxHeight: 260, overflowY: 'auto', background: 'var(--bg-float, #1e1f22)', border: '1px solid var(--border, #333)', borderRadius: 8, boxShadow: '0 8px 24px rgba(0,0,0,.4)' }}>
+      {windows.length === 0 && <div style={{ padding: '10px 12px', opacity: 0.6 }}>Нет окон</div>}
+      {windows.map((w) => <div key={w.hwnd} role="option" aria-selected={w.hwnd === value}
+        onClick={() => { onPick(w.hwnd); setOpen(false); }}
+        className="wpick-opt"
+        style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer', background: w.hwnd === value ? 'var(--accent-soft, rgba(88,101,242,.25))' : 'transparent' }}>
+        <AppIcon icon={w.icon} />
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{w.title}{w.process ? ` — ${w.process}` : ''}</span>
+      </div>)}
+    </div>}
+  </div>;
 }
 
 export function BroadcastModal() {
@@ -157,10 +208,7 @@ export function BroadcastModal() {
           </select>
         </div>
       : <div className="fld"><label>Окно</label>
-          <select value={cfg.windowHwnd ?? ''} onChange={(e) => { const hwnd = +e.target.value; const w = windows.find((x) => x.hwnd === hwnd); setCfg((c) => ({ ...c, windowHwnd: hwnd, audioPid: w ? w.pid : c.audioPid })); }}>
-            <option value="" disabled>Выбери окно</option>
-            {windows.map((w) => <option key={w.hwnd} value={w.hwnd}>{w.title}{w.process ? ` — ${w.process}` : ''}</option>)}
-          </select>
+          <WindowPicker windows={windows} value={cfg.windowHwnd} onPick={(hwnd) => { const w = windows.find((x) => x.hwnd === hwnd); setCfg((c) => ({ ...c, windowHwnd: hwnd, audioPid: w ? w.pid : c.audioPid })); }} />
         </div>}
   </>;
 
