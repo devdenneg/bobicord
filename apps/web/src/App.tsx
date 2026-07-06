@@ -8,6 +8,7 @@ import { Auth } from './components/Auth';
 import { Toasts } from './components/Toasts';
 import { ServerView } from './components/ServerView';
 import { Modals } from './components/Modals';
+import { DownloadFab } from './components/DownloadFab';
 import type { ServerSummary } from './types';
 
 function Rail() {
@@ -125,6 +126,7 @@ export function App() {
         </div>
       )}
       <Modals />
+      <DownloadFab />
       <div id="audioSink" style={{ display: 'none' }} />
     </>
   );
