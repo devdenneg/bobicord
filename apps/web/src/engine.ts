@@ -1,5 +1,5 @@
 import {
-  Room, RoomEvent, Track, LocalAudioTrack, AudioPresets,
+  Room, RoomEvent, Track, LocalAudioTrack, AudioPresets, ConnectionQuality,
   type RemoteParticipant, type Participant, type TrackPublication, type RemoteTrack,
 } from 'livekit-client';
 import type { User, Member, ChatMessage, Emote, HistoryMessage, ReplyRef } from './types';
@@ -12,10 +12,13 @@ import { TreeVideoTransport } from './transport/treeVideo';
 
 export interface PeerState { online: boolean; inVoice: boolean; micMuted: boolean; streaming: boolean }
 export interface StreamInfo { key: string; identity: string; isLocal: boolean }
+export type VoiceQuality = 'excellent' | 'good' | 'poor' | 'lost' | 'unknown';
 export interface Snapshot {
   connected: boolean;
   roomReady: boolean; // комната реально поднялась (после await connect), а не просто создан объект Room
   reconnecting: boolean;
+  voiceQuality: VoiceQuality; // качество связи в голосовом (LiveKit ConnectionQuality)
+  voicePing: number | null;   // RTT до сервера, мс (из WebRTC-статистики)
   inVoice: boolean;
   deafened: boolean;
   localMicMuted: boolean;
@@ -49,6 +52,16 @@ interface EngineHooks {
 
 let msgSeq = 1;
 
+function mapQuality(q: ConnectionQuality): VoiceQuality {
+  switch (q) {
+    case ConnectionQuality.Excellent: return 'excellent';
+    case ConnectionQuality.Good: return 'good';
+    case ConnectionQuality.Poor: return 'poor';
+    case ConnectionQuality.Lost: return 'lost';
+    default: return 'unknown';
+  }
+}
+
 export class Engine {
   private room: Room | null = null;
   private me: User;
@@ -58,6 +71,9 @@ export class Engine {
   inVoice = false;
   private roomReady = false; // true только после успешного await r.connect() (не просто наличие объекта Room)
   private reconnecting = false;
+  private connQuality: VoiceQuality = 'unknown'; // качество связи (обновляется по событию LiveKit)
+  private pingMs: number | null = null;          // RTT до сервера, мс (опрос статистики в голосовом)
+  private connTimer: number | null = null;       // таймер опроса пинга (только в голосовом)
   private deafened = false;
   private pttDown = false;
   private watchTimers = new Map<string, number>();
@@ -185,7 +201,9 @@ export class Engine {
     const watchers: Record<string, { name: string }[]> = {};
     this.streamWatchers.forEach((m, sid) => (watchers[sid] = [...m.values()].map((v) => ({ name: v.name }))));
     return {
-      connected: !!this.room, roomReady: this.roomReady, reconnecting: this.reconnecting, inVoice: this.inVoice, deafened: this.deafened,
+      connected: !!this.room, roomReady: this.roomReady, reconnecting: this.reconnecting,
+      voiceQuality: this.inVoice ? this.connQuality : 'unknown', voicePing: this.inVoice ? this.pingMs : null,
+      inVoice: this.inVoice, deafened: this.deafened,
       localMicMuted: this.localMicMuted(), pttDown: this.pttDown,
       presence, speaking, streams, watching, pending, watchers, messages: this.messages, chatHasMore: this.chatMore, chatTrimmed: this.trimmedFront,
       typing: [...this.typingUsers].filter(([n, exp]) => exp > Date.now() && n !== this.me.displayName).map(([n]) => n),
@@ -210,6 +228,7 @@ export class Engine {
       .on(RoomEvent.Reconnected, () => { this.reconnecting = false; this.hooks.toast('Связь восстановлена', 'ok'); this.emit(); })
       .on(RoomEvent.Disconnected, () => { this.reconnecting = false; this.emit(); })
       .on(RoomEvent.TrackUnmuted, () => this.emit())
+      .on(RoomEvent.ConnectionQualityChanged, (q, p) => { if (p === r.localParticipant) { this.connQuality = mapQuality(q); this.emit(); } })
       .on(RoomEvent.TrackPublished, this.onRemotePub)
       .on(RoomEvent.TrackUnpublished, this.onRemoteUnpub)
       .on(RoomEvent.DataReceived, this.onData);
@@ -224,6 +243,7 @@ export class Engine {
 
   disconnect() {
     if (this.presenceTimer) clearInterval(this.presenceTimer);
+    this.stopConnPoll();
     this.analysers.forEach((o) => { try { o.src.disconnect(); } catch { /**/ } });
     this.analysers.clear(); this.speakingSet.clear();
     if (this.spRAF) cancelAnimationFrame(this.spRAF); this.spRAF = null;
@@ -273,16 +293,44 @@ export class Engine {
     try { await this.startMic(); }
     catch { this.inVoice = false; this.hooks.toast('Нет доступа к микрофону', 'err'); this.emit(); return; }
     this.room.remoteParticipants.forEach((p) => { const mp = p.getTrackPublication(Track.Source.Microphone); if (mp) { try { (mp as any).setSubscribed(true); } catch { /**/ } } });
+    this.startConnPoll();
     this.emit();
   }
   async leaveVoice() {
     if (!this.room || !this.inVoice) return;
+    this.stopConnPoll();
     await this.stopShare().catch(() => {});
     this.stopMic();
     this.room.remoteParticipants.forEach((p) => { const rp = p.getTrackPublication(Track.Source.Microphone); if (rp) { try { (rp as any).setSubscribed(false); } catch { /**/ } } this.detachAnalyser(p.identity); });
     this.inVoice = false; this.deafened = false; this.manualMute = false; this.pttDown = false;
     this.screenAudioEls.forEach((a) => (a.muted = false));
     this.emit();
+  }
+
+  /* ---------- качество связи в голосовом (индикатор + пинг) ---------- */
+  private startConnPoll() {
+    if (this.connTimer) return;
+    this.pollPing();
+    this.connTimer = window.setInterval(() => this.pollPing(), 2500);
+  }
+  private stopConnPoll() {
+    if (this.connTimer) { clearInterval(this.connTimer); this.connTimer = null; }
+    this.pingMs = null; this.connQuality = 'unknown';
+  }
+  // RTT до сервера из WebRTC-статистики микрофонного трека (remote-inbound-rtp), фолбэк — candidate-pair
+  private async pollPing() {
+    const track = this.room?.localParticipant.getTrackPublication(Track.Source.Microphone)?.track;
+    if (!track) return;
+    try {
+      const rep: RTCStatsReport = await (track as any).getRTCStatsReport();
+      let rtt: number | null = null, cand: number | null = null;
+      rep.forEach((s: any) => {
+        if (s.type === 'remote-inbound-rtp' && s.roundTripTime != null) rtt = s.roundTripTime;
+        if (s.type === 'candidate-pair' && (s.nominated || s.state === 'succeeded') && s.currentRoundTripTime != null) cand = s.currentRoundTripTime;
+      });
+      const v = rtt ?? cand;
+      if (v != null) { this.pingMs = Math.round(v * 1000); this.emit(); }
+    } catch { /**/ }
   }
 
   /* ---------- MIC / DEAFEN / PTT ---------- */

@@ -92,7 +92,7 @@ function VoiceParticipantRow({ m }: { m: Member }) {
           {m.avatarUrl ? <img className="avimg" src={resolveUploadUrl(m.avatarUrl)} alt="" /> : initial(m.displayName)}
         </div>
         <div className="nm" title={m.displayName}>{m.displayName}{isLocal ? ' (ты)' : ''}</div>
-        {streaming ? <span className="livepill">LIVE</span> : null}
+        {streaming ? <span className="livepill" title="В эфире"><span className="lp-t">LIVE</span></span> : null}
         {remote && streaming ? (
           <button className={'watchbtn' + (watching ? ' on' : '')} disabled={pending}
             aria-label={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}
@@ -212,8 +212,12 @@ function VoiceControls() {
   const muted = eng.localMicMuted;
   const ptt = mode === 'ptt' && !eng.deafened;
   const micClass = 'cbtn' + (muted && !ptt ? ' danger-on' : '') + (muted && ptt && !eng.pttDown ? ' ptt-idle' : '') + (eng.pttDown ? ' ptt-live' : '');
+  const q = eng.voiceQuality;
+  const qLabel = q === 'excellent' ? 'отличное' : q === 'good' ? 'хорошее' : q === 'poor' ? 'слабое' : q === 'lost' ? 'потеряно' : 'соединение…';
+  const qTip = (eng.voicePing != null ? eng.voicePing + ' мс' : '—') + ' · ' + qLabel;
   return (
     <div className="vc-controls">
+      <div className={'conn-ind q-' + q} data-tip={qTip} aria-label={'Качество связи: ' + qTip} tabIndex={0}><i /><i /><i /></div>
       <button className={micClass} aria-pressed={muted} data-tip="Микрофон · M" onClick={() => E.toggleMic()}><Icon name={muted ? 'mic-off' : 'mic'} sm /></button>
       <button className={'cbtn' + (eng.deafened ? ' danger-on' : '')} aria-pressed={eng.deafened} data-tip="Заглушить · D" onClick={() => E.toggleDeaf()}><Icon name={eng.deafened ? 'head-off' : 'head'} sm /></button>
       {isTauri ? <NativeBroadcastButton /> : <ShareButton />}
@@ -296,7 +300,7 @@ function MemberRow({ m }: { m: Member }) {
           </button>
         ) : null}
         {canKick ? <button className="mkick" data-tip="Выгнать" onClick={kick}><Icon name="close" sm /></button> : null}
-        {streaming ? <span className="livepill">LIVE</span> : null}
+        {streaming ? <span className="livepill" title="В эфире"><span className="lp-t">LIVE</span></span> : null}
       </div>
       {!self && hc.rect ? <ProfileCard m={m} rect={hc.rect} /> : null}
     </div>

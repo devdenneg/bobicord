@@ -414,10 +414,24 @@
   .vc-controls .cbtn.ptt-live{box-shadow:0 0 0 2px var(--green),0 0 14px rgba(35,165,89,.5);animation:pttPulse .9s ease-in-out infinite}
   .vc-controls .cbtn.leave-v{background:#3c1b22;color:var(--red)}
   .vc-controls .cbtn.leave-v:hover{background:var(--red-fill);color:#fff}
+  /* индикатор качества связи в голосовом: столбики по качеству, пинг — в тултипе (data-tip) */
+  .conn-ind{display:inline-flex;align-items:flex-end;gap:2.5px;height:24px;align-self:center;padding:3px 6px;border-radius:10px;flex:0 0 auto;cursor:default;transition:background .15s}
+  .conn-ind:hover{background:var(--panel2)}
+  .conn-ind i{width:4px;border-radius:2px;background:var(--panel4);transition:background .35s,opacity .35s}
+  .conn-ind i:nth-child(1){height:8px}
+  .conn-ind i:nth-child(2){height:13px}
+  .conn-ind i:nth-child(3){height:18px}
+  .conn-ind.q-excellent i{background:var(--green)}
+  .conn-ind.q-good i:nth-child(-n+2){background:var(--green)}
+  .conn-ind.q-good i:nth-child(3){opacity:.3}
+  .conn-ind.q-poor i:nth-child(1){background:var(--yellow)}
+  .conn-ind.q-poor i:nth-child(n+2){opacity:.3}
+  .conn-ind.q-lost i{background:var(--red);animation:connLost 1s ease-in-out infinite}
+  @keyframes connLost{0%,100%{opacity:1}50%{opacity:.35}}
 
   #mlist{flex:1;overflow-y:auto;overflow-x:hidden;padding:4px 8px 12px}
   .pi{border-radius:var(--r-sm);margin-bottom:1px}
-  .pi .head{display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:var(--r-sm);transition:background var(--tr)}
+  .pi .head{display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:var(--r-sm);transition:background var(--tr);container-type:inline-size}
   .pi .head:hover{background:var(--panel2)}
   .pi .head:active{background:var(--panel3)}
   .pi.clickable .head{cursor:pointer}
@@ -434,9 +448,12 @@
   .pi .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;font-weight:500}
   .pi.offline .nm{color:var(--muted)}
   .pi .nm .rl{color:var(--yellow);font-size:11px;margin-left:5px}
-  .pi .livepill{flex:0 0 auto;background:var(--red);color:#fff;font-size:10px;font-weight:800;letter-spacing:.4px;text-transform:uppercase;height:20px;display:inline-flex;align-items:center;gap:5px;padding:0 9px 0 8px;border-radius:9999px;position:relative;box-shadow:0 0 10px -2px rgba(242,63,67,.55);animation:liveBreath 2.4s ease-in-out infinite}
-  .pi .livepill::before{content:'';width:5px;height:5px;border-radius:50%;background:#fff;box-shadow:0 0 6px 1px rgba(255,255,255,.8);animation:liveBlink 1.5s ease-in-out infinite}
-  @keyframes liveBreath{0%,100%{box-shadow:0 0 8px -2px rgba(242,63,67,.5)}50%{box-shadow:0 0 17px 0 rgba(242,63,67,.85)}}
+  /* ник в приоритете: LIVE компактный (flex:0 0 auto — не давит ник, ник ellipsis'ится) */
+  .pi .livepill{flex:0 0 auto;max-width:100%;background:var(--red);color:#fff;font-size:9px;font-weight:800;letter-spacing:.3px;text-transform:uppercase;height:18px;display:inline-flex;align-items:center;justify-content:center;gap:4px;padding:0 7px 0 6px;border-radius:9999px;position:relative;box-shadow:0 0 7px -3px rgba(242,63,67,.6);animation:liveBreath 2.4s ease-in-out infinite}
+  .pi .livepill::before{content:'';flex:0 0 auto;width:5px;height:5px;border-radius:50%;background:#fff;box-shadow:0 0 6px 1px rgba(255,255,255,.8);animation:liveBlink 1.5s ease-in-out infinite}
+  /* узкое окно → LIVE сворачивается в одну пульсирующую точку, освобождая место под ник */
+  @container (max-width: 210px){ .pi .livepill .lp-t{display:none} .pi .livepill{gap:0;padding:0;width:18px} }
+  @keyframes liveBreath{0%,100%{box-shadow:0 0 6px -3px rgba(242,63,67,.55)}50%{box-shadow:0 0 12px -2px rgba(242,63,67,.8)}}
   @keyframes liveBlink{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.8)}}
   .pi .watchbtn{flex:0 0 auto;width:28px;height:28px;padding:0;display:flex;align-items:center;justify-content:center;border-radius:8px;background:var(--panel3);color:var(--txt);opacity:0;transition:opacity var(--tr),background var(--tr),color var(--tr)}
   .pi .watchbtn .ic{font-size:15px}
