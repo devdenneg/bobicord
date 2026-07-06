@@ -10,11 +10,11 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Sender;
 use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
-use windows_capture::graphics_capture_api::InternalCaptureControl;
+use windows_capture::graphics_capture_api::{GraphicsCaptureApi, InternalCaptureControl};
 use windows_capture::monitor::Monitor;
 use windows_capture::settings::{
     ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
-    MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
+    GraphicsCaptureItemType, MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
 use windows_capture::window::Window;
 
@@ -346,6 +346,27 @@ fn validate_source(source: &CaptureSource) -> Result<(), String> {
 /// Если сессия завершилась НЕ по нашему `stop` (окно закрыли, все попытки старта
 /// провалились), шлёт `shutdown_tx` — иначе после развязки канала от жизни сессии
 /// (см. CaptureSupervisor) энкодер не узнал бы о смерти источника.
+/// Общая сборка WGC-Settings + старт для монитора/окна (обе ветки `spawn_session`
+/// отличались только типом `item`; `Settings`/`start` генерики по `TryInto<GraphicsCaptureItemType>`).
+fn try_start_capture<T: TryInto<GraphicsCaptureItemType>>(
+    item: T,
+    border: DrawBorderSettings,
+    min_interval: MinimumUpdateIntervalSettings,
+    flags: CaptureFlags,
+) -> Result<(), String> {
+    let settings = Settings::new(
+        item,
+        CursorCaptureSettings::WithCursor,
+        border,
+        SecondaryWindowSettings::Default,
+        min_interval,
+        DirtyRegionSettings::Default,
+        ColorFormat::Bgra8,
+        flags,
+    );
+    ScreenCapture::start(settings).map_err(|e| e.to_string())
+}
+
 fn spawn_session(
     source: CaptureSource,
     tx: Sender<Nv12Frame>,
@@ -378,14 +399,36 @@ fn spawn_session(
         let mut last_err = String::new();
         // true = сессия завершилась штатно по нашему `stop` (свитч/стоп), не сама.
         let mut clean_stop = false;
+        // Пробинг возможностей WGC до старта: свойства MinUpdateInterval (Win11 24H2+)
+        // и IsBorderRequired (Win10 2004+) есть не на всех билдах. windows-capture
+        // 2.0 жёстко возвращает MinimumUpdateIntervalUnsupported/BorderConfigUnsupported,
+        // если передать не-Default при отсутствии свойства — на Win10 это роняло КАЖДУЮ
+        // попытку старта (юзер видел «окно/монитор пропали», не мог вещать вообще).
+        // Отсутствие поддержки безвредно: программный fps-гейт в on_frame_arrived держит
+        // каденс и без min_interval; рамка на старых ОС и так не рисуется.
+        let min_interval_supported = GraphicsCaptureApi::is_minimum_update_interval_supported().unwrap_or(false);
+        let border_supported = GraphicsCaptureApi::is_border_settings_supported().unwrap_or(false);
+        if !min_interval_supported {
+            log::info!("capture: MinUpdateInterval не поддерживается этой ОС — fallback на Default (fps держит программный гейт)");
+        }
+        if !border_supported {
+            log::info!("capture: IsBorderRequired не поддерживается этой ОС — fallback на Default");
+        }
         for attempt in 1..=START_ATTEMPTS {
             if stop2.load(Ordering::Relaxed) {
                 clean_stop = true;
                 break; // остановили до успешного старта
             }
-            let min_interval = MinimumUpdateIntervalSettings::Custom(
-                std::time::Duration::from_secs_f64(0.5 / target_fps.max(1) as f64),
-            );
+            let min_interval = if min_interval_supported {
+                MinimumUpdateIntervalSettings::Custom(std::time::Duration::from_secs_f64(0.5 / target_fps.max(1) as f64))
+            } else {
+                MinimumUpdateIntervalSettings::Default
+            };
+            let border = if border_supported {
+                DrawBorderSettings::WithoutBorder
+            } else {
+                DrawBorderSettings::Default
+            };
             let flags = CaptureFlags {
                 tx: tx.clone(),
                 stop: stop2.clone(),
@@ -395,32 +438,12 @@ fn spawn_session(
                 stats: stats.clone(),
             };
             let result = match source {
-                CaptureSource::Monitor { index } => Monitor::from_index(index).map_err(|e| e.to_string()).and_then(|monitor| {
-                    let settings = Settings::new(
-                        monitor,
-                        CursorCaptureSettings::WithCursor,
-                        DrawBorderSettings::WithoutBorder,
-                        SecondaryWindowSettings::Default,
-                        min_interval,
-                        DirtyRegionSettings::Default,
-                        ColorFormat::Bgra8,
-                        flags,
-                    );
-                    ScreenCapture::start(settings).map_err(|e| e.to_string())
-                }),
+                CaptureSource::Monitor { index } => Monitor::from_index(index)
+                    .map_err(|e| e.to_string())
+                    .and_then(|monitor| try_start_capture(monitor, border, min_interval, flags)),
                 CaptureSource::Window { hwnd } => {
                     let window = Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void);
-                    let settings = Settings::new(
-                        window,
-                        CursorCaptureSettings::WithCursor,
-                        DrawBorderSettings::WithoutBorder,
-                        SecondaryWindowSettings::Default,
-                        min_interval,
-                        DirtyRegionSettings::Default,
-                        ColorFormat::Bgra8,
-                        flags,
-                    );
-                    ScreenCapture::start(settings).map_err(|e| e.to_string())
+                    try_start_capture(window, border, min_interval, flags)
                 }
             };
             match result {
@@ -441,10 +464,16 @@ fn spawn_session(
             }
         }
         if !clean_stop && !stop2.load(Ordering::Relaxed) {
-            if !last_err.is_empty() {
+            // last_err непуст только когда старт не удался (Ok-ветка его не трогает).
+            // Тогда показываем реальную ошибку WGC — иначе на Win10/битом источнике
+            // юзер видел бесполезное «окно/монитор пропали» и причину знал только лог.
+            let reason = if last_err.is_empty() {
+                "захват прервался (окно/монитор пропали)".to_string()
+            } else {
                 log::error!("capture: старт не удался после {START_ATTEMPTS} попыток: {last_err}");
-            }
-            let _ = shutdown_tx.send(Some("захват прервался (окно/монитор пропали)".into()));
+                format!("захват не запустился: {last_err}")
+            };
+            let _ = shutdown_tx.send(Some(reason));
         }
     });
 
