@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
 import { useStore, getEngine } from '../store';
-import { api } from '../api';
+import { api, resolveUploadUrl } from '../api';
 import { useEngine } from '../hooks';
 import { Icon } from '../Icon';
 import { avColor, initial, prefersReducedMotion } from '../util';
@@ -14,7 +14,7 @@ import type { Emote, Member } from '../types';
 function Avatar({ name, ci, url, size = 32, dot }: { name: string; ci: number; url?: string; size?: number; dot?: string }) {
   return (
     <div className="av" style={{ width: size, height: size, fontSize: size * 0.44, background: url ? '#0000' : avColor(name, ci) }}>
-      {url ? <img className="avimg" src={url} alt="" /> : initial(name)}
+      {url ? <img className="avimg" src={resolveUploadUrl(url)} alt="" /> : initial(name)}
       {dot ? <span className={'sdot ' + dot} /> : null}
     </div>
   );
@@ -40,7 +40,7 @@ function ProfileCard({ m, rect }: { m: Member; rect: DOMRect }) {
   return (
     <div className="pcard" style={style}>
       <div className="pcard-av" style={{ background: m.avatarUrl ? '#0000' : avColor(m.displayName, m.avatarColor) }}>
-        {m.avatarUrl ? <img className="avimg" src={m.avatarUrl} alt="" /> : initial(m.displayName)}
+        {m.avatarUrl ? <img className="avimg" src={resolveUploadUrl(m.avatarUrl)} alt="" /> : initial(m.displayName)}
       </div>
       <div className="pcard-name">{m.displayName}</div>
       <div className="pcard-user">@{m.username}</div>
@@ -76,7 +76,7 @@ function VoiceParticipantRow({ m }: { m: Member }) {
         onClick={() => remote && setOpen((v) => !v)}
         onKeyDown={(e) => { if (remote && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); setOpen((v) => !v); } }}>
         <div className="av" style={{ background: m.avatarUrl ? '#0000' : avColor(m.displayName, m.avatarColor) }}>
-          {m.avatarUrl ? <img className="avimg" src={m.avatarUrl} alt="" /> : initial(m.displayName)}
+          {m.avatarUrl ? <img className="avimg" src={resolveUploadUrl(m.avatarUrl)} alt="" /> : initial(m.displayName)}
         </div>
         <div className="nm" title={m.displayName}>{m.displayName}{isLocal ? ' (ты)' : ''}</div>
         {streaming ? <span className="livepill">LIVE</span> : null}
@@ -282,11 +282,12 @@ function ImageLightbox({ src, onClose }: { src: string; onClose: () => void }) {
     window.addEventListener('keydown', k);
     return () => window.removeEventListener('keydown', k);
   }, [onClose]);
+  const url = resolveUploadUrl(src);
   return (
     <div className="lightbox" role="dialog" aria-modal="true" onClick={onClose}>
       <button className="lb-close" aria-label="Закрыть" onClick={onClose}><Icon name="close" /></button>
-      <a className="lb-open" href={src} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>Открыть оригинал</a>
-      <img src={src} alt="" onClick={(e) => e.stopPropagation()} />
+      <a className="lb-open" href={url} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>Открыть оригинал</a>
+      <img src={url} alt="" onClick={(e) => e.stopPropagation()} />
     </div>
   );
 }
@@ -359,7 +360,7 @@ function Chat() {
                     {m.sys ? m.text : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : 'link' in p ? <a key={i} className="msg-link" href={p.link} target="_blank" rel="noreferrer">{p.link}</a> : <img key={i} className="emo" src={emoteUrl(p.emo)} alt={p.name} title={p.name} loading="lazy" decoding="async" />))}
                   </div>
                 ) : null}
-                {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox(m.img!)}><img className="msg-img" src={m.img} alt="" loading="lazy" onLoad={() => { const el = msgsRef.current; if (el && atBottomRef.current) el.scrollTop = el.scrollHeight; }} /></button> : null}
+                {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox(m.img!)}><img className="msg-img" src={resolveUploadUrl(m.img)} alt="" loading="lazy" onLoad={() => { const el = msgsRef.current; if (el && atBottomRef.current) el.scrollTop = el.scrollHeight; }} /></button> : null}
               </div>
             );
           })}

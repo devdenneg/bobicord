@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import { useStore, getEngine } from './store';
 import { getSettings } from './settings';
 import { avColor, initial } from './util';
+import { resolveUploadUrl } from './api';
 import { Icon, IconSprite } from './Icon';
 import { Auth } from './components/Auth';
 import { Toasts } from './components/Toasts';
@@ -29,7 +30,7 @@ function Rail() {
         </button>
       ))}
       <button className="railbtn rail-add tip-l" data-tip="Создать / войти" onClick={() => setModal('create')}><Icon name="plus" /></button>
-      <button className="railbtn rail-me tip-l" data-tip="Профиль" style={{ background: me.avatarUrl ? '#0000' : avColor(me.displayName, me.avatarColor) }} onClick={() => setModal('profile')}>{me.avatarUrl ? <img className="avimg" src={me.avatarUrl} alt="" /> : initial(me.displayName)}</button>
+      <button className="railbtn rail-me tip-l" data-tip="Профиль" style={{ background: me.avatarUrl ? '#0000' : avColor(me.displayName, me.avatarColor) }} onClick={() => setModal('profile')}>{me.avatarUrl ? <img className="avimg" src={resolveUploadUrl(me.avatarUrl)} alt="" /> : initial(me.displayName)}</button>
     </nav>
   );
 }
