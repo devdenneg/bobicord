@@ -28,7 +28,7 @@ export interface Snapshot {
   streams: StreamInfo[];
   watching: Record<string, true>;
   pending: Record<string, true>;
-  watchers: Record<string, { name: string }[]>;
+  watchers: Record<string, { name: string; color: number; avatarUrl?: string }[]>;
   messages: ChatMessage[];
   chatHasMore: boolean; // есть ли ещё более старые сообщения для догрузки вверх
   chatTrimmed: number; // накопленное число срезанных с начала сообщений (для коррекции якоря virtuoso)
@@ -93,7 +93,7 @@ export class Engine {
   private screenAudioEls = new Map<string, HTMLMediaElement>();
   private watching = new Set<string>();
   private pendingWatch = new Set<string>();
-  private streamWatchers = new Map<string, Map<string, { name: string; ts: number }>>();
+  private streamWatchers = new Map<string, Map<string, { name: string; color: number; avatarUrl?: string; ts: number }>>();
   private messages: ChatMessage[] = [];
   private chatMore = false; // есть ли ещё более старые сообщения на сервере (пагинация вверх)
   private oldestSid: number | null = null; // DB-id самого старого загруженного сообщения = курсор для before
@@ -198,8 +198,8 @@ export class Engine {
     const streams: StreamInfo[] = [...this.liveKitT.getStreams(), ...this.treeT.getStreams()];
     const watching: Record<string, true> = {}; this.watching.forEach((u) => (watching[u] = true));
     const pending: Record<string, true> = {}; this.pendingWatch.forEach((u) => (pending[u] = true));
-    const watchers: Record<string, { name: string }[]> = {};
-    this.streamWatchers.forEach((m, sid) => (watchers[sid] = [...m.values()].map((v) => ({ name: v.name }))));
+    const watchers: Record<string, { name: string; color: number; avatarUrl?: string }[]> = {};
+    this.streamWatchers.forEach((m, sid) => (watchers[sid] = [...m.values()].map((v) => ({ name: v.name, color: v.color, avatarUrl: v.avatarUrl }))));
     return {
       connected: !!this.room, roomReady: this.roomReady, reconnecting: this.reconnecting,
       voiceQuality: this.inVoice ? this.connQuality : 'unknown', voicePing: this.inVoice ? this.pingMs : null,
@@ -636,8 +636,8 @@ export class Engine {
     if (!this.room) return;
     const id = this.me.username;
     this.watching.forEach((sid) => {
-      const m = this.wset(sid); m.set(id, { name: this.me.displayName, ts: Date.now() });
-      this.dataSend({ t: 'watch', s: sid, id, n: this.me.displayName, on: true });
+      const m = this.wset(sid); m.set(id, { name: this.me.displayName, color: this.me.avatarColor, avatarUrl: this.me.avatarUrl, ts: Date.now() });
+      this.dataSend({ t: 'watch', s: sid, id, n: this.me.displayName, c: this.me.avatarColor, a: this.me.avatarUrl, on: true });
     });
     this.emit();
   }
@@ -760,7 +760,7 @@ export class Engine {
       if (d.t === 'chat') { if (d.em) for (const k in d.em) this.onEmoteResolve?.(k, d.em[k]); this.typingUsers.delete(d.name); const repliedToMe = this.replyToMe(d.reply); const mentioned = this.textMentionsMe(d.text) || repliedToMe; this.pushMsg(d.name, d.text, false, d.color, false, d.img, undefined, d.uid, d.reply); playSound(mentioned ? 'mention' : 'msg'); if (mentioned) this.hooks.toast(repliedToMe ? `${d.name} ответил тебе` : `${d.name} упомянул тебя`, 'info'); }
       else if (d.t === 'clear') { this.messages = []; this.emit(); this.sysMsg((d.by || 'Админ') + ' очистил чат'); }
       else if (d.t === 'emote') this.emoteListeners.forEach((f) => f(d.s, d.e, d.by, d.x, d.sz));
-      else if (d.t === 'watch') { const m = this.wset(d.s); if (d.on) m.set(d.id, { name: d.n, ts: Date.now() }); else m.delete(d.id); this.emit(); }
+      else if (d.t === 'watch') { const m = this.wset(d.s); if (d.on) m.set(d.id, { name: d.n, color: d.c ?? 0, avatarUrl: d.a, ts: Date.now() }); else m.delete(d.id); this.emit(); }
       else if (d.t === 'typing') { if (d.name && d.name !== this.me.displayName) { this.typingUsers.set(d.name, Date.now() + 3500); this.emit(); setTimeout(() => this.pruneTyping(), 3600); } }
     } catch { /**/ }
   };

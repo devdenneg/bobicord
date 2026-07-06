@@ -196,9 +196,13 @@
   .srv-header .hbtn.on{background:var(--accent);color:#fff}
 
   #content{flex:1;display:grid;grid-template-columns:1fr;min-height:0;position:relative}
-  #content.split{grid-template-columns:1fr var(--chat-w,340px)}
+  /* трансляция: видео на всю ширину, чат скрыт; открывается по кнопке (show-chat) отдельной колонкой */
+  #content.split{grid-template-columns:1fr}
+  #content.split #chat{display:none}
+  #content.split.show-chat{grid-template-columns:1fr var(--chat-w,340px)}
+  #content.split.show-chat #chat{display:flex}
   .rz-chat{right:var(--chat-w,340px);transform:translateX(50%)}
-  @media(max-width:900px){#content.split{grid-template-columns:1fr}#content.split #chat{display:none}#content.split.show-chat #stage{display:none}#content.split.show-chat #chat{display:flex}}
+  @media(max-width:900px){#content.split.show-chat{grid-template-columns:1fr}#content.split.show-chat #stage{display:none}#content.split.show-chat #chat{display:flex;grid-column:1}}
   .mob-chat-toggle{display:none}
   @media(max-width:900px){
     #content.split .mob-chat-toggle{display:inline-flex;align-items:center;gap:6px;position:absolute;left:50%;transform:translateX(-50%);bottom:66px;z-index:20;background:var(--accent);color:#fff;padding:9px 16px;border-radius:9999px;font-size:13px;font-weight:600;box-shadow:0 6px 18px rgba(0,0,0,.35)}
@@ -228,14 +232,14 @@
   .vbar .vb-btn:hover{background:#ffffff33}
   .vbar .vb-btn.danger:hover{background:var(--red-fill)}
   .vwrap .watchers{position:absolute;top:10px;left:10px;display:flex;align-items:center;background:#000b;backdrop-filter:blur(8px);padding:4px 11px 4px 8px;border-radius:9999px;font-size:12px;z-index:7;cursor:default}
-  .vwrap .watchers .wa{width:22px;height:22px;border-radius:50%;font-size:10.5px;font-weight:700;color:#fff;display:flex;align-items:center;justify-content:center;border:2px solid #050505;margin-right:-7px}
+  .vwrap .watchers .wa{width:22px;height:22px;border-radius:50%;overflow:hidden;font-size:10.5px;font-weight:700;color:#fff;display:flex;align-items:center;justify-content:center;border:2px solid #050505;margin-right:-7px}
   .vwrap .watchers .wc{margin-left:12px;color:#fff;font-weight:600;display:flex;align-items:center;gap:4px}
   .vwrap .watchers .wc .ic{font-size:14px}
   .vwrap .watchers .wtip{position:absolute;top:calc(100% + 6px);left:0;min-width:172px;max-height:260px;overflow-y:auto;background:var(--panel);border:1px solid var(--line-2);border-radius:10px;box-shadow:var(--sh-3);padding:8px;opacity:0;transform:translateY(-4px);pointer-events:none;transition:opacity var(--tr),transform var(--tr);z-index:9}
   .vwrap .watchers:hover .wtip{opacity:1;transform:none}
   .vwrap .watchers .wtip-h{font-size:10.5px;font-weight:700;letter-spacing:.3px;text-transform:uppercase;color:var(--muted);padding:2px 4px 6px}
   .vwrap .watchers .wtip-row{display:flex;align-items:center;gap:7px;padding:3px 4px;font-size:12.5px;color:var(--txt);white-space:nowrap}
-  .vwrap .watchers .wtip-av{width:20px;height:20px;border-radius:50%;font-size:9.5px;font-weight:700;color:#fff;display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+  .vwrap .watchers .wtip-av{width:20px;height:20px;border-radius:50%;overflow:hidden;font-size:9.5px;font-weight:700;color:#fff;display:flex;align-items:center;justify-content:center;flex:0 0 auto}
   .vwrap .spray{position:absolute;left:10px;bottom:10px;background:#000b;backdrop-filter:blur(8px);width:36px;height:36px;border-radius:9px;display:flex;align-items:center;justify-content:center;padding:0;z-index:8;color:#fff}
   .vwrap .spray:hover{background:var(--accent)}
   .emolayer{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:3}
@@ -272,16 +276,15 @@
   .msg-reply-btn .ic{font-size:16px}
   .virt-row:hover .msg-reply-btn{opacity:1}
   .msg-reply-btn:hover{background:var(--panel4);color:var(--accent-txt)}
-  .reply-quote{display:flex;align-items:center;gap:5px;max-width:100%;margin:0 0 3px 2px;padding:0;background:none;color:var(--muted);font-size:12.5px;line-height:1.3;position:relative;text-align:left}
-  .reply-quote::before{content:'';position:absolute;left:-2px;top:8px;width:12px;height:9px;border-left:2px solid var(--line-2);border-top:2px solid var(--line-2);border-top-left-radius:6px}
-  .reply-quote{padding-left:16px}
-  .reply-quote .ic{font-size:14px;color:var(--muted);flex:0 0 auto;transform:scaleX(-1)}
-  .reply-quote .rq-author{font-weight:600;flex:0 0 auto;white-space:nowrap}
-  .reply-quote .rq-text{color:var(--muted);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.85}
-  .reply-quote.jumpable{cursor:pointer}
-  .reply-quote.jumpable:hover .rq-text{opacity:1;color:var(--txt)}
-  .msg.me .reply-quote{align-self:flex-end;flex-direction:row-reverse;padding:0 16px 3px 0}
-  .msg.me .reply-quote::before{display:none}
+  /* цитата ответа: вертикальная цветная полоса + автор + сниппет, всегда слева-направо (и у своих) */
+  .reply-quote{display:flex;align-items:center;gap:7px;max-width:min(100%,340px);margin:0 0 4px;padding:3px 10px 3px 7px;background:var(--panel2);border-radius:7px;font-size:12.5px;line-height:1.3;text-align:left;overflow:hidden}
+  .reply-quote .rq-bar{flex:0 0 auto;align-self:stretch;width:3px;min-height:15px;border-radius:2px;background:var(--accent)}
+  .reply-quote .rq-author{font-weight:600;flex:0 1 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:48%}
+  .reply-quote .rq-text{color:var(--muted);flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .reply-quote.jumpable{cursor:pointer;transition:background .12s}
+  .reply-quote.jumpable:hover{background:var(--panel3)}
+  .reply-quote.jumpable:hover .rq-text{color:var(--txt)}
+  .msg.me .reply-quote{align-self:flex-end}
   .msg.flash .tx{animation:msgFlash 1.3s ease-out}
   @keyframes msgFlash{0%,55%{box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 45%,transparent)}100%{box-shadow:0 0 0 3px transparent}}
   .reply-bar{display:flex;align-items:center;gap:8px;margin:0 12px;padding:7px 12px;background:var(--panel2);border:1px solid var(--line-2);border-bottom:none;border-radius:10px 10px 0 0;font-size:13px;color:var(--muted);animation:sbIn .16s ease-out}
@@ -396,13 +399,11 @@
   .voice-card .vc-h .ic{font-size:16px}
   .vc-list{display:flex;flex-direction:column;gap:2px;margin-bottom:8px}
   .vc-empty{font-size:12.5px;color:var(--muted);padding:6px 6px 10px;text-align:center}
-  .vc-join{position:relative;overflow:hidden;width:100%;color:#fff;font-weight:700;letter-spacing:.2px;padding:12px;border-radius:10px;display:flex;align-items:center;justify-content:center;gap:8px;background:linear-gradient(180deg,color-mix(in srgb,var(--green) 84%,#fff),var(--green));box-shadow:0 4px 14px -5px color-mix(in srgb,var(--green) 65%,transparent),inset 0 1px 0 rgba(255,255,255,.22);transition:transform var(--tr),box-shadow var(--tr),filter var(--tr)}
-  .vc-join:hover{filter:brightness(1.07);transform:translateY(-2px);box-shadow:0 10px 26px -6px color-mix(in srgb,var(--green) 72%,transparent),inset 0 1px 0 rgba(255,255,255,.28)}
-  .vc-join:active{transform:translateY(0);filter:brightness(.98);box-shadow:0 3px 9px -5px color-mix(in srgb,var(--green) 60%,transparent)}
+  /* плоский, матовый — в стиль темы (без глянца/градиента/glow) */
+  .vc-join{width:100%;color:#fff;font-weight:600;letter-spacing:.2px;padding:11px;border-radius:10px;display:flex;align-items:center;justify-content:center;gap:8px;background:var(--green);box-shadow:var(--sh-1);transition:background var(--tr),transform var(--tr)}
+  .vc-join:hover{background:color-mix(in srgb,var(--green) 90%,#fff)}
+  .vc-join:active{transform:translateY(1px)}
   .vc-join .ic{transition:transform var(--tr)}
-  .vc-join:hover .ic{transform:scale(1.15) rotate(-4deg)}
-  .vc-join::before{content:'';position:absolute;top:0;left:-60%;width:45%;height:100%;background:linear-gradient(100deg,transparent,rgba(255,255,255,.38),transparent);transform:skewX(-18deg);pointer-events:none}
-  .vc-join:hover::before{animation:sheen .75s ease}
   @keyframes sheen{from{left:-60%}to{left:135%}}
   .voice-bar{flex:0 0 auto;background:var(--bg2);border-top:1px solid var(--line-2);padding:8px 6px}
   .vc-controls{display:flex;gap:7px;justify-content:center}
@@ -431,7 +432,7 @@
 
   #mlist{flex:1;overflow-y:auto;overflow-x:hidden;padding:4px 8px 12px}
   .pi{border-radius:var(--r-sm);margin-bottom:1px}
-  .pi .head{display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:var(--r-sm);transition:background var(--tr);container-type:inline-size}
+  .pi .head{display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:var(--r-sm);transition:background var(--tr)}
   .pi .head:hover{background:var(--panel2)}
   .pi .head:active{background:var(--panel3)}
   .pi.clickable .head{cursor:pointer}
@@ -448,13 +449,11 @@
   .pi .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;font-weight:500}
   .pi.offline .nm{color:var(--muted)}
   .pi .nm .rl{color:var(--yellow);font-size:11px;margin-left:5px}
-  /* ник в приоритете: LIVE компактный (flex:0 0 auto — не давит ник, ник ellipsis'ится) */
-  .pi .livepill{flex:0 0 auto;max-width:100%;background:var(--red);color:#fff;font-size:9px;font-weight:800;letter-spacing:.3px;text-transform:uppercase;height:18px;display:inline-flex;align-items:center;justify-content:center;gap:4px;padding:0 7px 0 6px;border-radius:9999px;position:relative;box-shadow:0 0 7px -3px rgba(242,63,67,.6);animation:liveBreath 2.4s ease-in-out infinite}
-  .pi .livepill::before{content:'';flex:0 0 auto;width:5px;height:5px;border-radius:50%;background:#fff;box-shadow:0 0 6px 1px rgba(255,255,255,.8);animation:liveBlink 1.5s ease-in-out infinite}
-  /* узкое окно → LIVE сворачивается в одну пульсирующую точку, освобождая место под ник */
-  @container (max-width: 210px){ .pi .livepill .lp-t{display:none} .pi .livepill{gap:0;padding:0;width:18px} }
-  @keyframes liveBreath{0%,100%{box-shadow:0 0 6px -3px rgba(242,63,67,.55)}50%{box-shadow:0 0 12px -2px rgba(242,63,67,.8)}}
-  @keyframes liveBlink{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.8)}}
+  /* LIVE — НА аватаре (кольцо + мини-бейдж), а не в строке ника: ник всегда в приоритете, не перекрывается */
+  .av.live{position:relative;box-shadow:0 0 0 2px var(--red),0 0 9px -2px rgba(242,63,67,.55);animation:avLive 2.2s ease-in-out infinite}
+  .av.live .sdot{display:none}
+  .av .av-live{position:absolute;left:50%;bottom:-5px;transform:translateX(-50%);background:var(--red);color:#fff;font-size:7.5px;font-weight:800;letter-spacing:.2px;line-height:1;padding:1.5px 4px 1px;border-radius:6px;border:1.5px solid var(--panel);white-space:nowrap;z-index:2;pointer-events:none}
+  @keyframes avLive{0%,100%{box-shadow:0 0 0 2px var(--red),0 0 6px -3px rgba(242,63,67,.5)}50%{box-shadow:0 0 0 2px var(--red),0 0 13px -1px rgba(242,63,67,.85)}}
   .pi .watchbtn{flex:0 0 auto;width:28px;height:28px;padding:0;display:flex;align-items:center;justify-content:center;border-radius:8px;background:var(--panel3);color:var(--txt);opacity:0;transition:opacity var(--tr),background var(--tr),color var(--tr)}
   .pi .watchbtn .ic{font-size:15px}
   .pi .watchbtn:hover{background:var(--accent);color:#fff}
@@ -470,7 +469,7 @@
   .pi .chev{opacity:.28;transition:opacity var(--tr),transform var(--tr);color:var(--muted);flex:0 0 auto;width:28px;height:28px;display:flex;align-items:center;justify-content:center}
   .pi.clickable .head:hover .chev{opacity:.8}.pi.open .chev{opacity:1;transform:rotate(180deg)}
   .pi .micst{width:28px;height:28px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;color:var(--red)}
-  .pi .micst:not(.off){visibility:hidden}.pi .micst .ic{font-size:15px}
+  .pi .micst:not(.off){display:none}.pi .micst .ic{font-size:15px}
   /* строка громкости — плавно раскрывается/уезжает */
   .pi .exp{display:flex;align-items:center;gap:10px;max-height:0;overflow:hidden;opacity:0;padding:0 8px 0 8px;transition:max-height .22s ease,opacity .18s ease,padding .22s ease}
   .pi.open .exp{max-height:56px;opacity:1;padding:4px 8px 12px 8px}
@@ -549,6 +548,15 @@
   .sm-ic{width:48px;height:48px;flex:0 0 auto;border-radius:16px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:20px;color:#fff;overflow:hidden;position:relative}
   .sm-ic.lg{width:72px;height:72px;border-radius:22px;font-size:28px}
   .sm-ic .avimg{width:100%;height:100%;object-fit:cover}
+  /* кнопки меню сервера: иконка+подпись по центру, одинаковая высота, чёткие роли */
+  .sm-act{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;padding:13px 14px;border-radius:10px;font-weight:600;font-size:14px;background:var(--panel2);color:var(--txt);transition:background .14s,transform .1s}
+  .sm-act:hover{background:var(--panel3)}
+  .sm-act:active{transform:translateY(1px)}
+  .sm-act .ic{font-size:18px;flex:0 0 auto;opacity:.92}
+  .sm-act.accent{background:var(--accent);color:#fff}
+  .sm-act.accent:hover{background:var(--accent-h)}
+  .sm-act.danger{background:var(--red-fill);color:#fff}
+  .sm-act.danger:hover{background:var(--red)}
   .role-list{display:flex;flex-direction:column;gap:6px;margin-bottom:8px}
   .role-row{display:flex;align-items:center;gap:9px;padding:8px 10px;background:var(--panel2);border-radius:var(--r-sm)}
   .role-dot{width:12px;height:12px;border-radius:50%;flex:0 0 auto}

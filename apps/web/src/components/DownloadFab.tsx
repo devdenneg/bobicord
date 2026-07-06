@@ -3,8 +3,8 @@ import { api } from '../api';
 import { isTauri } from '../native';
 import { Icon } from '../Icon';
 
-// Плавающая кнопка скачивания десктоп-приложения — всегда в правом нижнем углу.
-// Только в браузере (в самом app не нужна) и только если на сервере есть билд.
+// Плавающая кнопка скачивания десктоп-приложения (правый нижний угол).
+// Показывается только на главном экране (см. App.tsx), только в браузере и если на сервере есть билд.
 export function DownloadFab() {
   const [dl, setDl] = useState<{ version: string; url: string } | null>(null);
   useEffect(() => { if (!isTauri) api.appLatest().then(setDl); }, []);

@@ -14,11 +14,12 @@ import { applyNativeUpdate } from '../nativeUpdate';
 import type { ChatMessage, Emote, Member, ReplyRef, Role } from '../types';
 import { PERM, hasPerm } from '../types';
 
-function Avatar({ name, ci, url, size = 32, dot }: { name: string; ci: number; url?: string; size?: number; dot?: string }) {
+function Avatar({ name, ci, url, size = 32, dot, live }: { name: string; ci: number; url?: string; size?: number; dot?: string; live?: boolean }) {
   return (
-    <div className="av" style={{ width: size, height: size, fontSize: size * 0.44, background: url ? '#0000' : avColor(name, ci) }}>
+    <div className={'av' + (live ? ' live' : '')} style={{ width: size, height: size, fontSize: size * 0.44, background: url ? '#0000' : avColor(name, ci) }}>
       {url ? <img className="avimg" src={resolveUploadUrl(url)} alt="" /> : initial(name)}
       {dot ? <span className={'sdot ' + dot} /> : null}
+      {live ? <span className="av-live" title="В эфире">LIVE</span> : null}
     </div>
   );
 }
@@ -88,11 +89,11 @@ function VoiceParticipantRow({ m }: { m: Member }) {
         aria-expanded={remote ? open : undefined} aria-controls={remote ? rowId : undefined}
         onClick={() => remote && setOpen((v) => !v)}
         onKeyDown={(e) => { if (remote && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); setOpen((v) => !v); } }}>
-        <div className="av" style={{ background: m.avatarUrl ? '#0000' : avColor(m.displayName, m.avatarColor) }}>
+        <div className={'av' + (streaming ? ' live' : '')} style={{ background: m.avatarUrl ? '#0000' : avColor(m.displayName, m.avatarColor) }}>
           {m.avatarUrl ? <img className="avimg" src={resolveUploadUrl(m.avatarUrl)} alt="" /> : initial(m.displayName)}
+          {streaming ? <span className="av-live" title="В эфире">LIVE</span> : null}
         </div>
         <div className="nm" title={m.displayName}>{m.displayName}{isLocal ? ' (ты)' : ''}</div>
-        {streaming ? <span className="livepill" title="В эфире"><span className="lp-t">LIVE</span></span> : null}
         {remote && streaming ? (
           <button className={'watchbtn' + (watching ? ' on' : '')} disabled={pending}
             aria-label={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}
@@ -288,7 +289,7 @@ function MemberRow({ m }: { m: Member }) {
   return (
     <div className={'pi ' + st + (streaming ? ' streaming' : '')} data-spk={m.username}>
       <div className="head" ref={hc.ref} onMouseEnter={self ? undefined : hc.onEnter} onMouseLeave={self ? undefined : hc.onLeave}>
-        <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} dot={st} />
+        <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} dot={st} live={streaming} />
         <div className="nm" style={roleColorOf(m) ? { color: roleColorOf(m) } : undefined}>{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div>
         <MemberRoles roles={m.roles || []} />
         {!self && streaming && !pr?.inVoice ? (
@@ -300,7 +301,6 @@ function MemberRow({ m }: { m: Member }) {
           </button>
         ) : null}
         {canKick ? <button className="mkick" data-tip="Выгнать" onClick={kick}><Icon name="close" sm /></button> : null}
-        {streaming ? <span className="livepill" title="В эфире"><span className="lp-t">LIVE</span></span> : null}
       </div>
       {!self && hc.rect ? <ProfileCard m={m} rect={hc.rect} /> : null}
     </div>
@@ -649,10 +649,11 @@ function Chat() {
       const jumpable = m.reply.sid != null;
       const rep = m.reply;
       replyQuote = (
-        <button className={'reply-quote' + (jumpable ? ' jumpable' : '')} disabled={!jumpable} onClick={jumpable ? () => jumpToReply(rep) : undefined}>
-          <Icon name="reply" sm />
+        <button className={'reply-quote' + (jumpable ? ' jumpable' : '')} disabled={!jumpable} onClick={jumpable ? () => jumpToReply(rep) : undefined}
+          title={rep.author + ': ' + (rep.text || (rep.img ? 'изображение' : ''))}>
+          <span className="rq-bar" style={{ background: rColor }} />
           <span className="rq-author" style={{ color: rColor }}>{rep.author}</span>
-          <span className="rq-text">{rep.text || (rep.img ? '🖼 изображение' : '')}</span>
+          <span className="rq-text">{rep.text || (rep.img ? '🖼 Изображение' : '')}</span>
         </button>
       );
     }
@@ -857,12 +858,12 @@ function StreamTile({ streamKey, identity, isLocal }: { streamKey: string; ident
         ))}
       </div>
       <div className="watchers">
-        {watchers.slice(0, 4).map((w, i) => <div className="wa" key={i} style={{ background: avColor(w.name) }} title={w.name}>{initial(w.name)}</div>)}
+        {watchers.slice(0, 4).map((w, i) => <div className="wa" key={i} style={{ background: w.avatarUrl ? '#0000' : avColor(w.name, w.color) }} title={w.name}>{w.avatarUrl ? <img className="avimg" src={resolveUploadUrl(w.avatarUrl)} alt="" /> : initial(w.name)}</div>)}
         <div className="wc"><Icon name="eye" sm />{watchers.length}</div>
         {watchers.length ? (
           <div className="wtip">
             <div className="wtip-h">Смотрят · {watchers.length}</div>
-            {watchers.map((w, i) => <div className="wtip-row" key={i}><span className="wtip-av" style={{ background: avColor(w.name) }}>{initial(w.name)}</span>{w.name}</div>)}
+            {watchers.map((w, i) => <div className="wtip-row" key={i}><span className="wtip-av" style={{ background: w.avatarUrl ? '#0000' : avColor(w.name, w.color) }}>{w.avatarUrl ? <img className="avimg" src={resolveUploadUrl(w.avatarUrl)} alt="" /> : initial(w.name)}</span>{w.name}</div>)}
           </div>
         ) : null}
       </div>
@@ -1027,6 +1028,15 @@ export function ServerView() {
   useEffect(() => { localStorage.setItem('membersOpen', membersOpen ? '1' : '0'); }, [membersOpen]);
   const [showChat, setShowChat] = useState(false);
   useEffect(() => { if (!split) setShowChat(false); }, [split]);
+  // трансляция открылась → сразу прячем участников (место под видео); закрылась → возвращаем, если прятали сами
+  const prevSplit = useRef(false);
+  const autoHidMembers = useRef(false);
+  useEffect(() => {
+    if (split === prevSplit.current) return;
+    if (split) { if (membersOpen) { autoHidMembers.current = true; setMembersOpen(false); } }
+    else if (autoHidMembers.current) { autoHidMembers.current = false; setMembersOpen(true); }
+    prevSplit.current = split;
+  }, [split, membersOpen]);
 
   return (
     <>
@@ -1035,12 +1045,13 @@ export function ServerView() {
         <div id="main">
           <div className="srv-header">
             <div className="hn"><Icon name="hash" sm /><span>общий</span></div>
+            {split ? <button className={'hbtn' + (showChat ? ' on' : '')} data-tip={showChat ? 'Скрыть чат' : 'Показать чат'} onClick={() => setShowChat((v) => !v)}><Icon name="chat" sm /></button> : null}
             <button className={'hbtn' + (membersOpen ? ' on' : '')} data-tip={membersOpen ? 'Скрыть участников' : 'Показать участников'} onClick={() => setMembersOpen((v) => !v)}><Icon name="users" sm /></button>
             <button className="hbtn" data-tip="Пригласить" onClick={() => setModal('invite')}><Icon name="link" sm /></button>
           </div>
           <div id="content" className={(split ? 'split' : '') + (split && showChat ? ' show-chat' : '')} style={{ '--chat-w': chatW.w + 'px' } as CSSProperties}>
             <Stage minimized={minimized} setMin={setMin} />
-            {split ? <div className="rz rz-chat" onMouseDown={chatW.onDown} title="Потяни — ширина чата" /> : null}
+            {split && showChat ? <div className="rz rz-chat" onMouseDown={chatW.onDown} title="Потяни — ширина чата" /> : null}
             <Chat />
             {split ? <button className="mob-chat-toggle" onClick={() => setShowChat((v) => !v)}><Icon name={showChat ? 'screen' : 'chat'} sm />{showChat ? 'К трансляции' : 'Открыть чат'}</button> : null}
           </div>

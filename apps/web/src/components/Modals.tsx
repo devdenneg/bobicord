@@ -138,10 +138,13 @@ function ServerMenuModal() {
     </div>
     {active.description ? <p className="msub" style={{ marginTop: 4 }}>{active.description}</p> : null}
     <div className="rowbtns">
-      <button className="ghost" style={{ margin: 0 }} onClick={() => useStore.getState().setModal('invite')}><Icon name="link" sm />Пригласить</button>
-      {canManage ? <button className="primary" style={{ margin: 0 }} onClick={() => useStore.getState().setModal('srvsettings')}><Icon name="gear" sm />Настройки сервера</button> : null}
+      <button className="sm-act" onClick={() => useStore.getState().setModal('invite')}><Icon name="link" sm />Пригласить</button>
+      {canManage ? <button className="sm-act accent" onClick={() => useStore.getState().setModal('srvsettings')}><Icon name="gear" sm />Настройки сервера</button> : null}
     </div>
-    <div className="rowbtns"><button className="ghost" style={{ margin: 0 }} onClick={close}>Закрыть</button><button className="primary" style={{ margin: 0, background: 'var(--red-fill)' }} onClick={leave}>{owner ? 'Удалить сервер' : 'Покинуть сервер'}</button></div>
+    <div className="rowbtns">
+      <button className="sm-act" onClick={close}>Закрыть</button>
+      <button className="sm-act danger" onClick={leave}><Icon name="leave" sm />{owner ? 'Удалить сервер' : 'Покинуть сервер'}</button>
+    </div>
     <div className="err">{err}</div>
   </Backdrop>;
 }

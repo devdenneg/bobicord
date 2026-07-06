@@ -165,7 +165,7 @@ export function App() {
         </div>
       )}
       <Modals />
-      <DownloadFab />
+      {view === 'home' ? <DownloadFab /> : null}
       <div id="audioSink" style={{ display: 'none' }} />
     </>
   );
