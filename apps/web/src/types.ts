@@ -8,13 +8,20 @@ export interface User {
 }
 
 // права роли (битовая маска, синхронно с server/index.js PERM)
-export const PERM = { MANAGE_SERVER: 1, MANAGE_ROLES: 2, MANAGE_MEMBERS: 4, MANAGE_MESSAGES: 8, CREATE_INVITE: 16 } as const;
+export const PERM = { MANAGE_SERVER: 1, MANAGE_ROLES: 2, MANAGE_MEMBERS: 4, MANAGE_MESSAGES: 8, CREATE_INVITE: 16, MANAGE_CHANNELS: 32 } as const;
 export const PERM_LIST: { key: keyof typeof PERM; label: string; hint: string }[] = [
   { key: 'MANAGE_SERVER', label: 'Управление сервером', hint: 'Менять название, описание, обложку' },
+  { key: 'MANAGE_CHANNELS', label: 'Управление каналами', hint: 'Создавать и удалять голосовые каналы' },
   { key: 'MANAGE_ROLES', label: 'Управление ролями', hint: 'Создавать роли и назначать их' },
   { key: 'MANAGE_MEMBERS', label: 'Выгонять участников', hint: 'Кикать с сервера' },
   { key: 'MANAGE_MESSAGES', label: 'Модерация чата', hint: 'Чистить чат, команды' },
 ];
+
+export interface VoiceChannel {
+  id: string;
+  name: string;
+  position: number;
+}
 export const hasPerm = (perms: number, flag: number) => (perms & flag) === flag;
 
 export interface Role {
@@ -60,6 +67,7 @@ export interface ServerDetail {
   myRole: string;
   myPerms?: number;
   roles?: Role[];
+  channels?: VoiceChannel[];
 }
 
 export interface InvitePreview {

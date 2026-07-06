@@ -120,32 +120,112 @@ function VoiceParticipantRow({ m }: { m: Member }) {
   );
 }
 
-/* ---------- Voice channel card ---------- */
-function VoiceCard() {
+/* ---------- Voice channels (несколько голосовых каналов на сервер) ---------- */
+function VoiceChannels() {
   const eng = useEngine();
-  const members = useStore((s) => s.members);
-  const me = useStore((s) => s.me)!;
   const E = getEngine()!;
-  const inVoice = eng.inVoice;
-  const inVoiceMembers = members.filter((m) => eng.presence[m.username]?.inVoice);
+  const active = useStore((s) => s.active)!;
+  const members = useStore((s) => s.members);
+  const channels = active.channels || [];
+  const canManage = hasPerm(active.myPerms || 0, PERM.MANAGE_CHANNELS);
+  const myVc = eng.myVoiceChannel;
+
+  // мой голосовой канал удалили (админом) — аккуратно выходим из голосового
+  useEffect(() => {
+    if (myVc && channels.length && !channels.some((c) => c.id === myVc)) E.leaveVoice();
+  }, [myVc, channels, E]);
 
   return (
-    <div className="voice-card">
-      <div className="vc-h"><Icon name="speaker" />Голосовой канал</div>
-      <div className="vc-list">
-        {inVoiceMembers.map((m) => <VoiceParticipantRow m={m} key={m.username} />)}
-        {/* комната поднимается в фоне — вместо мигания «Никого» показываем скелетон, пока не знаем состав */}
-        {!eng.roomReady && inVoiceMembers.length === 0 ? (
-          <>
-            <div className="vc-sk-row"><span className="sk-av" /><span className="sk-line" style={{ width: '58%' }} /></div>
-            <div className="vc-sk-row"><span className="sk-av" /><span className="sk-line" style={{ width: '42%' }} /></div>
-          </>
+    <div className="vchans">
+      <div className="vchans-h">
+        <span>Голосовые каналы</span>
+        <span className="vchans-count">{channels.length}/5</span>
+      </div>
+      {!eng.roomReady && channels.length === 0 ? (
+        <div className="vchan"><div className="vchan-h"><span className="sk-line" style={{ width: '55%', height: 11 }} /></div></div>
+      ) : null}
+      {channels.map((c) => (
+        <VoiceChannelItem key={c.id} channel={c} canManage={canManage} canDelete={canManage && channels.length > 1} mine={myVc === c.id}
+          membersInChannel={members.filter((m) => eng.voiceChannels[m.username] === c.id)} />
+      ))}
+      {canManage && channels.length > 0 && channels.length < 5 ? <CreateChannelRow /> : null}
+    </div>
+  );
+}
+
+function VoiceChannelItem({ channel, membersInChannel, canManage, canDelete, mine }: { channel: { id: string; name: string }; membersInChannel: Member[]; canManage: boolean; canDelete: boolean; mine: boolean }) {
+  const E = getEngine()!;
+  const renameChannel = useStore((s) => s.renameChannel);
+  const deleteChannel = useStore((s) => s.deleteChannel);
+  const [editing, setEditing] = useState(false);
+  const [name, setName] = useState(channel.name);
+  const [confirmDel, setConfirmDel] = useState(false);
+  useEffect(() => { setName(channel.name); }, [channel.name]);
+
+  const join = () => { if (!mine) E.joinVoice(channel.id); };
+  const submitRename = () => { const n = name.trim(); if (n && n !== channel.name) renameChannel(channel.id, n); setEditing(false); };
+
+  return (
+    <div className={'vchan' + (mine ? ' mine' : '')}>
+      <div className="vchan-h" role="button" tabIndex={editing ? -1 : 0} data-tip={mine ? undefined : 'Зайти в канал'}
+        onClick={editing ? undefined : join}
+        onKeyDown={(e) => { if (!editing && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); join(); } }}>
+        <Icon name="speaker" sm />
+        {editing ? (
+          <input className="vchan-edit" autoFocus value={name} maxLength={24}
+            onClick={(e) => e.stopPropagation()}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => { e.stopPropagation(); if (e.key === 'Enter') submitRename(); if (e.key === 'Escape') { setName(channel.name); setEditing(false); } }}
+            onBlur={submitRename} />
+        ) : (
+          <span className="vchan-nm" title={channel.name}>{channel.name}</span>
+        )}
+        {!editing && membersInChannel.length ? <span className="vchan-n">{membersInChannel.length}</span> : null}
+        {canManage && !editing ? (
+          <span className="vchan-actions" onClick={(e) => e.stopPropagation()}>
+            <button className="vchan-act" data-tip="Переименовать" onClick={() => setEditing(true)}><Icon name="edit" sm /></button>
+            {canDelete ? <button className="vchan-act del" data-tip="Удалить канал" onClick={() => setConfirmDel(true)}><Icon name="trash" sm /></button> : null}
+          </span>
         ) : null}
       </div>
-      {eng.roomReady && inVoiceMembers.length === 0 ? <div className="vc-empty">Никого в голосовом</div> : null}
-      {!inVoice
-        ? <button className="vc-join" onClick={() => E.joinVoice()}><Icon name="mic" sm />Подключиться</button>
-        : null}
+      {membersInChannel.length ? (
+        <div className="vchan-list">{membersInChannel.map((m) => <VoiceParticipantRow m={m} key={m.username} />)}</div>
+      ) : null}
+      {confirmDel ? (
+        <div className="vchan-confirm">
+          <span>Удалить «{channel.name}»?</span>
+          <div className="vchan-confirm-btns">
+            <button className="vc-del-no" onClick={() => setConfirmDel(false)}>Отмена</button>
+            <button className="vc-del-yes" onClick={() => { setConfirmDel(false); deleteChannel(channel.id); }}>Удалить</button>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function CreateChannelRow() {
+  const createChannel = useStore((s) => s.createChannel);
+  const toast = useStore((s) => s.toast);
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState('');
+  const [busy, setBusy] = useState(false);
+  const submit = async () => {
+    const n = name.trim(); if (!n || busy) return;
+    setBusy(true);
+    try { await createChannel(n); setName(''); setOpen(false); }
+    catch (e: any) { toast(e?.message || 'Не удалось создать канал', 'err'); }
+    finally { setBusy(false); }
+  };
+  if (!open) return <button className="vchan-add" onClick={() => setOpen(true)}><Icon name="plus" sm />Создать канал</button>;
+  return (
+    <div className="vchan-create">
+      <Icon name="speaker" sm />
+      <input autoFocus placeholder="Название канала" maxLength={24} value={name}
+        onChange={(e) => setName(e.target.value)}
+        onKeyDown={(e) => { if (e.key === 'Enter') submit(); if (e.key === 'Escape') { setName(''); setOpen(false); } }} />
+      <button className="vchan-create-ok" disabled={!name.trim() || busy} data-tip="Создать" onClick={submit}>{busy ? <span className="spin" style={{ margin: 0, width: 13, height: 13 }} /> : <Icon name="check" sm />}</button>
+      <button className="vchan-create-x" data-tip="Отмена" onClick={() => { setName(''); setOpen(false); }}><Icon name="close" sm /></button>
     </div>
   );
 }
@@ -231,6 +311,32 @@ function VoiceControls() {
 function roleBadge(r: Role) {
   return <span key={r.id} className="role-badge" style={{ background: (r.color || 'var(--panel3)') + '22', color: r.color || 'var(--muted)', borderColor: (r.color || 'var(--line-2)') + '55' }}>{r.name}</span>;
 }
+// бейдж роли: если имя не влезает в max-width — пускаем бегущую строку (ping-pong), иначе обычный ellipsis
+function RoleBadge({ r }: { r: Role }) {
+  const outer = useRef<HTMLSpanElement>(null);
+  const inner = useRef<HTMLSpanElement>(null);
+  const [shift, setShift] = useState(0);
+  useLayoutEffect(() => {
+    const o = outer.current, i = inner.current; if (!o || !i) return;
+    const compute = () => {
+      const cs = getComputedStyle(o);
+      const avail = o.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+      const over = i.scrollWidth - avail;
+      setShift(over > 1 ? over : 0);
+    };
+    compute();
+    const ro = new ResizeObserver(compute); ro.observe(o);
+    return () => ro.disconnect();
+  }, [r.name]);
+  const marq = shift > 0 && !prefersReducedMotion();
+  const style: CSSProperties = { background: (r.color || 'var(--panel3)') + '22', color: r.color || 'var(--muted)', borderColor: (r.color || 'var(--line-2)') + '55' };
+  const innerStyle: CSSProperties | undefined = marq ? { ['--marq' as string]: -shift + 'px', animationDuration: (2 + shift / 28).toFixed(2) + 's' } as CSSProperties : undefined;
+  return (
+    <span ref={outer} key={r.id} className={'role-badge' + (marq ? ' marquee' : '')} style={style} data-tip={shift > 0 ? r.name : undefined}>
+      <span ref={inner} className="rb-t" style={innerStyle}>{r.name}</span>
+    </span>
+  );
+}
 function MemberRoles({ roles }: { roles: Role[] }) {
   const visRef = useRef<HTMLDivElement>(null);
   const ghostRef = useRef<HTMLDivElement>(null);
@@ -256,7 +362,7 @@ function MemberRoles({ roles }: { roles: Role[] }) {
   const hidden = roles.length - visN;
   return (
     <div className="mrow-roles" ref={visRef}>
-      {roles.slice(0, visN).map(roleBadge)}
+      {roles.slice(0, visN).map((r) => <RoleBadge r={r} key={r.id} />)}
       {hidden > 0 ? <span className="role-more" data-tip={roles.map((r) => r.name).join(', ')}>+{hidden}</span> : null}
       <div className="mrow-roles-ghost" ref={ghostRef} aria-hidden="true">{roles.map(roleBadge)}</div>
     </div>
@@ -660,7 +766,7 @@ function Chat() {
     return (
       <div className={'virt-row' + (cont ? ' cont' : '')}>
         <div className={'msg' + (m.sys ? ' sys' : '') + (m.mine ? ' me' : '') + (m.mention ? ' mentioned' : '') + (m.id === flashId ? ' flash' : '')}>
-          {!m.sys && !m.mine ? <div className="msg-av">{!cont ? <Avatar name={m.who || ''} ci={m.color ?? 0} url={author?.avatarUrl} size={36} /> : null}</div> : null}
+          {!m.sys ? <div className="msg-av">{!cont ? <Avatar name={m.who || ''} ci={m.color ?? 0} url={author?.avatarUrl} size={36} /> : null}</div> : null}
           <div className="msg-body">
             {replyQuote}
             {!m.sys && !cont ? <div className="who" style={{ color: nameColor }}>{m.who}{aRoles.length ? <span className="who-roles">{aRoles.map((r) => <span key={r.id} className="who-role" style={{ background: (r.color || 'var(--panel3)') + '22', color: r.color || 'var(--muted)', borderColor: (r.color || 'var(--line-2)') + '55' }}>{r.name}</span>)}</span> : null}{m.ts ? <span className="mtime">{fmtTime(m.ts)}</span> : null}</div> : null}
@@ -998,7 +1104,7 @@ function Channels() {
       <div className="ch-header" role="button" tabIndex={0} data-tip="Меню сервера" onClick={() => setModal('srvmenu')}>
         <span className="chn">{active.name}</span><Icon name="info" sm />
       </div>
-      <div className="ch-body"><VoiceCard /></div>
+      <div className="ch-body"><VoiceChannels /></div>
       {eng.inVoice ? <div className="voice-bar"><VoiceControls /></div> : null}
       <div className="user-panel">
         <div className="up-i" onClick={() => setModal('profile')}><b>{me.displayName}</b><span>В сети</span></div>
@@ -1060,7 +1166,7 @@ export function ServerView() {
 
   return (
     <>
-      <section id="server" className={'on' + (mtab !== 'main' ? ' tab-' + mtab : '')} style={{ '--ch-w': chan.w + 'px', '--mem-w': (membersOpen ? mem.w : 0) + 'px' } as CSSProperties}>
+      <section id="server" className={'on' + (mtab !== 'main' ? ' tab-' + mtab : '')} style={{ '--ch-w': chan.w + 'px', '--mem-w': (membersOpen ? mem.w : 0) + 'px', '--mem-open': mem.w + 'px' } as CSSProperties}>
         <Channels />
         <div id="main">
           <div className="srv-header">

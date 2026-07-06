@@ -1,4 +1,4 @@
-import type { User, ServerSummary, Member, ServerDetail, InvitePreview, HistoryMessage, Role } from './types';
+import type { User, ServerSummary, Member, ServerDetail, InvitePreview, HistoryMessage, Role, VoiceChannel } from './types';
 
 let token: string | null = localStorage.getItem('sess');
 export const getToken = () => token;
@@ -89,6 +89,10 @@ export const api = {
   updateRole: (id: string, rid: string, patch: Partial<{ name: string; color: string; permissions: number; position: number }>) => req<{ role: Role }>('PATCH', `/servers/${id}/roles/${rid}`, patch),
   deleteRole: (id: string, rid: string) => req<{ ok: boolean }>('DELETE', `/servers/${id}/roles/${rid}`),
   setMemberRoles: (id: string, userId: string, roleIds: string[]) => req<{ roles: Role[] }>('PUT', `/servers/${id}/members/${userId}/roles`, { roleIds }),
+  getChannels: (id: string) => req<{ channels: VoiceChannel[] }>('GET', `/servers/${id}/channels`),
+  createChannel: (id: string, name: string) => req<{ channel: VoiceChannel; channels: VoiceChannel[] }>('POST', `/servers/${id}/channels`, { name }),
+  renameChannel: (id: string, cid: string, name: string) => req<{ channels: VoiceChannel[] }>('PATCH', `/servers/${id}/channels/${cid}`, { name }),
+  deleteChannel: (id: string, cid: string) => req<{ channels: VoiceChannel[] }>('DELETE', `/servers/${id}/channels/${cid}`),
   clearChat: (id: string) => req<{ ok: boolean }>('POST', `/servers/${id}/clear`),
   serverToken: (id: string) => req<{ token: string; url: string; room: string }>('GET', `/servers/${id}/token`),
   getSettings: (id: string) => req<{ data: any }>('GET', `/servers/${id}/settings`),

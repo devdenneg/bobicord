@@ -109,6 +109,14 @@ CREATE TABLE IF NOT EXISTS member_roles(
   role_id TEXT NOT NULL,
   PRIMARY KEY(server_id, user_id, role_id)
 );
+CREATE TABLE IF NOT EXISTS voice_channels(
+  id TEXT PRIMARY KEY,
+  server_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  position INTEGER NOT NULL DEFAULT 0,
+  created INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vc_server ON voice_channels(server_id, position);
 CREATE INDEX IF NOT EXISTS idx_msg_server ON messages(server_id, created);
 CREATE INDEX IF NOT EXISTS idx_msg_server_id ON messages(server_id, id);
 CREATE INDEX IF NOT EXISTS idx_mem_server ON memberships(server_id);
@@ -182,7 +190,8 @@ function memberCount(sid) { return db.prepare('SELECT COUNT(*) c FROM membership
 function roleOf(uid, sid) { const r = db.prepare('SELECT role FROM memberships WHERE user_id=? AND server_id=?').get(uid, sid); return r ? r.role : null; }
 
 /* ---- права (битовая маска; задел на будущее — часть уже проверяется) ---- */
-const PERM = { MANAGE_SERVER: 1, MANAGE_ROLES: 2, MANAGE_MEMBERS: 4, MANAGE_MESSAGES: 8, CREATE_INVITE: 16 };
+const PERM = { MANAGE_SERVER: 1, MANAGE_ROLES: 2, MANAGE_MEMBERS: 4, MANAGE_MESSAGES: 8, CREATE_INVITE: 16, MANAGE_CHANNELS: 32 };
+const MAX_CHANNELS = 5;
 const ALL_PERMS = Object.values(PERM).reduce((a, b) => a | b, 0);
 const isOwner = (uid, sid) => { const s = db.prepare('SELECT owner_id FROM servers WHERE id=?').get(sid); return !!s && s.owner_id === uid; };
 function permsOf(uid, sid) {
@@ -194,6 +203,15 @@ const can = (uid, sid, perm) => (permsOf(uid, sid) & perm) === perm;
 const pubRole = r => ({ id: r.id, name: r.name, color: r.color || '', permissions: r.permissions || 0, position: r.position || 0 });
 function rolesOfServer(sid) { return db.prepare('SELECT * FROM roles WHERE server_id=? ORDER BY position DESC, created ASC').all(sid).map(pubRole); }
 function rolesOfMember(sid, uid) { return db.prepare('SELECT r.* FROM member_roles mr JOIN roles r ON r.id=mr.role_id WHERE mr.server_id=? AND mr.user_id=? ORDER BY r.position DESC').all(sid, uid).map(pubRole); }
+
+/* ---- голосовые каналы (несколько на сервер, максимум MAX_CHANNELS) ---- */
+const pubChannel = c => ({ id: c.id, name: c.name, position: c.position || 0 });
+function channelsOf(sid) { return db.prepare('SELECT * FROM voice_channels WHERE server_id=? ORDER BY position ASC, created ASC').all(sid).map(pubChannel); }
+// у каждого сервера всегда есть хотя бы один канал; для legacy-серверов создаём «Общий» лениво
+function ensureDefaultChannel(sid) {
+  const n = db.prepare('SELECT COUNT(*) c FROM voice_channels WHERE server_id=?').get(sid).c;
+  if (n === 0) db.prepare('INSERT INTO voice_channels(id,server_id,name,position,created) VALUES(?,?,?,?,?)').run(newId('vc'), sid, 'Общий', 0, Date.now());
+}
 
 /* ---------------- AUTH ---------------- */
 app.post('/api/register', (req, res) => {
@@ -282,6 +300,7 @@ app.post('/api/servers', requireAuth, (req, res) => {
   db.prepare('INSERT INTO servers(id,name,owner_id,icon_color,password_hash,created) VALUES(?,?,?,?,?,?)')
     .run(id, name, req.user.id, hashColor(name), null, now);
   db.prepare('INSERT INTO memberships(user_id,server_id,role,joined) VALUES(?,?,?,?)').run(req.user.id, id, 'owner', now);
+  db.prepare('INSERT INTO voice_channels(id,server_id,name,position,created) VALUES(?,?,?,?,?)').run(newId('vc'), id, 'Общий', 0, now);
   const inv = makeInvite(id, req.user.id);
   const s = db.prepare('SELECT * FROM servers WHERE id=?').get(id);
   res.json({ server: { ...pubServer(s), role: 'owner', memberCount: 1 }, invite: inv.code, inviteExpires: inv.expires });
@@ -295,7 +314,8 @@ app.get('/api/servers/:id', requireAuth, (req, res) => {
     SELECT u.id,u.username,u.display_name,u.avatar_color,u.avatar_url,u.bio,m.role FROM memberships m
     JOIN users u ON u.id=m.user_id WHERE m.server_id=? ORDER BY (m.role='owner') DESC, u.display_name ASC`).all(s.id)
     .map(u => ({ id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '', bio: u.bio || '', role: u.role, roles: rolesOfMember(s.id, u.id) }));
-  res.json({ server: { ...pubServer(s), memberCount: members.length, roles: rolesOfServer(s.id) }, members, myRole: roleOf(req.user.id, s.id), myPerms: permsOf(req.user.id, s.id) });
+  ensureDefaultChannel(s.id);
+  res.json({ server: { ...pubServer(s), memberCount: members.length, roles: rolesOfServer(s.id), channels: channelsOf(s.id) }, members, myRole: roleOf(req.user.id, s.id), myPerms: permsOf(req.user.id, s.id) });
 });
 
 /* owner kicks a member */
@@ -434,6 +454,44 @@ app.put('/api/servers/:id/members/:uid/roles', requireAuth, (req, res) => {
   res.json({ roles: rolesOfMember(sid, uid) });
 });
 
+/* ---------------- ГОЛОСОВЫЕ КАНАЛЫ (создание/переименование/удаление) ---------------- */
+app.get('/api/servers/:id/channels', requireAuth, (req, res) => {
+  if (!isMember(req.user.id, req.params.id)) return res.status(403).json({ error: 'нет' });
+  ensureDefaultChannel(req.params.id);
+  res.json({ channels: channelsOf(req.params.id) });
+});
+app.post('/api/servers/:id/channels', requireAuth, (req, res) => {
+  const sid = req.params.id;
+  if (!can(req.user.id, sid, PERM.MANAGE_CHANNELS)) return res.status(403).json({ error: 'Нет прав' });
+  ensureDefaultChannel(sid);
+  const count = db.prepare('SELECT COUNT(*) c FROM voice_channels WHERE server_id=?').get(sid).c;
+  if (count >= MAX_CHANNELS) return res.status(400).json({ error: `Максимум ${MAX_CHANNELS} голосовых каналов` });
+  const name = String(req.body.name || '').trim().slice(0, 24);
+  if (name.length < 1) return res.status(400).json({ error: 'Название канала не может быть пустым' });
+  const maxPos = db.prepare('SELECT COALESCE(MAX(position),-1) p FROM voice_channels WHERE server_id=?').get(sid).p;
+  const id = newId('vc');
+  db.prepare('INSERT INTO voice_channels(id,server_id,name,position,created) VALUES(?,?,?,?,?)').run(id, sid, name, maxPos + 1, Date.now());
+  res.json({ channel: pubChannel(db.prepare('SELECT * FROM voice_channels WHERE id=?').get(id)), channels: channelsOf(sid) });
+});
+app.patch('/api/servers/:id/channels/:cid', requireAuth, (req, res) => {
+  const sid = req.params.id;
+  if (!can(req.user.id, sid, PERM.MANAGE_CHANNELS)) return res.status(403).json({ error: 'Нет прав' });
+  const c = db.prepare('SELECT * FROM voice_channels WHERE id=? AND server_id=?').get(req.params.cid, sid);
+  if (!c) return res.status(404).json({ error: 'Канал не найден' });
+  const name = String(req.body.name || '').trim().slice(0, 24);
+  if (name.length < 1) return res.status(400).json({ error: 'Название не может быть пустым' });
+  db.prepare('UPDATE voice_channels SET name=? WHERE id=?').run(name, c.id);
+  res.json({ channels: channelsOf(sid) });
+});
+app.delete('/api/servers/:id/channels/:cid', requireAuth, (req, res) => {
+  const sid = req.params.id;
+  if (!can(req.user.id, sid, PERM.MANAGE_CHANNELS)) return res.status(403).json({ error: 'Нет прав' });
+  const count = db.prepare('SELECT COUNT(*) c FROM voice_channels WHERE server_id=?').get(sid).c;
+  if (count <= 1) return res.status(400).json({ error: 'Нельзя удалить последний голосовой канал' });
+  db.prepare('DELETE FROM voice_channels WHERE id=? AND server_id=?').run(req.params.cid, sid);
+  res.json({ channels: channelsOf(sid) });
+});
+
 /* ---------------- ADMIN: очистка чата ---------------- */
 app.post('/api/servers/:id/clear', requireAuth, (req, res) => {
   const sid = req.params.id;
@@ -449,7 +507,7 @@ app.get('/api/servers/:id/token', requireAuth, async (req, res) => {
   if (!isMember(req.user.id, s.id)) return res.status(403).json({ error: 'Ты не участник' });
   try {
     const at = new AccessToken(KEY, SECRET, { identity: req.user.username, name: req.user.display_name, ttl: '12h' });
-    at.addGrant({ roomJoin: true, room: 'srv:' + s.id, canPublish: true, canSubscribe: true, canPublishData: true });
+    at.addGrant({ roomJoin: true, room: 'srv:' + s.id, canPublish: true, canSubscribe: true, canPublishData: true, canUpdateOwnMetadata: true });
     res.json({ token: await at.toJwt(), url: WS_URL, room: 'srv:' + s.id });
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });

@@ -20,6 +20,8 @@ export interface Snapshot {
   voiceQuality: VoiceQuality; // качество связи в голосовом (LiveKit ConnectionQuality)
   voicePing: number | null;   // RTT до сервера, мс (из WebRTC-статистики)
   inVoice: boolean;
+  myVoiceChannel: string | null;              // id голосового канала, в котором я сейчас (null = не в голосовом)
+  voiceChannels: Record<string, string>;      // username -> channelId (кто в каком голосовом канале)
   deafened: boolean;
   localMicMuted: boolean;
   pttDown: boolean;
@@ -69,6 +71,7 @@ export class Engine {
   private hooks: EngineHooks;
 
   inVoice = false;
+  private currentVc: string | null = null; // id голосового канала, в котором я сейчас (несколько каналов на сервер)
   private roomReady = false; // true только после успешного await r.connect() (не просто наличие объекта Room)
   private reconnecting = false;
   private connQuality: VoiceQuality = 'unknown'; // качество связи (обновляется по событию LiveKit)
@@ -195,7 +198,15 @@ export class Engine {
     }
     const speaking: Record<string, boolean> = {};
     this.speakingSet.forEach((u) => (speaking[u] = true));
-    const streams: StreamInfo[] = [...this.liveKitT.getStreams(), ...this.treeT.getStreams()];
+    // кто в каком голосовом канале (по participant-атрибуту vc; для себя — currentVc)
+    const voiceChannels: Record<string, string> = {};
+    for (const m of this.members) {
+      const vc = this.voiceChannelOf(m.username);
+      if (vc && this.isInVoice(m.username)) voiceChannels[m.username] = vc;
+    }
+    // стримы видит только тот, кто в том же голосовом канале, что и вещатель (своё превью — всегда)
+    const streams: StreamInfo[] = [...this.liveKitT.getStreams(), ...this.treeT.getStreams()].filter((s) =>
+      s.isLocal || (!!this.currentVc && this.voiceChannelOf(s.identity) === this.currentVc));
     const watching: Record<string, true> = {}; this.watching.forEach((u) => (watching[u] = true));
     const pending: Record<string, true> = {}; this.pendingWatch.forEach((u) => (pending[u] = true));
     const watchers: Record<string, { name: string; color: number; avatarUrl?: string }[]> = {};
@@ -203,7 +214,7 @@ export class Engine {
     return {
       connected: !!this.room, roomReady: this.roomReady, reconnecting: this.reconnecting,
       voiceQuality: this.inVoice ? this.connQuality : 'unknown', voicePing: this.inVoice ? this.pingMs : null,
-      inVoice: this.inVoice, deafened: this.deafened,
+      inVoice: this.inVoice, myVoiceChannel: this.currentVc, voiceChannels, deafened: this.deafened,
       localMicMuted: this.localMicMuted(), pttDown: this.pttDown,
       presence, speaking, streams, watching, pending, watchers, messages: this.messages, chatHasMore: this.chatMore, chatTrimmed: this.trimmedFront,
       typing: [...this.typingUsers].filter(([n, exp]) => exp > Date.now() && n !== this.me.displayName).map(([n]) => n),
@@ -231,6 +242,15 @@ export class Engine {
       .on(RoomEvent.ConnectionQualityChanged, (q, p) => { if (p === r.localParticipant) { this.connQuality = mapQuality(q); this.emit(); } })
       .on(RoomEvent.TrackPublished, this.onRemotePub)
       .on(RoomEvent.TrackUnpublished, this.onRemoteUnpub)
+      // пир сменил голосовой канал (атрибут vc) → пере-подписаться/отписаться от микрофона;
+      // если ушёл из моего канала, а я смотрел его стрим — закрываем watch (иначе трафик идёт впустую)
+      .on(RoomEvent.ParticipantAttributesChanged, (_changed, p) => {
+        if (p !== r.localParticipant) {
+          this.reconcilePeerAudio(p as Participant);
+          if (this.watching.has(p.identity) && this.voiceChannelOf(p.identity) !== this.currentVc) this.closeWatch(p.identity);
+        }
+        this.emit();
+      })
       .on(RoomEvent.DataReceived, this.onData);
     await r.connect(url, token, { autoSubscribe: false });
     this.roomReady = true; // комната реально поднялась — можно снимать скелетоны голосового/сцены
@@ -273,6 +293,23 @@ export class Engine {
     if (p === this.room!.localParticipant) return this.inVoice;
     return !!p.getTrackPublication(Track.Source.Microphone);
   }
+  // голосовой канал участника: для себя — currentVc, для пира — participant-атрибут vc
+  private voiceChannelOf(username: string): string | null {
+    if (username === this.me.username) return this.currentVc;
+    const p = this.partOf(username);
+    const vc = (p as any)?.attributes?.vc;
+    return vc || null;
+  }
+  // подписка на микрофон пира только когда я в голосовом и мы в ОДНОМ канале (изоляция звука по каналам)
+  private reconcilePeerAudio(p: Participant) {
+    if (!this.room || p === this.room.localParticipant) return;
+    const mp = p.getTrackPublication(Track.Source.Microphone);
+    if (!mp) return;
+    const want = this.inVoice && !!this.currentVc && (p as any).attributes?.vc === this.currentVc;
+    try { (mp as any).setSubscribed(want); } catch { /**/ }
+    if (!want) this.detachAnalyser(p.identity);
+  }
+  private reconcileAllAudio() { this.room?.remoteParticipants.forEach((p) => this.reconcilePeerAudio(p)); }
   private isStreaming(username: string): boolean {
     if (username === this.me.username) return this.liveKitT.isBroadcasting(username) || this.treeT.isBroadcasting(username);
     return this.liveKitT.isRemoteBroadcasting(username) || this.treeT.isRemoteBroadcasting(username);
@@ -286,23 +323,43 @@ export class Engine {
   private localMicMuted(): boolean { return this.manualMute; }
   private micPub() { return this.room && this.room.localParticipant.getTrackPublication(Track.Source.Microphone); }
 
-  /* ---------- VOICE join/leave ---------- */
-  async joinVoice() {
-    if (!this.room || this.inVoice) return;
+  /* ---------- VOICE join/leave/switch (несколько каналов на сервер) ---------- */
+  // подключиться к голосовому каналу channelId; если уже в другом — переключиться без переподнятия микрофона
+  async joinVoice(channelId: string) {
+    if (!this.room || !channelId) return;
+    if (this.inVoice) { if (this.currentVc !== channelId) await this.switchVoice(channelId); return; }
+    this.currentVc = channelId;
     this.inVoice = true; this.manualMute = false; this.pttDown = false;
+    try { await this.room.localParticipant.setAttributes({ vc: channelId }); } catch { /**/ }
     try { await this.startMic(); }
-    catch { this.inVoice = false; this.hooks.toast('Нет доступа к микрофону', 'err'); this.emit(); return; }
-    this.room.remoteParticipants.forEach((p) => { const mp = p.getTrackPublication(Track.Source.Microphone); if (mp) { try { (mp as any).setSubscribed(true); } catch { /**/ } } });
+    catch {
+      this.inVoice = false; this.currentVc = null;
+      try { await this.room.localParticipant.setAttributes({ vc: '' }); } catch { /**/ }
+      this.hooks.toast('Нет доступа к микрофону', 'err'); this.emit(); return;
+    }
+    this.reconcileAllAudio(); // подписываемся только на пиров этого же канала
     this.startConnPoll();
+    this.emit();
+  }
+  // перейти в другой голосовой канал того же сервера: микрофон остаётся, меняются подписки и стримы
+  async switchVoice(channelId: string) {
+    if (!this.room || !this.inVoice || this.currentVc === channelId) return;
+    [...this.watching].forEach((id) => this.closeWatch(id)); // стримы привязаны к каналу — уходим из них
+    this.currentVc = channelId;
+    try { await this.room.localParticipant.setAttributes({ vc: channelId }); } catch { /**/ }
+    this.reconcileAllAudio();
+    playSound('join');
     this.emit();
   }
   async leaveVoice() {
     if (!this.room || !this.inVoice) return;
     this.stopConnPoll();
     await this.stopShare().catch(() => {});
+    [...this.watching].forEach((id) => this.closeWatch(id));
     this.stopMic();
     this.room.remoteParticipants.forEach((p) => { const rp = p.getTrackPublication(Track.Source.Microphone); if (rp) { try { (rp as any).setSubscribed(false); } catch { /**/ } } this.detachAnalyser(p.identity); });
-    this.inVoice = false; this.deafened = false; this.manualMute = false; this.pttDown = false;
+    try { await this.room.localParticipant.setAttributes({ vc: '' }); } catch { /**/ }
+    this.inVoice = false; this.currentVc = null; this.deafened = false; this.manualMute = false; this.pttDown = false;
     this.screenAudioEls.forEach((a) => (a.muted = false));
     this.emit();
   }
@@ -518,8 +575,15 @@ export class Engine {
   };
 
   /* ---------- track events (mic/chat only — video-domain events live in VideoTransport) ---------- */
-  private onRemotePub = (pub: TrackPublication, _p: RemoteParticipant, silent?: boolean) => {
-    if (pub.source === Track.Source.Microphone) { if (this.inVoice) { try { (pub as any).setSubscribed(true); } catch { /**/ } if (!silent) playSound('join'); } this.emit(); }
+  private onRemotePub = (pub: TrackPublication, p: RemoteParticipant, silent?: boolean) => {
+    if (pub.source === Track.Source.Microphone) {
+      // подписываемся на микрофон только если я в голосовом и пир в ТОМ ЖЕ канале
+      if (this.inVoice && !!this.currentVc && (p as any).attributes?.vc === this.currentVc) {
+        try { (pub as any).setSubscribed(true); } catch { /**/ }
+        if (!silent) playSound('join');
+      }
+      this.emit();
+    }
   };
   private onRemoteUnpub = (pub: TrackPublication, p: RemoteParticipant) => {
     if (pub.source === Track.Source.Microphone && this.inVoice) playSound('leave'); // вышел из голосового

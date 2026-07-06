@@ -47,6 +47,9 @@ interface AppState {
   refreshServers: () => Promise<void>;
   refreshMembers: () => Promise<void>;
   refreshServer: () => Promise<void>;
+  createChannel: (name: string) => Promise<void>;
+  renameChannel: (cid: string, name: string) => Promise<void>;
+  deleteChannel: (cid: string) => Promise<void>;
   setMe: (u: User) => void;
   setEmoteSize: (s: 'sm' | 'md' | 'lg') => void;
 }
@@ -61,7 +64,8 @@ function startMemberPoll(id: string) {
     if (st.view !== 'server' || st.connectedServerId !== id) return;
     try {
       const [srv, prs] = await Promise.all([api.getServer(id), api.presence(id)]);
-      useStore.setState({ members: srv.members });
+      const cur = useStore.getState().active;
+      useStore.setState({ members: srv.members, active: cur && cur.id === id ? { ...cur, channels: srv.server.channels } : cur });
       engine?.setMembers(srv.members); engine?.setOnlineHint(prs.online);
     } catch { /**/ }
   };
@@ -113,6 +117,22 @@ export const useStore = create<AppState>((set, get) => ({
   refreshServers: async () => { try { const d = await api.me(); set({ servers: d.servers }); } catch { /**/ } },
   refreshMembers: async () => { const a = get().active; if (!a) return; try { const d = await api.getServer(a.id); set({ members: d.members }); engine?.setMembers(d.members); } catch { /**/ } },
   refreshServer: async () => { const a = get().active; if (!a) return; try { const d = await api.getServer(a.id); set({ members: d.members, active: { ...d.server, myRole: d.myRole, myPerms: d.myPerms } }); engine?.setMembers(d.members); } catch { /**/ } },
+
+  createChannel: async (name) => {
+    const a = get().active; if (!a) return;
+    const d = await api.createChannel(a.id, name); // ошибка (лимит/права) пробрасывается — форма покажет
+    const cur = get().active; if (cur && cur.id === a.id) set({ active: { ...cur, channels: d.channels } });
+  },
+  renameChannel: async (cid, name) => {
+    const a = get().active; if (!a) return;
+    try { const d = await api.renameChannel(a.id, cid, name); const cur = get().active; if (cur && cur.id === a.id) set({ active: { ...cur, channels: d.channels } }); }
+    catch (e: any) { get().toast(e.message, 'err'); }
+  },
+  deleteChannel: async (cid) => {
+    const a = get().active; if (!a) return;
+    try { const d = await api.deleteChannel(a.id, cid); const cur = get().active; if (cur && cur.id === a.id) set({ active: { ...cur, channels: d.channels } }); }
+    catch (e: any) { get().toast(e.message, 'err'); }
+  },
 
   logout: () => { engine?.disconnect(); setToken(null); location.reload(); },
 
