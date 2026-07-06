@@ -116,6 +116,15 @@
   .railbtn:hover{border-radius:16px;background:var(--accent)}
   .railbtn.active{border-radius:16px}
   .railbtn.active::before{content:'';position:absolute;left:-12px;top:50%;transform:translateY(-50%);width:4px;height:34px;background:#fff;border-radius:0 4px 4px 0}
+  /* подключён к серверу, но сейчас не смотрим его (напр. на главной) — короткий акцентный пилл */
+  .railbtn.connected{border-radius:16px}
+  .railbtn.connected::before{content:'';position:absolute;left:-12px;top:50%;transform:translateY(-50%);width:4px;height:18px;background:var(--accent);border-radius:0 4px 4px 0}
+  /* строка «сервер → сервер» в модалке переключения */
+  .switch-srv-row{display:flex;align-items:center;justify-content:center;gap:14px;margin:8px 0 18px}
+  .switch-srv-row>.ic{color:var(--muted);font-size:22px;transform:rotate(-90deg);flex:0 0 auto}
+  .ssr-card{display:flex;flex-direction:column;align-items:center;gap:7px;min-width:0}
+  .ssr-ic{width:46px;height:46px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff;font-size:18px;overflow:hidden;flex:0 0 auto}
+  .ssr-card span{font-size:12.5px;color:var(--txt);max-width:104px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .railbtn .ic{font-size:22px}
   .rail-add{background:var(--panel2);color:var(--green)}
   .rail-add:hover{background:var(--green);color:#fff;border-radius:16px}
@@ -254,24 +263,27 @@
   #msgs{flex:1;overflow-y:auto;overflow-x:hidden;display:flex;flex-direction:column}
   .msgs-inner{margin-top:auto;display:flex;flex-direction:column;gap:11px;padding:14px}
   /* виртуальный список чата (react-virtuoso): скроллер занимает всё место; отступы/зазор — на строках */
-  .virt-msgs{flex:1;min-height:0}
-  .virt-row{padding:0 14px 11px;position:relative}
+  .virt-msgs{flex:1;min-height:0;overflow-x:hidden}
+  .virt-row{padding:11px 14px 0;position:relative}
+  .virt-row.cont{padding-top:2px}          /* продолжение группы того же автора — плотнее */
   .virt-row .msg{animation:none}          /* иначе msgIn проигрывается на каждом въезде строки в вьюпорт */
   /* ---- reply (ответы на сообщения) ---- */
-  .msg-reply-btn{position:absolute;top:-6px;right:16px;width:30px;height:30px;padding:0;display:flex;align-items:center;justify-content:center;background:var(--panel3);color:var(--muted);border:1px solid var(--line-2);border-radius:8px;box-shadow:var(--sh-1);opacity:0;transform:translateY(2px);transition:opacity .12s,transform .12s,color .12s,background .12s;z-index:2}
-  .msg-reply-btn .ic{font-size:17px}
-  .virt-row:hover .msg-reply-btn{opacity:1;transform:translateY(0)}
+  .msg-reply-btn{flex:0 0 auto;align-self:center;width:28px;height:28px;padding:0;display:flex;align-items:center;justify-content:center;background:var(--panel3);color:var(--muted);border:1px solid var(--line-2);border-radius:8px;opacity:0;transition:opacity .12s,color .12s,background .12s}
+  .msg-reply-btn .ic{font-size:16px}
+  .virt-row:hover .msg-reply-btn{opacity:1}
   .msg-reply-btn:hover{background:var(--panel4);color:var(--accent-txt)}
   .reply-quote{display:flex;align-items:center;gap:5px;max-width:100%;margin:0 0 3px 2px;padding:0;background:none;color:var(--muted);font-size:12.5px;line-height:1.3;position:relative;text-align:left}
   .reply-quote::before{content:'';position:absolute;left:-2px;top:8px;width:12px;height:9px;border-left:2px solid var(--line-2);border-top:2px solid var(--line-2);border-top-left-radius:6px}
   .reply-quote{padding-left:16px}
   .reply-quote .ic{font-size:14px;color:var(--muted);flex:0 0 auto;transform:scaleX(-1)}
   .reply-quote .rq-author{font-weight:600;flex:0 0 auto;white-space:nowrap}
-  .reply-quote .rq-text{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.85}
+  .reply-quote .rq-text{color:var(--muted);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.85}
   .reply-quote.jumpable{cursor:pointer}
   .reply-quote.jumpable:hover .rq-text{opacity:1;color:var(--txt)}
-  .msg.flash{animation:msgFlash 1.3s ease-out}
-  @keyframes msgFlash{0%,60%{background:color-mix(in srgb,var(--accent) 20%,transparent)}100%{background:transparent}}
+  .msg.me .reply-quote{align-self:flex-end;flex-direction:row-reverse;padding:0 16px 3px 0}
+  .msg.me .reply-quote::before{display:none}
+  .msg.flash .tx{animation:msgFlash 1.3s ease-out}
+  @keyframes msgFlash{0%,55%{box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 45%,transparent)}100%{box-shadow:0 0 0 3px transparent}}
   .reply-bar{display:flex;align-items:center;gap:8px;margin:0 12px;padding:7px 12px;background:var(--panel2);border:1px solid var(--line-2);border-bottom:none;border-radius:10px 10px 0 0;font-size:13px;color:var(--muted);animation:sbIn .16s ease-out}
   .reply-bar>.ic{font-size:16px;color:var(--muted);flex:0 0 auto;transform:scaleX(-1)}
   .reply-bar .rb-to{flex:0 0 auto;white-space:nowrap}
@@ -304,17 +316,25 @@
   .srv-sk .sk-composer .sk-line{height:42px;border-radius:8px}
   .vc-sk-row{display:flex;align-items:center;gap:8px;padding:6px 4px}
   .vc-sk-row .sk-av{width:26px;height:26px}
-  .msg{animation:msgIn .14s ease-out}
+  .msg{animation:msgIn .14s ease-out;display:flex;align-items:flex-start;gap:10px;max-width:100%}
+  .msg.me{flex-direction:row-reverse}                 /* свои: тело справа, без аватара */
+  .msg-av{flex:0 0 auto;width:36px}                   /* колонка аватара; пустая у продолжений — отступ сохраняется */
+  .msg-body{display:flex;flex-direction:column;min-width:0;max-width:calc(100% - 46px)}
+  .msg.me .msg-body,.msg.sys .msg-body{max-width:100%}
+  .msg.me .msg-body{align-items:flex-end}
+  .msg-main{display:flex;align-items:center;gap:6px;max-width:100%}
+  .msg.me .msg-main{flex-direction:row-reverse}
+  .msg-content{display:flex;flex-direction:column;gap:4px;min-width:0;max-width:100%}
+  .msg.me .msg-content{align-items:flex-end}
   .msg .who{font-size:13px;font-weight:600;color:var(--accent-txt);margin-bottom:3px}
-  .msg .tx{font-size:14px;background:var(--panel2);padding:8px 12px;border-radius:4px 12px 12px 12px;display:inline-block;max-width:100%;word-break:break-word;line-height:1.45}
-  .msg.me{background:rgba(88,101,242,.09);border-left:3px solid var(--accent);border-radius:0 8px 8px 0;padding:5px 8px 5px 9px;margin:0 -4px}
-  .msg.me .who{color:var(--accent-txt)}
+  .msg.me .who{text-align:right}
   .msg.me .who::after{content:' · ты';color:var(--muted);font-weight:400;font-size:11px}
   .msg .who .mtime{margin-left:7px;font-size:11px;font-weight:400;color:var(--muted)}
+  .msg .tx{font-size:14px;background:var(--panel2);padding:8px 12px;border-radius:4px 12px 12px 12px;display:inline-block;max-width:100%;word-break:break-word;line-height:1.45}
+  .msg.me .tx{background:rgba(88,101,242,.16);border-radius:12px 4px 12px 12px}
   .msg .tx a.msg-link{color:var(--accent-txt);text-decoration:underline;text-underline-offset:2px;word-break:break-all}
   .msg .tx a.msg-link:hover{opacity:.85}
-  .msg.me .tx{background:rgba(88,101,242,.16)}
-  .msg.sys{opacity:.9}
+  .msg.sys{opacity:.9;gap:0}
   .msg.sys .tx{background:transparent;color:var(--muted);font-size:12px;font-style:italic;letter-spacing:.2px;padding:1px 0;border-radius:0;display:flex;align-items:center;gap:8px}
   .msg.sys .tx::before{content:'';flex:0 0 auto;width:5px;height:5px;border-radius:50%;background:var(--muted);opacity:.55}
   .msg .tx img.emo{height:26px;vertical-align:-7px;margin:-2px 1px}
@@ -490,7 +510,8 @@
 
   /* ---- упоминания (@ник) ---- */
   .mention-tag{background:color-mix(in srgb,var(--accent) 22%,transparent);color:var(--accent-txt);border-radius:5px;padding:0 3px;font-weight:600}
-  .msg.mentioned{background:color-mix(in srgb,var(--accent) 12%,transparent);border-left:3px solid var(--accent);border-radius:0 8px 8px 0;padding:5px 8px 5px 9px;margin:0 -4px}
+  .msg.mentioned .tx{background:color-mix(in srgb,var(--accent) 22%,var(--panel2));box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 45%,transparent)}
+  .msg.mentioned.me .tx{background:color-mix(in srgb,var(--accent) 30%,transparent)}
   .msg.mentioned .who{color:var(--accent-txt)}
 
   /* ---- роли в списке участников ---- */

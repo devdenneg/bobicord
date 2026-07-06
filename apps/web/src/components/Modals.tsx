@@ -19,7 +19,7 @@ function CreateModal() {
   async function create() {
     if (name.trim().length < 2) { setErr('Название минимум 2 символа'); return; }
     setBusy(true);
-    try { const d = await api.createServer(name.trim()); close(); await useStore.getState().loadMe(); await useStore.getState().openServer(d.server.id); useStore.getState().toast('Сервер создан', 'ok'); }
+    try { const d = await api.createServer(name.trim()); close(); await useStore.getState().loadMe(); await useStore.getState().connectServer(d.server.id); useStore.getState().toast('Сервер создан', 'ok'); }
     catch (e: any) { setErr(e.message); } finally { setBusy(false); }
   }
   return <Backdrop onClose={close} label="Создать сервер">
@@ -44,7 +44,7 @@ function JoinModal() {
   async function join() {
     const cc = extractCode(code); if (!cc) { setErr('Введи код'); return; }
     setBusy(true); setErr('');
-    try { const d = await api.joinInvite(cc); close(); await useStore.getState().loadMe(); await useStore.getState().openServer(d.server.id); useStore.getState().toast('Ты на сервере «' + d.server.name + '»', 'ok'); }
+    try { const d = await api.joinInvite(cc); close(); await useStore.getState().loadMe(); await useStore.getState().connectServer(d.server.id); useStore.getState().toast('Ты на сервере «' + d.server.name + '»', 'ok'); }
     catch (e: any) { setErr(e.message); } finally { setBusy(false); }
   }
   return <Backdrop onClose={close} label="Присоединиться">
@@ -130,7 +130,7 @@ function ServerMenuModal() {
   const [err, setErr] = useState('');
   const owner = active.myRole === 'owner';
   const canManage = owner || hasPerm(active.myPerms || 0, PERM.MANAGE_SERVER) || hasPerm(active.myPerms || 0, PERM.MANAGE_ROLES);
-  async function leave() { try { if (owner) await api.deleteServer(active.id); else await api.leaveServer(active.id); close(); useStore.getState().toast('Готово', 'ok'); useStore.getState().goHome(); } catch (e: any) { setErr(e.message); } }
+  async function leave() { try { if (owner) await api.deleteServer(active.id); else await api.leaveServer(active.id); close(); useStore.getState().toast('Готово', 'ok'); useStore.getState().exitServer(); } catch (e: any) { setErr(e.message); } }
   return <Backdrop onClose={close} label="Сервер">
     <div className="srv-menu-head">
       <div className="sm-ic" style={{ background: active.iconUrl ? '#0000' : avColor(active.name, active.iconColor) }}>{active.iconUrl ? <img className="avimg" src={resolveUploadUrl(active.iconUrl)} alt="" /> : initial(active.name)}</div>
@@ -336,6 +336,27 @@ function SettingsModal() {
   </Backdrop>;
 }
 
+// Предупреждение при переходе на ДРУГОЙ сервер, пока подключён к текущему.
+function SwitchServerModal() {
+  const servers = useStore((s) => s.servers);
+  const fromId = useStore((s) => s.connectedServerId);
+  const targetId = useStore((s) => s.pendingSwitchId);
+  const from = servers.find((x) => x.id === fromId);
+  const target = servers.find((x) => x.id === targetId);
+  const cancel = () => useStore.setState({ modal: null, pendingSwitchId: null });
+  const confirm = () => useStore.getState().confirmSwitchServer();
+  return <Backdrop onClose={cancel} label="Переключение сервера">
+    <h2><Icon name="leave" />Перейти на другой сервер?</h2>
+    <p className="msub">Ты сейчас подключён к «<b style={{ color: 'var(--txt-h)' }}>{from?.name}</b>». Переход{target ? <> на «<b style={{ color: 'var(--txt-h)' }}>{target.name}</b>»</> : null} отключит тебя от текущего сервера — голос, трансляции и realtime-чат прервутся.</p>
+    <div className="switch-srv-row">
+      <div className="ssr-card"><div className="ssr-ic" style={{ background: from ? avColor(from.name, from.iconColor) : 'var(--panel3)' }}>{from ? initial(from.name) : '—'}</div><span>{from?.name || '—'}</span></div>
+      <Icon name="chevron" />
+      <div className="ssr-card"><div className="ssr-ic" style={{ background: target ? avColor(target.name, target.iconColor) : 'var(--panel3)' }}>{target ? initial(target.name) : '—'}</div><span>{target?.name || '—'}</span></div>
+    </div>
+    <div className="rowbtns"><button className="ghost" style={{ margin: 0 }} onClick={cancel}>Остаться</button><button className="primary" style={{ margin: 0 }} onClick={confirm}>Перейти</button></div>
+  </Backdrop>;
+}
+
 export function Modals() {
   const modal = useStore((s) => s.modal);
   switch (modal) {
@@ -347,6 +368,7 @@ export function Modals() {
     case 'srvsettings': return <ServerSettingsModal />;
     case 'settings': return <SettingsModal />;
     case 'broadcast': return <BroadcastModal />;
+    case 'switchServer': return <SwitchServerModal />;
     default: return null;
   }
 }

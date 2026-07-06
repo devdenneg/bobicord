@@ -14,18 +14,22 @@ import type { ServerSummary } from './types';
 function Rail() {
   const servers = useStore((s) => s.servers);
   const active = useStore((s) => s.active);
+  const view = useStore((s) => s.view);
   const loadingServerId = useStore((s) => s.loadingServerId);
+  const connectedServerId = useStore((s) => s.connectedServerId);
   const me = useStore((s) => s.me)!;
   const openServer = useStore((s) => s.openServer);
   const goHome = useStore((s) => s.goHome);
   const setModal = useStore((s) => s.setModal);
-  const activeId = active?.id || loadingServerId;
+  // подсвечиваем сервер только когда реально смотрим его (на главной — home активна)
+  const activeId = view === 'server' ? (active?.id || loadingServerId) : null;
   return (
     <nav id="rail">
       <button className={'railbtn tip-l' + (!activeId ? ' active' : '')} data-tip="Домой" onClick={goHome}><Icon name="home" /></button>
       <div className="rail-sep" />
       {servers.map((s) => (
-        <button key={s.id} className={'railbtn tip-l' + (activeId === s.id ? ' active' : '')} data-tip={s.name}
+        <button key={s.id} className={'railbtn tip-l' + (activeId === s.id ? ' active' : '') + (connectedServerId === s.id && activeId !== s.id ? ' connected' : '')}
+          data-tip={connectedServerId === s.id && activeId !== s.id ? s.name + ' · подключён' : s.name}
           style={{ background: s.iconUrl ? '#0000' : avColor(s.name, s.iconColor) }} onClick={() => openServer(s.id)}>
           {s.iconUrl ? <img className="avimg" src={resolveUploadUrl(s.iconUrl)} alt="" /> : initial(s.name)}{s.onlineCount ? <span className="dot green" /> : null}
         </button>

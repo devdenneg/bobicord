@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { useStore, getEngine } from '../store';
@@ -399,6 +399,18 @@ function ChatOlderHeader({ context }: { context?: { busy?: boolean; hasMore?: bo
 }
 function ChatFooter() { return <div style={{ height: 12 }} />; }
 
+// Группировка подряд идущих сообщений одного автора (как в Telegram): шапка (имя/время) —
+// только у первого сообщения группы. Группу разрывают: смена автора, системное сообщение,
+// ответ (reply) и пауза > 5 минут.
+const GROUP_GAP_MS = 5 * 60 * 1000;
+function isGroupStart(m: ChatMessage, prev?: ChatMessage): boolean {
+  if (m.sys || !prev || prev.sys) return true;
+  if (prev.who !== m.who || prev.mine !== m.mine) return true;
+  if (m.reply) return true;
+  if (m.ts && prev.ts && m.ts - prev.ts > GROUP_GAP_MS) return true;
+  return false;
+}
+
 function Chat() {
   const eng = useEngine();
   const E = getEngine()!;
@@ -602,9 +614,22 @@ function Chat() {
   const mentionNames = (() => { const s = new Set<string>(); for (const mm of members) { s.add(mm.username.toLowerCase()); s.add(mm.displayName.toLowerCase()); } ['все', 'all', 'everyone'].forEach((w) => s.add(w)); return s; })();
   const byName = new Map(members.map((mm) => [mm.displayName, mm] as const));
 
-  // рендер одного сообщения (используется как itemContent virtuoso). Обёртка .virt-row даёт
-  // горизонтальные отступы и межстрочный зазор — раньше это делал .msgs-inner{gap;padding}.
+  // начало группы (Telegram-style): шапка/аватар только у первого сообщения серии одного автора.
+  // Группа ограничена 10 сообщениями — после этого начинается заново даже у того же автора.
+  const groupStart = useMemo(() => {
+    const map = new Map<number, boolean>();
+    let count = 0;
+    for (let i = 0; i < messages.length; i++) {
+      const start = isGroupStart(messages[i], messages[i - 1]) || count >= 10;
+      map.set(messages[i].id, start);
+      count = start ? 1 : count + 1;
+    }
+    return map;
+  }, [messages]);
+
+  // рендер одного сообщения (itemContent virtuoso). Чужие — слева с аватаром, свои — справа без.
   const renderMessage = (m: typeof messages[number]) => {
+    const cont = groupStart.get(m.id) === false; // продолжение группы того же автора
     const parts = m.sys ? null : renderRich(m.text, mentionNames);
     const emoCount = parts ? parts.filter((p) => typeof p === 'object' && 'emo' in p).length : 0;
     const hasLink = parts ? parts.some((p) => typeof p === 'object' && 'link' in p) : false;
@@ -628,17 +653,24 @@ function Chat() {
       );
     }
     return (
-      <div className="virt-row">
-        {!m.sys ? <button className="msg-reply-btn" data-tip="Ответить" onMouseDown={(e) => e.preventDefault()} onClick={() => startReply(m)}><Icon name="reply" sm /></button> : null}
+      <div className={'virt-row' + (cont ? ' cont' : '')}>
         <div className={'msg' + (m.sys ? ' sys' : '') + (m.mine ? ' me' : '') + (m.mention ? ' mentioned' : '') + (m.id === flashId ? ' flash' : '')}>
-          {replyQuote}
-          {!m.sys ? <div className="who" style={{ color: nameColor }}>{m.who}{aRoles.length ? <span className="who-roles">{aRoles.map((r) => <span key={r.id} className="who-role" style={{ background: (r.color || 'var(--panel3)') + '22', color: r.color || 'var(--muted)', borderColor: (r.color || 'var(--line-2)') + '55' }}>{r.name}</span>)}</span> : null}{m.ts ? <span className="mtime">{fmtTime(m.ts)}</span> : null}</div> : null}
-          {m.sys || m.text ? (
-            <div className={'tx' + (big ? ' big' : '')}>
-              {m.sys ? m.text : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : 'link' in p ? <a key={i} className="msg-link" href={p.link} target="_blank" rel="noreferrer">{p.link}</a> : 'mention' in p ? <span key={i} className="mention-tag">{p.mention}</span> : <img key={i} className="emo" src={emoteUrl(p.emo)} alt={p.name} title={p.name} loading="lazy" decoding="async" />))}
+          {!m.sys && !m.mine ? <div className="msg-av">{!cont ? <Avatar name={m.who || ''} ci={m.color ?? 0} url={author?.avatarUrl} size={36} /> : null}</div> : null}
+          <div className="msg-body">
+            {replyQuote}
+            {!m.sys && !cont ? <div className="who" style={{ color: nameColor }}>{m.who}{aRoles.length ? <span className="who-roles">{aRoles.map((r) => <span key={r.id} className="who-role" style={{ background: (r.color || 'var(--panel3)') + '22', color: r.color || 'var(--muted)', borderColor: (r.color || 'var(--line-2)') + '55' }}>{r.name}</span>)}</span> : null}{m.ts ? <span className="mtime">{fmtTime(m.ts)}</span> : null}</div> : null}
+            <div className="msg-main">
+              <div className="msg-content">
+                {m.sys || m.text ? (
+                  <div className={'tx' + (big ? ' big' : '')}>
+                    {m.sys ? m.text : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : 'link' in p ? <a key={i} className="msg-link" href={p.link} target="_blank" rel="noreferrer">{p.link}</a> : 'mention' in p ? <span key={i} className="mention-tag">{p.mention}</span> : <img key={i} className="emo" src={emoteUrl(p.emo)} alt={p.name} title={p.name} loading="lazy" decoding="async" />))}
+                  </div>
+                ) : null}
+                {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox(m.img!)}><img className="msg-img" src={resolveUploadUrl(m.img)} alt="" loading="lazy" /></button> : null}
+              </div>
+              {!m.sys ? <button className="msg-reply-btn" data-tip="Ответить" onMouseDown={(e) => e.preventDefault()} onClick={() => startReply(m)}><Icon name="reply" sm /></button> : null}
             </div>
-          ) : null}
-          {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox(m.img!)}><img className="msg-img" src={resolveUploadUrl(m.img)} alt="" loading="lazy" /></button> : null}
+          </div>
         </div>
       </div>
     );
