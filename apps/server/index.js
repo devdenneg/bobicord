@@ -34,8 +34,11 @@ const TURN_URLS = (process.env.TURN_URLS || '').split(',').map((s) => s.trim()).
 const TURN_TTL_SEC = parseInt(process.env.TURN_TTL_SEC || '600', 10);
 const DATA_DIR = '/app/data';
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
+// сюда CI (build-windows.yml) заливает установщик натива + latest.json (updater-манифест)
+const RELEASES_DIR = path.join(DATA_DIR, 'releases');
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
 try { fs.mkdirSync(UPLOADS_DIR, { recursive: true }); } catch (e) {}
+try { fs.mkdirSync(RELEASES_DIR, { recursive: true }); } catch (e) {}
 
 /* ---------------- DB ---------------- */
 const db = new Database(path.join(DATA_DIR, 'voice.db'));
@@ -486,6 +489,16 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
 });
 
 app.get('/healthz', (req, res) => res.send('ok'));
+
+/* ---------- РЕЛИЗЫ НАТИВА: updater-манифест + установщик (публично, без auth) ----------
+ * CI (build-windows.yml) заливает *-setup.exe + latest.json в RELEASES_DIR.
+ * latest.json — updater-эндпоинт для Tauri (plugins.updater.endpoints); сам exe качают
+ * и updater'ом, и с лендинга в вебе. /api/app/latest — то же, но для UI (может дать 404). */
+app.get('/api/app/latest', (req, res) => {
+  try { res.json(JSON.parse(fs.readFileSync(path.join(RELEASES_DIR, 'latest.json'), 'utf8'))); }
+  catch (e) { res.status(404).json({ error: 'билд ещё не собран' }); }
+});
+app.use('/api/app', express.static(RELEASES_DIR, { index: false, setHeaders: (r) => r.setHeader('X-Content-Type-Options', 'nosniff') }));
 
 /* ---------- Э2 dev-only harness: browser test-publisher for the relay tree ----------
  * NOT part of prod (Dockerfile only COPYs index.js+tree.js, this file isn't in the image;

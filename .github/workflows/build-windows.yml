@@ -29,13 +29,60 @@ jobs:
       - name: Install native (tauri CLI) deps
         run: npm ci --prefix apps/native
 
-      # Собирает фронт (beforeBuildCommand в tauri.conf.json) и упаковывает
-      # MSI+NSIS (bundle.targets: "all") — не подписано (нет сертификата,
-      # SmartScreen будет ругаться на "неизвестного издателя" — ок для теста).
+      # Версия натива = 0.1.<кол-во коммитов> — монотонно растёт с каждым пушем в main,
+      # чтобы Tauri updater видел релиз новее установленного (build-metadata semver
+      # игнорирует, поэтому не +sha, а настоящий инкремент patch).
+      - name: Compute version
+        id: ver
+        shell: bash
+        run: echo "v=0.1.$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Patch version in tauri.conf.json
+        shell: bash
+        run: |
+          f=apps/native/src-tauri/tauri.conf.json
+          tmp=$(mktemp); jq --arg v "${{ steps.ver.outputs.v }}" '.version=$v' "$f" > "$tmp" && mv "$tmp" "$f"
+
+      # Собирает фронт (beforeBuildCommand в tauri.conf.json) и упаковывает MSI+NSIS
+      # (bundle.targets: "all") + updater-артефакты (createUpdaterArtifacts: true →
+      # *-setup.exe + *-setup.exe.sig, подписанные minisign-ключом из секретов).
+      # Code-signing-сертификата нет — SmartScreen ругнётся на "неизвестного издателя" (ок для теста).
       - name: Build Tauri app
         run: npm run build --prefix apps/native
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      # Собираем payload для VPS: сам установщик + latest.json (Tauri v2 dynamic-манифест,
+      # его читает updater-эндпоинт plugins.updater.endpoints). signature = содержимое .sig.
+      - name: Assemble release payload
+        shell: bash
+        run: |
+          set -e
+          v=${{ steps.ver.outputs.v }}
+          nsis=apps/native/src-tauri/target/release/bundle/nsis
+          exe=$(ls "$nsis"/*-setup.exe)
+          sig=$(cat "$nsis"/*-setup.exe.sig)
+          mkdir -p out && cp "$exe" out/
+          cat > out/latest.json <<EOF
+          { "version": "$v", "notes": "Автосборка main",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": { "windows-x86_64": { "signature": "$sig", "url": "https://138-16-170-21.sslip.io/api/app/$(basename "$exe")" } } }
+          EOF
+
+      # Заливаем на VPS в том, смонтированный в server (/app/data/releases). rm:true чистит
+      # старые exe — клиент всегда берёт url из свежего latest.json. SSH-секреты — как в deploy.yml.
+      - name: Upload to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          source: "out/*"
+          target: /opt/voice/data/releases
+          strip_components: 1
+          rm: true
 
       - uses: actions/upload-artifact@v4
         with:

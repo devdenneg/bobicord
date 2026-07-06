@@ -30,6 +30,7 @@ import KeyboardArrowDownRounded from '@mui/icons-material/KeyboardArrowDownRound
 import VolumeOffRounded from '@mui/icons-material/VolumeOffRounded';
 import CloseRounded from '@mui/icons-material/CloseRounded';
 import PaletteRounded from '@mui/icons-material/PaletteRounded';
+import DownloadRounded from '@mui/icons-material/DownloadRounded';
 
 const MAP: Record<string, SvgIconComponent> = {
   mic: MicRounded, 'mic-sm': MicRounded, 'mic-off': MicOffRounded,
@@ -44,7 +45,7 @@ const MAP: Record<string, SvgIconComponent> = {
   chevron: KeyboardArrowDownRounded, 'volume-off': VolumeOffRounded, close: CloseRounded,
   'eye-off': VisibilityOffRounded, refresh: RefreshRounded,
   fullscreen: FullscreenRounded, pip: PictureInPictureAltRounded,
-  palette: PaletteRounded,
+  palette: PaletteRounded, download: DownloadRounded,
 };
 
 export function Icon({ name, sm }: { name: string; sm?: boolean }) {

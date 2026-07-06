@@ -1,9 +1,14 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api, setToken } from '../api';
 import { useStore } from '../store';
 import { Icon } from '../Icon';
+import { isTauri } from '../native';
 
 export function Auth() {
+  // ссылка на свежий билд натива (только в браузере; в самом приложении не показываем)
+  const [appDl, setAppDl] = useState<{ version: string; url: string } | null>(null);
+  useEffect(() => { if (!isTauri) api.appLatest().then(setAppDl); }, []);
+
   const [mode, setMode] = useState<'login' | 'register'>('login');
   const [user, setUser] = useState('');
   const [pass, setPass] = useState('');
@@ -44,6 +49,11 @@ export function Auth() {
           {busy ? <span className="spin" /> : null}{mode === 'login' ? 'Войти' : 'Создать аккаунт'}
         </button>
         <div className="err" role="alert">{err}</div>
+        {appDl ? (
+          <a className="app-dl" href={appDl.url} download>
+            <Icon name="download" sm />Скачать приложение для Windows <span className="app-dl-ver">v{appDl.version}</span>
+          </a>
+        ) : null}
       </div>
     </div>
   );

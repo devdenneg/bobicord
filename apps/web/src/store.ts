@@ -18,6 +18,8 @@ interface AppState {
   loadingServer: boolean;
   loadingServerId: string | null;
   updateReady: boolean;
+  // доступное обновление НАТИВА (Tauri updater); obj — Update из @tauri-apps/plugin-updater
+  nativeUpdate: { version: string; obj: any } | null;
   emoteSize: 'sm' | 'md' | 'lg';
   toasts: Toast[];
   modal: null | 'create' | 'join' | 'profile' | 'srvmenu' | 'invite' | 'srvsettings' | 'settings' | 'broadcast';
@@ -46,7 +48,7 @@ let memberTimer: number | null = null;
 let toastSeq = 1;
 
 export const useStore = create<AppState>((set, get) => ({
-  view: 'loading', me: null, servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, updateReady: false, emoteSize: (localStorage.getItem('emoteSize') as 'sm' | 'md' | 'lg') || 'md', toasts: [], modal: null, joinPrefill: '', broadcastLive: false,
+  view: 'loading', me: null, servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, updateReady: false, nativeUpdate: null, emoteSize: (localStorage.getItem('emoteSize') as 'sm' | 'md' | 'lg') || 'md', toasts: [], modal: null, joinPrefill: '', broadcastLive: false,
 
   toast: (text, kind) => {
     const id = toastSeq++;
