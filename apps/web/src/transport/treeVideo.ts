@@ -84,6 +84,20 @@ function preferH264(pc: RTCPeerConnection) {
   });
 }
 
+// Может ли этот браузер ЭНКОДИТЬ H.264 (инвариант 4 — трек детям идёт в H.264). Relay-хоп
+// заставляет узел энкодить (serveChild=offerer+preferH264); часть Android-устройств (напр.
+// Huawei/Kirin) H.264 декодят (смотреть могут), но НЕ энкодят — как relay-родитель они дают
+// чёрный экран ребёнку. `RTCRtpSender.getCapabilities` перечисляет именно SEND-кодеки, поэтому
+// отсутствие H.264 тут = не можем быть relay-родителем. Неизвестно (нет API) → считаем что можем
+// (не переужесточать десктопы). Только decode (preferH264 через Receiver) для этого не годится.
+function canEncodeH264(): boolean {
+  try {
+    const caps = (window as any).RTCRtpSender?.getCapabilities?.('video');
+    if (!caps || !Array.isArray(caps.codecs)) return true; // не интроспектируется — не режем
+    return caps.codecs.some((c: any) => (c.mimeType || '').toLowerCase() === 'video/h264');
+  } catch { return true; }
+}
+
 export class TreeVideoTransport implements VideoTransport {
   private me = '';
   private serverId = '';
@@ -201,7 +215,11 @@ export class TreeVideoTransport implements VideoTransport {
       const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
       return urls.some((u) => /^turns?:/i.test(u || ''));
     });
-    st.maxChildren = isTauri ? 0 : (symmetricNat && !hasTurn ? 0 : BROWSER_RELAY_CAPACITY);
+    // Relay-родитель обязан энкодить H.264 (см. canEncodeH264): устройства, которые H.264 только
+    // декодят (Huawei/часть Android), остаются листом — смотреть могут, детей брать нет, иначе
+    // ребёнок получает чёрный экран (соединение встаёт, но энкодер не выдаёт кадры).
+    const cantRelay = isTauri || (symmetricNat && !hasTurn) || !canEncodeH264();
+    st.maxChildren = cantRelay ? 0 : BROWSER_RELAY_CAPACITY;
     try { st.ws.send(JSON.stringify({ t: 'join', streamId, role: 'viewer', native: false, maxChildren: st.maxChildren, identity: this.me, symmetricNat, serverId: this.serverId })); } catch { /**/ }
   }
   unwatch(streamId: string) {
