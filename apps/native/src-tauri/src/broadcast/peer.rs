@@ -17,6 +17,7 @@ use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit}
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType};
@@ -134,8 +135,20 @@ impl PeerManager {
         }));
 
         let child_for_state = child_id.clone();
+        let force_keyframe_for_state = self.force_keyframe.clone();
         pc.on_peer_connection_state_change(Box::new(move |s| {
             log::info!("peer {child_for_state}: state {s:?}");
+            // Форсим IDR здесь, а не сразу после offer: SRTP/DTLS этого конкретного
+            // ребёнка ещё не готовы в момент offer (это сотни мс вперёд) — общий
+            // видео-трек фанаутится всем детям сразу, и IDR, отправленный до готовности
+            // транспорта именно этого ребёнка, до него физически не долетает (сендер
+            // молча роняет пакеты для ещё не установленного соединения). Без периодического
+            // GOP на энкодере (полагаемся только на форс) ребёнок так и остаётся без
+            // единого декодируемого кадра — чёрный экран навсегда, пока не форсанёт кто-то
+            // другой. Ждём Connected — тогда транспорт точно жив.
+            if s == RTCPeerConnectionState::Connected {
+                force_keyframe_for_state.store(true, Ordering::Relaxed);
+            }
             Box::pin(async {})
         }));
 
@@ -150,8 +163,6 @@ impl PeerManager {
             Err(e) => { log::error!("peer: create_offer: {e}"); return; }
         }
 
-        // Новому ребёнку нужен свежий IDR с SPS/PPS — его декодер стартует с нуля.
-        self.force_keyframe.store(true, Ordering::Relaxed);
         self.children.insert(child_id, pc);
     }
 
