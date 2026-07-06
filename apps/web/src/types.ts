@@ -14,7 +14,6 @@ export const PERM_LIST: { key: keyof typeof PERM; label: string; hint: string }[
   { key: 'MANAGE_ROLES', label: 'Управление ролями', hint: 'Создавать роли и назначать их' },
   { key: 'MANAGE_MEMBERS', label: 'Выгонять участников', hint: 'Кикать с сервера' },
   { key: 'MANAGE_MESSAGES', label: 'Модерация чата', hint: 'Чистить чат, команды' },
-  { key: 'CREATE_INVITE', label: 'Приглашать', hint: 'Создавать ссылки-приглашения' },
 ];
 export const hasPerm = (perms: number, flag: number) => (perms & flag) === flag;
 

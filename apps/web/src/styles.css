@@ -461,16 +461,38 @@
   button.mini.danger{padding:5px 8px;color:var(--red)}button.mini.danger:hover{background:var(--red-fill);color:#fff}
   .role-color{width:44px;height:42px;flex:0 0 auto;padding:2px;border-radius:var(--r-sm);background:var(--panel2);border:1px solid var(--line-2);cursor:pointer}
   .perm-list{display:flex;flex-direction:column;gap:6px}
-  .perm-op{display:flex;align-items:flex-start;gap:10px;padding:8px 10px;background:var(--panel2);border:1.5px solid var(--line-2);border-radius:var(--r-sm);cursor:pointer;transition:border-color var(--tr)}
+  .perm-op{display:flex;align-items:center;gap:12px;padding:10px 12px;background:var(--panel2);border:1.5px solid var(--line-2);border-radius:var(--r-sm);cursor:pointer;transition:border-color var(--tr),background var(--tr)}
+  .perm-op:hover{background:var(--panel3)}
   .perm-op.on{border-color:var(--accent)}
-  .perm-op input{width:auto;flex:0 0 auto;margin-top:2px;accent-color:var(--accent)}
-  .perm-op span{display:flex;flex-direction:column;gap:1px}
+  .perm-op span{order:1;flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
   .perm-op b{font-size:13.5px;color:var(--txt)}.perm-op i{font-size:11.5px;color:var(--muted);font-style:normal}
-  .assign-list{display:flex;flex-direction:column;gap:8px;max-height:52vh;overflow-y:auto}
-  .assign-row{display:flex;flex-direction:column;gap:6px;padding:9px 10px;background:var(--panel2);border-radius:var(--r-sm)}
+  .perm-op input{order:2;appearance:none;-webkit-appearance:none;flex:0 0 auto;width:40px;height:23px;border-radius:9999px;background:var(--panel4);position:relative;margin:0;cursor:pointer;transition:background var(--tr)}
+  .perm-op input::after{content:'';position:absolute;top:2.5px;left:2.5px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.35);transition:transform var(--tr)}
+  .perm-op input:checked{background:var(--accent)}
+  .perm-op input:checked::after{transform:translateX(17px)}
+  .assign-list{display:flex;flex-direction:column;gap:6px;max-height:52vh;overflow-y:auto;margin:-2px -4px;padding:2px 4px}
+  .assign-row{display:flex;align-items:center;gap:11px;padding:8px 10px;background:var(--panel2);border-radius:var(--r-sm)}
+  .assign-av{width:34px;height:34px;flex:0 0 auto;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;color:#fff;overflow:hidden}
+  .assign-av .avimg{width:100%;height:100%;object-fit:cover}
+  .assign-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:5px}
   .assign-nm{display:flex;align-items:center;gap:6px;font-weight:600;font-size:14px}
   .assign-nm .rl{color:var(--yellow);font-size:11px}
   .assign-roles{display:flex;flex-wrap:wrap;gap:6px}
+
+  /* ---- роли рядом с ником в чате ---- */
+  .msg .who .who-roles{display:inline-flex;gap:5px;margin:0 7px;vertical-align:middle}
+  .who-role{font-size:9.5px;font-weight:700;line-height:1.6;padding:0 6px;border-radius:9999px;border:1px solid;letter-spacing:.2px;text-transform:none}
+
+  /* ---- автокомплит @упоминаний и /команд ---- */
+  .mention-pop{position:absolute;left:12px;right:12px;bottom:70px;z-index:40;background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-md);box-shadow:var(--sh-2),var(--hair);max-height:280px;overflow-y:auto;animation:popIn .12s ease-out}
+  .mention-pop .mpop-h{font-size:10.5px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--muted);padding:9px 12px 5px}
+  .mpop-row{display:flex;align-items:center;gap:10px;width:100%;padding:8px 12px;background:transparent;border-radius:0;color:var(--txt);text-align:left}
+  .mpop-row.sel,.mpop-row:hover{background:var(--panel3)}
+  .mpop-av{width:26px;height:26px;flex:0 0 auto;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px;color:#fff}
+  .mpop-nm{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .mpop-u{color:var(--muted);font-size:12.5px;flex:0 0 auto}
+  .mpop-cmd{font-family:ui-monospace,monospace;font-weight:700;color:var(--accent-txt);flex:0 0 auto}
+  .mpop-desc{color:var(--muted);font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
   /* profile row on rail bottom */
   .me-mini{width:48px;height:48px;border-radius:24px;display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff;position:relative}

@@ -284,8 +284,11 @@ function RoleAssignTab({ active, members }: { active: import('../types').ServerD
   if (roles.length === 0) return <div className="msub" style={{ padding: '4px 2px' }}>Сначала создай роли во вкладке «Роли».</div>;
   return <div className="assign-list">
     {members.map((m) => <div key={m.id} className="assign-row">
-      <div className="assign-nm">{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{busy === m.id ? <span className="spin" style={{ width: 12, height: 12 }} /> : null}</div>
-      <div className="assign-roles">{roles.map((r) => { const on = (m.roles || []).some((x) => x.id === r.id); return <button key={r.id} className={'role-chip' + (on ? ' on' : '')} style={on ? { background: r.color || 'var(--accent)', borderColor: r.color || 'var(--accent)' } : { borderColor: r.color || 'var(--line-2)', color: r.color || 'var(--muted)' }} disabled={m.role === 'owner'} onClick={() => toggle(m, r.id)}>{r.name}</button>; })}</div>
+      <div className="assign-av" style={{ background: m.avatarUrl ? '#0000' : avColor(m.displayName, m.avatarColor) }}>{m.avatarUrl ? <img className="avimg" src={resolveUploadUrl(m.avatarUrl)} alt="" /> : initial(m.displayName)}</div>
+      <div className="assign-main">
+        <div className="assign-nm">{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{busy === m.id ? <span className="spin" style={{ width: 12, height: 12 }} /> : null}</div>
+        <div className="assign-roles">{roles.map((r) => { const on = (m.roles || []).some((x) => x.id === r.id); return <button key={r.id} className={'role-chip' + (on ? ' on' : '')} style={on ? { background: r.color || 'var(--accent)', borderColor: r.color || 'var(--accent)' } : { borderColor: (r.color || 'var(--line-2)') + '88', color: r.color || 'var(--muted)' }} disabled={m.role === 'owner'} onClick={() => toggle(m, r.id)}>{r.name}</button>; })}</div>
+      </div>
     </div>)}
   </div>;
 }

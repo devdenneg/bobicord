@@ -47,7 +47,7 @@ function ProfileCard({ m, rect }: { m: Member; rect: DOMRect }) {
       <div className="pcard-user">@{m.username}</div>
       {m.roles && m.roles.length ? (<>
         <div className="pcard-label">Роли</div>
-        <div className="pcard-roles">{m.roles.map((r) => <span key={r.id} className="role-chip on" style={{ background: r.color || 'var(--accent)', borderColor: r.color || 'var(--accent)' }}>{r.name}</span>)}</div>
+        <div className="pcard-roles">{m.roles.map((r) => <span key={r.id} className="role-badge" style={{ background: (r.color || 'var(--panel3)') + '22', color: r.color || 'var(--muted)', borderColor: (r.color || 'var(--line-2)') + '55' }}>{r.name}</span>)}</div>
       </>) : null}
       <div className="pcard-label">О себе</div>
       <div className={'pcard-bio' + (bio ? '' : ' empty')}>{bio || 'Ничего не указано'}</div>
@@ -278,13 +278,41 @@ function Members() {
 }
 
 /* ---------- Chat ---------- */
-function renderRich(text: string): (string | { emo: string; name: string } | { link: string } | { mention: string })[] {
-  return text.split(/(\s+)/).map((tok) => {
-    if (emoteMap.has(tok)) return { emo: emoteMap.get(tok)!, name: tok };
-    if (/^https?:\/\/[^\s]+$/i.test(tok)) return { link: tok };
-    if (/^@[^\s@]{1,32}$/.test(tok)) return { mention: tok };
-    return tok;
-  });
+type RichPart = string | { emo: string; name: string } | { link: string } | { mention: string };
+// сначала вырезаем упоминания (в т.ч. многословные ники по списку известных имён), остальное токенизируем
+function renderRich(text: string, names?: Set<string>): RichPart[] {
+  const out: RichPart[] = [];
+  const tokenize = (chunk: string) => {
+    for (const tok of chunk.split(/(\s+)/)) {
+      if (!tok) continue;
+      if (emoteMap.has(tok)) out.push({ emo: emoteMap.get(tok)!, name: tok });
+      else if (/^https?:\/\/[^\s]+$/i.test(tok)) out.push({ link: tok });
+      else if ((!names || names.size === 0) && /^@[^\s@]{1,32}$/.test(tok)) out.push({ mention: tok });
+      else out.push(tok);
+    }
+  };
+  let last = 0;
+  if (names && names.size) {
+    for (let i = 0; i < text.length; i++) {
+      if (text[i] !== '@') continue;
+      if (i > 0 && !/\s/.test(text[i - 1])) continue; // @ только в начале токена
+      const rest = text.slice(i + 1).toLowerCase();
+      let best = 0;
+      for (const nm of names) {
+        if (nm && nm.length > best && rest.startsWith(nm)) {
+          const nx = rest[nm.length];
+          if (nx === undefined || /[\s.,!?:;)»"']/.test(nx)) best = nm.length;
+        }
+      }
+      if (best > 0) {
+        if (i > last) tokenize(text.slice(last, i));
+        out.push({ mention: text.slice(i, i + 1 + best) });
+        last = i + 1 + best; i = last - 1;
+      }
+    }
+  }
+  tokenize(text.slice(last));
+  return out;
 }
 function fmtTime(ts?: number): string {
   if (!ts) return '';
@@ -306,6 +334,11 @@ function ImageLightbox({ src, onClose }: { src: string; onClose: () => void }) {
   );
 }
 
+const COMMANDS: { name: string; desc: string }[] = [
+  { name: 'clear', desc: 'Очистить чат (нужна модерация)' },
+  { name: 'help', desc: 'Список команд' },
+];
+
 function Chat() {
   const eng = useEngine();
   const E = getEngine()!;
@@ -319,16 +352,21 @@ function Chat() {
   const toast = useStore((s) => s.toast);
   const updateReady = useStore((s) => s.updateReady);
   const me = useStore((s) => s.me)!;
+  const members = useStore((s) => s.members);
+  const activeId = useStore((s) => s.active?.id);
   const [pill, setPill] = useState(0);
   const [atBottom, setAtBottom] = useState(true);
   const atBottomRef = useRef(true);
+  const settleRef = useRef(0); // до этого времени игнорим scroll-события и жёстко держим низ
   const setBottom = (v: boolean) => { atBottomRef.current = v; setAtBottom(v); };
+  // автокомплит упоминаний (@ник)
+  const [mention, setMention] = useState<{ q: string; start: number } | null>(null);
+  const [mIdx, setMIdx] = useState(0);
 
+  const pinBottom = useCallback(() => { const el = msgsRef.current; if (el) el.scrollTop = el.scrollHeight; }, []);
   const scrollToBottom = useCallback(() => {
-    const el = msgsRef.current; if (!el) return;
-    el.scrollTop = el.scrollHeight;
-    atBottomRef.current = true; setAtBottom(true); setPill(0);
-  }, []);
+    pinBottom(); atBottomRef.current = true; setAtBottom(true); setPill(0);
+  }, [pinBottom]);
 
   // новые сообщения: если внизу — доскроллить, иначе счётчик непрочитанных
   useLayoutEffect(() => {
@@ -336,16 +374,22 @@ function Chat() {
     else setPill((p) => p + 1);
   }, [eng.messages.length, scrollToBottom]);
 
-  // при открытии сервера — в конец; держим прижатым к низу пока подгружаются
-  // картинки/link-превью (ResizeObserver), иначе поздний контент оставляет чат не внизу
+  // открытие/смена сервера: прижать к низу и «оседать» 1.8с, пока догружаются
+  // картинки/link-превью (иначе layout-сдвиг ставит atBottom=false раньше, чем добьём вниз)
   useLayoutEffect(() => {
+    settleRef.current = Date.now() + 1800;
     scrollToBottom();
+    requestAnimationFrame(scrollToBottom);
+  }, [activeId, scrollToBottom]);
+
+  // ResizeObserver: пока внизу ИЛИ идёт «оседание» — до-прижимаем к низу при любом росте высоты
+  useLayoutEffect(() => {
     const inner = msgsRef.current?.querySelector('.msgs-inner');
     if (!inner) return;
-    const ro = new ResizeObserver(() => { if (atBottomRef.current) { const el = msgsRef.current; if (el) el.scrollTop = el.scrollHeight; } });
+    const ro = new ResizeObserver(() => { if (atBottomRef.current || Date.now() < settleRef.current) pinBottom(); });
     ro.observe(inner);
     return () => ro.disconnect();
-  }, [scrollToBottom]);
+  }, [pinBottom]);
 
   async function runCommand(raw: string) {
     const active = useStore.getState().active;
@@ -385,25 +429,78 @@ function Chat() {
     finally { setUploading(false); }
   }
 
+  // slash-команды (только в начале строки, пока нет пробела)
+  const slashMode = /^\/[a-zа-я]*$/i.test(text);
+  const cmdQuery = slashMode ? text.slice(1).toLowerCase() : '';
+  const cmdCands = slashMode ? COMMANDS.filter((c) => c.name.startsWith(cmdQuery)) : [];
+  const mCands: { username: string; displayName: string; avatarColor: number; everyone?: boolean }[] = (() => {
+    if (!mention || slashMode) return [];
+    const q = mention.q.toLowerCase();
+    const list = members
+      .filter((x) => x.username !== me.username && (x.username.toLowerCase().includes(q) || x.displayName.toLowerCase().includes(q)))
+      .slice(0, 8)
+      .map((x) => ({ username: x.username, displayName: x.displayName, avatarColor: x.avatarColor, everyone: false }));
+    if (q === '' || ['все', 'all', 'everyone'].some((w) => w.startsWith(q))) list.unshift({ username: 'все', displayName: 'Все участники', avatarColor: 0, everyone: true });
+    return list.slice(0, 8);
+  })();
+  const acLen = slashMode ? cmdCands.length : mCands.length;
+  const acOpen = acLen > 0;
+  function detectMention(value: string, caret: number) {
+    const m = value.slice(0, caret).match(/(?:^|\s)@([^\s@]{0,32})$/);
+    return m ? { q: m[1], start: caret - m[1].length - 1 } : null;
+  }
+  function insertMention(uname: string) {
+    if (!mention) return;
+    const before = text.slice(0, mention.start);
+    const after = text.slice(mention.start + 1 + mention.q.length);
+    const inserted = before + '@' + uname + ' ';
+    setText(inserted + after); setMention(null); setMIdx(0);
+    focusEnd(inserted.length);
+  }
+  function insertCommand(name: string) {
+    const inserted = '/' + name + ' ';
+    setText(inserted); setMIdx(0);
+    focusEnd(inserted.length);
+  }
+  function focusEnd(pos: number) {
+    requestAnimationFrame(() => { const el = document.getElementById('msgIn') as HTMLInputElement | null; if (el) { el.focus(); el.setSelectionRange(pos, pos); } });
+  }
+  function acceptAc(i: number) { if (slashMode) insertCommand(cmdCands[i].name); else insertMention(mCands[i].username); }
+  function onComposerKey(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (acOpen) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); setMIdx((i) => (i + 1) % acLen); return; }
+      if (e.key === 'ArrowUp') { e.preventDefault(); setMIdx((i) => (i - 1 + acLen) % acLen); return; }
+      if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); acceptAc(Math.min(mIdx, acLen - 1)); return; }
+      if (e.key === 'Escape') { e.preventDefault(); setMention(null); setText((t) => (slashMode ? t + ' ' : t)); return; }
+    }
+    if (e.key === 'Enter') send();
+  }
+
+  const mentionNames = (() => { const s = new Set<string>(); for (const mm of members) { s.add(mm.username.toLowerCase()); s.add(mm.displayName.toLowerCase()); } ['все', 'all', 'everyone'].forEach((w) => s.add(w)); return s; })();
+  const byName = new Map(members.map((mm) => [mm.displayName, mm] as const));
+
   return (
     <div id="chat">
-      <div id="msgs" ref={msgsRef} onScroll={(e) => { const m = e.currentTarget; const b = m.scrollTop + m.clientHeight >= m.scrollHeight - 120; setBottom(b); if (b) setPill(0); }}>
+      <div id="msgs" ref={msgsRef} onScroll={(e) => { if (Date.now() < settleRef.current) return; const m = e.currentTarget; const b = m.scrollTop + m.clientHeight >= m.scrollHeight - 120; setBottom(b); if (b) setPill(0); }}>
         <div className="msgs-inner">
           {eng.messages.length === 0 ? <div id="chatEmpty">Общий чат сервера. Пиши сюда — видят все участники онлайн.</div> : null}
           {eng.messages.map((m) => {
-            const parts = m.sys ? null : renderRich(m.text);
+            const parts = m.sys ? null : renderRich(m.text, mentionNames);
             const emoCount = parts ? parts.filter((p) => typeof p === 'object' && 'emo' in p).length : 0;
             const hasLink = parts ? parts.some((p) => typeof p === 'object' && 'link' in p) : false;
             const big = !!parts && !hasLink && emoCount >= 1 && emoCount <= 3 && parts.every((p) => typeof p !== 'string' || !p.trim());
+            const author = m.who ? byName.get(m.who) : undefined;
+            const aRoles = author?.roles || [];
+            const nameColor = (author && roleColorOf(author)) || avColor(m.who || '', m.color);
             return (
               <div className={'msg' + (m.sys ? ' sys' : '') + (m.mine ? ' me' : '') + (m.mention ? ' mentioned' : '')} key={m.id}>
-                {!m.sys ? <div className="who" style={{ color: avColor(m.who || '', m.color) }}>{m.who}{m.ts ? <span className="mtime">{fmtTime(m.ts)}</span> : null}</div> : null}
+                {!m.sys ? <div className="who" style={{ color: nameColor }}>{m.who}{aRoles.length ? <span className="who-roles">{aRoles.map((r) => <span key={r.id} className="who-role" style={{ background: (r.color || 'var(--panel3)') + '22', color: r.color || 'var(--muted)', borderColor: (r.color || 'var(--line-2)') + '55' }}>{r.name}</span>)}</span> : null}{m.ts ? <span className="mtime">{fmtTime(m.ts)}</span> : null}</div> : null}
                 {m.sys || m.text ? (
                   <div className={'tx' + (big ? ' big' : '')}>
                     {m.sys ? m.text : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : 'link' in p ? <a key={i} className="msg-link" href={p.link} target="_blank" rel="noreferrer">{p.link}</a> : 'mention' in p ? <span key={i} className="mention-tag">{p.mention}</span> : <img key={i} className="emo" src={emoteUrl(p.emo)} alt={p.name} title={p.name} loading="lazy" decoding="async" />))}
                   </div>
                 ) : null}
-                {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox(m.img!)}><img className="msg-img" src={resolveUploadUrl(m.img)} alt="" loading="lazy" onLoad={() => { const el = msgsRef.current; if (el && atBottomRef.current) el.scrollTop = el.scrollHeight; }} /></button> : null}
+                {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox(m.img!)}><img className="msg-img" src={resolveUploadUrl(m.img)} alt="" loading="lazy" onLoad={() => { const el = msgsRef.current; if (el && (atBottomRef.current || Date.now() < settleRef.current)) el.scrollTop = el.scrollHeight; }} /></button> : null}
               </div>
             );
           })}
@@ -425,6 +522,21 @@ function Chat() {
           <button className="ub-btn" onClick={() => location.reload()}><Icon name="refresh" sm />Обновить</button>
         </div>
       ) : null}
+      {acOpen ? (
+        <div className="mention-pop" role="listbox">
+          <div className="mpop-h">{slashMode ? 'Команды' : 'Упомянуть'}</div>
+          {slashMode
+            ? cmdCands.map((c, i) => (
+              <button key={c.name} className={'mpop-row' + (i === mIdx ? ' sel' : '')} onMouseDown={(e) => { e.preventDefault(); insertCommand(c.name); }} onMouseEnter={() => setMIdx(i)}>
+                <span className="mpop-cmd">/{c.name}</span><span className="mpop-desc">{c.desc}</span>
+              </button>))
+            : mCands.map((x, i) => (
+              <button key={x.username} className={'mpop-row' + (i === mIdx ? ' sel' : '')} onMouseDown={(e) => { e.preventDefault(); insertMention(x.username); }} onMouseEnter={() => setMIdx(i)}>
+                <span className="mpop-av" style={{ background: x.everyone ? 'var(--accent)' : avColor(x.displayName, x.avatarColor) }}>{x.everyone ? '@' : initial(x.displayName)}</span>
+                <span className="mpop-nm">{x.displayName}</span>{!x.everyone ? <span className="mpop-u">@{x.username}</span> : null}
+              </button>))}
+        </div>
+      ) : null}
       <div className="chat-in">
         <button id="emoBtn" ref={emoBtnRef} className={'emo-toggle' + (pickAnchor !== undefined ? ' on' : '')} data-tip="7TV эмоуты"
           onClick={() => setPickAnchor((a) => (a === undefined ? emoBtnRef.current!.getBoundingClientRect() : undefined))}><Icon name="smile" /></button>
@@ -432,7 +544,7 @@ function Chat() {
         <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; if (f) sendImage(f); e.target.value = ''; }} />
         <input id="msgIn" placeholder="Сообщение..." maxLength={1000} autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false} name="chat-message" value={text}
           onPaste={(e) => { const items = e.clipboardData?.items; if (!items) return; for (let i = 0; i < items.length; i++) { if (items[i].type.startsWith('image/')) { const f = items[i].getAsFile(); if (f) { e.preventDefault(); sendImage(f); } break; } } }}
-          onChange={(e) => { setText(e.target.value); if (e.target.value.trim()) E.sendTyping(); }} onKeyDown={(e) => e.key === 'Enter' && send()} />
+          onChange={(e) => { const v = e.target.value; setText(v); if (v.trim()) E.sendTyping(); setMention(detectMention(v, e.target.selectionStart ?? v.length)); setMIdx(0); }} onKeyDown={onComposerKey} />
         <button id="sendBtn" className={text.trim() ? '' : 'empty'} data-tip="Отправить · Enter" onClick={send}><Icon name="send" /></button>
       </div>
       {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} onClose={() => setPickAnchor(undefined)}
