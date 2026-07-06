@@ -1,0 +1,7 @@
+# Для сборок с контекстом = корень репо (apps/relay/Dockerfile): не тащить в daemon
+# гигабайты артефактов. Контексты apps/server и apps/web этот файл не читают.
+**/target
+**/node_modules
+**/dist
+data/
+.git/

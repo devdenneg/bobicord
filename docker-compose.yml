@@ -38,6 +38,21 @@ services:
       - TURN_REALM=${TURN_REALM:-relayapp.local}
     command: ["sh", "-c", "turnserver -c /etc/turnserver.conf --static-auth-secret=$${TURN_SECRET} --realm=$${TURN_REALM}"]
 
+  # Э9: виртуальный fallback-relay — джойнится в relay-дерево, когда у зрителей нет живых
+  # relay-пиров (или зритель явно выбрал «через сервер»), и passthrough-ретранслирует RTP.
+  # host-сеть: WebRTC UDP напрямую с публичного IP (TURN/srflx не нужны); сигналинг — на
+  # локальный token-сервис, TLS не нужен.
+  vrelay:
+    image: ghcr.io/devdenneg/bobicord-vrelay:latest
+    pull_policy: always
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      - SESSION_SECRET=${SESSION_SECRET}
+      - TREE_WS_URL=ws://127.0.0.1:3000/tree
+      - VRELAY_MAX_CHILDREN=${VRELAY_MAX_CHILDREN:-8}
+      - RUST_LOG=info
+
   caddy:
     # запечены статика фронта + Caddyfile
     image: ghcr.io/devdenneg/bobicord-web:latest

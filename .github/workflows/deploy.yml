@@ -8,6 +8,7 @@ on:
 env:
   IMAGE_SERVER: ghcr.io/devdenneg/bobicord-server
   IMAGE_WEB: ghcr.io/devdenneg/bobicord-web
+  IMAGE_VRELAY: ghcr.io/devdenneg/bobicord-vrelay
 
 jobs:
   build:
@@ -46,6 +47,20 @@ jobs:
           tags: |
             ${{ env.IMAGE_WEB }}:latest
             ${{ env.IMAGE_WEB }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Э9: headless виртуальный fallback-relay. Контекст — корень репо (path-dep на
+      # apps/relay-core), см. apps/relay/Dockerfile и корневой .dockerignore.
+      - name: Build & push vrelay image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/relay/Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_VRELAY }}:latest
+            ${{ env.IMAGE_VRELAY }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

@@ -57,6 +57,8 @@ export interface TreeNode {
   children: number;
   capacity: number;
   native: boolean;
+  /** Э9: виртуальный серверный fallback-relay (vrelay). */
+  virtual?: boolean;
   broadcaster: boolean;
   availableOutgoing: number;
   rtt: number;

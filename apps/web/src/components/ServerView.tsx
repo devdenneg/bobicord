@@ -904,7 +904,7 @@ function StreamSourceBadge({ identity }: { identity: string }) {
   const you = topo.nodes.find((n) => n.id === topo.you);
   if (!you) return null;
   const parent = you.parentId ? topo.nodes.find((n) => n.id === you.parentId) : null;
-  const label = !parent ? 'подключение…' : parent.broadcaster ? 'напрямую от вещателя' : (members.find((m) => m.username === parent.identity)?.displayName || parent.identity);
+  const label = !parent ? 'подключение…' : parent.broadcaster ? 'напрямую от вещателя' : parent.virtual ? 'через сервер (fallback)' : (members.find((m) => m.username === parent.identity)?.displayName || parent.identity);
   return (
     <div className="srcbadge" style={{ position: 'absolute', top: 8, right: 8, display: 'flex', alignItems: 'center', gap: 4, padding: '3px 8px', borderRadius: 12, fontSize: 11, background: 'rgba(0,0,0,.55)', color: '#fff', pointerEvents: 'none' }}>
       <Icon name="link" sm />источник: {label}{you.children ? ` · ретрансляция ×${you.children}` : ''}
@@ -917,7 +917,7 @@ function TreePeerPanel({ identity, onClose }: { identity: string; onClose: () =>
   const E = getEngine()!;
   const members = useStore((s) => s.members);
   const topo = E.getStreamTopology(identity);
-  const nameOf = (n: { broadcaster: boolean; identity: string }) => n.broadcaster ? '📡 вещатель' : (members.find((m) => m.username === n.identity)?.displayName || n.identity);
+  const nameOf = (n: { broadcaster: boolean; virtual?: boolean; identity: string }) => n.broadcaster ? '📡 вещатель' : n.virtual ? '🖥 Сервер' : (members.find((m) => m.username === n.identity)?.displayName || n.identity);
   const youNode = topo?.nodes.find((n) => n.id === topo.you);
   return (
     <div className="treepanel" onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}
@@ -942,6 +942,11 @@ function TreePeerPanel({ identity, onClose }: { identity: string; onClose: () =>
           );
         })}
         <button className="ghost" style={{ margin: '8px 0 0', width: '100%' }} onClick={() => E.requestReparent(identity, null)}>Авто: лучший пир</button>
+        {/* Э9: ручной фолбэк — сервер поднимет виртуальный relay (если агент запущен) и
+            пересадит нас под него; выбор запинен от авто-дренажа, пока не уйдём сами. */}
+        {!youNode || !topo.nodes.find((n) => n.id === youNode.parentId)?.virtual
+          ? <button className="ghost" style={{ margin: '6px 0 0', width: '100%' }} onClick={() => E.requestReparent(identity, 'vrelay')}>🖥 Через сервер (fallback)</button>
+          : null}
       </>}
     </div>
   );
