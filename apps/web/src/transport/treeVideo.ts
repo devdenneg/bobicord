@@ -295,15 +295,31 @@ export class TreeVideoTransport implements VideoTransport {
   }
 
   /** Последний известный tree-info (позиция в дереве) для смотрибельного стрима. */
-  getTreeInfo(streamId: string): TreeInfo | null { return this.treeInfoByStream.get(streamId) || null; }
+  getTreeInfo(streamId: string): TreeInfo | null {
+    const ti = this.treeInfoByStream.get(streamId);
+    if (ti) return ti;
+    // Натив-путь (Tauri): tree-info приходит на Rust-сокет и в webview не пробрасывается —
+    // считаем позицию из топологии (relay-topology доходит по IPC). Без этого у зрителя
+    // в приложении панель показателей была пустой.
+    const topo = this.topologyByStream.get(streamId);
+    if (!topo || !topo.you) return null;
+    const you = topo.nodes.find((n) => n.id === topo.you);
+    if (!you) return null;
+    let treeDepth = 0;
+    for (const n of topo.nodes) if (n.depth > treeDepth) treeDepth = n.depth;
+    return { myDepth: you.depth, treeDepth, children: you.children, health: 'ok' };
+  }
 
   /** Живая RTP-статистика входящего видео (Э2.1 — дебаг-панель зрителя). `null`,
    * если сейчас не смотрим этот стрим или ещё нет отчёта. */
   async getRtpStats(streamId: string): Promise<RtpStats | null> {
-    const st = this.watches.get(streamId);
-    if (!st?.pc) return null;
+    // Натив-путь: смотрим через локальный webview-PC (Rust passthrough-ит RTP как есть —
+    // разрешение/fps настоящие, framesDropped локального хопа). Раньше читались только
+    // браузерные watches — у зрителя в приложении статов не было вовсе.
+    const pc = this.watches.get(streamId)?.pc ?? this.nativeWatches.get(streamId)?.pc ?? null;
+    if (!pc) return null;
     let report: RTCStatsReport;
-    try { report = await st.pc.getStats(); } catch { return null; }
+    try { report = await pc.getStats(); } catch { return null; }
     for (const stat of report.values()) {
       if (stat.type === 'inbound-rtp' && stat.kind === 'video') {
         return {
