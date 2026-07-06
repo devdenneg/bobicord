@@ -7,7 +7,9 @@ import { api, getToken, setToken } from './api';
 import { loadGlobalEmotes } from './emotes';
 import { isTauri, pingNative } from './native';
 import { watchForUpdates } from './version';
+import { applyStoredTheme } from './theme';
 
+applyStoredTheme(); // применить сохранённую тему до первого рендера
 loadGlobalEmotes();
 // SW для установки PWA. НЕ кэширует (кэш ранее ронял прод); старые кэши чистятся внутри sw.js.
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});

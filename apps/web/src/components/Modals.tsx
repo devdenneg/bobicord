@@ -3,6 +3,7 @@ import { Room } from 'livekit-client';
 import { api } from '../api';
 import { useStore, getEngine } from '../store';
 import { getSettings, setSettings } from '../settings';
+import { THEMES, getTheme, setTheme } from '../theme';
 import { playSound } from '../sounds';
 import { Icon } from '../Icon';
 import { MicMeter } from './MicMeter';
@@ -187,6 +188,19 @@ function SettingsModal() {
       <div className="fld"><label>Устройство вывода</label><select value={s.output} onChange={(e) => upd({ output: e.target.value }, () => E?.applyOutput())}><option value="">По умолчанию</option>{outs.map((d) => <option key={d.deviceId} value={d.deviceId}>{d.label || d.deviceId}</option>)}</select></div>
       <div className="fld"><label>Общая громкость: {s.master}%</label><input type="range" min={0} max={100} value={s.master} onChange={(e) => upd({ master: +e.target.value }, () => E?.applyMaster())} /></div>
       <div className="fld"><label>Громкость уведомлений: {s.notifyVolume}%</label><input type="range" min={0} max={100} value={s.notifyVolume} onChange={(e) => upd({ notifyVolume: +e.target.value })} onMouseUp={() => playSound('system')} /></div>
+    </div>
+    <div className="grp"><div className="gt"><Icon name="palette" sm /> Оформление</div>
+      <div className="fld"><label>Тема оформления</label>
+        <div className="theme-grid">
+          {THEMES.map((t) => (
+            <button key={t.id} className={'theme-op' + (getTheme() === t.id ? ' active' : '')} onClick={() => { setTheme(t.id); rerender(); }}>
+              <span className="theme-sw">{t.swatch.map((c, i) => <i key={i} style={{ background: c }} />)}</span>
+              <span className="theme-nm">{t.name}</span>
+              {getTheme() === t.id ? <Icon name="check" sm /> : null}
+            </button>
+          ))}
+        </div>
+      </div>
     </div>
     <button className="close" onClick={close}>Готово</button>
   </Backdrop>;
