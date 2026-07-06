@@ -821,6 +821,21 @@ function StreamTile({ streamKey, identity, isLocal }: { streamKey: string; ident
       if (!rtp && !tree) { setStats(''); return; }
       const parts: string[] = [];
       if (rtp) parts.push(`${rtp.width}×${rtp.height} · ${rtp.fps.toFixed(0)} fps · дропы ${rtp.framesDropped}`);
+      // Оценка задержки: сеть = сумма rtt/2 по цепочке хопов до вещателя (rtt линков
+      // сервер собирает в топологию из RTCP-отчётов родителей) + локальный джиттер-буфер
+      // декодера. Энкод/декод не учтены — это нижняя оценка, не точное e2e.
+      const topo = E.getStreamTopology(identity);
+      let netMs = 0;
+      if (topo?.you) {
+        let cur = topo.nodes.find((n) => n.id === topo.you);
+        let hops = 0;
+        while (cur && !cur.broadcaster && hops++ < 8) {
+          netMs += (cur.rtt || 0) / 2;
+          cur = cur.parentId ? topo.nodes.find((n) => n.id === cur!.parentId) : undefined;
+        }
+      }
+      const latency = Math.round(netMs + (rtp?.jitterBufferMs || 0));
+      if (latency > 0) parts.push(`задержка ≈${latency} мс (сеть ${Math.round(netMs)} + буфер ${Math.round(rtp?.jitterBufferMs || 0)})`);
       if (tree) parts.push(`дерево: глубина ${tree.myDepth}${tree.children ? `, ретранслируешь на ${tree.children}` : ''}`);
       setStats(parts.join('<br>'));
     }, 2000);

@@ -46,6 +46,9 @@ export interface RtpStats {
   fps: number;
   framesDropped: number;
   packetsLost: number;
+  /** Средняя задержка джиттер-буфера декодера за последний интервал опроса, мс
+   *  (дельта jitterBufferDelay/jitterBufferEmittedCount). Часть оценки задержки. */
+  jitterBufferMs: number;
 }
 
 /** Узел relay-дерева (Э8) — для UI «у кого беру стрим» и ручного выбора пира. */

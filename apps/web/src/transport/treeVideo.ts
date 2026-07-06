@@ -112,6 +112,8 @@ export class TreeVideoTransport implements VideoTransport {
   private videoTracks = new Map<string, MediaStreamVideoHandle>();
   private streamInfoByKey = new Map<string, StreamInfo>();
   private treeInfoByStream = new Map<string, TreeInfo>();
+  /** Прошлые кумулятивные jitterBufferDelay/Count по стриму — для дельты в getRtpStats. */
+  private lastJb = new Map<string, { delay: number; count: number }>();
   private topologyByStream = new Map<string, TreeTopology>();
   private topologyCbs = new Set<(streamId: string) => void>();
   private nativeWatches = new Map<string, NativeWatchState>();
@@ -278,6 +280,7 @@ export class TreeVideoTransport implements VideoTransport {
     this.closeChildren(st);
     this.watches.delete(streamId);
     this.treeInfoByStream.delete(streamId);
+    this.lastJb.delete(streamId);
     this.delVideo(streamId);
   }
   private teardownWatch(streamId: string, st: WatchState) {
@@ -286,6 +289,7 @@ export class TreeVideoTransport implements VideoTransport {
     this.closeChildren(st);
     this.watches.delete(streamId);
     this.treeInfoByStream.delete(streamId);
+    this.lastJb.delete(streamId);
     this.delVideo(streamId);
   }
   private closeChildren(st: WatchState) {
@@ -322,12 +326,22 @@ export class TreeVideoTransport implements VideoTransport {
     try { report = await pc.getStats(); } catch { return null; }
     for (const stat of report.values()) {
       if (stat.type === 'inbound-rtp' && stat.kind === 'video') {
+        // Джиттер-буфер: дельта кумулятивных счётчиков между опросами — средняя задержка
+        // буфера за интервал (lifetime-среднее врало бы после смены условий сети).
+        const prev = this.lastJb.get(streamId);
+        const delay = stat.jitterBufferDelay || 0;
+        const count = stat.jitterBufferEmittedCount || 0;
+        this.lastJb.set(streamId, { delay, count });
+        const dCount = prev ? count - prev.count : count;
+        const dDelay = prev ? delay - prev.delay : delay;
+        const jitterBufferMs = dCount > 0 ? (dDelay / dCount) * 1000 : 0;
         return {
           width: stat.frameWidth || 0,
           height: stat.frameHeight || 0,
           fps: stat.framesPerSecond || 0,
           framesDropped: stat.framesDropped || 0,
           packetsLost: stat.packetsLost || 0,
+          jitterBufferMs,
         };
       }
     }
@@ -513,6 +527,7 @@ export class TreeVideoTransport implements VideoTransport {
     if (st.pc) { try { st.pc.close(); } catch { /**/ } }
     this.nativeWatches.delete(streamId);
     this.treeInfoByStream.delete(streamId);
+    this.lastJb.delete(streamId);
     this.topologyByStream.delete(streamId);
     this.delVideo(streamId);
     stopNativeWatch().catch(() => {});
