@@ -61,7 +61,6 @@ function roleColorOf(m: Member): string | undefined {
   const r = (m.roles || []).find((x) => x.color);
   return r?.color || undefined;
 }
-function topRole(m: Member): Role | undefined { return (m.roles || [])[0]; }
 
 /* ---------- Voice channel participant row (LEFT, with controls) ---------- */
 function VoiceParticipantRow({ m }: { m: Member }) {
@@ -215,6 +214,42 @@ function VoiceControls() {
   );
 }
 
+// роли сразу за ником; что не влезло — сворачиваем в «+N» с тултипом всех ролей
+function roleBadge(r: Role) {
+  return <span key={r.id} className="role-badge" style={{ background: (r.color || 'var(--panel3)') + '22', color: r.color || 'var(--muted)', borderColor: (r.color || 'var(--line-2)') + '55' }}>{r.name}</span>;
+}
+function MemberRoles({ roles }: { roles: Role[] }) {
+  const visRef = useRef<HTMLDivElement>(null);
+  const ghostRef = useRef<HTMLDivElement>(null);
+  const [visN, setVisN] = useState(roles.length);
+  useLayoutEffect(() => {
+    const vis = visRef.current, ghost = ghostRef.current; if (!vis || !ghost) return;
+    const compute = () => {
+      const cw = vis.clientWidth; if (cw <= 0) return;
+      const badges = Array.from(ghost.children) as HTMLElement[];
+      const gap = 5, moreW = 34;
+      let used = 0, n = 0;
+      for (let i = 0; i < badges.length; i++) {
+        const add = badges[i].offsetWidth + (i > 0 ? gap : 0);
+        const budget = cw - (i < badges.length - 1 ? moreW + gap : 0);
+        if (used + add <= budget) { used += add; n++; } else break;
+      }
+      setVisN((p) => (p === n ? p : n));
+    };
+    compute();
+    const ro = new ResizeObserver(compute); ro.observe(vis);
+    return () => ro.disconnect();
+  }, [roles]);
+  const hidden = roles.length - visN;
+  return (
+    <div className="mrow-roles" ref={visRef}>
+      {roles.slice(0, visN).map(roleBadge)}
+      {hidden > 0 ? <span className="role-more" data-tip={roles.map((r) => r.name).join(', ')}>+{hidden}</span> : null}
+      <div className="mrow-roles-ghost" ref={ghostRef} aria-hidden="true">{roles.map(roleBadge)}</div>
+    </div>
+  );
+}
+
 /* ---------- Member list (right) — только инфо/статусы, без контролов ---------- */
 function MemberRow({ m }: { m: Member }) {
   const eng = useEngine();
@@ -243,7 +278,7 @@ function MemberRow({ m }: { m: Member }) {
       <div className="head" ref={hc.ref} onMouseEnter={self ? undefined : hc.onEnter} onMouseLeave={self ? undefined : hc.onLeave}>
         <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} dot={st} />
         <div className="nm" style={roleColorOf(m) ? { color: roleColorOf(m) } : undefined}>{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div>
-        {topRole(m) ? <span className="role-badge" style={{ background: (topRole(m)!.color || 'var(--panel3)') + '22', color: topRole(m)!.color || 'var(--muted)', borderColor: (topRole(m)!.color || 'var(--line-2)') + '55' }}>{topRole(m)!.name}</span> : null}
+        <MemberRoles roles={m.roles || []} />
         {!self && streaming && !pr?.inVoice ? (
           <button className={'watchbtn' + (watching ? ' on' : '')} disabled={pending}
             aria-label={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}
