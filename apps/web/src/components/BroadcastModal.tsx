@@ -75,6 +75,16 @@ export function BroadcastModal() {
     listWindows().then(setWindows).catch(() => {});
   }, [live]);
 
+  // Индексы мониторов из windows-capture 1-based (Monitor::from_index требует index > 0).
+  // Дефолт/сохранённый monitorIndex мог быть 0 (или указывать на отвалившийся монитор) —
+  // тогда <select> ни на что не мапится, а Старт шлёт невалидный индекс ("monitor 0").
+  // Подставляем первый доступный монитор, чтобы выбор всегда соответствовал списку.
+  useEffect(() => {
+    if (monitors.length === 0) return;
+    if (!monitors.some((m) => m.index === cfg.monitorIndex))
+      setCfg((c) => ({ ...c, monitorIndex: monitors[0].index }));
+  }, [monitors]);
+
   useEffect(() => {
     if (!live) { setStats(null); return; }
     let unStats: (() => void) | undefined;
@@ -197,8 +207,8 @@ export function BroadcastModal() {
         : 'Битрейт фиксирован. При плохой сети у зрителей возможны потери/буферизация.'}</p>
     </div>
     <div className="fld"><label>Прямых подключений</label>
-      <div className="seg">{[2, 4, 6, 8].map((n) => <button key={n} className={cfg.maxDirectChildren === n ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, maxDirectChildren: n }))}>{n}</button>)}</div>
-      <p className="msub" style={{ margin: '8px 0 0' }}>Сколько зрителей берут поток напрямую с тебя. Остальные — через ретранслирующих зрителей (дерево, глубже).</p>
+      <div className="seg">{[1, 2, 4, 6, 8].map((n) => <button key={n} className={cfg.maxDirectChildren === n ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, maxDirectChildren: n }))}>{n}</button>)}</div>
+      <p className="msub" style={{ margin: '8px 0 0' }}>Сколько зрителей берут поток напрямую с тебя. Остальные — через ретранслирующих зрителей (дерево, глубже). <b>1</b> — даже 2-й зритель пойдёт через 1-го (проверка relay/дерева на двух зрителях).</p>
     </div>
     <div className="fld"><label>Звук</label>
       <div className="seg">
