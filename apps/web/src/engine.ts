@@ -257,7 +257,10 @@ export class Engine {
     r.remoteParticipants.forEach((p) => p.trackPublications.forEach((pub) => this.onRemotePub(pub, p, true)));
     this.liveKitT.onRoomConnected();
     this.treeT.onRoomConnected();
-    this.presenceTimer = window.setInterval(() => { this.announceWatch(); this.cleanupWatchers(); }, 3000);
+    // periodic self-heal подписок на микрофоны: атрибут vc (голосовой канал) мог доехать без события
+    // ParticipantAttributesChanged (гонка при быстрых прыжках между каналами / реконнекте) — тогда пир
+    // виден в канале, но его не слышно. setSubscribed идемпотентен, поэтому реконсиляция дёшева и безопасна.
+    this.presenceTimer = window.setInterval(() => { this.announceWatch(); this.cleanupWatchers(); if (this.inVoice) this.reconcileAllAudio(); }, 3000);
     this.emit();
   }
 
