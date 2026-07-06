@@ -1,7 +1,9 @@
 # vrelay — headless-агент виртуального fallback-relay (Э9). Контекст сборки — КОРЕНЬ репо
 # (path-dependency на apps/relay-core): в deploy.yml шаг собирается с context: . и
 # file: apps/relay/Dockerfile. Корневой .dockerignore отсекает target/ и node_modules.
-FROM rust:1.82-bookworm AS build
+# rust:1 = последний стабильный (не пиновать: транзитивные депсы webrtc/tokio требуют
+# edition2024 / Rust 1.85+, пин 1.82 валил сборку; rust-version в манифестах — лишь минимум).
+FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY apps/relay-core ./apps/relay-core
 COPY apps/relay ./apps/relay
