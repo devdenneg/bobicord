@@ -11,6 +11,37 @@
     --sh-3:0 16px 48px -12px rgba(0,0,0,.7),0 4px 12px rgba(0,0,0,.4);
     --hair:inset 0 1px 0 rgba(255,255,255,.05);
   }
+  /* --- тёмные вариации палитры (см. theme.ts). Переопределяют только цвета, не радиусы/тени. --- */
+  :root[data-theme="midnight"]{
+    --bg:#0a0e17; --bg2:#0f141f; --panel:#161c2b; --panel2:#1f2637; --panel3:#2a3350; --panel4:#354064;
+    --line:#070a12; --line-2:#232c40;
+    --txt:#d5dbe6; --txt-h:#f0f4fa; --muted:#8794ad;
+    --accent:#3b82f6; --accent-h:#2563eb; --accent-txt:#84b4ff; --blue:#60a5fa;
+  }
+  :root[data-theme="graphite"]{
+    --bg:#0c0d0f; --bg2:#141517; --panel:#191a1d; --panel2:#242529; --panel3:#313338; --panel4:#3c3e44;
+    --line:#0a0b0d; --line-2:#2b2d33;
+    --txt:#dcdde0; --txt-h:#f4f5f6; --muted:#9a9ca2;
+    --accent:#14b8a6; --accent-h:#0d9488; --accent-txt:#4fd6c6;
+  }
+  :root[data-theme="plum"]{
+    --bg:#100a14; --bg2:#17101d; --panel:#201827; --panel2:#2b2035; --panel3:#392a46; --panel4:#453454;
+    --line:#0c0710; --line-2:#2f2339;
+    --txt:#e0d8e8; --txt-h:#f5f0fa; --muted:#a091ad;
+    --accent:#a855f7; --accent-h:#9333ea; --accent-txt:#c891ff;
+  }
+  :root[data-theme="forest"]{
+    --bg:#0a0f0c; --bg2:#0f150f; --panel:#161d18; --panel2:#1f2822; --panel3:#2b362d; --panel4:#354139;
+    --line:#070b08; --line-2:#263029;
+    --txt:#d6e0d8; --txt-h:#f0f5f1; --muted:#8ba090;
+    --accent:#22c55e; --accent-h:#16a34a; --accent-txt:#5ee08a; --green:#22c55e; --green-2:#4ade80;
+  }
+  :root[data-theme="crimson"]{
+    --bg:#120b0d; --bg2:#180f11; --panel:#1f1518; --panel2:#2a1d21; --panel3:#38272c; --panel4:#443036;
+    --line:#0d0709; --line-2:#301f24;
+    --txt:#e6dadd; --txt-h:#faf0f2; --muted:#ac9599;
+    --accent:#f43f5e; --accent-h:#e11d48; --accent-txt:#ff8095;
+  }
   @media (prefers-reduced-motion: reduce){*{transition-duration:.01ms!important;animation:none!important}}
   @keyframes popIn{from{opacity:0;transform:translateY(6px) scale(.98)}to{opacity:1;transform:none}}
   @keyframes shake{10%,90%{transform:translateX(-3px)}30%,70%{transform:translateX(3px)}50%{transform:translateX(-2px)}}
@@ -365,6 +396,14 @@
   .kbd{display:inline-block;background:var(--panel3);border:1px solid var(--line);border-bottom-width:2px;border-radius:6px;padding:1px 7px;font-size:12px;font-weight:600}
   .seg{display:flex;gap:4px;background:var(--panel2);padding:4px;border-radius:var(--r-sm)}
   .seg button{flex:1;background:transparent;color:var(--muted);padding:8px;font-size:13.5px}.seg button.active{background:var(--accent);color:#fff}
+  .theme-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+  .theme-op{display:flex;align-items:center;gap:10px;padding:9px 11px;background:var(--panel2);border:1.5px solid var(--line-2);border-radius:var(--r-sm);color:var(--txt);text-align:left}
+  .theme-op:hover{background:var(--panel3)}
+  .theme-op.active{border-color:var(--accent);background:var(--panel3)}
+  .theme-op .theme-sw{display:flex;flex:0 0 auto;border-radius:5px;overflow:hidden;box-shadow:var(--sh-1),inset 0 0 0 1px rgba(255,255,255,.06)}
+  .theme-op .theme-sw i{width:13px;height:24px;display:block}
+  .theme-op .theme-nm{flex:1;font-size:13.5px;font-weight:600;color:var(--txt)}
+  .theme-op .ic{color:var(--accent);font-size:17px}
   .dbgstats{display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;background:var(--panel2);border-radius:var(--r-sm);padding:12px 14px;margin-bottom:4px;font-variant-numeric:tabular-nums;max-width:100%}
   .dbgstats div{display:flex;justify-content:space-between;gap:8px;font-size:12.5px;min-width:0}
   .dbgstats span{color:var(--muted);flex:0 0 auto}
