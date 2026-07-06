@@ -93,6 +93,12 @@ pub fn connect(ws_url: String, join: JoinParams) -> (mpsc::UnboundedSender<TreeC
                                 }
                             }
                         }
+                        Some(Ok(Message::Ping(data))) => {
+                            // Сервер шлёт heartbeat-ping (tree.js) и терминирует, если pong не
+                            // пришёл. При split-стриме авто-pong tungstenite ненадёжен — отвечаем
+                            // явно, иначе нативное вещание/relay рвалось бы каждые ~20с.
+                            let _ = write.send(Message::Pong(data)).await;
+                        }
                         Some(Ok(Message::Close(_))) | None => break,
                         Some(Err(e)) => { log::warn!("tree ws error: {e}"); break; }
                         _ => {}

@@ -9,6 +9,7 @@
 // keyframe у корня через сервер (request-keyframe -> tree.js -> broadcaster force IDR).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,8 +23,11 @@ use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit}
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
+use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType};
 use webrtc::rtp_transceiver::rtp_receiver::RTCRtpReceiver;
 use webrtc::rtp_transceiver::RTCRtpTransceiver;
@@ -68,7 +72,19 @@ struct RelayManager {
     cmd_tx: mpsc::UnboundedSender<TreeCmd>,
     app: Option<AppHandle>,
     stream_id: String,
+    /// Момент последнего RequestKeyframe по PLI (мс) — rate-limit против шторма PLI детей.
+    last_kf_ms: Arc<AtomicU64>,
+    /// Состояние upstream-PC (к родителю): 0=unknown,1=connected,2=disconnected,3=failed,4=closed.
+    /// Watchdog в stats_tick по нему решает про авто-reparent (ICE упал, а WS ещё жив).
+    upstream_state: Arc<AtomicU8>,
+    /// Момент последней смены upstream_state (мс) — чтобы отмерить длительность Disconnected.
+    upstream_since_ms: Arc<AtomicU64>,
 }
+
+// Кодировка upstream_state.
+const UP_CONNECTED: u8 = 1;
+const UP_DISCONNECTED: u8 = 2;
+const UP_FAILED: u8 = 3;
 
 impl RelayManager {
     fn new(stream_id: String, cmd_tx: mpsc::UnboundedSender<TreeCmd>, app: Option<AppHandle>) -> Result<Self, String> {
@@ -128,6 +144,9 @@ impl RelayManager {
             cmd_tx,
             app,
             stream_id,
+            last_kf_ms: Arc::new(AtomicU64::new(0)),
+            upstream_state: Arc::new(AtomicU8::new(0)),
+            upstream_since_ms: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -196,6 +215,26 @@ impl RelayManager {
             })
         }));
 
+        // Следим за состоянием upstream: если ICE упал (Failed/долгий Disconnected), а WS
+        // ещё жив, сервер не узнает об обрыве — зритель фризит навсегда. Watchdog в
+        // stats_tick прочитает это и попросит reparent. Мы answerer, restart_ice не применим.
+        self.upstream_state.store(0, Ordering::Relaxed);
+        self.upstream_since_ms.store(super::peer::now_ms(), Ordering::Relaxed);
+        let up_state = self.upstream_state.clone();
+        let up_since = self.upstream_since_ms.clone();
+        pc.on_peer_connection_state_change(Box::new(move |s| {
+            let code = match s {
+                RTCPeerConnectionState::Connected => UP_CONNECTED,
+                RTCPeerConnectionState::Disconnected => UP_DISCONNECTED,
+                RTCPeerConnectionState::Failed => UP_FAILED,
+                RTCPeerConnectionState::Closed => 4,
+                _ => 0,
+            };
+            up_state.store(code, Ordering::Relaxed);
+            up_since.store(super::peer::now_ms(), Ordering::Relaxed);
+            Box::pin(async {})
+        }));
+
         if let Err(e) = pc.set_remote_description(match RTCSessionDescription::offer(sdp) { Ok(d) => d, Err(e) => { log::error!("relay: bad parent offer: {e}"); return; } }).await {
             log::error!("relay: upstream set_remote: {e}"); return;
         }
@@ -215,13 +254,49 @@ impl RelayManager {
             Ok(pc) => Arc::new(pc),
             Err(e) => { log::error!("relay: downstream new_peer_connection: {e}"); return None; }
         };
-        if let Err(e) = pc.add_track(self.video_track.clone() as Arc<dyn TrackLocal + Send + Sync>).await { log::error!("relay: add video: {e}"); }
+        match pc.add_track(self.video_track.clone() as Arc<dyn TrackLocal + Send + Sync>).await {
+            Ok(sender) => {
+                // PLI/FIR от downstream-зрителя = «дай keyframe». Мы passthrough, сами IDR не
+                // генерим — форвардим запрос корню (сервер релеит request-keyframe -> корень
+                // форсит IDR). Rate-limit 1с на relay — против шторма PLI от многих детей.
+                let cmd_tx = self.cmd_tx.clone();
+                let last_kf = self.last_kf_ms.clone();
+                tokio::spawn(async move {
+                    while let Ok((pkts, _)) = sender.read_rtcp().await {
+                        let want_idr = pkts.iter().any(|p| {
+                            let a = p.as_any();
+                            a.downcast_ref::<PictureLossIndication>().is_some()
+                                || a.downcast_ref::<FullIntraRequest>().is_some()
+                        });
+                        if want_idr {
+                            let now = super::peer::now_ms();
+                            if now.saturating_sub(last_kf.load(Ordering::Relaxed)) >= 1000 {
+                                last_kf.store(now, Ordering::Relaxed);
+                                let _ = cmd_tx.send(TreeCmd::RequestKeyframe);
+                            }
+                        }
+                    }
+                });
+            }
+            Err(e) => log::error!("relay: add video: {e}"),
+        }
         if let Err(e) = pc.add_track(self.audio_track.clone() as Arc<dyn TrackLocal + Send + Sync>).await { log::error!("relay: add audio: {e}"); }
         Some(pc)
     }
 
     async fn on_assign_child(&mut self, child_id: String) {
         let pc = match self.make_downstream().await { Some(pc) => pc, None => return };
+        // Просим keyframe у корня только когда транспорт ребёнка встал (Connected), а не
+        // сразу при create_offer: IDR, отправленный до готовности DTLS/ICE ребёнка, до него
+        // не долетает (сендер роняет пакеты для неустановленного соединения) — раньше это
+        // давало чёрный экран новому зрителю через relay до следующего случайного IDR.
+        let kf_tx = self.cmd_tx.clone();
+        pc.on_peer_connection_state_change(Box::new(move |s| {
+            if s == RTCPeerConnectionState::Connected {
+                let _ = kf_tx.send(TreeCmd::RequestKeyframe);
+            }
+            Box::pin(async {})
+        }));
         let cmd_tx = self.cmd_tx.clone();
         let child = child_id.clone();
         pc.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
@@ -244,9 +319,11 @@ impl RelayManager {
             }
             Err(e) => { log::error!("relay: child create_offer: {e}"); return; }
         }
-        self.children.insert(child_id, pc);
-        // Новый ребёнок должен получить IDR — просим keyframe у корня (мы passthrough, сами не форсим).
-        let _ = self.cmd_tx.send(TreeCmd::RequestKeyframe);
+        if let Some(old) = self.children.insert(child_id, pc) {
+            // Повторный assign того же id без leave — старый PC иначе утёк бы.
+            tokio::spawn(async move { let _ = old.close().await; });
+        }
+        // Keyframe теперь просим из on_peer_connection_state_change (Connected), не здесь.
     }
 
     async fn on_child_answer(&mut self, from: String, sdp: String) {
@@ -281,6 +358,15 @@ impl RelayManager {
     async fn start_webview(&mut self) {
         if self.webview.is_some() { return; }
         let pc = match self.make_downstream().await { Some(pc) => pc, None => return };
+        // Локальный показ тоже должен получить IDR когда встанет транспорт (иначе чёрный
+        // экран у самого вещателя-ретранслятора до следующего случайного keyframe).
+        let kf_tx = self.cmd_tx.clone();
+        pc.on_peer_connection_state_change(Box::new(move |s| {
+            if s == RTCPeerConnectionState::Connected {
+                let _ = kf_tx.send(TreeCmd::RequestKeyframe);
+            }
+            Box::pin(async {})
+        }));
         let app = self.app.clone();
         let sid = self.stream_id.clone();
         pc.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
@@ -368,6 +454,8 @@ pub fn start(
         mgr.start_webview().await;
 
         let mut stats_tick = tokio::time::interval(Duration::from_secs(2));
+        // Cooldown авто-reparent по обрыву upstream (не чаще 10с — совпадает с серверным).
+        let mut last_reparent_ms: u64 = 0;
         loop {
             tokio::select! {
                 evt = evt_rx.recv() => {
@@ -394,6 +482,20 @@ pub fn start(
                     }
                 }
                 _ = stats_tick.tick() => {
+                    // Watchdog upstream: ICE упал (Failed сразу / Disconnected дольше 6с), а WS
+                    // жив — сервер не знает об обрыве, зритель фризит. Просим reparent (мы
+                    // answerer, restart_ice не применим — сервер даст нового/того же родителя).
+                    if mgr.upstream.is_some() {
+                        let st = mgr.upstream_state.load(Ordering::Relaxed);
+                        let now = super::peer::now_ms();
+                        let since = mgr.upstream_since_ms.load(Ordering::Relaxed);
+                        let bad = st == UP_FAILED || (st == UP_DISCONNECTED && now.saturating_sub(since) >= 6000);
+                        if bad && now.saturating_sub(last_reparent_ms) >= 10_000 {
+                            last_reparent_ms = now;
+                            log::warn!("relay: upstream state={st} — авто-reparent");
+                            let _ = mgr.cmd_tx.send(TreeCmd::RequestReparent { target: None });
+                        }
+                    }
                     // Э8: реальные loss/rtt по каждому детскому линку (RTCP RR через get_stats) —
                     // сервер агрегирует worst-link по дереву (ABR-битрейт вещателю) и кормит ими
                     // best-peer скоринг репарента. Раньше слали нули (заглушка).

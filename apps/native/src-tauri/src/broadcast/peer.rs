@@ -5,8 +5,9 @@
 // apps/web/src/transport/treeVideo.ts — родитель держит медиа, ребёнок отвечает).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
@@ -20,6 +21,8 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
+use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType};
 use webrtc::stats::StatsReportType;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
@@ -59,6 +62,14 @@ pub struct PeerManager {
     pub audio_track: Arc<TrackLocalStaticSample>,
     cmd_tx: UnboundedSender<TreeCmd>,
     force_keyframe: Arc<AtomicBool>,
+    /// Момент последнего форса IDR по PLI (мс от эпохи) — rate-limit против шторма
+    /// PLI от N детей (без него каждый зритель с потерями держал бы сплошные IDR).
+    last_pli_ms: Arc<AtomicU64>,
+}
+
+/// Текущее время в мс — для rate-limit PLI (грубая метка, монотонность не критична).
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 impl PeerManager {
@@ -115,6 +126,7 @@ impl PeerManager {
             audio_track,
             cmd_tx,
             force_keyframe,
+            last_pli_ms: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -132,8 +144,36 @@ impl PeerManager {
             Err(e) => { log::error!("peer: new_peer_connection: {e}"); return; }
         };
 
-        if let Err(e) = pc.add_track(self.video_track.clone() as Arc<dyn TrackLocal + Send + Sync>).await {
-            log::error!("peer: add_track video: {e}");
+        match pc.add_track(self.video_track.clone() as Arc<dyn TrackLocal + Send + Sync>).await {
+            Ok(sender) => {
+                // Читаем RTCP от ребёнка: PLI/FIR = «потерял keyframe, дай IDR». Без этого
+                // потеря пакета в P-кадре фризит зрителя до следующего события навсегда.
+                // Форсим IDR через общий force_keyframe (энкодер заберёт на след. кадре),
+                // rate-limit 1с на весь корень — против шторма PLI от многих детей.
+                let fk = self.force_keyframe.clone();
+                let last_pli = self.last_pli_ms.clone();
+                let child_dbg = child_id.clone();
+                tokio::spawn(async move {
+                    while let Ok((pkts, _)) = sender.read_rtcp().await {
+                        let want_idr = pkts.iter().any(|p| {
+                            let a = p.as_any();
+                            a.downcast_ref::<PictureLossIndication>().is_some()
+                                || a.downcast_ref::<FullIntraRequest>().is_some()
+                        });
+                        if want_idr {
+                            let now = now_ms();
+                            let prev = last_pli.load(Ordering::Relaxed);
+                            if now.saturating_sub(prev) >= 1000 {
+                                last_pli.store(now, Ordering::Relaxed);
+                                fk.store(true, Ordering::Relaxed);
+                                log::debug!("peer {child_dbg}: PLI -> force IDR");
+                            }
+                        }
+                    }
+                    // read_rtcp вернул Err (ErrClosedPipe при закрытии PC) — задача завершается.
+                });
+            }
+            Err(e) => log::error!("peer: add_track video: {e}"),
         }
         if let Err(e) = pc.add_track(self.audio_track.clone() as Arc<dyn TrackLocal + Send + Sync>).await {
             log::error!("peer: add_track audio: {e}");
@@ -184,7 +224,11 @@ impl PeerManager {
             Err(e) => { log::error!("peer: create_offer: {e}"); return; }
         }
 
-        self.children.insert(child_id, pc);
+        if let Some(old) = self.children.insert(child_id, pc) {
+            // Повторный assign того же id без предшествующего leave — старый PC иначе
+            // утекал бы (висящий сендер + RTCP-таск). Закрываем в фоне.
+            tokio::spawn(async move { let _ = old.close().await; });
+        }
     }
 
     pub async fn on_sdp_answer(&mut self, from: String, sdp: String) {

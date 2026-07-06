@@ -88,6 +88,14 @@ impl H264Encoder {
                 // CBR вместо дефолтного VBR — статичный битрейт (не плавает с содержимым сцены),
                 // предсказуемая нагрузка на дерево/TURN.
                 let _ = api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &VARIANT::from(eAVEncCommonRateControlMode_CBR.0));
+                // Периодический IDR (GOP) как страховка от потери keyframe: основной путь
+                // восстановления — PLI от зрителя (peer.rs читает RTCP и форсит IDR), но если
+                // PLI/force потерялся, без периодического GOP зритель фризит до следующего
+                // события навсегда. GOP в кадрах = fps*4 (~4с): при 6 Мбит IDR ~100-300КБ,
+                // оверхед незаметный, максимум 4с фриза. 2с слишком часто для CBR (спайки).
+                // Часть MFT игнорирует свойство — тогда полагаемся только на PLI (let _ =).
+                const GOP_SECONDS: u32 = 4;
+                let _ = api.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(fps.saturating_mul(GOP_SECONDS).max(1)));
             }
 
             let stream_info = transform.GetOutputStreamInfo(0).map_err(|e| format!("GetOutputStreamInfo: {e}"))?;
