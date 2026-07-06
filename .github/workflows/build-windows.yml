@@ -59,6 +59,11 @@ jobs:
         run: npm run build --prefix apps/native
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+          # Абсолютные URL для натив-webview: location.host = tauri.localhost (bundle без
+          # reverse-proxy), поэтому REST/WS дерева указываем на прод явно. Vite впекает
+          # VITE_-префиксные из process.env в beforeBuildCommand-сборку веба.
+          VITE_TREE_WS_URL: wss://138-16-170-21.sslip.io/tree
+          VITE_API_BASE_URL: https://138-16-170-21.sslip.io
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 

@@ -61,7 +61,11 @@ interface WatchState {
 
 function treeWsUrl(): string {
   const override = (import.meta as any).env?.VITE_TREE_WS_URL as string | undefined;
-  const base = override || ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/tree');
+  // В нативе location.host = tauri.localhost (bundle без reverse-proxy) — фолбэк на прод-сервер,
+  // тот же, что nativeWsUrl в native.ts. Без него discovery/viewer-сокеты webview шли бы в
+  // tauri.localhost → liveStreams пуст → активные стримы и LIVE-бейджи не видны в натив-приложении.
+  const nativeDefault = isTauri ? 'wss://138-16-170-21.sslip.io/tree' : null;
+  const base = override || nativeDefault || ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/tree');
   const token = getToken() || '';
   return base + (base.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
 }
