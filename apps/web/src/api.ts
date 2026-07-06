@@ -30,6 +30,13 @@ export function resolveUploadUrl(u?: string): string | undefined {
   return API_BASE + u;
 }
 
+// Origin веб-приложения для внешних ссылок (инвайты). В нативе location.origin =
+// tauri.localhost, поэтому берём прод-хост (Caddy отдаёт и веб, и API на одном origin).
+// В вебе API_BASE пуст → location.origin. Инвайт всегда должен открываться в браузере.
+export function webOrigin(): string {
+  return API_BASE || location.origin;
+}
+
 async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = {};
   if (token) headers['Authorization'] = 'Bearer ' + token;
