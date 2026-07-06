@@ -410,6 +410,7 @@ function StreamTile({ streamKey, identity, isLocal }: { streamKey: string; ident
   const [floats, setFloats] = useState<{ id: number; url: string; by: string; x: number; size?: string }[]>([]);
   const [stats, setStats] = useState('');
   const [statsOn, setStatsOn] = useState(true);
+  const [treeOpen, setTreeOpen] = useState(false);
   const [pickAnchor, setPickAnchor] = useState<DOMRect | null | undefined>(undefined);
   const sprayRef = useRef<HTMLButtonElement>(null);
   const floatSeq = useRef(1);
@@ -471,6 +472,7 @@ function StreamTile({ streamKey, identity, isLocal }: { streamKey: string; ident
     <div className="vwrap" ref={wrapRef} onDoubleClick={toggleFs}>
       <video ref={vidRef} autoPlay playsInline />
       <div className="lbl">🖥 {name}{isLocal ? ' (ты)' : ''}</div>
+      {!isLocal ? <StreamSourceBadge identity={identity} /> : null}
       <div className="emolayer">
         {floats.map((f) => (
           <div className={'floatEmo em-' + (f.size || 'md')} key={f.id} style={{ left: Math.max(2, Math.min(92, f.x * 100)) + '%' }}>
@@ -499,15 +501,71 @@ function StreamTile({ streamKey, identity, isLocal }: { streamKey: string; ident
           </>
         ) : <span className="vb-lbl">🖥 Твоя трансляция</span>}
         <div className="vb-sp" />
+        {!isLocal ? <button className={'vb-btn' + (treeOpen ? ' active' : '')} data-tip="Дерево трансляции — выбрать пира" onClick={() => setTreeOpen((v) => !v)}><Icon name="users" sm /></button> : null}
         <button className="vb-btn" data-tip="Картинка-в-картинке" onClick={togglePip}><Icon name="pip" sm /></button>
         <button className="vb-btn" data-tip="Во весь экран" onClick={toggleFs}><Icon name="fullscreen" sm /></button>
         {!isLocal ? <button className="vb-btn danger" data-tip="Закрыть трансляцию" onClick={() => E.closeWatch(identity)}><Icon name="close" sm /></button> : null}
       </div>
+      {!isLocal && treeOpen ? <TreePeerPanel identity={identity} onClose={() => setTreeOpen(false)} /> : null}
       <div className="statsbox">
         <button className="stats-toggle" data-tip={statsOn ? 'Скрыть статистику' : 'Показать статистику'} onClick={(e) => { e.stopPropagation(); setStatsOn((v) => !v); }}><Icon name="info" sm /></button>
         {statsOn && stats ? <div className="stats" dangerouslySetInnerHTML={{ __html: stats }} /> : null}
       </div>
       {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} sizePicker onClose={() => setPickAnchor(undefined)} onPick={(em) => E.fling(identity, em, emoteSize)} /> : null}
+    </div>
+  );
+}
+
+/* Э8: бейдж «откуда идёт поток» + панель дерева с ручным выбором пира. Топология
+   приходит из tree-topology (браузер — по ws; натив — из Rust через IPC, см. treeVideo). */
+function StreamSourceBadge({ identity }: { identity: string }) {
+  useEngine(); // ре-рендер при смене топологии (engine.onTopology -> emit)
+  const E = getEngine()!;
+  const members = useStore((s) => s.members);
+  const topo = E.getStreamTopology(identity);
+  if (!topo || !topo.you) return null;
+  const you = topo.nodes.find((n) => n.id === topo.you);
+  if (!you) return null;
+  const parent = you.parentId ? topo.nodes.find((n) => n.id === you.parentId) : null;
+  const label = !parent ? 'подключение…' : parent.broadcaster ? 'напрямую от вещателя' : (members.find((m) => m.username === parent.identity)?.displayName || parent.identity);
+  return (
+    <div className="srcbadge" style={{ position: 'absolute', top: 8, right: 8, display: 'flex', alignItems: 'center', gap: 4, padding: '3px 8px', borderRadius: 12, fontSize: 11, background: 'rgba(0,0,0,.55)', color: '#fff', pointerEvents: 'none' }}>
+      <Icon name="link" sm />источник: {label}{you.children ? ` · ретрансляция ×${you.children}` : ''}
+    </div>
+  );
+}
+
+function TreePeerPanel({ identity, onClose }: { identity: string; onClose: () => void }) {
+  useEngine();
+  const E = getEngine()!;
+  const members = useStore((s) => s.members);
+  const topo = E.getStreamTopology(identity);
+  const nameOf = (n: { broadcaster: boolean; identity: string }) => n.broadcaster ? '📡 вещатель' : (members.find((m) => m.username === n.identity)?.displayName || n.identity);
+  const youNode = topo?.nodes.find((n) => n.id === topo.you);
+  return (
+    <div className="treepanel" onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}
+      style={{ position: 'absolute', right: 8, bottom: 52, width: 280, maxHeight: 320, overflow: 'auto', background: 'rgba(20,22,28,.96)', border: '1px solid rgba(255,255,255,.1)', borderRadius: 10, padding: 10, zIndex: 5, color: '#fff', fontSize: 12 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+        <b>Дерево трансляции</b>
+        <button className="vb-btn" onClick={onClose}><Icon name="close" sm /></button>
+      </div>
+      {!topo || !topo.nodes.length ? <div style={{ opacity: .6 }}>Нет данных о дереве</div> : <>
+        {[...topo.nodes].sort((a, b) => a.depth - b.depth).map((n) => {
+          const isYou = n.id === topo.you;
+          const isParent = youNode?.parentId === n.id;
+          const pickable = !isYou && !isParent && n.children < n.capacity;
+          return (
+            <div key={n.id} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 0', paddingLeft: n.depth * 10, borderBottom: '1px solid rgba(255,255,255,.05)' }}>
+              <span style={{ flex: 1, fontWeight: isYou ? 700 : 400, color: isParent ? '#8fd3ff' : '#fff' }}>
+                {nameOf(n)}{isYou ? ' (ты)' : ''}{isParent ? ' · источник' : ''}
+              </span>
+              <span style={{ opacity: .6, fontSize: 11 }}>гл.{n.depth} · {n.children}/{n.capacity}{n.native ? '' : ' 🌐'}</span>
+              {pickable ? <button className="primary" style={{ margin: 0, padding: '2px 8px', fontSize: 11 }} onClick={() => E.requestReparent(identity, n.id)}>взять</button> : <span style={{ width: 44 }} />}
+            </div>
+          );
+        })}
+        <button className="ghost" style={{ margin: '8px 0 0', width: '100%' }} onClick={() => E.requestReparent(identity, null)}>Авто: лучший пир</button>
+      </>}
     </div>
   );
 }

@@ -141,6 +141,8 @@ export class Engine {
       t.onStreamStart(onStreamStart);
       t.onStreamStop(onStreamStop);
     }
+    // Э8: топология дерева меняется (join/leave/reparent) — перерисовать UI пикера пиров.
+    this.treeT.onTopology?.(() => this.emit());
     this.snap = this.build();
   }
 
@@ -556,6 +558,11 @@ export class Engine {
    *  `null` для транспортов без дерева (LiveKit) — StreamTile просто не покажет панель. */
   getTreeInfo(identity: string) { return this.transportFor(identity).getTreeInfo?.(identity) ?? null; }
   async getWatchRtpStats(identity: string) { return (await this.transportFor(identity).getRtpStats?.(identity)) ?? null; }
+
+  /** Э8: топология дерева стрима + текущий родитель + ручной выбор пира (для UI пикера). */
+  getStreamTopology(identity: string) { return this.transportFor(identity).getTopology?.(identity) ?? null; }
+  getStreamParentId(identity: string) { return this.transportFor(identity).getParentId?.(identity) ?? null; }
+  requestReparent(identity: string, targetId: string | null) { this.transportFor(identity).requestReparent?.(identity, targetId); }
 
   /* ---------- emotes (spray) ---------- */
   onEmote(cb: EmoteListener) { this.emoteListeners.add(cb); return () => { this.emoteListeners.delete(cb); }; }
