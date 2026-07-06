@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
@@ -51,6 +51,9 @@ pub struct CaptureFlags {
     /// масштабируется вниз, если больше; апскейл никогда не делаем.
     pub max_width: u32,
     pub max_height: u32,
+    /// Целевой FPS — для программного пейсинга в on_frame_arrived (WGC отдаёт
+    /// коарс-поток чуть выше цели, точный каденс держим здесь). См. spawn_capture.
+    pub target_fps: u32,
     pub stats: StatsHandle,
 }
 
@@ -63,6 +66,43 @@ pub struct ScreenCapture {
     scratch: Vec<u8>,
     fps_window_start: Instant,
     fps_window_count: u32,
+    /// Дедлайн-аккумулятор пейсинга: `target_period` = 1/target_fps, `next_deadline`
+    /// = момент, к которому ждём следующий принятый кадр. Ниже цели пропускаем всё
+    /// (источник медленнее — дропать нечего), режем только реальный овершут над целью
+    /// (WGC на 120/144/164 Гц). Прежний порог «время с прошлого принятого» ошибочно
+    /// дропал бурстовые кадры даже под целью (raw 31 -> accepted 24 на Доте).
+    target_period: Duration,
+    next_deadline: Option<Instant>,
+    /// Таблицы соответствия выходной пиксель -> исходный: `col_lut[x]` — байтовый
+    /// сдвиг колонки внутри исходной строки (x*src_w/out_w * 4), `row_lut[y]` —
+    /// индекс исходной строки (y*src_h/out_h). Считаются один раз на разрешение —
+    /// убирают 64-битное умножение+деление из горячего цикла конвертации (это и
+    /// был потолок ~38 fps на 1080p: ~5М делений/кадр). `lut_key` — (src_w,src_h,
+    /// out_w,out_h), под которые построены таблицы.
+    col_lut: Vec<u32>,
+    row_lut: Vec<u32>,
+    lut_key: (u32, u32, u32, u32),
+    /// Сырые вызовы on_frame_arrived (до гейта) за окно = темп отдачи WGC (`raw` в
+    /// логе). Отделяет «источник мало презентит» от «гейт режет» при разборе fps.
+    raw_window_count: u32,
+}
+
+impl ScreenCapture {
+    /// Пересобирает LUT-таблицы, если сменилось разрешение источника/выхода
+    /// (ресайз окна, DPI). В стабильном случае — no-op (сверка ключа).
+    fn ensure_luts(&mut self, src_w: u32, src_h: u32, out_w: u32, out_h: u32) {
+        let key = (src_w, src_h, out_w, out_h);
+        if self.lut_key == key && !self.col_lut.is_empty() {
+            return;
+        }
+        self.col_lut = (0..out_w)
+            .map(|x| (x as u64 * src_w as u64 / out_w as u64) as u32 * 4)
+            .collect();
+        self.row_lut = (0..out_h)
+            .map(|y| (y as u64 * src_h as u64 / out_h as u64) as u32)
+            .collect();
+        self.lut_key = key;
+    }
 }
 
 impl GraphicsCaptureApiHandler for ScreenCapture {
@@ -79,6 +119,12 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
             scratch: Vec::new(),
             fps_window_start: Instant::now(),
             fps_window_count: 0,
+            target_period: Duration::from_secs_f64(1.0 / ctx.flags.target_fps.max(1) as f64),
+            next_deadline: None,
+            col_lut: Vec::new(),
+            row_lut: Vec::new(),
+            lut_key: (0, 0, 0, 0),
+            raw_window_count: 0,
         })
     }
 
@@ -92,6 +138,31 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
             return Ok(());
         }
 
+        // Диагностика: сырые вызовы (до гейта) = темп отдачи WGC.
+        self.raw_window_count += 1;
+
+        // Программный пейсинг дедлайн-аккумулятором: дропаем кадр, только если он
+        // пришёл РАНЬШЕ следующего дедлайна (реальный овершут над целью — WGC на
+        // 120/144/164 Гц). Если источник медленнее цели, дедлайн всегда в прошлом —
+        // пропускаем всё, ничего не теряя. Дроп ДО конвертации BGRA->NV12 экономит CPU.
+        // slack (период/8) позволяет принять кадр чуть раньше дедлайна, чтобы не
+        // сдвигать приём на следующий презент источника (иначе бился бы с каденсом).
+        let now = Instant::now();
+        let slack = self.target_period / 8;
+        match self.next_deadline {
+            None => self.next_deadline = Some(now + self.target_period),
+            Some(dl) => {
+                if now + slack < dl {
+                    return Ok(()); // раньше дедлайна — овершут, дропаем
+                }
+                // Приняли: сдвигаем дедлайн на период. Если уже отстали (источник
+                // медленнее цели) — привязываем к now, чтобы гейт не «догонял» долг
+                // пакетным приёмом и не резал последующие бурсты.
+                let next = dl + self.target_period;
+                self.next_deadline = Some(if next <= now { now + self.target_period } else { next });
+            }
+        }
+
         let src_w = frame.width();
         let src_h = frame.height();
         let mut buf = frame.buffer()?;
@@ -103,7 +174,8 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
         if self.scratch.len() != nv12_len {
             self.scratch = vec![0u8; nv12_len];
         }
-        bgra_to_nv12_scaled(raw, src_w, src_h, row_pitch, out_w, out_h, &mut self.scratch);
+        self.ensure_luts(src_w, src_h, out_w, out_h);
+        bgra_to_nv12_luts(raw, row_pitch, out_w, out_h, &self.col_lut, &self.row_lut, &mut self.scratch);
 
         self.stats.out_width.store(out_w, Ordering::Relaxed);
         self.stats.out_height.store(out_h, Ordering::Relaxed);
@@ -121,9 +193,15 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
         self.fps_window_count += 1;
         let elapsed = self.fps_window_start.elapsed();
         if elapsed.as_secs() >= 2 {
-            let fps = self.fps_window_count as f64 / elapsed.as_secs_f64();
-            log::info!("capture: {:.1} fps ({out_w}x{out_h}, source WGC frame rate)", fps);
+            let secs = elapsed.as_secs_f64();
+            let accepted = self.fps_window_count as f64 / secs;
+            let raw = self.raw_window_count as f64 / secs;
+            // accepted = fps, ушедший в трек; raw = темп отдачи WGC. raw≈accepted и оба
+            // низкие -> источник мало презентит (кап не наш). raw>>accepted -> гейт режет
+            // овершут над целью (норма на 120/144 Гц).
+            log::info!("capture: accepted={accepted:.1} raw={raw:.1} fps ({out_w}x{out_h})");
             self.fps_window_count = 0;
+            self.raw_window_count = 0;
             self.fps_window_start = Instant::now();
         }
         Ok(())
@@ -145,46 +223,69 @@ fn scaled_dims(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     (w, h)
 }
 
-/// BGRA8 (с учётом row_pitch) -> NV12, с масштабированием методом ближайшего
-/// соседа. Формулы BT.601 (studio range) — стандартные целочисленные коэффициенты.
+/// BGRA8 (с учётом row_pitch) -> NV12, ближайший сосед через LUT-таблицы
+/// (`col_lut`/`row_lut` см. ScreenCapture::ensure_luts) — без деления в цикле.
+/// Формулы BT.601 (studio range), стандартные целочисленные коэффициенты.
+/// Y-плоскость (доминирующая по стоимости) считается параллельно по бэндам строк
+/// через `std::thread::scope`: раньше однопоточная скалярная конвертация с делением
+/// на пиксель упиралась в ~38 fps на 1080p. Хрома (1/4 объёма) — однопоточно.
 ///
 /// Замечание: `windows-capture` отдаёт кадр уже как ID3D11Texture2D
 /// (`frame.as_raw_texture()`), то есть теоретически возможен zero-copy путь
-/// GPU-кадр -> DXGI-буфер MFT без обратного чтения в CPU. Здесь взят CPU-путь
-/// (проще, latency-бюджет ≤3с это позволяет) — GPU zero-copy можно сделать
-/// отдельной оптимизацией, не блокирует AC Э5.
-fn bgra_to_nv12_scaled(
+/// GPU-кадр -> DXGI-буфер MFT без обратного чтения в CPU. Здесь CPU-путь (проще,
+/// latency-бюджет ≤3с позволяет) — GPU zero-copy отдельная оптимизация, не блокер.
+fn bgra_to_nv12_luts(
     src: &[u8],
-    src_w: u32,
-    src_h: u32,
     row_pitch: u32,
     out_w: u32,
     out_h: u32,
+    col_lut: &[u32],
+    row_lut: &[u32],
     dst: &mut [u8],
 ) {
-    let y_size = (out_w * out_h) as usize;
+    let out_w = out_w as usize;
+    let out_h = out_h as usize;
+    let pitch = row_pitch as usize;
+    let y_size = out_w * out_h;
     let (y_plane, uv_plane) = dst.split_at_mut(y_size);
 
-    let sample_bgr = |x: u32, y: u32| -> (i32, i32, i32) {
-        let sx = (x as u64 * src_w as u64 / out_w as u64) as u32;
-        let sy = (y as u64 * src_h as u64 / out_h as u64) as u32;
-        let off = (sy * row_pitch + sx * 4) as usize;
-        (src[off + 2] as i32, src[off + 1] as i32, src[off] as i32) // R,G,B
-    };
-
-    for y in 0..out_h {
-        for x in 0..out_w {
-            let (r, g, b) = sample_bgr(x, y);
-            let yv = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-            y_plane[(y * out_w + x) as usize] = yv.clamp(0, 255) as u8;
+    // Число бэндов — по ядрам, но не больше числа строк; кап 12 против лишнего
+    // дробления. Каждый бэнд пишет непересекающийся диапазон строк Y.
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let bands = cores.clamp(1, 12).min(out_h.max(1));
+    let rows_per_band = out_h.div_ceil(bands);
+    std::thread::scope(|s| {
+        for (b, y_chunk) in y_plane.chunks_mut(rows_per_band * out_w).enumerate() {
+            let row0 = b * rows_per_band;
+            s.spawn(move || {
+                let rows = y_chunk.len() / out_w;
+                for ry in 0..rows {
+                    let base = row_lut[row0 + ry] as usize * pitch;
+                    let out_base = ry * out_w;
+                    for x in 0..out_w {
+                        let off = base + col_lut[x] as usize;
+                        let r = src[off + 2] as i32;
+                        let g = src[off + 1] as i32;
+                        let bl = src[off] as i32;
+                        let yv = ((66 * r + 129 * g + 25 * bl + 128) >> 8) + 16;
+                        y_chunk[out_base + x] = yv.clamp(0, 255) as u8;
+                    }
+                }
+            });
         }
-    }
+    });
+
     for y in (0..out_h).step_by(2) {
+        let base = row_lut[y] as usize * pitch;
+        let uv_row = (y / 2) * out_w;
         for x in (0..out_w).step_by(2) {
-            let (r, g, b) = sample_bgr(x, y);
-            let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-            let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-            let idx = ((y / 2) * out_w + x) as usize;
+            let off = base + col_lut[x] as usize;
+            let r = src[off + 2] as i32;
+            let g = src[off + 1] as i32;
+            let bl = src[off] as i32;
+            let u = ((-38 * r - 74 * g + 112 * bl + 128) >> 8) + 128;
+            let v = ((112 * r - 94 * g - 18 * bl + 128) >> 8) + 128;
+            let idx = uv_row + x;
             uv_plane[idx] = u.clamp(0, 255) as u8;
             uv_plane[idx + 1] = v.clamp(0, 255) as u8;
         }
@@ -251,47 +352,81 @@ pub fn spawn_capture(
     let stop2 = stop.clone();
 
     let handle = std::thread::spawn(move || {
-        // Без троттлинга WGC отдаёт кадры с реальной частотой обновления монитора
-        // (может быть заметно выше target_fps) — лишняя нагрузка на CPU/энкодер.
-        // RTP-сэмплы в mod.rs размечены реальным интервалом между `captured_at`,
-        // а не номинальным target_fps, так что неравномерная выдача WGC сама по
-        // себе к рассинхрону таймстемпов уже не приводит.
-        let min_interval = MinimumUpdateIntervalSettings::Custom(
-            std::time::Duration::from_secs_f64(1.0 / target_fps.max(1) as f64),
-        );
-        let flags = CaptureFlags { tx, stop: stop2, max_width, max_height, stats };
-        let result = match source {
-            CaptureSource::Monitor { index } => Monitor::from_index(index).map_err(|e| e.to_string()).and_then(|monitor| {
-                let settings = Settings::new(
-                    monitor,
-                    CursorCaptureSettings::WithCursor,
-                    DrawBorderSettings::WithoutBorder,
-                    SecondaryWindowSettings::Default,
-                    min_interval,
-                    DirtyRegionSettings::Default,
-                    ColorFormat::Bgra8,
-                    flags,
-                );
-                ScreenCapture::start(settings).map_err(|e| e.to_string())
-            }),
-            CaptureSource::Window { hwnd } => {
-                let window = Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void);
-                let settings = Settings::new(
-                    window,
-                    CursorCaptureSettings::WithCursor,
-                    DrawBorderSettings::WithoutBorder,
-                    SecondaryWindowSettings::Default,
-                    min_interval,
-                    DirtyRegionSettings::Default,
-                    ColorFormat::Bgra8,
-                    flags,
-                );
-                ScreenCapture::start(settings).map_err(|e| e.to_string())
+        // Троттл WGC ставим коарс — на 0.5×периода цели, а не ровно на период.
+        // Раньше min_interval == 1/target_fps бился по фазе с vblank монитора:
+        // когда порог совпадал с периодом обновления (60 fps на 60 Гц = 16.67 мс),
+        // джиттер ронял пограничные тики и отдача схлопывалась вдвое (60->30, 30->27).
+        // 0.5×периода гарантированно ниже периода vblank при target_fps <= refresh,
+        // так что WGC отдаёт как минимум с частотой цели без биения; точный каденс
+        // подрезает программный гейт в on_frame_arrived. RTP-сэмплы в mod.rs
+        // размечены реальным интервалом между `captured_at`, синхру это не трогает.
+        // Создание WGC capture-item ("convert item to GraphicsCaptureItem") иногда
+        // падает транзиентно сразу после выбора источника (окно ещё «устаканивается»,
+        // гонка DPI/композитора) — HWND валиден в проверке выше, но start падает и
+        // раньше это мгновенно убивало трансляцию (тост «окно/монитор пропали»).
+        // Повторяем старт несколько раз с паузой, прежде чем сдаться: в логах тот же
+        // источник поднимался после пары неудач. min_interval/flags пересобираем
+        // каждую попытку (Settings::new забирает их по значению).
+        const START_ATTEMPTS: u32 = 5;
+        let mut last_err = String::new();
+        for attempt in 1..=START_ATTEMPTS {
+            if stop2.load(Ordering::Relaxed) {
+                return; // остановили до успешного старта
             }
-        };
-        if let Err(e) = result {
-            log::error!("capture: {e}");
+            let min_interval = MinimumUpdateIntervalSettings::Custom(
+                std::time::Duration::from_secs_f64(0.5 / target_fps.max(1) as f64),
+            );
+            let flags = CaptureFlags {
+                tx: tx.clone(),
+                stop: stop2.clone(),
+                max_width,
+                max_height,
+                target_fps,
+                stats: stats.clone(),
+            };
+            let result = match source {
+                CaptureSource::Monitor { index } => Monitor::from_index(index).map_err(|e| e.to_string()).and_then(|monitor| {
+                    let settings = Settings::new(
+                        monitor,
+                        CursorCaptureSettings::WithCursor,
+                        DrawBorderSettings::WithoutBorder,
+                        SecondaryWindowSettings::Default,
+                        min_interval,
+                        DirtyRegionSettings::Default,
+                        ColorFormat::Bgra8,
+                        flags,
+                    );
+                    ScreenCapture::start(settings).map_err(|e| e.to_string())
+                }),
+                CaptureSource::Window { hwnd } => {
+                    let window = Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void);
+                    let settings = Settings::new(
+                        window,
+                        CursorCaptureSettings::WithCursor,
+                        DrawBorderSettings::WithoutBorder,
+                        SecondaryWindowSettings::Default,
+                        min_interval,
+                        DirtyRegionSettings::Default,
+                        ColorFormat::Bgra8,
+                        flags,
+                    );
+                    ScreenCapture::start(settings).map_err(|e| e.to_string())
+                }
+            };
+            match result {
+                // Ok = сессия отработала и штатно завершилась (стоп по кнопке) —
+                // выходим, ретраить нечего.
+                Ok(()) => return,
+                Err(e) => {
+                    last_err = e;
+                    log::warn!("capture: попытка старта {attempt}/{START_ATTEMPTS} не удалась: {last_err}");
+                    if attempt < START_ATTEMPTS && !stop2.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+            }
         }
+        log::error!("capture: старт не удался после {START_ATTEMPTS} попыток: {last_err}");
     });
 
     Ok((handle, stop, rx))
