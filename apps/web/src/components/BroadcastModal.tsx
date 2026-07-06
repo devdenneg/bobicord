@@ -19,7 +19,7 @@ interface SavedConfig {
   windowHwnd: number | null;
   resolution: Resolution;
   fps: 30 | 60;
-  bitrateMbps: 3 | 6 | 10;
+  bitrateMbps: 3 | 6 | 10 | 15 | 20;
   /** exclude — весь звук кроме RelayApp (WASAPI EXCLUDE себя, не всегда надёжно
    *  фильтрует наш многопроцессный WebView2, см. CLAUDE.md инвариант 6 и audio.rs).
    *  include — только звук выбранного процесса (надёжнее). */
@@ -129,7 +129,7 @@ export function BroadcastModal() {
       </div>
     </div>
     <div className="fld"><label>Битрейт</label>
-      <div className="seg">{[3, 6, 10].map((b) => <button key={b} className={cfg.bitrateMbps === b ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, bitrateMbps: b as 3 | 6 | 10 }))}>{b} Мбит/с</button>)}</div>
+      <div className="seg">{[3, 6, 10, 15, 20].map((b) => <button key={b} className={cfg.bitrateMbps === b ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, bitrateMbps: b as 3 | 6 | 10 | 15 | 20 }))}>{b} Мбит/с</button>)}</div>
     </div>
     <div className="fld"><label>Звук</label>
       <div className="seg">

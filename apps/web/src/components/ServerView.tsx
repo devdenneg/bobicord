@@ -409,6 +409,7 @@ function StreamTile({ streamKey, identity, isLocal }: { streamKey: string; ident
   const vidRef = useRef<HTMLVideoElement>(null);
   const [floats, setFloats] = useState<{ id: number; url: string; by: string; x: number; size?: string }[]>([]);
   const [stats, setStats] = useState('');
+  const [statsOn, setStatsOn] = useState(true);
   const [pickAnchor, setPickAnchor] = useState<DOMRect | null | undefined>(undefined);
   const sprayRef = useRef<HTMLButtonElement>(null);
   const floatSeq = useRef(1);
@@ -502,7 +503,10 @@ function StreamTile({ streamKey, identity, isLocal }: { streamKey: string; ident
         <button className="vb-btn" data-tip="Во весь экран" onClick={toggleFs}><Icon name="fullscreen" sm /></button>
         {!isLocal ? <button className="vb-btn danger" data-tip="Закрыть трансляцию" onClick={() => E.closeWatch(identity)}><Icon name="close" sm /></button> : null}
       </div>
-      {stats ? <div className="stats" dangerouslySetInnerHTML={{ __html: stats }} /> : null}
+      <div className="statsbox">
+        <button className="stats-toggle" data-tip={statsOn ? 'Скрыть статистику' : 'Показать статистику'} onClick={(e) => { e.stopPropagation(); setStatsOn((v) => !v); }}><Icon name="info" sm /></button>
+        {statsOn && stats ? <div className="stats" dangerouslySetInnerHTML={{ __html: stats }} /> : null}
+      </div>
       {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} sizePicker onClose={() => setPickAnchor(undefined)} onPick={(em) => E.fling(identity, em, emoteSize)} /> : null}
     </div>
   );
