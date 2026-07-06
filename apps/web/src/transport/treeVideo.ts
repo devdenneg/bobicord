@@ -57,6 +57,7 @@ interface WatchState {
   pendingChildren: Set<string>;   // assign-child пришёл раньше, чем появился трек
   maxChildren: number;
   joined: boolean;                // join уже отправлен (шлём после welcome — см. sendWatchJoin)
+  statsTimer: ReturnType<typeof setInterval> | null; // отчёт loss/rtt по детям (Э8 ABR)
 }
 
 
@@ -189,8 +190,14 @@ export class TreeVideoTransport implements VideoTransport {
     const st: WatchState = {
       ws, pc: null, parentId: null, closed: false, iceServers: this.iceServers,
       recvVideo: null, recvAudio: null, children: new Map(), pendingChildren: new Set(), maxChildren: 0, joined: false,
+      statsTimer: null,
     };
     this.watches.set(streamId, st);
+    // Э8 ABR: браузерный relay раньше НЕ слал stats — его линки к детям были невидимы
+    // серверу (worst-link ABR и best-peer скоринг их не учитывали): деградация под
+    // браузерным родителем не роняла битрейт и не триггерила миграцию. Тот же темп
+    // (2с), что у нативных узлов.
+    st.statsTimer = setInterval(() => { void this.reportChildStats(st); }, 2000);
 
     // join шлём НЕ в onopen, а после welcome (см. sendWatchJoin): welcome несёт актуальные
     // iceServers, и только зная, есть ли TURN, можно решить ёмкость relay при симметричном NAT.
@@ -233,12 +240,38 @@ export class TreeVideoTransport implements VideoTransport {
     st.maxChildren = cantRelay ? 0 : BROWSER_RELAY_CAPACITY;
     try { st.ws.send(JSON.stringify({ t: 'join', streamId, role: 'viewer', native: false, maxChildren: st.maxChildren, identity: this.me, symmetricNat, serverId: this.serverId })); } catch { /**/ }
   }
+  // Отчёт серверу о качестве линков к нашим детям (Э8 ABR + best-peer). Взгляд
+  // отправителя: remote-inbound-rtp = RTCP RR от ребёнка (fractionLost 0..1,
+  // roundTripTime в секундах). availableOutgoingBitrate — BWE-оценка аплинка.
+  private async reportChildStats(st: WatchState) {
+    if (st.closed || !st.children.size || st.ws.readyState !== WebSocket.OPEN) return;
+    const toChild: Array<{ id: string; bitrate: number; rtt: number; loss: number }> = [];
+    let availOut = 0;
+    for (const [id, pc] of st.children) {
+      let report: RTCStatsReport;
+      try { report = await pc.getStats(); } catch { continue; }
+      let loss = -1, rtt = 0;
+      for (const s of report.values() as Iterable<any>) {
+        if (s.type === 'remote-inbound-rtp' && s.kind === 'video') {
+          loss = Math.max(loss, typeof s.fractionLost === 'number' ? s.fractionLost : 0);
+          if (typeof s.roundTripTime === 'number') rtt = Math.max(rtt, s.roundTripTime * 1000);
+        } else if (s.type === 'candidate-pair' && s.nominated && typeof s.availableOutgoingBitrate === 'number') {
+          availOut = Math.max(availOut, s.availableOutgoingBitrate);
+        }
+      }
+      if (loss >= 0) toChild.push({ id, bitrate: 0, rtt, loss }); // нет RR — линк ещё поднимается, пропуск
+    }
+    if (!toChild.length && !availOut) return;
+    try { st.ws.send(JSON.stringify({ t: 'stats', toChild, availableOutgoing: Math.round(availOut) })); } catch { /**/ }
+  }
+
   unwatch(streamId: string) {
     const nst = this.nativeWatches.get(streamId);
     if (nst) { this.nativeUnwatch(streamId, nst); return; }
     const st = this.watches.get(streamId);
     if (!st) return;
     st.closed = true;
+    if (st.statsTimer) { clearInterval(st.statsTimer); st.statsTimer = null; }
     try { st.ws.send(JSON.stringify({ t: 'leave' })); } catch { /**/ }
     try { st.ws.close(); } catch { /**/ }
     if (st.pc) { try { st.pc.close(); } catch { /**/ } }
@@ -248,6 +281,7 @@ export class TreeVideoTransport implements VideoTransport {
     this.delVideo(streamId);
   }
   private teardownWatch(streamId: string, st: WatchState) {
+    if (st.statsTimer) { clearInterval(st.statsTimer); st.statsTimer = null; }
     if (st.pc) { try { st.pc.close(); } catch { /**/ } st.pc = null; }
     this.closeChildren(st);
     this.watches.delete(streamId);
@@ -394,7 +428,15 @@ export class TreeVideoTransport implements VideoTransport {
     const pc = new RTCPeerConnection({ iceServers: st.iceServers.length ? st.iceServers : DEFAULT_ICE_SERVERS });
     st.children.set(childId, pc);
     try {
-      pc.addTrack(st.recvVideo);
+      // Транскод-хоп: под узкий канал Chromium должен ронять разрешение, а не fps
+      // (плавность важнее чёткости — та же философия, что ABR-лестница вещателя).
+      try { (st.recvVideo as any).contentHint = 'motion'; } catch { /**/ }
+      const sender = pc.addTrack(st.recvVideo);
+      try {
+        const params = sender.getParameters();
+        (params as any).degradationPreference = 'maintain-framerate';
+        void sender.setParameters(params);
+      } catch { /**/ }
       if (st.recvAudio) pc.addTrack(st.recvAudio);
       preferH264(pc);
       pc.onicecandidate = (e) => {

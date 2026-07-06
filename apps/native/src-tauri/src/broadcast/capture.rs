@@ -3,7 +3,7 @@
 // но здесь CPU-путь (см. заметку у convert_and_scale). Кодирование — в encoder.rs
 // (инвариант CLAUDE.md 7: масштабирование/кодирование на стороне вещателя).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -44,24 +44,33 @@ pub struct Nv12Frame {
     pub captured_at: Instant,
 }
 
+/// Живые цели качества (ABR-лестница, Э8): верхняя граница разрешения и целевой FPS.
+/// Пишет сигналинг-цикл вещателя (QualityLadder в mod.rs), читает capture-сессия на
+/// каждом кадре — смена fps/разрешения на лету без пересоздания WGC-сессии/дерева.
+/// Апскейл никогда не делаем (см. scaled_dims).
+#[derive(Clone)]
+pub struct QualityTargets {
+    pub max_width: Arc<AtomicU32>,
+    pub max_height: Arc<AtomicU32>,
+    /// Целевой FPS — для программного пейсинга в on_frame_arrived (WGC отдаёт
+    /// коарс-поток чуть выше цели, точный каденс держим здесь). См. spawn_capture.
+    pub fps: Arc<AtomicU32>,
+}
+
 pub struct CaptureFlags {
     pub tx: Sender<Nv12Frame>,
     pub stop: Arc<AtomicBool>,
-    /// Верхняя граница выходного разрешения (например 1920x1080) — источник
-    /// масштабируется вниз, если больше; апскейл никогда не делаем.
-    pub max_width: u32,
-    pub max_height: u32,
-    /// Целевой FPS — для программного пейсинга в on_frame_arrived (WGC отдаёт
-    /// коарс-поток чуть выше цели, точный каденс держим здесь). См. spawn_capture.
-    pub target_fps: u32,
+    pub targets: QualityTargets,
     pub stats: StatsHandle,
 }
 
 pub struct ScreenCapture {
     tx: Sender<Nv12Frame>,
     stop: Arc<AtomicBool>,
-    max_width: u32,
-    max_height: u32,
+    targets: QualityTargets,
+    /// Кэш последнего прочитанного targets.fps — чтобы пересчитывать target_period
+    /// только на реальной смене цели (ABR-лестница), а не на каждом кадре.
+    cur_fps: u32,
     stats: StatsHandle,
     scratch: Vec<u8>,
     fps_window_start: Instant,
@@ -110,16 +119,17 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
+        let cur_fps = ctx.flags.targets.fps.load(Ordering::Relaxed).max(1);
         Ok(Self {
             tx: ctx.flags.tx,
             stop: ctx.flags.stop,
-            max_width: ctx.flags.max_width,
-            max_height: ctx.flags.max_height,
+            targets: ctx.flags.targets,
+            cur_fps,
             stats: ctx.flags.stats,
             scratch: Vec::new(),
             fps_window_start: Instant::now(),
             fps_window_count: 0,
-            target_period: Duration::from_secs_f64(1.0 / ctx.flags.target_fps.max(1) as f64),
+            target_period: Duration::from_secs_f64(1.0 / cur_fps as f64),
             next_deadline: None,
             col_lut: Vec::new(),
             row_lut: Vec::new(),
@@ -140,6 +150,15 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
 
         // Диагностика: сырые вызовы (до гейта) = темп отдачи WGC.
         self.raw_window_count += 1;
+
+        // ABR-лестница (Э8): цель fps могла смениться на лету — пересобираем период
+        // пейсинга и ресинхронизируем дедлайн под новый темп.
+        let fps_now = self.targets.fps.load(Ordering::Relaxed).max(1);
+        if fps_now != self.cur_fps {
+            self.cur_fps = fps_now;
+            self.target_period = Duration::from_secs_f64(1.0 / fps_now as f64);
+            self.next_deadline = None;
+        }
 
         // Программный пейсинг дедлайн-аккумулятором: дропаем кадр, только если он
         // пришёл РАНЬШЕ следующего дедлайна (реальный овершут над целью — WGC на
@@ -169,7 +188,14 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
         let row_pitch = buf.row_pitch();
         let raw = buf.as_raw_buffer();
 
-        let (out_w, out_h) = scaled_dims(src_w, src_h, self.max_width, self.max_height);
+        // ABR-лестница: максимумы разрешения тоже живые — их смена даст новый out_w/out_h,
+        // LUT/scratch пересоберутся сами (ensure_luts), энкодер увидит смену размера кадра
+        // и переинициализируется по существующему resize-пути (mod.rs).
+        let (out_w, out_h) = scaled_dims(
+            src_w, src_h,
+            self.targets.max_width.load(Ordering::Relaxed),
+            self.targets.max_height.load(Ordering::Relaxed),
+        );
         let nv12_len = (out_w * out_h * 3 / 2) as usize;
         if self.scratch.len() != nv12_len {
             self.scratch = vec![0u8; nv12_len];
@@ -324,6 +350,64 @@ pub fn list_windows() -> Vec<(isize, String, String, u32)> {
         .unwrap_or_default()
 }
 
+/// Диагностика СТОЙКОГО отказа WGC на окне («Failed to convert item to
+/// `GraphicsCaptureItem`» из CreateForWindow): ретраи бессмысленны, когда окно умерло,
+/// свёрнуто или принадлежит elevated-процессу (игра от администратора, RelayApp — нет:
+/// UIPI запрещает capture-item на окно с более высоким уровнем целостности).
+/// Возвращает человекочитаемую причину для тоста; None — причина неизвестна (транзиент).
+fn window_uncapturable_reason(hwnd: isize) -> Option<String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsIconic, IsWindow};
+    unsafe {
+        let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return Some("окно больше не существует — выберите источник заново".into());
+        }
+        if IsIconic(hwnd).as_bool() {
+            return Some("окно свёрнуто — разверните его и начните трансляцию снова".into());
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid != 0 {
+            if let (Some(theirs), Some(ours)) = (process_elevated(pid), process_elevated(std::process::id())) {
+                if theirs && !ours {
+                    return Some(
+                        "окно запущено от имени администратора — запустите RelayApp тоже от администратора либо вещайте монитор целиком".into(),
+                    );
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Процесс запущен с повышенными правами (elevated token)? `None` — не удалось узнать
+/// (нет доступа и т.п.) — тогда причину не утверждаем.
+fn process_elevated(pid: u32) -> Option<bool> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows::Win32::System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut token = HANDLE::default();
+        let opened = OpenProcessToken(proc, TOKEN_QUERY, &mut token);
+        let _ = CloseHandle(proc);
+        opened.ok()?;
+        let mut elev = TOKEN_ELEVATION::default();
+        let mut ret = 0u32;
+        let queried = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elev as *mut _ as *mut core::ffi::c_void),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut ret,
+        );
+        let _ = CloseHandle(token);
+        queried.ok()?;
+        Some(elev.TokenIsElevated != 0)
+    }
+}
+
 /// Синхронная проверка источника до спавна потока — чтобы неверный индекс/протухший
 /// HWND вернулись caller'у сразу как Err, а не молча уронили сессию.
 fn validate_source(source: &CaptureSource) -> Result<(), String> {
@@ -370,9 +454,12 @@ fn try_start_capture<T: TryInto<GraphicsCaptureItemType>>(
 fn spawn_session(
     source: CaptureSource,
     tx: Sender<Nv12Frame>,
-    max_width: u32,
-    max_height: u32,
-    target_fps: u32,
+    targets: QualityTargets,
+    // Пользовательский (максимальный) fps — для WGC min_interval. Живая цель
+    // (targets.fps, ABR-лестница) может быть ниже — точный каденс держит программный
+    // гейт; min_interval от МАКСИМУМА, чтобы возврат лестницы вверх не упирался в
+    // троттл сессии (и не ловил биение с vblank, см. комментарий про 0.5×период).
+    user_fps: u32,
     stats: StatsHandle,
     shutdown_tx: tokio::sync::mpsc::UnboundedSender<Option<String>>,
 ) -> (std::thread::JoinHandle<()>, Arc<AtomicBool>) {
@@ -395,7 +482,11 @@ fn spawn_session(
         // Повторяем старт несколько раз с паузой, прежде чем сдаться: в логах тот же
         // источник поднимался после пары неудач. min_interval/flags пересобираем
         // каждую попытку (Settings::new забирает их по значению).
-        const START_ATTEMPTS: u32 = 5;
+        // 8×250мс (~2с окно): фуллскрин-игры при смене режима дисплея/альт-табе могут
+        // не отдавать capture-item дольше секунды — прежних 5×200мс не хватало.
+        // Стойкие причины (elevated-окно, свёрнуто, умерло) прерывают ретраи сразу.
+        const START_ATTEMPTS: u32 = 8;
+        const RETRY_PAUSE: Duration = Duration::from_millis(250);
         let mut last_err = String::new();
         // true = сессия завершилась штатно по нашему `stop` (свитч/стоп), не сама.
         let mut clean_stop = false;
@@ -420,7 +511,7 @@ fn spawn_session(
                 break; // остановили до успешного старта
             }
             let min_interval = if min_interval_supported {
-                MinimumUpdateIntervalSettings::Custom(std::time::Duration::from_secs_f64(0.5 / target_fps.max(1) as f64))
+                MinimumUpdateIntervalSettings::Custom(std::time::Duration::from_secs_f64(0.5 / user_fps.max(1) as f64))
             } else {
                 MinimumUpdateIntervalSettings::Default
             };
@@ -432,9 +523,7 @@ fn spawn_session(
             let flags = CaptureFlags {
                 tx: tx.clone(),
                 stop: stop2.clone(),
-                max_width,
-                max_height,
-                target_fps,
+                targets: targets.clone(),
                 stats: stats.clone(),
             };
             let result = match source {
@@ -457,8 +546,18 @@ fn spawn_session(
                 Err(e) => {
                     last_err = e;
                     log::warn!("capture: попытка старта {attempt}/{START_ATTEMPTS} не удалась: {last_err}");
+                    // Стойкая причина отказа CreateForWindow (elevated/свёрнуто/умерло) —
+                    // дальнейшие ретраи бессмысленны, отдаём юзеру конкретную причину
+                    // вместо сырого «Failed to convert item to GraphicsCaptureItem».
+                    if let CaptureSource::Window { hwnd } = source {
+                        if let Some(reason) = window_uncapturable_reason(hwnd) {
+                            log::error!("capture: стойкий отказ: {reason}");
+                            last_err = reason;
+                            break;
+                        }
+                    }
                     if attempt < START_ATTEMPTS && !stop2.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(200));
+                        std::thread::sleep(RETRY_PAUSE);
                     }
                 }
             }
@@ -487,9 +586,11 @@ fn spawn_session(
 /// трансляцию и не трогая WebRTC-треки/дерево.
 pub struct CaptureSupervisor {
     tx: Sender<Nv12Frame>,
-    max_width: u32,
-    max_height: u32,
-    target_fps: u32,
+    /// Живые цели качества (ABR-лестница) — общие для всех сессий супервайзера;
+    /// клоны отдаются наружу через `targets()` (пишет сигналинг-цикл вещателя).
+    targets: QualityTargets,
+    /// Пользовательский (максимальный) fps — для WGC min_interval сессий (см. spawn_session).
+    user_fps: u32,
     stats: StatsHandle,
     shutdown_tx: tokio::sync::mpsc::UnboundedSender<Option<String>>,
     cur: Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)>,
@@ -497,7 +598,9 @@ pub struct CaptureSupervisor {
 
 impl CaptureSupervisor {
     /// Создаёт канал (bounded(2) — как раньше: отставший энкодер роняет кадр, а не
-    /// копит задержку) и возвращает приёмник для энкодерного потока.
+    /// копит задержку) и возвращает приёмник для энкодерного потока. Переданные
+    /// max_width/max_height/target_fps становятся стартовыми (и максимальными)
+    /// значениями живых целей качества.
     pub fn new(
         max_width: u32,
         max_height: u32,
@@ -506,11 +609,19 @@ impl CaptureSupervisor {
         shutdown_tx: tokio::sync::mpsc::UnboundedSender<Option<String>>,
     ) -> (Self, crossbeam_channel::Receiver<Nv12Frame>) {
         let (tx, rx) = crossbeam_channel::bounded(2);
+        let targets = QualityTargets {
+            max_width: Arc::new(AtomicU32::new(max_width)),
+            max_height: Arc::new(AtomicU32::new(max_height)),
+            fps: Arc::new(AtomicU32::new(target_fps)),
+        };
         (
-            Self { tx, max_width, max_height, target_fps, stats, shutdown_tx, cur: None },
+            Self { tx, targets, user_fps: target_fps, stats, shutdown_tx, cur: None },
             rx,
         )
     }
+
+    /// Живые цели качества — для ABR-лестницы (mod.rs пишет сюда при set-bitrate).
+    pub fn targets(&self) -> QualityTargets { self.targets.clone() }
 
     /// Запускает сессию для источника. Ошибка валидации возвращается синхронно
     /// (текущая сессия, если была, не трогается — вызывать после stop_current).
@@ -519,9 +630,8 @@ impl CaptureSupervisor {
         let session = spawn_session(
             source,
             self.tx.clone(),
-            self.max_width,
-            self.max_height,
-            self.target_fps,
+            self.targets.clone(),
+            self.user_fps,
             self.stats.clone(),
             self.shutdown_tx.clone(),
         );

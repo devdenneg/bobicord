@@ -19,6 +19,57 @@ use std::time::{Duration, Instant};
 /// зрителя репарентом. Верхняя полка — выбранный вещателем битрейт (config.bitrate_bps).
 const BITRATE_FLOOR: u32 = 800_000;
 
+/// Лестница качества (Э8, стабильность > качество): когда ABR роняет битрейт, одним
+/// снижением битрейта при полном fps/разрешении картинка разваливается (800 кбит/с на
+/// 1080p60 — каша, а IDR-спайки пробивают слабый линк => потери => PLI => ещё IDR).
+/// Режем сначала FPS (ниже LADDER_FPS_BPS — cap 30), затем разрешение (ниже
+/// LADDER_RES_BPS — cap 1280x720): 720p30 на том же битрейте смотрибельны и дают
+/// энкодеру запас. Всё на стороне вещателя (инвариант 7): capture перечитывает цели
+/// на лету (QualityTargets), энкодер пересоздаётся на смене fps/размера кадра.
+const LADDER_FPS_BPS: u32 = 2_500_000;
+const LADDER_RES_BPS: u32 = 1_400_000;
+/// Подъём ступени только с запасом (анти-флаппинг): ABR пробует вверх по +8%/тик и
+/// у порога без гистерезиса лестница дёргала бы пересоздание MFT каждые пару секунд.
+const LADDER_UP_FACTOR: f64 = 1.15;
+
+/// Состояние лестницы. step: 0 = полное качество, 1 = 30 fps, 2 = 720p30.
+struct QualityLadder {
+    user_fps: u32,
+    user_w: u32,
+    user_h: u32,
+    targets: capture::QualityTargets,
+    step: u8,
+}
+
+impl QualityLadder {
+    fn step_for(&self, bps: u32) -> u8 {
+        let up = |t: u32| (t as f64 * LADDER_UP_FACTOR) as u32;
+        match self.step {
+            0 => if bps < LADDER_RES_BPS { 2 } else if bps < LADDER_FPS_BPS { 1 } else { 0 },
+            1 => if bps < LADDER_RES_BPS { 2 } else if bps >= up(LADDER_FPS_BPS) { 0 } else { 1 },
+            _ => if bps >= up(LADDER_FPS_BPS) { 0 } else if bps >= up(LADDER_RES_BPS) { 1 } else { 2 },
+        }
+    }
+
+    /// Применяет ступень под новую цель битрейта (вызывается на каждом set-bitrate;
+    /// no-op, пока ступень не сменилась). Пишет живые цели — захват подхватит на
+    /// следующем кадре, энкодер пересоздастся по своим resize/fps-путям.
+    fn apply(&mut self, bps: u32) {
+        let next = self.step_for(bps);
+        if next == self.step { return; }
+        self.step = next;
+        let (f, w, h) = match next {
+            0 => (self.user_fps, self.user_w, self.user_h),
+            1 => (self.user_fps.min(30), self.user_w, self.user_h),
+            _ => (self.user_fps.min(30), self.user_w.min(1280), self.user_h.min(720)),
+        };
+        self.targets.fps.store(f, Ordering::Relaxed);
+        self.targets.max_width.store(w, Ordering::Relaxed);
+        self.targets.max_height.store(h, Ordering::Relaxed);
+        log::info!("ladder: ступень {next} при цели {:.1} Мбит/с -> {f} fps, max {w}x{h}", bps as f64 / 1e6);
+    }
+}
+
 use bytes::Bytes;
 use serde_json::json;
 use tauri::{AppHandle, Emitter};
@@ -217,6 +268,9 @@ pub async fn start(
     // Захват через супервайзер: он держит канал, под которым можно менять WGC-сессии
     // (монитор/окно) на лету — энкодер и WebRTC-треки этого не замечают (Э5.3).
     let (mut cap_sup, cap_rx) = capture::CaptureSupervisor::new(max_width, max_height, fps, stats.clone(), shutdown_tx.clone());
+    // Живые цели качества (ABR-лестница): пишет сигналинг-цикл, читают capture (на кадре)
+    // и энкодер-поток (смена fps => пересоздание MFT с корректным rate-control).
+    let quality_targets = cap_sup.targets();
     cap_sup.start(source)?; // синхронная валидация источника — ошибка уйдёт caller'у сразу
     let cap_sup = Arc::new(std::sync::Mutex::new(cap_sup));
 
@@ -240,6 +294,7 @@ pub async fn start(
     let stats_enc = stats.clone();
     let shutdown_tx_enc = shutdown_tx.clone();
     let target_bitrate_enc = target_bitrate.clone();
+    let eff_fps_enc = quality_targets.fps.clone();
 
     let encoder_thread = std::thread::spawn(move || {
         unsafe {
@@ -258,10 +313,12 @@ pub async fn start(
         // энкодер замирал на старом разрешении и все дальнейшие кадры молча
         // отбрасывались (зритель видел "1920x1044" и рваный fps — фактически
         // почти все кадры терялись после первого ресайза окна).
-        let frame_dur = Duration::from_secs_f64(1.0 / fps as f64);
         let mut fps_window_start = Instant::now();
         let mut fps_window_count = 0u32;
-        let mut enc: Option<(encoder::H264Encoder, u32, u32)> = None;
+        // (энкодер, ширина, высота, fps его инициализации) — fps живой (ABR-лестница),
+        // на его смене MFT пересоздаётся: CBR-бюджет на кадр у MFT завязан на frame rate,
+        // кормить 30 fps энкодеру, настроенному на 60, значит отдавать кадрам половину бит.
+        let mut enc: Option<(encoder::H264Encoder, u32, u32, u32)> = None;
         // Реальное время между кадрами (а не номинальный frame_dur) — иначе RTP-таймстемпы
         // расходятся с фактическим темпом захвата (WGC отдаёт кадры неравномерно), и
         // зритель видит рваный fps даже когда энкодер стабильно поспевает.
@@ -286,7 +343,17 @@ pub async fn start(
                     break;
                 }
             };
-            if let Some((_, w, h)) = &enc {
+            let cur_fps = eff_fps_enc.load(Ordering::Relaxed).max(1);
+            let frame_dur = Duration::from_secs_f64(1.0 / cur_fps as f64);
+            // ABR-лестница сменила целевой fps — пересоздаём MFT (см. комментарий у enc).
+            // Без дебаунса: ступени лестницы редкие (гистерезис в QualityLadder), в отличие
+            // от живого ресайза окна ниже.
+            if matches!(&enc, Some((_, _, _, efps)) if *efps != cur_fps) {
+                log::info!("encoder: ladder fps -> {cur_fps}, переинициализация MFT");
+                enc = None;
+                pending_resize = None;
+            }
+            if let Some((_, w, h, _)) = &enc {
                 if frame.width != *w || frame.height != *h {
                     let stable = match pending_resize {
                         Some((pw, ph, at)) if pw == frame.width && ph == frame.height => at.elapsed() >= RESIZE_DEBOUNCE,
@@ -317,8 +384,8 @@ pub async fn start(
                 // Берём живую цель, не замороженный bitrate_bps: после ресайза окна MFT
                 // пересоздаётся и должен подхватить уже адаптированный ABR-битрейт.
                 let start_bitrate = target_bitrate_enc.load(Ordering::Relaxed);
-                match encoder::H264Encoder::new(frame.width, frame.height, fps, start_bitrate, force_keyframe_enc.clone()) {
-                    Ok(e) => { force_keyframe_enc.store(true, Ordering::Relaxed); enc = Some((e, frame.width, frame.height)); }
+                match encoder::H264Encoder::new(frame.width, frame.height, cur_fps, start_bitrate, force_keyframe_enc.clone()) {
+                    Ok(e) => { force_keyframe_enc.store(true, Ordering::Relaxed); enc = Some((e, frame.width, frame.height, cur_fps)); }
                     Err(e) => {
                         log::error!("encoder: init failed: {e}");
                         let _ = shutdown_tx_enc.send(Some(format!("не удалось создать H264-энкодер: {e}")));
@@ -326,7 +393,7 @@ pub async fn start(
                     }
                 }
             }
-            let (encoder_ref, _enc_w, _enc_h) = enc.as_mut().expect("initialized above");
+            let (encoder_ref, _enc_w, _enc_h, _enc_fps) = enc.as_mut().expect("initialized above");
             // ABR: подхватываем цель, присланную сервером (set_bitrate — no-op на неизменной).
             encoder_ref.set_bitrate(target_bitrate_enc.load(Ordering::Relaxed));
             let real_dur = match prev_captured_at {
@@ -377,8 +444,9 @@ pub async fn start(
 
     let alive = Arc::new(AtomicBool::new(true));
     let alive_loop = alive.clone();
-    let meta = DebugMeta { stream_id, source_label: source_label.clone(), target_fps: fps, target_bitrate_bps: bitrate_bps };
-    tokio::spawn(run_signaling_loop(mgr, evt_rx, shutdown_rx, app, stats, meta, alive_loop, force_keyframe.clone(), target_bitrate));
+    let meta = DebugMeta { stream_id, source_label: source_label.clone(), target_bitrate_bps: bitrate_bps };
+    let ladder = QualityLadder { user_fps: fps, user_w: max_width, user_h: max_height, targets: quality_targets, step: 0 };
+    tokio::spawn(run_signaling_loop(mgr, evt_rx, shutdown_rx, app, stats, meta, alive_loop, force_keyframe.clone(), target_bitrate, ladder));
 
     Ok(BroadcastHandle {
         enc_stop,
@@ -395,7 +463,6 @@ pub async fn start(
 struct DebugMeta {
     stream_id: String,
     source_label: Arc<std::sync::Mutex<String>>,
-    target_fps: u32,
     target_bitrate_bps: u32,
 }
 
@@ -427,6 +494,7 @@ async fn run_signaling_loop(
     alive: Arc<AtomicBool>,
     force_keyframe: Arc<AtomicBool>,
     target_bitrate: Arc<AtomicU32>,
+    mut ladder: QualityLadder,
 ) {
     let mut stats_tick = tokio::time::interval(Duration::from_secs(2));
     let mut prev_at = Instant::now();
@@ -452,6 +520,9 @@ async fn run_signaling_loop(
                     Some(TreeEvent::SetBitrate { bps }) => {
                         let clamped = bps.clamp(BITRATE_FLOOR, meta.target_bitrate_bps);
                         target_bitrate.store(clamped, Ordering::Relaxed);
+                        // Лестница качества: битрейт упал — режем fps/разрешение вслед
+                        // (стабильность важнее чёткости; см. QualityLadder).
+                        ladder.apply(clamped);
                     }
                     // Корень не имеет родителя — эти события к нему не относятся.
                     Some(TreeEvent::AssignParent { .. }) | Some(TreeEvent::SdpOffer { .. }) | Some(TreeEvent::Topology { .. }) => {}
@@ -472,7 +543,9 @@ async fn run_signaling_loop(
                     source: meta.source_label.lock().unwrap().clone(),
                     width: stats.out_width.load(Ordering::Relaxed),
                     height: stats.out_height.load(Ordering::Relaxed),
-                    target_fps: meta.target_fps,
+                    // Живая цель (ABR-лестница), не пользовательский максимум — чтобы
+                    // дебаг-панель показывала фактический режим (напр. 30 при цели 60).
+                    target_fps: ladder.targets.fps.load(Ordering::Relaxed),
                     capture_fps: (cap - prev_cap) as f64 / dt,
                     encoder_fps: (enc - prev_enc) as f64 / dt,
                     dropped_frames: stats.capture_drops.load(Ordering::Relaxed),
