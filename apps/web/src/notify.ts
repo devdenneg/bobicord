@@ -69,10 +69,26 @@ async function showNativeCard(kind: NotifKind, title: string, body: string): Pro
     const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
     // одно окно за раз: закрываем прежнее, иначе конфликт по label
     try { const ex = await WebviewWindow.getByLabel('notif'); if (ex) await ex.close(); } catch { /**/ }
-    const W = 372, H = 104;
-    const sw = (typeof screen !== 'undefined' && screen.availWidth) || 1280;
-    const sh = (typeof screen !== 'undefined' && screen.availHeight) || 800;
-    const x = Math.max(8, sw - W - 18), y = Math.max(8, sh - H - 18); // правый нижний угол
+    const W = 380, H = 108, MARGIN = 16;
+    // Позиция — правый нижний угол РАБОЧЕЙ ОБЛАСТИ текущего монитора (без таскбара), в ГЛОБАЛЬНЫХ
+    // логических px. screen.availWidth не учитывает офсет монитора → на мультимониторе/DPI x/y
+    // уводили за пределы → Tauri ЦЕНТРИРОВАЛ окно («у некоторых по середине»). currentMonitor даёт
+    // и офсет, и workArea, и scaleFactor. Фолбэк на screen, если монитор не отдался.
+    let x: number, y: number;
+    try {
+      const { currentMonitor } = await import('@tauri-apps/api/window');
+      const mon = await currentMonitor();
+      if (mon) {
+        const pos = mon.workArea.position.toLogical(mon.scaleFactor);
+        const size = mon.workArea.size.toLogical(mon.scaleFactor);
+        x = Math.round(pos.x + size.width - W - MARGIN);
+        y = Math.round(pos.y + size.height - H - MARGIN);
+      } else { throw new Error('no monitor'); }
+    } catch {
+      const sw = (typeof screen !== 'undefined' && screen.availWidth) || 1280;
+      const sh = (typeof screen !== 'undefined' && screen.availHeight) || 800;
+      x = Math.max(8, sw - W - MARGIN); y = Math.max(8, sh - H - MARGIN);
+    }
     const url = `notif.html?k=${encodeURIComponent(kind)}&t=${encodeURIComponent(title)}&b=${encodeURIComponent(body)}`;
     return await new Promise<boolean>((resolve) => {
       let settled = false;
