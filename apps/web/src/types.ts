@@ -131,6 +131,10 @@ export interface AudioSettings {
   sensitivity: number; // порог чувствительности ввода, 0..100 (нормализованная dB-шкала)
   sensitivityAuto: boolean; // авто-подбор порога по шумовому фону
   notifyVolume: number; // громкость звуков-уведомлений в %
+  notif: boolean; // мастер системных уведомлений (opt-in; включение запрашивает разрешение ОС)
+  notifMention: boolean; // уведомлять при упоминании/ответе
+  notifStream: boolean; // уведомлять о старте трансляции
+  notifUpdate: boolean; // уведомлять о доступном обновлении
   keybinds: Keybinds; // хоткеи мута (коды KeyboardEvent.code, 1..3 клавиши)
   disableGlobalHotkeys: boolean; // чекбокс «отключить комбинацию вне приложения» (только натив)
 }

@@ -9,3 +9,15 @@ self.addEventListener('activate', (event) => {
 });
 // fetch-обработчик обязателен для installability; чистый passthrough — всегда сеть, без кэша
 self.addEventListener('fetch', () => { /* passthrough */ });
+
+// клик по системному уведомлению → фокус существующего окна (или открыть новое)
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  event.waitUntil((async () => {
+    try {
+      const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+      for (const c of all) { if ('focus' in c) return c.focus(); }
+      if (self.clients.openWindow) return self.clients.openWindow('/');
+    } catch (e) { /* ignore */ }
+  })());
+});

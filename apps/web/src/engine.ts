@@ -4,6 +4,7 @@ import {
 } from 'livekit-client';
 import type { User, Member, ChatMessage, Emote, HistoryMessage, ReplyRef } from './types';
 import { baseUid } from './util';
+import { notify } from './notify';
 import { getSettings, setSettings } from './settings';
 import { emoteUrl } from './emotes';
 import { playSound } from './sounds';
@@ -157,9 +158,11 @@ export class Engine {
     const onStreamStart = (identity: string, silent: boolean) => {
       this.emit();
       if (!silent) {
-        this.sysMsg(`📺 ${this.nameOf(identity)} начал трансляцию — «▶ Смотреть» в списке`);
+        const who = this.nameOf(identity);
+        this.sysMsg(`📺 ${who} начал трансляцию — «▶ Смотреть» в списке`);
         playSound('stream');
-        this.hooks.toast(this.nameOf(identity) + ' начал трансляцию', 'info');
+        this.hooks.toast(who + ' начал трансляцию', 'info');
+        notify('stream', { title: who, body: 'начал(а) трансляцию', tag: 'stream-' + identity });
       }
     };
     const onStreamStop = (identity: string) => {
@@ -889,7 +892,11 @@ export class Engine {
     const mapped = this.mapHistory(add);
     this.messages = [...this.messages, ...mapped];
     const mentioned = mapped.filter((m) => m.mention); // один звук, а не по сообщению (не спамим при длинном обрыве)
-    if (mentioned.length) { playSound('mention'); this.hooks.toast(mentioned.length === 1 ? `${mentioned[0].who} упомянул тебя` : `Тебя упомянули · ${mentioned.length}`, 'info'); }
+    if (mentioned.length) {
+      playSound('mention');
+      this.hooks.toast(mentioned.length === 1 ? `${mentioned[0].who} упомянул тебя` : `Тебя упомянули · ${mentioned.length}`, 'info');
+      notify('mention', { title: mentioned.length === 1 ? String(mentioned[0].who) : 'Упоминания', body: mentioned.length === 1 ? String(mentioned[0].text || '').slice(0, 140) : `Тебя упомянули · ${mentioned.length}`, tag: 'mention' });
+    }
     else playSound('msg');
     this.emit();
   }
@@ -941,7 +948,13 @@ export class Engine {
         const repliedToMe = !own && this.replyToMe(d.reply);
         const mentioned = !own && (this.textMentionsMe(d.text) || repliedToMe);
         this.pushMsg(d.name, d.text, false, d.color, own, d.img, undefined, d.uid, d.reply);
-        if (!own) { playSound(mentioned ? 'mention' : 'msg'); if (mentioned) this.hooks.toast(repliedToMe ? `${d.name} ответил тебе` : `${d.name} упомянул тебя`, 'info'); }
+        if (!own) {
+          playSound(mentioned ? 'mention' : 'msg');
+          if (mentioned) {
+            this.hooks.toast(repliedToMe ? `${d.name} ответил тебе` : `${d.name} упомянул тебя`, 'info');
+            notify('mention', { title: d.name, body: String(d.text || '').slice(0, 140) || '🖼 изображение', tag: 'mention' });
+          }
+        }
       }
       else if (d.t === 'vclaim') {
         // другая моя сессия зашла в голосовой → выхожу (одна голосовая на аккаунт).

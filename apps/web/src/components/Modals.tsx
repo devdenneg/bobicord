@@ -13,6 +13,7 @@ import { PERM, PERM_LIST, hasPerm } from '../types';
 import { Backdrop } from './Backdrop';
 import { BroadcastModal } from './BroadcastModal';
 import { isTauri, setGlobalHotkeys } from '../native';
+import { enableNotifications, notifSupported, notifPermission } from '../notify';
 
 function CreateModal() {
   const close = () => useStore.getState().setModal(null);
@@ -299,6 +300,12 @@ function RoleAssignTab({ active, members }: { active: import('../types').ServerD
 
 const KEYBIND_LABELS: Record<KeybindAction, string> = { muteMic: 'Заглушить микрофон', deafen: 'Заглушить звук' };
 
+const NOTIF_KINDS: { key: 'notifMention' | 'notifStream' | 'notifUpdate'; title: string; desc: string }[] = [
+  { key: 'notifMention', title: 'Упоминания', desc: 'Когда вас тегнули или ответили в чате' },
+  { key: 'notifStream', title: 'Трансляции', desc: 'Когда кто-то начал трансляцию' },
+  { key: 'notifUpdate', title: 'Обновления', desc: 'Когда вышло новое обновление приложения' },
+];
+
 // Мини-окно назначения клавиши: до 3 клавиш одновременно, живой показ комбинации, сохранение
 // только по «Применить». Слушатели повешены на capture-фазу window, чтобы: (1) успеть
 // stopPropagation раньше bubble-фазового Escape-хендлера родительского Backdrop (иначе Escape
@@ -365,6 +372,25 @@ function SettingsModal() {
       <div className="fld"><label>Устройство вывода</label><select value={s.output} onChange={(e) => upd({ output: e.target.value }, () => E?.applyOutput())}><option value="">По умолчанию</option>{outs.map((d) => <option key={d.deviceId} value={d.deviceId}>{d.label || d.deviceId}</option>)}</select></div>
       <div className="fld"><label>Общая громкость: {s.master}%</label><input type="range" min={0} max={100} value={s.master} onChange={(e) => upd({ master: +e.target.value }, () => E?.applyMaster())} /></div>
       <div className="fld"><label>Громкость уведомлений: {s.notifyVolume}%</label><input type="range" min={0} max={100} value={s.notifyVolume} onChange={(e) => upd({ notifyVolume: +e.target.value })} onMouseUp={() => playSound('system')} /></div>
+    </div>
+    <div className="grp"><div className="gt"><Icon name="bell" sm /> Уведомления</div>
+      {!notifSupported() ? (
+        <div className="fld"><label style={{ color: 'var(--txt-dim)' }}>Системные уведомления не поддерживаются на этом устройстве</label></div>
+      ) : <>
+        <label className="perm-op">
+          <input type="checkbox" checked={s.notif} onChange={async (e) => {
+            if (e.target.checked) { await enableNotifications(); } else { setSettings({ notif: false }); }
+            rerender();
+          }} />
+          <span><b>Системные уведомления</b><i>Показывать, когда приложение свёрнуто или не в фокусе{notifPermission() === 'denied' ? ' · доступ запрещён в системе' : ''}</i></span>
+        </label>
+        {NOTIF_KINDS.map((o) => (
+          <label key={o.key} className="perm-op" style={{ marginTop: 4, opacity: s.notif ? 1 : .45, pointerEvents: s.notif ? 'auto' : 'none' }}>
+            <input type="checkbox" disabled={!s.notif} checked={s[o.key]} onChange={(e) => upd({ [o.key]: e.target.checked } as Partial<AudioSettings>)} />
+            <span><b>{o.title}</b><i>{o.desc}</i></span>
+          </label>
+        ))}
+      </>}
     </div>
     <div className="grp"><div className="gt"><Icon name="palette" sm /> Оформление</div>
       <div className="fld"><label>Тема оформления</label>

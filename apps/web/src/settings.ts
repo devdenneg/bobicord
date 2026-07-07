@@ -1,6 +1,6 @@
 import type { AudioSettings } from './types';
 
-const DEF: AudioSettings = { input: '', output: '', ns: true, ec: true, agc: true, mode: 'voice', pttKey: 'KeyV', master: 100, sensitivity: 10, sensitivityAuto: true, notifyVolume: 60, keybinds: { muteMic: ['ShiftLeft', 'KeyM'], deafen: ['ShiftLeft', 'KeyD'] }, disableGlobalHotkeys: false };
+const DEF: AudioSettings = { input: '', output: '', ns: true, ec: true, agc: true, mode: 'voice', pttKey: 'KeyV', master: 100, sensitivity: 10, sensitivityAuto: true, notifyVolume: 60, notif: false, notifMention: true, notifStream: true, notifUpdate: true, keybinds: { muteMic: ['ShiftLeft', 'KeyM'], deafen: ['ShiftLeft', 'KeyD'] }, disableGlobalHotkeys: false };
 const stored = JSON.parse(localStorage.getItem('audioSettings') || '{}');
 // keybinds/disableGlobalHotkeys — сознательно НЕ читаем из локального кэша при старте (в
 // отличие от остальных полей). Это привязано к аккаунту (см. App.tsx: GET/PUT /api/me/settings),

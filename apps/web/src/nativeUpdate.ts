@@ -3,6 +3,7 @@
 import { isTauri } from './native';
 import { useStore } from './store';
 import { playSound } from './sounds';
+import { notify } from './notify';
 
 export async function checkNativeUpdate(): Promise<boolean> {
   if (!isTauri) return false;
@@ -16,6 +17,7 @@ export async function checkNativeUpdate(): Promise<boolean> {
       if (!shown || shown.version !== upd.version) {
         useStore.setState({ nativeUpdate: { version: upd.version, obj: upd } });
         playSound('system');
+        notify('update', { title: 'Вышло обновление', body: `Версия ${upd.version} готова к установке`, tag: 'update' });
       }
       return true;
     }
