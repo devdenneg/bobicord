@@ -182,19 +182,22 @@ function requireAuth(req, res, next) {
   req.user = u; next();
 }
 const rsc = new RoomServiceClient(WS_URL.replace('wss://', 'https://'), KEY, SECRET);
+// LiveKit identity = `username#<nonce>` (уникально на сессию — иначе второй девайс кикает первого).
+// Наружу (presence/voice) отдаём БАЗОВЫЙ username, дедуплицируя несколько сессий одного юзера.
+const baseIdentity = id => { const s = String(id || ''); const i = s.indexOf('#'); return i < 0 ? s : s.slice(0, i); };
 async function onlineIn(serverId) {
-  try { const ps = await rsc.listParticipants('srv:' + serverId); return ps.map(p => p.identity); }
+  try { const ps = await rsc.listParticipants('srv:' + serverId); return [...new Set(ps.map(p => baseIdentity(p.identity)))]; }
   catch (e) { return []; }
 }
-// online-состав + карта {identity: channelId} (кто в каком голосовом канале) из participant-атрибута vc.
+// online-состав + карта {username: channelId} (кто в каком голосовом канале) из participant-атрибута vc.
 // Отдаём это в /presence, чтобы состав голосовых каналов был виден сразу на загрузке — не дожидаясь,
-// пока у зрителя локально поднимется LiveKit-комната.
+// пока у зрителя локально поднимется LiveKit-комната. Несколько сессий одного юзера сводим к одному.
 async function voiceStateIn(serverId) {
   try {
     const ps = await rsc.listParticipants('srv:' + serverId);
-    const online = [], voice = {};
-    for (const p of ps) { online.push(p.identity); const vc = p.attributes && p.attributes.vc; if (vc) voice[p.identity] = vc; }
-    return { online, voice };
+    const online = new Set(), voice = {};
+    for (const p of ps) { const u = baseIdentity(p.identity); online.add(u); const vc = p.attributes && p.attributes.vc; if (vc) voice[u] = vc; }
+    return { online: [...online], voice };
   } catch (e) { return { online: [], voice: {} }; }
 }
 const pubUser = u => ({ id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '', bio: u.bio });
@@ -344,7 +347,8 @@ app.post('/api/servers/:id/kick', requireAuth, (req, res) => {
   db.prepare('DELETE FROM member_roles WHERE user_id=? AND server_id=?').run(uid, s.id);
   db.prepare('DELETE FROM server_settings WHERE user_id=? AND server_id=?').run(uid, s.id);
   const ku = db.prepare('SELECT username FROM users WHERE id=?').get(uid);
-  if (ku) { try { rsc.removeParticipant('srv:' + s.id, ku.username).catch(() => {}); } catch (e) {} }
+  // выгоняем ВСЕ live-сессии юзера из комнаты (identity = username#nonce)
+  if (ku) { try { rsc.listParticipants('srv:' + s.id).then(ps => ps.filter(p => baseIdentity(p.identity) === ku.username).forEach(p => rsc.removeParticipant('srv:' + s.id, p.identity).catch(() => {}))).catch(() => {}); } catch (e) {} }
   res.json({ ok: true });
 });
 
@@ -521,7 +525,7 @@ app.get('/api/servers/:id/token', requireAuth, async (req, res) => {
   if (!s) return res.status(404).json({ error: 'нет' });
   if (!isMember(req.user.id, s.id)) return res.status(403).json({ error: 'Ты не участник' });
   try {
-    const at = new AccessToken(KEY, SECRET, { identity: req.user.username, name: req.user.display_name, ttl: '12h' });
+    const at = new AccessToken(KEY, SECRET, { identity: req.user.username + '#' + crypto.randomBytes(4).toString('hex'), name: req.user.display_name, ttl: '12h' });
     at.addGrant({ roomJoin: true, room: 'srv:' + s.id, canPublish: true, canSubscribe: true, canPublishData: true, canUpdateOwnMetadata: true });
     res.json({ token: await at.toJwt(), url: WS_URL, room: 'srv:' + s.id });
   } catch (e) { res.status(500).json({ error: String(e) }); }

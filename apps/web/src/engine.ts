@@ -3,6 +3,7 @@ import {
   type RemoteParticipant, type Participant, type TrackPublication, type RemoteTrack,
 } from 'livekit-client';
 import type { User, Member, ChatMessage, Emote, HistoryMessage, ReplyRef } from './types';
+import { baseUid } from './util';
 import { getSettings, setSettings } from './settings';
 import { emoteUrl } from './emotes';
 import { playSound } from './sounds';
@@ -257,8 +258,8 @@ export class Engine {
     this.treeT.attach(r, { me: this.me.username, serverId });
     r.on(RoomEvent.TrackSubscribed, this.onSub)
       .on(RoomEvent.TrackUnsubscribed, this.onUnsub)
-      .on(RoomEvent.ParticipantConnected, (p) => { this.hooks.peerJoined(p.identity); this.hooks.toast((p.name || p.identity) + ' в сети', 'ok'); this.emit(); })
-      .on(RoomEvent.ParticipantDisconnected, (p) => { this.cleanupPeer(p.identity); this.emit(); })
+      .on(RoomEvent.ParticipantConnected, (p) => { const u = baseUid(p.identity); if (u !== this.me.username && !this.hasOtherSession(u, p.identity)) this.hooks.toast((p.name || u) + ' в сети', 'ok'); this.hooks.peerJoined(u); this.emit(); })
+      .on(RoomEvent.ParticipantDisconnected, (p) => { const u = baseUid(p.identity); if (!this.hasOtherSession(u, p.identity)) this.cleanupPeer(u); this.emit(); })
       // звук мута слышен только самому мутящемуся (не остальным) — играем при локальном событии
       .on(RoomEvent.TrackMuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.room?.localParticipant) playSound('mute'); this.emit(); })
       .on(RoomEvent.Reconnecting, () => { this.reconnecting = true; this.hooks.toast('Связь потеряна — переподключаюсь…', 'warn'); this.emit(); })
@@ -316,10 +317,26 @@ export class Engine {
   }
 
   /* ---------- presence helpers ---------- */
+  // участник по БАЗОВОМУ username (identity = username#session). Несколько сессий одного юзера →
+  // предпочитаем ту, что в голосовом (с mic-треком), иначе любую.
   private partOf(username: string): Participant | null {
     if (!this.room) return null;
     if (username === this.me.username) return this.room.localParticipant;
-    return this.room.remoteParticipants.get(username) || null;
+    let any: Participant | null = null;
+    for (const p of this.room.remoteParticipants.values()) {
+      if (baseUid(p.identity) !== username) continue;
+      if (p.getTrackPublication(Track.Source.Microphone)) return p;
+      any = p;
+    }
+    return any;
+  }
+  // есть ли у юзера ещё живые сессии, кроме указанной (для presence/cleanup при отключении одной)
+  private hasOtherSession(username: string, exceptIdentity: string): boolean {
+    if (!this.room) return false;
+    for (const p of this.room.remoteParticipants.values()) {
+      if (p.identity !== exceptIdentity && baseUid(p.identity) === username) return true;
+    }
+    return false;
   }
   private isInVoice(username: string): boolean {
     const p = this.partOf(username); if (!p) return false;
@@ -336,11 +353,12 @@ export class Engine {
   // подписка на микрофон пира только когда я в голосовом и мы в ОДНОМ канале (изоляция звука по каналам)
   private reconcilePeerAudio(p: Participant) {
     if (!this.room || p === this.room.localParticipant) return;
+    if (baseUid(p.identity) === this.me.username) return; // своя же другая сессия — не подписываемся (эхо)
     const mp = p.getTrackPublication(Track.Source.Microphone);
     if (!mp) return;
     const want = this.inVoice && !!this.currentVc && (p as any).attributes?.vc === this.currentVc;
     try { (mp as any).setSubscribed(want); } catch { /**/ }
-    if (!want) this.detachAnalyser(p.identity);
+    if (!want) this.detachAnalyser(baseUid(p.identity));
   }
   private reconcileAllAudio() { this.room?.remoteParticipants.forEach((p) => this.reconcilePeerAudio(p)); }
   private isStreaming(username: string): boolean {
@@ -375,6 +393,7 @@ export class Engine {
     }
     this.reconcileAllAudio(); // подписываемся только на пиров этого же канала
     this.startConnPoll();
+    this.dataSend({ t: 'vclaim', uid: this.me.id }); // забираем голос у своих других сессий (одна голосовая на аккаунт)
     this.voiceConnecting = false;
     this.emit();
   }
@@ -395,7 +414,7 @@ export class Engine {
     this.stopConnPoll();
     await this.stopShare().catch(() => {});
     this.stopMic();
-    this.room.remoteParticipants.forEach((p) => { const rp = p.getTrackPublication(Track.Source.Microphone); if (rp) { try { (rp as any).setSubscribed(false); } catch { /**/ } } this.detachAnalyser(p.identity); });
+    this.room.remoteParticipants.forEach((p) => { const rp = p.getTrackPublication(Track.Source.Microphone); if (rp) { try { (rp as any).setSubscribed(false); } catch { /**/ } } this.detachAnalyser(baseUid(p.identity)); });
     try { await this.room.localParticipant.setAttributes({ vc: '', deaf: '' }); } catch { /**/ }
     this.screenAudioEls.forEach((a) => (a.muted = false));
     this.emit();
@@ -620,8 +639,9 @@ export class Engine {
   /* ---------- track events (mic/chat only — video-domain events live in VideoTransport) ---------- */
   private onRemotePub = (pub: TrackPublication, p: RemoteParticipant, silent?: boolean) => {
     if (pub.source === Track.Source.Microphone) {
+      const own = baseUid(p.identity) === this.me.username; // своя же другая сессия — без звука/подписки
       // подписываемся на микрофон только если я в голосовом и пир в ТОМ ЖЕ канале
-      if (this.inVoice && !!this.currentVc && (p as any).attributes?.vc === this.currentVc) {
+      if (!own && this.inVoice && !!this.currentVc && (p as any).attributes?.vc === this.currentVc) {
         try { (pub as any).setSubscribed(true); } catch { /**/ }
         if (!silent) playSound('join');
       }
@@ -629,22 +649,24 @@ export class Engine {
     }
   };
   private onRemoteUnpub = (pub: TrackPublication, p: RemoteParticipant) => {
-    if (pub.source === Track.Source.Microphone && this.inVoice) playSound('leave'); // вышел из голосового
+    if (pub.source === Track.Source.Microphone && this.inVoice && baseUid(p.identity) !== this.me.username) playSound('leave'); // вышел из голосового
     this.emit();
   };
   private onSub = (track: RemoteTrack, pub: TrackPublication, p: RemoteParticipant) => {
     if (track.kind === Track.Kind.Audio) {
       const a = track.attach(); a.autoplay = true; document.getElementById('audioSink')?.appendChild(a);
       const out = getSettings().output; if ((a as any).setSinkId && out) (a as any).setSinkId(out).catch(() => {});
-      if (pub.source === Track.Source.ScreenShareAudio) { this.screenAudioEls.set(p.identity, a); a.muted = this.deafened; a.volume = this.streamVolOf(p.identity); }
-      else { this.applyVolumeByName(p.identity); this.attachAnalyser(p.identity, (track as any).mediaStreamTrack); }
+      const u = baseUid(p.identity);
+      if (pub.source === Track.Source.ScreenShareAudio) { this.screenAudioEls.set(u, a); a.muted = this.deafened; a.volume = this.streamVolOf(u); }
+      else { this.applyVolumeByName(u); this.attachAnalyser(u, (track as any).mediaStreamTrack); }
     }
     this.emit();
   };
   private onUnsub = (track: RemoteTrack, pub: TrackPublication, p: RemoteParticipant) => {
     track.detach().forEach((el) => el.remove());
-    if (pub.source === Track.Source.ScreenShareAudio) this.screenAudioEls.delete(p.identity);
-    if (pub.source === Track.Source.Microphone) this.detachAnalyser(p.identity);
+    const u = baseUid(p.identity);
+    if (pub.source === Track.Source.ScreenShareAudio) this.screenAudioEls.delete(u);
+    if (pub.source === Track.Source.Microphone) this.detachAnalyser(u);
     this.emit();
   };
 
@@ -775,7 +797,7 @@ export class Engine {
     const v = (this.deafened || this.perMute.has(username)) ? 0 : (getSettings().master / 100) * base;
     try { (p as any).setVolume(v); } catch { /**/ }
   }
-  private applyAllVolumes() { this.room?.remoteParticipants.forEach((p) => this.applyVolumeByName(p.identity)); }
+  private applyAllVolumes() { this.room?.remoteParticipants.forEach((p) => this.applyVolumeByName(baseUid(p.identity))); }
   async applyOutput() { if (!this.room) return; const out = getSettings().output; try { await this.room.switchActiveDevice('audiooutput', out || 'default'); } catch { /**/ } document.querySelectorAll('#audioSink audio').forEach((a) => { if ((a as any).setSinkId && out) (a as any).setSinkId(out).catch(() => {}); }); }
 
   /* ---------- chat ---------- */
@@ -908,7 +930,16 @@ export class Engine {
   private onData = (payload: Uint8Array) => {
     try {
       const d = JSON.parse(new TextDecoder().decode(payload));
-      if (d.t === 'chat') { if (d.em) for (const k in d.em) this.onEmoteResolve?.(k, d.em[k]); this.typingUsers.delete(d.name); const repliedToMe = this.replyToMe(d.reply); const mentioned = this.textMentionsMe(d.text) || repliedToMe; this.pushMsg(d.name, d.text, false, d.color, false, d.img, undefined, d.uid, d.reply); playSound(mentioned ? 'mention' : 'msg'); if (mentioned) this.hooks.toast(repliedToMe ? `${d.name} ответил тебе` : `${d.name} упомянул тебя`, 'info'); }
+      if (d.t === 'chat') {
+        if (d.em) for (const k in d.em) this.onEmoteResolve?.(k, d.em[k]);
+        this.typingUsers.delete(d.name);
+        const own = d.uid === this.me.id; // моё же сообщение с другой сессии — показываем как своё, без звука/меншена
+        const repliedToMe = !own && this.replyToMe(d.reply);
+        const mentioned = !own && (this.textMentionsMe(d.text) || repliedToMe);
+        this.pushMsg(d.name, d.text, false, d.color, own, d.img, undefined, d.uid, d.reply);
+        if (!own) { playSound(mentioned ? 'mention' : 'msg'); if (mentioned) this.hooks.toast(repliedToMe ? `${d.name} ответил тебе` : `${d.name} упомянул тебя`, 'info'); }
+      }
+      else if (d.t === 'vclaim') { if (d.uid === this.me.id && this.inVoice) this.leaveVoice(); } // другая моя сессия зашла в голосовой → выхожу (одна голосовая на аккаунт)
       else if (d.t === 'clear') { this.messages = []; this.emit(); this.sysMsg((d.by || 'Админ') + ' очистил чат'); }
       else if (d.t === 'emote') this.emoteListeners.forEach((f) => f(d.s, d.e, d.by, d.x, d.sz));
       else if (d.t === 'watch') { const m = this.wset(d.s); if (d.on) m.set(d.id, { name: d.n, color: d.c ?? 0, avatarUrl: d.a, ts: Date.now() }); else m.delete(d.id); this.emit(); }

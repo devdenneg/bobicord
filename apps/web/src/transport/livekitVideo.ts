@@ -4,6 +4,7 @@ import {
 } from 'livekit-client';
 import type { VideoTransport } from './videoTransport';
 import type { StreamInfo } from '../engine';
+import { baseUid } from '../util';
 
 /**
  * LiveKit SFU implementation of VideoTransport — behavior identical to pre-Э0 engine.ts.
@@ -80,8 +81,19 @@ export class LiveKitVideoTransport implements VideoTransport {
     if (a && a.track) { try { await this.room.localParticipant.unpublishTrack(a.track, true); } catch { /**/ } }
   }
   isBroadcasting(_streamId: string) { return !!(this.room && this.room.localParticipant.isScreenShareEnabled); }
-  isRemoteBroadcasting(identity: string) {
-    const p = this.room?.remoteParticipants.get(identity);
+  // участник по базовому username (несколько сессий одного юзера → берём вещающую)
+  private byUser(username: string): RemoteParticipant | undefined {
+    if (!this.room) return undefined;
+    let any: RemoteParticipant | undefined;
+    for (const p of this.room.remoteParticipants.values()) {
+      if (baseUid(p.identity) !== username) continue;
+      if (p.getTrackPublication(Track.Source.ScreenShare)) return p;
+      any = p;
+    }
+    return any;
+  }
+  isRemoteBroadcasting(username: string) {
+    const p = this.byUser(username);
     return !!(p && p.getTrackPublication(Track.Source.ScreenShare));
   }
 
@@ -103,12 +115,12 @@ export class LiveKitVideoTransport implements VideoTransport {
 
   /* ---------- watching (remote) ---------- */
   watch(streamId: string) {
-    const p = this.room?.remoteParticipants.get(streamId); if (!p) return;
+    const p = this.byUser(streamId); if (!p) return;
     const v = p.getTrackPublication(Track.Source.ScreenShare), a = p.getTrackPublication(Track.Source.ScreenShareAudio);
     [v, a].forEach((pub) => { if (pub) { try { (pub as any).setSubscribed(true); } catch { /**/ } } });
   }
   unwatch(streamId: string) {
-    const p = this.room?.remoteParticipants.get(streamId); if (!p) return;
+    const p = this.byUser(streamId); if (!p) return;
     const v = p.getTrackPublication(Track.Source.ScreenShare), a = p.getTrackPublication(Track.Source.ScreenShareAudio);
     [v, a].forEach((pub) => { if (pub) { try { (pub as any).setSubscribed(false); } catch { /**/ } } });
   }
@@ -134,15 +146,15 @@ export class LiveKitVideoTransport implements VideoTransport {
   /* ---------- room events (video-domain only; mic/chat stay in engine.ts) ---------- */
   private onRemotePub = (pub: TrackPublication, p: RemoteParticipant, silent?: boolean) => {
     if (pub.source !== Track.Source.ScreenShare) return;
-    this.streamStartCbs.forEach((cb) => cb(p.identity, !!silent));
+    this.streamStartCbs.forEach((cb) => cb(baseUid(p.identity), !!silent));
   };
   private onRemoteUnpub = (pub: TrackPublication, p: RemoteParticipant) => {
     if (pub.source !== Track.Source.ScreenShare) return;
-    this.streamStopCbs.forEach((cb) => cb(p.identity));
+    this.streamStopCbs.forEach((cb) => cb(baseUid(p.identity)));
   };
   private onSub = (track: RemoteTrack, pub: TrackPublication, p: RemoteParticipant) => {
     if (track.kind !== Track.Kind.Video) return;
-    this.addVideo(pub.trackSid, track, p.identity, false);
+    this.addVideo(pub.trackSid, track, baseUid(p.identity), false);
   };
   private onUnsub = (track: RemoteTrack, pub: TrackPublication) => {
     if (track.kind !== Track.Kind.Video) return;

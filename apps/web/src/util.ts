@@ -3,6 +3,8 @@ export function hueOf(s: string): number { let h = 0; for (let i = 0; i < (s || 
 export const initial = (n: string) => (n || '?').trim().charAt(0).toUpperCase() || '?';
 export const avColor = (name: string, ci?: number) => AV_COLORS[(ci != null ? ci : hueOf(name)) % AV_COLORS.length];
 export const prefersReducedMotion = () => window.matchMedia('(prefers-reduced-motion:reduce)').matches;
+// LiveKit identity = `username#<nonce>` (уникально на сессию). Базовый username = ключ юзера в UI/presence.
+export const baseUid = (id: string) => { const i = (id || '').indexOf('#'); return i < 0 ? (id || '') : id.slice(0, i); };
 // Человекочитаемая метка одной клавиши по KeyboardEvent.code.
 const KEY_LABELS: Record<string, string> = {
   ControlLeft: 'Ctrl', ControlRight: 'Ctrl', ShiftLeft: 'Shift', ShiftRight: 'Shift',
