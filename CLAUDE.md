@@ -39,3 +39,62 @@
 Запись на диск, мобильные клиенты, транскод на сервере, DRM, вещание из браузера, spatial-SVC, полный RBAC/Supabase (пока owner/member + SQLite), оверлей курсоров/рисование — позже.
 
 Всегда пиши на русском языке
+
+---
+
+# Подсистемы и уроки (накоплено по сессиям)
+
+Архитектурные факты и грабли, которые НЕ выводятся из кода за минуту. Перед правкой соответствующей области — прочитать.
+
+## Голос / аудио (engine.ts)
+
+- **Изоляция звука по каналам:** подписка на mic пира только если `inVoice && !deafened && currentVc && attributes.vc===currentVc`. Единая точка — `reconcilePeerAudio` (+ `onRemotePub` для TrackPublished). `reconcileAllAudio` перебирает всех.
+- **Фулл-мут (deafen) = ОТПИСКА, не громкость.** Раньше глушили `setVolume(0)`, но подписка оставалась → пир размутился → `ParticipantAttributesChanged` → resubscribe без re-apply громкости → звук проходил мимо мута. Теперь `!deafened` в `want`, `toggleDeaf` всегда зовёт `reconcileAllAudio` (deafen→отписка, undeafen→переподписка). Нет трека = гарантированная тишина. `leaveVoice` сразу сносит mic-аудиоэлементы (не screenshare — стрим смотрится и без голосового; отличаем по `screenAudioEls`).
+- **Ростер голосового — по vc-АТРИБУТУ, не по mic-публикации.** При `autoSubscribe:false` mic-публикация «уже присутствовавших» пиров локально не приезжает → `isInVoice` давал false → пир пропадал из канала, хотя сам и сервер видят его в голосовом (симптом «я его не вижу, а он меня — да»). `voiceChannelOf` (attributes.vc) доставляется и для старых пиров. Fallback — серверный `voiceHint` из /presence.
+- **setAttributes МЕРЖИТ** (не заменяет) — `{deaf}` не затирает `vc`. Но публикация может тихо провалиться (гонка оптимистичного входа / rate-limit / таймаут 5с): `setAttributes` ждёт серверного эха и обновляет `localParticipant.attributes` только по подтверждению → при неудаче реджект, атрибут пуст. Симптом «юзер невидим другим, появился через время (на реконнекте)». Лечит `selfHealVc` в 3с-таймере: пере-заявляет vc/deaf, ЕСЛИ опубликованный (server-confirmed) атрибут ≠ текущему состоянию. Двунаправленно (в войсе vc=currentVc; вне — vc='').
+- **Индикатор качества связи:** `connQuality` читаем НАПРЯМУЮ из `localParticipant.connectionQuality` в conn-полле (2.5с), не ждём событие `ConnectionQualityChanged` (оно только при СМЕНЕ качества → при стабильной связи метка залипала на «соединение…»). Фолбэк из пинга, если LiveKit ещё отдаёт unknown.
+- **Мультисессия:** LiveKit identity = `username#nonce`, наружу — `baseUid()` (base username). Своя другая сессия не подписывается (эхо). Одна голосовая на аккаунт — `vclaim` (reliable data + переотправка на Reconnected + tie-break гонки по session-id).
+- **reliable data** (`dataSend`) для чата/vclaim/clear — терять нельзя. typing/emote/watch — эфемерны.
+
+## Уведомления (многослойно)
+
+- **Локальные** (`notify.ts`): натив — кастомное окно-карточка (Tauri WebviewWindow, см. ниже) с фолбэком на OS-toast; веб — `reg.showNotification` (SW) с фолбэком `new Notification`. Гейт фокуса ТОЛЬКО для mention (Discord-стиль); стрим/обновление — всегда. Общий тег `<kind>:<serverId>` в local И push → ОС схлопывает в один баннер (без дублей). Автозапрос разрешения при старте (opt-out флаг `notifOptOut`); iOS промпт нужен по ЖЕСТУ (тумблер), авто-запрос там игнорится.
+- **Web Push (VAPID)** (`push.ts` + сервер): фон/закрыто, единственный путь для iOS PWA (в фоне JS заморожен). Ключи авто-генерятся в `data/vapid.json` (стабильно). `urgency:'high'` + TTL — КРИТИЧНО (без high FCM/APNs батчат → «не сразу»). Room-gate УБРАН (свёрнутая мобилка ещё ~15-20с «в комнате» → окно пропуска). SW ВСЕГДА `showNotification` в `waitUntil` (iOS: тихий push → Safari снимает подписку). Подписка перепривязывается к аккаунту в `afterAuth` (минуя opt-out гейт); logout отписывает под старым токеном.
+- **Глобальный notify-WS** (`/ws`, `notifyws.ts`): для уведомлений о НЕ подключённом сервере (LiveKit-комната поднята только для текущего; натив web-push не получает). Сервер на mention/stream шлёт `notifyUser(uid)` напрямую по user_id → его ws-сокеты. Клиент дедупит по `connectedServerId` (текущий сервер обслуживает live LiveKit-путь).
+- **Кастомная нативная карточка** (`notif.html` + `notif-window.ts`, Vite multi-page): своё окно-оверлей (как Discord/Steam), прозрачное/без рамки/поверх всех/non-focus, правый нижний угол. Позиция — `currentMonitor().workArea` в ГЛОБАЛЬНЫХ логических px (screen.availWidth не учитывает офсет монитора → Tauri центрировал окно). Capabilities: главному — `core:webview:allow-create-webview-window`+`core:window:allow-close`; окну `notif` — `core:default`+close/set-focus/unminimize/show. Клик по карточке → фокус главного окна; `focusable:false` (не крадёт фокус).
+- **Таскбар-бейдж:** `navigator.setAppBadge` (установленная PWA). Сумма непрочитанного + флаг обновления.
+
+## Непрочитанное (unread)
+
+- Сервер: таблица `read_state(user,server,last_read)`. `/me` отдаёт `unread`+`lastRead` per server; `POST /servers/:id/read`; лёгкий `GET /unread` (без LiveKit). unread = чат-сообщения новее last_read и НЕ свои. **Первое обращение лениво сеет** last_read=последнему (иначе на раскатке весь бэклог = непрочитан).
+- Клиент (store): `unread`/`lastRead`-мапы. Активный (connected) сервер клиент ведёт сам (`bumpUnread` на новое не-своё пока не читаем, `markRead` внизу чата); остальные — поллинг `/unread` 30с (mergeUnread не трогает connected). Рейл-бейдж на иконке сервера. В чате — дивайдер «Новые сообщения» перед первым непрочитанным + `initialTopMostItemIndex` позиционирует туда, jump-кнопка (⌄) со счётчиком. Скролл в конец на отправку/фокус инпута.
+
+## Чат (надёжность)
+
+- **Дедуп mergeRecent** (реконнект-догрузка): по sid И по сигнатуре (автор+текст+картинка) — live-эхо от onData не имеет sid, иначе refetchChat дублировал. Совпавшему live-сообщению «усыновляем» серверный sid. Свои НЕ пропускаем безусловно (мультисессия: своё с другого устройства могло не дойти).
+- **Идемпотентность POST**: клиент шлёт `client_key` (переживает retry) → partial-unique индекс `(server_id,user_id,client_key)` + `INSERT OR IGNORE`. `info.changes===0` = дубль (retry после потери ответа) → не пушим повторно.
+
+## Оркестрация соединения (store.ts)
+
+- **Эпоха соединения (`connEpoch`)**: инкрементится на connectServer/exitServer/logout. Фоновый connect-IIFE и member-poll сверяют эпоху перед записью — иначе протухший хвост прошлого сервера рвёт живую комнату нового / пишет чужой состав. Убран безусловный disconnect по устаревшему `connectedServerId` (убивал живую комнату). Провал фонового connect сбрасывает `connectedServerId` (иначе повторный клик → showConnectedServer без реконнекта → realtime мёртв до F5). `goHome` НЕ рвёт соединение.
+- **fetch-таймаут 15с** (AbortController) в `api.req` — мёртвый TCP иначе оставлял вечное «отправляется».
+
+## Видео-дерево / discovery (treeVideo.ts)
+
+- **Tree-liveness самолечится ре-`hello`** (15с): `liveStreams` мутируют только discovery-события → потерянный `stream-live` (полуоткрытый WS) висел до F5. onHello на сервере идемпотентен (переотдаёт бэклог), клиентский `fresh`-гард без дублей. LiveKit-стримы самолечатся 3с-таймером (живой опрос комнаты).
+- `openDiscovery` при throw конструктора WS планирует ретрай (раньше discovery умирал навсегда). 2с-реконсиляр НЕ сносит активные watch (окно 4с). Закрытие прежнего сокета + гард реконнекта (только текущий сокет).
+- **Rust держит ОДИН watch-слот** (`WatchState = Mutex<Option>`), `stopNativeWatch()` глобален → зритель смотрит max 1 стрим (`engine.watch` закрывает прочие). Иначе остановка одного рубила единственный слот.
+
+## Игровой статус (натив, Discord-стиль)
+
+- `detect_game` (lib.rs) → `fullscreen_windows()` (скан ВСЕХ окон, не foreground — таб в наш апп не сбрасывал; фуллскрин по монитору ОКНА через MonitorFromWindow/GetMonitorInfoW, rcMonitor включает таскбар → максимизированный браузер не проходит) + фолбэк `foreground_window()` (оконная игра, пока в фокусе). **Скипаем свой процесс по `std::process::id()`** (блоклиста по имени exe мало). anti-cheat игра с пустым title (UIPI) → имя из exe (`process_name` кросс-integrity). Иконка — `icon.rs` (PNG base64). Только метаданные окна/exe → анти-читам безопасно. Presence через participant-атрибут `game`/`gicon` (иконка ~1КБ влезает; веб только ОТОБРАЖАЕТ, детект не делает).
+
+## Превью главной
+
+- `/me` отдаёт `online` как объекты (`onlineDetailed`): аватар/имя + стрим (LiveKit ScreenShare-трек ИЛИ tree-broadcaster) + голос (mic-трек/vc-атрибут). ServerCard рисует аватарки + тултип «кто в сети и что делает».
+
+## Инфра / грабли
+
+- **RTK-хук ломает `git commit -m @'...'`** (добавляет литерал `@`) — коммить через `git commit -F - <<'MSG'` heredoc.
+- **Rust локально не компилится** (нет toolchain) — Win32/Tauri-сигнатуры выверять по `microsoft.github.io/windows-docs-rs` + `node_modules/@tauri-apps/api/*.d.ts` перед пушем (неверное имя ACL-права = ФЕЙЛ сборки). PROPERTYKEY — в `Foundation`, не PropertiesSystem. Cargo.lock синкать в CI через `cargo fetch` (build-windows.yml).
+- **Деплой**: push с правками `apps/web/**`/`apps/server/**` триггерит `deploy.yml` → пересоздание контейнеров РВЁТ живые relay-деревья (стримы падают). Натив (`capabilities/*.json`, `src/**`) → `build-windows.yml`, грузит бандл + capabilities вшиты в бинарь (веб-деплою не подчиняется).
