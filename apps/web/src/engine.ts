@@ -311,7 +311,7 @@ export class Engine {
     // periodic self-heal подписок на микрофоны: атрибут vc (голосовой канал) мог доехать без события
     // ParticipantAttributesChanged (гонка при быстрых прыжках между каналами / реконнекте) — тогда пир
     // виден в канале, но его не слышно. setSubscribed идемпотентен, поэтому реконсиляция дёшева и безопасна.
-    this.presenceTimer = window.setInterval(() => { this.announceWatch(); this.cleanupWatchers(); if (this.inVoice) { this.reconcileAllAudio(); this.selfHealVc(); } }, 3000);
+    this.presenceTimer = window.setInterval(() => { this.announceWatch(); this.cleanupWatchers(); if (this.inVoice) this.reconcileAllAudio(); this.selfHealVc(); }, 3000);
     this.emit();
   }
 
@@ -393,11 +393,15 @@ export class Engine {
   // локально), но ВСЕ остальные — нет: они читают participant-атрибут vc (или серверный voiceHint,
   // который тоже строится из атрибута), а он пуст. Ретрай был только на Reconnected — теперь и в 3с-self-heal.
   private selfHealVc() {
-    if (!this.room || !this.inVoice || !this.currentVc) return;
+    if (!this.room) return;
+    // Двунаправленно: в войсе публикуем vc=currentVc; ВНЕ войса — vc='' (иначе если setAttributes({vc:''})
+    // при leaveVoice не долетел, покинувший «залипает» в канале у других до реконнекта — обратная сторона
+    // того же бага). deaf публикуем только пока в войсе.
+    const wantVc = this.inVoice ? (this.currentVc || '') : '';
+    const wantDeaf = (this.inVoice && this.deafened) ? '1' : '';
     const attrs = this.room.localParticipant.attributes || {};
-    const wantDeaf = this.deafened ? '1' : '';
-    if (attrs.vc !== this.currentVc || (attrs.deaf || '') !== wantDeaf) {
-      this.room.localParticipant.setAttributes({ vc: this.currentVc, deaf: wantDeaf }).catch(() => {});
+    if ((attrs.vc || '') !== wantVc || (attrs.deaf || '') !== wantDeaf) {
+      this.room.localParticipant.setAttributes({ vc: wantVc, deaf: wantDeaf }).catch(() => {});
     }
   }
   private isStreaming(username: string): boolean {
