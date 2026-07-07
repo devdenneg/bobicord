@@ -204,36 +204,36 @@ export class Engine {
 
   private build(): Snapshot {
     const presence: Record<string, PeerState> = {};
+    // Кто в каком голосовом канале. Главный источник — vc-АТРИБУТ участника: LiveKit доставляет
+    // его даже для пиров, сидевших в комнате ДО нашего коннекта. mic-ПУБЛИКАЦИЯ для таких
+    // «уже присутствовавших» при autoSubscribe:false нам не приезжает, поэтому isInVoice давал
+    // false и пир пропадал из канала — хотя и сервер, и он сам видели его в голосовом (ровно
+    // баг «не вижу друга, а он меня видит»: меня он видел, т.к. я подключился ПОЗЖЕ и ему
+    // прилетел живой TrackPublished). Серверный хинт /presence — fallback, когда пир не виден
+    // локально или атрибут ещё в полёте.
+    const voiceChannels: Record<string, string> = {};
     for (const m of this.members) {
       const p = this.partOf(m.username);
       const online = !!p || this.onlineHint.has(m.username);
-      const inV = this.isInVoice(m.username);
+      let vc = '';
+      if (this.roomReady && p) {
+        vc = this.voiceChannelOf(m.username) || '';                          // vc-атрибут (доезжает и для «старых» пиров)
+        if (!vc && this.isInVoice(m.username)) vc = this.voiceHint[m.username] || ''; // атрибут в полёте, но mic-трек уже виден
+      } else {
+        vc = this.voiceHint[m.username] || '';                               // пир не виден локально → серверный хинт
+      }
+      if (vc) voiceChannels[m.username] = vc;
+      const inV = !!vc || this.isInVoice(m.username);
       const mp = p ? p.getTrackPublication(Track.Source.Microphone) : undefined;
       // «оглох» (deafen) транслируется пирам participant-атрибутом deaf (как vc для голосового
       // канала) — иначе другие видят для оглохшего то же «мик выключен», что и для просто мута.
       const deaf = m.username === this.me.username ? this.deafened : !!(p as any)?.attributes?.deaf;
-      // !mp (трек ещё не опубликован — до roomReady показываем состав канала по серверному
-      // хинту, публикация мика/round-trip атрибута vc ещё в полёте) — это «пока не знаем»,
-      // а не «замучен»: раньше !mp трактовалось как muted и на секунду мигал ложный бейдж
-      // всем в канале (и себе, пока свой мик ещё стартует) сразу после захода на сервер.
-      // || deaf — подстраховка: оглохший всегда считается замьюченным для бейджа независимо
-      // от сырого флага трека (см. toggleMic — там же зафиксирован сам источник рассинхрона).
+      // !mp (трек ещё не опубликован / не доехал) — это «пока не знаем», а не «замучен»: иначе
+      // на секунду мигал бы ложный бейдж «мут» всем в канале. || deaf — оглохший всегда замьючен.
       presence[m.username] = { online, inVoice: inV, micMuted: (!!mp && mp.isMuted) || deaf, streaming: this.isStreaming(m.username), deafened: deaf };
     }
     const speaking: Record<string, boolean> = {};
     this.speakingSet.forEach((u) => (speaking[u] = true));
-    // кто в каком голосовом канале. Комната поднялась и пир виден локально → доверяем локальному
-    // состоянию (attr vc / микрофон). Иначе (комната ещё в фоне / пира нет локально) — серверный хинт
-    // из /presence, чтобы состав каналов был виден сразу, без пустого мигания на загрузке.
-    const voiceChannels: Record<string, string> = {};
-    for (const m of this.members) {
-      const p = this.partOf(m.username);
-      if (this.roomReady && p) {
-        if (this.isInVoice(m.username)) { const vc = this.voiceChannelOf(m.username) || this.voiceHint[m.username]; if (vc) voiceChannels[m.username] = vc; }
-      } else {
-        const vc = this.voiceHint[m.username]; if (vc) voiceChannels[m.username] = vc;
-      }
-    }
     // стримы (screenshare) смотрятся server-wide, независимо от голосового канала: по каналам
     // изолирован только звук микрофона. Иначе нельзя было бы смотреть трансляцию не заходя в её канал.
     const streams: StreamInfo[] = [...this.liveKitT.getStreams(), ...this.treeT.getStreams()];
