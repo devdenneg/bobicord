@@ -17,41 +17,77 @@ use windows_capture::settings::{
     GraphicsCaptureItemType, MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
 use windows_capture::window::Window;
-use windows::Win32::Foundation::RECT;
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetSystemMetrics, GetWindowRect, SM_CXSCREEN, SM_CYSCREEN,
+use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect};
 
-use super::stats::StatsHandle;
-
-/// Foreground-окно, ЕСЛИ оно похоже на игру: покрывает весь ОСНОВНОЙ экран (фуллскрин/borderless)
-/// — типичный признак игры, отсекающий обычные окна. Возвращает (hwnd, title, process, pid);
-/// дальше отсеивается блоклистом в lib.rs. Эвристика: фуллскрин на ВТОРИЧНОМ мониторе в MVP не
-/// ловим (SM_C*SCREEN — основной) — осознанное упрощение.
-pub fn foreground_game() -> Option<(isize, String, String, u32)> {
+/// Активное окно (foreground) — для детекта ОКОННОЙ игры (не фуллскрин): пока игра в фокусе,
+/// ловим её как игру, если не из блоклиста (проверка в lib.rs). Возвращает (hwnd, title, process, pid).
+pub fn foreground_window() -> Option<(isize, String, String, u32)> {
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.0.is_null() {
             return None;
         }
         let hwnd_i = hwnd.0 as isize;
-        let mut r = RECT::default();
-        if GetWindowRect(hwnd, &mut r).is_err() {
-            return None;
-        }
-        let (w, h) = (r.right - r.left, r.bottom - r.top);
-        let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
-        if w < sw || h < sh {
-            return None; // не фуллскрин на основном мониторе → не считаем игрой
-        }
-        let win = Window::from_raw_hwnd(hwnd_i as *mut std::ffi::c_void);
-        let process = win.process_name().unwrap_or_default();
+        let w = Window::from_raw_hwnd(hwnd_i as *mut std::ffi::c_void);
+        let process = w.process_name().unwrap_or_default();
         if process.is_empty() {
             return None;
         }
-        Some((hwnd_i, win.title().unwrap_or_default(), process, win.process_id().unwrap_or(0)))
+        Some((hwnd_i, w.title().unwrap_or_default(), process, w.process_id().unwrap_or(0)))
     }
 }
+
+/// Окно покрывает ВЕСЬ свой монитор (фуллскрин/borderless) — признак игры. Сравниваем с монитором
+/// ОКНА (не основного) — корректно для мультимонитора/DPI. rcMonitor включает область таскбара,
+/// поэтому МАКСИМИЗИРОВАННОЕ окно (браузер и т.п.) сюда НЕ попадает — только настоящий фуллскрин.
+fn is_fullscreen_window(hwnd_i: isize) -> bool {
+    unsafe {
+        let hwnd = HWND(hwnd_i as *mut std::ffi::c_void);
+        let mut wr = RECT::default();
+        if GetWindowRect(hwnd, &mut wr).is_err() {
+            return false;
+        }
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(mon, &mut mi).as_bool() {
+            return false;
+        }
+        let m = mi.rcMonitor;
+        if m.right - m.left <= 0 || m.bottom - m.top <= 0 {
+            return false;
+        }
+        // окно ≥ монитора (borderless иногда чуть переполняет), допуск 2px
+        wr.left <= m.left + 2 && wr.top <= m.top + 2 && wr.right >= m.right - 2 && wr.bottom >= m.bottom - 2
+    }
+}
+
+/// Все ПОЛНОЭКРАННЫЕ окна (кандидаты в игры). НЕ завязано на foreground — иначе таб в наш апп
+/// сбрасывал бы статус. title может быть пустым у elevated/анти-чит игр (UIPI блокирует
+/// GetWindowText) — имя тогда берётся из exe в lib.rs; process_name работает кросс-integrity
+/// (OpenProcess QUERY_LIMITED_INFORMATION). Блоклист применяется в lib.rs.
+pub fn fullscreen_windows() -> Vec<(isize, String, String, u32)> {
+    let mut out = Vec::new();
+    if let Ok(windows) = Window::enumerate() {
+        for w in windows {
+            let hwnd = w.as_raw_hwnd() as isize;
+            if !is_fullscreen_window(hwnd) {
+                continue;
+            }
+            let process = w.process_name().unwrap_or_default();
+            if process.is_empty() {
+                continue;
+            }
+            out.push((hwnd, w.title().unwrap_or_default(), process, w.process_id().unwrap_or(0)));
+        }
+    }
+    out
+}
+
+use super::stats::StatsHandle;
 
 /// Источник кадров: монитор целиком либо отдельное окно (Э5.1 — захват окна).
 /// `Window::from_raw_hwnd` ничего не валидирует сама по себе, так что перед

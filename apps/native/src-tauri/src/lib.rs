@@ -38,22 +38,16 @@ struct GameInfo { name: String, icon: Option<String> }
 // Имя — заголовок окна (у игр обычно человекочитаемый), фолбэк — имя exe. Иконка — PNG base64
 // (переиспользуем icon.rs, тот же путь, что для стрим-пикера). Только метаданные окна/exe: НЕ
 // читаем память игры и не инжектим → безопасно для анти-читов.
-#[tauri::command]
-fn detect_game() -> Option<GameInfo> {
-  let (hwnd, title, process, pid) = broadcast::capture::foreground_game()?;
-  let exe = process.to_lowercase();
-  let stem = exe.strip_suffix(".exe").unwrap_or(exe.as_str());
-  const BLOCK: &[&str] = &[
-    "relayapp", "explorer", "chrome", "firefox", "msedge", "brave", "opera", "vivaldi",
-    "yandex", "code", "devenv", "rider64", "idea64", "pycharm64", "sublime_text", "discord",
-    "steam", "steamwebhelper", "epicgameslauncher", "spotify", "telegram", "whatsapp",
-    "obs64", "obs", "notepad", "cmd", "powershell", "windowsterminal", "wt", "taskmgr",
-    "searchhost", "searchapp", "startmenuexperiencehost", "shellexperiencehost",
-    "applicationframehost", "textinputhost", "dwm", "sihost", "systemsettings", "lockapp",
-  ];
-  if stem.is_empty() || BLOCK.contains(&stem) {
-    return None;
-  }
+const GAME_BLOCK: &[&str] = &[
+  "relayapp", "explorer", "chrome", "firefox", "msedge", "brave", "opera", "vivaldi",
+  "yandex", "code", "devenv", "rider64", "idea64", "pycharm64", "sublime_text", "discord",
+  "steam", "steamwebhelper", "epicgameslauncher", "battlenet", "spotify", "telegram",
+  "whatsapp", "obs64", "obs", "notepad", "cmd", "powershell", "windowsterminal", "wt",
+  "taskmgr", "searchhost", "searchapp", "startmenuexperiencehost", "shellexperiencehost",
+  "applicationframehost", "textinputhost", "dwm", "sihost", "systemsettings", "lockapp",
+];
+
+fn game_info_from(hwnd: isize, title: &str, stem: &str, pid: u32) -> GameInfo {
   let t = title.trim();
   let name: String = if t.is_empty() {
     let mut c = stem.chars();
@@ -61,7 +55,32 @@ fn detect_game() -> Option<GameInfo> {
   } else {
     t.chars().take(48).collect()
   };
-  Some(GameInfo { name, icon: broadcast::icon::window_icon_png_base64(hwnd, pid) })
+  GameInfo { name, icon: broadcast::icon::window_icon_png_base64(hwnd, pid) }
+}
+
+fn allowed_game(process: &str) -> Option<String> {
+  let exe = process.to_lowercase();
+  let stem = exe.strip_suffix(".exe").unwrap_or(exe.as_str()).to_string();
+  if stem.is_empty() || GAME_BLOCK.contains(&stem.as_str()) { None } else { Some(stem) }
+}
+
+#[tauri::command]
+fn detect_game() -> Option<GameInfo> {
+  // 1) ПОЛНОЭКРАННОЕ окно не из блоклиста — сильный сигнал, НЕ зависит от фокуса (таб в наш апп
+  //    не сбрасывает; anti-cheat игра с пустым title детектится по exe).
+  for (hwnd, title, process, pid) in broadcast::capture::fullscreen_windows() {
+    if let Some(stem) = allowed_game(&process) {
+      return Some(game_info_from(hwnd, &title, &stem, pid));
+    }
+  }
+  // 2) ОКОННАЯ игра: активное окно, если не из блоклиста (пока игра в фокусе). Ловит игры в окне,
+  //    ценой того, что при табе в наш апп статус оконной игры сбрасывается (фуллскрин — не сбрасывает).
+  if let Some((hwnd, title, process, pid)) = broadcast::capture::foreground_window() {
+    if let Some(stem) = allowed_game(&process) {
+      return Some(game_info_from(hwnd, &title, &stem, pid));
+    }
+  }
+  None
 }
 
 struct BroadcastState(Mutex<Option<broadcast::BroadcastHandle>>);
