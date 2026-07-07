@@ -6,6 +6,7 @@ import type { User, Member, ChatMessage, Emote, HistoryMessage, ReplyRef } from 
 import { baseUid } from './util';
 import { notify } from './notify';
 import { api } from './api';
+import { isTauri, detectGame } from './native';
 import { getSettings, setSettings } from './settings';
 import { emoteUrl } from './emotes';
 import { playSound } from './sounds';
@@ -13,7 +14,8 @@ import type { VideoTransport } from './transport/videoTransport';
 import { LiveKitVideoTransport } from './transport/livekitVideo';
 import { TreeVideoTransport } from './transport/treeVideo';
 
-export interface PeerState { online: boolean; inVoice: boolean; micMuted: boolean; streaming: boolean; deafened: boolean }
+export interface GameStatus { name: string; icon?: string }
+export interface PeerState { online: boolean; inVoice: boolean; micMuted: boolean; streaming: boolean; deafened: boolean; game?: GameStatus | null }
 export interface StreamInfo { key: string; identity: string; isLocal: boolean; appName?: string; appIcon?: string }
 export type VoiceQuality = 'excellent' | 'good' | 'poor' | 'lost' | 'unknown';
 export interface Snapshot {
@@ -132,6 +134,8 @@ export class Engine {
   private screenStream: MediaStream | null = null;
   private presenceTimer: number | null = null;
   private serverId = ''; // текущий сервер (для api.streamStart → фоновый push о трансляции)
+  private gameTimer: number | null = null;
+  private myGame: GameStatus | null = null; // игра на переднем плане (натив, если включено в настройках)
 
   VOLS = { users: {} as Record<string, number>, streams: {} as Record<string, number> };
   private perMute = new Set<string>();
@@ -238,7 +242,11 @@ export class Engine {
       const deaf = m.username === this.me.username ? this.deafened : !!(p as any)?.attributes?.deaf;
       // !mp (трек ещё не опубликован / не доехал) — это «пока не знаем», а не «замучен»: иначе
       // на секунду мигал бы ложный бейдж «мут» всем в канале. || deaf — оглохший всегда замьючен.
-      presence[m.username] = { online, inVoice: inV, micMuted: (!!mp && mp.isMuted) || deaf, streaming: this.isStreaming(m.username), deafened: deaf };
+      // «играет в X»: для себя — локальный детект, для пира — participant-атрибуты game/gicon
+      let game: GameStatus | null = null;
+      if (m.username === this.me.username) game = this.myGame;
+      else { const gn = (p as any)?.attributes?.game; if (gn) game = { name: gn, icon: (p as any)?.attributes?.gicon || undefined }; }
+      presence[m.username] = { online, inVoice: inV, micMuted: (!!mp && mp.isMuted) || deaf, streaming: this.isStreaming(m.username), deafened: deaf, game };
     }
     const speaking: Record<string, boolean> = {};
     this.speakingSet.forEach((u) => (speaking[u] = true));
@@ -312,11 +320,32 @@ export class Engine {
     // ParticipantAttributesChanged (гонка при быстрых прыжках между каналами / реконнекте) — тогда пир
     // виден в канале, но его не слышно. setSubscribed идемпотентен, поэтому реконсиляция дёшева и безопасна.
     this.presenceTimer = window.setInterval(() => { this.announceWatch(); this.cleanupWatchers(); if (this.inVoice) this.reconcileAllAudio(); this.selfHealVc(); }, 3000);
+    // Детект игры (натив): раз в 10с публикуем участник-атрибуты game/gicon → все (вкл. веб и
+    // late-joiner'ов) видят «играет в X». Веб detectGame → null (процессы не видит), но статус
+    // ДРУГИХ читает из атрибутов в build(). Гейтится тумблером shareGame.
+    if (isTauri) { this.pollGame(); this.gameTimer = window.setInterval(() => this.pollGame(), 10000); }
+    this.emit();
+  }
+  private async pollGame() {
+    if (!this.room) return;
+    let g: GameStatus | null = null;
+    if (isTauri && getSettings().shareGame) {
+      try { const d = await detectGame(); if (d && d.name) g = { name: d.name.slice(0, 48), icon: d.icon || undefined }; } catch { /**/ }
+    }
+    this.myGame = g;
+    const wantName = g?.name || '';
+    const wantIcon = (g?.icon && g.icon.length < 4000) ? g.icon : ''; // атрибут маленький — большую иконку не шлём
+    const attrs = this.room.localParticipant.attributes || {};
+    if ((attrs.game || '') !== wantName || (attrs.gicon || '') !== wantIcon) {
+      // setAttributes МЕРЖИТ (не заменяет) — vc/deaf не затираются (проверено существующим поведением)
+      this.room.localParticipant.setAttributes({ game: wantName, gicon: wantIcon }).catch(() => {});
+    }
     this.emit();
   }
 
   disconnect() {
     if (this.presenceTimer) clearInterval(this.presenceTimer);
+    if (this.gameTimer) { clearInterval(this.gameTimer); this.gameTimer = null; } this.myGame = null;
     this.stopConnPoll();
     this.analysers.forEach((o) => { try { o.src.disconnect(); } catch { /**/ } });
     this.analysers.clear(); this.speakingSet.clear();

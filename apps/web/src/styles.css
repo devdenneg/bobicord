@@ -531,6 +531,12 @@
   .pi .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;font-weight:500}
   .pi.offline .nm{color:var(--muted)}
   .pi .nm .rl{color:var(--yellow);font-size:11px;margin-left:5px}
+  /* «играет в X»: в голосовом — только иконка (тултип), в участниках — иконка + название */
+  .pi-game{flex:0 0 auto;display:inline-flex;align-items:center;gap:5px;min-width:0}
+  .pi-game img{width:16px;height:16px;border-radius:4px;object-fit:contain;display:block}
+  .pi-game .gpad{font-size:13px;line-height:1}
+  .pi-game.mem{max-width:46%;padding:1px 7px 1px 5px;border-radius:9999px;background:var(--panel2);border:1px solid var(--line-2)}
+  .pi-game.mem .pg-nm{font-size:11px;font-weight:600;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   /* LIVE — НА аватаре (кольцо + мини-бейдж), а не в строке ника: ник всегда в приоритете, не перекрывается */
   .av.live{position:relative;box-shadow:0 0 0 2px var(--red),0 0 9px -2px rgba(242,63,67,.55);animation:avLive 2.2s ease-in-out infinite}
   .av.live .sdot{display:none}

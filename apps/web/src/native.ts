@@ -9,6 +9,14 @@ export async function pingNative(): Promise<string | null> {
   return invoke<string>('ping');
 }
 
+export interface GameInfo { name: string; icon: string | null }
+// Детект игры на переднем плане (Discord-style «играет в X»). null в браузере / если не игра.
+export async function detectGame(): Promise<GameInfo | null> {
+  if (!isTauri) return null;
+  try { const { invoke } = await import('@tauri-apps/api/core'); return await invoke<GameInfo | null>('detect_game'); }
+  catch { return null; }
+}
+
 export interface MonitorInfo { index: number; name: string }
 
 export async function listMonitors(): Promise<MonitorInfo[]> {

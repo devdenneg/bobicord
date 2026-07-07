@@ -403,6 +403,14 @@ function SettingsModal() {
         ))}
       </>}
     </div>
+    {isTauri ? (
+      <div className="grp"><div className="gt"><Icon name="cam" sm /> Игровой статус</div>
+        <label className="perm-op">
+          <input type="checkbox" checked={s.shareGame} onChange={(e) => upd({ shareGame: e.target.checked })} />
+          <span><b>Показывать, во что играю</b><i>Другие увидят название и иконку игры рядом с ником (только полноэкранная игра на переднем плане). Читается имя окна и иконка — без доступа к самой игре.</i></span>
+        </label>
+      </div>
+    ) : null}
     <div className="grp"><div className="gt"><Icon name="palette" sm /> Оформление</div>
       <div className="fld"><label>Тема оформления</label>
         <div className="theme-grid">

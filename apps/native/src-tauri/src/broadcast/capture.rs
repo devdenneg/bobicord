@@ -17,8 +17,41 @@ use windows_capture::settings::{
     GraphicsCaptureItemType, MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
 use windows_capture::window::Window;
+use windows::Win32::Foundation::RECT;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetSystemMetrics, GetWindowRect, SM_CXSCREEN, SM_CYSCREEN,
+};
 
 use super::stats::StatsHandle;
+
+/// Foreground-окно, ЕСЛИ оно похоже на игру: покрывает весь ОСНОВНОЙ экран (фуллскрин/borderless)
+/// — типичный признак игры, отсекающий обычные окна. Возвращает (hwnd, title, process, pid);
+/// дальше отсеивается блоклистом в lib.rs. Эвристика: фуллскрин на ВТОРИЧНОМ мониторе в MVP не
+/// ловим (SM_C*SCREEN — основной) — осознанное упрощение.
+pub fn foreground_game() -> Option<(isize, String, String, u32)> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return None;
+        }
+        let hwnd_i = hwnd.0 as isize;
+        let mut r = RECT::default();
+        if GetWindowRect(hwnd, &mut r).is_err() {
+            return None;
+        }
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+        if w < sw || h < sh {
+            return None; // не фуллскрин на основном мониторе → не считаем игрой
+        }
+        let win = Window::from_raw_hwnd(hwnd_i as *mut std::ffi::c_void);
+        let process = win.process_name().unwrap_or_default();
+        if process.is_empty() {
+            return None;
+        }
+        Some((hwnd_i, win.title().unwrap_or_default(), process, win.process_id().unwrap_or(0)))
+    }
+}
 
 /// Источник кадров: монитор целиком либо отдельное окно (Э5.1 — захват окна).
 /// `Window::from_raw_hwnd` ничего не валидирует сама по себе, так что перед

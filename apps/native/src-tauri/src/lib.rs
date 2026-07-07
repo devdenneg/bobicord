@@ -31,6 +31,39 @@ fn list_windows() -> Vec<WindowInfo> {
     .collect()
 }
 
+#[derive(serde::Serialize)]
+struct GameInfo { name: String, icon: Option<String> }
+
+// Детект игры (Discord-style «играет в X»): foreground-фуллскрин-окно, не из блоклиста.
+// Имя — заголовок окна (у игр обычно человекочитаемый), фолбэк — имя exe. Иконка — PNG base64
+// (переиспользуем icon.rs, тот же путь, что для стрим-пикера). Только метаданные окна/exe: НЕ
+// читаем память игры и не инжектим → безопасно для анти-читов.
+#[tauri::command]
+fn detect_game() -> Option<GameInfo> {
+  let (hwnd, title, process, pid) = broadcast::capture::foreground_game()?;
+  let exe = process.to_lowercase();
+  let stem = exe.strip_suffix(".exe").unwrap_or(exe.as_str());
+  const BLOCK: &[&str] = &[
+    "relayapp", "explorer", "chrome", "firefox", "msedge", "brave", "opera", "vivaldi",
+    "yandex", "code", "devenv", "rider64", "idea64", "pycharm64", "sublime_text", "discord",
+    "steam", "steamwebhelper", "epicgameslauncher", "spotify", "telegram", "whatsapp",
+    "obs64", "obs", "notepad", "cmd", "powershell", "windowsterminal", "wt", "taskmgr",
+    "searchhost", "searchapp", "startmenuexperiencehost", "shellexperiencehost",
+    "applicationframehost", "textinputhost", "dwm", "sihost", "systemsettings", "lockapp",
+  ];
+  if stem.is_empty() || BLOCK.contains(&stem) {
+    return None;
+  }
+  let t = title.trim();
+  let name: String = if t.is_empty() {
+    let mut c = stem.chars();
+    match c.next() { Some(f) => f.to_uppercase().collect::<String>() + c.as_str(), None => String::new() }
+  } else {
+    t.chars().take(48).collect()
+  };
+  Some(GameInfo { name, icon: broadcast::icon::window_icon_png_base64(hwnd, pid) })
+}
+
 struct BroadcastState(Mutex<Option<broadcast::BroadcastHandle>>);
 struct WatchState(Mutex<Option<broadcast::relay::RelayHandle>>);
 
@@ -200,7 +233,7 @@ pub fn run() {
       std::thread::spawn(branding::fix_shortcuts);
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![ping, list_monitors, list_windows, start_broadcast, set_broadcast_source, stop_broadcast, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys])
+    .invoke_handler(tauri::generate_handler![ping, list_monitors, list_windows, detect_game, start_broadcast, set_broadcast_source, stop_broadcast, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }
