@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "notif",
+  "description": "Кастомное окно-уведомление: закрыть себя, сфокусировать/развернуть главное окно по клику",
+  "windows": [
+    "notif"
+  ],
+  "permissions": [
+    "core:window:allow-close",
+    "core:window:allow-set-focus",
+    "core:window:allow-unminimize",
+    "core:window:allow-show"
+  ]
+}

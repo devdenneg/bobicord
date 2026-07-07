@@ -13,7 +13,11 @@ export default defineConfig(({ mode, command }) => {
   }
   return {
     plugins: [react()],
-    build: { outDir: 'dist', sourcemap: false, chunkSizeWarningLimit: 1500 },
+    build: {
+      outDir: 'dist', sourcemap: false, chunkSizeWarningLimit: 1500,
+      // Вторая точка входа — окно кастомного нативного уведомления (лёгкая страница, без React-бандла).
+      rollupOptions: { input: { main: 'index.html', notif: 'notif.html' } },
+    },
     server: {
       host: '127.0.0.1', // IPv4-loopback явно (иначе Node на Windows биндит только IPv6 [::1] → refused)
       proxy: {

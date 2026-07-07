@@ -62,6 +62,36 @@ function focused(): boolean {
   try { return document.visibilityState === 'visible' && document.hasFocus(); } catch { return false; }
 }
 
+// Кастомное нативное уведомление: своя карточка в стиле приложения (окно Tauri notif.html),
+// вместо системного toast. Возвращает true, если окно создалось (иначе вызывающий даёт фолбэк).
+async function showNativeCard(kind: NotifKind, title: string, body: string): Promise<boolean> {
+  try {
+    const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+    // одно окно за раз: закрываем прежнее, иначе конфликт по label
+    try { const ex = await WebviewWindow.getByLabel('notif'); if (ex) await ex.close(); } catch { /**/ }
+    const W = 372, H = 104;
+    const sw = (typeof screen !== 'undefined' && screen.availWidth) || 1280;
+    const sh = (typeof screen !== 'undefined' && screen.availHeight) || 800;
+    const x = Math.max(8, sw - W - 18), y = Math.max(8, sh - H - 18); // правый нижний угол
+    const url = `notif.html?k=${encodeURIComponent(kind)}&t=${encodeURIComponent(title)}&b=${encodeURIComponent(body)}`;
+    return await new Promise<boolean>((resolve) => {
+      let settled = false;
+      const done = (ok: boolean) => { if (!settled) { settled = true; resolve(ok); } };
+      try {
+        const win = new WebviewWindow('notif', {
+          url, width: W, height: H, x, y,
+          decorations: false, transparent: true, alwaysOnTop: true,
+          skipTaskbar: true, focus: false, resizable: false, shadow: false, title: 'RelayApp',
+        });
+        win.once('tauri://created', () => done(true));
+        win.once('tauri://error', () => done(false)); // нет прав / ошибка → фолбэк на OS-toast
+      } catch { done(false); }
+      // события не пришли — считаем показанным (лучше пропустить фолбэк, чем задвоить уведомление)
+      setTimeout(() => done(true), 2000);
+    });
+  } catch { return false; }
+}
+
 /** Показать уведомление типа kind (если включено и разрешено; фокус гейтит только mention). Не бросает. */
 export async function notify(kind: NotifKind, opts: { title: string; body: string; tag?: string }): Promise<void> {
   try {
@@ -69,9 +99,11 @@ export async function notify(kind: NotifKind, opts: { title: string; body: strin
     if (!s.notif || !s[KIND_PREF[kind]]) return; // мастер или тип выключены
     if (FOCUS_GATED[kind] && focused()) return;  // упоминание в фокусе — не спамим системным (виден чат)
     if (isTauri) {
-      const m = await import('@tauri-apps/plugin-notification');
-      if (!(await m.isPermissionGranted())) return;
-      await m.sendNotification({ title: opts.title, body: opts.body });
+      // кастомная карточка в стиле приложения; если окно не создалось (нет прав/ошибка) — системный toast
+      const shown = await showNativeCard(kind, opts.title, opts.body);
+      if (!shown) {
+        try { const m = await import('@tauri-apps/plugin-notification'); if (await m.isPermissionGranted()) await m.sendNotification({ title: opts.title, body: opts.body }); } catch { /**/ }
+      }
       return;
     }
     if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
