@@ -66,7 +66,42 @@ function roleColorOf(m: Member): string | undefined {
 }
 
 /* ---------- Voice channel participant row (LEFT, with controls) ---------- */
-function VoiceParticipantRow({ m }: { m: Member }) {
+// анимация появления/ухода строк списка: enter (новые) / exit (ghost'ы, схлопываются со сдвигом).
+// ключ по username; ghost вставляется на свою бывшую позицию. Возвращает элементы + класс анимации.
+function useRowTransition<T extends { username: string }>(items: T[], dur = 660): { item: T; anim: string }[] {
+  const [enter, setEnter] = useState<Set<string>>(() => new Set());
+  const [exit, setExit] = useState<Map<string, { item: T; idx: number }>>(() => new Map());
+  const prev = useRef<Map<string, T> | null>(null);
+  const timers = useRef<Map<string, number>>(new Map());
+  useLayoutEffect(() => {
+    const cur = new Map(items.map((i) => [i.username, i] as [string, T]));
+    if (prev.current === null) { prev.current = cur; return; }
+    const was = prev.current, wasKeys = [...was.keys()];
+    const added: string[] = [], removed: string[] = [];
+    cur.forEach((_v, u) => { if (!was.has(u)) added.push(u); });
+    was.forEach((_v, u) => { if (!cur.has(u)) removed.push(u); });
+    prev.current = cur;
+    if ((!added.length && !removed.length) || added.length + removed.length > 8) return;
+    if (added.length) setEnter((p) => { const n = new Set(p); added.forEach((u) => n.add(u)); return n; });
+    if (removed.length) setExit((p) => { const n = new Map(p); removed.forEach((u) => n.set(u, { item: was.get(u)!, idx: wasKeys.indexOf(u) })); return n; });
+    [...added, ...removed].forEach((u) => {
+      const old = timers.current.get(u); if (old) clearTimeout(old);
+      timers.current.set(u, window.setTimeout(() => {
+        setEnter((p) => { const n = new Set(p); n.delete(u); return n; });
+        setExit((p) => { const n = new Map(p); n.delete(u); return n; });
+        timers.current.delete(u);
+      }, dur));
+    });
+  }, [items]);
+  useEffect(() => () => { timers.current.forEach((t) => clearTimeout(t)); }, []);
+  const curSet = new Set(items.map((i) => i.username));
+  const out: { item: T; anim: string }[] = items.map((i) => ({ item: i, anim: enter.has(i.username) ? 'vrow-enter' : '' }));
+  [...exit.entries()].filter(([u]) => !curSet.has(u)).sort((a, b) => a[1].idx - b[1].idx)
+    .forEach(([, g]) => out.splice(Math.min(g.idx, out.length), 0, { item: g.item, anim: 'vrow-exit' }));
+  return out;
+}
+
+function VoiceParticipantRow({ m, anim }: { m: Member; anim?: string }) {
   const eng = useEngine();
   const E = getEngine()!;
   const me = useStore((s) => s.me)!;
@@ -83,7 +118,7 @@ function VoiceParticipantRow({ m }: { m: Member }) {
   const rowId = `vc-${m.username}`;
   const hc = useHoverCard();
   return (
-    <div className={'pi' + (remote ? ' clickable' : '') + (streaming ? ' streaming' : '') + (talking ? ' speaking' : '') + (open ? ' open' : '')} data-spk={m.username}>
+    <div className={'pi' + (remote ? ' clickable' : '') + (streaming ? ' streaming' : '') + (talking ? ' speaking' : '') + (open ? ' open' : '') + (anim ? ' ' + anim : '')} data-spk={m.username}>
       <div className="head"
         ref={hc.ref} onMouseEnter={remote ? hc.onEnter : undefined} onMouseLeave={remote ? hc.onLeave : undefined}
         role={remote ? 'button' : undefined} tabIndex={remote ? 0 : undefined}
@@ -163,6 +198,7 @@ function VoiceChannelItem({ channel, membersInChannel, canManage, canDelete, min
   const [confirmDel, setConfirmDel] = useState(false);
   useEffect(() => { setName(channel.name); }, [channel.name]);
 
+  const rows = useRowTransition(membersInChannel);
   const join = () => { if (!mine) E.joinVoice(channel.id); };
   const submitRename = () => { const n = name.trim(); if (n && n !== channel.name) renameChannel(channel.id, n); setEditing(false); };
 
@@ -189,8 +225,8 @@ function VoiceChannelItem({ channel, membersInChannel, canManage, canDelete, min
           </span>
         ) : null}
       </div>
-      {membersInChannel.length ? (
-        <div className="vchan-list">{membersInChannel.map((m) => <VoiceParticipantRow m={m} key={m.username} />)}</div>
+      {rows.length ? (
+        <div className="vchan-list">{rows.map(({ item, anim }) => <VoiceParticipantRow m={item} anim={anim} key={item.username} />)}</div>
       ) : null}
       {confirmDel ? (
         <div className="vchan-confirm">
@@ -371,7 +407,7 @@ function MemberRoles({ roles }: { roles: Role[] }) {
 }
 
 /* ---------- Member list (right) — только инфо/статусы, без контролов ---------- */
-function MemberRow({ m }: { m: Member }) {
+function MemberRow({ m, anim }: { m: Member; anim?: string }) {
   const eng = useEngine();
   const E = getEngine()!;
   const me = useStore((s) => s.me)!;
@@ -394,7 +430,7 @@ function MemberRow({ m }: { m: Member }) {
     catch (err: any) { toast(err?.message || 'Не удалось выгнать', 'err'); }
   }
   return (
-    <div className={'pi ' + st + (streaming ? ' streaming' : '')} data-spk={m.username}>
+    <div className={'pi ' + st + (streaming ? ' streaming' : '') + (anim ? ' ' + anim : '')} data-spk={m.username}>
       <div className="head" ref={hc.ref} onMouseEnter={self ? undefined : hc.onEnter} onMouseLeave={self ? undefined : hc.onLeave}>
         <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} dot={st} live={streaming} liveApp={streaming ? E.getStreamAppMeta(m.username) : null} />
         <div className="nm" style={roleColorOf(m) ? { color: roleColorOf(m) } : undefined}>{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div>
@@ -419,14 +455,54 @@ function Members() {
   const members = useStore((s) => s.members);
   const online = members.filter((m) => eng.presence[m.username]?.online);
   const offline = members.filter((m) => !eng.presence[m.username]?.online);
+
+  // анимация смены online<->offline: строка уезжает вправо из старой секции (ghost, схлопывается)
+  // и въезжает справа в новую. enter — юзеры с анимацией входа; exit — ghost'ы в покидаемой секции.
+  const [enter, setEnter] = useState<Set<string>>(() => new Set());
+  const [exit, setExit] = useState<Map<string, 'on' | 'off'>>(() => new Map());
+  const prevOn = useRef<Set<string> | null>(null);
+  const timers = useRef<Map<string, number>>(new Map());
+  // useLayoutEffect (не useEffect): стейт входа/выхода ставим ДО paint, иначе мелькнёт
+  // промежуточный кадр (строка исчезла из старой секции раньше, чем появился ghost)
+  useLayoutEffect(() => {
+    const onSet = new Set(online.map((m) => m.username));
+    if (prevOn.current === null) { prevOn.current = onSet; return; } // первый маунт — без анимации
+    const was = prevOn.current, cur = new Set(members.map((m) => m.username));
+    const flips: { u: string; toOnline: boolean }[] = [];
+    onSet.forEach((u) => { if (!was.has(u)) flips.push({ u, toOnline: true }); });
+    was.forEach((u) => { if (!onSet.has(u) && cur.has(u)) flips.push({ u, toOnline: false }); });
+    prevOn.current = onSet;
+    if (!flips.length || flips.length > 6) return; // >6 = массовая смена (переключение сервера) — без анимации
+    setEnter((p) => { const n = new Set(p); flips.forEach((f) => n.add(f.u)); return n; });
+    setExit((p) => { const n = new Map(p); flips.forEach((f) => n.set(f.u, f.toOnline ? 'off' : 'on')); return n; });
+    flips.forEach((f) => {
+      const old = timers.current.get(f.u); if (old) clearTimeout(old);
+      timers.current.set(f.u, window.setTimeout(() => {
+        setEnter((p) => { const n = new Set(p); n.delete(f.u); return n; });
+        setExit((p) => { const n = new Map(p); n.delete(f.u); return n; });
+        timers.current.delete(f.u);
+      }, 660));
+    });
+  }, [online, offline, members]);
+  useEffect(() => () => { timers.current.forEach((t) => clearTimeout(t)); }, []);
+
+  const onSet = new Set(online.map((m) => m.username));
+  const onlineRender = members.filter((m) => onSet.has(m.username) || exit.get(m.username) === 'on');
+  const offlineRender = members.filter((m) => !onSet.has(m.username) || exit.get(m.username) === 'off');
+  const animOf = (m: Member, sectionOnline: boolean): string => {
+    const isNow = sectionOnline ? onSet.has(m.username) : !onSet.has(m.username);
+    if (!isNow) return 'mrow-exit';                                  // ghost в покидаемой секции
+    return enter.has(m.username) ? 'mrow-enter' : '';
+  };
+
   return (
     <aside id="members">
       <div className="m-sec" style={{ borderBottom: '1px solid var(--line-2)', height: 50, display: 'flex', alignItems: 'center' }}>Участники · <span>{members.length}</span></div>
       <div id="mlist">
         {online.length ? <div className="m-sec" style={{ padding: '10px 8px 4px' }}>В сети — {online.length}</div> : null}
-        {online.map((m) => <MemberRow m={m} key={m.username} />)}
+        {onlineRender.map((m) => <MemberRow m={m} anim={animOf(m, true)} key={m.username} />)}
         {offline.length ? <div className="m-sec" style={{ padding: '10px 8px 4px' }}>Не в сети — {offline.length}</div> : null}
-        {offline.map((m) => <MemberRow m={m} key={m.username} />)}
+        {offlineRender.map((m) => <MemberRow m={m} anim={animOf(m, false)} key={m.username} />)}
       </div>
     </aside>
   );

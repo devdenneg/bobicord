@@ -481,6 +481,16 @@
 
   #mlist{flex:1;overflow-y:auto;overflow-x:hidden;padding:4px 8px 12px}
   .pi{border-radius:var(--r-sm);margin-bottom:1px}
+  /* переход online<->offline: въезд справа / выезд вправо со схлопыванием высоты */
+  @keyframes mrowIn{from{opacity:0;transform:translateX(26px)}to{opacity:1;transform:none}}
+  @keyframes mrowOut{0%{opacity:1;transform:translateX(0);max-height:60px}100%{opacity:0;transform:translateX(30px);max-height:0;margin-bottom:0}}
+  .pi.mrow-enter{animation:mrowIn .58s cubic-bezier(.2,.7,.3,1)}
+  .pi.mrow-exit{overflow:hidden;pointer-events:none;animation:mrowOut .62s cubic-bezier(.4,0,.2,1) forwards}
+  /* голосовой канал: вход — слева вправо, выход — влево (со схлопыванием) */
+  @keyframes vrowIn{from{opacity:0;transform:translateX(-24px)}to{opacity:1;transform:none}}
+  @keyframes vrowOut{0%{opacity:1;transform:translateX(0);max-height:54px}100%{opacity:0;transform:translateX(-28px);max-height:0;margin-bottom:0}}
+  .pi.vrow-enter{animation:vrowIn .55s cubic-bezier(.2,.7,.3,1)}
+  .pi.vrow-exit{overflow:hidden;pointer-events:none;animation:vrowOut .6s cubic-bezier(.4,0,.2,1) forwards}
   .pi .head{display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:var(--r-sm);transition:background var(--tr)}
   .pi .head:hover{background:var(--panel2)}
   .pi .head:active{background:var(--panel3)}
