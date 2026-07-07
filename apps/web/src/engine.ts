@@ -885,13 +885,27 @@ export class Engine {
     this.trimmedFront = 0; // новая история — счётчик среза сбрасывается (компонент тоже обнулит prevTrim)
     this.emit();
   }
-  // догрузка пропущенного после реконнекта: добавляем только сообщения НОВЕЕ последнего известного
-  // sid и НЕ свои (свои уже показаны оптимистично) — чтобы не задублировать локальный эхо
+  // догрузка пропущенного после реконнекта. Дедуп двойной:
+  // 1) по sid — сообщения истории, уже показанные;
+  // 2) по сигнатуре (автор+текст+картинка) — live-эхо от onData НЕ имеет sid, поэтому без этого
+  //    refetchChat притаскивал те же сообщения из истории (уже с sid) и они дублировались.
+  //    Совпавшему live-сообщению «усыновляем» серверный sid — дальше дедуп идёт по sid.
+  // Свои сообщения не трогаем (показаны оптимистично, приходят с m.uid === me.id).
   mergeRecent(list: HistoryMessage[]) {
     if (!list.length) return;
-    const maxSid = this.messages.reduce((mx, m) => (m.sid != null && m.sid > mx ? m.sid : mx), 0);
     const haveSids = new Set(this.messages.map((m) => m.sid).filter((s): s is number => s != null));
-    const add = list.filter((m) => m.id != null && m.id > maxSid && !haveSids.has(m.id) && m.uid !== this.me.id);
+    const sig = (uid?: string, text?: string, img?: string) => `${uid || ''}${text || ''}${img || ''}`;
+    const liveBySig = new Map<string, ChatMessage[]>();
+    for (const m of this.messages) {
+      if (m.sid == null && !m.sys && m.uid) { const k = sig(m.uid, m.text, m.img); (liveBySig.get(k) || liveBySig.set(k, []).get(k)!).push(m); }
+    }
+    const add: HistoryMessage[] = [];
+    for (const m of list) {
+      if (m.id == null || haveSids.has(m.id) || m.uid === this.me.id) continue;
+      const bucket = liveBySig.get(sig(m.uid, m.text, m.img));
+      if (bucket && bucket.length) { bucket.shift()!.sid = m.id; continue; } // усыновили sid, не дублируем
+      add.push(m);
+    }
     if (!add.length) return;
     const mapped = this.mapHistory(add);
     this.messages = [...this.messages, ...mapped];
