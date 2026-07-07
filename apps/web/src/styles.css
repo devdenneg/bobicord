@@ -202,6 +202,7 @@
   .srv-header .hbtn{background:none;padding:7px;color:var(--muted);border-radius:7px}
   .srv-header .hbtn:hover{background:var(--panel2);color:var(--txt)}
   .srv-header .hbtn.on{background:var(--accent);color:#fff}
+  .srv-header .hbtn.mob-only{display:none}
 
   #content{flex:1;display:grid;grid-template-columns:1fr;min-height:0;position:relative;transition:grid-template-columns .28s cubic-bezier(.4,0,.2,1)}
   body.resizing #content{transition:none}
@@ -708,4 +709,8 @@
     #mtabs button{flex:1;background:transparent;border-radius:0;padding:11px;color:var(--muted);display:flex;flex-direction:column;align-items:center;gap:3px;font-size:11px}
     #mtabs button.active{color:var(--accent-txt)}#mtabs .ic{font-size:20px}
     #content,#chat{padding-bottom:54px}
+    /* user-panel c шестерёнкой на табе «Голос» не должна прятаться под фиксированный #mtabs */
+    #channels{padding-bottom:54px}
+    /* шестерёнка-настройки в хедере чата — только в мобилке (на десктопе она в user-panel) */
+    .srv-header .hbtn.mob-only{display:inline-flex;align-items:center}
   }
