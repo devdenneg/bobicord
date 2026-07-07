@@ -81,7 +81,7 @@ async function showNativeCard(kind: NotifKind, title: string, body: string): Pro
         const win = new WebviewWindow('notif', {
           url, width: W, height: H, x, y,
           decorations: false, transparent: true, alwaysOnTop: true,
-          skipTaskbar: true, focus: false, resizable: false, shadow: false, title: 'RelayApp',
+          skipTaskbar: true, focus: false, focusable: false, resizable: false, shadow: false, title: 'RelayApp',
         });
         win.once('tauri://created', () => done(true));
         win.once('tauri://error', () => done(false)); // нет прав / ошибка → фолбэк на OS-toast
