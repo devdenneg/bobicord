@@ -30,10 +30,20 @@ function useHoverCard() {
   const [rect, setRect] = useState<DOMRect | null>(null);
   const ref = useRef<HTMLDivElement>(null);
   const t = useRef<number | undefined>(undefined);
-  const onEnter = () => { t.current = window.setTimeout(() => { if (ref.current) setRect(ref.current.getBoundingClientRect()); }, 320); };
-  const onLeave = () => { window.clearTimeout(t.current); setRect(null); };
+  const isTouch = typeof matchMedia !== 'undefined' && matchMedia('(hover:none)').matches;
+  const onEnter = () => { if (isTouch) return; t.current = window.setTimeout(() => { if (ref.current) setRect(ref.current.getBoundingClientRect()); }, 320); };
+  const onLeave = () => { if (isTouch) return; window.clearTimeout(t.current); setRect(null); };
+  // тач: открыть/закрыть карточку по тапу (на десктопе no-op — работает hover)
+  const onTap = () => { if (!isTouch) return; setRect((r) => (r ? null : (ref.current ? ref.current.getBoundingClientRect() : null))); };
   useEffect(() => () => window.clearTimeout(t.current), []);
-  return { ref, rect, onEnter, onLeave };
+  // тач-дисмисс открытой карточки: тап вне / скролл / ресайз
+  useEffect(() => {
+    if (!isTouch || !rect) return;
+    const close = () => setRect(null);
+    const id = window.setTimeout(() => { document.addEventListener('pointerdown', close); window.addEventListener('scroll', close, true); window.addEventListener('resize', close); }, 0);
+    return () => { window.clearTimeout(id); document.removeEventListener('pointerdown', close); window.removeEventListener('scroll', close, true); window.removeEventListener('resize', close); };
+  }, [isTouch, rect]);
+  return { ref, rect, onEnter, onLeave, onTap };
 }
 
 function ProfileCard({ m, rect }: { m: Member; rect: DOMRect }) {
@@ -135,7 +145,7 @@ function VoiceParticipantRow({ m, anim }: { m: Member; anim?: string }) {
         </div>
         <div className="nm" title={m.displayName}>{m.displayName}{isLocal && !connecting ? ' (ты)' : ''}</div>
         {connecting ? <span className="vc-connecting">подключение…</span> : null}
-        {pr?.game ? <span className="pi-game" data-tip={'Играет в ' + pr.game.name}>{pr.game.icon ? <img src={`data:image/png;base64,${pr.game.icon}`} alt="" /> : <span className="gpad">🎮</span>}</span> : null}
+        {pr?.game ? <span className="pi-game vc" data-tip={'Играет в ' + pr.game.name}>{pr.game.icon ? <img src={`data:image/png;base64,${pr.game.icon}`} alt="" /> : <span className="gpad">🎮</span>}<span className="pg-nm">{pr.game.name}</span></span> : null}
         {remote && streaming ? (
           <button className={'watchbtn' + (watching ? ' on' : '')} disabled={pending}
             aria-label={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}
@@ -341,6 +351,7 @@ function VoiceControls() {
   return (
     <div className="vc-controls">
       <div className={'conn-ind q-' + q} data-tip={qTip} aria-label={'Качество связи: ' + qTip} tabIndex={0}><i /><i /><i /></div>
+      <span className="conn-ms">{eng.voicePing != null ? eng.voicePing + ' мс' : ''}</span>
       <button className={micClass} aria-pressed={muted} data-tip="Микрофон · M" onClick={() => E.toggleMic()}><Icon name={muted ? 'mic-off' : 'mic'} sm /></button>
       <button className={'cbtn' + (eng.deafened ? ' danger-on' : '')} aria-pressed={eng.deafened} data-tip="Заглушить · D" onClick={() => E.toggleDeaf()}><Icon name={eng.deafened ? 'head-off' : 'head'} sm /></button>
       {isTauri ? <NativeBroadcastButton /> : <ShareButton />}
@@ -436,7 +447,7 @@ function MemberRow({ m, anim }: { m: Member; anim?: string }) {
   }
   return (
     <div className={'pi ' + st + (streaming ? ' streaming' : '') + (anim ? ' ' + anim : '')} data-spk={m.username}>
-      <div className="head" ref={hc.ref} onMouseEnter={self ? undefined : hc.onEnter} onMouseLeave={self ? undefined : hc.onLeave}>
+      <div className="head" ref={hc.ref} onClick={self ? undefined : hc.onTap} onMouseEnter={self ? undefined : hc.onEnter} onMouseLeave={self ? undefined : hc.onLeave}>
         <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} dot={st} live={streaming} liveApp={streaming ? E.getStreamAppMeta(m.username) : null} />
         <div className="nm-row">
           <div className="nm" style={roleColorOf(m) ? { color: roleColorOf(m) } : undefined}>{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div>
@@ -955,7 +966,7 @@ function Chat() {
         </div>
       ) : null}
       {acOpen ? (
-        <div className="mention-pop" role="listbox" ref={popRef}>
+        <div className={'mention-pop' + (replyTo ? ' with-reply' : '')} role="listbox" ref={popRef}>
           <div className="mpop-h">{slashMode ? 'Команды' : 'Упомянуть'}</div>
           {slashMode
             ? cmdCands.map((c, i) => (
@@ -1009,6 +1020,7 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
   const [floats, setFloats] = useState<{ id: number; url: string; by: string; x: number; size?: string }[]>([]);
   const [stats, setStats] = useState('');
   const [statsOn, setStatsOn] = useState(true);
+  const [wOpen, setWOpen] = useState(false); // тач: «кто смотрит» по тапу
   const [treeOpen, setTreeOpen] = useState(false);
   const [pickAnchor, setPickAnchor] = useState<DOMRect | null | undefined>(undefined);
   const sprayRef = useRef<HTMLButtonElement>(null);
@@ -1109,7 +1121,7 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
           </div>
         ))}
       </div>
-      <div className="watchers">
+      <div className={'watchers' + (wOpen ? ' open' : '')} onClick={(e) => { e.stopPropagation(); setWOpen((v) => !v); }}>
         {watchers.slice(0, 4).map((w, i) => <div className="wa" key={i} style={{ background: w.avatarUrl ? '#0000' : avColor(w.name, w.color) }} title={w.name}>{w.avatarUrl ? <img className="avimg" src={resolveUploadUrl(w.avatarUrl)} alt="" /> : initial(w.name)}</div>)}
         <div className="wc"><Icon name="eye" sm />{watchers.length}</div>
         {watchers.length ? (
@@ -1313,7 +1325,7 @@ export function ServerView() {
           <div className="srv-header">
             <div className="hn"><Icon name="hash" sm /><span>общий</span></div>
             {split ? <button className={'hbtn' + (showChat ? ' on' : '')} data-tip={showChat ? 'Скрыть чат' : 'Показать чат'} onClick={() => setShowChat((v) => !v)}><Icon name="chat" sm /></button> : null}
-            <button className={'hbtn' + (membersOpen ? ' on' : '')} data-tip={membersOpen ? 'Скрыть участников' : 'Показать участников'} onClick={() => setMembersOpen((v) => !v)}><Icon name="users" sm /></button>
+            <button className={'hbtn mob-hide' + (membersOpen ? ' on' : '')} data-tip={membersOpen ? 'Скрыть участников' : 'Показать участников'} onClick={() => setMembersOpen((v) => !v)}><Icon name="users" sm /></button>
             <button className="hbtn" data-tip="Пригласить" onClick={() => setModal('invite')}><Icon name="link" sm /></button>
             <button className="hbtn mob-only" data-tip="Настройки" onClick={() => setModal('settings')}><Icon name="gear" sm /></button>
           </div>

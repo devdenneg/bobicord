@@ -105,7 +105,7 @@
   .tabs2 button{flex:1;background:transparent;color:var(--muted);padding:9px;font-weight:500}
   .tabs2 button.active{background:var(--accent);color:#fff}
   .link{background:none;color:var(--accent-txt);padding:8px 0;width:100%;font-size:13.5px}
-  .dl-fab{position:fixed;right:20px;bottom:20px;width:52px;height:52px;border-radius:50%;background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center;box-shadow:0 6px 20px -4px rgba(88,101,242,.6);z-index:40;text-decoration:none;transition:transform .12s ease,background .12s ease}
+  .dl-fab{position:fixed;right:calc(20px + env(safe-area-inset-right,0px));bottom:calc(20px + env(safe-area-inset-bottom,0px));width:52px;height:52px;border-radius:50%;background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center;box-shadow:0 6px 20px -4px rgba(88,101,242,.6);z-index:40;text-decoration:none;transition:transform .12s ease,background .12s ease}
   .dl-fab:hover{background:var(--accent-h);transform:translateY(-2px)}
   .link:hover{background:none;text-decoration:underline}
 
@@ -150,7 +150,7 @@
   .home-brand span{font-size:23px;font-weight:800;letter-spacing:-.02em;line-height:1;background:linear-gradient(90deg,#57d6ff,#a578f2,#ff62c6);-webkit-background-clip:text;background-clip:text;color:transparent}
   .home-greet{margin:0 0 22px;font-size:22px;font-weight:700;color:var(--txt-h)}
   .home-actions{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:30px}
-  .bigbtn{flex:1;min-width:220px;background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-md);padding:20px;text-align:left;display:flex;gap:14px;align-items:center;box-shadow:var(--sh-1)}
+  .bigbtn{flex:1;min-width:min(220px,100%);background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-md);padding:20px;text-align:left;display:flex;gap:14px;align-items:center;box-shadow:var(--sh-1)}
   .bigbtn:hover{background:var(--panel2);border-color:var(--accent)}
   .bigbtn .bi{width:46px;height:46px;border-radius:12px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;color:#fff}
   .bigbtn .bi.g{background:linear-gradient(135deg,#3ba55d,#1f8b4c)}
@@ -158,7 +158,7 @@
   .bigbtn b{display:block;font-size:15.5px;color:var(--txt-h)}
   .bigbtn span{font-size:13px;color:var(--muted)}
   .home-sec{font-size:12px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--muted);margin:0 0 12px}
-  .srv-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px}
+  .srv-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(230px,100%),1fr));gap:12px}
   .srv-card{background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-md);padding:16px;text-align:left;box-shadow:var(--sh-1);display:flex;flex-direction:column;gap:10px;align-items:stretch}
   .srv-card:hover{background:var(--panel2);border-color:var(--accent);transform:translateY(-2px)}
   .srv-card .sc-h{display:flex;align-items:center;gap:12px}
@@ -583,7 +583,7 @@
   .pi .vlbl{font-size:11px;color:var(--muted);width:38px;text-align:right;flex:0 0 auto;font-weight:600}
 
   /* modals */
-  .modal{display:none;position:fixed;inset:0;background:rgba(6,8,12,.72);backdrop-filter:blur(6px);z-index:60;align-items:center;justify-content:center;padding:16px}
+  .modal{display:none;position:fixed;inset:0;background:rgba(6,8,12,.72);backdrop-filter:blur(6px);z-index:60;align-items:center;justify-content:center;padding:calc(16px + env(safe-area-inset-top)) calc(16px + env(safe-area-inset-right)) calc(16px + env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left))}
   .modal.show{display:flex}
   .modal .box{background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-lg);width:min(440px,96vw);max-height:90vh;overflow:auto;padding:24px;box-shadow:var(--sh-3),var(--hair);animation:popIn .18s cubic-bezier(.2,.8,.4,1)}
   .modal h2{margin:0 0 4px;font-size:19px;color:var(--txt-h);letter-spacing:-.01em;display:flex;align-items:center;gap:9px}
@@ -742,9 +742,112 @@
     #mtabs{display:flex;position:fixed;bottom:0;left:0;right:0;background:var(--panel);border-top:1px solid var(--line);z-index:20;padding-bottom:env(safe-area-inset-bottom)}
     #mtabs button{flex:1;background:transparent;border-radius:0;padding:11px;color:var(--muted);display:flex;flex-direction:column;align-items:center;gap:3px;font-size:11px}
     #mtabs button.active{color:var(--accent-txt)}#mtabs .ic{font-size:20px}
-    #content,#chat{padding-bottom:54px}
+    #content{padding-bottom:calc(58px + env(safe-area-inset-bottom))}
     /* user-panel c шестерёнкой на табе «Голос» не должна прятаться под фиксированный #mtabs */
-    #channels{padding-bottom:54px}
+    #channels{padding-bottom:calc(58px + env(safe-area-inset-bottom))}
     /* шестерёнка-настройки в хедере чата — только в мобилке (на десктопе она в user-panel) */
     .srv-header .hbtn.mob-only{display:inline-flex;align-items:center}
+  }
+
+  /* ============ АДАПТИВ mobile/tablet (workflow-аудит) — десктоп изолирован через @media/pointer/env/min-max ============ */
+
+  /* --- глобальное (на десктопе no-op) --- */
+  @media (pointer:coarse){*{touch-action:manipulation}}          /* гасим double-tap-zoom только под тач */
+  @media (max-width:900px),(pointer:coarse){                     /* инпуты >=16px — против iOS focus-zoom */
+    input,select,textarea{font-size:16px}
+    .vchan-edit,.vchan-create input,.invite-box input,#epick input{font-size:16px}
+  }
+  /* overscroll: без цепного скролла / pull-to-refresh (десктоп no-op) */
+  #msgs,.virt-msgs,.ch-body,#mlist,#epickGrid,.modal .box,.assign-list{overscroll-behavior:contain}
+  #home{overscroll-behavior-y:contain}
+  .virt-msgs [data-virtuoso-scroller]{overscroll-behavior:contain}
+  /* dvh — прогрессивно (браузеры без dvh игнорят строку) */
+  .modal .box{max-height:90dvh}
+  .lightbox img{max-height:90dvh}
+  /* дефолты для тач-only инлайнов (перебиваются в @media(hover:none) ниже) */
+  .conn-ms{display:none}
+  .pi-game.vc .pg-nm{display:none;font-size:11px;font-weight:600;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+  /* --- телефон/узкий (<=900) — дополнения к существующему мобильному блоку --- */
+  @media(max-width:900px){
+    #root{height:100dvh}
+    #app.on{padding-left:env(safe-area-inset-left);padding-right:env(safe-area-inset-right)}
+    #mtabs{left:calc(60px + env(safe-area-inset-left));padding-right:env(safe-area-inset-right)}
+    .railbtn{width:46px;height:46px}
+    #content.split .mob-chat-toggle{bottom:calc(58px + env(safe-area-inset-bottom, 0px) + 8px)}
+    .srv-header .hbtn.mob-hide{display:none}
+    /* главная: safe-area + запас под dl-fab */
+    .home-top{padding-right:max(28px,env(safe-area-inset-right))}
+    .home-inner{padding-right:max(28px,env(safe-area-inset-right));padding-bottom:calc(80px + env(safe-area-inset-bottom,0px))}
+    .home-top .hbtn{min-height:44px;display:inline-flex;align-items:center}
+    /* чат: не даём min-width:340 распирать split-чат */
+    #content.split.show-chat #chat>:not(#scrollbtn):not(.mob-chat-toggle){min-width:0}
+    /* mention-pop: тач-строки + над таб-баром/reply-баром */
+    .mpop-row{min-height:44px;padding:11px 12px}
+    .mention-pop{bottom:calc(70px + 54px + env(safe-area-inset-bottom))}
+    .mention-pop.with-reply{bottom:calc(70px + 54px + 40px + env(safe-area-inset-bottom))}
+    /* стрим: контролы переносятся, а не обрезаются overflow:hidden */
+    .vbar{flex-wrap:wrap;gap:6px;padding:8px 8px 8px 52px}
+    .vbar .vb-vol{flex:1 1 60px;width:auto;min-width:40px}
+    .vbar .vb-pct{min-width:30px}
+    .vbar .vb-btn{width:40px;height:40px}
+    #grid.n2{grid-template-columns:1fr}
+    #stage{overflow-y:auto}
+    #mini{bottom:calc(62px + env(safe-area-inset-bottom));right:10px;width:min(300px,calc(100vw - 20px))}
+    .vwrap .statsbox{max-width:calc(100% - 20px)}
+    .vwrap .stats{white-space:normal;overflow-wrap:anywhere;min-width:0;font-size:10.5px}
+    .vwrap .watchers .wtip{max-width:calc(100vw - 40px)}
+    /* ProfileCard — над таб-баром на всю ширину (перебивает inline-позицию только на мобилке) */
+    .pcard{left:8px!important;right:8px!important;top:auto!important;bottom:calc(60px + env(safe-area-inset-bottom))!important;width:auto!important;max-width:none!important}
+    #members>.m-sec,#members>#mlist{min-width:0}
+    /* модалка прижата к верху — активный инпут виден над клавиатурой; assign-list без двойного скролла */
+    .modal{align-items:flex-start}
+    .assign-list{max-height:none;overflow:visible}
+    #epick{height:auto;max-height:min(360px,70dvh)}
+  }
+  @media(max-width:900px) and (orientation:landscape){
+    #stage{padding-right:max(14px,env(safe-area-inset-right))}
+  }
+  @media (min-width:768px) and (max-width:900px) and (orientation:landscape){#grid.n2{grid-template-columns:1fr 1fr}}
+
+  /* --- тач-слой (любая ширина; мышиный десктоп = pointer:fine не матчит) --- */
+  @media (hover:none){
+    .msg-reply-btn{opacity:.75;width:40px;height:40px}
+    .msg-reply-btn .ic{font-size:18px}
+    .conn-ms{display:inline-flex;align-items:center;font-size:12px;color:var(--muted);margin-left:2px}
+    .pi-game.vc{flex:0 1 auto;min-width:0;max-width:45%}
+    .pi-game.vc .pg-nm{display:block}
+    .vwrap .watchers{cursor:pointer}
+    .vwrap .watchers.open .wtip{opacity:1;transform:none;pointer-events:auto}
+    .pcard{pointer-events:auto}
+    /* «кто в сети» на карточке сервера — инлайн вместо hover-тултипа */
+    .srv-card .sc-tip{display:block;position:static;min-width:0;max-width:none;max-height:none;overflow:visible;margin-top:8px;padding:6px 4px;box-shadow:none;background:transparent;border:none;animation:none}
+    .srv-card .sc-online{flex-direction:column;align-items:flex-start;gap:8px}
+    /* толще ползунок громкости под палец (кастомный thumb → цвет задаём явно) */
+    .vwrap .spray,.vwrap .stats-toggle{width:44px;height:44px}
+    .vbar .vb-vol{height:22px;background:transparent;-webkit-appearance:none;appearance:none}
+    .vbar .vb-vol::-webkit-slider-runnable-track{height:5px;border-radius:3px;background:#ffffff33}
+    .vbar .vb-vol::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;margin-top:-6.5px;border-radius:50%;background:var(--accent)}
+    .vbar .vb-vol::-moz-range-track{height:5px;border-radius:3px;background:#ffffff33}
+    .vbar .vb-vol::-moz-range-thumb{width:18px;height:18px;border:0;border-radius:50%;background:var(--accent)}
+  }
+  /* тач-таргеты >=44px (coarse — вкл. тач-планшеты) */
+  @media (hover:none),(pointer:coarse){
+    .vchan-actions{gap:6px}
+    .vchan-act{min-width:44px;min-height:44px}
+    .vchan-list .pi .head{padding:8px 7px}
+    .pi .watchbtn,.pi .mkick,.pi .exp .mut{min-width:44px;min-height:44px}
+    .vc-controls{gap:10px}
+    .vc-controls .cbtn{width:44px;height:44px}
+    .pi .head{gap:12px}
+    .modal .seg button{min-height:40px;padding:9px 8px}
+    .colorpick .cp{width:40px;height:40px}
+    .modal .role-chip{padding:8px 12px;min-height:36px}
+    .modal button.mini{padding:9px 12px;min-height:40px}
+  }
+
+  /* --- планшет 901–1024: узкие каналы, чтобы #main не задыхался (десктоп >1024 не тронут) --- */
+  @media (min-width:901px) and (max-width:1024px){
+    #server.on{grid-template-columns:216px 1fr var(--mem-w,244px)}   /* фикс-ширина каналов, минуя --ch-w */
+    .rz-ch{display:none}                                             /* ресайзер каналов скрыт (ширина фиксирована) */
   }
