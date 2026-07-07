@@ -410,7 +410,10 @@ export class Engine {
     if (baseUid(p.identity) === this.me.username) return; // своя же другая сессия — не подписываемся (эхо)
     const mp = p.getTrackPublication(Track.Source.Microphone);
     if (!mp) return;
-    const want = this.inVoice && !!this.currentVc && (p as any).attributes?.vc === this.currentVc;
+    // ОГЛОХ (deafened) → НЕ подписываемся: нет трека = гарантированная тишина, независимо от громкости.
+    // Иначе оглохший оставался подписан, а глушение по громкости могло не примениться (пир размутился →
+    // resubscribe без re-apply громкости → слышно, хотя фулл-мут).
+    const want = this.inVoice && !this.deafened && !!this.currentVc && (p as any).attributes?.vc === this.currentVc;
     try { (mp as any).setSubscribed(want); } catch { /**/ }
     if (!want) this.detachAnalyser(baseUid(p.identity));
   }
@@ -488,6 +491,10 @@ export class Engine {
     await this.stopShare().catch(() => {});
     this.stopMic();
     this.room.remoteParticipants.forEach((p) => { const rp = p.getTrackPublication(Track.Source.Microphone); if (rp) { try { (rp as any).setSubscribed(false); } catch { /**/ } } this.detachAnalyser(baseUid(p.identity)); });
+    // Belt-and-suspenders: сносим mic-аудиоэлементы сразу (не ждём async onUnsub). НЕ трогаем
+    // screenshare-элементы (стрим смотрится и без голосового) — их отличаем по screenAudioEls.
+    const screenEls = new Set(this.screenAudioEls.values());
+    document.querySelectorAll('#audioSink audio').forEach((a) => { if (!screenEls.has(a as HTMLAudioElement)) a.remove(); });
     try { await this.room.localParticipant.setAttributes({ vc: '', deaf: '' }); } catch { /**/ }
     this.screenAudioEls.forEach((a) => (a.muted = false));
     this.emit();
@@ -661,7 +668,10 @@ export class Engine {
     this.room?.localParticipant.setAttributes({ deaf: this.deafened ? '1' : '' }).catch(() => {});
     const p = this.micPub();
     if (this.deafened) { if (p && p.track) p.track.mute(); }
-    else { if (p && p.track && !this.manualMute) p.track.unmute(); this.reconcileAllAudio(); } // undeafen: поднять пиров, чья подписка отвалилась в окне deafen
+    else { if (p && p.track && !this.manualMute) p.track.unmute(); }
+    // deafen → отписка от всех миков (want=false при deafened), undeafen → переподписка. Отписка
+    // надёжнее глушения громкостью: нет трека = точно тишина, и размут пира не воскресит звук.
+    this.reconcileAllAudio();
     this.applyGate();
     this.screenAudioEls.forEach((a) => (a.muted = this.deafened));
     this.applyAllVolumes();
@@ -725,8 +735,8 @@ export class Engine {
   private onRemotePub = (pub: TrackPublication, p: RemoteParticipant, silent?: boolean) => {
     if (pub.source === Track.Source.Microphone) {
       const own = baseUid(p.identity) === this.me.username; // своя же другая сессия — без звука/подписки
-      // подписываемся на микрофон только если я в голосовом и пир в ТОМ ЖЕ канале
-      if (!own && this.inVoice && !!this.currentVc && (p as any).attributes?.vc === this.currentVc) {
+      // подписываемся на микрофон только если я в голосовом, НЕ оглох и пир в ТОМ ЖЕ канале
+      if (!own && this.inVoice && !this.deafened && !!this.currentVc && (p as any).attributes?.vc === this.currentVc) {
         try { (pub as any).setSubscribed(true); } catch { /**/ }
         if (!silent) playSound('join');
       }
@@ -743,7 +753,7 @@ export class Engine {
       const out = getSettings().output; if ((a as any).setSinkId && out) (a as any).setSinkId(out).catch(() => {});
       const u = baseUid(p.identity);
       if (pub.source === Track.Source.ScreenShareAudio) { this.screenAudioEls.set(u, a); a.muted = this.deafened; a.volume = this.streamVolOf(u); }
-      else { this.applyVolumeToParticipant(p); this.attachAnalyser(u, (track as any).mediaStreamTrack); }
+      else { (a as HTMLAudioElement).muted = this.deafened; this.applyVolumeToParticipant(p); this.attachAnalyser(u, (track as any).mediaStreamTrack); }
     }
     this.emit();
   };
