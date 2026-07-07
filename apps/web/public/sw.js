@@ -11,30 +11,41 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', () => { /* passthrough */ });
 
 // фоновый web-push (VAPID): сервер будит SW даже когда PWA свёрнута/закрыта (единственный путь
-// на iOS — там JS страницы в фоне заморожен). payload = { kind, title, body, serverId }.
+// на iOS — там JS страницы в фоне заморожен). payload = { kind, title, body, serverId, tag, url }.
+// ВАЖНО (iOS): на КАЖДЫЙ push обязателен видимый showNotification внутри waitUntil — иначе Safari
+// считает push «тихим» и после нескольких таких СНИМАЕТ подписку. Поэтому показываем ВСЕГДА.
+// Дедуп с живым локальным уведомлением — общим тегом <kind>:<serverId> (ОС схлопывает в один
+// баннер: и local через reg.showNotification, и push идут через одну регистрацию).
 self.addEventListener('push', (event) => {
-  let d = {};
-  try { d = event.data ? event.data.json() : {}; } catch (e) { /* не-JSON payload */ }
-  const title = d.title || 'Рилэй';
-  const opts = {
-    body: d.body || '',
-    tag: d.kind || 'msg',
-    renotify: true,
-    icon: '/icon-256.png',
-    badge: '/icon-128.png',
-    data: { serverId: d.serverId || '' },
-  };
-  event.waitUntil(self.registration.showNotification(title, opts));
+  event.waitUntil((async () => {
+    let d = {};
+    try { d = event.data ? event.data.json() : {}; } catch (e) { /* не-JSON payload */ }
+    const tag = d.tag || ((d.kind || 'msg') + ':' + (d.serverId || ''));
+    await self.registration.showNotification(d.title || 'Рилэй', {
+      body: d.body || '',
+      tag,
+      renotify: true,
+      icon: '/icon-256.png',
+      badge: '/icon-128.png',
+      data: { serverId: d.serverId || '', url: d.url || '/' },
+    });
+    // живым вкладкам — сообщение (обновить UI/бейдж). Показ НЕ подавляем (iOS требует show).
+    try { const cls = await self.clients.matchAll({ type: 'window', includeUncontrolled: true }); for (const c of cls) c.postMessage({ type: 'push', kind: d.kind, serverId: d.serverId }); } catch (e) { /* ignore */ }
+  })());
 });
 
-// клик по системному уведомлению → фокус существующего окна (или открыть новое)
+// клик по уведомлению → сфокусировать окно и открыть нужный сервер (или открыть новое окно на url)
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
+  const data = event.notification.data || {};
+  const url = data.url || '/';
   event.waitUntil((async () => {
     try {
       const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-      for (const c of all) { if ('focus' in c) return c.focus(); }
-      if (self.clients.openWindow) return self.clients.openWindow('/');
+      for (const c of all) {
+        if ('focus' in c) { try { c.postMessage({ type: 'open-server', serverId: data.serverId || '' }); } catch (e) { /* ignore */ } return c.focus(); }
+      }
+      if (self.clients.openWindow) return self.clients.openWindow(url);
     } catch (e) { /* ignore */ }
   })());
 });

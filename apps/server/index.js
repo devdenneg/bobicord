@@ -253,8 +253,14 @@ async function pushToUsers(kind, userIds, payload) {
     `AND NOT EXISTS (SELECT 1 FROM push_prefs p WHERE p.user_id=s.user_id AND p.${prefCol}=0)`
   ).all(...ids);
   const body = JSON.stringify(payload);
+  // urgency:'high' — КРИТИЧНО для мгновенной доставки: без него push-сервисы (FCM/APNs/Mozilla)
+  // считают уведомление низкоприоритетным и БАТЧАТ его (доставка минутами, особенно на спящем
+  // мобильном) → симптом «приходят не сразу». high → FCM high priority / APNs apns-priority:10.
+  // TTL 1 день — переживёт короткий оффлайн (доставится при реконнекте устройства), но не копится
+  // вечно. topic НЕ ставим: он схлопнул бы разные упоминания (два тега оффлайн → видно только последний).
+  const opts = { TTL: 86400, urgency: 'high' };
   await Promise.all(rows.map(async (r) => {
-    try { await VAPID.webpush.sendNotification({ endpoint: r.endpoint, keys: { p256dh: r.p256dh, auth: r.auth } }, body); }
+    try { await VAPID.webpush.sendNotification({ endpoint: r.endpoint, keys: { p256dh: r.p256dh, auth: r.auth } }, body, opts); }
     catch (e) { if (e && (e.statusCode === 404 || e.statusCode === 410)) db.prepare('DELETE FROM push_subs WHERE endpoint=?').run(r.endpoint); }
   }));
 }
@@ -384,10 +390,11 @@ app.post('/api/servers/:id/stream-start', requireAuth, async (req, res) => {
   res.json({ ok: true });
   if (!VAPID) return;
   try {
-    const members = serverMembersFull(sid);
-    const inRoom = new Set(await onlineIn(sid));
-    const targets = members.filter(m => m.id !== req.user.id && !inRoom.has(m.username)).map(m => m.id);
-    await pushToUsers('stream', targets, { kind: 'stream', title: req.user.display_name, body: 'начал(а) трансляцию', serverId: sid });
+    // Шлём ВСЕМ участникам кроме автора (room-gate убран: свёрнутая мобильная PWA ещё ~15-20с
+    // числится «в комнате» на сервере, а JS уже заморожен → окно гарантированного пропуска.
+    // Дедуп с живым локальным уведомлением — общим тегом на клиенте, не room-фильтром здесь).
+    const targets = serverMembersFull(sid).filter(m => m.id !== req.user.id).map(m => m.id);
+    await pushToUsers('stream', targets, { kind: 'stream', title: req.user.display_name, body: 'начал(а) трансляцию', serverId: sid, tag: 'stream:' + sid, url: '/?server=' + sid });
   } catch (e) { console.error('[push] stream-start:', e && e.message); }
 });
 
@@ -723,8 +730,11 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
   res.json({ ok: true });
   if (info.changes === 0) return; // дубль — дальше (cleanup/push) не нужно
   db.prepare('DELETE FROM messages WHERE server_id=? AND created<?').run(sid, now - WEEK_MS);
-  // Фоновый push упомянутым/адресату ответа, которых НЕТ в комнате (в комнате — живая доставка
-  // через LiveKit, без дублей). Fire-and-forget: ответ клиенту уже отдан.
+  // Фоновый push упомянутым/адресату ответа. Шлём ВСЕМ таргетам кроме автора (room-gate убран:
+  // свёрнутая мобильная PWA ещё числится «в комнате» на сервере, а JS уже заморожен → окно
+  // гарантированного пропуска — ровно жалоба «не доставляются»). Дедуп с живым локальным
+  // уведомлением — общим тегом mention:<sid> на клиенте (схлопнутся в один баннер), не здесь.
+  // Fire-and-forget: ответ клиенту уже отдан.
   if (VAPID) (async () => {
     try {
       const members = serverMembersFull(sid);
@@ -733,10 +743,7 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
       if (rpUid) ids.add(rpUid);
       ids.delete(req.user.id); // не себе
       if (!ids.size) return;
-      const inRoom = new Set(await onlineIn(sid));
-      const byId = new Map(members.map(m => [m.id, m]));
-      const targets = [...ids].filter(id => { const m = byId.get(id); return m && !inRoom.has(m.username); });
-      await pushToUsers('mention', targets, { kind: 'mention', title: req.user.display_name, body: text.slice(0, 140) || '🖼 изображение', serverId: sid });
+      await pushToUsers('mention', [...ids], { kind: 'mention', title: req.user.display_name, body: text.slice(0, 140) || '🖼 изображение', serverId: sid, tag: 'mention:' + sid, url: '/?server=' + sid });
     } catch (e) { console.error('[push] mention:', e && e.message); }
   })();
 });

@@ -170,7 +170,7 @@ export class Engine {
         this.sysMsg(`📺 ${who} начал трансляцию — «▶ Смотреть» в списке`);
         playSound('stream');
         this.hooks.toast(who + ' начал трансляцию', 'info');
-        notify('stream', { title: who, body: 'начал(а) трансляцию', tag: 'stream-' + identity });
+        notify('stream', { title: who, body: 'начал(а) трансляцию', tag: 'stream:' + this.serverId }); // тег как у серверного push → local+push схлопываются в один баннер
       }
     };
     const onStreamStop = (identity: string) => {
@@ -964,7 +964,7 @@ export class Engine {
     if (mentioned.length) {
       playSound('mention');
       this.hooks.toast(mentioned.length === 1 ? `${mentioned[0].who} упомянул тебя` : `Тебя упомянули · ${mentioned.length}`, 'info');
-      notify('mention', { title: mentioned.length === 1 ? String(mentioned[0].who) : 'Упоминания', body: mentioned.length === 1 ? String(mentioned[0].text || '').slice(0, 140) : `Тебя упомянули · ${mentioned.length}`, tag: 'mention' });
+      notify('mention', { title: mentioned.length === 1 ? String(mentioned[0].who) : 'Упоминания', body: mentioned.length === 1 ? String(mentioned[0].text || '').slice(0, 140) : `Тебя упомянули · ${mentioned.length}`, tag: 'mention:' + this.serverId });
     }
     else playSound('msg');
     this.emit();
@@ -1022,7 +1022,7 @@ export class Engine {
           playSound(mentioned ? 'mention' : 'msg');
           if (mentioned) {
             this.hooks.toast(repliedToMe ? `${d.name} ответил тебе` : `${d.name} упомянул тебя`, 'info');
-            notify('mention', { title: d.name, body: String(d.text || '').slice(0, 140) || '🖼 изображение', tag: 'mention' });
+            notify('mention', { title: d.name, body: String(d.text || '').slice(0, 140) || '🖼 изображение', tag: 'mention:' + this.serverId });
           }
         }
       }
