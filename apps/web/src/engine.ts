@@ -20,6 +20,7 @@ export interface Snapshot {
   voiceQuality: VoiceQuality; // качество связи в голосовом (LiveKit ConnectionQuality)
   voicePing: number | null;   // RTT до сервера, мс (из WebRTC-статистики)
   inVoice: boolean;
+  voiceConnecting: boolean;                    // оптимистично зашли, но mic ещё не опубликован (идёт подключение)
   myVoiceChannel: string | null;              // id голосового канала, в котором я сейчас (null = не в голосовом)
   voiceChannels: Record<string, string>;      // username -> channelId (кто в каком голосовом канале)
   deafened: boolean;
@@ -49,7 +50,8 @@ interface EngineHooks {
   toast: (text: string, kind?: 'ok' | 'warn' | 'err' | 'info') => void;
   saveSettings: (vols: { users: Record<string, number>; streams: Record<string, number> }) => void;
   peerJoined: (identity: string) => void;
-  persistMessage: (text: string, em: Record<string, string>, image?: string, reply?: ReplyRef) => void;
+  persistMessage: (text: string, em: Record<string, string>, image: string | undefined, reply: ReplyRef | undefined, localId: number) => void;
+  refetchChat?: () => void; // догрузить свежие сообщения (после реконнекта — заполнить пропуск)
 }
 
 let msgSeq = 1;
@@ -71,6 +73,7 @@ export class Engine {
   private hooks: EngineHooks;
 
   inVoice = false;
+  private voiceConnecting = false; // оптимистично зашли в канал, но mic ещё публикуется
   private currentVc: string | null = null; // id голосового канала, в котором я сейчас (несколько каналов на сервер)
   private roomReady = false; // true только после успешного await r.connect() (не просто наличие объекта Room)
   private reconnecting = false;
@@ -236,7 +239,7 @@ export class Engine {
     return {
       connected: !!this.room, roomReady: this.roomReady, reconnecting: this.reconnecting,
       voiceQuality: this.inVoice ? this.connQuality : 'unknown', voicePing: this.inVoice ? this.pingMs : null,
-      inVoice: this.inVoice, myVoiceChannel: this.currentVc, voiceChannels, deafened: this.deafened,
+      inVoice: this.inVoice, voiceConnecting: this.inVoice && this.voiceConnecting, myVoiceChannel: this.currentVc, voiceChannels, deafened: this.deafened,
       localMicMuted: this.localMicMuted(), pttDown: this.pttDown,
       presence, speaking, streams, watching, pending, watchers, messages: this.messages, chatHasMore: this.chatMore, chatTrimmed: this.trimmedFront,
       typing: [...this.typingUsers].filter(([n, exp]) => exp > Date.now() && n !== this.me.displayName).map(([n]) => n),
@@ -259,7 +262,17 @@ export class Engine {
       // звук мута слышен только самому мутящемуся (не остальным) — играем при локальном событии
       .on(RoomEvent.TrackMuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.room?.localParticipant) playSound('mute'); this.emit(); })
       .on(RoomEvent.Reconnecting, () => { this.reconnecting = true; this.hooks.toast('Связь потеряна — переподключаюсь…', 'warn'); this.emit(); })
-      .on(RoomEvent.Reconnected, () => { this.reconnecting = false; this.hooks.toast('Связь восстановлена', 'ok'); this.emit(); })
+      .on(RoomEvent.Reconnected, () => {
+        this.reconnecting = false;
+        // после реконнекта заново заявляем голосовой канал (vc-атрибут мог потеряться) и чиним
+        // подписки сразу, не дожидаясь периодического self-heal — иначе на пару секунд пропадёт звук/состав
+        if (this.inVoice && this.currentVc) {
+          this.room?.localParticipant.setAttributes({ vc: this.currentVc, deaf: this.deafened ? '1' : '' }).catch(() => {});
+          this.reconcileAllAudio();
+        }
+        this.hooks.refetchChat?.(); // догрузить сообщения, пришедшие во время обрыва
+        this.hooks.toast('Связь восстановлена', 'ok'); this.emit();
+      })
       .on(RoomEvent.Disconnected, () => { this.reconnecting = false; this.emit(); })
       .on(RoomEvent.TrackUnmuted, () => this.emit())
       .on(RoomEvent.ConnectionQualityChanged, (q, p) => { if (p === r.localParticipant) { this.connQuality = mapQuality(q); this.emit(); } })
@@ -351,15 +364,18 @@ export class Engine {
     if (this.inVoice) { if (this.currentVc !== channelId) await this.switchVoice(channelId); return; }
     this.currentVc = channelId;
     this.inVoice = true; this.manualMute = false; this.pttDown = false;
+    this.voiceConnecting = true;
+    this.emit(); // ОПТИМИСТИЧНО: сразу рисуем себя в канале + статус «подключение» (mic ещё публикуется)
     try { await this.room.localParticipant.setAttributes({ vc: channelId }); } catch { /**/ }
     try { await this.startMic(); }
     catch {
-      this.inVoice = false; this.currentVc = null;
+      this.inVoice = false; this.currentVc = null; this.voiceConnecting = false;
       try { await this.room.localParticipant.setAttributes({ vc: '' }); } catch { /**/ }
       this.hooks.toast('Нет доступа к микрофону', 'err'); this.emit(); return;
     }
     this.reconcileAllAudio(); // подписываемся только на пиров этого же канала
     this.startConnPoll();
+    this.voiceConnecting = false;
     this.emit();
   }
   // перейти в другой голосовой канал того же сервера: микрофон остаётся, меняются подписки и стримы
@@ -373,12 +389,14 @@ export class Engine {
   }
   async leaveVoice() {
     if (!this.room || !this.inVoice) return;
+    // оптимистично: сразу убираем себя из канала (UI не ждёт async-очистку mic/треков)
+    this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.deafened = false; this.manualMute = false; this.pttDown = false;
+    this.emit();
     this.stopConnPoll();
     await this.stopShare().catch(() => {});
     this.stopMic();
     this.room.remoteParticipants.forEach((p) => { const rp = p.getTrackPublication(Track.Source.Microphone); if (rp) { try { (rp as any).setSubscribed(false); } catch { /**/ } } this.detachAnalyser(p.identity); });
     try { await this.room.localParticipant.setAttributes({ vc: '', deaf: '' }); } catch { /**/ }
-    this.inVoice = false; this.currentVc = null; this.deafened = false; this.manualMute = false; this.pttDown = false;
     this.screenAudioEls.forEach((a) => (a.muted = false));
     this.emit();
   }
@@ -788,16 +806,36 @@ export class Engine {
     if (!reply) return false;
     return (!!reply.uid && reply.uid === this.me.id) || reply.author === this.me.displayName;
   }
-  private pushMsg(who: string | null, text: string, sys: boolean, color?: number, mineOverride?: boolean, img?: string, ts?: number, uid?: string, reply?: ReplyRef) {
+  private pushMsg(who: string | null, text: string, sys: boolean, color?: number, mineOverride?: boolean, img?: string, ts?: number, uid?: string, reply?: ReplyRef): number {
     const mine = mineOverride !== undefined ? mineOverride : (!sys && who === this.me.displayName);
     const mention = !sys && !mine && (this.textMentionsMe(text) || this.replyToMe(reply));
-    const next = [...this.messages, { id: msgSeq++, uid, who, text, mine, sys, color, img, ts: ts ?? Date.now(), mention, reply }];
+    const id = msgSeq++;
+    const next = [...this.messages, { id, uid, who, text, mine, sys, color, img, ts: ts ?? Date.now(), mention, reply }];
     // кап на память сессии; срез идёт с НАЧАЛА, поэтому копим trimmedFront — компонент на столько же
     // поднимет firstItemIndex virtuoso, иначе якорь скролла рассинхронится и контент прыгнет.
     const CAP = 1000;
     if (next.length > CAP) { this.trimmedFront += next.length - CAP; this.messages = next.slice(next.length - CAP); }
     else this.messages = next;
     this.emit();
+    return id;
+  }
+  // статус отправки моего сообщения (для «не отправлено · повторить»)
+  private pendingSend = new Map<number, { text: string; em: Record<string, string>; img?: string; reply?: ReplyRef }>();
+  private setMsgStatus(localId: number, status: 'failed' | undefined) {
+    let changed = false;
+    this.messages = this.messages.map((m) => (m.id === localId && m.status !== status ? (changed = true, { ...m, status }) : m));
+    if (changed) this.emit();
+  }
+  markSendResult(localId: number, ok: boolean) {
+    if (ok) { this.pendingSend.delete(localId); this.setMsgStatus(localId, undefined); }
+    else this.setMsgStatus(localId, 'failed');
+  }
+  retrySend(localId: number) {
+    const p = this.pendingSend.get(localId); if (!p) return;
+    this.setMsgStatus(localId, undefined);
+    // только повторный persist (без ре-broadcast): если первый dataSend прошёл, у живых
+    // сообщение уже есть — повтор рассылки дал бы дубль. Упал именно POST в БД.
+    this.hooks.persistMessage(p.text, p.em, p.img, p.reply, localId);
   }
   sysMsg(text: string) { this.pushMsg(null, text, true); }
   private mapHistory(list: HistoryMessage[]): ChatMessage[] {
@@ -812,6 +850,21 @@ export class Engine {
     this.chatMore = hasMore;
     this.oldestSid = list.length ? (list[0].id ?? null) : null; // list в ASC-порядке, [0] — самое старое
     this.trimmedFront = 0; // новая история — счётчик среза сбрасывается (компонент тоже обнулит prevTrim)
+    this.emit();
+  }
+  // догрузка пропущенного после реконнекта: добавляем только сообщения НОВЕЕ последнего известного
+  // sid и НЕ свои (свои уже показаны оптимистично) — чтобы не задублировать локальный эхо
+  mergeRecent(list: HistoryMessage[]) {
+    if (!list.length) return;
+    const maxSid = this.messages.reduce((mx, m) => (m.sid != null && m.sid > mx ? m.sid : mx), 0);
+    const haveSids = new Set(this.messages.map((m) => m.sid).filter((s): s is number => s != null));
+    const add = list.filter((m) => m.id != null && m.id > maxSid && !haveSids.has(m.id) && m.uid !== this.me.id);
+    if (!add.length) return;
+    const mapped = this.mapHistory(add);
+    this.messages = [...this.messages, ...mapped];
+    const mentioned = mapped.filter((m) => m.mention); // один звук, а не по сообщению (не спамим при длинном обрыве)
+    if (mentioned.length) { playSound('mention'); this.hooks.toast(mentioned.length === 1 ? `${mentioned[0].who} упомянул тебя` : `Тебя упомянули · ${mentioned.length}`, 'info'); }
+    else playSound('msg');
     this.emit();
   }
   // догрузка более старых сообщений при скролле вверх — prepend в начало, курсор сдвигается назад
@@ -836,8 +889,9 @@ export class Engine {
     // realtime-раздача только при поднятой комнате; локальный эхо + persist работают и без неё —
     // в окне фоновой докрутки connect (сразу после входа в сервер) сообщение не теряется, ложится в БД.
     if (this.room) this.dataSend({ t: 'chat', name: this.me.displayName, text: t, em, color: this.me.avatarColor, img, uid: this.me.id, reply });
-    this.pushMsg(this.me.displayName, t, false, this.me.avatarColor, true, img, undefined, this.me.id, reply);
-    this.hooks.persistMessage(t, em, img, reply);
+    const id = this.pushMsg(this.me.displayName, t, false, this.me.avatarColor, true, img, undefined, this.me.id, reply);
+    this.pendingSend.set(id, { text: t, em, img, reply });
+    this.hooks.persistMessage(t, em, img, reply, id);
   }
   sendTyping() {
     if (!this.room) return;

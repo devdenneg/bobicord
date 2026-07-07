@@ -99,7 +99,14 @@ export const useStore = create<AppState>((set, get) => ({
         saveTimer = window.setTimeout(() => { api.putSettings(a.id, vols).catch(() => {}); }, 800);
       },
       peerJoined: (id) => { if (!get().members.some((m) => m.username === id)) get().refreshMembers(); },
-      persistMessage: (text, em, image, reply) => { const a = get().active; if (a) api.postMessage(a.id, text, em, image, reply).catch(() => {}); },
+      persistMessage: (text, em, image, reply, localId) => {
+        const a = get().active;
+        if (!a) { engine?.markSendResult(localId, false); return; }
+        api.postMessage(a.id, text, em, image, reply)
+          .then(() => engine?.markSendResult(localId, true))
+          .catch(() => engine?.markSendResult(localId, false));
+      },
+      refetchChat: () => { const a = get().active; if (!a) return; api.getMessages(a.id, undefined, 30).then((d) => engine?.mergeRecent(d.messages)).catch(() => {}); },
     });
     engine.onEmoteResolve = (name, id) => emoteMap.set(name, id);
     set({ me: user });

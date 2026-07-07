@@ -100,6 +100,7 @@ export interface ChatMessage {
   ts?: number; // timestamp (ms)
   mention?: boolean; // упоминает меня (@ник) ИЛИ ответ на моё сообщение
   reply?: ReplyRef; // это ответ на другое сообщение
+  status?: 'failed'; // не удалось сохранить на сервере (показываем «не отправлено · повторить»)
 }
 
 export interface HistoryMessage {

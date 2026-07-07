@@ -115,10 +115,11 @@ function VoiceParticipantRow({ m, anim }: { m: Member; anim?: string }) {
   const pending = !!eng.pending[m.username];
   const [vol, setVol] = useState(() => Math.round(E.userVolOf(m.username) * 100));
   const talking = speaking && !pr?.micMuted;
+  const connecting = isLocal && eng.voiceConnecting;
   const rowId = `vc-${m.username}`;
   const hc = useHoverCard();
   return (
-    <div className={'pi' + (remote ? ' clickable' : '') + (streaming ? ' streaming' : '') + (talking ? ' speaking' : '') + (open ? ' open' : '') + (anim ? ' ' + anim : '')} data-spk={m.username}>
+    <div className={'pi' + (remote ? ' clickable' : '') + (streaming ? ' streaming' : '') + (talking ? ' speaking' : '') + (open ? ' open' : '') + (connecting ? ' connecting' : '') + (anim ? ' ' + anim : '')} data-spk={m.username}>
       <div className="head"
         ref={hc.ref} onMouseEnter={remote ? hc.onEnter : undefined} onMouseLeave={remote ? hc.onLeave : undefined}
         role={remote ? 'button' : undefined} tabIndex={remote ? 0 : undefined}
@@ -132,7 +133,8 @@ function VoiceParticipantRow({ m, anim }: { m: Member; anim?: string }) {
             {streaming && meta?.appIcon ? <img src={`data:image/png;base64,${meta.appIcon}`} alt="" title={meta.appName ? `Стримит ${meta.appName}` : undefined} style={{ position: 'absolute', right: -3, bottom: -3, width: 14, height: 14, borderRadius: 3, border: '2px solid var(--bg-alt, #111)', objectFit: 'contain' }} /> : null}
           </>; })()}
         </div>
-        <div className="nm" title={m.displayName}>{m.displayName}{isLocal ? ' (ты)' : ''}</div>
+        <div className="nm" title={m.displayName}>{m.displayName}{isLocal && !connecting ? ' (ты)' : ''}</div>
+        {connecting ? <span className="vc-connecting">подключение…</span> : null}
         {remote && streaming ? (
           <button className={'watchbtn' + (watching ? ' on' : '')} disabled={pending}
             aria-label={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}
@@ -141,7 +143,9 @@ function VoiceParticipantRow({ m, anim }: { m: Member; anim?: string }) {
             {pending ? <span className="spin" style={{ margin: 0, width: 13, height: 13 }} /> : <Icon name={watching ? 'eye-off' : 'eye'} />}
           </button>
         ) : null}
-        <div className={'micst' + (pr?.micMuted ? ' off' : '')} aria-label={pr?.micMuted ? (pr?.deafened ? 'Оглох' : 'Микрофон выключен') : undefined}><Icon name={pr?.deafened ? 'head-off' : 'mic-off'} /></div>
+        {connecting
+          ? <span className="spin" style={{ margin: 0, width: 14, height: 14 }} aria-label="Подключение" />
+          : <div className={'micst' + (pr?.micMuted ? ' off' : '')} aria-label={pr?.micMuted ? (pr?.deafened ? 'Оглох' : 'Микрофон выключен') : undefined}><Icon name={pr?.deafened ? 'head-off' : 'mic-off'} /></div>}
         {remote ? <div className="chev" aria-hidden="true"><Icon name="chevron" sm /></div> : null}
       </div>
       {remote ? (
@@ -842,7 +846,7 @@ function Chat() {
     }
     return (
       <div className={'virt-row' + (cont ? ' cont' : '')}>
-        <div className={'msg' + (m.sys ? ' sys' : '') + (m.mine ? ' me' : '') + (m.mention ? ' mentioned' : '') + (m.id === flashId ? ' flash' : '')}>
+        <div className={'msg' + (m.sys ? ' sys' : '') + (m.mine ? ' me' : '') + (m.mention ? ' mentioned' : '') + (m.id === flashId ? ' flash' : '') + (m.status === 'failed' ? ' failed' : '')}>
           {!m.sys ? <div className="msg-av">{!cont ? <Avatar name={m.who || ''} ci={m.color ?? 0} url={author?.avatarUrl} size={36} /> : null}</div> : null}
           <div className="msg-body">
             {replyQuote}
@@ -855,6 +859,7 @@ function Chat() {
                   </div>
                 ) : null}
                 {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox(m.img!)}><img className="msg-img" src={resolveUploadUrl(m.img)} alt="" loading="lazy" /></button> : null}
+                {m.status === 'failed' ? <div className="msg-failed"><Icon name="warn" sm />Не отправлено<button onClick={() => getEngine()?.retrySend(m.id)}>Повторить</button></div> : null}
               </div>
               {!m.sys ? <button className="msg-reply-btn" data-tip="Ответить" onMouseDown={(e) => e.preventDefault()} onClick={() => startReply(m)}><Icon name="reply" sm /></button> : null}
             </div>
