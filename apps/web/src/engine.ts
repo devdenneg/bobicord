@@ -556,6 +556,10 @@ export class Engine {
     this.micGain.connect(dest);
     const lat = new LocalAudioTrack(dest.stream.getAudioTracks()[0]);
     await this.room.localParticipant.publishTrack(lat, { source: Track.Source.Microphone, dtx: true, red: true, audioPreset: AudioPresets.musicHighQuality });
+    // свежий трек публикуется НЕмьютнутым на уровне LiveKit — если сейчас ручной мут/оглушение,
+    // домьютить сразу (иначе после reapplyMic в муте пиры читают mp.isMuted=false → бейдж мута
+    // пропадает у всех, хотя мы молчим через gain=0). applyGate решает лишь громкость, не LiveKit-mute.
+    if (this.manualMute || this.deafened) { try { lat.mute(); } catch { /**/ } }
     // индикатор «говорит» берём с сырого трека устройства
     this.attachAnalyser(this.me.username, this.micRaw.getAudioTracks()[0]);
     this.applyGate();
@@ -753,6 +757,7 @@ export class Engine {
       const out = getSettings().output; if ((a as any).setSinkId && out) (a as any).setSinkId(out).catch(() => {});
       const u = baseUid(p.identity);
       if (pub.source === Track.Source.ScreenShareAudio) { this.screenAudioEls.set(u, a); a.muted = this.deafened; a.volume = this.streamVolOf(u); }
+      else if (!this.inVoice) { try { track.detach().forEach((el) => el.remove()); } catch { /**/ } this.emit(); return; } // in-flight mic-подписка после leaveVoice — не клеим элемент
       else { (a as HTMLAudioElement).muted = this.deafened; this.applyVolumeToParticipant(p); this.attachAnalyser(u, (track as any).mediaStreamTrack); }
     }
     this.emit();
@@ -880,7 +885,7 @@ export class Engine {
   }
   private wset(sid: string) { let m = this.streamWatchers.get(sid); if (!m) { m = new Map(); this.streamWatchers.set(sid, m); } return m; }
   private cleanupWatchers() { const now = Date.now(); let ch = false; this.streamWatchers.forEach((m) => m.forEach((v, wid) => { if (now - v.ts > 9000) { m.delete(wid); ch = true; } })); if (ch) this.emit(); }
-  private cleanupPeer(id: string) { this.streamWatchers.delete(id); this.streamWatchers.forEach((m) => m.delete(id)); this.detachAnalyser(id); this.watching.delete(id); this.pendingWatch.delete(id); this.watchT.delete(id); }
+  private cleanupPeer(id: string) { this.streamWatchers.delete(id); this.streamWatchers.forEach((m) => m.delete(id)); this.detachAnalyser(id); this.watching.delete(id); this.pendingWatch.delete(id); this.watchT.delete(id); const sa = this.screenAudioEls.get(id); if (sa) { try { sa.remove(); } catch { /**/ } this.screenAudioEls.delete(id); } } // защитно: при резком обрыве TrackUnsubscribed может не прийти → стрим-аудио залипнет
 
   /* ---------- volumes ---------- */
   streamVolOf(id: string) { return this.VOLS.streams[id] !== undefined ? this.VOLS.streams[id] : 1; }
