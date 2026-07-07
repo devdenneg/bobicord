@@ -486,7 +486,19 @@ export class Engine {
         if (s.type === 'candidate-pair' && (s.nominated || s.state === 'succeeded') && s.currentRoundTripTime != null) cand = s.currentRoundTripTime;
       });
       const v = rtt ?? cand;
-      if (v != null) { this.pingMs = Math.round(v * 1000); this.emit(); }
+      let changed = false;
+      if (v != null && this.pingMs !== Math.round(v * 1000)) { this.pingMs = Math.round(v * 1000); changed = true; }
+      // Качество читаем НАПРЯМУЮ из localParticipant.connectionQuality, а не ждём событие
+      // ConnectionQualityChanged: оно приходит лишь при СМЕНЕ качества, поэтому при стабильной
+      // связи с самого старта метка залипала на «соединение…» (unknown), хотя пинг уже шёл.
+      const lp = this.room?.localParticipant;
+      let cq = lp?.connectionQuality != null ? mapQuality(lp.connectionQuality) : 'unknown';
+      if (cq === 'unknown' && v != null) {
+        // LiveKit ещё не отдал качество, но RTT есть → связь жива. Выводим из пинга, чтобы не залипать.
+        const ms = v * 1000; cq = ms < 120 ? 'excellent' : ms < 250 ? 'good' : 'poor';
+      }
+      if (cq !== this.connQuality) { this.connQuality = cq; changed = true; }
+      if (changed) this.emit();
     } catch { /**/ }
   }
 
