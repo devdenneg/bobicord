@@ -133,9 +133,10 @@ export function App() {
   const me = useStore((s) => s.me);
 
   // hotkeys (мут микрофона / заглушить звук — настраиваемые комбинации из keybinds, + PTT) —
-  // active while logged in. Когда натив держит глобальный хук (не отключён чекбоксом), сами
-  // combo-мут/дифен здесь не триггерим — иначе двойной тогл, т.к. хук ловит и в фокусе тоже
-  // (см. onGlobalHotkey-эффект ниже). PTT глобального режима не имеет — всегда обрабатывается тут.
+  // active while logged in. Работает ВСЕГДА, пока окно в фокусе (keydown на window иначе и не
+  // придёт) — независимо от чекбокса «глобально»: нативный WH_KEYBOARD_LL-хук (см. эффект ниже)
+  // сам проверяет фокус своего окна и не эмитит событие, если оно в фокусе, — так что здесь и там
+  // никогда не сработает дважды на одно нажатие. PTT глобального режима не имеет — всегда тут.
   useEffect(() => {
     if (!me) return;
     const pressed = new Set<string>();
@@ -147,8 +148,7 @@ export function App() {
       const s = getSettings();
       const nk = normKey(e.code);
       pressed.add(nk);
-      const globalActive = isTauri && !s.disableGlobalHotkeys;
-      if (E.inVoice && !typing && !globalActive) {
+      if (E.inVoice && !typing) {
         (Object.keys(armed) as KeybindAction[]).forEach((action) => {
           const combo = s.keybinds[action].map(normKey);
           if (!armed[action] && combo.length && combo.every((c) => pressed.has(c))) {
@@ -171,7 +171,9 @@ export function App() {
     return () => { window.removeEventListener('keydown', kd); window.removeEventListener('keyup', ku); };
   }, [me]);
 
-  // натив: держим Rust-хук (WH_KEYBOARD_LL) в курсе актуальных биндов/режима, слушаем его события
+  // натив: держим Rust-хук (WH_KEYBOARD_LL) в курсе актуальных биндов/режима (чекбокс «отключить
+  // вне приложения» = enabled false — хук вообще ничего не матчит). Хук сам не эмитит, пока наше
+  // окно в фокусе (см. hotkeys.rs), поэтому событие сюда прилетает только когда фокус не у нас.
   useEffect(() => {
     if (!isTauri) return;
     const sync = () => { const s = getSettings(); setGlobalHotkeys(s.keybinds, !s.disableGlobalHotkeys); };

@@ -12,11 +12,12 @@ use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 
-use tauri::{AppHandle, Emitter};
-use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use tauri::{AppHandle, Emitter, Manager};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage,
-    KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, SetWindowsHookExW,
+    TranslateMessage, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
+    WM_SYSKEYUP,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -36,6 +37,10 @@ impl Action {
 
 struct State {
     app: Option<AppHandle>,
+    // HWND главного окна (как isize — сырой хэндл, не завязываемся на Send/Sync у HWND).
+    // Используется, чтобы не эмитить событие, когда наше окно и так в фокусе (см. hook_proc) —
+    // тогда клавишу обрабатывает in-app JS-хендлер (App.tsx), иначе сработало бы дважды.
+    own_hwnd: Option<isize>,
     // (действие, требуемые VK-коды комбинации; модификаторы уже нормализованы — без L/R различия)
     combos: Vec<(Action, Vec<u32>)>,
     pressed: HashSet<u32>,
@@ -48,6 +53,7 @@ fn state() -> &'static Mutex<State> {
     STATE.get_or_init(|| {
         Mutex::new(State {
             app: None,
+            own_hwnd: None,
             combos: Vec::new(),
             pressed: HashSet::new(),
             armed: HashSet::new(),
@@ -126,6 +132,7 @@ fn code_to_vk(code: &str) -> Option<u32> {
 /// глобальный хук фактически не матчит ничего (in-app хендлер в App.tsx берёт мут на себя).
 pub fn set_hotkeys(app: AppHandle, mute_mic: Vec<String>, deafen: Vec<String>, enabled: bool) {
     let mut st = state().lock().unwrap();
+    st.own_hwnd = app.get_webview_window("main").and_then(|w| w.hwnd().ok()).map(|h| h.0 as isize);
     st.app = Some(app);
     st.combos = if enabled {
         vec![
@@ -177,11 +184,17 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                 st.pressed.insert(vk);
                 let combos = st.combos.clone();
                 let app = st.app.clone();
+                // наше окно сейчас в фокусе -> клавишу и так обработает in-app JS-хендлер
+                // (App.tsx слушает keydown на window, он получает событие только в фокусе);
+                // не эмитим, чтобы не сработало дважды на одно нажатие.
+                let we_are_foreground = st.own_hwnd.map(|h| unsafe { GetForegroundWindow() } == HWND(h as _)).unwrap_or(false);
                 for (action, combo) in &combos {
                     if !st.armed.contains(action) && !combo.is_empty() && combo.iter().all(|c| st.pressed.contains(c)) {
                         st.armed.insert(*action);
-                        if let Some(app) = &app {
-                            let _ = app.emit("global-hotkey", serde_json::json!({ "action": action.wire_name() }));
+                        if !we_are_foreground {
+                            if let Some(app) = &app {
+                                let _ = app.emit("global-hotkey", serde_json::json!({ "action": action.wire_name() }));
+                            }
                         }
                     }
                 }
