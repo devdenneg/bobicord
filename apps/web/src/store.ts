@@ -5,6 +5,7 @@ import { emoteMap } from './emotes';
 import { setSettings } from './settings';
 import { notifPermission } from './notify';
 import { ensurePushSubscribed, unsubscribePush } from './push';
+import { connectNotifyWs, disconnectNotifyWs } from './notifyws';
 import type { User, ServerSummary, Member, ServerDetail, Toast, ToastKind } from './types';
 
 let engine: Engine | null = null;
@@ -155,6 +156,7 @@ export const useStore = create<AppState>((set, get) => ({
     // initNotifications — иначе опт-аут прошлого юзера навсегда лишал бы нового push. Только при уже
     // выданном разрешении; master включаем, т.к. на этом устройстве уведомления уже разрешены.
     if (notifPermission() === 'granted') { setSettings({ notif: true }); localStorage.removeItem('notifOptOut'); ensurePushSubscribed(); }
+    connectNotifyWs(); // глобальный live-канал уведомлений (любой сервер, даже не подключённый)
     const pend = sessionStorage.getItem('pendingInvite');
     if (pend) { sessionStorage.removeItem('pendingInvite'); set({ modal: 'join', joinPrefill: pend }); }
   },
@@ -201,6 +203,7 @@ export const useStore = create<AppState>((set, get) => ({
     // иначе endpoint остаётся привязан к нему на сервере и его push летели бы следующему юзеру.
     // cap 2с, чтобы разлогин не подвисал на мёртвой сети.
     try { await Promise.race([unsubscribePush(), new Promise((r) => setTimeout(r, 2000))]); } catch { /**/ }
+    disconnectNotifyWs();
     setToken(null); location.reload();
   },
 

@@ -7,6 +7,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const Database = require('better-sqlite3');
 const { AccessToken, RoomServiceClient } = require('livekit-server-sdk');
+const { WebSocketServer } = require('ws');
 const { attachTreeServer } = require('./tree');
 
 const app = express();
@@ -320,6 +321,19 @@ function serverMembersFull(sid) {
   return db.prepare('SELECT u.id,u.username,u.display_name FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.server_id=?').all(sid);
 }
 
+// Глобальный live-notify канал (WS /ws): не привязан к серверной LiveKit-комнате, поэтому юзер
+// получает уведомление о упоминании/трансляции в ЛЮБОМ своём сервере — даже в НЕ подключённом
+// (веб-push бьёт только по свёрнутому/закрытому; натив web-push не получает вообще). Карта
+// user_id → набор живых ws-соединений (несколько устройств/вкладок). Заполняется в WS-setup внизу.
+const notifyConns = new Map();
+function notifyUser(userId, payload) {
+  const set = notifyConns.get(userId);
+  if (!set || !set.size) return;
+  const data = JSON.stringify(payload);
+  for (const ws of set) { if (ws.readyState === 1 /* OPEN */) { try { ws.send(data); } catch (e) { /**/ } } }
+}
+function serverName(sid) { const s = db.prepare('SELECT name FROM servers WHERE id=?').get(sid); return s ? s.name : 'Сервер'; }
+
 const pubUser = u => ({ id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '', bio: u.bio });
 const UPLOAD_RE = /^\/api\/uploads\/[a-zA-Z0-9._-]+$/; // локальный путь к загрузке
 const pubServer = s => ({ id: s.id, name: s.name, ownerId: s.owner_id, iconColor: s.icon_color, iconUrl: s.icon_url || '', description: s.description || '' });
@@ -456,14 +470,14 @@ app.post('/api/servers/:id/stream-start', requireAuth, async (req, res) => {
   const sid = req.params.id;
   if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
   res.json({ ok: true });
-  if (!VAPID) return;
   try {
-    // Шлём ВСЕМ участникам кроме автора (room-gate убран: свёрнутая мобильная PWA ещё ~15-20с
-    // числится «в комнате» на сервере, а JS уже заморожен → окно гарантированного пропуска.
-    // Дедуп с живым локальным уведомлением — общим тегом на клиенте, не room-фильтром здесь).
+    // ВСЕМ участникам кроме автора. Глобальный notify-WS (мгновенно онлайн, любой сервер) + web-push
+    // (свёрнуто/закрыто). Дедуп с живым путём — на клиенте по connectedServerId.
     const targets = serverMembersFull(sid).filter(m => m.id !== req.user.id).map(m => m.id);
-    await pushToUsers('stream', targets, { kind: 'stream', title: req.user.display_name, body: 'начал(а) трансляцию', serverId: sid, tag: 'stream:' + sid, url: '/?server=' + sid });
-  } catch (e) { console.error('[push] stream-start:', e && e.message); }
+    const nm = serverName(sid);
+    for (const uid of targets) notifyUser(uid, { t: 'notify', kind: 'stream', serverId: sid, serverName: nm, title: req.user.display_name, body: 'начал(а) трансляцию' });
+    if (VAPID) pushToUsers('stream', targets, { kind: 'stream', title: req.user.display_name, body: 'начал(а) трансляцию', serverId: sid, tag: 'stream:' + sid, url: '/?server=' + sid }).catch(() => {});
+  } catch (e) { console.error('[notify] stream-start:', e && e.message); }
 });
 
 app.patch('/api/me', requireAuth, (req, res) => {
@@ -798,12 +812,11 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
   res.json({ ok: true });
   if (info.changes === 0) return; // дубль — дальше (cleanup/push) не нужно
   db.prepare('DELETE FROM messages WHERE server_id=? AND created<?').run(sid, now - WEEK_MS);
-  // Фоновый push упомянутым/адресату ответа. Шлём ВСЕМ таргетам кроме автора (room-gate убран:
-  // свёрнутая мобильная PWA ещё числится «в комнате» на сервере, а JS уже заморожен → окно
-  // гарантированного пропуска — ровно жалоба «не доставляются»). Дедуп с живым локальным
-  // уведомлением — общим тегом mention:<sid> на клиенте (схлопнутся в один баннер), не здесь.
+  // Уведомление упомянутым/адресату ответа. ДВА канала: (1) глобальный notify-WS — мгновенно тем,
+  // кто онлайн в приложении (натив + веб), для ЛЮБОГО сервера, даже НЕ подключённого («куда зайти»);
+  // (2) web-push — свёрнуто/закрыто. Дедуп с живым LiveKit-путём на клиенте (по connectedServerId).
   // Fire-and-forget: ответ клиенту уже отдан.
-  if (VAPID) (async () => {
+  (() => {
     try {
       const members = serverMembersFull(sid);
       const ids = mentionedIds(text, members);
@@ -811,8 +824,12 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
       if (rpUid) ids.add(rpUid);
       ids.delete(req.user.id); // не себе
       if (!ids.size) return;
-      await pushToUsers('mention', [...ids], { kind: 'mention', title: req.user.display_name, body: text.slice(0, 140) || '🖼 изображение', serverId: sid, tag: 'mention:' + sid, url: '/?server=' + sid });
-    } catch (e) { console.error('[push] mention:', e && e.message); }
+      const targets = [...ids];
+      const body = text.slice(0, 140) || '🖼 изображение';
+      const nm = serverName(sid);
+      for (const uid of targets) notifyUser(uid, { t: 'notify', kind: 'mention', serverId: sid, serverName: nm, title: req.user.display_name, body, msgId: info.lastInsertRowid });
+      if (VAPID) pushToUsers('mention', targets, { kind: 'mention', title: req.user.display_name, body, serverId: sid, tag: 'mention:' + sid, url: '/?server=' + sid }).catch(() => {});
+    } catch (e) { console.error('[notify] mention:', e && e.message); }
   })();
 });
 
@@ -869,4 +886,25 @@ const treeSrv = attachTreeServer(server, {
   turnUrls: TURN_URLS,
   turnTtlSec: TURN_TTL_SEC,
 });
-server.listen(3000, () => console.log('voice API (servers+sqlite) + tree ws on :3000'));
+
+/* ---------- Глобальный notify-WS (/ws): уведомления по любому серверу, вкл. не подключённый ---------- */
+const notifyWss = new WebSocketServer({ noServer: true });
+server.on('upgrade', (req, socket, head) => {
+  let url; try { url = new URL(req.url, 'http://internal'); } catch { return; }
+  if (url.pathname !== '/ws') return; // не наш путь — оставляем tree-хендлеру
+  let p; try { p = jwt.verify(url.searchParams.get('token') || '', SESSION_SECRET); }
+  catch (e) { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
+  const uid = p.id || (p.u && (db.prepare('SELECT id FROM users WHERE username=?').get(p.u) || {}).id);
+  if (!uid) { socket.destroy(); return; }
+  notifyWss.handleUpgrade(req, socket, head, (ws) => {
+    let set = notifyConns.get(uid); if (!set) { set = new Set(); notifyConns.set(uid, set); }
+    set.add(ws);
+    ws.on('close', () => { const s = notifyConns.get(uid); if (s) { s.delete(ws); if (!s.size) notifyConns.delete(uid); } });
+    ws.on('error', () => { try { ws.close(); } catch (e) {} });
+    ws.on('message', () => { /* клиент только слушает (ping игнорим) */ });
+  });
+});
+// heartbeat: закрываем мёртвые notify-сокеты, иначе висят в notifyConns
+setInterval(() => { for (const set of notifyConns.values()) for (const ws of set) { if (ws.readyState === 1) { try { ws.ping(); } catch (e) {} } } }, 30000).unref?.();
+
+server.listen(3000, () => console.log('voice API (servers+sqlite) + tree ws + notify ws on :3000'));
