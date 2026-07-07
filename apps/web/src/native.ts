@@ -161,3 +161,23 @@ export async function onNativeWatchEnded(cb: (streamId: string) => void): Promis
   const un = await listen<{ streamId: string }>('relay-watch-ended', (e) => cb(e.payload.streamId));
   return un;
 }
+
+/* ---------- глобальные хоткеи мута (низкоуровневый WH_KEYBOARD_LL хук, только Windows) ---------- */
+
+import type { Keybinds } from './types';
+
+/** Синхронизирует хук с текущими биндами. `enabled=false` (чекбокс «отключить вне приложения») —
+ *  хук снимает все комбинации, дальше хоткеи работают только через in-app-слушатель (App.tsx). No-op в браузере. */
+export async function setGlobalHotkeys(binds: Keybinds, enabled: boolean): Promise<void> {
+  if (!isTauri) return;
+  const { invoke } = await import('@tauri-apps/api/core');
+  await invoke('set_global_hotkeys', { muteMic: binds.muteMic, deafen: binds.deafen, enabled });
+}
+
+/** Событие от хука: комбинация зажата целиком (вне зависимости от фокуса окна). No-op в браузере. */
+export async function onGlobalHotkey(cb: (action: 'muteMic' | 'deafen') => void): Promise<() => void> {
+  if (!isTauri) return () => {};
+  const { listen } = await import('@tauri-apps/api/event');
+  const un = await listen<{ action: 'muteMic' | 'deafen' }>('global-hotkey', (e) => cb(e.payload.action));
+  return un;
+}

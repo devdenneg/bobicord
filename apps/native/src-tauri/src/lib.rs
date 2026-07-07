@@ -1,6 +1,7 @@
 // IPC bridge stub UI<->Rust; expanded в Э5 (broadcast::* — захват/энкодер/webrtc-дерево).
 // pub — нужен examples/broadcast_smoke.rs (e2e-смоук без Tauri/webview/UI).
 pub mod broadcast;
+mod hotkeys;
 
 use tokio::sync::Mutex;
 
@@ -154,6 +155,16 @@ async fn set_broadcast_source(
   }).await
 }
 
+// Настройки -> «Настройка клавиш»: (пере)регистрирует глобальный WH_KEYBOARD_LL-хук с
+// актуальными биндами. Вызывается фронтом при старте и на каждое изменение keybinds/
+// disableGlobalHotkeys (см. App.tsx). enabled=false — хук матчит пустые комбо, мут
+// глобально не срабатывает (in-app хендлер берёт клавиши на себя, пока окно в фокусе).
+#[tauri::command]
+async fn set_global_hotkeys(app: tauri::AppHandle, mute_mic: Vec<String>, deafen: Vec<String>, enabled: bool) -> Result<(), String> {
+  hotkeys::set_hotkeys(app, mute_mic, deafen, enabled);
+  Ok(())
+}
+
 #[tauri::command]
 async fn stop_broadcast(state: tauri::State<'_, BroadcastState>) -> Result<(), String> {
   let handle = state.0.lock().await.take();
@@ -185,7 +196,7 @@ pub fn run() {
       )?;
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![ping, list_monitors, list_windows, start_broadcast, set_broadcast_source, stop_broadcast, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent])
+    .invoke_handler(tauri::generate_handler![ping, list_monitors, list_windows, start_broadcast, set_broadcast_source, stop_broadcast, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }

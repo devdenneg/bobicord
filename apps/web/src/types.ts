@@ -130,4 +130,13 @@ export interface AudioSettings {
   sensitivity: number; // порог чувствительности ввода, 0..100 (нормализованная dB-шкала)
   sensitivityAuto: boolean; // авто-подбор порога по шумовому фону
   notifyVolume: number; // громкость звуков-уведомлений в %
+  keybinds: Keybinds; // хоткеи мута (коды KeyboardEvent.code, 1..3 клавиши)
+  disableGlobalHotkeys: boolean; // чекбокс «отключить комбинацию вне приложения» (только натив)
 }
+
+// Каждый бинд — массив KeyboardEvent.code (напр. ['KeyM'] или ['ControlLeft','ShiftLeft','KeyM']).
+export interface Keybinds {
+  muteMic: string[]; // «Заглушить микрофон» (свой мик)
+  deafen: string[]; // «Заглушить звук» (все звуки, deafen)
+}
+export type KeybindAction = keyof Keybinds;

@@ -7,11 +7,12 @@ import { THEMES, getTheme, setTheme } from '../theme';
 import { playSound } from '../sounds';
 import { Icon } from '../Icon';
 import { MicMeter } from './MicMeter';
-import { AV_COLORS, avColor, initial, keyLabel } from '../util';
-import type { AudioSettings, InvitePreview, Role, Member } from '../types';
+import { AV_COLORS, avColor, initial, keyLabel, comboLabel } from '../util';
+import type { AudioSettings, InvitePreview, Role, Member, KeybindAction } from '../types';
 import { PERM, PERM_LIST, hasPerm } from '../types';
 import { Backdrop } from './Backdrop';
 import { BroadcastModal } from './BroadcastModal';
+import { isTauri, setGlobalHotkeys } from '../native';
 
 function CreateModal() {
   const close = () => useStore.getState().setModal(null);
@@ -296,12 +297,55 @@ function RoleAssignTab({ active, members }: { active: import('../types').ServerD
   </div>;
 }
 
+const KEYBIND_LABELS: Record<KeybindAction, string> = { muteMic: 'Заглушить микрофон', deafen: 'Заглушить звук' };
+
+// Мини-окно назначения клавиши: до 3 клавиш одновременно, живой показ комбинации, сохранение
+// только по «Применить». Слушатели повешены на capture-фазу window, чтобы: (1) успеть
+// stopPropagation раньше bubble-фазового Escape-хендлера родительского Backdrop (иначе Escape
+// закрыл бы разом и диалог захвата, и всё окно настроек), и (2) не дать событию дойти до
+// глобального in-app хоткей-хендлера (App.tsx) — иначе запись комбинации сама триггерила бы мут.
+function KeyCaptureDialog({ action, onClose }: { action: KeybindAction; onClose: () => void }) {
+  const [captured, setCaptured] = useState<string[]>([]);
+  const [warn, setWarn] = useState(false);
+  useEffect(() => {
+    const held = new Set<string>();
+    const kd = (e: KeyboardEvent) => {
+      e.preventDefault(); e.stopPropagation();
+      if (e.repeat) return;
+      if (e.code === 'Escape') { onClose(); return; }
+      if (held.size >= 3) { setWarn(true); return; }
+      held.add(e.code);
+      setCaptured([...held]);
+    };
+    const ku = (e: KeyboardEvent) => { e.preventDefault(); e.stopPropagation(); held.delete(e.code); };
+    window.addEventListener('keydown', kd, true); window.addEventListener('keyup', ku, true);
+    return () => { window.removeEventListener('keydown', kd, true); window.removeEventListener('keyup', ku, true); };
+  }, [onClose]);
+  function apply() {
+    if (!captured.length) return;
+    const next = { ...getSettings().keybinds, [action]: captured };
+    setSettings({ keybinds: next });
+    if (isTauri) setGlobalHotkeys(next, !getSettings().disableGlobalHotkeys);
+    onClose();
+  }
+  return <Backdrop onClose={onClose} label="Назначить клавишу">
+    <h2><Icon name="keyboard" />{KEYBIND_LABELS[action]}</h2>
+    <p className="msub">Нажми комбинацию клавиш (до 3 одновременно) — она отобразится ниже. Esc отменяет.</p>
+    <div className="fld" style={{ textAlign: 'center', padding: '10px 0' }}>
+      <span className="kbd" style={{ fontSize: 15, padding: '6px 14px' }}>{captured.length ? comboLabel(captured) : 'Нажимай клавиши…'}</span>
+    </div>
+    {warn ? <div className="err" style={{ textAlign: 'center' }}>Максимум 3 клавиши одновременно</div> : null}
+    <div className="rowbtns"><button className="ghost" style={{ margin: 0 }} onClick={onClose}>Отмена</button><button className="primary" style={{ margin: 0 }} disabled={!captured.length} onClick={apply}>Применить</button></div>
+  </Backdrop>;
+}
+
 function SettingsModal() {
   const close = () => useStore.getState().setModal(null);
   const [, force] = useState(0); const rerender = () => force((n) => n + 1);
   const s = getSettings();
   const [ins, setIns] = useState<MediaDeviceInfo[]>([]); const [outs, setOuts] = useState<MediaDeviceInfo[]>([]);
   const [binding, setBinding] = useState(false);
+  const [captureAction, setCaptureAction] = useState<KeybindAction | null>(null);
   useEffect(() => { Room.getLocalDevices('audioinput').then(setIns).catch(() => {}); Room.getLocalDevices('audiooutput').then(setOuts).catch(() => {}); }, []);
   useEffect(() => { if (!binding) return; const k = (e: KeyboardEvent) => { e.preventDefault(); setSettings({ pttKey: e.code }); setBinding(false); rerender(); }; window.addEventListener('keydown', k, { once: true }); return () => window.removeEventListener('keydown', k); }, [binding]);
   const E = getEngine();
@@ -335,7 +379,22 @@ function SettingsModal() {
         </div>
       </div>
     </div>
+    <div className="grp"><div className="gt"><Icon name="keyboard" sm /> Настройка клавиш</div>
+      {(Object.keys(KEYBIND_LABELS) as KeybindAction[]).map((action) => (
+        <div key={action} className="fld" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+          <span style={{ fontSize: 13.5, color: 'var(--txt)' }}>{KEYBIND_LABELS[action]}</span>
+          <button style={{ padding: '5px 12px', fontSize: 12.5, width: 'auto', display: 'flex', alignItems: 'center', gap: 8 }} onClick={() => setCaptureAction(action)}>
+            <span className="kbd">{comboLabel(s.keybinds[action])}</span>Сменить
+          </button>
+        </div>
+      ))}
+      {isTauri ? <label className="perm-op" style={{ marginTop: 4 }}>
+        <input type="checkbox" checked={s.disableGlobalHotkeys} onChange={(e) => upd({ disableGlobalHotkeys: e.target.checked }, () => setGlobalHotkeys(getSettings().keybinds, !e.target.checked))} />
+        <span><b>Отключить комбинацию вне приложения</b><i>Клавиши сработают только когда окно RelayApp в фокусе</i></span>
+      </label> : null}
+    </div>
     <button className="close" onClick={close}>Готово</button>
+    {captureAction ? <KeyCaptureDialog action={captureAction} onClose={() => { setCaptureAction(null); rerender(); }} /> : null}
   </Backdrop>;
 }
 
