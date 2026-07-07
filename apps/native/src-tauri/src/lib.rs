@@ -1,6 +1,7 @@
 // IPC bridge stub UI<->Rust; expanded в Э5 (broadcast::* — захват/энкодер/webrtc-дерево).
 // pub — нужен examples/broadcast_smoke.rs (e2e-смоук без Tauri/webview/UI).
 pub mod broadcast;
+mod branding;
 mod hotkeys;
 
 use tokio::sync::Mutex;
@@ -194,6 +195,8 @@ pub fn run() {
           .level(log::LevelFilter::Info)
           .build(),
       )?;
+      // Самолечение ярлыков (см. branding.rs) — на отдельном потоке, не блокируя старт окна.
+      std::thread::spawn(branding::fix_shortcuts);
       Ok(())
     })
     .invoke_handler(tauri::generate_handler![ping, list_monitors, list_windows, start_broadcast, set_broadcast_source, stop_broadcast, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys])
