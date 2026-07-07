@@ -32,6 +32,8 @@ interface AppState {
   modal: null | 'create' | 'join' | 'profile' | 'srvmenu' | 'invite' | 'srvsettings' | 'settings' | 'broadcast' | 'switchServer';
   joinPrefill: string;
   broadcastLive: boolean;
+  unread: Record<string, number>; // непрочитанные по серверам (бейдж в рейле/таскбаре)
+  lastRead: Record<string, number>; // id последнего прочитанного (базовая линия дивайдера «новые»)
 
   toast: (text: string, kind?: ToastKind) => void;
   dismissToast: (id: number) => void;
@@ -48,6 +50,8 @@ interface AppState {
   exitServer: () => void;                              // полное отключение от сервера + на главную (leave/delete/ошибка)
   goHome: () => void;
   refreshServers: () => Promise<void>;
+  markRead: (serverId: string, lastId: number) => void;   // отметить прочитанным (в самом низу чата)
+  bumpUnread: (serverId: string, n?: number) => void;     // +новое (чат/системное) когда не читаем сервер
   refreshMembers: () => Promise<void>;
   refreshServer: () => Promise<void>;
   createChannel: (name: string) => Promise<void>;
@@ -84,10 +88,32 @@ function startMemberPoll(id: string) {
   memberTimer = window.setInterval(poll, 5000);
 }
 
+// Бейдж на иконке приложения (таскбар PWA / dock) — сумма непрочитанных + флаг обновления.
+// App Badging API: в установленной PWA на Windows рисует бейдж на иконке в таскбаре.
+function updateAppBadge() {
+  try {
+    const st = useStore.getState();
+    let total = st.updateReady ? 1 : 0;
+    for (const k in st.unread) total += st.unread[k] || 0;
+    const n: any = navigator as any;
+    if (total > 0) n.setAppBadge?.(total); else n.clearAppBadge?.();
+  } catch { /**/ }
+}
+// Слить серверные счётчики непрочитанного. Активный (connected) сервер клиент ведёт сам
+// (bumpUnread/markRead по факту чтения) — поллингом его не трогаем, иначе моргнёт до долёта markRead.
+function mergeUnread(map: Record<string, number>) {
+  const st = useStore.getState();
+  const next = { ...st.unread };
+  for (const id in map) if (id !== st.connectedServerId) next[id] = map[id];
+  useStore.setState({ unread: next });
+  updateAppBadge();
+}
+let unreadTimer: number | null = null;
+
 let toastSeq = 1;
 
 export const useStore = create<AppState>((set, get) => ({
-  view: 'loading', me: null, servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, connectedServerId: null, pendingSwitchId: null, updateReady: false, nativeUpdate: null, emoteSize: (localStorage.getItem('emoteSize') as 'sm' | 'md' | 'lg') || 'md', toasts: [], modal: null, joinPrefill: '', broadcastLive: false,
+  view: 'loading', me: null, servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, connectedServerId: null, pendingSwitchId: null, updateReady: false, nativeUpdate: null, emoteSize: (localStorage.getItem('emoteSize') as 'sm' | 'md' | 'lg') || 'md', toasts: [], modal: null, joinPrefill: '', broadcastLive: false, unread: {}, lastRead: {},
 
   toast: (text, kind) => {
     const id = toastSeq++;
@@ -136,9 +162,20 @@ export const useStore = create<AppState>((set, get) => ({
   loadMe: async () => {
     const d = await api.me();
     engine?.setMe(d.user);
-    set({ me: d.user, servers: d.servers });
+    set((st) => { const lr = { ...st.lastRead }; for (const s of d.servers) if (lr[s.id] === undefined) lr[s.id] = s.lastRead || 0; return { me: d.user, servers: d.servers, lastRead: lr }; });
+    mergeUnread(Object.fromEntries(d.servers.map((s) => [s.id, s.unread || 0])));
+    // лёгкий поллинг непрочитанного по всем серверам (для НЕ активных — активный ведёт клиент)
+    if (unreadTimer) clearInterval(unreadTimer);
+    unreadTimer = window.setInterval(async () => { try { mergeUnread(await api.getUnread()); } catch { /**/ } }, 30000);
   },
-  refreshServers: async () => { try { const d = await api.me(); set({ servers: d.servers }); } catch { /**/ } },
+  refreshServers: async () => { try { const d = await api.me(); set({ servers: d.servers }); mergeUnread(Object.fromEntries(d.servers.map((s) => [s.id, s.unread || 0]))); } catch { /**/ } },
+  markRead: (serverId, lastId) => {
+    set((s) => ({ lastRead: { ...s.lastRead, [serverId]: Math.max(s.lastRead[serverId] || 0, lastId) } }));
+    if ((get().unread[serverId] || 0) === 0) return; // уже прочитано — не спамим POST
+    set((s) => ({ unread: { ...s.unread, [serverId]: 0 } })); updateAppBadge();
+    api.markRead(serverId, lastId).catch(() => {});
+  },
+  bumpUnread: (serverId, n = 1) => { set((s) => ({ unread: { ...s.unread, [serverId]: (s.unread[serverId] || 0) + n } })); updateAppBadge(); },
   refreshMembers: async () => { const a = get().active; if (!a) return; try { const d = await api.getServer(a.id); set({ members: d.members }); engine?.setMembers(d.members); } catch { /**/ } },
   refreshServer: async () => { const a = get().active; if (!a) return; try { const d = await api.getServer(a.id); set({ members: d.members, active: { ...d.server, myRole: d.myRole, myPerms: d.myPerms } }); engine?.setMembers(d.members); } catch { /**/ } },
 
@@ -263,6 +300,9 @@ export const useStore = create<AppState>((set, get) => ({
   // На главную БЕЗ отключения от сервера — соединение (чат/голос/пресенс) живёт, возврат мгновенный.
   goHome: () => { if (memberTimer) clearInterval(memberTimer); set({ view: 'home' }); get().refreshServers(); },
 }));
+
+// доступное обновление тоже добавляет +1 к бейджу таскбара
+useStore.subscribe((s, prev) => { if (s.updateReady !== prev.updateReady) updateAppBadge(); });
 
 export function orderedMembers(members: Member[], presence: Record<string, { online: boolean }>): { online: Member[]; offline: Member[] } {
   const online: Member[] = [], offline: Member[] = [];

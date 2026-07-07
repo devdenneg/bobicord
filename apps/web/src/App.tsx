@@ -24,19 +24,24 @@ function Rail() {
   const openServer = useStore((s) => s.openServer);
   const goHome = useStore((s) => s.goHome);
   const setModal = useStore((s) => s.setModal);
+  const unread = useStore((s) => s.unread);
   // подсвечиваем сервер только когда реально смотрим его (на главной — home активна)
   const activeId = view === 'server' ? (active?.id || loadingServerId) : null;
   return (
     <nav id="rail">
       <button className={'railbtn tip-l' + (!activeId ? ' active' : '')} data-tip="Домой" onClick={goHome}><Icon name="home" /></button>
       <div className="rail-sep" />
-      {servers.map((s) => (
-        <button key={s.id} className={'railbtn tip-l' + (activeId === s.id ? ' active' : '') + (connectedServerId === s.id && activeId !== s.id ? ' connected' : '')}
+      {servers.map((s) => {
+        const un = activeId === s.id ? 0 : (unread[s.id] || 0); // активный не бейджим (читаем его)
+        return (
+        <button key={s.id} className={'railbtn tip-l' + (activeId === s.id ? ' active' : '') + (connectedServerId === s.id && activeId !== s.id ? ' connected' : '') + (un ? ' unread' : '')}
           data-tip={connectedServerId === s.id && activeId !== s.id ? s.name + ' · подключён' : s.name}
           style={{ background: s.iconUrl ? '#0000' : avColor(s.name, s.iconColor) }} onClick={() => openServer(s.id)}>
           {s.iconUrl ? <img className="avimg" src={resolveUploadUrl(s.iconUrl)} alt="" /> : initial(s.name)}{s.onlineCount ? <span className="dot green" /> : null}
+          {un ? <span className="rail-badge">{un > 99 ? '99+' : un}</span> : null}
         </button>
-      ))}
+        );
+      })}
       <button className="railbtn rail-add tip-l" data-tip="Создать / войти" onClick={() => setModal('create')}><Icon name="plus" /></button>
       <button className="railbtn rail-me tip-l" data-tip="Профиль" style={{ background: me.avatarUrl ? '#0000' : avColor(me.displayName, me.avatarColor) }} onClick={() => setModal('profile')}>{me.avatarUrl ? <img className="avimg" src={resolveUploadUrl(me.avatarUrl)} alt="" /> : initial(me.displayName)}</button>
     </nav>

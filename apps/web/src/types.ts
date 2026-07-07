@@ -52,6 +52,8 @@ export interface ServerSummary {
   memberCount: number;
   online?: OnlineMember[];
   onlineCount?: number;
+  unread?: number;
+  lastRead?: number; // id последнего прочитанного сообщения (для дивайдера «новые» в чате)
 }
 
 export interface Member {

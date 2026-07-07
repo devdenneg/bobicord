@@ -628,6 +628,13 @@ function Chat() {
   const messages = eng.messages;
   const [replyTo, setReplyTo] = useState<ChatMessage | null>(null); // на какое сообщение отвечаем
   const [flashId, setFlashId] = useState<number | null>(null);      // подсветка оригинала при переходе по цитате
+  const markReadStore = useStore((s) => s.markRead);
+  const bumpUnreadStore = useStore((s) => s.bumpUnread);
+  // базовая линия «прочитано до» (id) — замораживается при входе на сервер; дивайдер «новые» рисуется
+  // перед первым сообщением НОВЕЕ неё (чужим). При повторном входе lastRead уже сдвинут → дивайдера нет.
+  const baseline = useMemo(() => useStore.getState().lastRead[activeId || ''] || 0, [activeId]);
+  const firstUnread = messages.findIndex((m) => m.sid != null && m.sid > baseline && !m.mine);
+  const firstUnreadId = firstUnread >= 0 ? messages[firstUnread].id : null;
 
   // --- виртуальный список чата (react-virtuoso) ---
   const virtuosoRef = useRef<VirtuosoHandle>(null);
@@ -654,7 +661,10 @@ function Chat() {
   // смена сервера: сброс состояния виртуального списка (Virtuoso ремонтится по key={activeId})
   useLayoutEffect(() => {
     setFirstItemIndex(VIRT_BASE_INDEX);
-    setPill(0); setAtBottom(true); atBottomRef.current = true; setReplyTo(null);
+    // на входе: если есть непрочитанные — сеем счётчик jump-кнопки и стартуем НЕ внизу (позиция у
+    // дивайдера, см. initialTopMostItemIndex), иначе внизу
+    const unreadHere = messages.filter((m) => m.sid != null && m.sid > baseline && !m.mine).length;
+    setPill(unreadHere); setAtBottom(unreadHere === 0); atBottomRef.current = unreadHere === 0; setReplyTo(null);
     prevLastId.current = null; prevTrim.current = 0; loadingOlder.current = false; setOlderBusy(false);
     // не даём startReached стрельнуть догрузкой прямо на маунте (пока идёт scroll-to-bottom и оседание)
     olderReady.current = false;
@@ -665,13 +675,23 @@ function Chat() {
   // счётчик непрочитанных: растёт только на append нового сообщения, когда мы не внизу.
   // prepend старых меняет messages[0], но не последний id → счётчик не трогает.
   useEffect(() => {
-    const last = messages.length ? messages[messages.length - 1].id : null;
-    if (prevLastId.current !== null && last !== prevLastId.current && !atBottomRef.current) {
+    const lastMsg = messages.length ? messages[messages.length - 1] : null;
+    const last = lastMsg ? lastMsg.id : null;
+    if (prevLastId.current !== null && last !== prevLastId.current && !atBottomRef.current && lastMsg && !lastMsg.mine) {
       setPill((p) => p + 1);
+      if (activeId) bumpUnreadStore(activeId); // бейдж в рейле/таскбаре растёт (не читаем сейчас)
     }
     prevLastId.current = last;
-  }, [messages]);
+  }, [messages, activeId, bumpUnreadStore]);
   useEffect(() => { if (atBottom) setPill(0); }, [atBottom]);
+  // внизу чата (и есть сообщения) → отмечаем прочитанным до последнего серверного sid: чистит
+  // бейдж текущего сервера и сдвигает базовую линию. markRead сам не спамит POST, если уже 0.
+  useEffect(() => {
+    if (!atBottom || !activeId) return;
+    let lastSid: number | undefined;
+    for (let i = messages.length - 1; i >= 0; i--) { if (messages[i].sid != null) { lastSid = messages[i].sid!; break; } }
+    if (lastSid != null && lastSid > (useStore.getState().lastRead[activeId] || 0)) markReadStore(activeId, lastSid);
+  }, [atBottom, messages, activeId, markReadStore]);
 
   // срез сообщений с начала (кап памяти в engine) сдвигает данные вперёд — поднимаем firstItemIndex
   // на столько же, иначе якорь virtuoso рассинхронится. useLayoutEffect — до отрисовки, без мелькания.
@@ -737,6 +757,7 @@ function Chat() {
     t.split(/\s+/).forEach((w) => { if (emoteMap.has(w)) em[w] = emoteMap.get(w)!; });
     E.sendChatWithEmotes(t, em, undefined, replyTo ? buildReplyRef(replyTo) : undefined);
     setText(''); setReplyTo(null);
+    scrollToBottom(); // req: после отправки всегда показываем конец
   }
 
   async function sendImage(file: File) {
@@ -750,6 +771,7 @@ function Chat() {
       t.split(/\s+/).forEach((w) => { if (emoteMap.has(w)) em[w] = emoteMap.get(w)!; });
       E.sendChatWithEmotes(t, em, url, replyTo ? buildReplyRef(replyTo) : undefined);
       setText(''); setReplyTo(null);
+      scrollToBottom();
     } catch (e: any) { toast(e?.message || 'Не удалось загрузить', 'err'); }
     finally { setUploading(false); }
   }
@@ -887,7 +909,7 @@ function Chat() {
           className="virt-msgs"
           data={messages}
           firstItemIndex={firstItemIndex}
-          initialTopMostItemIndex={messages.length - 1}
+          initialTopMostItemIndex={firstUnread >= 0 ? { index: firstUnread, align: 'start' } : messages.length - 1}
           alignToBottom
           startReached={loadOlder}
           followOutput={(bottom) => (bottom ? 'auto' : false)}
@@ -897,7 +919,9 @@ function Chat() {
           computeItemKey={(_, m) => m.id}
           context={{ busy: olderBusy, hasMore: eng.chatHasMore }}
           components={{ Header: ChatOlderHeader, Footer: ChatFooter }}
-          itemContent={(_, m) => renderMessage(m)}
+          itemContent={(_, m) => (m.id === firstUnreadId
+            ? <div className="msg-newwrap"><div className="msg-newdiv"><span>Новые сообщения</span></div>{renderMessage(m)}</div>
+            : renderMessage(m))}
         />
       )}
       {!atBottom ? <button id="scrollbtn" aria-label="Прокрутить вниз" data-tip="К последним" onClick={scrollToBottom}><Icon name="chevron" />{pill > 0 ? <span className="sb-badge">{pill > 99 ? '99+' : pill}</span> : null}</button> : null}
@@ -960,6 +984,7 @@ function Chat() {
         <button className="emo-toggle" data-tip="Прикрепить картинку (или Ctrl+V)" disabled={uploading} onClick={() => fileRef.current?.click()}>{uploading ? <span className="spin" /> : <Icon name="image" />}</button>
         <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; if (f) sendImage(f); e.target.value = ''; }} />
         <input id="msgIn" placeholder="Сообщение..." maxLength={1000} autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false} name="chat-message" value={text}
+          onFocus={() => { if (!atBottomRef.current) scrollToBottom(); }}
           onPaste={(e) => { const items = e.clipboardData?.items; if (!items) return; for (let i = 0; i < items.length; i++) { if (items[i].type.startsWith('image/')) { const f = items[i].getAsFile(); if (f) { e.preventDefault(); sendImage(f); } break; } } }}
           onChange={(e) => { const v = e.target.value; setText(v); if (v.trim()) E.sendTyping(); setMention(detectMention(v, e.target.selectionStart ?? v.length)); setMIdx(0); }} onKeyDown={onComposerKey} />
         <button id="sendBtn" className={text.trim() ? '' : 'empty'} data-tip="Отправить · Enter" onClick={send}><Icon name="send" /></button>
