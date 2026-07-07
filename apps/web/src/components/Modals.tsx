@@ -13,7 +13,7 @@ import { PERM, PERM_LIST, hasPerm } from '../types';
 import { Backdrop } from './Backdrop';
 import { BroadcastModal } from './BroadcastModal';
 import { isTauri, setGlobalHotkeys } from '../native';
-import { enableNotifications, notifSupported, notifPermission } from '../notify';
+import { enableNotifications, notifSupported, notifPermission, notifyTest } from '../notify';
 
 function CreateModal() {
   const close = () => useStore.getState().setModal(null);
@@ -379,7 +379,12 @@ function SettingsModal() {
       ) : <>
         <label className="perm-op">
           <input type="checkbox" checked={s.notif} onChange={async (e) => {
-            if (e.target.checked) { await enableNotifications(); } else { setSettings({ notif: false }); }
+            if (e.target.checked) {
+              const ok = await enableNotifications();
+              if (!ok) useStore.getState().toast(notifPermission() === 'denied'
+                ? 'Разрешение заблокировано — включите уведомления для RelayApp в настройках ОС/браузера'
+                : 'Система не выдала разрешение на уведомления', 'err');
+            } else { setSettings({ notif: false }); }
             rerender();
           }} />
           <span><b>Системные уведомления</b><i>Показывать, когда приложение свёрнуто или не в фокусе{notifPermission() === 'denied' ? ' · доступ запрещён в системе' : ''}</i></span>
@@ -390,6 +395,11 @@ function SettingsModal() {
             <span><b>{o.title}</b><i>{o.desc}</i></span>
           </label>
         ))}
+        <button style={{ width: 'auto', padding: '6px 14px', marginTop: 8, fontSize: 12.5 }} onClick={async () => {
+          const r = await notifyTest();
+          useStore.getState().toast(r.msg, r.ok ? 'ok' : 'err');
+          rerender();
+        }}>Проверить уведомление</button>
       </>}
     </div>
     <div className="grp"><div className="gt"><Icon name="palette" sm /> Оформление</div>
