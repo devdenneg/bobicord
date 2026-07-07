@@ -27,7 +27,7 @@ export function Auth() {
   return (
     <div id="auth" className="overlay">
       <div className="card" ref={cardRef}>
-        <div className="brand"><div className="logo"><img src="/icon-256.png" alt="" /></div><h1 className="wordmark">РИЛЭЙ</h1></div>
+        <div className="brand"><div className="logo"><img src="/icon-256.png" alt="" /></div><h1 className="wordmark">Рилэй</h1></div>
         <p className="sub">Голос, чат и трансляции — для своих.</p>
         <div className="tabs2">
           <button className={mode === 'login' ? 'active' : ''} onClick={() => { setMode('login'); setErr(''); }}>Вход</button>
