@@ -311,7 +311,7 @@ export class Engine {
     // periodic self-heal подписок на микрофоны: атрибут vc (голосовой канал) мог доехать без события
     // ParticipantAttributesChanged (гонка при быстрых прыжках между каналами / реконнекте) — тогда пир
     // виден в канале, но его не слышно. setSubscribed идемпотентен, поэтому реконсиляция дёшева и безопасна.
-    this.presenceTimer = window.setInterval(() => { this.announceWatch(); this.cleanupWatchers(); if (this.inVoice) this.reconcileAllAudio(); }, 3000);
+    this.presenceTimer = window.setInterval(() => { this.announceWatch(); this.cleanupWatchers(); if (this.inVoice) { this.reconcileAllAudio(); this.selfHealVc(); } }, 3000);
     this.emit();
   }
 
@@ -386,6 +386,20 @@ export class Engine {
     if (!want) this.detachAnalyser(baseUid(p.identity));
   }
   private reconcileAllAudio() { this.room?.remoteParticipants.forEach((p) => this.reconcilePeerAudio(p)); }
+  // Self-heal публикации своего vc/deaf. Если опубликованный participant-атрибут не совпадает с
+  // текущим состоянием — пере-заявляем. Симптом без этого: initial setAttributes({vc}) в joinVoice
+  // мог не долететь до сервера (гонка при оптимистичном входе до готовности комнаты / rate-limit
+  // LiveKit на частых апдейтах). Тогда сам юзер видит СЕБЯ в канале (self берётся из currentVc
+  // локально), но ВСЕ остальные — нет: они читают participant-атрибут vc (или серверный voiceHint,
+  // который тоже строится из атрибута), а он пуст. Ретрай был только на Reconnected — теперь и в 3с-self-heal.
+  private selfHealVc() {
+    if (!this.room || !this.inVoice || !this.currentVc) return;
+    const attrs = this.room.localParticipant.attributes || {};
+    const wantDeaf = this.deafened ? '1' : '';
+    if (attrs.vc !== this.currentVc || (attrs.deaf || '') !== wantDeaf) {
+      this.room.localParticipant.setAttributes({ vc: this.currentVc, deaf: wantDeaf }).catch(() => {});
+    }
+  }
   private isStreaming(username: string): boolean {
     if (username === this.me.username) return this.liveKitT.isBroadcasting(username) || this.treeT.isBroadcasting(username);
     return this.liveKitT.isRemoteBroadcasting(username) || this.treeT.isRemoteBroadcasting(username);
