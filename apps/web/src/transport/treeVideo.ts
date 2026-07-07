@@ -563,7 +563,13 @@ export class TreeVideoTransport implements VideoTransport {
       st.unlisten.push(await onNativeWatchEnded(endCb));
     } catch { /**/ }
     if (st.closed) { st.unlisten.forEach((u) => { try { u(); } catch { /**/ } }); return; }
-    try { await startNativeWatch(streamId, this.me, this.serverId, NATIVE_RELAY_CAPACITY); }
+    // Rust держит ОДИН watch-слот (WatchState). Явно останавливаем прошлый ПЕРЕД стартом нового
+    // и ждём — иначе fire-and-forget stopNativeWatch предыдущего стрима мог прийти на Rust ПОСЛЕ
+    // start нового и снести уже его (гонка при переключении A→B). Первый watch: слот пуст, no-op.
+    try {
+      await stopNativeWatch().catch(() => {});
+      await startNativeWatch(streamId, this.me, this.serverId, NATIVE_RELAY_CAPACITY);
+    }
     catch { this.nativeUnwatch(streamId, st); }
   }
   private async onNativeOffer(streamId: string, st: NativeWatchState, sdp: string) {

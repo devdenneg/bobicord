@@ -700,6 +700,10 @@ export class Engine {
   getVideoTrack(key: string) { return this.liveKitT.getVideoTrack(key) ?? this.treeT.getVideoTrack(key); }
 
   watch(identity: string) {
+    // Смотрим ТОЛЬКО ОДИН стрим одновременно: закрываем все прочие открытые/подключающиеся.
+    // Это и требование продукта, и защита: grid верстается лишь под 1-2 плитки, а каждый tree-watch
+    // держит свой PC/relay — множественный просмотр перегружал и путал teardown при остановке одного.
+    for (const other of [...this.watching]) if (other !== identity) this.closeWatch(other);
     // no `this.room` participant guard here: a tree broadcaster (Э2) is a native peer,
     // not a LiveKit room participant (voice and video are separate transports now) —
     // existence is the VideoTransport's job (it no-ops safely on an unknown identity).
