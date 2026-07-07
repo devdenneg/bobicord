@@ -83,6 +83,10 @@ CREATE TABLE IF NOT EXISTS server_settings(
   data TEXT NOT NULL DEFAULT '{}',
   PRIMARY KEY(user_id, server_id)
 );
+CREATE TABLE IF NOT EXISTS user_settings(
+  user_id TEXT PRIMARY KEY,
+  data TEXT NOT NULL DEFAULT '{}'
+);
 CREATE TABLE IF NOT EXISTS messages(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   server_id TEXT NOT NULL,
@@ -521,6 +525,18 @@ app.get('/api/servers/:id/token', requireAuth, async (req, res) => {
     at.addGrant({ roomJoin: true, room: 'srv:' + s.id, canPublish: true, canSubscribe: true, canPublishData: true, canUpdateOwnMetadata: true });
     res.json({ token: await at.toJwt(), url: WS_URL, room: 'srv:' + s.id });
   } catch (e) { res.status(500).json({ error: String(e) }); }
+});
+
+/* ---------------- ACCOUNT-WIDE SETTINGS (хоткеи и т.п. — следуют за юзером, не за устройством) ---------------- */
+app.get('/api/me/settings', requireAuth, (req, res) => {
+  const row = db.prepare('SELECT data FROM user_settings WHERE user_id=?').get(req.user.id);
+  res.json({ data: row ? JSON.parse(row.data) : {} });
+});
+app.put('/api/me/settings', requireAuth, (req, res) => {
+  const data = JSON.stringify(req.body.data || {}).slice(0, 20000);
+  db.prepare(`INSERT INTO user_settings(user_id,data) VALUES(?,?)
+    ON CONFLICT(user_id) DO UPDATE SET data=excluded.data`).run(req.user.id, data);
+  res.json({ ok: true });
 });
 
 /* ---------------- PER-SERVER SETTINGS (volumes etc) ---------------- */

@@ -223,10 +223,10 @@
   .vwrap video{width:100%;height:100%;object-fit:contain;background:#000;opacity:0;transition:opacity .22s ease-out}
   .vwrap video.ready{opacity:1}
   .vwrap .lbl{position:absolute;left:56px;bottom:10px;background:#000c;backdrop-filter:blur(8px);padding:4px 10px;border-radius:8px;font-size:12.5px;font-weight:500;z-index:2;transition:opacity var(--tr)}
-  .vwrap:hover .lbl,.vwrap:focus-within .lbl{opacity:0}
+  .vwrap:hover:not(.idle) .lbl,.vwrap:focus-within .lbl{opacity:0}
   /* hover control bar */
   .vbar{position:absolute;left:0;right:0;bottom:0;z-index:6;display:flex;align-items:center;gap:9px;padding:9px 12px 9px 56px;background:linear-gradient(0deg,#000e,#000a 55%,transparent);opacity:0;transform:translateY(10px);transition:opacity var(--tr),transform var(--tr);pointer-events:none}
-  .vwrap:hover .vbar,.vwrap:focus-within .vbar{opacity:1;transform:none;pointer-events:auto}
+  .vwrap:hover:not(.idle) .vbar,.vwrap:focus-within .vbar{opacity:1;transform:none;pointer-events:auto}
   @media (hover:none){.vbar{opacity:1;transform:none;pointer-events:auto}}
   .vbar .vb-vol{width:104px;accent-color:var(--accent);cursor:pointer;height:5px}
   .vbar .vb-pct{font-size:11.5px;color:#fff;min-width:34px;font-weight:600}
@@ -512,7 +512,7 @@
   .pi .chev{opacity:.28;transition:opacity var(--tr),transform var(--tr);color:var(--muted);flex:0 0 auto;width:28px;height:28px;display:flex;align-items:center;justify-content:center}
   .pi.clickable .head:hover .chev{opacity:.8}.pi.open .chev{opacity:1;transform:rotate(180deg)}
   .pi .micst{width:28px;height:28px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;color:var(--red)}
-  .pi .micst:not(.off){display:none}.pi .micst .ic{font-size:15px}
+  .pi .micst:not(.off){visibility:hidden}.pi .micst .ic{font-size:15px}
   /* строка громкости — плавно раскрывается/уезжает */
   .pi .exp{display:flex;align-items:center;gap:10px;max-height:0;overflow:hidden;opacity:0;padding:0 8px 0 8px;transition:max-height .22s ease,opacity .18s ease,padding .22s ease}
   .pi.open .exp{max-height:56px;opacity:1;padding:4px 8px 12px 8px}

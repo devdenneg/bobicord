@@ -1,8 +1,8 @@
 import { useEffect } from 'react';
 import { useStore, getEngine } from './store';
-import { getSettings, subscribeSettings } from './settings';
+import { getSettings, setSettings, subscribeSettings } from './settings';
 import { avColor, initial, normKey } from './util';
-import { resolveUploadUrl } from './api';
+import { api, resolveUploadUrl } from './api';
 import { Icon, IconSprite } from './Icon';
 import { Auth } from './components/Auth';
 import { Toasts } from './components/Toasts';
@@ -186,6 +186,38 @@ export function App() {
     }).then((un) => { unlisten = un; });
     return () => { unsubSettings(); unlisten?.(); };
   }, []);
+
+  // хоткеи привязаны к аккаунту, а не к устройству/браузеру: подтягиваем при логине (можно
+  // зайти под тем же аккаунтом на другой машине) и отправляем на сервер при изменении —
+  // но только когда реально меняются keybinds/disableGlobalHotkeys, а не любая настройка
+  // (иначе на каждый чих слайдера громкости улетал бы запрос).
+  useEffect(() => {
+    if (!me) return;
+    let cancelled = false;
+    api.getMySettings().then((d) => {
+      if (cancelled) return;
+      const remote = d?.data || {};
+      const s = getSettings();
+      const patch: Partial<ReturnType<typeof getSettings>> = {};
+      if (remote.keybinds) patch.keybinds = { ...s.keybinds, ...remote.keybinds };
+      if (typeof remote.disableGlobalHotkeys === 'boolean') patch.disableGlobalHotkeys = remote.disableGlobalHotkeys;
+      if (Object.keys(patch).length) setSettings(patch);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [me]);
+
+  useEffect(() => {
+    if (!me) return;
+    const snapshot = () => JSON.stringify({ keybinds: getSettings().keybinds, disableGlobalHotkeys: getSettings().disableGlobalHotkeys });
+    let last = snapshot();
+    const push = () => {
+      const cur = snapshot();
+      if (cur === last) return;
+      last = cur;
+      api.putMySettings(JSON.parse(cur)).catch(() => {});
+    };
+    return subscribeSettings(push);
+  }, [me]);
 
   return (
     <>

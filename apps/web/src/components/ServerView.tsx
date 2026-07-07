@@ -897,6 +897,16 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
   const [treeOpen, setTreeOpen] = useState(false);
   const [pickAnchor, setPickAnchor] = useState<DOMRect | null | undefined>(undefined);
   const sprayRef = useRef<HTMLButtonElement>(null);
+  // контролы прячутся не только при уходе мыши с плитки (:hover в CSS), но и если мышь
+  // осталась над плиткой, но не двигалась 5с — как в видеоплеерах. idle-класс перебивает :hover.
+  const [idle, setIdle] = useState(false);
+  const idleTimer = useRef<number | null>(null);
+  const resetIdle = () => {
+    setIdle(false);
+    if (idleTimer.current) window.clearTimeout(idleTimer.current);
+    idleTimer.current = window.setTimeout(() => setIdle(true), 5000);
+  };
+  useEffect(() => () => { if (idleTimer.current) window.clearTimeout(idleTimer.current); }, []);
   const floatSeq = useRef(1);
   const name = members.find((m) => m.username === identity)?.displayName || identity;
 
@@ -968,7 +978,7 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
   const togglePip = () => { if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => {}); else vidRef.current?.requestPictureInPicture().catch(() => {}); };
 
   return (
-    <div className="vwrap" ref={wrapRef} onDoubleClick={toggleFs}>
+    <div className={'vwrap' + (idle ? ' idle' : '')} ref={wrapRef} onDoubleClick={toggleFs} onMouseMove={resetIdle} onMouseEnter={resetIdle}>
       <video ref={vidRef} autoPlay playsInline />
       <div className="lbl" title={appName ? `${name} · ${appName}` : name}>
         {appIcon
