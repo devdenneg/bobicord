@@ -438,14 +438,16 @@ function MemberRow({ m, anim }: { m: Member; anim?: string }) {
     <div className={'pi ' + st + (streaming ? ' streaming' : '') + (anim ? ' ' + anim : '')} data-spk={m.username}>
       <div className="head" ref={hc.ref} onMouseEnter={self ? undefined : hc.onEnter} onMouseLeave={self ? undefined : hc.onLeave}>
         <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} dot={st} live={streaming} liveApp={streaming ? E.getStreamAppMeta(m.username) : null} />
-        <div className="nm" style={roleColorOf(m) ? { color: roleColorOf(m) } : undefined}>{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div>
+        <div className="nm-row">
+          <div className="nm" style={roleColorOf(m) ? { color: roleColorOf(m) } : undefined}>{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div>
+          {pr?.game ? (
+            <span className="pi-game mem" data-tip={'Играет в ' + pr.game.name}>
+              {pr.game.icon ? <img src={`data:image/png;base64,${pr.game.icon}`} alt="" /> : <span className="gpad">🎮</span>}
+              <span className="pg-nm">{pr.game.name}</span>
+            </span>
+          ) : null}
+        </div>
         <MemberRoles roles={m.roles || []} />
-        {pr?.game ? (
-          <span className="pi-game mem" data-tip={'Играет в ' + pr.game.name}>
-            {pr.game.icon ? <img src={`data:image/png;base64,${pr.game.icon}`} alt="" /> : <span className="gpad">🎮</span>}
-            <span className="pg-nm">{pr.game.name}</span>
-          </span>
-        ) : null}
         {!self && streaming && !pr?.inVoice ? (
           <button className={'watchbtn' + (watching ? ' on' : '')} disabled={pending}
             aria-label={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}

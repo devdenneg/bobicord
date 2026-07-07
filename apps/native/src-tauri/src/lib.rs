@@ -66,9 +66,12 @@ fn allowed_game(process: &str) -> Option<String> {
 
 #[tauri::command]
 fn detect_game() -> Option<GameInfo> {
+  let me_pid = std::process::id(); // свой процесс — окна RelayApp не считаем игрой (блоклиста по имени
+                                   // exe мало: имя бинаря может отличаться от "relayapp")
   // 1) ПОЛНОЭКРАННОЕ окно не из блоклиста — сильный сигнал, НЕ зависит от фокуса (таб в наш апп
   //    не сбрасывает; anti-cheat игра с пустым title детектится по exe).
   for (hwnd, title, process, pid) in broadcast::capture::fullscreen_windows() {
+    if pid == me_pid { continue; }
     if let Some(stem) = allowed_game(&process) {
       return Some(game_info_from(hwnd, &title, &stem, pid));
     }
@@ -76,8 +79,10 @@ fn detect_game() -> Option<GameInfo> {
   // 2) ОКОННАЯ игра: активное окно, если не из блоклиста (пока игра в фокусе). Ловит игры в окне,
   //    ценой того, что при табе в наш апп статус оконной игры сбрасывается (фуллскрин — не сбрасывает).
   if let Some((hwnd, title, process, pid)) = broadcast::capture::foreground_window() {
-    if let Some(stem) = allowed_game(&process) {
-      return Some(game_info_from(hwnd, &title, &stem, pid));
+    if pid != me_pid {
+      if let Some(stem) = allowed_game(&process) {
+        return Some(game_info_from(hwnd, &title, &stem, pid));
+      }
     }
   }
   None
