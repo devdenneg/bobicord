@@ -55,17 +55,26 @@ interface AppState {
 }
 
 let memberTimer: number | null = null;
+// Эпоха соединения: инкрементится каждый раз, когда engine-коннект РВЁТСЯ или ЗАМЕНЯЕТСЯ
+// (connectServer/exitServer/logout). Фоновые async-хвосты (connect IIFE, member-poll) захватывают
+// эпоху на старте и сверяют перед записью в стор/engine — иначе протухший хвост прошлого сервера
+// пишет своё состояние поверх текущего или рвёт живую комнату. goHome НЕ бампит (соединение живёт).
+let connEpoch = 0;
 
 // поллинг состава/пресенса активного сервера (5с). Работает только пока смотрим этот сервер.
 function startMemberPoll(id: string) {
   if (memberTimer) clearInterval(memberTimer);
+  const epoch = connEpoch;
   const poll = async () => {
     const st = useStore.getState();
-    if (st.view !== 'server' || st.connectedServerId !== id) return;
+    if (st.view !== 'server' || st.connectedServerId !== id || connEpoch !== epoch) return;
     try {
       const [srv, prs] = await Promise.all([api.getServer(id), api.presence(id)]);
-      const cur = useStore.getState().active;
-      useStore.setState({ members: srv.members, active: cur && cur.id === id ? { ...cur, channels: srv.server.channels } : cur });
+      // повторный гард ПОСЛЕ await: за время сети юзер мог переключить/покинуть сервер — иначе
+      // протухший ответ пишет состав/пресенс чужого сервера в стор и engine (чинилось только 5с спустя)
+      const st2 = useStore.getState();
+      if (st2.view !== 'server' || st2.connectedServerId !== id || connEpoch !== epoch) return;
+      useStore.setState({ members: srv.members, active: st2.active && st2.active.id === id ? { ...st2.active, channels: srv.server.channels } : st2.active });
       engine?.setMembers(srv.members); engine?.setOnlineHint(prs.online); engine?.setVoiceHint(prs.voice || {});
     } catch { /**/ }
   };
@@ -99,10 +108,10 @@ export const useStore = create<AppState>((set, get) => ({
         saveTimer = window.setTimeout(() => { api.putSettings(a.id, vols).catch(() => {}); }, 800);
       },
       peerJoined: (id) => { if (!get().members.some((m) => m.username === id)) get().refreshMembers(); },
-      persistMessage: (text, em, image, reply, localId) => {
+      persistMessage: (text, em, image, reply, localId, key) => {
         const a = get().active;
         if (!a) { engine?.markSendResult(localId, false); return; }
-        api.postMessage(a.id, text, em, image, reply)
+        api.postMessage(a.id, text, em, image, reply, key)
           .then(() => engine?.markSendResult(localId, true))
           .catch(() => engine?.markSendResult(localId, false));
       },
@@ -141,7 +150,7 @@ export const useStore = create<AppState>((set, get) => ({
     catch (e: any) { get().toast(e.message, 'err'); }
   },
 
-  logout: () => { engine?.disconnect(); setToken(null); location.reload(); },
+  logout: () => { connEpoch++; engine?.disconnect(); setToken(null); location.reload(); },
 
   // Точка входа по клику на сервер. Решает: показать уже подключённый / предупредить о переключении / коннектить.
   openServer: async (id) => {
@@ -169,6 +178,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   // Фактический (ре)коннект: рвём прошлое соединение и поднимаем новое.
   connectServer: async (id) => {
+    const myEpoch = ++connEpoch; // новый коннект — предыдущие async-хвосты устаревают
     if (memberTimer) clearInterval(memberTimer);
     engine?.disconnect();
     set({ view: 'server', loadingServer: true, loadingServerId: id, active: null, members: [], connectedServerId: id });
@@ -196,15 +206,23 @@ export const useStore = create<AppState>((set, get) => ({
         localStorage.setItem('onboardedSrv', '1');
         engine?.sysMsg('👋 Ты в чате, но НЕ в голосовом. Нажми «Подключиться», чтобы говорить. Справа — кто в сети и кто в голосовом.');
       }
-      // WebRTC-коннект к комнате — В ФОНЕ; guard по connectedServerId (переживает уход на главную)
+      // WebRTC-коннект к комнате — В ФОНЕ; гард по эпохе (переживает уход на главную через goHome,
+      // который эпоху не бампит). Если эпоха сменилась (свитч/выход) — НЕ рвём engine: им уже владеет
+      // новый connectServer, который сам сделал disconnect+connect. Раньше тут был безусловный
+      // disconnect по устаревшему connectedServerId — он убивал ЖИВУЮ комнату нового сервера.
       (async () => {
         try {
           const tk = await api.serverToken(id);
-          if (get().connectedServerId !== id) return; // уже переключились на другой сервер
+          if (connEpoch !== myEpoch) return; // устарели до коннекта
           await engine?.connect(tk.url, tk.token, id);
-          if (get().connectedServerId !== id) engine?.disconnect();
+          // устарели ПОКА коннектились — engine уже принадлежит новому connect, ничего не делаем
         } catch {
-          if (get().connectedServerId === id) get().toast('Realtime-связь не поднялась — обнови страницу', 'warn');
+          // провал коннекта: сбрасываем connectedServerId, иначе повторный клик уходит в
+          // showConnectedServer (без реконнекта) и realtime мёртв до F5. Теперь клик = полный вход.
+          if (connEpoch === myEpoch && get().connectedServerId === id) {
+            set({ connectedServerId: null });
+            get().toast('Realtime-связь не поднялась — зайди на сервер заново', 'warn');
+          }
         }
       })();
       startMemberPoll(id);
@@ -220,6 +238,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   // Полное отключение от сервера + на главную (выход/удаление сервера/ошибка коннекта).
   exitServer: () => {
+    connEpoch++; // in-flight connect/poll прошлого сервера устаревают
     if (memberTimer) clearInterval(memberTimer);
     engine?.disconnect();
     set({ active: null, members: [], loadingServer: false, loadingServerId: null, connectedServerId: null, view: 'home' });

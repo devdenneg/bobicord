@@ -151,7 +151,13 @@ for (const sql of [
   "ALTER TABLE servers ADD COLUMN description TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE servers ADD COLUMN icon_url TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE invites ADD COLUMN expires INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE messages ADD COLUMN client_key TEXT NOT NULL DEFAULT ''",
 ]) { try { db.exec(sql); } catch (e) { /* column already exists */ } }
+
+// Идемпотентность отправки: клиент шлёт стабильный dedup-ключ (переживает retry). Partial-unique
+// индекс (только для непустого ключа — старые/безключевые сообщения не задеты) даёт INSERT OR IGNORE
+// схлопнуть повторный POST, если первый дошёл в БД, а ответ до клиента не добрался.
+try { db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_ckey ON messages(server_id, user_id, client_key) WHERE client_key <> ''"); } catch (e) {}
 
 /* one-time migration of legacy users.json -> users table */
 (function migrateLegacy() {
@@ -708,10 +714,15 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
     return JSON.stringify(clean).slice(0, 500);
   })();
   const now = Date.now();
-  db.prepare('INSERT INTO messages(server_id,user_id,display_name,avatar_color,text,emotes,image,reply_to,created) VALUES(?,?,?,?,?,?,?,?,?)')
-    .run(sid, req.user.id, req.user.display_name, req.user.avatar_color, text, em, image, replyTo, now);
-  db.prepare('DELETE FROM messages WHERE server_id=? AND created<?').run(sid, now - WEEK_MS);
+  const clientKey = String(req.body.key || '').slice(0, 64);
+  // OR IGNORE: повторный POST с тем же (server_id,user_id,client_key) схлопывается (retry после
+  // потери ответа). info.changes===0 → это дубль: не чистим/не пушим повторно, но отвечаем ok
+  // (сообщение уже в БД — для клиента это успех).
+  const info = db.prepare('INSERT OR IGNORE INTO messages(server_id,user_id,display_name,avatar_color,text,emotes,image,reply_to,created,client_key) VALUES(?,?,?,?,?,?,?,?,?,?)')
+    .run(sid, req.user.id, req.user.display_name, req.user.avatar_color, text, em, image, replyTo, now, clientKey);
   res.json({ ok: true });
+  if (info.changes === 0) return; // дубль — дальше (cleanup/push) не нужно
+  db.prepare('DELETE FROM messages WHERE server_id=? AND created<?').run(sid, now - WEEK_MS);
   // Фоновый push упомянутым/адресату ответа, которых НЕТ в комнате (в комнате — живая доставка
   // через LiveKit, без дублей). Fire-and-forget: ответ клиенту уже отдан.
   if (VAPID) (async () => {

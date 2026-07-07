@@ -42,7 +42,14 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
   if (token) headers['Authorization'] = 'Bearer ' + token;
   const opt: RequestInit = { method, headers };
   if (body !== undefined) { headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
-  const r = await fetch(API_BASE + '/api' + path, opt);
+  // таймаут: мёртвый TCP иначе оставляет промис висеть вечно → «отправляется» без failed/повтора
+  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), 15000) : null;
+  if (ctrl) opt.signal = ctrl.signal;
+  let r: Response;
+  try { r = await fetch(API_BASE + '/api' + path, opt); }
+  catch (e) { throw new Error(ctrl?.signal.aborted ? 'Таймаут запроса' : (e instanceof Error ? e.message : 'Сеть недоступна')); }
+  finally { if (timer) clearTimeout(timer); }
   let d: any = {};
   let parsed = false;
   try { d = await r.json(); parsed = true; } catch { /* ignore */ }
@@ -109,7 +116,7 @@ export const api = {
     const q = qs.toString();
     return req<{ messages: HistoryMessage[]; hasMore: boolean }>('GET', `/servers/${id}/messages${q ? '?' + q : ''}`);
   },
-  postMessage: (id: string, text: string, em: Record<string, string>, image?: string, reply?: import('./types').ReplyRef) => req<{ ok: boolean }>('POST', `/servers/${id}/messages`, { text, em, image, reply }),
+  postMessage: (id: string, text: string, em: Record<string, string>, image?: string, reply?: import('./types').ReplyRef, key?: string) => req<{ ok: boolean }>('POST', `/servers/${id}/messages`, { text, em, image, reply, key }),
   // Web Push (фоновые уведомления PWA/браузера)
   pushVapid: () => req<{ enabled: boolean; key: string }>('GET', '/push/vapid'),
   pushSubscribe: (sub: unknown, prefs: { mention: boolean; stream: boolean }) => req<{ ok: boolean }>('POST', '/push/subscribe', { sub, prefs }),

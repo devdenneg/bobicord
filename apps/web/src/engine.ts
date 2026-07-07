@@ -53,11 +53,17 @@ interface EngineHooks {
   toast: (text: string, kind?: 'ok' | 'warn' | 'err' | 'info') => void;
   saveSettings: (vols: { users: Record<string, number>; streams: Record<string, number> }) => void;
   peerJoined: (identity: string) => void;
-  persistMessage: (text: string, em: Record<string, string>, image: string | undefined, reply: ReplyRef | undefined, localId: number) => void;
+  persistMessage: (text: string, em: Record<string, string>, image: string | undefined, reply: ReplyRef | undefined, localId: number, key: string) => void;
   refetchChat?: () => void; // догрузить свежие сообщения (после реконнекта — заполнить пропуск)
 }
 
 let msgSeq = 1;
+
+// стабильный dedup-ключ сообщения (переживает retry) — сервер по нему игнорит дубль,
+// если первый POST дошёл, а ответ потерялся
+function newClientKey(): string {
+  try { return crypto.randomUUID(); } catch { return Date.now().toString(36) + Math.random().toString(36).slice(2, 10); }
+}
 
 function mapQuality(q: ConnectionQuality): VoiceQuality {
   switch (q) {
@@ -277,7 +283,14 @@ export class Engine {
         if (this.inVoice && this.currentVc) {
           this.room?.localParticipant.setAttributes({ vc: this.currentVc, deaf: this.deafened ? '1' : '' }).catch(() => {});
           this.reconcileAllAudio();
+          // переотправляем vclaim (одна голосовая на аккаунт): пока мы лежали, другая сессия могла
+          // зайти в голосовой и её vclaim до нас не дошёл — иначе обе сессии остались бы в войсе
+          this.lastVclaim = Date.now();
+          this.dataSend({ t: 'vclaim', uid: this.me.id, session: this.sessionId() });
         }
+        // ре-энумерация чужих screenshare-публикаций: стрим, появившийся во время обрыва, иначе не
+        // прошёл бы через onStreamStart (нет живого TrackPublished) — бейдж/«Смотреть» не появлялись
+        this.liveKitT.onRoomConnected();
         this.hooks.refetchChat?.(); // догрузить сообщения, пришедшие во время обрыва
         this.hooks.toast('Связь восстановлена', 'ok'); this.emit();
       })
@@ -315,6 +328,9 @@ export class Engine {
     this.liveKitT.detach(); this.treeT.detach(); this.screenAudioEls.clear();
     this.watching.clear(); this.pendingWatch.clear(); this.watchT.clear(); this.streamWatchers.clear();
     this.perMute.clear(); this.messages = []; this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0;
+    // presence-хинты и typing принадлежат ПРЕДЫДУЩЕМУ серверу — иначе при свитче первый emit (по
+    // setMembers нового сервера) рисует их онлайн/в чужом голосовом канале до прихода нового /presence
+    this.onlineHint.clear(); this.voiceHint = {}; this.typingUsers.clear();
     if (this.micRaw) { this.micRaw.getTracks().forEach((t) => t.stop()); this.micRaw = null; }
     if (this.micActx) { try { this.micActx.close(); } catch { /**/ } this.micActx = null; }
     this.micGain = null;
@@ -853,7 +869,7 @@ export class Engine {
     return id;
   }
   // статус отправки моего сообщения (для «не отправлено · повторить»)
-  private pendingSend = new Map<number, { text: string; em: Record<string, string>; img?: string; reply?: ReplyRef }>();
+  private pendingSend = new Map<number, { text: string; em: Record<string, string>; img?: string; reply?: ReplyRef; key: string }>();
   private setMsgStatus(localId: number, status: 'failed' | undefined) {
     let changed = false;
     this.messages = this.messages.map((m) => (m.id === localId && m.status !== status ? (changed = true, { ...m, status }) : m));
@@ -867,8 +883,9 @@ export class Engine {
     const p = this.pendingSend.get(localId); if (!p) return;
     this.setMsgStatus(localId, undefined);
     // только повторный persist (без ре-broadcast): если первый dataSend прошёл, у живых
-    // сообщение уже есть — повтор рассылки дал бы дубль. Упал именно POST в БД.
-    this.hooks.persistMessage(p.text, p.em, p.img, p.reply, localId);
+    // сообщение уже есть — повтор рассылки дал бы дубль. Упал именно POST в БД. Тот же key —
+    // если первый POST на самом деле дошёл (потерян лишь ответ), сервер проигнорит дубль.
+    this.hooks.persistMessage(p.text, p.em, p.img, p.reply, localId, p.key);
   }
   sysMsg(text: string) { this.pushMsg(null, text, true); }
   private mapHistory(list: HistoryMessage[]): ChatMessage[] {
@@ -901,7 +918,10 @@ export class Engine {
     }
     const add: HistoryMessage[] = [];
     for (const m of list) {
-      if (m.id == null || haveSids.has(m.id) || m.uid === this.me.id) continue;
+      if (m.id == null || haveSids.has(m.id)) continue;
+      // Свои сообщения НЕ пропускаем безусловно: при мультисессии своё сообщение с другого
+      // устройства могло не дойти по data-каналу (обрыв) → его надо догрузить. Дубля не будет —
+      // оптимистичная копия лежит в liveBySig и усыновит sid; реально пропущенное попадёт в add.
       const bucket = liveBySig.get(sig(m.uid, m.text, m.img));
       if (bucket && bucket.length) { bucket.shift()!.sid = m.id; continue; } // усыновили sid, не дублируем
       add.push(m);
@@ -941,8 +961,9 @@ export class Engine {
     // в окне фоновой докрутки connect (сразу после входа в сервер) сообщение не теряется, ложится в БД.
     if (this.room) this.dataSend({ t: 'chat', name: this.me.displayName, text: t, em, color: this.me.avatarColor, img, uid: this.me.id, reply });
     const id = this.pushMsg(this.me.displayName, t, false, this.me.avatarColor, true, img, undefined, this.me.id, reply);
-    this.pendingSend.set(id, { text: t, em, img, reply });
-    this.hooks.persistMessage(t, em, img, reply, id);
+    const key = newClientKey();
+    this.pendingSend.set(id, { text: t, em, img, reply, key });
+    this.hooks.persistMessage(t, em, img, reply, id, key);
   }
   sendTyping() {
     if (!this.room) return;
@@ -990,7 +1011,9 @@ export class Engine {
     } catch { /**/ }
   };
   onEmoteResolve: ((name: string, id: string) => void) | null = null;
-  private dataSend(obj: any) { if (!this.room) return; try { this.room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify(obj)), { reliable: obj.t === 'chat' }); } catch { /**/ } }
+  // reliable для состояния, которое нельзя терять: чат (сообщения), vclaim (одна голосовая на
+  // аккаунт — потеря датаграммы оставила бы две сессии в войсе), clear (чистка чата).
+  private dataSend(obj: any) { if (!this.room) return; try { this.room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify(obj)), { reliable: obj.t === 'chat' || obj.t === 'vclaim' || obj.t === 'clear' }); } catch { /**/ } }
 
   emoteImg(id: string) { return emoteUrl(id); }
 }

@@ -107,6 +107,7 @@ export class TreeVideoTransport implements VideoTransport {
   private serverId = '';
   private closed = false;
   private discoveryWs: WebSocket | null = null;
+  private helloTimer: number | null = null; // периодический ре-hello: самолечение пропущенных stream-live
   /** Живые стримы гильдии + метаданные приложения из stream-live (иконка/имя — Э-icon). */
   private liveStreams = new Map<string, StreamMeta>();
   private watches = new Map<string, WatchState>();
@@ -134,10 +135,21 @@ export class TreeVideoTransport implements VideoTransport {
     this.closed = false;
     this.natProbe = detectSymmetricNat();
     this.openDiscovery();
+    // Самолечение: периодически шлём hello по живому сокету. onHello на сервере идемпотентен —
+    // на каждый hello переотдаёт бэклог живых стримов (tree.js), а клиентский fresh-гард в
+    // stream-live не даёт дублей. Так пропущенный stream-live (полуоткрытый WS / микрообрыв /
+    // сон вкладки) подхватывается за ≤15с, а не «висит до F5». LiveKit-путь так самолечится
+    // сам (живой опрос комнаты 3с-таймером) — уравниваем tree.
+    if (this.helloTimer) clearInterval(this.helloTimer);
+    this.helloTimer = window.setInterval(() => {
+      const ws = this.discoveryWs;
+      if (ws && ws.readyState === WebSocket.OPEN) { try { ws.send(JSON.stringify({ t: 'hello', serverId: this.serverId })); } catch { /**/ } }
+    }, 15000);
   }
   onRoomConnected() { /* discovery socket already syncs live-stream backlog on connect */ }
   detach() {
     this.closed = true;
+    if (this.helloTimer) { clearInterval(this.helloTimer); this.helloTimer = null; }
     if (this.discoveryWs) { try { this.discoveryWs.close(); } catch { /**/ } this.discoveryWs = null; }
     this.watches.forEach((_w, streamId) => this.unwatch(streamId));
     this.watches.clear();
@@ -151,12 +163,19 @@ export class TreeVideoTransport implements VideoTransport {
 
   private openDiscovery() {
     if (this.closed) return;
+    // прежний сокет закрываем, чтобы не осиротить его (утечка + двойная обработка stream-live/end)
+    if (this.discoveryWs) { try { this.discoveryWs.close(); } catch { /**/ } this.discoveryWs = null; }
     let ws: WebSocket;
-    try { ws = new WebSocket(treeWsUrl()); } catch { return; }
+    // throw конструктора (битый URL/CSP/токен на миг) раньше делал голый return без ретрая —
+    // onclose не будет (сокет не создан), discovery умирал НАВСЕГДА до F5. Планируем ретрай.
+    try { ws = new WebSocket(treeWsUrl()); } catch { if (!this.closed) setTimeout(() => this.openDiscovery(), 3000); return; }
     this.discoveryWs = ws;
-    // Сверка после (ре)коннекта: stream-end, пришедший пока сокет лежал (3с окно реконнекта),
-    // потерян навсегда — бэклог при re-hello объявляет только ЖИВЫЕ стримы. Всё, что не
-    // переобъявлено за 2с после hello, считаем закончившимся и сносим тем же путём.
+    // Сверка после (ре)коннекта: stream-end, пришедший пока сокет лежал (окно реконнекта),
+    // потерян — бэклог при re-hello объявляет только ЖИВЫЕ стримы. Что не переобъявлено за 4с
+    // после hello, считаем закончившимся. НО активные watch не трогаем: при медленном бэклоге
+    // (сеть уже деградировала) реальный стрим мог опоздать >окна — снос вышибал бы зрителя из
+    // живого стрима навсегда (unwatch → st.closed, авто-ре-watch не срабатывает). Их teardown —
+    // только по явному stream-end.
     const announced = new Set<string>();
     ws.onopen = () => {
       try { ws.send(JSON.stringify({ t: 'hello', serverId: this.serverId })); } catch { /**/ }
@@ -164,11 +183,11 @@ export class TreeVideoTransport implements VideoTransport {
         if (this.closed || this.discoveryWs !== ws) return;
         for (const identity of [...this.liveStreams.keys()]) {
           if (announced.has(identity)) continue;
-          this.unwatch(identity);
+          if (this.watches.has(identity) || this.nativeWatches.has(identity)) continue; // активный просмотр — не сносим по таймауту
           this.liveStreams.delete(identity);
           this.streamStopCbs.forEach((cb) => cb(identity));
         }
-      }, 2000);
+      }, 4000);
     };
     // Сервер узнаёт, в каком сервере (гильдии) мы сидим, только из hello —
     // до него бэклог живых стримов не шлётся (см. tree.js onHello), а после join'а
@@ -195,7 +214,9 @@ export class TreeVideoTransport implements VideoTransport {
         if (this.liveStreams.delete(msg.identity)) this.streamStopCbs.forEach((cb) => cb(msg.identity));
       }
     };
-    ws.onclose = () => { if (this.discoveryWs === ws) this.discoveryWs = null; if (!this.closed) setTimeout(() => this.openDiscovery(), 3000); };
+    // Реконнект планирует ТОЛЬКО текущий сокет: иначе закрытие прежнего (в начале openDiscovery)
+    // или осиротевшего сокета зациклило бы переоткрытие каждые 3с.
+    ws.onclose = () => { if (this.discoveryWs !== ws) return; this.discoveryWs = null; if (!this.closed) setTimeout(() => this.openDiscovery(), 3000); };
     ws.onerror = () => { try { ws.close(); } catch { /**/ } };
   }
 
