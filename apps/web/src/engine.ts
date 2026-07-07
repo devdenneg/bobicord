@@ -602,7 +602,7 @@ export class Engine {
     this.room?.localParticipant.setAttributes({ deaf: this.deafened ? '1' : '' }).catch(() => {});
     const p = this.micPub();
     if (this.deafened) { if (p && p.track) p.track.mute(); }
-    else { if (p && p.track && !this.manualMute) p.track.unmute(); }
+    else { if (p && p.track && !this.manualMute) p.track.unmute(); this.reconcileAllAudio(); } // undeafen: поднять пиров, чья подписка отвалилась в окне deafen
     this.applyGate();
     this.screenAudioEls.forEach((a) => (a.muted = this.deafened));
     this.applyAllVolumes();
@@ -684,7 +684,7 @@ export class Engine {
       const out = getSettings().output; if ((a as any).setSinkId && out) (a as any).setSinkId(out).catch(() => {});
       const u = baseUid(p.identity);
       if (pub.source === Track.Source.ScreenShareAudio) { this.screenAudioEls.set(u, a); a.muted = this.deafened; a.volume = this.streamVolOf(u); }
-      else { this.applyVolumeByName(u); this.attachAnalyser(u, (track as any).mediaStreamTrack); }
+      else { this.applyVolumeToParticipant(p); this.attachAnalyser(u, (track as any).mediaStreamTrack); }
     }
     this.emit();
   };
@@ -820,11 +820,20 @@ export class Engine {
   private applyVolumeByName(username: string) {
     const p = this.partOf(username);
     if (!p || p === this.room?.localParticipant || !(p as any).setVolume) return;
-    const base = this.userVolOf(username);
-    const v = (this.deafened || this.perMute.has(username)) ? 0 : (getSettings().master / 100) * base;
+    this.applyVolumeToParticipant(p);
+  }
+  // Громкость СТАВИМ на конкретную сессию (participant), а не через partOf(username): partOf
+  // предпочитает mic-сессию, но при второй (ghost/реконнект) сессии или транзитной пропаже
+  // mic-публикации возвращает ПУСТУЮ сессию — setVolume уходил мимо звучащего элемента, и на
+  // undeafen громкость реально звучащей сессии оставалась 0 навсегда (ничто её больше не
+  // восстанавливает). Прямой проход по каждому участнику этого промаха лишён.
+  private applyVolumeToParticipant(p: Participant) {
+    if (!(p as any).setVolume) return;
+    const u = baseUid(p.identity);
+    const v = (this.deafened || this.perMute.has(u)) ? 0 : (getSettings().master / 100) * this.userVolOf(u);
     try { (p as any).setVolume(v); } catch { /**/ }
   }
-  private applyAllVolumes() { this.room?.remoteParticipants.forEach((p) => this.applyVolumeByName(baseUid(p.identity))); }
+  private applyAllVolumes() { this.room?.remoteParticipants.forEach((p) => this.applyVolumeToParticipant(p)); }
   async applyOutput() { if (!this.room) return; const out = getSettings().output; try { await this.room.switchActiveDevice('audiooutput', out || 'default'); } catch { /**/ } document.querySelectorAll('#audioSink audio').forEach((a) => { if ((a as any).setSinkId && out) (a as any).setSinkId(out).catch(() => {}); }); }
 
   /* ---------- chat ---------- */
