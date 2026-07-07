@@ -110,6 +110,12 @@ export const api = {
     return req<{ messages: HistoryMessage[]; hasMore: boolean }>('GET', `/servers/${id}/messages${q ? '?' + q : ''}`);
   },
   postMessage: (id: string, text: string, em: Record<string, string>, image?: string, reply?: import('./types').ReplyRef) => req<{ ok: boolean }>('POST', `/servers/${id}/messages`, { text, em, image, reply }),
+  // Web Push (фоновые уведомления PWA/браузера)
+  pushVapid: () => req<{ enabled: boolean; key: string }>('GET', '/push/vapid'),
+  pushSubscribe: (sub: unknown, prefs: { mention: boolean; stream: boolean }) => req<{ ok: boolean }>('POST', '/push/subscribe', { sub, prefs }),
+  pushUnsubscribe: (endpoint: string) => req<{ ok: boolean }>('POST', '/push/unsubscribe', { endpoint }),
+  // вещатель сообщает серверу о старте трансляции → фоновый push участникам не в комнате
+  streamStart: (id: string) => req<{ ok: boolean }>('POST', `/servers/${id}/stream-start`),
   // публичный (без auth) — свежий билд натива для кнопки скачивания в вебе; 404 если билда нет
   appLatest: async (): Promise<{ version: string; url: string } | null> => {
     try {

@@ -5,6 +5,7 @@ import {
 import type { User, Member, ChatMessage, Emote, HistoryMessage, ReplyRef } from './types';
 import { baseUid } from './util';
 import { notify } from './notify';
+import { api } from './api';
 import { getSettings, setSettings } from './settings';
 import { emoteUrl } from './emotes';
 import { playSound } from './sounds';
@@ -124,6 +125,7 @@ export class Engine {
   private keepOsc: OscillatorNode | null = null;
   private screenStream: MediaStream | null = null;
   private presenceTimer: number | null = null;
+  private serverId = ''; // текущий сервер (для api.streamStart → фоновый push о трансляции)
 
   VOLS = { users: {} as Record<string, number>, streams: {} as Record<string, number> };
   private perMute = new Set<string>();
@@ -258,6 +260,7 @@ export class Engine {
       publishDefaults: { dtx: true, red: true, simulcast: true, audioPreset: AudioPresets.musicHighQuality },
     });
     const r = this.room;
+    this.serverId = serverId;
     this.liveKitT.attach(r, { me: this.me.username, serverId });
     this.treeT.attach(r, { me: this.me.username, serverId });
     r.on(RoomEvent.TrackSubscribed, this.onSub)
@@ -736,6 +739,7 @@ export class Engine {
     const surf = (vt.getSettings() as any).displaySurface || '';
     if (surf === 'monitor' || surf === 'window') this.hooks.toast('Выбран экран/окно (~15fps). Для 60fps выбирай «Вкладка Chrome»', 'warn'); else this.hooks.toast('Трансляция запущена', 'ok');
     playSound('stream');
+    if (this.serverId) api.streamStart(this.serverId).catch(() => {}); // фоновый push участникам не в комнате
     this.emit();
   }
   async stopShare() {

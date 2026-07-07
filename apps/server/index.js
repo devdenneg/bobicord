@@ -120,6 +120,19 @@ CREATE TABLE IF NOT EXISTS voice_channels(
   position INTEGER NOT NULL DEFAULT 0,
   created INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS push_subs(
+  endpoint TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  p256dh TEXT NOT NULL,
+  auth TEXT NOT NULL,
+  created INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS push_prefs(
+  user_id TEXT PRIMARY KEY,
+  mention INTEGER NOT NULL DEFAULT 1,
+  stream INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_push_user ON push_subs(user_id);
 CREATE INDEX IF NOT EXISTS idx_vc_server ON voice_channels(server_id, position);
 CREATE INDEX IF NOT EXISTS idx_msg_server ON messages(server_id, created);
 CREATE INDEX IF NOT EXISTS idx_msg_server_id ON messages(server_id, id);
@@ -200,6 +213,68 @@ async function voiceStateIn(serverId) {
     return { online: [...online], voice };
   } catch (e) { return { online: [], voice: {} }; }
 }
+/* ---------------- Web Push (VAPID) — фоновые уведомления для PWA (iOS/Android) и закрытого приложения ----------------
+ * Ключи берём из env (VAPID_PUBLIC/VAPID_PRIVATE), иначе авто-генерим и СТАБИЛЬНО храним в
+ * DATA_DIR/vapid.json — рестарт не должен инвалидировать уже выданные подписки. web-push не
+ * установлен / ключи не завелись → push просто отключён (не роняем сервер). */
+let VAPID = null;
+(function initVapid() {
+  try {
+    const webpush = require('web-push');
+    let pub = process.env.VAPID_PUBLIC, priv = process.env.VAPID_PRIVATE;
+    const subject = process.env.VAPID_SUBJECT || 'mailto:admin@relay.app';
+    if (!pub || !priv) {
+      const f = path.join(DATA_DIR, 'vapid.json');
+      if (fs.existsSync(f)) { const j = JSON.parse(fs.readFileSync(f, 'utf8')); pub = j.publicKey; priv = j.privateKey; }
+      else { const k = webpush.generateVAPIDKeys(); pub = k.publicKey; priv = k.privateKey; fs.writeFileSync(f, JSON.stringify(k)); console.log('VAPID keys сгенерированы →', f); }
+    }
+    webpush.setVapidDetails(subject, pub, priv);
+    VAPID = { webpush, publicKey: pub };
+    console.log('Web Push включён');
+  } catch (e) { console.warn('Web Push отключён:', e.message); }
+})();
+
+// Разослать web-push набору user_id. kind фильтруется по push_prefs (юзер мог выключить тип);
+// отсутствие строки prefs = дефолт «всё включено». Протухшие подписки (404/410) удаляем.
+async function pushToUsers(kind, userIds, payload) {
+  if (!VAPID || !userIds || !userIds.length) return;
+  const ids = [...new Set(userIds.filter(Boolean))];
+  if (!ids.length) return;
+  const ph = ids.map(() => '?').join(',');
+  const prefCol = kind === 'stream' ? 'stream' : 'mention';
+  const rows = db.prepare(
+    `SELECT s.* FROM push_subs s WHERE s.user_id IN (${ph}) ` +
+    `AND NOT EXISTS (SELECT 1 FROM push_prefs p WHERE p.user_id=s.user_id AND p.${prefCol}=0)`
+  ).all(...ids);
+  const body = JSON.stringify(payload);
+  await Promise.all(rows.map(async (r) => {
+    try { await VAPID.webpush.sendNotification({ endpoint: r.endpoint, keys: { p256dh: r.p256dh, auth: r.auth } }, body); }
+    catch (e) { if (e && (e.statusCode === 404 || e.statusCode === 410)) db.prepare('DELETE FROM push_subs WHERE endpoint=?').run(r.endpoint); }
+  }));
+}
+
+// Кого упоминает text среди members (mirror engine.textMentionsMe: @username / @displayName /
+// @everyone|@all|@все, с учётом многословных ников). Возвращает Set user_id.
+function mentionedIds(text, members) {
+  const out = new Set();
+  const raw = String(text || '');
+  if (!raw) return out;
+  if (/@(everyone|all|все)\b/i.test(raw)) { for (const m of members) out.add(m.id); return out; }
+  const low = raw.toLowerCase();
+  const tokens = new Set(); let mm; const re = /@([^\s@]+)/g;
+  while ((mm = re.exec(low))) tokens.add(mm[1]);
+  for (const m of members) {
+    const u = String(m.username || '').toLowerCase();
+    const d = String(m.display_name || '').toLowerCase();
+    if (tokens.has(u) || tokens.has(d)) { out.add(m.id); continue; }
+    if (d.includes(' ') && low.includes('@' + d)) out.add(m.id);
+  }
+  return out;
+}
+function serverMembersFull(sid) {
+  return db.prepare('SELECT u.id,u.username,u.display_name FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.server_id=?').all(sid);
+}
+
 const pubUser = u => ({ id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '', bio: u.bio });
 const UPLOAD_RE = /^\/api\/uploads\/[a-zA-Z0-9._-]+$/; // локальный путь к загрузке
 const pubServer = s => ({ id: s.id, name: s.name, ownerId: s.owner_id, iconColor: s.icon_color, iconUrl: s.icon_url || '', description: s.description || '' });
@@ -269,6 +344,45 @@ app.get('/api/me', requireAuth, async (req, res) => {
 app.get('/api/servers/:id/presence', requireAuth, async (req, res) => {
   if (!isMember(req.user.id, req.params.id)) return res.status(403).json({ error: 'нет' });
   res.json(await voiceStateIn(req.params.id));
+});
+
+/* ---------- Web Push: подписка PWA/браузера на фоновые уведомления ---------- */
+// Публичный VAPID-ключ для PushManager.subscribe на клиенте (+ флаг, включён ли push вообще).
+app.get('/api/push/vapid', (req, res) => {
+  res.json({ enabled: !!VAPID, key: VAPID ? VAPID.publicKey : '' });
+});
+// Сохранить/обновить подписку текущего юзера (+ его пер-типовые предпочтения push).
+app.post('/api/push/subscribe', requireAuth, (req, res) => {
+  const sub = req.body && req.body.sub;
+  if (!sub || !sub.endpoint || !sub.keys || !sub.keys.p256dh || !sub.keys.auth) return res.status(400).json({ error: 'плохая подписка' });
+  db.prepare('INSERT INTO push_subs(endpoint,user_id,p256dh,auth,created) VALUES(?,?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth')
+    .run(String(sub.endpoint).slice(0, 512), req.user.id, String(sub.keys.p256dh).slice(0, 256), String(sub.keys.auth).slice(0, 128), Date.now());
+  const pr = req.body && req.body.prefs;
+  if (pr && typeof pr === 'object') {
+    db.prepare('INSERT INTO push_prefs(user_id,mention,stream) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET mention=excluded.mention,stream=excluded.stream')
+      .run(req.user.id, pr.mention === false ? 0 : 1, pr.stream === false ? 0 : 1);
+  }
+  res.json({ ok: true });
+});
+// Отписаться (юзер выключил уведомления / вышел). Удаляем по endpoint.
+app.post('/api/push/unsubscribe', requireAuth, (req, res) => {
+  const ep = req.body && req.body.endpoint;
+  if (ep) db.prepare('DELETE FROM push_subs WHERE endpoint=? AND user_id=?').run(String(ep), req.user.id);
+  res.json({ ok: true });
+});
+// Вещатель начал трансляцию → пуш участникам сервера, которых сейчас НЕТ в комнате (те, кто в
+// комнате, узнают через LiveKit/дерево — без дублей). Клиент дёргает это на старте шары.
+app.post('/api/servers/:id/stream-start', requireAuth, async (req, res) => {
+  const sid = req.params.id;
+  if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
+  res.json({ ok: true });
+  if (!VAPID) return;
+  try {
+    const members = serverMembersFull(sid);
+    const inRoom = new Set(await onlineIn(sid));
+    const targets = members.filter(m => m.id !== req.user.id && !inRoom.has(m.username)).map(m => m.id);
+    await pushToUsers('stream', targets, { kind: 'stream', title: req.user.display_name, body: 'начал(а) трансляцию', serverId: sid });
+  } catch (e) { console.error('[push] stream-start:', e && e.message); }
 });
 
 app.patch('/api/me', requireAuth, (req, res) => {
@@ -598,6 +712,22 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
     .run(sid, req.user.id, req.user.display_name, req.user.avatar_color, text, em, image, replyTo, now);
   db.prepare('DELETE FROM messages WHERE server_id=? AND created<?').run(sid, now - WEEK_MS);
   res.json({ ok: true });
+  // Фоновый push упомянутым/адресату ответа, которых НЕТ в комнате (в комнате — живая доставка
+  // через LiveKit, без дублей). Fire-and-forget: ответ клиенту уже отдан.
+  if (VAPID) (async () => {
+    try {
+      const members = serverMembersFull(sid);
+      const ids = mentionedIds(text, members);
+      let rpUid = ''; try { const rp = replyTo ? JSON.parse(replyTo) : null; if (rp && rp.uid) rpUid = rp.uid; } catch (e) {}
+      if (rpUid) ids.add(rpUid);
+      ids.delete(req.user.id); // не себе
+      if (!ids.size) return;
+      const inRoom = new Set(await onlineIn(sid));
+      const byId = new Map(members.map(m => [m.id, m]));
+      const targets = [...ids].filter(id => { const m = byId.get(id); return m && !inRoom.has(m.username); });
+      await pushToUsers('mention', targets, { kind: 'mention', title: req.user.display_name, body: text.slice(0, 140) || '🖼 изображение', serverId: sid });
+    } catch (e) { console.error('[push] mention:', e && e.message); }
+  })();
 });
 
 app.get('/healthz', (req, res) => res.send('ok'));

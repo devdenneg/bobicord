@@ -10,6 +10,23 @@ self.addEventListener('activate', (event) => {
 // fetch-обработчик обязателен для installability; чистый passthrough — всегда сеть, без кэша
 self.addEventListener('fetch', () => { /* passthrough */ });
 
+// фоновый web-push (VAPID): сервер будит SW даже когда PWA свёрнута/закрыта (единственный путь
+// на iOS — там JS страницы в фоне заморожен). payload = { kind, title, body, serverId }.
+self.addEventListener('push', (event) => {
+  let d = {};
+  try { d = event.data ? event.data.json() : {}; } catch (e) { /* не-JSON payload */ }
+  const title = d.title || 'Рилэй';
+  const opts = {
+    body: d.body || '',
+    tag: d.kind || 'msg',
+    renotify: true,
+    icon: '/icon-256.png',
+    badge: '/icon-128.png',
+    data: { serverId: d.serverId || '' },
+  };
+  event.waitUntil(self.registration.showNotification(title, opts));
+});
+
 // клик по системному уведомлению → фокус существующего окна (или открыть новое)
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();

@@ -8,6 +8,7 @@
     "bcryptjs": "^2.4.3",
     "jsonwebtoken": "^9.0.2",
     "better-sqlite3": "^11.3.0",
+    "web-push": "^3.6.7",
     "ws": "^8.18.0"
   }
 }

@@ -14,6 +14,7 @@ import { Backdrop } from './Backdrop';
 import { BroadcastModal } from './BroadcastModal';
 import { isTauri, setGlobalHotkeys } from '../native';
 import { enableNotifications, notifSupported, notifPermission } from '../notify';
+import { unsubscribePush, syncPushPrefs } from '../push';
 
 function CreateModal() {
   const close = () => useStore.getState().setModal(null);
@@ -388,6 +389,7 @@ function SettingsModal() {
             } else {
               localStorage.setItem('notifOptOut', '1'); // явный опт-аут: не переспрашиваем при запуске
               setSettings({ notif: false });
+              unsubscribePush(); // снимаем фоновую web-push подписку
             }
             rerender();
           }} />
@@ -395,7 +397,7 @@ function SettingsModal() {
         </label>
         {NOTIF_KINDS.map((o) => (
           <label key={o.key} className="perm-op" style={{ marginTop: 4, opacity: s.notif ? 1 : .45, pointerEvents: s.notif ? 'auto' : 'none' }}>
-            <input type="checkbox" disabled={!s.notif} checked={s[o.key]} onChange={(e) => upd({ [o.key]: e.target.checked } as Partial<AudioSettings>)} />
+            <input type="checkbox" disabled={!s.notif} checked={s[o.key]} onChange={(e) => { upd({ [o.key]: e.target.checked } as Partial<AudioSettings>); syncPushPrefs(); }} />
             <span><b>{o.title}</b><i>{o.desc}</i></span>
           </label>
         ))}

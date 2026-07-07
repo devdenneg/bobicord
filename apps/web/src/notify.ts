@@ -4,6 +4,7 @@
 // там не сработают вообще.
 import { isTauri } from './native';
 import { getSettings, setSettings } from './settings';
+import { ensurePushSubscribed } from './push';
 import type { AudioSettings } from './types';
 
 export type NotifKind = 'mention' | 'stream' | 'update';
@@ -25,6 +26,7 @@ export function notifPermission(): 'default' | 'granted' | 'denied' {
 export async function enableNotifications(): Promise<boolean> {
   const granted = await requestPermission();
   setSettings({ notif: granted });
+  if (granted) ensurePushSubscribed(); // подписка на фоновый web-push (PWA/браузер)
   return granted;
 }
 async function requestPermission(): Promise<boolean> {
@@ -50,6 +52,7 @@ export async function initNotifications(): Promise<boolean> {
   const granted = notifPermission() === 'granted' ? true : await requestPermission();
   if (!granted) return false;
   setSettings({ notif: true });
+  ensurePushSubscribed(); // фоновый web-push: подписываем при каждом старте (подписка могла ротироваться)
   if (localStorage.getItem('notifWelcomed') === '1') return false;
   localStorage.setItem('notifWelcomed', '1');
   return true;

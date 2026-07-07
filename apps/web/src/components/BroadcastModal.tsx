@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useStore } from '../store';
+import { api } from '../api';
 import { Icon } from '../Icon';
 import { Backdrop } from './Backdrop';
 import { listMonitors, listWindows, startNativeBroadcast, setNativeBroadcastSource, stopNativeBroadcast, onBroadcastStats } from '../native';
@@ -174,6 +175,7 @@ export function BroadcastModal() {
       await startNativeBroadcast(me.username, me.username, active.id, { source, maxWidth: res.w, maxHeight: res.h, fps: cfg.fps, bitrateBps: cfg.bitrateKbps * 1000, autoBitrate: cfg.autoBitrate, audioTargetPid, maxDirectChildren: cfg.maxDirectChildren });
       saveConfig(cfg);
       useStore.getState().setBroadcastLive(true);
+      api.streamStart(active.id).catch(() => {}); // фоновый push участникам не в комнате
     } catch (e: any) { setErr(String(e?.message || e)); } finally { setBusy(false); }
   }
 
