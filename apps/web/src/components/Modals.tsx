@@ -377,6 +377,20 @@ function SettingsModal() {
       {!notifSupported() ? (
         <div className="fld"><label style={{ color: 'var(--txt-dim)' }}>Системные уведомления не поддерживаются на этом устройстве</label></div>
       ) : <>
+        {notifPermission() !== 'granted' ? (
+          <div className="fld" style={{ marginBottom: 6 }}>
+            <button className="primary" style={{ width: '100%', padding: '9px 16px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }} onClick={async () => {
+              const ok = await enableNotifications();
+              useStore.getState().toast(ok
+                ? 'Уведомления разрешены и включены'
+                : (notifPermission() === 'denied'
+                    ? 'Разрешение заблокировано — включите уведомления для RelayApp в настройках ОС/браузера'
+                    : 'Система не выдала разрешение на уведомления'), ok ? 'ok' : 'err');
+              rerender();
+            }}><Icon name="bell" sm />Разрешить уведомления</button>
+            <label style={{ marginTop: 6, fontSize: 12, color: 'var(--txt-dim)', display: 'block' }}>Браузер/система спросят разрешение. Это нужно один раз.</label>
+          </div>
+        ) : null}
         <label className="perm-op">
           <input type="checkbox" checked={s.notif} onChange={async (e) => {
             if (e.target.checked) {
@@ -397,7 +411,10 @@ function SettingsModal() {
         ))}
         <button style={{ width: 'auto', padding: '6px 14px', marginTop: 8, fontSize: 12.5 }} onClick={async () => {
           const r = await notifyTest();
-          useStore.getState().toast(r.msg, r.ok ? 'ok' : 'err');
+          // успешный тест = явное намерение получать уведомления → включаем мастер, если был выкл
+          // (иначе реальный тег молчал бы на гейте !notif, хотя тест только что показался).
+          if (r.ok && !getSettings().notif) setSettings({ notif: true });
+          useStore.getState().toast(r.ok && !s.notif ? 'Работает — уведомления включены' : r.msg, r.ok ? 'ok' : 'err');
           rerender();
         }}>Проверить уведомление</button>
       </>}
