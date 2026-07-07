@@ -75,6 +75,7 @@ export class Engine {
 
   inVoice = false;
   private voiceConnecting = false; // оптимистично зашли в канал, но mic ещё публикуется
+  private lastVclaim = 0; // когда мы сами заявили голос (для tie-break гонки claim'ов между своими сессиями)
   private currentVc: string | null = null; // id голосового канала, в котором я сейчас (несколько каналов на сервер)
   private roomReady = false; // true только после успешного await r.connect() (не просто наличие объекта Room)
   private reconnecting = false;
@@ -330,6 +331,8 @@ export class Engine {
     }
     return any;
   }
+  // id этой сессии = суффикс после # в моём LiveKit-identity (для tie-break гонки vclaim)
+  private sessionId(): string { const id = this.room?.localParticipant.identity || ''; const i = id.indexOf('#'); return i < 0 ? id : id.slice(i + 1); }
   // есть ли у юзера ещё живые сессии, кроме указанной (для presence/cleanup при отключении одной)
   private hasOtherSession(username: string, exceptIdentity: string): boolean {
     if (!this.room) return false;
@@ -393,7 +396,8 @@ export class Engine {
     }
     this.reconcileAllAudio(); // подписываемся только на пиров этого же канала
     this.startConnPoll();
-    this.dataSend({ t: 'vclaim', uid: this.me.id }); // забираем голос у своих других сессий (одна голосовая на аккаунт)
+    this.lastVclaim = Date.now();
+    this.dataSend({ t: 'vclaim', uid: this.me.id, session: this.sessionId() }); // забираем голос у своих других сессий (одна голосовая на аккаунт)
     this.voiceConnecting = false;
     this.emit();
   }
@@ -939,7 +943,15 @@ export class Engine {
         this.pushMsg(d.name, d.text, false, d.color, own, d.img, undefined, d.uid, d.reply);
         if (!own) { playSound(mentioned ? 'mention' : 'msg'); if (mentioned) this.hooks.toast(repliedToMe ? `${d.name} ответил тебе` : `${d.name} упомянул тебя`, 'info'); }
       }
-      else if (d.t === 'vclaim') { if (d.uid === this.me.id && this.inVoice) this.leaveVoice(); } // другая моя сессия зашла в голосовой → выхожу (одна голосовая на аккаунт)
+      else if (d.t === 'vclaim') {
+        // другая моя сессия зашла в голосовой → выхожу (одна голосовая на аккаунт).
+        // tie-break: если это ГОНКА (я тоже только что заявил голос) — уступает сессия с меньшим
+        // session-id; вне гонки (я просто сидел в голосовом) новый девайс всегда побеждает.
+        if (d.uid === this.me.id && this.inVoice) {
+          const race = Date.now() - this.lastVclaim < 800;
+          if (!race || String(d.session || '') > this.sessionId()) this.leaveVoice();
+        }
+      }
       else if (d.t === 'clear') { this.messages = []; this.emit(); this.sysMsg((d.by || 'Админ') + ' очистил чат'); }
       else if (d.t === 'emote') this.emoteListeners.forEach((f) => f(d.s, d.e, d.by, d.x, d.sz));
       else if (d.t === 'watch') { const m = this.wset(d.s); if (d.on) m.set(d.id, { name: d.n, color: d.c ?? 0, avatarUrl: d.a, ts: Date.now() }); else m.delete(d.id); this.emit(); }
