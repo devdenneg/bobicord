@@ -174,7 +174,17 @@ class TreeManager {
       t.targetBitrate = null; t.lastSentBitrate = 0; // сброс ABR под нового вещателя
       return { parent: null };
     }
-    const parent = this.pickParent(t, node);
+    // Э9: виртуал — ВСЕГДА прямой ребёнок вещателя (fanout-хаб на глубине 1), НЕ через pickParent.
+    // pickParent зарыл бы его под зрителя со свободным слотом (у корня слот занят) → виртуал на
+    // глубине 2+ ПОТОМКОМ зрителя → его же запрос «через сервер» давал бы цикл, а хаб-фанаут терялся.
+    // Нет слота у корня — входим сиротой, ensureVirtualAttached выселит жертву и усадит под корень.
+    let parent;
+    if (node.virtual) {
+      const bc = t.nodes.get(t.broadcasterId);
+      parent = bc && bc.children.length < this.capacityOf(bc) ? bc : null;
+    } else {
+      parent = this.pickParent(t, node);
+    }
     node.parent = parent ? parent.id : null;
     node.depth = parent ? parent.depth + 1 : 0;
     if (parent) parent.children.push(node.id);
@@ -452,33 +462,53 @@ function attachTreeServer(httpServer, opts) {
   // фолбэк не сработал бы именно тогда, когда нужен. Выселяем «жертву» из-под корня:
   // отцепляем одного не-виртуального ребёнка вещателя (drop-peer), сажаем виртуала в
   // освободившийся слот, жертва (с поддеревом) уезжает под виртуала через settleOrphans.
+  // Гарантирует, что виртуал — ПРЯМОЙ ребёнок вещателя (fanout-хаб на глубине 1). Два случая:
+  // (а) виртуал вошёл в забитое дерево и повис сиротой — фолбэк не сработал бы, когда нужен;
+  // (б) generic pickParent/авто-reparent зарыл виртуала под обычного зрителя (у корня слот занят,
+  //     у зрителя свободен) → виртуал ПОТОМОК зрителя → его же «через сервер» = цикл, хаб потерян.
+  // Отцепляем виртуала откуда бы он ни висел и сажаем прямо под корень; нет слота у корня —
+  // выселяем одну не-виртуальную жертву-лист (её поддерево уедет под виртуала через settleOrphans).
   function ensureVirtualAttached(streamId) {
     const t = mgr.trees.get(streamId);
     if (!t || !t.broadcasterId) return;
     const virt = findVirtual(t);
-    if (!virt || virt.parent) return;
+    if (!virt) return;
     const bc = t.nodes.get(t.broadcasterId);
     if (!bc) return;
-    // Жертва — предпочтительно лист (не тащить поддерево), иначе первый попавшийся.
-    let victimId = null;
-    for (const cid of bc.children) {
-      const c = t.nodes.get(cid);
-      if (!c || c.virtual) continue;
-      if (victimId == null) victimId = cid;
-      if (!c.children.length) { victimId = cid; break; }
+    if (virt.parent === bc.id) return; // уже прямой ребёнок корня — ничего не делаем
+
+    // (б) Виртуал зарыт под зрителя — отцепляем от текущего родителя (drop-peer старому родителю),
+    // делаем сиротой, дальше общий путь усаживает под корень.
+    if (virt.parent) {
+      const op = t.nodes.get(virt.parent);
+      if (op) { op.children = op.children.filter((cid) => cid !== virt.id); send(op.id, { t: 'drop-peer', streamId, peerId: virt.id }); }
+      virt.parent = null; virt.depth = 0;
     }
-    if (victimId == null) return; // у корня нет детей => есть слот => placeOrphans справится сам
-    const victim = t.nodes.get(victimId);
-    tlog(`[${streamId}] виртуал ${virt.id} сирота (дерево забито) — выселяю жертву ${victimId} (${victim.identity}) из-под корня`);
-    bc.children = bc.children.filter((cid) => cid !== victimId);
-    victim.parent = null; victim.depth = 0;
-    send(t.broadcasterId, { t: 'drop-peer', streamId, peerId: victimId });
+
+    // Нет свободного слота у корня — выселяем жертву (предпочтительно лист, чтобы не тащить поддерево).
+    let victimId = null;
+    if (bc.children.length >= mgr.capacityOf(bc)) {
+      for (const cid of bc.children) {
+        const c = t.nodes.get(cid);
+        if (!c || c.virtual) continue;
+        if (victimId == null) victimId = cid;
+        if (!c.children.length) { victimId = cid; break; }
+      }
+      if (victimId == null) return; // у корня только виртуал/пусто — слота нет, выселять некого
+      const victim = t.nodes.get(victimId);
+      tlog(`[${streamId}] виртуал ${virt.id} — у корня нет слота, выселяю жертву ${victimId} (${victim.identity})`);
+      bc.children = bc.children.filter((cid) => cid !== victimId);
+      victim.parent = null; victim.depth = 0;
+      send(t.broadcasterId, { t: 'drop-peer', streamId, peerId: victimId });
+    }
+
     virt.parent = bc.id; virt.depth = 1; bc.children.push(virt.id);
     mgr.updateSubtreeDepth(t, virt.id);
     send(virt.id, { t: 'assign-parent', streamId, parentId: bc.id });
     send(bc.id, { t: 'assign-child', streamId, childId: virt.id });
-    settleOrphans(streamId); // жертва сядет под виртуала (единственный кандидат со слотом)
-    if (victim.parent) mgr.updateSubtreeDepth(t, victimId); // placeOrphans не пересчитывает глубины поддерева
+    tlog(`[${streamId}] виртуал ${virt.id} усажен прямым ребёнком корня (depth 1)`);
+    settleOrphans(streamId); // выселенная жертва и любые сироты сядут под виртуала (единственный слот)
+    if (victimId) { const v = t.nodes.get(victimId); if (v && v.parent) mgr.updateSubtreeDepth(t, victimId); } // placeOrphans не пересчитывает глубины поддерева жертвы
     broadcastTreeInfo(streamId);
     broadcastTopology(streamId);
   }
@@ -649,7 +679,10 @@ function attachTreeServer(httpServer, opts) {
     if (!t || !t.broadcasterId) return;
     let virt = findVirtual(t);
     const now = Date.now();
-    if (virt && !mgr.attachedToRoot(t, virt)) { ensureVirtualAttached(p.streamId); virt = findVirtual(t); }
+    // Всегда усаживаем виртуала прямым ребёнком корня перед reparent: он мог быть сиротой (забитое
+    // дерево) ИЛИ зарыт под самого запросившего (тогда attachedToRoot=true, но reparent на него дал
+    // бы цикл). ensureVirtualAttached идемпотентен — если виртуал уже под корнем, ничего не делает.
+    if (virt) { ensureVirtualAttached(p.streamId); virt = findVirtual(t); }
     if (virt && mgr.attachedToRoot(t, virt)) {
       if (p.parent === virt.id) { p.vrelayPinned = true; return; }
       const res = mgr.reparent(p.streamId, id, virt.id, now);

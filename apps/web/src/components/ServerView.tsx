@@ -1171,6 +1171,16 @@ function TreePeerPanel({ identity, onClose }: { identity: string; onClose: () =>
   const topo = E.getStreamTopology(identity);
   const nameOf = (n: { broadcaster: boolean; virtual?: boolean; identity: string }) => n.broadcaster ? '📡 вещатель' : n.virtual ? '🖥 Сервер' : (members.find((m) => m.username === n.identity)?.displayName || n.identity);
   const youNode = topo?.nodes.find((n) => n.id === topo.you);
+  // Потомки твоего узла: репарент под собственного потомка = цикл (сервер отклонит) — «взять» на них не даём.
+  const youDesc = (() => {
+    const set = new Set<string>();
+    if (!topo) return set;
+    const byParent = new Map<string, string[]>();
+    topo.nodes.forEach((n) => { if (n.parentId) { const a = byParent.get(n.parentId) || []; a.push(n.id); byParent.set(n.parentId, a); } });
+    const stack = [topo.you];
+    while (stack.length) { const cur = stack.pop()!; for (const c of byParent.get(cur) || []) if (!set.has(c)) { set.add(c); stack.push(c); } }
+    return set;
+  })();
   return (
     <div className="treepanel" onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}
       style={{ position: 'absolute', right: 8, bottom: 52, width: 280, maxHeight: 320, overflow: 'auto', background: 'rgba(20,22,28,.96)', border: '1px solid rgba(255,255,255,.1)', borderRadius: 10, padding: 10, zIndex: 5, color: '#fff', fontSize: 12 }}>
@@ -1182,7 +1192,7 @@ function TreePeerPanel({ identity, onClose }: { identity: string; onClose: () =>
         {[...topo.nodes].sort((a, b) => a.depth - b.depth).map((n) => {
           const isYou = n.id === topo.you;
           const isParent = youNode?.parentId === n.id;
-          const pickable = !isYou && !isParent && n.children < n.capacity;
+          const pickable = !isYou && !isParent && !youDesc.has(n.id) && n.children < n.capacity;
           return (
             <div key={n.id} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 0', paddingLeft: n.depth * 10, borderBottom: '1px solid rgba(255,255,255,.05)' }}>
               <span style={{ flex: 1, fontWeight: isYou ? 700 : 400, color: isParent ? '#8fd3ff' : '#fff' }}>

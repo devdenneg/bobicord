@@ -101,6 +101,8 @@ export interface VideoTransport {
   getParentId?(streamId: string): string | null;
   requestReparent?(streamId: string, targetId: string | null): void;
   onTopology?(cb: (streamId: string) => void): () => void;
+  /** Сервер отклонил ручной reparent («взять»/«через сервер») — reason для тоста зрителю. */
+  onReparentDenied?(cb: (streamId: string, reason: string) => void): () => void;
 
   /** Только TreeVideoTransport — метаданные приложения вещателя (иконка/имя окна из
    *  stream-live). LiveKit не реализует: getDisplayMedia метаданных не даёт. */

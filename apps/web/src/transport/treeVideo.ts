@@ -121,6 +121,7 @@ export class TreeVideoTransport implements VideoTransport {
   private lastJb = new Map<string, { delay: number; count: number }>();
   private topologyByStream = new Map<string, TreeTopology>();
   private topologyCbs = new Set<(streamId: string) => void>();
+  private reparentDeniedCbs = new Set<(streamId: string, reason: string) => void>();
   private nativeWatches = new Map<string, NativeWatchState>();
 
   private streamStartCbs = new Set<(identity: string, silent: boolean) => void>();
@@ -460,6 +461,11 @@ export class TreeVideoTransport implements VideoTransport {
         this.setTopology(streamId, { you: msg.you ?? null, nodes: msg.nodes || [] });
         break;
       }
+      case 'reparent-denied': {
+        // Ручной выбор родителя не прошёл (нет ёмкости / агент vrelay не поднят / гонка) — тост зрителю.
+        this.reparentDeniedCbs.forEach((cb) => cb(streamId, msg.reason || ''));
+        break;
+      }
     }
   }
 
@@ -619,6 +625,7 @@ export class TreeVideoTransport implements VideoTransport {
     if (st) { try { st.ws.send(JSON.stringify({ t: 'request-reparent', streamId, targetParentId: targetId })); } catch { /**/ } }
   }
   onTopology(cb: (streamId: string) => void) { this.topologyCbs.add(cb); return () => { this.topologyCbs.delete(cb); }; }
+  onReparentDenied(cb: (streamId: string, reason: string) => void) { this.reparentDeniedCbs.add(cb); return () => { this.reparentDeniedCbs.delete(cb); }; }
 
   /* ---------- track registry ---------- */
   getVideoTrack(key: string) { return this.videoTracks.get(key); }
