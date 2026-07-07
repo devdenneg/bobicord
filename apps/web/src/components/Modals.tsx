@@ -13,7 +13,7 @@ import { PERM, PERM_LIST, hasPerm } from '../types';
 import { Backdrop } from './Backdrop';
 import { BroadcastModal } from './BroadcastModal';
 import { isTauri, setGlobalHotkeys } from '../native';
-import { enableNotifications, notifSupported, notifPermission, notifyTest } from '../notify';
+import { enableNotifications, notifSupported, notifPermission } from '../notify';
 
 function CreateModal() {
   const close = () => useStore.getState().setModal(null);
@@ -377,31 +377,21 @@ function SettingsModal() {
       {!notifSupported() ? (
         <div className="fld"><label style={{ color: 'var(--txt-dim)' }}>Системные уведомления не поддерживаются на этом устройстве</label></div>
       ) : <>
-        {notifPermission() !== 'granted' ? (
-          <div className="fld" style={{ marginBottom: 6 }}>
-            <button className="primary" style={{ width: '100%', padding: '9px 16px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }} onClick={async () => {
-              const ok = await enableNotifications();
-              useStore.getState().toast(ok
-                ? 'Уведомления разрешены и включены'
-                : (notifPermission() === 'denied'
-                    ? 'Разрешение заблокировано — включите уведомления для RelayApp в настройках ОС/браузера'
-                    : 'Система не выдала разрешение на уведомления'), ok ? 'ok' : 'err');
-              rerender();
-            }}><Icon name="bell" sm />Разрешить уведомления</button>
-            <label style={{ marginTop: 6, fontSize: 12, color: 'var(--txt-dim)', display: 'block' }}>Браузер/система спросят разрешение. Это нужно один раз.</label>
-          </div>
-        ) : null}
         <label className="perm-op">
           <input type="checkbox" checked={s.notif} onChange={async (e) => {
             if (e.target.checked) {
+              localStorage.removeItem('notifOptOut'); // снова хотим уведомления
               const ok = await enableNotifications();
               if (!ok) useStore.getState().toast(notifPermission() === 'denied'
-                ? 'Разрешение заблокировано — включите уведомления для RelayApp в настройках ОС/браузера'
+                ? 'Разрешение заблокировано — включите уведомления для приложения в настройках ОС/браузера'
                 : 'Система не выдала разрешение на уведомления', 'err');
-            } else { setSettings({ notif: false }); }
+            } else {
+              localStorage.setItem('notifOptOut', '1'); // явный опт-аут: не переспрашиваем при запуске
+              setSettings({ notif: false });
+            }
             rerender();
           }} />
-          <span><b>Системные уведомления</b><i>Показывать, когда приложение свёрнуто или не в фокусе{notifPermission() === 'denied' ? ' · доступ запрещён в системе' : ''}</i></span>
+          <span><b>Системные уведомления</b><i>Упоминания — когда окно не в фокусе; трансляции и обновления — всегда{notifPermission() === 'denied' ? ' · доступ запрещён в системе' : ''}</i></span>
         </label>
         {NOTIF_KINDS.map((o) => (
           <label key={o.key} className="perm-op" style={{ marginTop: 4, opacity: s.notif ? 1 : .45, pointerEvents: s.notif ? 'auto' : 'none' }}>
@@ -409,14 +399,6 @@ function SettingsModal() {
             <span><b>{o.title}</b><i>{o.desc}</i></span>
           </label>
         ))}
-        <button style={{ width: 'auto', padding: '6px 14px', marginTop: 8, fontSize: 12.5 }} onClick={async () => {
-          const r = await notifyTest();
-          // успешный тест = явное намерение получать уведомления → включаем мастер, если был выкл
-          // (иначе реальный тег молчал бы на гейте !notif, хотя тест только что показался).
-          if (r.ok && !getSettings().notif) setSettings({ notif: true });
-          useStore.getState().toast(r.ok && !s.notif ? 'Работает — уведомления включены' : r.msg, r.ok ? 'ok' : 'err');
-          rerender();
-        }}>Проверить уведомление</button>
       </>}
     </div>
     <div className="grp"><div className="gt"><Icon name="palette" sm /> Оформление</div>

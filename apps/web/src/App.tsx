@@ -12,6 +12,7 @@ import { DownloadFab } from './components/DownloadFab';
 import { isTauri, setGlobalHotkeys, onGlobalHotkey } from './native';
 import type { ServerSummary, KeybindAction } from './types';
 import { LogoLoader } from './components/LogoLoader';
+import { initNotifications } from './notify';
 
 function Rail() {
   const servers = useStore((s) => s.servers);
@@ -135,6 +136,16 @@ export function App() {
   const view = useStore((s) => s.view);
   const loadingServer = useStore((s) => s.loadingServer);
   const me = useStore((s) => s.me);
+
+  // Уведомления: при первом входе (после логина) запрашиваем разрешение автоматически и
+  // включаем — отключить можно в Настройках → Уведомления (там же ставится опт-аут, чтобы
+  // не переспрашивать). initNotifications сам уважает опт-аут и не пристаёт повторно.
+  useEffect(() => {
+    if (!me) return;
+    initNotifications().then((welcomed) => {
+      if (welcomed) useStore.getState().toast('Уведомления включены — отключить можно в Настройках → Уведомления', 'info');
+    }).catch(() => {});
+  }, [me]);
 
   // hotkeys (мут микрофона / заглушить звук — настраиваемые комбинации из keybinds, + PTT) —
   // active while logged in. Работает ВСЕГДА, пока окно в фокусе (keydown на window иначе и не
