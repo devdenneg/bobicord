@@ -10,7 +10,7 @@ import type { VideoTransport } from './transport/videoTransport';
 import { LiveKitVideoTransport } from './transport/livekitVideo';
 import { TreeVideoTransport } from './transport/treeVideo';
 
-export interface PeerState { online: boolean; inVoice: boolean; micMuted: boolean; streaming: boolean }
+export interface PeerState { online: boolean; inVoice: boolean; micMuted: boolean; streaming: boolean; deafened: boolean }
 export interface StreamInfo { key: string; identity: string; isLocal: boolean; appName?: string; appIcon?: string }
 export type VoiceQuality = 'excellent' | 'good' | 'poor' | 'lost' | 'unknown';
 export interface Snapshot {
@@ -201,7 +201,16 @@ export class Engine {
       const online = !!p || this.onlineHint.has(m.username);
       const inV = this.isInVoice(m.username);
       const mp = p ? p.getTrackPublication(Track.Source.Microphone) : undefined;
-      presence[m.username] = { online, inVoice: inV, micMuted: !mp || mp.isMuted, streaming: this.isStreaming(m.username) };
+      // «оглох» (deafen) транслируется пирам participant-атрибутом deaf (как vc для голосового
+      // канала) — иначе другие видят для оглохшего то же «мик выключен», что и для просто мута.
+      const deaf = m.username === this.me.username ? this.deafened : !!(p as any)?.attributes?.deaf;
+      // !mp (трек ещё не опубликован — до roomReady показываем состав канала по серверному
+      // хинту, публикация мика/round-trip атрибута vc ещё в полёте) — это «пока не знаем»,
+      // а не «замучен»: раньше !mp трактовалось как muted и на секунду мигал ложный бейдж
+      // всем в канале (и себе, пока свой мик ещё стартует) сразу после захода на сервер.
+      // || deaf — подстраховка: оглохший всегда считается замьюченным для бейджа независимо
+      // от сырого флага трека (см. toggleMic — там же зафиксирован сам источник рассинхрона).
+      presence[m.username] = { online, inVoice: inV, micMuted: (!!mp && mp.isMuted) || deaf, streaming: this.isStreaming(m.username), deafened: deaf };
     }
     const speaking: Record<string, boolean> = {};
     this.speakingSet.forEach((u) => (speaking[u] = true));
@@ -247,7 +256,8 @@ export class Engine {
       .on(RoomEvent.TrackUnsubscribed, this.onUnsub)
       .on(RoomEvent.ParticipantConnected, (p) => { this.hooks.peerJoined(p.identity); this.hooks.toast((p.name || p.identity) + ' в сети', 'ok'); this.emit(); })
       .on(RoomEvent.ParticipantDisconnected, (p) => { this.cleanupPeer(p.identity); this.emit(); })
-      .on(RoomEvent.TrackMuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p !== this.room?.localParticipant) playSound('mute'); this.emit(); })
+      // звук мута слышен только самому мутящемуся (не остальным) — играем при локальном событии
+      .on(RoomEvent.TrackMuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.room?.localParticipant) playSound('mute'); this.emit(); })
       .on(RoomEvent.Reconnecting, () => { this.reconnecting = true; this.hooks.toast('Связь потеряна — переподключаюсь…', 'warn'); this.emit(); })
       .on(RoomEvent.Reconnected, () => { this.reconnecting = false; this.hooks.toast('Связь восстановлена', 'ok'); this.emit(); })
       .on(RoomEvent.Disconnected, () => { this.reconnecting = false; this.emit(); })
@@ -367,7 +377,7 @@ export class Engine {
     await this.stopShare().catch(() => {});
     this.stopMic();
     this.room.remoteParticipants.forEach((p) => { const rp = p.getTrackPublication(Track.Source.Microphone); if (rp) { try { (rp as any).setSubscribed(false); } catch { /**/ } } this.detachAnalyser(p.identity); });
-    try { await this.room.localParticipant.setAttributes({ vc: '' }); } catch { /**/ }
+    try { await this.room.localParticipant.setAttributes({ vc: '', deaf: '' }); } catch { /**/ }
     this.inVoice = false; this.currentVc = null; this.deafened = false; this.manualMute = false; this.pttDown = false;
     this.screenAudioEls.forEach((a) => (a.muted = false));
     this.emit();
@@ -514,13 +524,19 @@ export class Engine {
     if (!this.inVoice || !this.room) return;
     this.manualMute = !this.manualMute;
     const p = this.micPub();
-    if (p && p.track) { this.manualMute ? p.track.mute() : p.track.unmute(); } // ручной мут виден другим
+    // пока фулл-мут (deafened) активен, трек должен оставаться замьюченным на уровне LiveKit
+    // независимо от ручного тогла — иначе снятие ручного мута во время deafen паразитно
+    // размучивает трек (звук всё равно молчит через applyGate/gain=0, но у пиров и у себя
+    // пропадает бейдж мута, будто фулл-мута больше нет).
+    if (p && p.track) { (this.manualMute || this.deafened) ? p.track.mute() : p.track.unmute(); } // ручной мут виден другим
     this.applyGate();
     this.emit();
   }
   toggleDeaf() {
     if (!this.inVoice) return;
     this.deafened = !this.deafened;
+    // транслируем пирам, чтобы у них статус-бейдж отличался от простого мута мика (см. build())
+    this.room?.localParticipant.setAttributes({ deaf: this.deafened ? '1' : '' }).catch(() => {});
     const p = this.micPub();
     if (this.deafened) { if (p && p.track) p.track.mute(); }
     else { if (p && p.track && !this.manualMute) p.track.unmute(); }
