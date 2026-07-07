@@ -2,6 +2,9 @@ import { create } from 'zustand';
 import { api, setToken } from './api';
 import { Engine } from './engine';
 import { emoteMap } from './emotes';
+import { setSettings } from './settings';
+import { notifPermission } from './notify';
+import { ensurePushSubscribed, unsubscribePush } from './push';
 import type { User, ServerSummary, Member, ServerDetail, Toast, ToastKind } from './types';
 
 let engine: Engine | null = null;
@@ -121,6 +124,11 @@ export const useStore = create<AppState>((set, get) => ({
     set({ me: user });
     await get().loadMe();
     set({ view: 'home' });
+    // Web-push: перепривязываем подписку к ТЕКУЩЕМУ аккаунту (endpoint переживает смену юзера/reload,
+    // на сервере ON CONFLICT перезапишет user_id). Зовём НАПРЯМУЮ, минуя глобальный notifOptOut-гейт
+    // initNotifications — иначе опт-аут прошлого юзера навсегда лишал бы нового push. Только при уже
+    // выданном разрешении; master включаем, т.к. на этом устройстве уведомления уже разрешены.
+    if (notifPermission() === 'granted') { setSettings({ notif: true }); localStorage.removeItem('notifOptOut'); ensurePushSubscribed(); }
     const pend = sessionStorage.getItem('pendingInvite');
     if (pend) { sessionStorage.removeItem('pendingInvite'); set({ modal: 'join', joinPrefill: pend }); }
   },
@@ -150,7 +158,14 @@ export const useStore = create<AppState>((set, get) => ({
     catch (e: any) { get().toast(e.message, 'err'); }
   },
 
-  logout: () => { connEpoch++; engine?.disconnect(); setToken(null); location.reload(); },
+  logout: async () => {
+    connEpoch++; engine?.disconnect();
+    // отписываем web-push ПОКА токен ещё текущего юзера (api.pushUnsubscribe шлёт Bearer) —
+    // иначе endpoint остаётся привязан к нему на сервере и его push летели бы следующему юзеру.
+    // cap 2с, чтобы разлогин не подвисал на мёртвой сети.
+    try { await Promise.race([unsubscribePush(), new Promise((r) => setTimeout(r, 2000))]); } catch { /**/ }
+    setToken(null); location.reload();
+  },
 
   // Точка входа по клику на сервер. Решает: показать уже подключённый / предупредить о переключении / коннектить.
   openServer: async (id) => {
