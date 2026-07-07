@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"/>
+<style>
+  html,body{margin:0;height:100%;background:#07090f;display:flex;align-items:center;justify-content:center}
+  canvas{width:512px;height:512px;display:block}
+</style></head>
+<body>
+<canvas id="c" width="1024" height="1024"></canvas>
+<script>
+const cv=document.getElementById('c'), ctx=cv.getContext('2d');
+const S=2; // рисуем в 2x для чёткости (retina)
+ctx.scale(S,S);
+const W=512,H=512;
+
+// --- центровая линия «P» из логотипа (замкнутый контур; узлы cyan/magenta/pink — станции) ---
+const PTS=[
+ [141,178],[141,150],[142,126],[150,113],[184,104],[246,101],[312,105],[362,123],
+ [389,152],[398,183],[400,213],[399,245],[394,272],[382,293],[361,308],[324,320],
+ [288,328],[253,333],[229,338],[216,350],[210,370],[207,396],[204,410],[196,423],
+ [177,431],[156,430],[143,422],[140,409],[140,300]
+]; // закрыт (Catmull-Rom по кругу)
+
+// ЦЕНТРОСТРЕМИТЕЛЬНЫЙ Catmull-Rom (alpha=0.5, Barry-Goldman) — ровные скругления без овершутов/пинчей
+function sample(pts,per=22){
+  const n=pts.length, out=[], A=0.5;
+  const g=i=>pts[((i%n)+n)%n];
+  const tj=(ti,pa,pb)=>ti+Math.pow(Math.hypot(pb[0]-pa[0],pb[1]-pa[1])||1e-4,A);
+  for(let i=0;i<n;i++){
+    const p0=g(i-1),p1=g(i),p2=g(i+1),p3=g(i+2);
+    const t0=0,t1=tj(t0,p0,p1),t2=tj(t1,p1,p2),t3=tj(t2,p2,p3);
+    for(let k=0;k<per;k++){
+      const t=t1+(t2-t1)*k/per;
+      const l=(a,b,pa,pb,c)=>((b-t)/((b-a)||1e-9))*pa[c]+((t-a)/((b-a)||1e-9))*pb[c];
+      const A1=[l(t0,t1,p0,p1,0),l(t0,t1,p0,p1,1)];
+      const A2=[l(t1,t2,p1,p2,0),l(t1,t2,p1,p2,1)];
+      const A3=[l(t2,t3,p2,p3,0),l(t2,t3,p2,p3,1)];
+      const lr=(a,b,pa,pb,c)=>((b-t)/((b-a)||1e-9))*pa[c]+((t-a)/((b-a)||1e-9))*pb[c];
+      const B1=[lr(t0,t2,A1,A2,0),lr(t0,t2,A1,A2,1)];
+      const B2=[lr(t1,t3,A2,A3,0),lr(t1,t3,A2,A3,1)];
+      out.push([lr(t1,t2,B1,B2,0),lr(t1,t2,B1,B2,1)]);
+    }
+  }
+  out.push(out[0].slice());
+  let len=0; const cum=[0];
+  for(let i=1;i<out.length;i++){len+=Math.hypot(out[i][0]-out[i-1][0],out[i][1]-out[i-1][1]);cum.push(len);}
+  return {pts:out,cum,len};
+}
+const P=sample(PTS);
+function at(d){ // точка по длине дуги (по кругу)
+  d=((d%P.len)+P.len)%P.len;
+  let lo=0,hi=P.cum.length-1;
+  while(lo<hi){const m=(lo+hi)>>1; if(P.cum[m]<d)lo=m+1; else hi=m;}
+  const i=Math.max(1,lo), a=P.cum[i-1],b=P.cum[i], f=(d-a)/(b-a||1);
+  const p=P.pts[i-1],q=P.pts[i];
+  return [p[0]+(q[0]-p[0])*f, p[1]+(q[1]-p[1])*f];
+}
+
+// путь как Path2D (для заливки штриха)
+function tracePath(g){ g.beginPath(); g.moveTo(P.pts[0][0],P.pts[0][1]); for(let i=1;i<P.pts.length;i++)g.lineTo(P.pts[i][0],P.pts[i][1]); g.closePath(); }
+
+const grad=ctx.createLinearGradient(120,90,410,430);
+grad.addColorStop(0,'#54d6ff'); grad.addColorStop(0.5,'#a578f2'); grad.addColorStop(1,'#ff62c6');
+function colAt(d){ const t=(((d%P.len)+P.len)%P.len)/P.len; // цвет по позиции на контуре (для кометы)
+  const stops=[[0,84,214,255],[0.4,165,120,242],[0.75,255,98,198],[1,84,214,255]];
+  for(let i=1;i<stops.length;i++){ if(t<=stops[i][0]){const a=stops[i-1],b=stops[i],f=(t-a[0])/(b[0]-a[0]); return `rgb(${a[1]+(b[1]-a[1])*f|0},${a[2]+(b[2]-a[2])*f|0},${a[3]+(b[3]-a[3])*f|0})`;}}
+  return '#fff';
+}
+
+const NODES=[[140,178],[400,213],[207,396]];
+
+// offscreen-канвас для кометного хвоста (накопление + затухание = motion-blur trail)
+const tc=document.createElement('canvas'); tc.width=1024;tc.height=1024; const tg=tc.getContext('2d'); tg.scale(S,S);
+// offscreen для штриха (рисуем непрозрачно -> без наслоения альфы; свечение = blur этого слоя)
+const sc=document.createElement('canvas'); sc.width=1024;sc.height=1024; const sg=sc.getContext('2d'); sg.scale(S,S);
+
+function squircle(g){ const r=118; g.beginPath();
+  g.moveTo(8+r,8); g.arcTo(504,8,504,504,r); g.arcTo(504,504,8,504,r); g.arcTo(8,504,8,8,r); g.arcTo(8,8,504,8,r); g.closePath(); }
+
+// циклическая палитра (cyan->purple->magenta->purple->cyan) — течёт по замкнутому контуру без шва
+function palette(t){
+  t=((t%1)+1)%1;
+  const st=[[0,84,214,255],[0.28,150,120,242],[0.55,255,98,198],[0.8,150,120,242],[1,84,214,255]];
+  for(let i=1;i<st.length;i++){ if(t<=st[i][0]){ const a=st[i-1],b=st[i],f=(t-a[0])/(b[0]-a[0]);
+    return `rgb(${a[1]+(b[1]-a[1])*f|0},${a[2]+(b[2]-a[2])*f|0},${a[3]+(b[3]-a[3])*f|0})`; } }
+  return 'rgb(84,214,255)';
+}
+// штрих посегментно с round-cap (гладкая трубка) + потоковый градиент; рисуем НЕПРОЗРАЧНО на offscreen
+function drawFlow(phase){
+  const pts=P.pts, cum=P.cum, L=P.len, step=1;
+  sg.clearRect(0,0,W,H);
+  sg.lineCap='round'; sg.lineJoin='round'; sg.lineWidth=16; sg.globalAlpha=1;
+  for(let i=step;i<pts.length;i+=step){
+    sg.strokeStyle=palette(cum[i]/L - phase);
+    sg.beginPath(); sg.moveTo(pts[i-step][0],pts[i-step][1]); sg.lineTo(pts[i][0],pts[i][1]); sg.stroke();
+  }
+}
+
+let t0=null;
+const SPEED=P.len/3000;   // обход ~3с
+const COMETS=3;           // 3 точки логотипа «едут» по букве
+function frame(ts){
+  if(t0===null)t0=ts; const T=ts-t0;
+  const FORCE=parseFloat(location.hash.slice(1));
+  const head=isNaN(FORCE)?T*SPEED:FORCE*P.len;   // debug: #<0..1> замораживает фазу
+  const headsD=[]; for(let cN=0;cN<COMETS;cN++) headsD.push(head+cN*P.len/COMETS);
+
+  // --- trail canvas: затухание прошлого кадра + аддитивная дорисовка головы кометы ---
+  tg.globalCompositeOperation='source-over';
+  tg.fillStyle='rgba(0,0,0,0.14)'; tg.fillRect(0,0,W,H);
+  tg.globalCompositeOperation='lighter';
+  for(const d of headsD){
+    for(let k=0;k<5;k++){
+      const dd=d-k*3.4, p=at(dd), a=(1-k/5), r=(5.5-k*0.7)*2.4;
+      const gr=tg.createRadialGradient(p[0],p[1],0,p[0],p[1],r);
+      gr.addColorStop(0,`rgba(255,255,255,${0.85*a})`);
+      gr.addColorStop(0.4,`rgba(180,210,255,${0.5*a})`);
+      gr.addColorStop(1,'rgba(0,0,0,0)');
+      tg.fillStyle=gr; tg.beginPath(); tg.arc(p[0],p[1],r,0,7); tg.fill();
+    }
+  }
+
+  // --- main ---
+  ctx.globalCompositeOperation='source-over';
+  ctx.clearRect(0,0,W,H);
+  squircle(ctx); const bg=ctx.createRadialGradient(256,215,40,256,256,360);
+  bg.addColorStop(0,'#17223c'); bg.addColorStop(1,'#0a0e18'); ctx.fillStyle=bg; ctx.fill();
+  ctx.save(); squircle(ctx); ctx.clip();
+
+  // штрих буквы с потоковым градиентом, движущимся вместе с точками
+  drawFlow(head/P.len);
+  ctx.filter='blur(5px)'; ctx.globalAlpha=0.8; ctx.drawImage(sc,0,0,W,H);   // мягкое неон-свечение
+  ctx.filter='none'; ctx.globalAlpha=1; ctx.drawImage(sc,0,0,W,H);          // чёткая трубка
+
+  // светящийся хвост кометы (аддитивно поверх штриха)
+  ctx.globalCompositeOperation='lighter'; ctx.drawImage(tc,0,0,W,H); ctx.globalCompositeOperation='source-over';
+
+  // головы точек: яркое ядро + гало
+  for(const d of headsD){
+    const p=at(d);
+    ctx.globalCompositeOperation='lighter';
+    const gr=ctx.createRadialGradient(p[0],p[1],0,p[0],p[1],22);
+    gr.addColorStop(0,'rgba(255,255,255,0.95)'); gr.addColorStop(0.28,'rgba(190,215,255,0.55)'); gr.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.fillStyle=gr; ctx.beginPath(); ctx.arc(p[0],p[1],22,0,7); ctx.fill();
+    ctx.globalCompositeOperation='source-over';
+    ctx.fillStyle='#fff'; ctx.beginPath(); ctx.arc(p[0],p[1],6.5,0,7); ctx.fill();
+  }
+  ctx.restore();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body></html>

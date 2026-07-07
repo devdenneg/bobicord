@@ -11,6 +11,7 @@ import { Modals } from './components/Modals';
 import { DownloadFab } from './components/DownloadFab';
 import { isTauri, setGlobalHotkeys, onGlobalHotkey } from './native';
 import type { ServerSummary, KeybindAction } from './types';
+import { LogoLoader } from './components/LogoLoader';
 
 function Rail() {
   const servers = useStore((s) => s.servers);
@@ -71,9 +72,12 @@ function Home() {
   const setModal = useStore((s) => s.setModal);
   return (
     <section id="home">
-      <div className="home-top"><h1>Здарова, {me.displayName}!</h1>
-        <button className="hbtn" style={{ background: 'var(--panel2)', padding: '8px 14px' }} onClick={() => setModal('profile')}>Профиль</button></div>
+      <div className="home-top">
+        <div className="home-brand"><LogoLoader size={64} speedMs={8000} /><span>Рилэй</span></div>
+        <button className="hbtn" style={{ background: 'var(--panel2)', padding: '8px 14px' }} onClick={() => setModal('profile')}>Профиль</button>
+      </div>
       <div className="home-inner">
+        <h1 className="home-greet">Здарова, {me.displayName}! 👋</h1>
         <div className="home-actions">
           <button className="bigbtn" onClick={() => setModal('create')}><div className="bi g"><Icon name="plus" /></div><div><b>Создать сервер</b><span>Свой сервер для друзей</span></div></button>
           <button className="bigbtn" onClick={() => setModal('join')}><div className="bi a"><Icon name="link" /></div><div><b>Присоединиться</b><span>По коду или ссылке-приглашению</span></div></button>
@@ -225,10 +229,7 @@ export function App() {
       <Toasts />
       {view === 'loading' ? (
         <div className="overlay" style={{ background: 'var(--bg)' }}>
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 18 }}>
-            <div style={{ width: 56, height: 56, borderRadius: 16, background: 'linear-gradient(135deg,#6366f1,#8b5cf6)', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 8px 24px -6px rgba(99,102,241,.6)' }}><Icon name="mic" /></div>
-            <span className="spin" style={{ width: 22, height: 22, margin: 0 }} />
-          </div>
+          <LogoLoader size={200} />
         </div>
       ) : view === 'auth' ? <Auth /> : (
         <div id="app" className="on">
