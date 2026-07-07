@@ -877,7 +877,17 @@ function attachTreeServer(httpServer, opts) {
   }, HEARTBEAT_MS);
   hbTimer.unref?.();
 
-  return { mgr, peers, wss, abrTimer, hbTimer, drainTimer };
+  // Кто прямо сейчас вещает (нативный tree-стрим) в данном сервере — по активным broadcaster-пирам.
+  // Для превью на главной (кто в сети и что делает). identity дерева = базовый username.
+  function liveBroadcastersIn(serverId) {
+    const out = new Set();
+    for (const p of peers.values()) {
+      if (p.role === 'broadcaster' && p.serverId === serverId && p.identity) out.add(String(p.identity).split('#')[0]);
+    }
+    return out;
+  }
+
+  return { mgr, peers, wss, abrTimer, hbTimer, drainTimer, liveBroadcastersIn };
 }
 
 module.exports = { attachTreeServer, TreeManager, MAX_DEPTH, NATIVE_CAPACITY, BROWSER_CAPACITY };

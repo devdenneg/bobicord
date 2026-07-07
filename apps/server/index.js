@@ -208,6 +208,33 @@ async function onlineIn(serverId) {
   try { const ps = await rsc.listParticipants('srv:' + serverId); return [...new Set(ps.map(p => baseIdentity(p.identity)))]; }
   catch (e) { return []; }
 }
+// Детальный online-состав для превью на главной: аватар/имя + чем занят (стрим/голос). Стрим —
+// LiveKit ScreenShare-трек (браузерное вещание) ИЛИ активный tree-broadcaster (нативное). Голос —
+// mic-трек или vc-атрибут. Сессии одного юзера сводим к одному. LK TrackSource: MICROPHONE=2, SCREEN_SHARE=3.
+async function onlineDetailed(serverId) {
+  try {
+    const ps = await rsc.listParticipants('srv:' + serverId);
+    const byUser = new Map();
+    for (const p of ps) {
+      const u = baseIdentity(p.identity);
+      const tracks = p.tracks || [];
+      const streaming = tracks.some(t => t.source === 3);
+      const inVoice = tracks.some(t => t.source === 2) || !!(p.attributes && p.attributes.vc);
+      const cur = byUser.get(u) || { streaming: false, inVoice: false };
+      byUser.set(u, { streaming: cur.streaming || streaming, inVoice: cur.inVoice || inVoice });
+    }
+    for (const u of treeSrv.liveBroadcastersIn(serverId)) { const c = byUser.get(u) || { streaming: false, inVoice: false }; c.streaming = true; byUser.set(u, c); }
+    const stmt = db.prepare('SELECT display_name, avatar_color, avatar_url FROM users WHERE username=?');
+    const out = [];
+    for (const [username, st] of byUser) {
+      const r = stmt.get(username);
+      out.push({ username, displayName: r ? r.display_name : username, avatarColor: r ? r.avatar_color : 0, avatarUrl: r ? (r.avatar_url || '') : '', streaming: st.streaming, inVoice: st.inVoice });
+    }
+    // сначала стримеры, потом в голосе, потом остальные — для превью
+    out.sort((a, b) => (b.streaming - a.streaming) || (b.inVoice - a.inVoice));
+    return out;
+  } catch (e) { return []; }
+}
 // online-состав + карта {username: channelId} (кто в каком голосовом канале) из participant-атрибута vc.
 // Отдаём это в /presence, чтобы состав голосовых каналов был виден сразу на загрузке — не дожидаясь,
 // пока у зрителя локально поднимется LiveKit-комната. Несколько сессий одного юзера сводим к одному.
@@ -346,7 +373,7 @@ app.get('/api/me', requireAuth, async (req, res) => {
     SELECT s.*, m.role FROM servers s JOIN memberships m ON m.server_id=s.id
     WHERE m.user_id=? ORDER BY m.joined ASC`).all(req.user.id);
   const servers = await Promise.all(rows.map(async s => {
-    const online = await onlineIn(s.id);
+    const online = await onlineDetailed(s.id); // объекты {username,displayName,avatarColor,avatarUrl,streaming,inVoice}
     return { ...pubServer(s), role: s.role, memberCount: memberCount(s.id), online, onlineCount: online.length };
   }));
   res.json({ user: pubUser(req.user), servers });
@@ -794,7 +821,7 @@ app.use((err, req, res, next) => {
 
 /* ---------- relay-дерево: WS-сигналинг на том же порту (Э1) ---------- */
 const server = http.createServer(app);
-attachTreeServer(server, {
+const treeSrv = attachTreeServer(server, {
   sessionSecret: SESSION_SECRET,
   path: '/tree',
   turnSecret: TURN_SECRET,

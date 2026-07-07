@@ -162,10 +162,24 @@
   .srv-card .sc-ic{width:46px;height:46px;border-radius:14px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:19px;color:#fff}
   .srv-card .sc-nm{font-weight:600;font-size:15.5px;color:var(--txt-h);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .srv-card .sc-sub{font-size:12.5px;color:var(--muted)}
-  .srv-card .sc-online{display:flex;align-items:center;gap:-6px;min-height:24px}
-  .srv-card .sc-online .mini-av{width:24px;height:24px;border-radius:50%;font-size:11px;font-weight:700;color:#fff;display:flex;align-items:center;justify-content:center;border:2px solid var(--panel);margin-right:-7px}
-  .srv-card .sc-online .more{margin-left:12px;font-size:12px;color:var(--green);font-weight:600}
+  .srv-card .sc-online{position:relative;display:flex;align-items:center;min-height:24px}
+  .srv-card .sc-online .mini-av{width:24px;height:24px;border-radius:50%;font-size:11px;font-weight:700;color:#fff;display:flex;align-items:center;justify-content:center;border:2px solid var(--panel);margin-right:-7px;overflow:hidden;flex:0 0 auto}
+  .srv-card .sc-online .mini-av.live{border-color:#ff5a6a;box-shadow:0 0 0 1px #ff5a6a}
+  .srv-card .sc-online .mini-av.voice{border-color:var(--green)}
+  .srv-card .sc-online .more{margin-left:14px;font-size:12px;color:var(--green);font-weight:600}
   .srv-card .sc-none{font-size:12px;color:var(--muted)}
+  /* тултип превью: кто в сети и что делает */
+  .sc-tip{display:none;position:absolute;bottom:calc(100% + 8px);left:0;min-width:210px;max-width:290px;max-height:250px;overflow-y:auto;
+    background:var(--panel3,#171b23);border:1px solid var(--line-2);border-radius:11px;box-shadow:var(--sh-2),var(--hair);padding:7px;z-index:40;cursor:default}
+  .sc-online:hover .sc-tip{display:block;animation:tin .16s ease-out}
+  .sc-tip-h{font-size:10.5px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin:2px 6px 6px}
+  .sc-tip-row{display:flex;align-items:center;gap:8px;padding:4px 5px;border-radius:8px}
+  .sc-tip-row:hover{background:var(--panel2)}
+  .sc-tip-av{width:26px;height:26px;border-radius:50%;flex:0 0 auto;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff;overflow:hidden}
+  .sc-tip-nm{flex:1;min-width:0;font-size:13px;color:var(--txt-h);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sc-tip-st{flex:0 0 auto;font-size:10.5px;font-weight:600;color:var(--muted);white-space:nowrap}
+  .sc-tip-st.live{color:#ff5a6a}
+  .sc-tip-st.voice{color:var(--green)}
 
   /* ---------- SERVER VIEW ---------- */
   #server{display:none;grid-template-columns:var(--ch-w,290px) 1fr var(--mem-w,244px);height:100%;min-height:0;position:relative;transition:grid-template-columns .28s cubic-bezier(.4,0,.2,1)}

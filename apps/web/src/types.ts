@@ -32,6 +32,15 @@ export interface Role {
   position: number;
 }
 
+// online-участник для превью на главной: аватар/имя + чем занят (стрим/голос)
+export interface OnlineMember {
+  username: string;
+  displayName: string;
+  avatarColor: number;
+  avatarUrl?: string;
+  streaming: boolean;
+  inVoice: boolean;
+}
 export interface ServerSummary {
   id: string;
   name: string;
@@ -41,7 +50,7 @@ export interface ServerSummary {
   description?: string;
   role: string;
   memberCount: number;
-  online?: string[];
+  online?: OnlineMember[];
   onlineCount?: number;
 }
 

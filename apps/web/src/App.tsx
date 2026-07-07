@@ -45,6 +45,7 @@ function Rail() {
 
 function ServerCard({ s, onOpen }: { s: ServerSummary; onOpen: () => void }) {
   const on = s.online || [];
+  const streamers = on.filter((m) => m.streaming).length;
   return (
     <button className="srv-card" onClick={onOpen}>
       <div className="sc-h">
@@ -57,8 +58,23 @@ function ServerCard({ s, onOpen }: { s: ServerSummary; onOpen: () => void }) {
       <div className="sc-online">
         {on.length ? (
           <>
-            {on.slice(0, 5).map((u, i) => <div className="mini-av" key={i} style={{ background: avColor(u) }}>{initial(u)}</div>)}
-            <span className="more" style={{ marginLeft: 12 }}>{on.length > 5 ? '+' + (on.length - 5) : on.length + ' в сети'}</span>
+            {on.slice(0, 5).map((m) => (
+              <div key={m.username} className={'mini-av' + (m.streaming ? ' live' : m.inVoice ? ' voice' : '')} style={{ background: m.avatarUrl ? '#0000' : avColor(m.displayName, m.avatarColor) }}>
+                {m.avatarUrl ? <img className="avimg" src={resolveUploadUrl(m.avatarUrl)} alt="" /> : initial(m.displayName)}
+              </div>
+            ))}
+            <span className="more">{on.length > 5 ? '+' + (on.length - 5) + ' · ' : ''}{on.length} в сети{streamers ? ' · 📺 ' + streamers : ''}</span>
+            {/* тултип: кто в сети и что делает (стрим / голос / просто в сети) */}
+            <div className="sc-tip" role="tooltip">
+              <div className="sc-tip-h">В сети · {on.length}</div>
+              {on.map((m) => (
+                <div key={m.username} className="sc-tip-row">
+                  <span className="sc-tip-av" style={{ background: m.avatarUrl ? '#0000' : avColor(m.displayName, m.avatarColor) }}>{m.avatarUrl ? <img className="avimg" src={resolveUploadUrl(m.avatarUrl)} alt="" /> : initial(m.displayName)}</span>
+                  <span className="sc-tip-nm">{m.displayName}</span>
+                  <span className={'sc-tip-st' + (m.streaming ? ' live' : m.inVoice ? ' voice' : '')}>{m.streaming ? '📺 трансляция' : m.inVoice ? '🎤 в голосе' : 'в сети'}</span>
+                </div>
+              ))}
+            </div>
           </>
         ) : <span className="sc-none">Сейчас никого нет в сети</span>}
       </div>
