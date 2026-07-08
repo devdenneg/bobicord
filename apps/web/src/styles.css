@@ -936,13 +936,13 @@
   /* toasts — зарезервированный стек СНИЗУ-СЛЕВА (за рейлом), новый снизу, стек вверх, без наслоений.
      column-reverse: последний тост внизу у угла, старые уезжают вверх; контейнер не ловит клики,
      каждый тост — ловит (клик = закрыть). Фикс-ширина → длинный текст переносится, не тянет вьюпорт. */
-  #toasts{position:fixed;left:calc(92px + env(safe-area-inset-left));bottom:calc(62px + env(safe-area-inset-bottom));top:auto;transform:none;z-index:80;display:flex;flex-direction:column;gap:8px;align-items:flex-start;width:min(360px,calc(100vw - 108px));pointer-events:none}
+  #toasts{position:fixed;left:50%;transform:translateX(-50%);top:calc(16px + env(safe-area-inset-top));bottom:auto;z-index:80;display:flex;flex-direction:column;gap:8px;align-items:center;width:min(380px,calc(100vw - 32px));pointer-events:none}
   .toast{width:100%;background:#0a0d13ee;border:1px solid var(--line-2);backdrop-filter:blur(10px);color:var(--txt);padding:11px 15px;border-radius:12px;font-size:13.5px;box-shadow:var(--sh-2);display:flex;align-items:center;gap:9px;animation:toastIn .22s cubic-bezier(.2,.8,.4,1);transition:opacity .2s,transform .2s;pointer-events:auto;cursor:pointer}
   .toast span{min-width:0;overflow-wrap:anywhere}
   .toast .ic{font-size:17px;flex:0 0 auto}.toast.ok .ic{color:var(--green)}.toast.warn .ic{color:var(--yellow)}.toast.err .ic{color:var(--red)}
-  @keyframes toastIn{from{opacity:0;transform:translateX(-14px) scale(.98)}to{opacity:1;transform:none}}
-  /* мобилка: рейла нет по краю — прижимаем к левому краю с safe-area, во всю доступную ширину */
-  @media (max-width:900px){#toasts{left:calc(12px + env(safe-area-inset-left));width:min(400px,calc(100vw - 24px));bottom:calc(66px + env(safe-area-inset-bottom))}}
+  @keyframes toastIn{from{opacity:0;transform:translateY(-12px) scale(.98)}to{opacity:1;transform:none}}
+  /* мобилка: центр сверху под safe-area, во всю доступную ширину */
+  @media (max-width:900px){#toasts{top:calc(10px + env(safe-area-inset-top));width:min(400px,calc(100vw - 24px))}}
 
   /* mobile */
   #mtabs{display:none}
