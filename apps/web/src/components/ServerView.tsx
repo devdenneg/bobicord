@@ -143,9 +143,11 @@ function VoiceParticipantRow({ m, anim }: { m: Member; anim?: string }) {
             {streaming && meta?.appIcon ? <img src={`data:image/png;base64,${meta.appIcon}`} alt="" title={meta.appName ? `Стримит ${meta.appName}` : undefined} style={{ position: 'absolute', right: -3, bottom: -3, width: 14, height: 14, borderRadius: 3, border: '2px solid var(--bg-alt, #111)', objectFit: 'contain' }} /> : null}
           </>; })()}
         </div>
-        <div className="nm" title={m.displayName}>{m.displayName}{isLocal && !connecting ? ' (ты)' : ''}</div>
-        {connecting ? <span className="vc-connecting">подключение…</span> : null}
-        {pr?.game ? <span className="pi-game vc" data-tip={'Играет в ' + pr.game.name}>{pr.game.icon ? <img src={`data:image/png;base64,${pr.game.icon}`} alt="" /> : <span className="gpad">🎮</span>}<span className="pg-nm">{pr.game.name}</span></span> : null}
+        <div className="vc-id">
+          <div className="nm" title={m.displayName}>{m.displayName}{isLocal && !connecting ? ' (ты)' : ''}</div>
+          {connecting ? <span className="vc-connecting">подключение…</span> : null}
+          {pr?.game ? <span className="pi-game vc" data-tip={'Играет в ' + pr.game.name}>{pr.game.icon ? <img src={`data:image/png;base64,${pr.game.icon}`} alt="" /> : <span className="gpad">🎮</span>}<span className="pg-nm">{pr.game.name}</span></span> : null}
+        </div>
         {remote && streaming ? (
           <button className={'watchbtn' + (watching ? ' on' : '')} disabled={pending}
             aria-label={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}

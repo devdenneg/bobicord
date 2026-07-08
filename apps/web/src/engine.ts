@@ -256,7 +256,11 @@ export class Engine {
       let game: GameStatus | null = null;
       if (m.username === this.me.username) game = this.myGame;
       else { const gn = (p as any)?.attributes?.game; if (gn) game = { name: gn, icon: (p as any)?.attributes?.gicon || undefined }; }
-      presence[m.username] = { online, inVoice: inV, micMuted: (!!mp && mp.isMuted) || deaf, streaming: this.isStreaming(m.username), deafened: deaf, game };
+      const streaming = this.isStreaming(m.username);
+      // Стример игры без явного game-атрибута (детект не успел/захват сменил foreground): берём игру из
+      // МЕТА стрима (захваченное окно = игра) — чтобы «играет в X» показывалось у стримеров, в т.ч. у себя.
+      if (!game && streaming) { const meta = this.getStreamAppMeta(m.username); if (meta?.appName) game = { name: meta.appName, icon: meta.appIcon }; }
+      presence[m.username] = { online, inVoice: inV, micMuted: (!!mp && mp.isMuted) || deaf, streaming, deafened: deaf, game };
     }
     const speaking: Record<string, boolean> = {};
     this.speakingSet.forEach((u) => (speaking[u] = true));
@@ -448,7 +452,12 @@ export class Engine {
     }
   }
   private isStreaming(username: string): boolean {
-    if (username === this.me.username) return this.liveKitT.isBroadcasting(username) || this.treeT.isBroadcasting(username);
+    if (username === this.me.username) {
+      // web self-share (LiveKit) ИЛИ НАТИВНЫЙ self-стрим: его поднимает Rust, web-treeT в дерево НЕ
+      // вещает (treeT.isBroadcasting всегда false) — берём из discovery liveStreams (isRemoteBroadcasting),
+      // куда сервер шлёт stream-live И самому вещателю. Иначе стример не видел свой LIVE (другие — видели).
+      return this.liveKitT.isBroadcasting(username) || this.treeT.isRemoteBroadcasting(username);
+    }
     return this.liveKitT.isRemoteBroadcasting(username) || this.treeT.isRemoteBroadcasting(username);
   }
   // Один стрим — один транспорт (не dual-publish): смотрим, откуда реально вещает

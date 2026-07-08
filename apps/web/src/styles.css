@@ -598,6 +598,10 @@
   .vchan-list{padding:1px 2px 5px 6px;display:flex;flex-direction:column;gap:1px}
   .vchan-list .pi .head{gap:8px;padding:5px 7px}
   .vchan-list .pi .av{width:30px;height:30px;font-size:12px}
+  /* имя+игра в одном flex:1-контейнере → иконка игры инлайн сразу после ника (не уезжает вправо от
+     растянутого flex:1 ника), контролы (смотреть/мик/шеврон) прижаты вправо */
+  .vc-id{flex:1;min-width:0;display:flex;align-items:center;gap:8px}
+  .vc-id .nm{flex:0 1 auto}
   /* inline-инпуты: переименование + создание канала */
   .vchan-edit,.vchan-create input{flex:1;min-width:0;font-size:14px;font-weight:600;padding:4px 8px;border-radius:7px;background:var(--panel);border:1px solid var(--accent);color:var(--txt-h);width:auto}
   .vchan-create{display:flex;align-items:center;gap:7px;padding:6px 8px;border-radius:10px;background:var(--panel2)}
