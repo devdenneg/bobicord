@@ -559,12 +559,17 @@ export class TreeVideoTransport implements VideoTransport {
     const offCb = (sid: string, sdp: string) => { if (sid === streamId && !st.closed) this.onNativeOffer(streamId, st, sdp); };
     const iceCb = (sid: string, candidate: any) => { if (sid === streamId && st.pc && candidate) st.pc.addIceCandidate(candidate).catch(() => {}); };
     const topoCb = (payload: any) => { if (payload && payload.streamId === streamId) this.setTopology(streamId, { you: payload.you ?? null, nodes: payload.nodes || [] }); };
-    // Rust-relay сам понял, что стрим кончился (сирота >20с) — сносим watch и объявляем
-    // конец, даже если discovery-сокет webview пропустил stream-end.
+    // onNativeWatchEnded может прийти СПУРИОЗНО: остановка СВОЕЙ трансляции (или свитч) сбрасывает
+    // общий Rust relay-core и рвёт АКТИВНЫЙ watch чужого стрима. Поэтому тут НЕ удаляем стрим из
+    // liveStreams и НЕ объявляем «конец» (иначе у зрителя пропадал чужой стрим + ложное «закончил»,
+    // пока re-hello его не вернёт). Авторитет конца — discovery (stream-end) + re-hello. Рвём лишь
+    // мёртвый локальный watch; если стрим по discovery ещё жив — тут же переустанавливаем (авто-recovery).
     const endCb = (sid: string) => {
       if (sid !== streamId || st.closed) return;
       this.unwatch(streamId);
-      if (this.liveStreams.delete(streamId)) this.streamStopCbs.forEach((cb) => cb(streamId));
+      setTimeout(() => {
+        if (!this.closed && this.liveStreams.has(streamId) && !this.nativeWatches.has(streamId) && !this.watches.has(streamId)) this.watch(streamId);
+      }, 1500);
     };
     try {
       st.unlisten.push(await onNativeWatchOffer(offCb));
