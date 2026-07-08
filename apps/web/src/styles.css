@@ -624,6 +624,20 @@
   .vc-del-yes:hover{background:var(--red)}
   @keyframes sheen{from{left:-60%}to{left:135%}}
   .voice-bar{flex:0 0 auto;background:var(--bg2);border-top:1px solid var(--line-2);padding:8px 6px}
+  /* Персистентный голос-док (VoiceDock, уровень App): виден на всех экранах пока в голосовом.
+     На сервере снизу есть user-panel (#channels) → приподнимаем, чтоб не перекрыть; на главной — к низу. */
+  #voicedock{position:fixed;left:80px;bottom:14px;z-index:60;width:min(224px,calc(100vw - 96px));background:var(--bg2);border:1px solid var(--line-2);border-radius:14px;box-shadow:var(--sh-2);padding:8px;display:flex;flex-direction:column;gap:6px;animation:toastIn .2s cubic-bezier(.2,.8,.4,1)}
+  #voicedock.on-server{bottom:64px}
+  #voicedock .vd-info{display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:9px;cursor:pointer;min-width:0}
+  #voicedock .vd-info:hover{background:var(--panel3)}
+  #voicedock .vd-mark{width:28px;height:28px;flex:0 0 auto;border-radius:8px;display:flex;align-items:center;justify-content:center;background:rgba(35,165,89,.16);color:var(--green)}
+  #voicedock .vd-txt{min-width:0}
+  #voicedock .vd-txt b{display:block;font-size:12.5px;color:var(--green);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.25}
+  #voicedock .vd-txt span{display:block;font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #voicedock .vc-controls{gap:6px;justify-content:space-between}
+  #voicedock .vc-controls .cbtn{width:36px;height:36px}
+  #voicedock .conn-ms{display:none}
+  @media(max-width:900px){#voicedock{left:8px;bottom:72px;width:min(224px,calc(100vw - 16px))}#voicedock.on-server{bottom:72px}}
   .vc-controls{display:flex;gap:8px;justify-content:center}
   .vc-controls .cbtn{width:42px;height:42px;flex:0 0 auto;border-radius:50%;display:flex;align-items:center;justify-content:center;background:var(--panel3);color:var(--txt);padding:0;box-shadow:var(--sh-1),inset 0 0 0 1px rgba(255,255,255,.05),inset 0 1px 0 rgba(255,255,255,.07);transition:background .18s,color .18s,transform .18s cubic-bezier(.34,1.4,.64,1),box-shadow .18s}
   .vc-controls .cbtn .ic{transition:transform .18s cubic-bezier(.34,1.4,.64,1)}

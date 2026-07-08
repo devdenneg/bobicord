@@ -27,6 +27,7 @@ export interface Snapshot {
   inVoice: boolean;
   voiceConnecting: boolean;                    // оптимистично зашли, но mic ещё не опубликован (идёт подключение)
   myVoiceChannel: string | null;              // id голосового канала, в котором я сейчас (null = не в голосовом)
+  voiceServerId: string | null;               // сервер, на котором я в голосовом (для персистентного VoiceDock + гарда auto-leave); null = не в голосе
   voiceChannels: Record<string, string>;      // username -> channelId (кто в каком голосовом канале)
   deafened: boolean;
   localMicMuted: boolean;
@@ -280,7 +281,7 @@ export class Engine {
     return {
       connected: !!this.viewRoom, roomReady: this.roomReady, reconnecting: this.reconnecting,
       voiceQuality: this.inVoice ? this.connQuality : 'unknown', voicePing: this.inVoice ? this.pingMs : null,
-      inVoice: this.inVoice, voiceConnecting: this.inVoice && this.voiceConnecting, myVoiceChannel: this.currentVc, voiceChannels, deafened: this.deafened,
+      inVoice: this.inVoice, voiceConnecting: this.inVoice && this.voiceConnecting, myVoiceChannel: this.currentVc, voiceServerId: this.inVoice ? this.serverId : null, voiceChannels, deafened: this.deafened,
       localMicMuted: this.localMicMuted(), pttDown: this.pttDown,
       presence, speaking, streams, watching, pending, watchers, messages: this.messages, chatHasMore: this.chatMore, chatTrimmed: this.trimmedFront,
       typing: [...this.typingUsers].filter(([n, exp]) => exp > Date.now() && n !== this.me.displayName).map(([n]) => n),

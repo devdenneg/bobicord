@@ -9,7 +9,6 @@ import { avColor, initial, prefersReducedMotion } from '../util';
 import { emoteMap, emoteUrl } from '../emotes';
 import { EmotePicker } from './EmotePicker';
 import { getSettings, setSettings } from '../settings';
-import { isTauri, onBroadcastStopped, stopNativeBroadcast } from '../native';
 import { applyNativeUpdate } from '../nativeUpdate';
 import type { ChatMessage, Emote, Member, ReplyRef, Role } from '../types';
 import { PERM, hasPerm } from '../types';
@@ -185,11 +184,15 @@ function VoiceChannels() {
   const channels = active.channels || [];
   const canManage = hasPerm(active.myPerms || 0, PERM.MANAGE_CHANNELS);
   const myVc = eng.myVoiceChannel;
+  // список каналов относится к СМОТРИМОМУ серверу; мой голосовой может быть на ДРУГОМ (после расцепа
+  // голос/просмотр). auto-leave/подсветка .mine валидны лишь когда смотрю свой голосовой сервер —
+  // иначе myVc не найдётся в channels чужого сервера и leaveVoice ложно уронил бы живой голос.
+  const onVoiceServer = eng.voiceServerId === active.id;
 
   // мой голосовой канал удалили (админом) — аккуратно выходим из голосового
   useEffect(() => {
-    if (myVc && channels.length && !channels.some((c) => c.id === myVc)) E.leaveVoice();
-  }, [myVc, channels, E]);
+    if (onVoiceServer && myVc && channels.length && !channels.some((c) => c.id === myVc)) E.leaveVoice();
+  }, [onVoiceServer, myVc, channels, E]);
 
   return (
     <div className="vchans">
@@ -198,7 +201,7 @@ function VoiceChannels() {
         <span className="vchans-count">{channels.length}/5</span>
       </div>
       {channels.map((c) => (
-        <VoiceChannelItem key={c.id} channel={c} canManage={canManage} canDelete={canManage && channels.length > 1} mine={myVc === c.id}
+        <VoiceChannelItem key={c.id} channel={c} canManage={canManage} canDelete={canManage && channels.length > 1} mine={onVoiceServer && myVc === c.id}
           membersInChannel={members.filter((m) => eng.voiceChannels[m.username] === c.id)} />
       ))}
       {canManage && channels.length > 0 && channels.length < 5 ? <CreateChannelRow /> : null}
@@ -284,83 +287,8 @@ function CreateChannelRow() {
   );
 }
 
-/* Вещание — только из нативного клиента (Evolution-TZ Э5 / CLAUDE.md инвариант 2).
-   В браузере эта кнопка не рендерится вовсе. Конфиг источника/разрешения/битрейта
-   и живая дебаг-статистика — в BroadcastModal (открывается по клику, живёт в
-   глобальном сторе modal/broadcastLive, т.к. должна остаться открытой между
-   ре-рендерами и переживать переключение вкладок сервера). */
-function NativeBroadcastButton() {
-  const eng = useEngine();
-  const live = useStore((s) => s.broadcastLive);
-
-  // Слушаем и когда модалка со статистикой закрыта — трансляция может
-  // завершиться сама (например источник-окно закрыли, или энкодер/захват упали
-  // фатально — mod.rs теперь шлёт это событие и в таких случаях тоже). Дополнительно
-  // форсируем stop_broadcast: он же снимает Tauri-состояние (BroadcastState),
-  // без этого повторный старт вечно отвечал бы «уже вещаем», даже когда трансляция
-  // уже мертва.
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    onBroadcastStopped((info) => {
-      useStore.getState().setBroadcastLive(false);
-      // reason == null — штатный стоп по кнопке, тост не нужен. Иначе трансляция
-      // умерла сама (энкодер/захват/сигналинг) — раньше это било молча, юзер видел
-      // только откат в форму настроек без объяснения.
-      if (info.reason) useStore.getState().toast('Трансляция остановлена: ' + info.reason, 'err');
-      stopNativeBroadcast().catch(() => {});
-    }).then((u) => (unlisten = u));
-    return () => unlisten?.();
-  }, []);
-
-  if (!eng.inVoice) return null;
-  return (
-    <button className={'cbtn' + (live ? ' danger-on' : '')} aria-pressed={live}
-      data-tip={live ? 'Трансляция идёт' : 'Начать трансляцию экрана'}
-      onClick={() => useStore.getState().setModal('broadcast')}>
-      <Icon name={live ? 'screen-stop' : 'screen'} sm />
-    </button>
-  );
-}
-
-/* Веб-вещание — старый LiveKit-путь (VP8, через SFU), оставлен параллельно с
-   нативным P2P-деревом (см. CLAUDE.md инвариант 2 / docs/Evolution-TZ.md, решение
-   2026-07-06). Зритель сам определяет транспорт при `watch()` — тут ничего не меняем. */
-function ShareButton() {
-  const eng = useEngine();
-  const E = getEngine()!;
-  const me = useStore((s) => s.me)!;
-  if (!eng.inVoice) return null;
-  const live = !!eng.presence[me.username]?.streaming;
-  return (
-    <button className={'cbtn' + (live ? ' danger-on' : '')} aria-pressed={live}
-      data-tip={live ? 'Трансляция идёт' : 'Транслировать экран'}
-      onClick={() => E.share()}>
-      <Icon name={live ? 'screen-stop' : 'screen'} sm />
-    </button>
-  );
-}
-
-function VoiceControls() {
-  const eng = useEngine();
-  const E = getEngine()!;
-  const mode = getSettings().mode;
-  const muted = eng.localMicMuted;
-  const ptt = mode === 'ptt' && !eng.deafened;
-  const micClass = 'cbtn' + (muted && !ptt ? ' danger-on' : '') + (muted && ptt && !eng.pttDown ? ' ptt-idle' : '') + (eng.pttDown ? ' ptt-live' : '');
-  const q = eng.voiceQuality;
-  const qLabel = q === 'excellent' ? 'отличное' : q === 'good' ? 'хорошее' : q === 'poor' ? 'слабое' : q === 'lost' ? 'потеряно' : 'соединение…';
-  const qTip = (eng.voicePing != null ? eng.voicePing + ' мс' : '—') + ' · ' + qLabel;
-  return (
-    <div className="vc-controls">
-      <div className={'conn-ind q-' + q} data-tip={qTip} aria-label={'Качество связи: ' + qTip} tabIndex={0}><i /><i /><i /></div>
-      <span className="conn-ms">{eng.voicePing != null ? eng.voicePing + ' мс' : ''}</span>
-      <button className={micClass} aria-pressed={muted} data-tip="Микрофон · M" onClick={() => E.toggleMic()}><Icon name={muted ? 'mic-off' : 'mic'} sm /></button>
-      <button className={'cbtn' + (eng.deafened ? ' danger-on' : '')} aria-pressed={eng.deafened} data-tip="Заглушить · D" onClick={() => E.toggleDeaf()}><Icon name={eng.deafened ? 'head-off' : 'head'} sm /></button>
-      {isTauri ? <NativeBroadcastButton /> : <ShareButton />}
-      <button className="cbtn leave-v" data-tip="Выйти из голосового" onClick={() => E.leaveVoice()}><Icon name="leave" sm /></button>
-    </div>
-  );
-}
+// VoiceControls / ShareButton / NativeBroadcastButton вынесены в components/VoiceDock.tsx —
+// персистентный голос-док на уровне App (виден на всех экранах, пока ты в голосовом).
 
 // роли сразу за ником; что не влезло — сворачиваем в «+N» с тултипом всех ролей
 function roleBadge(r: Role) {
@@ -1286,7 +1214,6 @@ function Stage({ minimized, setMin }: { minimized: boolean; setMin: (v: boolean)
 
 /* ---------- Channels sidebar (left) ---------- */
 function Channels() {
-  const eng = useEngine();
   const active = useStore((s) => s.active)!;
   const me = useStore((s) => s.me)!;
   const setModal = useStore((s) => s.setModal);
@@ -1296,7 +1223,6 @@ function Channels() {
         <span className="chn">{active.name}</span><Icon name="info" sm />
       </div>
       <div className="ch-body"><VoiceChannels /></div>
-      {eng.inVoice ? <div className="voice-bar"><VoiceControls /></div> : null}
       <div className="user-panel">
         <div className="up-i" onClick={() => setModal('profile')}><b>{me.displayName}</b><span>В сети</span></div>
         <button className="up-btn" data-tip="Настройки звука" onClick={() => setModal('settings')}><Icon name="gear" sm /></button>
