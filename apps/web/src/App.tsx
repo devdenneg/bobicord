@@ -11,7 +11,7 @@ import { ServerView } from './components/ServerView';
 import { Modals } from './components/Modals';
 import { DownloadCard } from './components/DownloadFab';
 import { applyNativeUpdate } from './nativeUpdate';
-import { isTauri, setGlobalHotkeys, onGlobalHotkey } from './native';
+import { isTauri, setGlobalHotkeys, onGlobalHotkey, setDetectableGames } from './native';
 import type { ServerSummary, OnlineMember, KeybindAction } from './types';
 import { LogoLoader } from './components/LogoLoader';
 import { initNotifications } from './notify';
@@ -385,6 +385,8 @@ export function App() {
     initNotifications().then((welcomed) => {
       if (welcomed) useStore.getState().toast('Уведомления включены — отключить можно в Настройках → Уведомления', 'info');
     }).catch(() => {});
+    // натив: подтягиваем аллоулист игр Discord (сервер дистиллирует) → Rust матчит процессы для детекта
+    if (isTauri) api.detectableGames().then((d) => { if (d?.games?.length) setDetectableGames(d.games); }).catch(() => {});
   }, [me]);
 
   // hotkeys (мут микрофона / заглушить звук — настраиваемые комбинации из keybinds, + PTT) —

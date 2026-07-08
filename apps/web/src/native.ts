@@ -16,6 +16,12 @@ export async function detectGame(): Promise<GameInfo | null> {
   try { const { invoke } = await import('@tauri-apps/api/core'); return await invoke<GameInfo | null>('detect_game'); }
   catch { return null; }
 }
+// Передаёт в Rust аллоулист игр Discord (веб фетчит /api/detectable-games) — главный сигнал детекта.
+export async function setDetectableGames(games: { name: string; exes: string[] }[]): Promise<void> {
+  if (!isTauri) return;
+  try { const { invoke } = await import('@tauri-apps/api/core'); await invoke('set_detectable_games', { games }); }
+  catch { /**/ }
+}
 
 export interface MonitorInfo { index: number; name: string }
 

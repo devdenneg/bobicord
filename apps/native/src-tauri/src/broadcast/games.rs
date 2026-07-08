@@ -13,7 +13,8 @@
 //! не запускавшиеся / с выключенным GameDVR игры отсутствуют — поэтому это ПОЗИТИВНЫЙ сигнал (уверенно
 //! подтверждает игру), а не единственный; за играми вне списка остаётся эвристика-фолбэк в lib.rs.
 
-use std::collections::HashSet;
+use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -52,6 +53,101 @@ fn read_gameconfigstore() -> HashSet<String> {
                 }
             }
         }
+    }
+    out
+}
+
+// ─────────── Discord detectable-games (главный позитивный аллоулист: тысячи игр, точно) ───────────
+// Веб фетчит /api/detectable-games (сервер дистиллирует список Discord) и передаёт сюда командой
+// set_detectable_games. Матчим ЗАПУЩЕННЫЕ процессы по суффиксу пути exe (как arRPC). Это первичный
+// сигнал детекта — покрывает почти все игры и НЕ ловит не-игры (в отличие от фуллскрин-эвристики).
+
+#[derive(Deserialize)]
+pub struct GameEntry {
+    pub name: String,
+    pub exes: Vec<String>, // win32 path-suffix'ы (lowercase, '/'), напр. "bin/win64/cs2.exe"
+}
+
+struct Detectable {
+    suffix_to_name: HashMap<String, String>, // суффикс пути → имя игры
+    basenames: HashSet<String>,              // basename каждого exe — дешёвый пред-фильтр по ToolHelp
+}
+static DETECTABLE: Mutex<Option<Detectable>> = Mutex::new(None);
+
+/// Устанавливает аллоулист Discord (из веба). Строит суффикс→имя + множество basename'ов.
+pub fn set_detectable(games: Vec<GameEntry>) {
+    let mut suffix_to_name: HashMap<String, String> = HashMap::new();
+    let mut basenames: HashSet<String> = HashSet::new();
+    for g in games {
+        for exe in g.exes {
+            let e = exe.trim().to_lowercase().replace('\\', "/");
+            if e.is_empty() {
+                continue;
+            }
+            if let Some(base) = e.rsplit('/').next() {
+                basenames.insert(base.to_string());
+            }
+            suffix_to_name.entry(e).or_insert_with(|| g.name.clone());
+        }
+    }
+    *DETECTABLE.lock().unwrap() = Some(Detectable { suffix_to_name, basenames });
+}
+
+/// Ищет среди ЗАПУЩЕННЫХ процессов игру из аллоулиста Discord. Дёшево: сначала матч по basename
+/// (ToolHelp, без OpenProcess), затем у кандидатов — полный путь и суффикс-матч. (имя игры, pid) или None.
+pub fn match_running_game(me_pid: u32) -> Option<(String, u32)> {
+    let guard = DETECTABLE.lock().unwrap();
+    let det = guard.as_ref()?;
+    if det.suffix_to_name.is_empty() {
+        return None;
+    }
+    for (pid, exe) in enum_processes() {
+        if pid == me_pid || pid == 0 {
+            continue;
+        }
+        if !det.basenames.contains(&exe.to_lowercase()) {
+            continue; // не кандидат — не открываем процесс (дёшево)
+        }
+        let path = match crate::broadcast::capture::process_full_path(pid) {
+            Some(p) => p,
+            None => continue,
+        };
+        let p = path.to_lowercase().replace('\\', "/");
+        let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+        // tail-суффиксы: game.exe → dir/game.exe → ... (ключ Discord любой глубины)
+        for i in 1..=parts.len() {
+            let suffix = parts[parts.len() - i..].join("/");
+            if let Some(name) = det.suffix_to_name.get(&suffix) {
+                return Some((name.clone(), pid));
+            }
+        }
+    }
+    None
+}
+
+/// Перечень запущенных процессов (pid, exe basename) через ToolHelp — дёшево, без OpenProcess.
+fn enum_processes() -> Vec<(u32, String)> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    let mut out = Vec::new();
+    unsafe {
+        let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            Ok(h) => h,
+            Err(_) => return out,
+        };
+        let mut pe = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        if Process32FirstW(snap, &mut pe).is_ok() {
+            loop {
+                let n = pe.szExeFile.iter().position(|&c| c == 0).unwrap_or(pe.szExeFile.len());
+                out.push((pe.th32ProcessID, String::from_utf16_lossy(&pe.szExeFile[..n])));
+                if Process32NextW(snap, &mut pe).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
     }
     out
 }

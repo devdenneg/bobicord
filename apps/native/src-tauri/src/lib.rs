@@ -86,24 +86,34 @@ fn allowed_game(process: &str) -> Option<String> {
   if stem.is_empty() || GAME_BLOCK.contains(&stem.as_str()) { None } else { Some(stem) }
 }
 
-// Детект игры (Discord-style «играет в X»). Двухуровнево:
-//   1) ПОЗИТИВНЫЙ АЛЛОУЛИСТ — полный путь exe окна есть в списке игр Windows (GameConfigStore,
-//      games.rs). Near-zero false-positive, ловит игру в любом режиме (фуллскрин/окно/alt-tab).
-//   2) ФОЛБЭК — только полноэкранное FOREGROUND-окно не из блоклиста (для игр, которых Windows ещё
-//      не распознала). Прежний «любое foreground-окно = игра» УБРАН — он и ловил каждое окно.
-// Только метаданные окна/exe: НЕ читаем память игры и не инжектим → безопасно для анти-читов.
+// Веб фетчит /api/detectable-games (сервер дистиллирует список Discord) и передаёт сюда — главный
+// позитивный аллоулист для детекта (тысячи игр, точно, без ложных срабатываний фуллскрин-эвристики).
+#[tauri::command]
+fn set_detectable_games(games: Vec<broadcast::games::GameEntry>) {
+  broadcast::games::set_detectable(games);
+}
+
+// Детект игры (Discord-style «играет в X») — ДВА позитивных аллоулиста, без фуллскрин-эвристики:
+//   1) Discord detectable-list — запущенный процесс сматчен по суффиксу пути exe (games.rs, тысячи игр).
+//   2) GameConfigStore — полный путь exe окна ∈ списке игр, реально запускавшихся на этой машине (Windows).
+// Фуллскрин-фолбэк УБРАН: ловил не-игры (полноэкранное видео/приложения) → «лишние программы».
+// Только метаданные окна/exe/процесса: НЕ читаем память игры и не инжектим → безопасно для анти-читов.
 #[tauri::command]
 fn detect_game() -> Option<GameInfo> {
-  let me_pid = std::process::id(); // свой процесс — окна RelayApp игрой не считаем (имя бинаря может ≠ "relayapp")
+  let me_pid = std::process::id(); // свой процесс — окна/процессы RelayApp игрой не считаем
 
-  // 1) Позитивный аллоулист: окно, чей полный путь exe Windows сама признала игрой. foreground
-  //    первым (если смотрим именно на игру), затем все окна (фоновая/alt-tab игра из списка).
+  // 1) Discord-аллоулист: любой ЗАПУЩЕННЫЙ процесс = известная игра. Ловит в любом режиме (окно/фуллскрин/фон).
+  if let Some((name, pid)) = broadcast::games::match_running_game(me_pid) {
+    return Some(GameInfo { name: name.chars().take(48).collect(), icon: broadcast::icon::window_icon_png_base64(0, pid) });
+  }
+
+  // 2) GameConfigStore: окно, чей полный путь exe Windows сама признала игрой. foreground первым
+  //    (если смотрим именно на игру), затем все окна (фоновая/alt-tab игра из списка).
   let allow = broadcast::games::game_exe_allowlist();
   if !allow.is_empty() {
     let mut cands: Vec<(isize, String, String, u32)> = Vec::new();
     if let Some(fg) = broadcast::capture::foreground_window() { cands.push(fg); }
     cands.extend(broadcast::capture::all_windows());
-    // Кэш «путь этого pid ∈ аллоулист?» — не дёргаем OpenProcess повторно на окнах одного процесса.
     let mut checked: std::collections::HashMap<u32, bool> = std::collections::HashMap::new();
     for (hwnd, title, process, pid) in cands {
       if pid == me_pid { continue; }
@@ -112,17 +122,6 @@ fn detect_game() -> Option<GameInfo> {
       });
       if is_game {
         return Some(game_info_from(hwnd, &title, &exe_stem(&process), pid));
-      }
-    }
-  }
-
-  // 2) Фолбэк для игр вне списка Windows: ТОЛЬКО полноэкранное FOREGROUND-окно, не из блоклиста.
-  //    foreground+фуллскрин отсекает подавляющую часть шума (оконные приложения, фоновые плееры/обои
-  //    на другом мониторе); остаток (полноэкранное видео в нишевом плеере) редок и покрыт блоклистом.
-  if let Some((hwnd, title, process, pid)) = broadcast::capture::foreground_fullscreen_window() {
-    if pid != me_pid {
-      if let Some(stem) = allowed_game(&process) {
-        return Some(game_info_from(hwnd, &title, &stem, pid));
       }
     }
   }
@@ -298,7 +297,7 @@ pub fn run() {
       std::thread::spawn(branding::fix_shortcuts);
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![ping, list_monitors, list_windows, detect_game, start_broadcast, set_broadcast_source, stop_broadcast, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys])
+    .invoke_handler(tauri::generate_handler![ping, list_monitors, list_windows, detect_game, set_detectable_games, start_broadcast, set_broadcast_source, stop_broadcast, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }

@@ -135,4 +135,6 @@ export const api = {
       return url ? { version: d.version, url } : null;
     } catch { return null; }
   },
+  // аллоулист игр Discord (дистиллят с сервера) — натив матчит запущенные процессы для детекта игры
+  detectableGames: () => req<{ games: { name: string; exes: string[] }[] }>('GET', '/detectable-games'),
 };

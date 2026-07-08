@@ -408,6 +408,36 @@ app.post('/api/login', (req, res) => {
   res.json({ token: makeSession(u.id), user: pubUser(u), username: u.username });
 });
 
+/* ---------------- Discord detectable-games (аллоулист для натив-детекта игры) ---------------- */
+// Дистиллируем публичный список Discord (тысячи игр) в компактный [{name, exes:[win32 path-suffix]}].
+// Кэш в памяти + на диске, обновление раз в сутки. Натив-клиент фетчит и матчит запущенные процессы по
+// суффиксу пути exe → точный детект без фуллскрин-эвристики (убирает и «слабо ловит», и «лишние программы»).
+let _detCache = null, _detAt = 0;
+const _DET_FILE = path.join(DATA_DIR, 'detectable.json');
+async function getDetectableGames() {
+  const now = Date.now();
+  if (_detCache && now - _detAt < 24 * 3600 * 1000) return _detCache;
+  try {
+    const r = await fetch('https://discord.com/api/v10/applications/detectable', { signal: AbortSignal.timeout(20000) });
+    const list = await r.json();
+    const out = [];
+    for (const g of Array.isArray(list) ? list : []) {
+      const exes = (g.executables || [])
+        .filter(e => e && e.os === 'win32' && !e.is_launcher && e.name)
+        .map(e => String(e.name).toLowerCase().replace(/\\/g, '/'));
+      if (exes.length && g.name) out.push({ name: String(g.name).slice(0, 80), exes: [...new Set(exes)] });
+    }
+    if (out.length) { _detCache = out; _detAt = now; try { fs.writeFileSync(_DET_FILE, JSON.stringify(out)); } catch (e) {} }
+    return _detCache || out;
+  } catch (e) {
+    if (_detCache) return _detCache;
+    try { _detCache = JSON.parse(fs.readFileSync(_DET_FILE, 'utf8')); _detAt = now; return _detCache; } catch (e2) { return []; }
+  }
+}
+app.get('/api/detectable-games', requireAuth, async (req, res) => {
+  try { res.json({ games: await getDetectableGames() }); } catch (e) { res.json({ games: [] }); }
+});
+
 /* ---------------- PROFILE ---------------- */
 app.get('/api/me', requireAuth, async (req, res) => {
   const rows = db.prepare(`
