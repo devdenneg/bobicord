@@ -700,7 +700,9 @@ function Chat() {
   useEffect(() => {
     const lastMsg = messages.length ? messages[messages.length - 1] : null;
     const last = lastMsg ? lastMsg.id : null;
-    if (prevLastId.current !== null && last !== prevLastId.current && !atBottomRef.current && lastMsg && !lastMsg.mine) {
+    // !lastMsg.sys — системные события (стрим начал/закончил, служебное) НЕ считаются непрочитанным
+    // чатом: иначе они накручивали бейдж (у них нет sid → markRead-внизу их не сбрасывал → залипали).
+    if (prevLastId.current !== null && last !== prevLastId.current && !atBottomRef.current && lastMsg && !lastMsg.mine && !lastMsg.sys) {
       setPill((p) => p + 1);
       if (activeId) bumpUnreadStore(activeId); // бейдж в рейле/таскбаре растёт (не читаем сейчас)
     }
@@ -713,7 +715,11 @@ function Chat() {
     if (!atBottom || !activeId) return;
     let lastSid: number | undefined;
     for (let i = messages.length - 1; i >= 0; i--) { if (messages[i].sid != null) { lastSid = messages[i].sid!; break; } }
-    if (lastSid != null && lastSid > (useStore.getState().lastRead[activeId] || 0)) markReadStore(activeId, lastSid);
+    const lr = useStore.getState().lastRead[activeId] || 0;
+    // Внизу чата = всё прочитано. Есть sid новее lastRead → markRead двигает базу + чистит бейдж.
+    // Нет нового sid, но бейдж накручен (sys-события / stale) → всё равно сбрасываем локальный unread=0.
+    if (lastSid != null && lastSid > lr) markReadStore(activeId, lastSid);
+    else if ((useStore.getState().unread[activeId] || 0) > 0) markReadStore(activeId, lr);
   }, [atBottom, messages, activeId, markReadStore]);
 
   // срез сообщений с начала (кап памяти в engine) сдвигает данные вперёд — поднимаем firstItemIndex
