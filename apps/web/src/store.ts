@@ -7,6 +7,7 @@ import { notifPermission } from './notify';
 import { ensurePushSubscribed, unsubscribePush } from './push';
 import { connectNotifyWs, disconnectNotifyWs } from './notifyws';
 import { preloadSounds } from './sounds';
+import { isTauri } from './native';
 import type { User, ServerSummary, Member, ServerDetail, Toast, ToastKind } from './types';
 
 let engine: Engine | null = null;
@@ -96,6 +97,8 @@ function startMemberPoll(id: string) {
 
 // Бейдж на иконке приложения (таскбар PWA / dock) — сумма непрочитанных + флаг обновления.
 // App Badging API: в установленной PWA на Windows рисует бейдж на иконке в таскбаре.
+// В НАТИВЕ (Tauri) App Badging в WebView2 на таскбаре не рисует → отдельно ставим Windows
+// overlay-иконку (setOverlayIcon) — красный кружок с числом в углу иконки, как у Discord/Telegram.
 function updateAppBadge() {
   try {
     const st = useStore.getState();
@@ -103,7 +106,41 @@ function updateAppBadge() {
     for (const k in st.unread) total += st.unread[k] || 0;
     const n: any = navigator as any;
     if (total > 0) n.setAppBadge?.(total); else n.clearAppBadge?.();
+    if (isTauri) setNativeBadge(total);
   } catch { /**/ }
+}
+// Windows overlay-иконка таскбара (натив). Перерисовываем PNG только при СМЕНЕ числа (updateAppBadge
+// дёргается на каждое сообщение). undefined снимает оверлей.
+let lastNativeBadge = -1;
+async function setNativeBadge(total: number) {
+  if (total === lastNativeBadge) return;
+  lastNativeBadge = total;
+  try {
+    const { getCurrentWindow } = await import('@tauri-apps/api/window');
+    const win = getCurrentWindow();
+    if (total <= 0) { await win.setOverlayIcon(undefined); return; }
+    const png = await badgePng(total);
+    if (png) await win.setOverlayIcon(png); else await win.setOverlayIcon(undefined);
+  } catch { /**/ }
+}
+// Рисуем бейдж (красный кружок + число, «9+» при >9) в PNG-байты для setOverlayIcon.
+function badgePng(nRaw: number): Promise<Uint8Array | null> {
+  return new Promise((resolve) => {
+    try {
+      const S = 32; // Windows скалит оверлей до 16×16 — рисуем крупнее для чёткости
+      const c = document.createElement('canvas'); c.width = S; c.height = S;
+      const g = c.getContext('2d'); if (!g) { resolve(null); return; }
+      const label = nRaw > 9 ? '9+' : String(nRaw);
+      g.beginPath(); g.arc(S / 2, S / 2, S / 2 - 1, 0, Math.PI * 2); g.fillStyle = '#ed4245'; g.fill();
+      g.fillStyle = '#fff'; g.font = `bold ${label.length > 1 ? 17 : 22}px "Segoe UI", sans-serif`;
+      g.textAlign = 'center'; g.textBaseline = 'middle';
+      g.fillText(label, S / 2, S / 2 + 1);
+      c.toBlob((b) => {
+        if (!b) { resolve(null); return; }
+        b.arrayBuffer().then((ab) => resolve(new Uint8Array(ab))).catch(() => resolve(null));
+      }, 'image/png');
+    } catch { resolve(null); }
+  });
 }
 // Слить серверные счётчики непрочитанного. Активный (connected) сервер клиент ведёт сам
 // (bumpUnread/markRead по факту чтения) — поллингом его не трогаем, иначе моргнёт до долёта markRead.

@@ -12,6 +12,7 @@
     "notification:default",
     "core:window:allow-create",
     "core:webview:allow-create-webview-window",
-    "core:window:allow-close"
+    "core:window:allow-close",
+    "core:window:allow-set-overlay-icon"
   ]
 }
