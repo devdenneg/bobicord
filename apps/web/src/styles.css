@@ -4,6 +4,8 @@
     --txt:#dbdee1; --txt-h:#f2f3f5; --muted:#949ba4;
     --accent:#5865f2; --accent-h:#4752c4; --accent-txt:#8b93ff;
     --green:#23a559; --green-2:#3ba55d; --red:#f23f43; --red-fill:#da373c; --yellow:#f0b232; --blue:#3b9dff;
+    /* live = ФИКС hue (не --accent): стрим не сливается с акцентом даже в crimson-теме. num = табличные цифры. */
+    --live:#ff5a6a; --live-glow:rgba(255,90,106,.22); --num:ui-monospace,'Cascadia Code','Segoe UI Mono',Consolas,monospace;
     --r-lg:16px; --r-md:12px; --r-sm:8px; --r-xs:6px;
     --tr:150ms cubic-bezier(0,0,.2,1);
     --sh-1:0 1px 2px rgba(0,0,0,.4);
@@ -157,14 +159,18 @@
   .bigbtn{flex:1;min-width:min(220px,100%);background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-md);padding:20px;text-align:left;display:flex;gap:14px;align-items:center;box-shadow:var(--sh-1)}
   .bigbtn:hover{background:var(--panel2);border-color:var(--accent)}
   .bigbtn .bi{width:46px;height:46px;border-radius:12px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;color:#fff}
-  .bigbtn .bi.g{background:linear-gradient(135deg,#3ba55d,#1f8b4c)}
-  .bigbtn .bi.a{background:linear-gradient(135deg,#6366f1,#8b5cf6)}
+  .bigbtn .bi.g{background:var(--green)}
+  .bigbtn .bi.a{background:var(--accent)}
   .bigbtn b{display:block;font-size:15.5px;color:var(--txt-h)}
   .bigbtn span{font-size:13px;color:var(--muted)}
   .home-sec{font-size:12px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--muted);margin:0 0 12px}
-  .srv-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(230px,100%),1fr));gap:12px}
-  .srv-card{background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-md);padding:16px;text-align:left;box-shadow:var(--sh-1);display:flex;flex-direction:column;gap:10px;align-items:stretch}
+  /* bento: активные (live/voice) карточки span-2, dense затыкает дыры → взвешенная сетка, не однообразная */
+  .srv-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(288px,100%),1fr));gap:14px;grid-auto-flow:dense}
+  .srv-card{background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-md);padding:16px;text-align:left;box-shadow:var(--sh-1);display:flex;flex-direction:column;gap:10px;align-items:stretch;transition:background var(--tr),border-color var(--tr),transform var(--tr),box-shadow var(--tr)}
   .srv-card:hover{background:var(--panel2);border-color:var(--accent);transform:translateY(-2px)}
+  .srv-card.is-live{grid-column:span 2;box-shadow:var(--sh-2),var(--hair)}
+  .srv-card.is-connected .sc-ic{box-shadow:0 0 0 2px var(--panel),0 0 0 4px var(--green)}
+  @media(max-width:1024px){.srv-card.is-live{grid-column:auto}}
   .srv-card .sc-h{display:flex;align-items:center;gap:12px}
   .srv-card .sc-ic{width:46px;height:46px;border-radius:14px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:19px;color:#fff}
   .srv-card .sc-nm{font-weight:600;font-size:15.5px;color:var(--txt-h);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -185,8 +191,107 @@
   .sc-tip-av{width:26px;height:26px;border-radius:50%;flex:0 0 auto;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff;overflow:hidden}
   .sc-tip-nm{flex:1;min-width:0;font-size:13px;color:var(--txt-h);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .sc-tip-st{flex:0 0 auto;font-size:10.5px;font-weight:600;color:var(--muted);white-space:nowrap}
-  .sc-tip-st.live{color:#ff5a6a}
+  .sc-tip-st.live{color:var(--live)}
   .sc-tip-st.voice{color:var(--green)}
+
+  /* ═══ HOME «пультовая» (редизайн): activity-first, bento, сигнатурный кластер ═══ */
+  .dot{width:7px;height:7px;border-radius:50%;flex:0 0 auto;display:inline-block;background:var(--muted)}
+  .dot.green{background:var(--green)} .dot.acc{background:var(--accent)}
+
+  /* липкий хедер: бренд · приветствие · стат-стрип · действия · профиль (заменяет .home-top) */
+  .home-hd{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding:12px 28px;border-bottom:1px solid var(--line-2);background:color-mix(in srgb,var(--bg2) 90%,transparent);backdrop-filter:blur(10px)}
+  .home-hd .home-brand span{font-size:19px}
+  .hd-greet{font-size:14px;color:var(--muted)}
+  .stat-strip{display:flex;gap:9px;margin-left:auto;flex-wrap:wrap}
+  .stat-pill{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--muted);background:var(--panel);border:1px solid var(--line-2);border-radius:999px;padding:5px 12px;font-family:var(--num);font-variant-numeric:tabular-nums}
+  .stat-pill b{color:var(--txt-h);font-weight:700}
+  .hd-actions{display:flex;align-items:center;gap:8px}
+  .hd-create{display:flex;align-items:center;gap:6px;background:var(--accent);color:#fff;font-weight:600;font-size:13.5px;padding:8px 14px;border-radius:9px}
+  .hd-create:hover{background:var(--accent-h)}
+  .hd-join{background:var(--panel2);color:var(--txt);font-size:13.5px;padding:8px 14px;border-radius:9px}
+  .hd-join:hover{background:var(--panel3)}
+  .hd-me{width:38px;height:38px;border-radius:50%;padding:0;overflow:hidden;color:#fff;font-weight:700;font-size:14px;display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+  .hd-me:hover{box-shadow:0 0 0 2px var(--accent)}
+
+  .home-body{max-width:1120px;width:100%;margin:0 auto;padding:22px 28px 72px}
+  .home-body .home-sec:first-child{margin-top:0}
+  /* брендовое подчёркивание «Сейчас в эфире», когда эфир есть */
+  .home-sec.hot::after{content:'';display:block;width:34px;height:2px;margin-top:6px;border-radius:2px;background:linear-gradient(90deg,#57d6ff,#a578f2,#ff62c6)}
+
+  /* приветственный герой (нет серверов) */
+  .home-welcome{display:flex;align-items:center;justify-content:center;min-height:60vh}
+  .hw-inner{text-align:center;max-width:640px}
+  .hw-inner h1{margin:0 0 6px;font-size:26px;color:var(--txt-h)}
+  .hw-inner p{margin:0 0 24px;color:var(--muted);font-size:15px}
+
+  /* S1 живой эфир */
+  .live-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+  .live-card{position:relative;background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-lg);padding:15px 17px;box-shadow:var(--sh-2),var(--hair);display:flex;flex-direction:column;gap:13px;min-height:118px}
+  .live-card.stream{border-top:1.5px solid var(--live)}
+  .live-card:hover{border-color:var(--accent)}
+  .lc-top{display:flex;align-items:center;gap:10px}
+  .lc-srv{margin-left:auto;font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:45%}
+  .live-pill{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:800;letter-spacing:.4px;text-transform:uppercase;color:var(--live);background:var(--live-glow);padding:3px 9px;border-radius:999px}
+  .live-pill .live-dot{width:7px;height:7px;border-radius:50%;background:var(--live);animation:pulse 2s ease-in-out infinite}
+  .live-pill.voice-pill{color:var(--green);background:color-mix(in srgb,var(--green) 16%,transparent)}
+  .live-pill.voice-pill .ic{font-size:14px}
+  .lc-lead{display:flex;align-items:center;gap:11px}
+  .lc-av{width:44px;height:44px;border-radius:50%;flex:0 0 auto;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:17px;color:#fff;overflow:hidden}
+  .lc-av.live{box-shadow:0 0 0 2px var(--panel),0 0 0 4px var(--live)}
+  .lc-who{min-width:0}
+  .lc-who b{display:block;font-size:15px;color:var(--txt-h);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .lc-who span{font-size:12.5px;color:var(--muted)}
+  .lc-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:auto}
+  .cta{background:var(--accent);color:#fff;font-weight:700;font-size:13.5px;padding:9px 18px;border-radius:var(--r-sm);flex:0 0 auto}
+  .cta:hover{background:var(--accent-h)}
+  .cta.ghost{background:var(--panel2);color:var(--txt)}
+  .cta.ghost:hover{background:var(--panel3)}
+
+  /* пустой эфир — не белый лист */
+  .live-empty{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+  .live-empty .le-body{grid-column:1;background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-lg);padding:18px;display:flex;flex-direction:column;gap:12px;box-shadow:var(--sh-1)}
+  .le-ic{width:42px;height:42px;border-radius:12px;background:var(--panel2);display:flex;align-items:center;justify-content:center;color:var(--muted)}
+  .le-txt b{display:block;font-size:15px;color:var(--txt-h)}
+  .le-txt span{font-size:13px;color:var(--muted)}
+  .le-ghost{border:1.5px dashed var(--line-2);border-radius:var(--r-lg);opacity:.4;min-height:118px}
+  @media(max-width:900px){.live-empty{grid-template-columns:1fr}.le-ghost{display:none}}
+
+  /* ★ сигнатурный кластер (везде одинаковый) */
+  .cluster{display:flex;align-items:center}
+  .cluster .mini-av{width:27px;height:27px;border-radius:50%;font-size:11px;font-weight:700;color:#fff;display:flex;align-items:center;justify-content:center;overflow:hidden;flex:0 0 auto;margin-right:-8px;border:2px solid var(--panel)}
+  .cluster .mini-av.live{border-color:var(--live);box-shadow:0 0 0 1px var(--live)}
+  .cluster .mini-av.voice{border-color:var(--green)}
+  .cluster .more{margin-left:14px;font-family:var(--num);font-variant-numeric:tabular-nums;color:var(--muted);font-size:12px;font-weight:600}
+
+  /* S2 «Тебя ждут» — чипы непрочитанного */
+  .catchup{display:flex;flex-wrap:wrap;gap:8px}
+  .cu-chip{display:flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--line-2);border-radius:999px;padding:5px 12px 5px 5px;color:var(--txt);font-size:13px}
+  .cu-chip:hover{background:var(--panel2);border-color:var(--accent)}
+  .cu-ic{width:24px;height:24px;border-radius:50%;flex:0 0 auto;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff;overflow:hidden}
+  .cu-nm{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .cu-chip b{min-width:20px;height:20px;padding:0 6px;border-radius:10px;background:var(--accent);color:#fff;font-size:11.5px;font-weight:800;display:flex;align-items:center;justify-content:center;font-family:var(--num)}
+
+  /* S3 фильтр-чипы + bento */
+  .home-chips{display:flex;gap:8px;margin:0 0 14px}
+  .chip{font-size:13px;color:var(--muted);background:var(--panel);border:1px solid var(--line-2);border-radius:999px;padding:6px 14px}
+  .chip:hover{background:var(--panel2);color:var(--txt)}
+  .chip.on{color:#fff;background:var(--accent);border-color:transparent}
+
+  /* доминант-бейдж карточки (ОДИН громкий сигнал) */
+  .dominant{margin-left:auto;flex:0 0 auto;display:inline-flex;align-items:center;gap:5px;font-family:var(--num);font-variant-numeric:tabular-nums;font-size:12px;font-weight:700}
+  .dominant .ic{font-size:14px}
+  .dominant .live-dot{width:7px;height:7px;border-radius:50%;background:var(--live);animation:pulse 2s ease-in-out infinite}
+  .dominant.live{color:var(--live);letter-spacing:.4px}
+  .dominant.voice{color:var(--green)}
+  .dominant.online{color:var(--muted)}
+  .dominant.unread{color:#fff;background:var(--accent);padding:2px 9px;border-radius:999px;font-weight:800}
+  .dominant.quiet{color:var(--muted);font-weight:500;font-family:inherit}
+
+  /* enter-стаггер (только первый маунт home) */
+  .home-enter>*{animation:popIn .28s cubic-bezier(.2,.8,.4,1) both}
+  .home-enter>*:nth-child(2){animation-delay:.05s}
+  .home-enter>*:nth-child(3){animation-delay:.1s}
+  .home-enter>*:nth-child(n+4){animation-delay:.14s}
 
   /* ---------- SERVER VIEW ---------- */
   #server{display:none;grid-template-columns:var(--ch-w,290px) 1fr var(--mem-w,244px);height:100%;min-height:0;position:relative;transition:grid-template-columns .28s cubic-bezier(.4,0,.2,1)}
@@ -819,10 +924,13 @@
     .railbtn{width:46px;height:46px}
     #content.split .mob-chat-toggle{bottom:calc(58px + env(safe-area-inset-bottom, 0px) + 8px)}
     .srv-header .hbtn.mob-hide{display:none}
-    /* главная: safe-area + запас под dl-fab */
-    .home-top{padding-right:max(28px,env(safe-area-inset-right))}
-    .home-inner{padding-right:max(28px,env(safe-area-inset-right));padding-bottom:calc(80px + env(safe-area-inset-bottom,0px))}
-    .home-top .hbtn{min-height:44px;display:inline-flex;align-items:center}
+    /* главная: safe-area + запас под dl-fab; хедер переносит действия, эфир — горизонтальный рельс */
+    .home-hd{padding:10px 16px;padding-right:max(16px,env(safe-area-inset-right))}
+    .home-hd .hd-greet{display:none}
+    .stat-strip{width:100%;order:3;margin-left:0;overflow-x:auto;flex-wrap:nowrap}
+    .home-body{padding:18px 16px;padding-right:max(16px,env(safe-area-inset-right));padding-bottom:calc(84px + env(safe-area-inset-bottom,0px))}
+    .live-grid{grid-auto-flow:column;grid-template-columns:none;grid-auto-columns:84%;overflow-x:auto;scroll-snap-type:x mandatory;margin:0 -16px;padding:0 16px}
+    .live-card{scroll-snap-align:start}
     /* чат: не даём min-width:340 распирать split-чат */
     #content.split.show-chat #chat>:not(#scrollbtn):not(.mob-chat-toggle){min-width:0}
     /* mention-pop: тач-строки + над таб-баром/reply-баром */
