@@ -6,6 +6,7 @@ import { setSettings } from './settings';
 import { notifPermission } from './notify';
 import { ensurePushSubscribed, unsubscribePush } from './push';
 import { connectNotifyWs, disconnectNotifyWs } from './notifyws';
+import { preloadSounds } from './sounds';
 import type { User, ServerSummary, Member, ServerDetail, Toast, ToastKind } from './types';
 
 let engine: Engine | null = null;
@@ -161,6 +162,7 @@ export const useStore = create<AppState>((set, get) => ({
     // выданном разрешении; master включаем, т.к. на этом устройстве уведомления уже разрешены.
     if (notifPermission() === 'granted') { setSettings({ notif: true }); localStorage.removeItem('notifOptOut'); ensurePushSubscribed(); }
     connectNotifyWs(); // глобальный live-канал уведомлений (любой сервер, даже не подключённый)
+    preloadSounds(); // прогреть звуки (fetch+decode+нормализация громкости) — первый проигрыш без задержки
     const pend = sessionStorage.getItem('pendingInvite');
     if (pend) { sessionStorage.removeItem('pendingInvite'); set({ modal: 'join', joinPrefill: pend }); }
   },

@@ -5,6 +5,7 @@
 import { isTauri } from './native';
 import { getSettings, setSettings } from './settings';
 import { ensurePushSubscribed } from './push';
+import { playSound } from './sounds';
 import type { AudioSettings } from './types';
 
 export type NotifKind = 'mention' | 'stream' | 'update';
@@ -108,27 +109,39 @@ async function showNativeCard(kind: NotifKind, title: string, body: string): Pro
   } catch { return false; }
 }
 
-/** Показать уведомление типа kind (если включено и разрешено; фокус гейтит только mention, кроме force). Не бросает. */
-export async function notify(kind: NotifKind, opts: { title: string; body: string; tag?: string; force?: boolean }): Promise<void> {
+/**
+ * Показать уведомление типа kind (если включено и разрешено; фокус гейтит только mention, кроме force).
+ * Возвращает true, если уведомление реально ПОКАЗАНО. Звук mention-«тега» (как в Discord) — от самого
+ * уведомления: беззвучную нативную карточку озвучиваем tag ЗДЕСЬ; когда уведомления нет (нет прав/не
+ * поддерживается) — тоже tag (пинг из приложения); системный toast/веб-уведомление звучат сами (ОС).
+ * Не пингуем, когда пользователь выключил уведомления или смотрит чат (фокус-гейт) — как в Discord.
+ * Не бросает.
+ */
+export async function notify(kind: NotifKind, opts: { title: string; body: string; tag?: string; force?: boolean }): Promise<boolean> {
   try {
     const s = getSettings();
-    if (!s.notif || !s[KIND_PREF[kind]]) return; // мастер или тип выключены
+    if (!s.notif || !s[KIND_PREF[kind]]) return false; // мастер или тип выключены — тихо
     // Фокус-гейт mention («виден чат») применим ТОЛЬКО к текущему просматриваемому серверу. Для
     // упоминания в ДРУГОМ сервере (notify-WS, force:true) чат не виден — уведомляем даже в фокусе.
-    if (FOCUS_GATED[kind] && focused() && !opts.force) return;
+    if (FOCUS_GATED[kind] && focused() && !opts.force) return false; // смотришь чат — Discord канал в фокусе не пингует
     if (isTauri) {
       // кастомная карточка в стиле приложения; если окно не создалось (нет прав/ошибка) — системный toast
       const shown = await showNativeCard(kind, opts.title, opts.body);
-      if (!shown) {
-        try { const m = await import('@tauri-apps/plugin-notification'); if (await m.isPermissionGranted()) await m.sendNotification({ title: opts.title, body: opts.body }); } catch { /**/ }
+      if (shown) { if (kind === 'mention') playSound('tag'); } // карточка беззвучна → звук тега из приложения (один пинг)
+      else {
+        try { const m = await import('@tauri-apps/plugin-notification'); if (await m.isPermissionGranted()) await m.sendNotification({ title: opts.title, body: opts.body }); } catch { /**/ } // toast звучит сам (ОС)
       }
-      return;
+      return shown;
     }
-    if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+    if (typeof Notification === 'undefined' || Notification.permission !== 'granted') {
+      if (kind === 'mention') playSound('tag'); // нет веб-уведомлений (нет прав/не поддерживается) → пинг из приложения
+      return false;
+    }
     const data: NotificationOptions = { body: opts.body, icon: '/icon-256.png', badge: '/icon-128.png', tag: opts.tag, ...( { renotify: !!opts.tag } as any) };
     // предпочитаем показ через service worker (переживает бэкграунд вкладки, кликабелен → фокус окна)
     const reg = await navigator.serviceWorker?.getRegistration?.();
-    if (reg && reg.showNotification) { await reg.showNotification(opts.title, data); return; }
+    if (reg && reg.showNotification) { await reg.showNotification(opts.title, data); return true; } // веб-уведомление звучит само (ОС)
     new Notification(opts.title, data);
-  } catch { /* тихо: уведомления не должны ронять поток событий */ }
+    return true;
+  } catch { return false; /* тихо: уведомления не должны ронять поток событий */ }
 }

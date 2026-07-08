@@ -101,6 +101,7 @@ export class Engine {
   private micActx: AudioContext | null = null;
   private micGain: GainNode | null = null;
   private manualMute = false;
+  private deafToggling = false; // окно подавления mute/unmute-звука от track.mute()/unmute() при оглушении (deaf сам играет fullMute/unmute)
 
   // Оба транспорта живут одновременно (не выбор build-флагом): нативный вещатель
   // публикует только в дерево, браузер — только в LiveKit (старый путь, инвариант 2
@@ -173,7 +174,7 @@ export class Engine {
       if (!silent) {
         const who = this.nameOf(identity);
         this.sysMsg(`📺 ${who} начал трансляцию — «▶ Смотреть» в списке`);
-        playSound('stream');
+        playSound('streamOn');
         this.hooks.toast(who + ' начал трансляцию', 'info');
         notify('stream', { title: who, body: 'начал(а) трансляцию', tag: 'stream:' + this.serverId }); // тег как у серверного push → local+push схлопываются в один баннер
       }
@@ -186,6 +187,7 @@ export class Engine {
       this.watchT.delete(identity);
       this.watching.delete(identity); this.pendingWatch.delete(identity);
       this.sysMsg(`${this.nameOf(identity)} закончил трансляцию`);
+      if (baseUid(identity) !== this.me.username) playSound('streamOff'); // свой streamOff играет stopShare (без задвоения)
       this.emit();
     };
     for (const t of [this.liveKitT, this.treeT]) {
@@ -295,7 +297,7 @@ export class Engine {
       .on(RoomEvent.ParticipantConnected, (p) => { const u = baseUid(p.identity); if (u !== this.me.username && !this.hasOtherSession(u, p.identity)) this.hooks.toast((p.name || u) + ' в сети', 'ok'); this.hooks.peerJoined(u); this.emit(); })
       .on(RoomEvent.ParticipantDisconnected, (p) => { const u = baseUid(p.identity); if (!this.hasOtherSession(u, p.identity)) this.cleanupPeer(u); this.emit(); })
       // звук мута слышен только самому мутящемуся (не остальным) — играем при локальном событии
-      .on(RoomEvent.TrackMuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.room?.localParticipant) playSound('mute'); this.emit(); })
+      .on(RoomEvent.TrackMuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.room?.localParticipant && !this.deafToggling) playSound('mute'); this.emit(); })
       .on(RoomEvent.Reconnecting, () => { this.reconnecting = true; this.hooks.toast('Связь потеряна — переподключаюсь…', 'warn'); this.emit(); })
       .on(RoomEvent.Reconnected, () => {
         this.reconnecting = false;
@@ -316,7 +318,8 @@ export class Engine {
         this.hooks.toast('Связь восстановлена', 'ok'); this.emit();
       })
       .on(RoomEvent.Disconnected, () => { this.reconnecting = false; this.emit(); })
-      .on(RoomEvent.TrackUnmuted, () => this.emit())
+      // размут мика слышен только самому (не остальным); при оглушении звук даёт toggleDeaf, тут глушим
+      .on(RoomEvent.TrackUnmuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.room?.localParticipant && !this.deafToggling) playSound('unmute'); this.emit(); })
       .on(RoomEvent.ConnectionQualityChanged, (q, p) => { if (p === r.localParticipant) { this.connQuality = mapQuality(q); this.emit(); } })
       .on(RoomEvent.TrackPublished, this.onRemotePub)
       .on(RoomEvent.TrackUnpublished, this.onRemoteUnpub)
@@ -377,7 +380,7 @@ export class Engine {
     if (this.micRaw) { this.micRaw.getTracks().forEach((t) => t.stop()); this.micRaw = null; }
     if (this.micActx) { try { this.micActx.close(); } catch { /**/ } this.micActx = null; }
     this.micGain = null;
-    this.inVoice = false; this.roomReady = false; this.deafened = false; this.manualMute = false; this.screenStream = null;
+    this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.roomReady = false; this.deafened = false; this.manualMute = false; this.screenStream = null;
     if (this.room) { try { this.room.disconnect(); } catch { /**/ } }
     this.room = null; this.emit();
   }
@@ -468,16 +471,42 @@ export class Engine {
   private nameOf(identity: string): string { const p = this.partOf(identity); return (p && p.name) || identity; }
   private localMicMuted(): boolean { return this.manualMute; }
   private micPub() { return this.room && this.room.localParticipant.getTrackPublication(Track.Source.Microphone); }
+  // Ждём, пока комната реально ПОДКЛЮЧИТСЯ (roomReady). Нужно, когда после свитча серверов WebRTC-connect
+  // ещё идёт в фоне: объект Room есть, но публиковать в него нельзя. Резолвит true при готовности, false —
+  // на таймауте или если вход отменён (disconnect на свитче сбросил inVoice). Поллинг дёшев (200мс).
+  private waitRoomReady(timeoutMs: number): Promise<boolean> {
+    if (this.roomReady) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const start = Date.now();
+      const iv = window.setInterval(() => {
+        if (this.roomReady) { clearInterval(iv); resolve(true); }
+        else if (!this.inVoice || Date.now() - start > timeoutMs) { clearInterval(iv); resolve(false); }
+      }, 200);
+    });
+  }
 
   /* ---------- VOICE join/leave/switch (несколько каналов на сервер) ---------- */
   // подключиться к голосовому каналу channelId; если уже в другом — переключиться без переподнятия микрофона
   async joinVoice(channelId: string) {
-    if (!this.room || !channelId) return;
+    if (!channelId) return;
     if (this.inVoice) { if (this.currentVc !== channelId) await this.switchVoice(channelId); return; }
     this.currentVc = channelId;
     this.inVoice = true; this.manualMute = false; this.pttDown = false;
     this.voiceConnecting = true;
     this.emit(); // ОПТИМИСТИЧНО: сразу рисуем себя в канале + статус «подключение» (mic ещё публикуется)
+    // После свитча серверов WebRTC-коннект к комнате идёт В ФОНЕ (ретраи ~9.5с): объект Room уже создан
+    // (non-null), но ещё НЕ подключён (roomReady=false). Публикация mic/vc в неподнятую комнату молча
+    // проваливается — по UI «зашёл», по факту нет (selfHealVc чинит только vc-атрибут, но не mic-трек).
+    // Ждём реального подключения, показывая «подключение»; не поднялась за таймаут — откат.
+    if (!this.roomReady) {
+      const ready = await this.waitRoomReady(15000);
+      if (this.currentVc !== channelId || !this.inVoice) return; // за время ожидания свитч/выход/передумал
+      if (!ready || !this.room) {
+        this.inVoice = false; this.currentVc = null; this.voiceConnecting = false;
+        this.hooks.toast('Realtime-связь не поднялась — попробуй ещё раз', 'warn'); this.emit(); return;
+      }
+    }
+    if (!this.room) { this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.emit(); return; }
     try { await this.room.localParticipant.setAttributes({ vc: channelId }); } catch { /**/ }
     try { await this.startMic(); }
     catch {
@@ -490,6 +519,7 @@ export class Engine {
     this.lastVclaim = Date.now();
     this.dataSend({ t: 'vclaim', uid: this.me.id, session: this.sessionId() }); // забираем голос у своих других сессий (одна голосовая на аккаунт)
     this.voiceConnecting = false;
+    playSound('entry'); // сам зашедший тоже слышит вход (остальные в канале — через onRemotePub)
     this.emit();
   }
   // перейти в другой голосовой канал того же сервера: микрофон остаётся, меняются подписки и стримы
@@ -498,13 +528,14 @@ export class Engine {
     this.currentVc = channelId;
     try { await this.room.localParticipant.setAttributes({ vc: channelId }); } catch { /**/ }
     this.reconcileAllAudio();
-    playSound('join');
+    playSound('entry');
     this.emit();
   }
   async leaveVoice() {
     if (!this.room || !this.inVoice) return;
     // оптимистично: сразу убираем себя из канала (UI не ждёт async-очистку mic/треков)
     this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.deafened = false; this.manualMute = false; this.pttDown = false;
+    playSound('exit'); // сам вышедший тоже слышит выход (остальные в канале — через onRemoteUnpub)
     this.emit();
     this.stopConnPoll();
     await this.stopShare().catch(() => {});
@@ -716,6 +747,10 @@ export class Engine {
   toggleDeaf() {
     if (!this.inVoice) return;
     this.deafened = !this.deafened;
+    // оглушение внутри мьютит/размьютит мик-трек → RoomEvent.TrackMuted/Unmuted. Глушим их
+    // паразитный mute/unmute-звук на ~250мс: свой звук (fullMute/unmute) играем явно ниже.
+    this.deafToggling = true;
+    window.setTimeout(() => { this.deafToggling = false; }, 250);
     // транслируем пирам, чтобы у них статус-бейдж отличался от простого мута мика (см. build())
     this.room?.localParticipant.setAttributes({ deaf: this.deafened ? '1' : '' }).catch(() => {});
     const p = this.micPub();
@@ -727,6 +762,7 @@ export class Engine {
     this.applyGate();
     this.screenAudioEls.forEach((a) => (a.muted = this.deafened));
     this.applyAllVolumes();
+    playSound(this.deafened ? 'fullMute' : 'unmute'); // оглох → fullMute; вернул звук → unmute (только сам)
     this.hooks.toast(this.deafened ? 'Тебя не слышно и ты никого не слышишь' : 'Звук включён');
     this.emit();
   }
@@ -790,13 +826,13 @@ export class Engine {
       // подписываемся на микрофон только если я в голосовом, НЕ оглох и пир в ТОМ ЖЕ канале
       if (!own && this.inVoice && !this.deafened && !!this.currentVc && (p as any).attributes?.vc === this.currentVc) {
         try { (pub as any).setSubscribed(true); } catch { /**/ }
-        if (!silent) playSound('join');
+        if (!silent) playSound('entry');
       }
       this.emit();
     }
   };
   private onRemoteUnpub = (pub: TrackPublication, p: RemoteParticipant) => {
-    if (pub.source === Track.Source.Microphone && this.inVoice && baseUid(p.identity) !== this.me.username) playSound('leave'); // вышел из голосового
+    if (pub.source === Track.Source.Microphone && this.inVoice && baseUid(p.identity) !== this.me.username) playSound('exit'); // вышел из голосового
     this.emit();
   };
   private onSub = (track: RemoteTrack, pub: TrackPublication, p: RemoteParticipant) => {
@@ -880,16 +916,18 @@ export class Engine {
     this.keepAliveOn();
     const surf = (vt.getSettings() as any).displaySurface || '';
     if (surf === 'monitor' || surf === 'window') this.hooks.toast('Выбран экран/окно (~15fps). Для 60fps выбирай «Вкладка Chrome»', 'warn'); else this.hooks.toast('Трансляция запущена', 'ok');
-    playSound('stream');
+    playSound('streamOn');
     if (this.serverId) api.streamStart(this.serverId).catch(() => {}); // фоновый push участникам не в комнате
     this.emit();
   }
   async stopShare() {
     if (!this.room) return;
+    const wasBroadcasting = this.liveKitT.isBroadcasting(this.me.username); // leaveVoice зовёт stopShare всегда — streamOff только если реально вещали
     await this.liveKitT.stopBroadcast(this.me.username);
     if (this.screenStream) { this.screenStream.getTracks().forEach((t) => t.stop()); this.screenStream = null; }
     this.keepAliveOff();
     if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => {});
+    if (wasBroadcasting) playSound('streamOff'); // сам вещатель слышит стоп (остальные на сервере — через onStreamStop)
     this.emit();
   }
   isSharing() { return this.liveKitT.isBroadcasting(this.me.username); }
@@ -1066,11 +1104,10 @@ export class Engine {
     this.messages = [...this.messages, ...mapped];
     const mentioned = mapped.filter((m) => m.mention); // один звук, а не по сообщению (не спамим при длинном обрыве)
     if (mentioned.length) {
-      playSound('mention');
+      // звук тега играет само уведомление (notify) — как в Discord; на обычные сообщения не звучим
       this.hooks.toast(mentioned.length === 1 ? `${mentioned[0].who} упомянул тебя` : `Тебя упомянули · ${mentioned.length}`, 'info');
       notify('mention', { title: mentioned.length === 1 ? String(mentioned[0].who) : 'Упоминания', body: mentioned.length === 1 ? String(mentioned[0].text || '').slice(0, 140) : `Тебя упомянули · ${mentioned.length}`, tag: 'mention:' + this.serverId });
     }
-    else playSound('msg');
     this.emit();
   }
   // догрузка более старых сообщений при скролле вверх — prepend в начало, курсор сдвигается назад
@@ -1122,12 +1159,9 @@ export class Engine {
         const repliedToMe = !own && this.replyToMe(d.reply);
         const mentioned = !own && (this.textMentionsMe(d.text) || repliedToMe);
         this.pushMsg(d.name, d.text, false, d.color, own, d.img, undefined, d.uid, d.reply);
-        if (!own) {
-          playSound(mentioned ? 'mention' : 'msg');
-          if (mentioned) {
-            this.hooks.toast(repliedToMe ? `${d.name} ответил тебе` : `${d.name} упомянул тебя`, 'info');
-            notify('mention', { title: d.name, body: String(d.text || '').slice(0, 140) || '🖼 изображение', tag: 'mention:' + this.serverId });
-          }
+        if (!own && mentioned) { // тост+notify ТОЛЬКО когда тегнули/реплайнули; звук тега даёт само notify (Discord)
+          this.hooks.toast(repliedToMe ? `${d.name} ответил тебе` : `${d.name} упомянул тебя`, 'info');
+          notify('mention', { title: d.name, body: String(d.text || '').slice(0, 140) || '🖼 изображение', tag: 'mention:' + this.serverId });
         }
       }
       else if (d.t === 'vclaim') {
