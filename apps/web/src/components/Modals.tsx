@@ -358,87 +358,120 @@ function SettingsModal() {
   useEffect(() => { if (!binding) return; const k = (e: KeyboardEvent) => { e.preventDefault(); setSettings({ pttKey: e.code }); setBinding(false); rerender(); }; window.addEventListener('keydown', k, { once: true }); return () => window.removeEventListener('keydown', k); }, [binding]);
   const E = getEngine();
   const upd = (patch: Partial<AudioSettings>, act?: () => void) => { setSettings(patch); act?.(); rerender(); };
-  return <Backdrop onClose={close} label="Настройки звука">
-    <h2><Icon name="gear" />Звук и микрофон</h2>
-    <div className="grp" style={{ border: 'none', marginTop: 8, paddingTop: 0 }}>
-      <div className="gt"><Icon name="mic-sm" sm /> Микрофон</div>
-      <div className="fld"><label>Устройство ввода</label><select value={s.input} onChange={(e) => upd({ input: e.target.value }, () => E?.reapplyMic())}><option value="">По умолчанию</option>{ins.map((d) => <option key={d.deviceId} value={d.deviceId}>{d.label || d.deviceId}</option>)}</select></div>
-      <MicMeter />
-      <div className="fld" style={{ marginTop: 10 }}><label>Режим передачи</label>
-        <div className="seg"><button className={s.mode === 'voice' ? 'active' : ''} onClick={() => upd({ mode: 'voice' }, () => E?.onModeChanged())}>Активация голосом</button><button className={s.mode === 'ptt' ? 'active' : ''} onClick={() => upd({ mode: 'ptt' }, () => E?.onModeChanged())}>Push-to-Talk</button></div>
-        {s.mode === 'ptt' ? <div className="ptt-hint">Удерживай <span className="kbd">{keyLabel(s.pttKey)}</span> · <button style={{ padding: '4px 10px', fontSize: 12 }} onClick={() => setBinding(true)}>{binding ? 'Нажми клавишу...' : 'Сменить'}</button></div> : null}
-      </div>
-    </div>
-    <div className="grp"><div className="gt"><Icon name="head" sm /> Звук</div>
-      <div className="fld"><label>Устройство вывода</label><select value={s.output} onChange={(e) => upd({ output: e.target.value }, () => E?.applyOutput())}><option value="">По умолчанию</option>{outs.map((d) => <option key={d.deviceId} value={d.deviceId}>{d.label || d.deviceId}</option>)}</select></div>
-      <div className="fld"><label>Общая громкость: {s.master}%</label><input type="range" min={0} max={100} value={s.master} onChange={(e) => upd({ master: +e.target.value }, () => E?.applyMaster())} /></div>
-      <div className="fld"><label>Громкость уведомлений: {s.notifyVolume}%</label><input type="range" min={0} max={100} value={s.notifyVolume} onChange={(e) => upd({ notifyVolume: +e.target.value })} onMouseUp={() => playSound('system')} /></div>
-    </div>
-    <div className="grp"><div className="gt"><Icon name="bell" sm /> Уведомления</div>
-      {!notifSupported() ? (
-        <div className="fld"><label style={{ color: 'var(--txt-dim)' }}>Системные уведомления не поддерживаются на этом устройстве</label></div>
-      ) : <>
-        <label className="perm-op">
-          <input type="checkbox" checked={s.notif} onChange={async (e) => {
-            if (e.target.checked) {
-              localStorage.removeItem('notifOptOut'); // снова хотим уведомления
-              const ok = await enableNotifications();
-              if (!ok) useStore.getState().toast(notifPermission() === 'denied'
-                ? 'Разрешение заблокировано — включите уведомления для приложения в настройках ОС/браузера'
-                : 'Система не выдала разрешение на уведомления', 'err');
-            } else {
-              localStorage.setItem('notifOptOut', '1'); // явный опт-аут: не переспрашиваем при запуске
-              setSettings({ notif: false });
-              unsubscribePush(); // снимаем фоновую web-push подписку
-            }
-            rerender();
-          }} />
-          <span><b>Системные уведомления</b><i>Упоминания — когда окно не в фокусе; трансляции и обновления — всегда{notifPermission() === 'denied' ? ' · доступ запрещён в системе' : ''}</i></span>
-        </label>
-        {NOTIF_KINDS.map((o) => (
-          <label key={o.key} className="perm-op" style={{ marginTop: 4, opacity: s.notif ? 1 : .45, pointerEvents: s.notif ? 'auto' : 'none' }}>
-            <input type="checkbox" disabled={!s.notif} checked={s[o.key]} onChange={(e) => { upd({ [o.key]: e.target.checked } as Partial<AudioSettings>); syncPushPrefs(); }} />
-            <span><b>{o.title}</b><i>{o.desc}</i></span>
-          </label>
-        ))}
-      </>}
-    </div>
-    {isTauri ? (
-      <div className="grp"><div className="gt"><Icon name="cam" sm /> Игровой статус</div>
-        <label className="perm-op">
-          <input type="checkbox" checked={s.shareGame} onChange={(e) => upd({ shareGame: e.target.checked })} />
-          <span><b>Показывать, во что играю</b><i>Другие увидят название и иконку игры рядом с ником (только полноэкранная игра на переднем плане). Читается имя окна и иконка — без доступа к самой игре.</i></span>
-        </label>
-      </div>
-    ) : null}
-    <div className="grp"><div className="gt"><Icon name="palette" sm /> Оформление</div>
-      <div className="fld"><label>Тема оформления</label>
-        <div className="theme-grid">
-          {THEMES.map((t) => (
-            <button key={t.id} className={'theme-op' + (getTheme() === t.id ? ' active' : '')} onClick={() => { setTheme(t.id); rerender(); }}>
-              <span className="theme-sw">{t.swatch.map((c, i) => <i key={i} style={{ background: c }} />)}</span>
-              <span className="theme-nm">{t.name}</span>
-              {getTheme() === t.id ? <Icon name="check" sm /> : null}
-            </button>
-          ))}
-        </div>
-      </div>
-    </div>
-    <div className="grp"><div className="gt"><Icon name="keyboard" sm /> Настройка клавиш</div>
-      {(Object.keys(KEYBIND_LABELS) as KeybindAction[]).map((action) => (
-        <div key={action} className="fld" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
-          <span style={{ fontSize: 13.5, color: 'var(--txt)' }}>{KEYBIND_LABELS[action]}</span>
-          <button style={{ padding: '5px 12px', fontSize: 12.5, width: 'auto', display: 'flex', alignItems: 'center', gap: 8 }} onClick={() => setCaptureAction(action)}>
-            <span className="kbd">{comboLabel(s.keybinds[action])}</span>Сменить
+  type Tab = 'voice' | 'notif' | 'appearance' | 'keys' | 'game';
+  const [tab, setTab] = useState<Tab>('voice');
+  const cats: { id: Tab; label: string; icon: string }[] = [
+    { id: 'voice', label: 'Голос и звук', icon: 'mic-sm' },
+    { id: 'notif', label: 'Уведомления', icon: 'bell' },
+    { id: 'appearance', label: 'Оформление', icon: 'palette' },
+    { id: 'keys', label: 'Клавиши', icon: 'keyboard' },
+    ...(isTauri ? [{ id: 'game' as Tab, label: 'Игровой статус', icon: 'cam' }] : []),
+  ];
+  return <Backdrop onClose={close} label="Настройки" boxClass="box-settings">
+    <div className="settings">
+      <nav className="settings-nav">
+        <div className="settings-nav-h">Настройки</div>
+        {cats.map((c) => (
+          <button key={c.id} className={tab === c.id ? 'active' : ''} onClick={() => setTab(c.id)}>
+            <Icon name={c.icon} />{c.label}
           </button>
+        ))}
+      </nav>
+      <div className="settings-main">
+        <button className="settings-x" onClick={close} aria-label="Закрыть"><Icon name="close" /></button>
+        <div className="settings-main-inner">
+
+          {tab === 'voice' && <>
+            <h2><Icon name="mic-sm" />Голос и звук</h2>
+            <div className="grp">
+              <div className="gt"><Icon name="mic-sm" sm /> Микрофон</div>
+              <div className="fld"><label>Устройство ввода</label><select value={s.input} onChange={(e) => upd({ input: e.target.value }, () => E?.reapplyMic())}><option value="">По умолчанию</option>{ins.map((d) => <option key={d.deviceId} value={d.deviceId}>{d.label || d.deviceId}</option>)}</select></div>
+              <MicMeter />
+              <div className="fld" style={{ marginTop: 10 }}><label>Режим передачи</label>
+                <div className="seg"><button className={s.mode === 'voice' ? 'active' : ''} onClick={() => upd({ mode: 'voice' }, () => E?.onModeChanged())}>Активация голосом</button><button className={s.mode === 'ptt' ? 'active' : ''} onClick={() => upd({ mode: 'ptt' }, () => E?.onModeChanged())}>Push-to-Talk</button></div>
+                {s.mode === 'ptt' ? <div className="ptt-hint">Удерживай <span className="kbd">{keyLabel(s.pttKey)}</span> · <button style={{ padding: '4px 10px', fontSize: 12 }} onClick={() => setBinding(true)}>{binding ? 'Нажми клавишу...' : 'Сменить'}</button></div> : null}
+              </div>
+            </div>
+            <div className="grp"><div className="gt"><Icon name="head" sm /> Звук</div>
+              <div className="fld"><label>Устройство вывода</label><select value={s.output} onChange={(e) => upd({ output: e.target.value }, () => E?.applyOutput())}><option value="">По умолчанию</option>{outs.map((d) => <option key={d.deviceId} value={d.deviceId}>{d.label || d.deviceId}</option>)}</select></div>
+              <div className="fld"><label>Общая громкость: {s.master}%</label><input type="range" min={0} max={100} value={s.master} onChange={(e) => upd({ master: +e.target.value }, () => E?.applyMaster())} /></div>
+              <div className="fld"><label>Громкость уведомлений: {s.notifyVolume}%</label><input type="range" min={0} max={100} value={s.notifyVolume} onChange={(e) => upd({ notifyVolume: +e.target.value })} onMouseUp={() => playSound('system')} /></div>
+            </div>
+          </>}
+
+          {tab === 'notif' && <>
+            <h2><Icon name="bell" />Уведомления</h2>
+            {!notifSupported() ? (
+              <div className="fld"><label style={{ color: 'var(--txt-dim)' }}>Системные уведомления не поддерживаются на этом устройстве</label></div>
+            ) : <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <label className="perm-op">
+                <input type="checkbox" checked={s.notif} onChange={async (e) => {
+                  if (e.target.checked) {
+                    localStorage.removeItem('notifOptOut'); // снова хотим уведомления
+                    const ok = await enableNotifications();
+                    if (!ok) useStore.getState().toast(notifPermission() === 'denied'
+                      ? 'Разрешение заблокировано — включите уведомления для приложения в настройках ОС/браузера'
+                      : 'Система не выдала разрешение на уведомления', 'err');
+                  } else {
+                    localStorage.setItem('notifOptOut', '1'); // явный опт-аут: не переспрашиваем при запуске
+                    setSettings({ notif: false });
+                    unsubscribePush(); // снимаем фоновую web-push подписку
+                  }
+                  rerender();
+                }} />
+                <span><b>Системные уведомления</b><i>Упоминания — когда окно не в фокусе; трансляции и обновления — всегда{notifPermission() === 'denied' ? ' · доступ запрещён в системе' : ''}</i></span>
+              </label>
+              {NOTIF_KINDS.map((o) => (
+                <label key={o.key} className="perm-op" style={{ opacity: s.notif ? 1 : .45, pointerEvents: s.notif ? 'auto' : 'none' }}>
+                  <input type="checkbox" disabled={!s.notif} checked={s[o.key]} onChange={(e) => { upd({ [o.key]: e.target.checked } as Partial<AudioSettings>); syncPushPrefs(); }} />
+                  <span><b>{o.title}</b><i>{o.desc}</i></span>
+                </label>
+              ))}
+            </div>}
+          </>}
+
+          {tab === 'appearance' && <>
+            <h2><Icon name="palette" />Оформление</h2>
+            <div className="fld"><label>Тема оформления</label>
+              <div className="theme-grid">
+                {THEMES.map((t) => (
+                  <button key={t.id} className={'theme-op' + (getTheme() === t.id ? ' active' : '')} onClick={() => { setTheme(t.id); rerender(); }}>
+                    <span className="theme-sw">{t.swatch.map((c, i) => <i key={i} style={{ background: c }} />)}</span>
+                    <span className="theme-nm">{t.name}</span>
+                    {getTheme() === t.id ? <Icon name="check" sm /> : null}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </>}
+
+          {tab === 'keys' && <>
+            <h2><Icon name="keyboard" />Клавиши</h2>
+            {(Object.keys(KEYBIND_LABELS) as KeybindAction[]).map((action) => (
+              <div key={action} className="fld" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+                <span style={{ fontSize: 13.5, color: 'var(--txt)' }}>{KEYBIND_LABELS[action]}</span>
+                <button style={{ padding: '5px 12px', fontSize: 12.5, width: 'auto', display: 'flex', alignItems: 'center', gap: 8 }} onClick={() => setCaptureAction(action)}>
+                  <span className="kbd">{comboLabel(s.keybinds[action])}</span>Сменить
+                </button>
+              </div>
+            ))}
+            {isTauri ? <label className="perm-op" style={{ marginTop: 8 }}>
+              <input type="checkbox" checked={s.disableGlobalHotkeys} onChange={(e) => upd({ disableGlobalHotkeys: e.target.checked }, () => setGlobalHotkeys(getSettings().keybinds, !e.target.checked))} />
+              <span><b>Отключить комбинацию вне приложения</b><i>Клавиши сработают только когда окно RelayApp в фокусе</i></span>
+            </label> : null}
+          </>}
+
+          {tab === 'game' && isTauri && <>
+            <h2><Icon name="cam" />Игровой статус</h2>
+            <label className="perm-op">
+              <input type="checkbox" checked={s.shareGame} onChange={(e) => upd({ shareGame: e.target.checked })} />
+              <span><b>Показывать, во что играю</b><i>Другие увидят название и иконку игры рядом с ником (только полноэкранная игра на переднем плане или распознанная Windows). Читается имя окна и иконка — без доступа к самой игре.</i></span>
+            </label>
+          </>}
+
         </div>
-      ))}
-      {isTauri ? <label className="perm-op" style={{ marginTop: 4 }}>
-        <input type="checkbox" checked={s.disableGlobalHotkeys} onChange={(e) => upd({ disableGlobalHotkeys: e.target.checked }, () => setGlobalHotkeys(getSettings().keybinds, !e.target.checked))} />
-        <span><b>Отключить комбинацию вне приложения</b><i>Клавиши сработают только когда окно RelayApp в фокусе</i></span>
-      </label> : null}
+      </div>
     </div>
-    <button className="close" onClick={close}>Готово</button>
     {captureAction ? <KeyCaptureDialog action={captureAction} onClose={() => { setCaptureAction(null); rerender(); }} /> : null}
   </Backdrop>;
 }
