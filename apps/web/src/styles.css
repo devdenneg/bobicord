@@ -216,7 +216,9 @@
   .hd-me:hover{box-shadow:0 0 0 2px var(--accent)}
 
   .home-body{max-width:1120px;width:100%;margin:0 auto;padding:22px 28px 72px}
-  .home-body .home-sec:first-child{margin-top:0}
+  /* отступ между блоками — на самих секциях (порядок блоков динамический, инлайн-marginTop убран) */
+  .home-body>.home-sec{margin-top:26px}
+  .home-body>.home-sec:first-child{margin-top:0}
   /* брендовое подчёркивание «Сейчас в эфире», когда эфир есть */
   .home-sec.hot::after{content:'';display:block;width:34px;height:2px;margin-top:6px;border-radius:2px;background:linear-gradient(90deg,#57d6ff,#a578f2,#ff62c6)}
 
@@ -249,14 +251,12 @@
   .cta.ghost{background:var(--panel2);color:var(--txt)}
   .cta.ghost:hover{background:var(--panel3)}
 
-  /* пустой эфир — не белый лист */
-  .live-empty{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
-  .live-empty .le-body{grid-column:1;background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-lg);padding:18px;display:flex;flex-direction:column;gap:12px;box-shadow:var(--sh-1)}
-  .le-ic{width:42px;height:42px;border-radius:12px;background:var(--panel2);display:flex;align-items:center;justify-content:center;color:var(--muted)}
-  .le-txt b{display:block;font-size:15px;color:var(--txt-h)}
-  .le-txt span{font-size:13px;color:var(--muted)}
-  .le-ghost{border:1.5px dashed var(--line-2);border-radius:var(--r-lg);opacity:.4;min-height:118px}
-  @media(max-width:900px){.live-empty{grid-template-columns:1fr}.le-ghost{display:none}}
+  /* нет эфира — тонкая строка-шёпот (демотирована вниз, не пустой герой) */
+  .live-quiet{display:flex;align-items:center;gap:10px;margin-top:26px;padding:11px 14px;background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-md);color:var(--muted);font-size:13px}
+  .live-quiet .lq-ic{display:flex;color:var(--muted);opacity:.7}
+  .live-quiet .lq-tx{flex:1}
+  .live-quiet .lq-cta{background:var(--panel2);color:var(--txt);font-size:12.5px;padding:6px 12px;border-radius:8px;flex:0 0 auto}
+  .live-quiet .lq-cta:hover{background:var(--panel3)}
 
   /* ★ сигнатурный кластер (везде одинаковый) */
   .cluster{display:flex;align-items:center}

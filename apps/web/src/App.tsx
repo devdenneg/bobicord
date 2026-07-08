@@ -104,7 +104,7 @@ function DominantBadge({ s, unread }: { s: ServerSummary; unread: Record<string,
   const d = dominant(s, unread);
   if (d.kind === 'live') return <span className="dominant live"><i className="live-dot" />LIVE</span>;
   if (d.kind === 'voice') return <span className="dominant voice"><Icon name="mic-sm" sm />{d.n}</span>;
-  if (d.kind === 'unread') return <span className="dominant unread">{d.n} новых</span>;
+  if (d.kind === 'unread') return <span className="dominant unread" title={d.n + ' непрочитанных сообщений'}><Icon name="chat" sm />{d.n}</span>;
   if (d.kind === 'online') return <span className="dominant online"><i className="dot green" />{d.n}</span>;
   return <span className="dominant quiet">тихо</span>;
 }
@@ -155,21 +155,6 @@ function ServerCard({ s, unread, connected, onOpen }: { s: ServerSummary; unread
 
 function StatPill({ icon, n, label }: { icon?: 'green' | 'acc'; n: number; label: string }) {
   return <span className="stat-pill">{icon ? <i className={'dot ' + (icon === 'green' ? 'green' : 'acc')} /> : null}<b>{n}</b> {label}</span>;
-}
-
-// Пустое состояние эфира — не белый лист: подсказка + фантомные плейсхолдеры, «будь первым».
-// CTA показываем ТОЛЬКО как resume в подключённый сервер (осмысленно) — без «открыть рандомный».
-function LiveEmpty({ resume }: { resume?: { name: string; onOpen: () => void } | null }) {
-  return (
-    <div className="live-empty">
-      <div className="le-body">
-        <div className="le-ic"><Icon name="screen" /></div>
-        <div className="le-txt"><b>Пока тихо</b><span>Никто не в эфире — будь первым</span></div>
-        {resume ? <button className="cta ghost" onClick={resume.onOpen}>Вернуться в {resume.name}</button> : null}
-      </div>
-      <div className="le-ghost" /><div className="le-ghost" />
-    </div>
-  );
 }
 
 // Главная — «пультовая»: что происходит СЕЙЧАС во всех твоих мирах (эфир) + куда прыгнуть, а не список серверов.
@@ -242,13 +227,15 @@ function Home() {
       </header>
 
       <div className="home-body home-enter">
-        <div className={'home-sec' + (live.length ? ' hot' : '')}>Сейчас в эфире</div>
-        {live.length
-          ? <div className="live-grid">{live.map((it) => <LiveCard key={it.key} item={it} onOpen={() => openServer(it.server.id)} />)}</div>
-          : <LiveEmpty resume={connectedServer ? { name: connectedServer.name, onOpen: () => openServer(connectedServer.id) } : null} />}
+        {/* Приоритет ДИНАМИЧЕСКИЙ: эфир — герой ТОЛЬКО когда он есть. Пусто → ведут «Тебя ждут» и серверы,
+            а «никто не в эфире» ужимается в тонкую строку внизу (не доминирует экраном показывая ничего). */}
+        {live.length ? <>
+          <div className="home-sec hot">Сейчас в эфире</div>
+          <div className="live-grid">{live.map((it) => <LiveCard key={it.key} item={it} onOpen={() => openServer(it.server.id)} />)}</div>
+        </> : null}
 
         {waiting.length ? <>
-          <div className="home-sec" style={{ marginTop: 28 }}>Тебя ждут</div>
+          <div className="home-sec">Тебя ждут</div>
           <div className="catchup">
             {waiting.map((s) => (
               <button key={s.id} className="cu-chip" onClick={() => openServer(s.id)}>
@@ -259,7 +246,7 @@ function Home() {
           </div>
         </> : null}
 
-        <div className="home-sec" style={{ marginTop: 28 }}>Твои серверы</div>
+        <div className="home-sec">Твои серверы</div>
         <div className="home-chips">
           {(['all', 'unread', 'mine'] as const).map((f) => (
             <button key={f} className={'chip' + (filter === f ? ' on' : '')} onClick={() => setFilter(f)}>{f === 'all' ? 'Все' : f === 'unread' ? 'Непрочитанное' : 'Мои'}</button>
@@ -270,8 +257,17 @@ function Home() {
             : <div className="sc-none" style={{ gridColumn: '1/-1', padding: 10 }}>Ничего не найдено по фильтру.</div>}
         </div>
 
+        {/* нет эфира — тонкая строка-шёпот внизу, не большой пустой герой */}
+        {!live.length ? (
+          <div className="live-quiet">
+            <span className="lq-ic"><Icon name="screen" sm /></span>
+            <span className="lq-tx">Сейчас никто не в эфире</span>
+            {connectedServer ? <button className="lq-cta" onClick={() => openServer(connectedServer.id)}>Вернуться в {connectedServer.name}</button> : null}
+          </div>
+        ) : null}
+
         {/* дубль действий из хедера — крупными карточками в теле (быстрый доступ, не только мелкие кнопки сверху) */}
-        <div className="home-sec" style={{ marginTop: 28 }}>Добавить сервер</div>
+        <div className="home-sec">Добавить сервер</div>
         <div className="home-actions">
           <button className="bigbtn" onClick={() => setModal('create')}><div className="bi g"><Icon name="plus" /></div><div><b>Создать сервер</b><span>Свой сервер для друзей</span></div></button>
           <button className="bigbtn" onClick={() => setModal('join')}><div className="bi a"><Icon name="link" /></div><div><b>Присоединиться</b><span>По коду или ссылке-приглашению</span></div></button>
