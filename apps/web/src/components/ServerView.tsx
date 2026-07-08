@@ -11,6 +11,7 @@ import { EmotePicker } from './EmotePicker';
 import { VoiceDock } from './VoiceDock';
 import { getSettings, setSettings } from '../settings';
 import { applyNativeUpdate } from '../nativeUpdate';
+import { isTauri, saveFileDialog } from '../native';
 import type { Attachment, ChatMessage, Emote, Member, ReplyRef, Role } from '../types';
 import { PERM, hasPerm } from '../types';
 
@@ -557,10 +558,10 @@ function MessageAttachments({ files, onImageClick }: { files: Attachment[]; onIm
   const images = files.filter((f) => f.kind === 'image');
   const others = files.filter((f) => f.kind === 'file');
   const [downloading, setDownloading] = useState<number | null>(null);
-  // Клик по <a target="_blank"> на внешний https:// origin в нативе (Tauri) молча блокируется —
-  // нет плагина shell/opener, некуда открыть новую вкладку/окно. Качаем сам байты через fetch() в
-  // Blob и триггерим сохранение локальной blob:-ссылкой — она same-document, никакой навигации/нового
-  // окна не требуется, работает одинаково в вебе и нативе.
+  // В нативе (Tauri) — настоящий системный диалог «Сохранить как» (plugin-dialog + запись
+  // байт через plugin-fs). В вебе — как и раньше: fetch() в Blob + локальная blob:-ссылка
+  // (a.click(), same-document, без навигации/нового окна — <a target="_blank"> на внешний
+  // https:// origin в нативе молча блокируется, нет плагина shell/opener).
   async function downloadFile(i: number, f: Attachment) {
     if (downloading != null) return;
     setDownloading(i);
@@ -568,11 +569,18 @@ function MessageAttachments({ files, onImageClick }: { files: Attachment[]; onIm
       const r = await fetch(resolveUploadUrl(f.url));
       if (!r.ok) throw new Error('Ошибка ' + r.status);
       const blob = await r.blob();
+      if (isTauri) {
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        const path = await saveFileDialog(bytes, f.name);
+        if (path) toast(`Сохранено: ${f.name}`, 'ok');
+        return;
+      }
       const objUrl = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = objUrl; a.download = f.name;
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(objUrl), 30000);
+      toast(`Сохранено: ${f.name}`, 'ok');
     } catch { toast(`Не удалось скачать ${f.name}`, 'err'); }
     finally { setDownloading(null); }
   }

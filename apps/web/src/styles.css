@@ -521,7 +521,9 @@
   .msg-file .ic{flex:0 0 auto;color:var(--muted);font-size:19px}
   .msg-file .mf-name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:500}
   .msg-file .mf-size{flex:0 0 auto;font-size:11.5px;color:var(--muted)}
-  .msg-file:hover .ic:last-child{color:var(--accent-txt)}
+  .msg-file .ic:last-child{opacity:0;transition:opacity .12s,color .12s}
+  .msg-file:hover .ic:last-child{opacity:1;color:var(--accent-txt)}
+  @media (hover:none) and (pointer:coarse){.msg-file .ic:last-child{opacity:1}}
   /* панель прикреплённых вложений над инпутом чата — предпросмотр перед отправкой */
   .attach-panel{display:flex;flex-wrap:wrap;gap:8px;margin:8px 12px 0;padding:10px;background:var(--panel2);border:1px solid var(--line-2);border-radius:10px}
   .attach-chip{position:relative;display:flex;align-items:center;gap:8px;max-width:220px;padding:6px 28px 6px 6px;background:var(--panel3);border:1px solid var(--line-2);border-radius:9px}
@@ -531,7 +533,7 @@
   .attach-meta{display:flex;flex-direction:column;min-width:0;gap:1px}
   .attach-name{font-size:12.5px;font-weight:500;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:140px}
   .attach-size{font-size:11px;color:var(--muted)}
-  .attach-chip .spin{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:14px;height:14px;margin:0}
+  .attach-chip .spin{position:absolute;right:6px;top:calc(50% - 7px);width:14px;height:14px;margin:0}
   .attach-remove{position:absolute;right:3px;top:3px;width:20px;height:20px;padding:0;display:flex;align-items:center;justify-content:center;border-radius:6px;background:none;color:var(--muted)}
   .attach-remove:hover{background:var(--panel2);color:var(--txt-h)}
   .lightbox{position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.86);display:flex;align-items:center;justify-content:center;padding:28px;animation:lbFade .15s ease}

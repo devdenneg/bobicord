@@ -195,3 +195,18 @@ export async function onGlobalHotkey(cb: (action: 'muteMic' | 'deafen') => void)
   const un = await listen<{ action: 'muteMic' | 'deafen' }>('global-hotkey', (e) => cb(e.payload.action));
   return un;
 }
+
+/* ---------- сохранение файла-вложения (нативный Save As, см. плагины dialog/fs) ---------- */
+
+/** Системный диалог «Сохранить как» + запись байт на диск. `null` — юзер отменил диалог
+ *  (не ошибка, тихо пропускаем) или мы не в нативе (вызывающий код фолбэчится на
+ *  браузерное скачивание через blob-ссылку). */
+export async function saveFileDialog(bytes: Uint8Array, defaultName: string): Promise<string | null> {
+  if (!isTauri) return null;
+  const { save } = await import('@tauri-apps/plugin-dialog');
+  const path = await save({ defaultPath: defaultName });
+  if (!path) return null;
+  const { writeFile } = await import('@tauri-apps/plugin-fs');
+  await writeFile(path, bytes);
+  return path;
+}
