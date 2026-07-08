@@ -650,9 +650,9 @@
   /* Персистентный голос-док (VoiceDock, уровень App): виден на всех экранах пока в голосовом.
      На сервере снизу есть user-panel (#channels) → приподнимаем, чтоб не перекрыть; на главной — к низу. */
   /* Голосовая панель (Discord-style): плавающий док #voicedock (server-view) + карточка .vd-homecard (главная). */
-  #voicedock{position:fixed;left:80px;bottom:14px;z-index:60;width:min(310px,calc(100vw - 96px));animation:toastIn .2s cubic-bezier(.2,.8,.4,1)}
+  #voicedock{position:fixed;left:80px;bottom:14px;z-index:60;width:min(340px,calc(100vw - 96px));animation:toastIn .2s cubic-bezier(.2,.8,.4,1)}
   #voicedock.on-server{bottom:64px}
-  @media(max-width:900px){#voicedock{left:8px;bottom:72px;width:min(310px,calc(100vw - 16px))}#voicedock.on-server{bottom:72px}}
+  @media(max-width:900px){#voicedock{left:8px;bottom:72px;width:min(340px,calc(100vw - 16px))}#voicedock.on-server{bottom:72px}}
   .vd-homecard{margin-bottom:16px}
   .vd-panel{background:var(--bg2);border:1px solid var(--line-2);border-radius:14px;box-shadow:var(--sh-2);padding:9px;display:flex;flex-direction:column;gap:8px}
   .vd-panel.home{background:linear-gradient(180deg,rgba(35,165,89,.09),rgba(35,165,89,0) 60%),var(--panel);border-color:rgba(35,165,89,.3);border-radius:16px;padding:13px 14px}
@@ -666,8 +666,8 @@
   .vd-panel.home .vd-txt b{font-size:15px}
   .vd-txt span{display:block;font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .vd-panel.home .vd-txt span{font-size:12.5px}
-  .vd-controls{display:flex;align-items:center;gap:7px}
-  .vd-panel.home .vd-controls{gap:9px}
+  .vd-controls{display:flex;align-items:center;justify-content:center;gap:9px}
+  .vd-panel.home .vd-controls{gap:11px}
   .vd-btn{width:38px;height:38px;flex:0 0 auto;border-radius:10px;display:flex;align-items:center;justify-content:center;background:var(--panel3);color:var(--txt);padding:0;box-shadow:var(--sh-1),inset 0 0 0 1px rgba(255,255,255,.05);transition:background .16s,color .16s,transform .16s cubic-bezier(.34,1.4,.64,1),box-shadow .16s}
   .vd-btn:hover{background:var(--panel4);color:var(--txt-h);transform:translateY(-1px)}
   .vd-btn:active{transform:translateY(0) scale(.93)}
@@ -677,7 +677,6 @@
   .vd-btn.ptt-live{box-shadow:0 0 0 2px var(--green),0 0 12px rgba(35,165,89,.5);animation:pttPulse .9s ease-in-out infinite}
   .vd-btn.vd-leave{width:34px;height:34px;background:#3c1b22;color:var(--red)}
   .vd-btn.vd-leave:hover{background:var(--red-fill);color:#fff}
-  .vd-btn.vd-set{margin-left:auto}
   /* группа кнопка + ▾ (выбор устройства, как в Discord) */
   .vd-grp{display:flex;align-items:stretch;border-radius:10px;background:var(--panel3);box-shadow:var(--sh-1),inset 0 0 0 1px rgba(255,255,255,.05)}
   .vd-grp .vd-btn{background:none;box-shadow:none;border-radius:10px 0 0 10px}

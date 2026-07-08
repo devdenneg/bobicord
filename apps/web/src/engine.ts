@@ -58,6 +58,7 @@ interface EngineHooks {
   peerJoined: (identity: string) => void;
   persistMessage: (text: string, em: Record<string, string>, image: string | undefined, reply: ReplyRef | undefined, localId: number, key: string, files?: Attachment[]) => void;
   refetchChat?: () => void; // догрузить свежие сообщения (после реконнекта — заполнить пропуск)
+  endBroadcast?: () => void; // остановить нативную трансляцию (Rust) при выходе из голосового — browser-share гасит stopShare
 }
 
 let msgSeq = 1;
@@ -371,6 +372,7 @@ export class Engine {
 
   // Полный teardown (logout / выход с сервера, где я в голосе): рвём ОБЕ комнаты + всё состояние.
   disconnect() {
+    if (this.inVoice) this.hooks.endBroadcast?.(); // гасим нативную трансляцию (browser-share упадёт с room.disconnect)
     if (this.presenceTimer) clearInterval(this.presenceTimer);
     if (this.gameTimer) { clearInterval(this.gameTimer); this.gameTimer = null; } this.myGame = null;
     this.stopConnPoll();
@@ -595,7 +597,8 @@ export class Engine {
     playSound('exit'); // сам вышедший тоже слышит выход (остальные в канале — через onRemoteUnpub)
     this.emit();
     this.stopConnPoll();
-    await this.stopShare().catch(() => {});
+    await this.stopShare().catch(() => {}); // browser-share (LiveKit)
+    this.hooks.endBroadcast?.();            // нативная трансляция (Rust-дерево) — тоже гасим
     this.stopMic();
     vr.remoteParticipants.forEach((p) => { const rp = p.getTrackPublication(Track.Source.Microphone); if (rp) { try { (rp as any).setSubscribed(false); } catch { /**/ } } this.detachAnalyser(baseUid(p.identity)); });
     // Сносим мик-аудиоэлементы сразу (origin=voice), не ждём async onUnsub. Стрим-аудио (origin=view)

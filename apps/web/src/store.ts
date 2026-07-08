@@ -7,7 +7,7 @@ import { notifPermission } from './notify';
 import { ensurePushSubscribed, unsubscribePush } from './push';
 import { connectNotifyWs, disconnectNotifyWs } from './notifyws';
 import { preloadSounds } from './sounds';
-import { isTauri } from './native';
+import { isTauri, stopNativeBroadcast } from './native';
 import type { User, ServerSummary, Member, ServerDetail, Toast, ToastKind } from './types';
 
 let engine: Engine | null = null;
@@ -192,6 +192,8 @@ export const useStore = create<AppState>((set, get) => ({
           .catch(() => engine?.markSendResult(localId, false));
       },
       refetchChat: () => { const a = get().active; if (!a) return; api.getMessages(a.id, undefined, 30).then((d) => engine?.mergeRecent(d.messages)).catch(() => {}); },
+      // выход из голосового → гасим нативную трансляцию (Rust-дерево) + сбрасываем флаг (browser-share гасит engine.stopShare)
+      endBroadcast: () => { if (isTauri) stopNativeBroadcast().catch(() => {}); get().setBroadcastLive(false); },
     });
     engine.onEmoteResolve = (name, id) => emoteMap.set(name, id);
     set({ me: user });
