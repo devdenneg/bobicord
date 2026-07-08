@@ -462,12 +462,20 @@ app.get('/api/servers/:id/presence', requireAuth, async (req, res) => {
 // Отметить прочитанным до lastId (клиент шлёт при просмотре чата в самом низу).
 app.post('/api/servers/:id/read', requireAuth, (req, res) => {
   if (!isMember(req.user.id, req.params.id)) return res.status(403).json({ error: 'нет' });
-  markRead(req.user.id, req.params.id, req.body.lastId);
-  res.json({ ok: true });
+  // all:true — «прочитать всё» (last_read = максимальный id сервера). Нужно, т.к. ЖИВЫЕ сообщения на
+  // клиенте не имеют серверного sid (узнаются лишь через refetch) → клиент не может назвать актуальный
+  // lastId, last_read отставал бы, и прочитанное считалось бы непрочитанным (на главной / др. устройстве).
+  const lastId = req.body.all
+    ? (db.prepare('SELECT MAX(id) m FROM messages WHERE server_id=?').get(req.params.id).m || 0)
+    : req.body.lastId;
+  markRead(req.user.id, req.params.id, lastId);
+  const lr = _lastReadStmt.get(req.user.id, req.params.id);
+  const lastRead = lr ? lr.last_read : 0;
+  res.json({ ok: true, lastRead });
   // КРОСС-ДЕВАЙС: read_state в БД — источник правды. Мгновенно сообщаем ДРУГИМ устройствам этого юзера
   // (notify-WS), что сервер прочитан → они сбрасывают unread и двигают дивайдер, даже для ПОДКЛЮЧЁННОГО
   // сервера (его клиент ведёт unread локально и /unread-поллинг его пропускает — без этого badge завис бы).
-  try { const lr = _lastReadStmt.get(req.user.id, req.params.id); notifyUser(req.user.id, { t: 'read', serverId: req.params.id, lastRead: lr ? lr.last_read : 0 }); } catch (e) { /**/ }
+  try { notifyUser(req.user.id, { t: 'read', serverId: req.params.id, lastRead }); } catch (e) { /**/ }
 });
 // Лёгкий поллинг непрочитанных по всем серверам юзера (без LiveKit — только БД).
 app.get('/api/unread', requireAuth, (req, res) => {

@@ -53,7 +53,7 @@ interface AppState {
   exitServer: () => void;                              // полное отключение от сервера + на главную (leave/delete/ошибка)
   goHome: () => void;
   refreshServers: () => Promise<void>;
-  markRead: (serverId: string, lastId: number) => void;   // отметить прочитанным (в самом низу чата)
+  markRead: (serverId: string, lastId: number, all?: boolean) => void;   // отметить прочитанным (в самом низу чата); all — «прочитать всё» (сервер last_read=MAX)
   bumpUnread: (serverId: string, n?: number) => void;     // +новое (чат/системное) когда не читаем сервер
   applyRemoteRead: (serverId: string, lastRead: number) => void; // прочитано на ДРУГОМ устройстве (notify-WS)
   refreshMembers: () => Promise<void>;
@@ -218,11 +218,17 @@ export const useStore = create<AppState>((set, get) => ({
     unreadTimer = window.setInterval(async () => { try { mergeUnread(await api.getUnread()); } catch { /**/ } }, 30000);
   },
   refreshServers: async () => { try { const d = await api.me(); set({ servers: d.servers }); mergeUnread(Object.fromEntries(d.servers.map((s) => [s.id, s.unread || 0]))); } catch { /**/ } },
-  markRead: (serverId, lastId) => {
+  markRead: (serverId, lastId, all) => {
     set((s) => ({ lastRead: { ...s.lastRead, [serverId]: Math.max(s.lastRead[serverId] || 0, lastId) } }));
-    if ((get().unread[serverId] || 0) === 0) return; // уже прочитано — не спамим POST
-    set((s) => ({ unread: { ...s.unread, [serverId]: 0 } })); updateAppBadge();
-    api.markRead(serverId, lastId).catch(() => {});
+    const hadUnread = (get().unread[serverId] || 0) > 0;
+    if (hadUnread) { set((s) => ({ unread: { ...s.unread, [serverId]: 0 } })); updateAppBadge(); }
+    // POST: при all — ВСЕГДА (двигаем серверный last_read за живые sid-less сообщения, даже когда локально
+    // unread уже 0 — иначе прочитанное живое считается непрочитанным на главной/др. устройстве); иначе —
+    // только если было что чистить (не спамим). Ответ несёт актуальный серверный last_read → синкаем.
+    if (!all && !hadUnread) return;
+    api.markRead(serverId, lastId, all).then((r) => {
+      if (r?.lastRead) set((s) => ({ lastRead: { ...s.lastRead, [serverId]: Math.max(s.lastRead[serverId] || 0, r.lastRead) } }));
+    }).catch(() => {});
   },
   bumpUnread: (serverId, n = 1) => { set((s) => ({ unread: { ...s.unread, [serverId]: (s.unread[serverId] || 0) + n } })); updateAppBadge(); },
   // кросс-девайс: прочитано на ДРУГОМ устройстве (notify-WS t:read, БД read_state — источник правды) →

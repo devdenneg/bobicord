@@ -671,6 +671,7 @@ function Chat() {
   const olderReady = useRef(false);                  // гейт: не грузить старое, пока вход не устаканился
   const prevLastId = useRef<number | null>(null);    // id последнего сообщения — детект append vs prepend
   const prevTrim = useRef(0);                         // сколько среза уже учтено в firstItemIndex
+  const lastAckedRef = useRef<number | null>(null);   // последний месседж (local id), для которого послан readAll — не спамим POST
   // автокомплит упоминаний (@ник)
   const [mention, setMention] = useState<{ q: string; start: number } | null>(null);
   const [mIdx, setMIdx] = useState(0);
@@ -689,7 +690,7 @@ function Chat() {
     // дивайдера, см. initialTopMostItemIndex), иначе внизу
     const unreadHere = messages.filter((m) => m.sid != null && m.sid > baseline && !m.mine).length;
     setPill(unreadHere); setAtBottom(unreadHere === 0); atBottomRef.current = unreadHere === 0; setReplyTo(null);
-    prevLastId.current = null; prevTrim.current = 0; loadingOlder.current = false; setOlderBusy(false);
+    prevLastId.current = null; prevTrim.current = 0; lastAckedRef.current = null; loadingOlder.current = false; setOlderBusy(false);
     // не даём startReached стрельнуть догрузкой прямо на маунте (пока идёт scroll-to-bottom и оседание)
     olderReady.current = false;
     const t = window.setTimeout(() => { olderReady.current = true; }, 700);
@@ -727,19 +728,20 @@ function Chat() {
     prevLastId.current = last;
   }, [messages, activeId, bumpUnreadStore]);
   useEffect(() => { if (atBottom) setPill(0); }, [atBottom]);
-  // Внизу чата + окно В ФОКУСЕ/видимо → отмечаем прочитанным (реально увидел). Не в фокусе — НЕ читаем:
-  // непрочитанное копится, пока не вернёшься в окно (focusTick пере-триггерит и прочитает). markRead
-  // сам не спамит POST, если уже 0.
+  // Внизу чата + окно В ФОКУСЕ/видимо → «прочитать всё» (реально увидел). Не в фокусе — НЕ читаем:
+  // непрочитанное копится, пока не вернёшься в окно (focusTick пере-триггерит). Живые сообщения не имеют
+  // серверного sid (узнаются лишь через refetch) → шлём all:true, сервер выставит last_read=MAX id.
+  // Иначе прочитанное живое считалось бы непрочитанным на главной/др. устройстве. lastAckedRef — один
+  // POST на последний месседж (не спамим на каждый ре-рендер).
   useEffect(() => {
     if (!atBottom || !activeId) return;
     if (document.visibilityState !== 'visible' || !document.hasFocus()) return; // не в фокусе — не прочитано
+    const lastLocalId = messages.length ? messages[messages.length - 1].id : null;
+    if (lastLocalId == null || lastAckedRef.current === lastLocalId) return; // этот последний месседж уже отмечен
+    lastAckedRef.current = lastLocalId;
     let lastSid: number | undefined;
     for (let i = messages.length - 1; i >= 0; i--) { if (messages[i].sid != null) { lastSid = messages[i].sid!; break; } }
-    const lr = useStore.getState().lastRead[activeId] || 0;
-    // Есть sid новее lastRead → markRead двигает базу + чистит бейдж. Нет нового sid, но бейдж накручен
-    // (sys-события / stale) → всё равно сбрасываем локальный unread=0.
-    if (lastSid != null && lastSid > lr) markReadStore(activeId, lastSid);
-    else if ((useStore.getState().unread[activeId] || 0) > 0) markReadStore(activeId, lr);
+    markReadStore(activeId, lastSid ?? (useStore.getState().lastRead[activeId] || 0), true);
   }, [atBottom, messages, activeId, markReadStore, focusTick]);
 
   // срез сообщений с начала (кап памяти в engine) сдвигает данные вперёд — поднимаем firstItemIndex
