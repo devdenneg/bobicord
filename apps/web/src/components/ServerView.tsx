@@ -664,6 +664,7 @@ function Chat() {
   const [pill, setPill] = useState(0);            // счётчик непрочитанных (пока не внизу)
   const [atBottom, setAtBottom] = useState(true);
   const atBottomRef = useRef(true);
+  const [focusTick, setFocusTick] = useState(0); // тикает на focus/blur/visibility — «увидел глазами» зависит от фокуса окна
   const [firstItemIndex, setFirstItemIndex] = useState(VIRT_BASE_INDEX); // якорь для prepend
   const [olderBusy, setOlderBusy] = useState(false); // идёт догрузка старых
   const loadingOlder = useRef(false);                // защита от повторного startReached
@@ -695,32 +696,51 @@ function Chat() {
     return () => clearTimeout(t);
   }, [activeId]);
 
-  // счётчик непрочитанных: растёт только на append нового сообщения, когда мы не внизу.
-  // prepend старых меняет messages[0], но не последний id → счётчик не трогает.
+  // «Увидел своими глазами» = чат этого сервера открыт, проскроллен ВНИЗ И окно В ФОКУСЕ/видимо.
+  // Только тогда новое сообщение прочитано. Свернул окно / ушёл в игру / проскроллил вверх — чужие
+  // сообщения копятся в непрочитанное, даже если чат формально открыт (главное правило: не увидел → +1).
+  const seenNow = () => atBottomRef.current && document.visibilityState === 'visible' && document.hasFocus();
+
+  // focus/blur/visibility окна → пере-триггер эффекта прочтения (вернулся в окно внизу чата = прочитал)
+  useEffect(() => {
+    const onFocusChange = () => setFocusTick((t) => t + 1);
+    window.addEventListener('focus', onFocusChange);
+    window.addEventListener('blur', onFocusChange);
+    document.addEventListener('visibilitychange', onFocusChange);
+    return () => {
+      window.removeEventListener('focus', onFocusChange);
+      window.removeEventListener('blur', onFocusChange);
+      document.removeEventListener('visibilitychange', onFocusChange);
+    };
+  }, []);
+
+  // append нового сообщения: pill (⌄) растёт по СКРОЛЛУ (есть сообщения ниже), непрочитанное — по
+  // ФОКУСУ. prepend старых меняет messages[0], но не последний id → ничего не трогает.
   useEffect(() => {
     const lastMsg = messages.length ? messages[messages.length - 1] : null;
     const last = lastMsg ? lastMsg.id : null;
-    // !lastMsg.sys — системные события (стрим начал/закончил, служебное) НЕ считаются непрочитанным
-    // чатом: иначе они накручивали бейдж (у них нет sid → markRead-внизу их не сбрасывал → залипали).
-    if (prevLastId.current !== null && last !== prevLastId.current && !atBottomRef.current && lastMsg && !lastMsg.mine && !lastMsg.sys) {
-      setPill((p) => p + 1);
-      if (activeId) bumpUnreadStore(activeId); // бейдж в рейле/таскбаре растёт (не читаем сейчас)
+    // !lastMsg.sys — системные события (стрим начал/закончил) НЕ считаются непрочитанным чатом.
+    if (prevLastId.current !== null && last !== prevLastId.current && lastMsg && !lastMsg.mine && !lastMsg.sys) {
+      if (!atBottomRef.current) setPill((p) => p + 1);       // индикатор скролла: есть сообщения ниже
+      if (!seenNow() && activeId) bumpUnreadStore(activeId);  // непрочитанное: не в фокусе или не внизу
     }
     prevLastId.current = last;
   }, [messages, activeId, bumpUnreadStore]);
   useEffect(() => { if (atBottom) setPill(0); }, [atBottom]);
-  // внизу чата (и есть сообщения) → отмечаем прочитанным до последнего серверного sid: чистит
-  // бейдж текущего сервера и сдвигает базовую линию. markRead сам не спамит POST, если уже 0.
+  // Внизу чата + окно В ФОКУСЕ/видимо → отмечаем прочитанным (реально увидел). Не в фокусе — НЕ читаем:
+  // непрочитанное копится, пока не вернёшься в окно (focusTick пере-триггерит и прочитает). markRead
+  // сам не спамит POST, если уже 0.
   useEffect(() => {
     if (!atBottom || !activeId) return;
+    if (document.visibilityState !== 'visible' || !document.hasFocus()) return; // не в фокусе — не прочитано
     let lastSid: number | undefined;
     for (let i = messages.length - 1; i >= 0; i--) { if (messages[i].sid != null) { lastSid = messages[i].sid!; break; } }
     const lr = useStore.getState().lastRead[activeId] || 0;
-    // Внизу чата = всё прочитано. Есть sid новее lastRead → markRead двигает базу + чистит бейдж.
-    // Нет нового sid, но бейдж накручен (sys-события / stale) → всё равно сбрасываем локальный unread=0.
+    // Есть sid новее lastRead → markRead двигает базу + чистит бейдж. Нет нового sid, но бейдж накручен
+    // (sys-события / stale) → всё равно сбрасываем локальный unread=0.
     if (lastSid != null && lastSid > lr) markReadStore(activeId, lastSid);
     else if ((useStore.getState().unread[activeId] || 0) > 0) markReadStore(activeId, lr);
-  }, [atBottom, messages, activeId, markReadStore]);
+  }, [atBottom, messages, activeId, markReadStore, focusTick]);
 
   // срез сообщений с начала (кап памяти в engine) сдвигает данные вперёд — поднимаем firstItemIndex
   // на столько же, иначе якорь virtuoso рассинхронится. useLayoutEffect — до отрисовки, без мелькания.
