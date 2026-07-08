@@ -46,6 +46,9 @@ audiopus = "0.2.0"
 audiopus_sys = { version = "0.2.2", features = ["static"] }
 crossbeam-channel = "0.5.15"
 windows-core = "=0.62.2"
+# Реестр для позитивного аллоулиста игр (GameConfigStore\Children\MatchedExeFullPath, см. broadcast/games.rs).
+# Эргономичная обёртка над windows-sys — надёжнее ручного RegOpenKeyExW/RegEnumKeyExW.
+winreg = "0.55"
 
 [dev-dependencies]
 env_logger = "0.11.11"

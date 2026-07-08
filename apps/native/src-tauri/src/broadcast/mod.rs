@@ -6,6 +6,7 @@
 pub mod audio;
 pub mod capture;
 pub mod encoder;
+pub mod games;
 pub mod icon;
 pub mod peer;
 // relay-ядро и WS-сигналинг дерева вынесены в кросс-платформенный крейт relay-core

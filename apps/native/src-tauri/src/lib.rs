@@ -38,13 +38,29 @@ struct GameInfo { name: String, icon: Option<String> }
 // Имя — заголовок окна (у игр обычно человекочитаемый), фолбэк — имя exe. Иконка — PNG base64
 // (переиспользуем icon.rs, тот же путь, что для стрим-пикера). Только метаданные окна/exe: НЕ
 // читаем память игры и не инжектим → безопасно для анти-читов.
+// Блоклист для ЭВРИСТИКИ-ФОЛБЭКА (шаг 2 detect_game). Позитивный аллоулист (games.rs) первичен;
+// сюда падают только полноэкранные foreground-окна ВНЕ списка игр Windows, и тут отсекается всё, что
+// на весь экран, но игрой не является. Расширен медиаплеерами/конференциями/удалёнкой/обоями —
+// именно они дают полноэкранные ложняки, которые прежний узкий список пропускал.
 const GAME_BLOCK: &[&str] = &[
+  // наш апп / браузеры / IDE / лаунчеры / шелл
   "relayapp", "explorer", "chrome", "firefox", "msedge", "brave", "opera", "vivaldi",
-  "yandex", "code", "devenv", "rider64", "idea64", "pycharm64", "sublime_text", "discord",
+  "yandex", "arc", "zen", "chromium", "librewolf", "waterfox", "thorium", "msedgewebview2",
+  "code", "devenv", "rider64", "idea64", "pycharm64", "sublime_text", "discord",
   "steam", "steamwebhelper", "epicgameslauncher", "battlenet", "spotify", "telegram",
   "whatsapp", "obs64", "obs", "notepad", "cmd", "powershell", "windowsterminal", "wt",
   "taskmgr", "searchhost", "searchapp", "startmenuexperiencehost", "shellexperiencehost",
   "applicationframehost", "textinputhost", "dwm", "sihost", "systemsettings", "lockapp",
+  // медиаплееры (полноэкранное видео ≠ игра)
+  "vlc", "mpc-hc64", "mpc-hc", "mpc-be64", "mpv", "potplayermini64", "potplayer",
+  "kodi", "plex", "plexmediaplayer", "jellyfinmediaplayer", "wmplayer", "smplayer",
+  // конференции / удалёнка / стриминг рабочего стола
+  "zoom", "ms-teams", "teams", "msteams", "webex", "skype", "mstsc", "parsecd", "parsec",
+  "moonlight", "anydesk", "teamviewer", "rustdesk", "sunshine",
+  // офис / просмотр документов
+  "powerpnt", "soffice", "sumatrapdf", "acrobat", "acrord32",
+  // обои / оверлеи
+  "wallpaper32", "wallpaper64", "wallpaperengine", "livelywpf", "lively",
 ];
 
 fn game_info_from(hwnd: isize, title: &str, stem: &str, pid: u32) -> GameInfo {
@@ -58,27 +74,52 @@ fn game_info_from(hwnd: isize, title: &str, stem: &str, pid: u32) -> GameInfo {
   GameInfo { name, icon: broadcast::icon::window_icon_png_base64(hwnd, pid) }
 }
 
+// Имя без расширения (для человекочитаемого фолбэка имени, если title пуст).
+fn exe_stem(process: &str) -> String {
+  let e = process.to_lowercase();
+  e.strip_suffix(".exe").unwrap_or(e.as_str()).to_string()
+}
+
+// Фолбэк-эвристика: имя exe годится в «игру», если НЕ в блоклисте.
 fn allowed_game(process: &str) -> Option<String> {
-  let exe = process.to_lowercase();
-  let stem = exe.strip_suffix(".exe").unwrap_or(exe.as_str()).to_string();
+  let stem = exe_stem(process);
   if stem.is_empty() || GAME_BLOCK.contains(&stem.as_str()) { None } else { Some(stem) }
 }
 
+// Детект игры (Discord-style «играет в X»). Двухуровнево:
+//   1) ПОЗИТИВНЫЙ АЛЛОУЛИСТ — полный путь exe окна есть в списке игр Windows (GameConfigStore,
+//      games.rs). Near-zero false-positive, ловит игру в любом режиме (фуллскрин/окно/alt-tab).
+//   2) ФОЛБЭК — только полноэкранное FOREGROUND-окно не из блоклиста (для игр, которых Windows ещё
+//      не распознала). Прежний «любое foreground-окно = игра» УБРАН — он и ловил каждое окно.
+// Только метаданные окна/exe: НЕ читаем память игры и не инжектим → безопасно для анти-читов.
 #[tauri::command]
 fn detect_game() -> Option<GameInfo> {
-  let me_pid = std::process::id(); // свой процесс — окна RelayApp не считаем игрой (блоклиста по имени
-                                   // exe мало: имя бинаря может отличаться от "relayapp")
-  // 1) ПОЛНОЭКРАННОЕ окно не из блоклиста — сильный сигнал, НЕ зависит от фокуса (таб в наш апп
-  //    не сбрасывает; anti-cheat игра с пустым title детектится по exe).
-  for (hwnd, title, process, pid) in broadcast::capture::fullscreen_windows() {
-    if pid == me_pid { continue; }
-    if let Some(stem) = allowed_game(&process) {
-      return Some(game_info_from(hwnd, &title, &stem, pid));
+  let me_pid = std::process::id(); // свой процесс — окна RelayApp игрой не считаем (имя бинаря может ≠ "relayapp")
+
+  // 1) Позитивный аллоулист: окно, чей полный путь exe Windows сама признала игрой. foreground
+  //    первым (если смотрим именно на игру), затем все окна (фоновая/alt-tab игра из списка).
+  let allow = broadcast::games::game_exe_allowlist();
+  if !allow.is_empty() {
+    let mut cands: Vec<(isize, String, String, u32)> = Vec::new();
+    if let Some(fg) = broadcast::capture::foreground_window() { cands.push(fg); }
+    cands.extend(broadcast::capture::all_windows());
+    // Кэш «путь этого pid ∈ аллоулист?» — не дёргаем OpenProcess повторно на окнах одного процесса.
+    let mut checked: std::collections::HashMap<u32, bool> = std::collections::HashMap::new();
+    for (hwnd, title, process, pid) in cands {
+      if pid == me_pid { continue; }
+      let is_game = *checked.entry(pid).or_insert_with(|| {
+        broadcast::capture::process_full_path(pid).map_or(false, |p| allow.contains(&p.to_lowercase()))
+      });
+      if is_game {
+        return Some(game_info_from(hwnd, &title, &exe_stem(&process), pid));
+      }
     }
   }
-  // 2) ОКОННАЯ игра: активное окно, если не из блоклиста (пока игра в фокусе). Ловит игры в окне,
-  //    ценой того, что при табе в наш апп статус оконной игры сбрасывается (фуллскрин — не сбрасывает).
-  if let Some((hwnd, title, process, pid)) = broadcast::capture::foreground_window() {
+
+  // 2) Фолбэк для игр вне списка Windows: ТОЛЬКО полноэкранное FOREGROUND-окно, не из блоклиста.
+  //    foreground+фуллскрин отсекает подавляющую часть шума (оконные приложения, фоновые плееры/обои
+  //    на другом мониторе); остаток (полноэкранное видео в нишевом плеере) редок и покрыт блоклистом.
+  if let Some((hwnd, title, process, pid)) = broadcast::capture::foreground_fullscreen_window() {
     if pid != me_pid {
       if let Some(stem) = allowed_game(&process) {
         return Some(game_info_from(hwnd, &title, &stem, pid));

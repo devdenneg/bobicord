@@ -21,7 +21,9 @@ use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GWL_STYLE, WS_CAPTION, WS_MAXIMIZE,
+};
 
 /// Активное окно (foreground) — для детекта ОКОННОЙ игры (не фуллскрин): пока игра в фокусе,
 /// ловим её как игру, если не из блоклиста (проверка в lib.rs). Возвращает (hwnd, title, process, pid).
@@ -47,6 +49,14 @@ pub fn foreground_window() -> Option<(isize, String, String, u32)> {
 fn is_fullscreen_window(hwnd_i: isize) -> bool {
     unsafe {
         let hwnd = HWND(hwnd_i as *mut std::ffi::c_void);
+        // Максимизированное окно С РАМКОЙ (WS_CAPTION+WS_MAXIMIZE) — это развёрнутое приложение
+        // (браузер/IDE/Проводник), а НЕ фуллскрин, даже когда достаёт до rcMonitor (таскбар на
+        // другом мониторе / автоскрытие → rcWork≈rcMonitor, геометрия одна пропускала бы его).
+        // Настоящий фуллскрин/borderless сбрасывает заголовок. Отсекаем такие сразу.
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        if (style & WS_CAPTION.0) == WS_CAPTION.0 && (style & WS_MAXIMIZE.0) != 0 {
+            return false;
+        }
         let mut wr = RECT::default();
         if GetWindowRect(hwnd, &mut wr).is_err() {
             return false;
@@ -85,6 +95,58 @@ pub fn fullscreen_windows() -> Vec<(isize, String, String, u32)> {
         }
     }
     out
+}
+
+/// Foreground-окно, ЕСЛИ оно реально полноэкранное — фолбэк-детект игры ВНЕ аллоулиста (lib.rs).
+/// Требование foreground убирает фоновые ложняки (свёрнутый плеер / wallpaper на другом мониторе),
+/// требование фуллскрина — оконный шум. Возвращает (hwnd, title, process, pid).
+pub fn foreground_fullscreen_window() -> Option<(isize, String, String, u32)> {
+    let fg = foreground_window()?;
+    if is_fullscreen_window(fg.0) {
+        Some(fg)
+    } else {
+        None
+    }
+}
+
+/// Все top-level окна (не только фуллскрин) — для сверки с позитивным аллоулистом игр (games.rs):
+/// игра ловится и в окне, и alt-tab, не только на весь экран. Тот же фильтр валидности, что у
+/// `Window::enumerate` (видимые, не tool/child, не наш процесс). Возвращает (hwnd, title, process, pid).
+pub fn all_windows() -> Vec<(isize, String, String, u32)> {
+    let mut out = Vec::new();
+    if let Ok(windows) = Window::enumerate() {
+        for w in windows {
+            let process = w.process_name().unwrap_or_default();
+            if process.is_empty() {
+                continue;
+            }
+            out.push((w.as_raw_hwnd() as isize, w.title().unwrap_or_default(), process, w.process_id().unwrap_or(0)));
+        }
+    }
+    out
+}
+
+/// Полный путь образа процесса (Win32-формат) по pid — для сверки с аллоулистом игр (games.rs).
+/// OpenProcess QUERY_LIMITED_INFORMATION работает кросс-integrity (в т.ч. elevated/анти-чит), без
+/// чтения памяти → анти-чит-безопасно. None при pid==0 или отказе доступа.
+pub fn process_full_path(pid: u32) -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 {
+        return None;
+    }
+    unsafe {
+        let proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 520];
+        let mut size = buf.len() as u32;
+        let r = QueryFullProcessImageNameW(proc, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut size);
+        let _ = CloseHandle(proc);
+        r.ok()?;
+        Some(String::from_utf16_lossy(&buf[..size as usize]))
+    }
 }
 
 use super::stats::StatsHandle;
