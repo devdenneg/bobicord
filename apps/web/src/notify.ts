@@ -108,12 +108,14 @@ async function showNativeCard(kind: NotifKind, title: string, body: string): Pro
   } catch { return false; }
 }
 
-/** Показать уведомление типа kind (если включено и разрешено; фокус гейтит только mention). Не бросает. */
-export async function notify(kind: NotifKind, opts: { title: string; body: string; tag?: string }): Promise<void> {
+/** Показать уведомление типа kind (если включено и разрешено; фокус гейтит только mention, кроме force). Не бросает. */
+export async function notify(kind: NotifKind, opts: { title: string; body: string; tag?: string; force?: boolean }): Promise<void> {
   try {
     const s = getSettings();
     if (!s.notif || !s[KIND_PREF[kind]]) return; // мастер или тип выключены
-    if (FOCUS_GATED[kind] && focused()) return;  // упоминание в фокусе — не спамим системным (виден чат)
+    // Фокус-гейт mention («виден чат») применим ТОЛЬКО к текущему просматриваемому серверу. Для
+    // упоминания в ДРУГОМ сервере (notify-WS, force:true) чат не виден — уведомляем даже в фокусе.
+    if (FOCUS_GATED[kind] && focused() && !opts.force) return;
     if (isTauri) {
       // кастомная карточка в стиле приложения; если окно не создалось (нет прав/ошибка) — системный toast
       const shown = await showNativeCard(kind, opts.title, opts.body);

@@ -12,6 +12,11 @@
 	handle /tree* {
 		reverse_proxy 127.0.0.1:3000
 	}
+	# Глобальный notify-WS (уведомления по любому серверу, вкл. не подключённый). Без этого
+	# правила /ws уходил в fallback-статику (index.html), upgrade падал → notify-WS не коннектился.
+	handle /ws* {
+		reverse_proxy 127.0.0.1:3000
+	}
 	handle {
 		root * /srv
 		header Cache-Control "no-store, no-cache, must-revalidate"

@@ -28,10 +28,13 @@ export function connectNotifyWs() {
     const st = useStore.getState();
     // текущий (подключённый) сервер обслуживает живой LiveKit-путь — тут не дублируем
     if (d.serverId && d.serverId === st.connectedServerId) return;
+    // force: сюда доходят ТОЛЬКО не-текущие серверы (текущий отсеян выше по connectedServerId) —
+    // их чат не виден, поэтому упоминание уведомляем даже в фокусе (обходим FOCUS_GATED).
     notify((d.kind as NotifKind) || 'mention', {
       title: `${d.title || 'Рилэй'}${d.serverName ? ' · ' + d.serverName : ''}`,
       body: d.body || '',
       tag: (d.kind || 'mention') + ':' + (d.serverId || ''),
+      force: true,
     });
     if (d.serverId) st.bumpUnread(d.serverId);
   };
