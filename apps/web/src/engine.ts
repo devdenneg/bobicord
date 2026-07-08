@@ -79,6 +79,11 @@ function mapQuality(q: ConnectionQuality): VoiceQuality {
 
 export class Engine {
   private room: Room | null = null;
+  // Расцеп голос/просмотр (см. two-room-decouple): voiceRoom — комната сервера, где я в голосовом;
+  // viewRoom — комната сервера, который смотрю. Пока ОДНА физическая комната (оба геттера → this.room),
+  // поведение идентично. На стадии реального расцепа станут раздельными полями (this.room уйдёт).
+  private get voiceRoom(): Room | null { return this.room; }
+  private get viewRoom(): Room | null { return this.room; }
   private me: User;
   private members: Member[] = [];
   private hooks: EngineHooks;
@@ -273,7 +278,7 @@ export class Engine {
     const watchers: Record<string, { name: string; color: number; avatarUrl?: string }[]> = {};
     this.streamWatchers.forEach((m, sid) => (watchers[sid] = [...m.values()].map((v) => ({ name: v.name, color: v.color, avatarUrl: v.avatarUrl }))));
     return {
-      connected: !!this.room, roomReady: this.roomReady, reconnecting: this.reconnecting,
+      connected: !!this.viewRoom, roomReady: this.roomReady, reconnecting: this.reconnecting,
       voiceQuality: this.inVoice ? this.connQuality : 'unknown', voicePing: this.inVoice ? this.pingMs : null,
       inVoice: this.inVoice, voiceConnecting: this.inVoice && this.voiceConnecting, myVoiceChannel: this.currentVc, voiceChannels, deafened: this.deafened,
       localMicMuted: this.localMicMuted(), pttDown: this.pttDown,
@@ -297,14 +302,14 @@ export class Engine {
       .on(RoomEvent.ParticipantConnected, (p) => { const u = baseUid(p.identity); if (u !== this.me.username && !this.hasOtherSession(u, p.identity)) this.hooks.toast((p.name || u) + ' в сети', 'ok'); this.hooks.peerJoined(u); this.emit(); })
       .on(RoomEvent.ParticipantDisconnected, (p) => { const u = baseUid(p.identity); if (!this.hasOtherSession(u, p.identity)) this.cleanupPeer(u); this.emit(); })
       // звук мута слышен только самому мутящемуся (не остальным) — играем при локальном событии
-      .on(RoomEvent.TrackMuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.room?.localParticipant && !this.deafToggling) playSound('mute'); this.emit(); })
+      .on(RoomEvent.TrackMuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.voiceRoom?.localParticipant && !this.deafToggling) playSound('mute'); this.emit(); })
       .on(RoomEvent.Reconnecting, () => { this.reconnecting = true; this.hooks.toast('Связь потеряна — переподключаюсь…', 'warn'); this.emit(); })
       .on(RoomEvent.Reconnected, () => {
         this.reconnecting = false;
         // после реконнекта заново заявляем голосовой канал (vc-атрибут мог потеряться) и чиним
         // подписки сразу, не дожидаясь периодического self-heal — иначе на пару секунд пропадёт звук/состав
         if (this.inVoice && this.currentVc) {
-          this.room?.localParticipant.setAttributes({ vc: this.currentVc, deaf: this.deafened ? '1' : '' }).catch(() => {});
+          this.voiceRoom?.localParticipant.setAttributes({ vc: this.currentVc, deaf: this.deafened ? '1' : '' }).catch(() => {});
           this.reconcileAllAudio();
           // переотправляем vclaim (одна голосовая на аккаунт): пока мы лежали, другая сессия могла
           // зайти в голосовой и её vclaim до нас не дошёл — иначе обе сессии остались бы в войсе
@@ -319,7 +324,7 @@ export class Engine {
       })
       .on(RoomEvent.Disconnected, () => { this.reconnecting = false; this.emit(); })
       // размут мика слышен только самому (не остальным); при оглушении звук даёт toggleDeaf, тут глушим
-      .on(RoomEvent.TrackUnmuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.room?.localParticipant && !this.deafToggling) playSound('unmute'); this.emit(); })
+      .on(RoomEvent.TrackUnmuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.voiceRoom?.localParticipant && !this.deafToggling) playSound('unmute'); this.emit(); })
       .on(RoomEvent.ConnectionQualityChanged, (q, p) => { if (p === r.localParticipant) { this.connQuality = mapQuality(q); this.emit(); } })
       .on(RoomEvent.TrackPublished, this.onRemotePub)
       .on(RoomEvent.TrackUnpublished, this.onRemoteUnpub)
@@ -343,7 +348,7 @@ export class Engine {
     this.emit();
   }
   private async pollGame() {
-    if (!this.room) return;
+    if (!this.viewRoom) return;
     let g: GameStatus | null = null;
     if (isTauri && getSettings().shareGame) {
       try { const d = await detectGame(); if (d && d.name) g = { name: d.name.slice(0, 48), icon: d.icon || undefined }; } catch { /**/ }
@@ -351,10 +356,10 @@ export class Engine {
     this.myGame = g;
     const wantName = g?.name || '';
     const wantIcon = (g?.icon && g.icon.length < 4000) ? g.icon : ''; // атрибут маленький — большую иконку не шлём
-    const attrs = this.room.localParticipant.attributes || {};
+    const attrs = this.viewRoom.localParticipant.attributes || {};
     if ((attrs.game || '') !== wantName || (attrs.gicon || '') !== wantIcon) {
       // setAttributes МЕРЖИТ (не заменяет) — vc/deaf не затираются (проверено существующим поведением)
-      this.room.localParticipant.setAttributes({ game: wantName, gicon: wantIcon }).catch(() => {});
+      this.viewRoom.localParticipant.setAttributes({ game: wantName, gicon: wantIcon }).catch(() => {});
     }
     this.emit();
   }
@@ -388,11 +393,11 @@ export class Engine {
   /* ---------- presence helpers ---------- */
   // участник по БАЗОВОМУ username (identity = username#session). Несколько сессий одного юзера →
   // предпочитаем ту, что в голосовом (с mic-треком), иначе любую.
-  private partOf(username: string): Participant | null {
-    if (!this.room) return null;
-    if (username === this.me.username) return this.room.localParticipant;
+  private partOf(username: string, room: Room | null = this.viewRoom): Participant | null {
+    if (!room) return null;
+    if (username === this.me.username) return room.localParticipant;
     let any: Participant | null = null;
-    for (const p of this.room.remoteParticipants.values()) {
+    for (const p of room.remoteParticipants.values()) {
       if (baseUid(p.identity) !== username) continue;
       if (p.getTrackPublication(Track.Source.Microphone)) return p;
       any = p;
@@ -400,18 +405,18 @@ export class Engine {
     return any;
   }
   // id этой сессии = суффикс после # в моём LiveKit-identity (для tie-break гонки vclaim)
-  private sessionId(): string { const id = this.room?.localParticipant.identity || ''; const i = id.indexOf('#'); return i < 0 ? id : id.slice(i + 1); }
+  private sessionId(): string { const id = this.voiceRoom?.localParticipant.identity || ''; const i = id.indexOf('#'); return i < 0 ? id : id.slice(i + 1); }
   // есть ли у юзера ещё живые сессии, кроме указанной (для presence/cleanup при отключении одной)
   private hasOtherSession(username: string, exceptIdentity: string): boolean {
-    if (!this.room) return false;
-    for (const p of this.room.remoteParticipants.values()) {
+    if (!this.viewRoom) return false;
+    for (const p of this.viewRoom.remoteParticipants.values()) {
       if (p.identity !== exceptIdentity && baseUid(p.identity) === username) return true;
     }
     return false;
   }
   private isInVoice(username: string): boolean {
     const p = this.partOf(username); if (!p) return false;
-    if (p === this.room!.localParticipant) return this.inVoice;
+    if (p === this.viewRoom!.localParticipant) return this.inVoice;
     return !!p.getTrackPublication(Track.Source.Microphone);
   }
   // голосовой канал участника: для себя — currentVc, для пира — participant-атрибут vc
@@ -423,7 +428,7 @@ export class Engine {
   }
   // подписка на микрофон пира только когда я в голосовом и мы в ОДНОМ канале (изоляция звука по каналам)
   private reconcilePeerAudio(p: Participant) {
-    if (!this.room || p === this.room.localParticipant) return;
+    if (!this.voiceRoom || p === this.voiceRoom.localParticipant) return;
     if (baseUid(p.identity) === this.me.username) return; // своя же другая сессия — не подписываемся (эхо)
     const mp = p.getTrackPublication(Track.Source.Microphone);
     if (!mp) return;
@@ -434,7 +439,7 @@ export class Engine {
     try { (mp as any).setSubscribed(want); } catch { /**/ }
     if (!want) this.detachAnalyser(baseUid(p.identity));
   }
-  private reconcileAllAudio() { this.room?.remoteParticipants.forEach((p) => this.reconcilePeerAudio(p)); }
+  private reconcileAllAudio() { this.voiceRoom?.remoteParticipants.forEach((p) => this.reconcilePeerAudio(p)); }
   // Self-heal публикации своего vc/deaf. Если опубликованный participant-атрибут не совпадает с
   // текущим состоянием — пере-заявляем. Симптом без этого: initial setAttributes({vc}) в joinVoice
   // мог не долететь до сервера (гонка при оптимистичном входе до готовности комнаты / rate-limit
@@ -442,15 +447,15 @@ export class Engine {
   // локально), но ВСЕ остальные — нет: они читают participant-атрибут vc (или серверный voiceHint,
   // который тоже строится из атрибута), а он пуст. Ретрай был только на Reconnected — теперь и в 3с-self-heal.
   private selfHealVc() {
-    if (!this.room) return;
+    if (!this.voiceRoom) return;
     // Двунаправленно: в войсе публикуем vc=currentVc; ВНЕ войса — vc='' (иначе если setAttributes({vc:''})
     // при leaveVoice не долетел, покинувший «залипает» в канале у других до реконнекта — обратная сторона
     // того же бага). deaf публикуем только пока в войсе.
     const wantVc = this.inVoice ? (this.currentVc || '') : '';
     const wantDeaf = (this.inVoice && this.deafened) ? '1' : '';
-    const attrs = this.room.localParticipant.attributes || {};
+    const attrs = this.voiceRoom.localParticipant.attributes || {};
     if ((attrs.vc || '') !== wantVc || (attrs.deaf || '') !== wantDeaf) {
-      this.room.localParticipant.setAttributes({ vc: wantVc, deaf: wantDeaf }).catch(() => {});
+      this.voiceRoom.localParticipant.setAttributes({ vc: wantVc, deaf: wantDeaf }).catch(() => {});
     }
   }
   private isStreaming(username: string): boolean {
@@ -470,7 +475,7 @@ export class Engine {
   }
   private nameOf(identity: string): string { const p = this.partOf(identity); return (p && p.name) || identity; }
   private localMicMuted(): boolean { return this.manualMute; }
-  private micPub() { return this.room && this.room.localParticipant.getTrackPublication(Track.Source.Microphone); }
+  private micPub() { return this.voiceRoom && this.voiceRoom.localParticipant.getTrackPublication(Track.Source.Microphone); }
   // Ждём, пока комната реально ПОДКЛЮЧИТСЯ (roomReady). Нужно, когда после свитча серверов WebRTC-connect
   // ещё идёт в фоне: объект Room есть, но публиковать в него нельзя. Резолвит true при готовности, false —
   // на таймауте или если вход отменён (disconnect на свитче сбросил inVoice). Поллинг дёшев (200мс).
@@ -501,17 +506,17 @@ export class Engine {
     if (!this.roomReady) {
       const ready = await this.waitRoomReady(15000);
       if (this.currentVc !== channelId || !this.inVoice) return; // за время ожидания свитч/выход/передумал
-      if (!ready || !this.room) {
+      if (!ready || !this.voiceRoom) {
         this.inVoice = false; this.currentVc = null; this.voiceConnecting = false;
         this.hooks.toast('Realtime-связь не поднялась — попробуй ещё раз', 'warn'); this.emit(); return;
       }
     }
-    if (!this.room) { this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.emit(); return; }
-    try { await this.room.localParticipant.setAttributes({ vc: channelId }); } catch { /**/ }
+    if (!this.voiceRoom) { this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.emit(); return; }
+    try { await this.voiceRoom.localParticipant.setAttributes({ vc: channelId }); } catch { /**/ }
     try { await this.startMic(); }
     catch {
       this.inVoice = false; this.currentVc = null; this.voiceConnecting = false;
-      try { await this.room.localParticipant.setAttributes({ vc: '' }); } catch { /**/ }
+      try { await this.voiceRoom.localParticipant.setAttributes({ vc: '' }); } catch { /**/ }
       this.hooks.toast('Нет доступа к микрофону', 'err'); this.emit(); return;
     }
     this.reconcileAllAudio(); // подписываемся только на пиров этого же канала
@@ -524,15 +529,15 @@ export class Engine {
   }
   // перейти в другой голосовой канал того же сервера: микрофон остаётся, меняются подписки и стримы
   async switchVoice(channelId: string) {
-    if (!this.room || !this.inVoice || this.currentVc === channelId) return;
+    if (!this.voiceRoom || !this.inVoice || this.currentVc === channelId) return;
     this.currentVc = channelId;
-    try { await this.room.localParticipant.setAttributes({ vc: channelId }); } catch { /**/ }
+    try { await this.voiceRoom.localParticipant.setAttributes({ vc: channelId }); } catch { /**/ }
     this.reconcileAllAudio();
     playSound('entry');
     this.emit();
   }
   async leaveVoice() {
-    if (!this.room || !this.inVoice) return;
+    if (!this.voiceRoom || !this.inVoice) return;
     // оптимистично: сразу убираем себя из канала (UI не ждёт async-очистку mic/треков)
     this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.deafened = false; this.manualMute = false; this.pttDown = false;
     playSound('exit'); // сам вышедший тоже слышит выход (остальные в канале — через onRemoteUnpub)
@@ -540,12 +545,12 @@ export class Engine {
     this.stopConnPoll();
     await this.stopShare().catch(() => {});
     this.stopMic();
-    this.room.remoteParticipants.forEach((p) => { const rp = p.getTrackPublication(Track.Source.Microphone); if (rp) { try { (rp as any).setSubscribed(false); } catch { /**/ } } this.detachAnalyser(baseUid(p.identity)); });
+    this.voiceRoom.remoteParticipants.forEach((p) => { const rp = p.getTrackPublication(Track.Source.Microphone); if (rp) { try { (rp as any).setSubscribed(false); } catch { /**/ } } this.detachAnalyser(baseUid(p.identity)); });
     // Belt-and-suspenders: сносим mic-аудиоэлементы сразу (не ждём async onUnsub). НЕ трогаем
     // screenshare-элементы (стрим смотрится и без голосового) — их отличаем по screenAudioEls.
     const screenEls = new Set(this.screenAudioEls.values());
     document.querySelectorAll('#audioSink audio').forEach((a) => { if (!screenEls.has(a as HTMLAudioElement)) a.remove(); });
-    try { await this.room.localParticipant.setAttributes({ vc: '', deaf: '' }); } catch { /**/ }
+    try { await this.voiceRoom.localParticipant.setAttributes({ vc: '', deaf: '' }); } catch { /**/ }
     this.screenAudioEls.forEach((a) => (a.muted = false));
     this.emit();
   }
@@ -565,7 +570,7 @@ export class Engine {
     // Watchdog: контекст публикации мика мог родиться/остаться 'suspended' (getUserMedia-промпт съел
     // user-activation) → пиры не слышат, хотя локально «всё работает». Держим его running, пока в войсе.
     if (this.inVoice && this.micActx && this.micActx.state !== 'running') this.ensureVoiceAudioRunning();
-    const track = this.room?.localParticipant.getTrackPublication(Track.Source.Microphone)?.track;
+    const track = this.voiceRoom?.localParticipant.getTrackPublication(Track.Source.Microphone)?.track;
     if (!track) return;
     try {
       const rep: RTCStatsReport = await (track as any).getRTCStatsReport();
@@ -580,7 +585,7 @@ export class Engine {
       // Качество читаем НАПРЯМУЮ из localParticipant.connectionQuality, а не ждём событие
       // ConnectionQualityChanged: оно приходит лишь при СМЕНЕ качества, поэтому при стабильной
       // связи с самого старта метка залипала на «соединение…» (unknown), хотя пинг уже шёл.
-      const lp = this.room?.localParticipant;
+      const lp = this.voiceRoom?.localParticipant;
       let cq = lp?.connectionQuality != null ? mapQuality(lp.connectionQuality) : 'unknown';
       if (cq === 'unknown' && v != null) {
         // LiveKit ещё не отдал качество, но RTT есть → связь жива. Выводим из пинга, чтобы не залипать.
@@ -598,7 +603,7 @@ export class Engine {
 
   // строим цепочку: устройство -> analyser(VAD) + gain -> published track
   private async startMic() {
-    if (!this.room) return;
+    if (!this.voiceRoom) return;
     this.micRaw = await navigator.mediaDevices.getUserMedia({ audio: this.micCapture() });
     this.micActx = new AudioContext();
     // Дожидаемся resume: getUserMedia выше (+ промпт разрешения) РВЁТ user-activation → этот
@@ -611,7 +616,7 @@ export class Engine {
     const dest = this.micActx.createMediaStreamDestination();
     this.micGain.connect(dest);
     const lat = new LocalAudioTrack(dest.stream.getAudioTracks()[0]);
-    await this.room.localParticipant.publishTrack(lat, { source: Track.Source.Microphone, dtx: true, red: true, audioPreset: AudioPresets.musicHighQuality });
+    await this.voiceRoom.localParticipant.publishTrack(lat, { source: Track.Source.Microphone, dtx: true, red: true, audioPreset: AudioPresets.musicHighQuality });
     // свежий трек публикуется НЕмьютнутым на уровне LiveKit — если сейчас ручной мут/оглушение,
     // домьютить сразу (иначе после reapplyMic в муте пиры читают mp.isMuted=false → бейдж мута
     // пропадает у всех, хотя мы молчим через gain=0). applyGate решает лишь громкость, не LiveKit-mute.
@@ -644,7 +649,7 @@ export class Engine {
   private clearAudioUnlock() { if (this.audioUnlock) { this.audioUnlock(); this.audioUnlock = null; } }
   private stopMic() {
     const p = this.micPub();
-    if (p && p.track) { try { this.room?.localParticipant.unpublishTrack(p.track, true); } catch { /**/ } }
+    if (p && p.track) { try { this.voiceRoom?.localParticipant.unpublishTrack(p.track, true); } catch { /**/ } }
     this.detachAnalyser(this.me.username);
     this.vadOpen = false;
     this.clearAudioUnlock();
@@ -721,7 +726,7 @@ export class Engine {
     if (this.levelCtx) { try { this.levelCtx.close(); } catch { /**/ } this.levelCtx = null; }
   }
   async reapplyMic() {
-    if (!this.room || !this.inVoice) { this.hooks.toast('Микрофон применится при подключении к голосовому'); return; }
+    if (!this.voiceRoom || !this.inVoice) { this.hooks.toast('Микрофон применится при подключении к голосовому'); return; }
     this.stopMic();
     try { await this.startMic(); this.hooks.toast('Микрофон переключён', 'ok'); }
     catch {
@@ -733,7 +738,7 @@ export class Engine {
     this.emit();
   }
   async toggleMic() {
-    if (!this.inVoice || !this.room) return;
+    if (!this.inVoice || !this.voiceRoom) return;
     this.manualMute = !this.manualMute;
     const p = this.micPub();
     // пока фулл-мут (deafened) активен, трек должен оставаться замьюченным на уровне LiveKit
@@ -752,7 +757,7 @@ export class Engine {
     this.deafToggling = true;
     window.setTimeout(() => { this.deafToggling = false; }, 250);
     // транслируем пирам, чтобы у них статус-бейдж отличался от простого мута мика (см. build())
-    this.room?.localParticipant.setAttributes({ deaf: this.deafened ? '1' : '' }).catch(() => {});
+    this.voiceRoom?.localParticipant.setAttributes({ deaf: this.deafened ? '1' : '' }).catch(() => {});
     const p = this.micPub();
     if (this.deafened) { if (p && p.track) p.track.mute(); }
     else { if (p && p.track && !this.manualMute) p.track.unmute(); }
@@ -921,7 +926,7 @@ export class Engine {
     this.emit();
   }
   async stopShare() {
-    if (!this.room) return;
+    if (!this.voiceRoom) return;
     const wasBroadcasting = this.liveKitT.isBroadcasting(this.me.username); // leaveVoice зовёт stopShare всегда — streamOff только если реально вещали
     await this.liveKitT.stopBroadcast(this.me.username);
     if (this.screenStream) { this.screenStream.getTracks().forEach((t) => t.stop()); this.screenStream = null; }
@@ -961,7 +966,7 @@ export class Engine {
 
   /* ---------- watchers presence ---------- */
   private announceWatch() {
-    if (!this.room) return;
+    if (!this.viewRoom) return;
     const id = this.me.username;
     this.watching.forEach((sid) => {
       const m = this.wset(sid); m.set(id, { name: this.me.displayName, color: this.me.avatarColor, avatarUrl: this.me.avatarUrl, ts: Date.now() });
@@ -983,7 +988,7 @@ export class Engine {
   applyMaster() { this.applyAllVolumes(); }
   private applyVolumeByName(username: string) {
     const p = this.partOf(username);
-    if (!p || p === this.room?.localParticipant || !(p as any).setVolume) return;
+    if (!p || p === this.viewRoom?.localParticipant || !(p as any).setVolume) return;
     this.applyVolumeToParticipant(p);
   }
   // Громкость СТАВИМ на конкретную сессию (participant), а не через partOf(username): partOf
@@ -997,8 +1002,8 @@ export class Engine {
     const v = (this.deafened || this.perMute.has(u)) ? 0 : (getSettings().master / 100) * this.userVolOf(u);
     try { (p as any).setVolume(v); } catch { /**/ }
   }
-  private applyAllVolumes() { this.room?.remoteParticipants.forEach((p) => this.applyVolumeToParticipant(p)); }
-  async applyOutput() { if (!this.room) return; const out = getSettings().output; try { await this.room.switchActiveDevice('audiooutput', out || 'default'); } catch { /**/ } document.querySelectorAll('#audioSink audio').forEach((a) => { if ((a as any).setSinkId && out) (a as any).setSinkId(out).catch(() => {}); }); }
+  private applyAllVolumes() { this.voiceRoom?.remoteParticipants.forEach((p) => this.applyVolumeToParticipant(p)); }
+  async applyOutput() { if (!this.viewRoom) return; const out = getSettings().output; try { await this.viewRoom.switchActiveDevice('audiooutput', out || 'default'); } catch { /**/ } document.querySelectorAll('#audioSink audio').forEach((a) => { if ((a as any).setSinkId && out) (a as any).setSinkId(out).catch(() => {}); }); }
 
   /* ---------- chat ---------- */
   // упоминание меня: @username / @displayName / @everyone|@all|@все
@@ -1131,14 +1136,14 @@ export class Engine {
     const t = text.trim();
     // realtime-раздача только при поднятой комнате; локальный эхо + persist работают и без неё —
     // в окне фоновой докрутки connect (сразу после входа в сервер) сообщение не теряется, ложится в БД.
-    if (this.room) this.dataSend({ t: 'chat', name: this.me.displayName, text: t, em, color: this.me.avatarColor, img, uid: this.me.id, reply });
+    if (this.viewRoom) this.dataSend({ t: 'chat', name: this.me.displayName, text: t, em, color: this.me.avatarColor, img, uid: this.me.id, reply });
     const id = this.pushMsg(this.me.displayName, t, false, this.me.avatarColor, true, img, undefined, this.me.id, reply);
     const key = newClientKey();
     this.pendingSend.set(id, { text: t, em, img, reply, key });
     this.hooks.persistMessage(t, em, img, reply, id, key);
   }
   sendTyping() {
-    if (!this.room) return;
+    if (!this.viewRoom) return;
     const now = Date.now();
     if (now - this.lastTypingSent < 2200) return; // троттлинг
     this.lastTypingSent = now;
@@ -1182,7 +1187,8 @@ export class Engine {
   onEmoteResolve: ((name: string, id: string) => void) | null = null;
   // reliable для состояния, которое нельзя терять: чат (сообщения), vclaim (одна голосовая на
   // аккаунт — потеря датаграммы оставила бы две сессии в войсе), clear (чистка чата).
-  private dataSend(obj: any) { if (!this.room) return; try { this.room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify(obj)), { reliable: obj.t === 'chat' || obj.t === 'vclaim' || obj.t === 'clear' }); } catch { /**/ } }
+  // vclaim принадлежит голосовой сессии → voiceRoom; чат/clear/typing/emote/watch — просматриваемому серверу → viewRoom
+  private dataSend(obj: any) { const room = obj.t === 'vclaim' ? this.voiceRoom : this.viewRoom; if (!room) return; try { room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify(obj)), { reliable: obj.t === 'chat' || obj.t === 'vclaim' || obj.t === 'clear' }); } catch { /**/ } }
 
   emoteImg(id: string) { return emoteUrl(id); }
 }
