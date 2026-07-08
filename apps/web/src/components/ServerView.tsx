@@ -450,17 +450,18 @@ function MemberRow({ m, anim }: { m: Member; anim?: string }) {
       <div className="head" ref={hc.ref} onClick={self ? undefined : hc.onTap} onMouseEnter={self ? undefined : hc.onEnter} onMouseLeave={self ? undefined : hc.onLeave}>
         <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} dot={st} live={streaming} liveApp={streaming ? E.getStreamAppMeta(m.username) : null} />
         <div className="pi-main">
-          <div className="pi-l1"><div className="nm" style={roleColorOf(m) ? { color: roleColorOf(m) } : undefined}>{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div></div>
-          {/* вторая строка: игра + роли — отдельно от ника, не наслаиваются (у каждого свой overflow) */}
-          {(pr?.game || (m.roles && m.roles.length > 0)) ? (
+          {/* нет игры → роли ИНЛАЙН сразу после ника (одна строка). Есть игра → ник ↑, игра+роли ↓. */}
+          <div className="pi-l1">
+            <div className="nm" style={roleColorOf(m) ? { color: roleColorOf(m) } : undefined}>{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div>
+            {!pr?.game && m.roles && m.roles.length > 0 ? <MemberRoles roles={m.roles} /> : null}
+          </div>
+          {pr?.game ? (
             <div className="pi-l2">
-              {pr?.game ? (
-                <span className="pi-game mem" data-tip={'Играет в ' + pr.game.name}>
-                  {pr.game.icon ? <img src={`data:image/png;base64,${pr.game.icon}`} alt="" /> : <span className="gpad">🎮</span>}
-                  <span className="pg-nm">{pr.game.name}</span>
-                </span>
-              ) : null}
-              <MemberRoles roles={m.roles || []} />
+              <span className="pi-game mem" data-tip={'Играет в ' + pr.game.name}>
+                {pr.game.icon ? <img src={`data:image/png;base64,${pr.game.icon}`} alt="" /> : <span className="gpad">🎮</span>}
+                <span className="pg-nm">{pr.game.name}</span>
+              </span>
+              {m.roles && m.roles.length > 0 ? <MemberRoles roles={m.roles} /> : null}
             </div>
           ) : null}
         </div>

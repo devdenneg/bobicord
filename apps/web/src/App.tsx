@@ -9,7 +9,8 @@ import { Auth } from './components/Auth';
 import { Toasts } from './components/Toasts';
 import { ServerView } from './components/ServerView';
 import { Modals } from './components/Modals';
-import { DownloadFab } from './components/DownloadFab';
+import { DownloadCard } from './components/DownloadFab';
+import { applyNativeUpdate } from './nativeUpdate';
 import { isTauri, setGlobalHotkeys, onGlobalHotkey } from './native';
 import type { ServerSummary, OnlineMember, KeybindAction } from './types';
 import { LogoLoader } from './components/LogoLoader';
@@ -153,6 +154,35 @@ function ServerCard({ s, unread, connected, onOpen }: { s: ServerSummary; unread
   );
 }
 
+// Баннер обновления (веб-рефреш ИЛИ натив-апдейт) — акцентный, для главной (в сервере свой в ServerView).
+function UpdateBanner() {
+  const updateReady = useStore((s) => s.updateReady);
+  const nativeUpdate = useStore((s) => s.nativeUpdate);
+  const toast = useStore((s) => s.toast);
+  const [updating, setUpdating] = useState(false);
+  if (updateReady) {
+    return (
+      <div className="update-bar">
+        <div className="ub-ic"><Icon name="refresh" /></div>
+        <div className="ub-txt"><b>Вышло обновление приложения</b><span>Обнови страницу, чтобы продолжить — <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd></span></div>
+        <button className="ub-btn" onClick={() => location.reload()}><Icon name="refresh" sm />Обновить</button>
+      </div>
+    );
+  }
+  if (nativeUpdate) {
+    return (
+      <div className="update-bar">
+        <div className="ub-ic"><Icon name="refresh" /></div>
+        <div className="ub-txt"><b>Доступна версия {nativeUpdate.version}</b><span>{updating ? 'Скачиваю и устанавливаю — приложение перезапустится…' : 'Обновить приложение до свежей версии'}</span></div>
+        <button className="ub-btn" disabled={updating} onClick={async () => { setUpdating(true); try { await applyNativeUpdate(); } catch (e: any) { setUpdating(false); toast('Не удалось обновить: ' + (e?.message || e), 'err'); } }}>
+          {updating ? <span className="spin" /> : <Icon name="refresh" sm />}Установить
+        </button>
+      </div>
+    );
+  }
+  return null;
+}
+
 // «Играют сейчас» — прикольный кросс-серверный блок: карточка на игру (иконка + кластер игроков + счётчик).
 function GamesNow({ games }: { games: GameGroup[] }) {
   return (
@@ -245,6 +275,9 @@ function Home() {
       </header>
 
       <div className="home-body home-enter">
+        {/* акцентные баннеры: обновление (веб/натив) → промо десктоп-приложения (веб). null, если нечего показать */}
+        <UpdateBanner />
+        <DownloadCard />
         {/* Приоритет ДИНАМИЧЕСКИЙ: эфир — герой ТОЛЬКО когда он есть. Пусто → ведут «Тебя ждут» и серверы,
             а «никто не в эфире» ужимается в тонкую строку внизу (не доминирует экраном показывая ничего). */}
         {live.length ? <>
@@ -456,7 +489,6 @@ export function App() {
         </div>
       )}
       <Modals />
-      {view === 'home' ? <DownloadFab /> : null}
       <div id="audioSink" style={{ display: 'none' }} />
     </>
   );

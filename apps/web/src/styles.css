@@ -107,8 +107,22 @@
   .tabs2 button{flex:1;background:transparent;color:var(--muted);padding:9px;font-weight:500}
   .tabs2 button.active{background:var(--accent);color:#fff}
   .link{background:none;color:var(--accent-txt);padding:8px 0;width:100%;font-size:13.5px}
-  .dl-fab{position:fixed;right:calc(20px + env(safe-area-inset-right,0px));bottom:calc(20px + env(safe-area-inset-bottom,0px));width:52px;height:52px;border-radius:50%;background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center;box-shadow:0 6px 20px -4px rgba(88,101,242,.6);z-index:40;text-decoration:none;transition:transform .12s ease,background .12s ease}
-  .dl-fab:hover{background:var(--accent-h);transform:translateY(-2px)}
+  /* промо-карточка десктоп-приложения на главной (вместо старого FAB) — с анимацией внимания */
+  .dl-card{position:relative;overflow:hidden;display:flex;align-items:center;gap:14px;margin-bottom:22px;padding:13px 15px;border-radius:var(--r-md);background:linear-gradient(120deg,color-mix(in srgb,var(--accent) 15%,var(--panel)),var(--panel) 70%);border:1px solid color-mix(in srgb,var(--accent) 32%,var(--line-2));animation:dlGlow 3s ease-in-out infinite}
+  /* диагональный блик-свип периодически проезжает по карточке — ловит взгляд, но не мельтешит */
+  .dl-card::before{content:'';position:absolute;top:0;bottom:0;left:0;width:60%;background:linear-gradient(105deg,transparent,rgba(255,255,255,.09),transparent);transform:translateX(-180%);animation:dlSweep 4.5s ease-in-out infinite;pointer-events:none}
+  @keyframes dlGlow{0%,100%{box-shadow:var(--sh-1),0 0 0 0 transparent}50%{box-shadow:var(--sh-1),0 0 22px -6px color-mix(in srgb,var(--accent) 55%,transparent)}}
+  @keyframes dlSweep{0%,55%{transform:translateX(-180%)}82%,100%{transform:translateX(320%)}}
+  .dl-card .dl-ic{animation:dlBob 3s ease-in-out infinite}
+  @keyframes dlBob{50%{transform:translateY(-2px)}}
+  .dl-card .dl-ic{width:44px;height:44px;border-radius:12px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;background:var(--accent);color:#fff;box-shadow:0 4px 12px -4px color-mix(in srgb,var(--accent) 70%,transparent)}
+  .dl-card .dl-ic .ic{font-size:22px}
+  .dl-txt{flex:1;min-width:0}
+  .dl-txt b{display:block;font-size:14.5px;color:var(--txt-h)}
+  .dl-txt span{font-size:12.5px;color:var(--muted)}
+  .dl-btn{flex:0 0 auto;display:flex;align-items:center;gap:6px;background:var(--accent);color:#fff;font-weight:600;font-size:13.5px;padding:9px 16px;border-radius:9px;text-decoration:none;transition:background var(--tr)}
+  .dl-btn:hover{background:var(--accent-h)}
+  @media(max-width:560px){.dl-card{flex-wrap:wrap}.dl-txt{flex:1 1 60%}}
   .link:hover{background:none;text-decoration:underline}
 
   /* ---------- APP SHELL ---------- */
@@ -513,15 +527,19 @@
   .pcard-bio{margin-top:5px;font-size:13px;color:var(--txt);line-height:1.45;word-break:break-word;white-space:pre-wrap;max-height:150px;overflow:hidden}
   .pcard-bio.empty{color:var(--muted);font-style:italic}
   @keyframes pcardIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
-  .update-bar{display:flex;align-items:center;gap:12px;margin:10px 14px 14px;padding:12px 14px;background:linear-gradient(90deg,rgba(88,101,242,.18),rgba(88,101,242,.07));border:1px solid var(--accent);border-radius:12px;box-shadow:0 4px 18px -6px rgba(88,101,242,.5);animation:popIn .2s cubic-bezier(.2,.8,.4,1)}
+  /* flex-wrap: в УЗКОМ чате (сплит при просмотре стрима) кнопка «Установить» переносится под текст,
+     а не сжимается/распирает контейнер; текст — в одну строку с ellipsis, не переносится в столбик. */
+  .update-bar{display:flex;flex-wrap:wrap;align-items:center;gap:10px 12px;margin:10px 14px 14px;padding:12px 14px;background:linear-gradient(90deg,rgba(88,101,242,.18),rgba(88,101,242,.07));border:1px solid var(--accent);border-radius:12px;box-shadow:0 4px 18px -6px rgba(88,101,242,.5);animation:popIn .2s cubic-bezier(.2,.8,.4,1)}
   .update-bar .ub-ic{width:38px;height:38px;flex:0 0 auto;border-radius:10px;background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center}
   .update-bar .ub-ic .ic{animation:ubspin 2.4s linear infinite}
-  .update-bar .ub-txt{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
-  .update-bar .ub-txt b{font-size:14px;color:var(--txt-h)}
-  .update-bar .ub-txt span{font-size:12.5px;color:var(--muted)}
+  .update-bar .ub-txt{flex:1 1 150px;min-width:0;display:flex;flex-direction:column;gap:2px}
+  .update-bar .ub-txt b{font-size:14px;color:var(--txt-h);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .update-bar .ub-txt span{font-size:12.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .update-bar .ub-btn{margin-left:auto}
   .update-bar kbd{background:var(--panel3);border:1px solid var(--line-2);border-bottom-width:2px;border-radius:5px;padding:1px 5px;font-size:11px;font-family:inherit;color:var(--txt);font-weight:600}
   .update-bar .ub-btn{flex:0 0 auto;background:var(--accent);color:#fff;font-weight:600;padding:9px 14px;border-radius:9px;display:flex;align-items:center;gap:6px}
   .update-bar .ub-btn:hover{background:var(--accent-h)}
+  .home-body .update-bar{margin:0 0 22px}  /* на главной — без боковых отступов, как download-card */
   @keyframes ubspin{to{transform:rotate(360deg)}}
   .typing-ind{display:flex;align-items:center;gap:8px;padding:2px 16px 5px;font-size:12.5px;color:var(--muted);min-height:19px}
   .tdots{display:inline-flex;gap:3px;align-items:center;flex:0 0 auto}
@@ -672,7 +690,7 @@
   /* member-row (участники): ДВЕ строки — имя сверху, игра+роли снизу. У каждой строки свой overflow,
      ничего не наслаивается на любой ширине; строка 2 не рендерится, если нет ни игры, ни ролей. */
   .pi-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px;justify-content:center}
-  .pi-l1{display:flex;align-items:center;min-width:0}
+  .pi-l1{display:flex;align-items:center;gap:8px;min-width:0}
   .pi-l2{display:flex;align-items:center;gap:6px;min-width:0;min-height:17px}
   .pi-l2 .pi-game.mem{flex:0 1 auto;max-width:62%}
   .pi-ctl{flex:0 0 auto;display:flex;align-items:center;gap:2px}
