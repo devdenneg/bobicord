@@ -103,27 +103,33 @@ function ProfileModal() {
     try { const d = await api.updateMe({ displayName: dn.trim(), bio, avatarColor: color, avatarUrl }); useStore.getState().setMe(d.user); useStore.getState().refreshMembers(); useStore.getState().refreshServers(); close(); useStore.getState().toast('Профиль сохранён', 'ok'); }
     catch (e: any) { setErr(e.message); } finally { setBusy(false); }
   }
-  return <Backdrop onClose={close} label="Профиль">
-    <h2>Профиль</h2>
-    <div className="fld" style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 18 }}>
-      <div className="me-mini" style={{ width: 64, height: 64, borderRadius: 20, fontSize: 26, background: avatarUrl ? '#0000' : avColor(dn, color), overflow: 'hidden', position: 'relative', cursor: 'pointer' }} onClick={() => fileRef.current?.click()} title="Загрузить аватар">
+  return <Backdrop onClose={close} label="Профиль" boxClass="profile-modal">
+    <button className="settings-x" onClick={close} aria-label="Закрыть"><Icon name="close" /></button>
+    <div className="pm-hero">
+      <div className="pm-av" onClick={() => fileRef.current?.click()} title="Загрузить аватар" style={{ background: avatarUrl ? '#0000' : avColor(dn, color) }}>
         {avatarUrl ? <img className="avimg" src={resolveUploadUrl(avatarUrl)} alt="" /> : initial(dn)}
-        {uploading ? <span className="spin" style={{ position: 'absolute', inset: 0, margin: 'auto' }} /> : null}
+        {uploading ? <span className="spin" style={{ position: 'absolute', inset: 0, margin: 'auto' }} /> : <span className="pm-av-edit"><Icon name="edit" sm /></span>}
       </div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-        <div style={{ fontSize: 12, color: 'var(--muted)' }}>@{me.username}</div>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <button className="ghost" style={{ margin: 0, padding: '6px 12px', fontSize: 13, width: 'auto' }} disabled={uploading} onClick={() => fileRef.current?.click()}>{uploading ? 'Загрузка…' : 'Загрузить фото'}</button>
-          {avatarUrl ? <button className="ghost" style={{ margin: 0, padding: '6px 12px', fontSize: 13, width: 'auto', color: 'var(--red)' }} onClick={() => setAvatarUrl('')}>Убрать</button> : null}
-        </div>
+      <div className="pm-id">
+        <div className="pm-nm">{dn.trim() || 'Без имени'}</div>
+        <div className="pm-un">@{me.username}</div>
+      </div>
+    </div>
+    <div className="pm-body">
+      <div className="pm-avbtns">
+        <button className="ghost" style={{ margin: 0, padding: '7px 14px', fontSize: 13, width: 'auto' }} disabled={uploading} onClick={() => fileRef.current?.click()}>{uploading ? 'Загрузка…' : 'Загрузить фото'}</button>
+        {avatarUrl ? <button className="ghost" style={{ margin: 0, padding: '7px 14px', fontSize: 13, width: 'auto', color: 'var(--red)' }} onClick={() => setAvatarUrl('')}>Убрать</button> : null}
       </div>
       <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; if (f) pickAvatar(f); e.target.value = ''; }} />
+      <div className="fld"><label>Отображаемое имя</label><input value={dn} maxLength={32} onChange={(e) => setDn(e.target.value)} /></div>
+      <div className="fld"><label>О себе</label><textarea value={bio} maxLength={200} rows={2} placeholder="пара слов о себе" onChange={(e) => setBio(e.target.value)} /></div>
+      <div className="fld"><label>Цвет аватара{avatarUrl ? ' (когда без фото)' : ''}</label><div className="colorpick">{AV_COLORS.map((c, i) => <div key={i} className={'cp' + (i === color ? ' sel' : '')} style={{ background: c }} onClick={() => setColor(i)} />)}</div></div>
+      <div className="err">{err}</div>
+      <div className="pm-foot">
+        <button className="ghost pm-logout" style={{ margin: 0 }} onClick={() => useStore.getState().logout()}><Icon name="leave" sm />Выйти</button>
+        <button className="primary" style={{ margin: 0 }} disabled={busy} onClick={save}>Сохранить</button>
+      </div>
     </div>
-    <div className="fld"><label>Отображаемое имя</label><input value={dn} maxLength={32} onChange={(e) => setDn(e.target.value)} /></div>
-    <div className="fld"><label>О себе</label><textarea value={bio} maxLength={200} rows={2} placeholder="пара слов о себе" onChange={(e) => setBio(e.target.value)} /></div>
-    <div className="fld"><label>Цвет аватара{avatarUrl ? ' (когда без фото)' : ''}</label><div className="colorpick">{AV_COLORS.map((c, i) => <div key={i} className={'cp' + (i === color ? ' sel' : '')} style={{ background: c }} onClick={() => setColor(i)} />)}</div></div>
-    <div className="rowbtns"><button className="ghost" style={{ margin: 0, color: 'var(--red)' }} onClick={() => useStore.getState().logout()}>Выйти из аккаунта</button><button className="primary" style={{ margin: 0 }} disabled={busy} onClick={save}>Сохранить</button></div>
-    <div className="err">{err}</div>
   </Backdrop>;
 }
 
@@ -189,18 +195,30 @@ function ServerSettingsModal() {
   const owner = active.myRole === 'owner';
   const canServer = owner || hasPerm(perms, PERM.MANAGE_SERVER);
   const canRoles = owner || hasPerm(perms, PERM.MANAGE_ROLES);
-  const [tab, setTab] = useState<'profile' | 'roles' | 'members'>(canServer ? 'profile' : 'roles');
-  return <Backdrop onClose={close} label="Настройки сервера" wide>
-    <h2><Icon name="gear" />Настройки сервера</h2>
-    <div className="seg" style={{ marginBottom: 14 }}>
-      {canServer ? <button className={tab === 'profile' ? 'active' : ''} onClick={() => setTab('profile')}>Профиль</button> : null}
-      {canRoles ? <button className={tab === 'roles' ? 'active' : ''} onClick={() => setTab('roles')}>Роли</button> : null}
-      {canRoles ? <button className={tab === 'members' ? 'active' : ''} onClick={() => setTab('members')}>Участники</button> : null}
+  type T = 'profile' | 'roles' | 'members';
+  const cats = ([
+    { id: 'profile', label: 'Профиль', icon: 'edit', show: canServer },
+    { id: 'roles', label: 'Роли', icon: 'shield', show: canRoles },
+    { id: 'members', label: 'Участники', icon: 'users', show: canRoles },
+  ] as { id: T; label: string; icon: string; show: boolean }[]).filter((c) => c.show);
+  const [tab, setTab] = useState<T>(canServer ? 'profile' : 'roles');
+  return <Backdrop onClose={close} label="Настройки сервера" boxClass="box-settings">
+    <div className="settings">
+      <nav className="settings-nav">
+        <div className="settings-nav-h" title={active.name} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{active.name}</div>
+        {cats.map((c) => (
+          <button key={c.id} className={tab === c.id ? 'active' : ''} onClick={() => setTab(c.id)}><Icon name={c.icon} />{c.label}</button>
+        ))}
+      </nav>
+      <div className="settings-main">
+        <button className="settings-x" onClick={close} aria-label="Закрыть"><Icon name="close" /></button>
+        <div className="settings-main-inner">
+          {tab === 'profile' && canServer ? <><h2><Icon name="edit" />Профиль сервера</h2><ServerProfileTab active={active} /></> : null}
+          {tab === 'roles' && canRoles ? <><h2><Icon name="shield" />Роли</h2><RolesTab active={active} /></> : null}
+          {tab === 'members' && canRoles ? <><h2><Icon name="users" />Участники</h2><RoleAssignTab active={active} members={members} /></> : null}
+        </div>
+      </div>
     </div>
-    {tab === 'profile' && canServer ? <ServerProfileTab active={active} /> : null}
-    {tab === 'roles' && canRoles ? <RolesTab active={active} /> : null}
-    {tab === 'members' && canRoles ? <RoleAssignTab active={active} members={members} /> : null}
-    <button className="close" onClick={close}>Готово</button>
   </Backdrop>;
 }
 

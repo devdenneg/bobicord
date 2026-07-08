@@ -36,6 +36,8 @@ import DeleteRounded from '@mui/icons-material/DeleteRounded';
 import EditRounded from '@mui/icons-material/EditRounded';
 import KeyboardRounded from '@mui/icons-material/KeyboardRounded';
 import NotificationsRounded from '@mui/icons-material/NotificationsRounded';
+import ShieldRounded from '@mui/icons-material/ShieldRounded';
+import BadgeRounded from '@mui/icons-material/BadgeRounded';
 
 const MAP: Record<string, SvgIconComponent> = {
   mic: MicRounded, 'mic-sm': MicRounded, 'mic-off': MicOffRounded,
@@ -52,7 +54,7 @@ const MAP: Record<string, SvgIconComponent> = {
   fullscreen: FullscreenRounded, pip: PictureInPictureAltRounded,
   palette: PaletteRounded, download: DownloadRounded, reply: ReplyRounded,
   trash: DeleteRounded, edit: EditRounded, keyboard: KeyboardRounded,
-  bell: NotificationsRounded,
+  bell: NotificationsRounded, shield: ShieldRounded, badge: BadgeRounded,
 };
 
 export function Icon({ name, sm }: { name: string; sm?: boolean }) {

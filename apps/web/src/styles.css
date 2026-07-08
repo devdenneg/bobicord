@@ -219,8 +219,6 @@
   /* отступ между блоками — на самих секциях (порядок блоков динамический, инлайн-marginTop убран) */
   .home-body>.home-sec{margin-top:26px}
   .home-body>.home-sec:first-child{margin-top:0}
-  /* брендовое подчёркивание «Сейчас в эфире», когда эфир есть */
-  .home-sec.hot::after{content:'';display:block;width:34px;height:2px;margin-top:6px;border-radius:2px;background:linear-gradient(90deg,#57d6ff,#a578f2,#ff62c6)}
 
   /* приветственный герой (нет серверов) */
   .home-welcome{display:flex;align-items:center;justify-content:center;min-height:60vh}
@@ -801,6 +799,22 @@
     .settings-main{padding:18px 16px 26px}
     .settings-x{top:12px;right:12px}
   }
+
+  /* ── Профиль: hero-шапка (крупный аватар + @username на баннере) в стиле редизайна ── */
+  .modal .profile-modal{position:relative;width:min(480px,96vw);max-width:none;padding:0;overflow:hidden}
+  .pm-hero{display:flex;align-items:center;gap:16px;padding:28px 24px 22px;background:linear-gradient(150deg,color-mix(in srgb,var(--accent) 20%,var(--panel2)),var(--panel));border-bottom:1px solid var(--line-2)}
+  .pm-av{width:82px;height:82px;border-radius:26px;flex:0 0 auto;position:relative;cursor:pointer;overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:33px;font-weight:700;color:#fff;box-shadow:0 8px 22px -8px rgba(0,0,0,.7),inset 0 0 0 1px rgba(255,255,255,.1)}
+  .pm-av-edit{position:absolute;right:2px;bottom:2px;width:26px;height:26px;background:var(--accent);border:2px solid var(--panel);border-radius:50%;display:flex;align-items:center;justify-content:center;color:#fff;opacity:0;transition:opacity .15s}
+  .pm-av:hover .pm-av-edit{opacity:1}
+  .pm-id{min-width:0}
+  .pm-nm{font-size:21px;font-weight:800;color:var(--txt-h);letter-spacing:-.01em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .pm-un{font-size:13.5px;color:var(--muted);font-family:var(--num);margin-top:2px}
+  .pm-body{padding:16px 24px 22px}
+  .pm-avbtns{display:flex;gap:8px;margin-bottom:8px}
+  .pm-foot{display:flex;align-items:center;gap:10px;margin-top:20px}
+  .pm-foot .primary{margin-left:auto;padding:11px 24px}
+  .pm-logout{display:flex;align-items:center;gap:7px;width:auto;color:var(--red);background:var(--panel2)}
+  .pm-logout:hover{background:color-mix(in srgb,var(--red) 22%,var(--panel2));color:#fff}
   .srv-menu-head{display:flex;align-items:center;gap:12px;margin-bottom:10px}
   .sm-ic{width:48px;height:48px;flex:0 0 auto;border-radius:16px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:20px;color:#fff;overflow:hidden;position:relative}
   .sm-ic.lg{width:72px;height:72px;border-radius:22px;font-size:28px}
