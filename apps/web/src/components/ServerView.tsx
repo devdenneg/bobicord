@@ -622,6 +622,10 @@ function Chat() {
   const [staged, setStaged] = useState<StagedAttachment[]>([]);
   const stagedRef = useRef<StagedAttachment[]>([]);
   stagedRef.current = staged;
+  // юзер нажал «Отправить»/Enter, пока вложение ещё грузится — не просто тост в пустоту (выглядит
+  // как «зависло»), а ставим в очередь: кнопка отправки показывает спиннер, реальная отправка уходит
+  // автоматически как только все загрузки завершатся (см. эффект ниже send()).
+  const [sendQueued, setSendQueued] = useState(false);
   const toast = useStore((s) => s.toast);
   const updateReady = useStore((s) => s.updateReady);
   const me = useStore((s) => s.me)!;
@@ -673,6 +677,7 @@ function Chat() {
     setPill(unreadHere); setAtBottom(unreadHere === 0); atBottomRef.current = unreadHere === 0; setReplyTo(null);
     // сброс стейджинга вложений при смене сервера — не тащим прикреплённые файлы между чатами
     setStaged((s) => { s.forEach((it) => it.previewUrl && URL.revokeObjectURL(it.previewUrl)); return []; });
+    setSendQueued(false);
     prevLastId.current = null; prevTrim.current = 0; lastAckedRef.current = null; loadingOlder.current = false; setOlderBusy(false);
     // не даём startReached стрельнуть догрузкой прямо на маунте (пока идёт scroll-to-bottom и оседание)
     olderReady.current = false;
@@ -834,7 +839,11 @@ function Chat() {
   function send() {
     const t = text.trim();
     const pending = staged.some((s) => s.status === 'uploading');
-    if (pending) { toast('Дождись загрузки вложений', 'warn'); return; }
+    if (pending) {
+      if (t || staged.length) setSendQueued(true); // отправится сама, см. эффект ниже
+      return;
+    }
+    setSendQueued(false);
     const ready = staged.filter((s) => s.status === 'ready' && s.attachment).map((s) => s.attachment!);
     if (!t && !ready.length) return;
     if (t.startsWith('/')) { runCommand(t); setText(''); return; }
@@ -844,6 +853,13 @@ function Chat() {
     setText(''); setReplyTo(null); setStaged([]);
     scrollToBottom(); // req: после отправки всегда показываем конец
   }
+  // очередь на отправку: как только последнее вложение долилось (успешно или с ошибкой — send()
+  // сам отфильтрует неудачные), стреляем реальной отправкой без повторного нажатия юзером.
+  useEffect(() => {
+    if (!sendQueued) return;
+    if (staged.some((s) => s.status === 'uploading')) return;
+    send();
+  }, [staged, sendQueued]);
 
   // slash-команды (только в начале строки, пока нет пробела)
   const slashMode = /^\/[a-zа-я]*$/i.test(text);
@@ -1083,7 +1099,9 @@ function Chat() {
             if (imgs.length) { e.preventDefault(); stageFiles(imgs, 'image'); }
           }}
           onChange={(e) => { const v = e.target.value; setText(v); if (v.trim()) E.sendTyping(); setMention(detectMention(v, e.target.selectionStart ?? v.length)); setMIdx(0); }} onKeyDown={onComposerKey} />
-        <button id="sendBtn" className={(text.trim() || staged.some((s) => s.status !== 'error')) ? '' : 'empty'} data-tip="Отправить · Enter" onClick={send}><Icon name="send" /></button>
+        <button id="sendBtn" className={(text.trim() || staged.some((s) => s.status !== 'error')) ? '' : 'empty'} data-tip={sendQueued ? 'Отправится, как только вложения загрузятся' : 'Отправить · Enter'} onClick={send}>
+          {sendQueued ? <span className="spin" /> : <Icon name="send" />}
+        </button>
       </div>
       {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} onClose={() => setPickAnchor(undefined)}
         onPick={(e: Emote) => { setText((t) => t + (t && !t.endsWith(' ') ? ' ' : '') + e.name + ' '); }} /> : null}

@@ -17,7 +17,11 @@ const app = express();
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  // X-Attachment-Name — кастомный заголовок POST /api/upload-file (имя файла для форс-скачивания).
+  // Без него в нативе (кросс-доменный запрос, tauri://localhost → прод-API) CORS-preflight не
+  // пропускал бы заголовок → реальный POST блокировался браузером ещё до отправки («ошибка загрузки»
+  // на любой файл). В вебе не всплывало — там same-origin через Caddy, CORS не участвует вовсе.
+  res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Attachment-Name');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
