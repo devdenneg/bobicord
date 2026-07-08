@@ -198,7 +198,9 @@
   body.resizing{cursor:col-resize;user-select:none}
 
   /* left channel sidebar */
-  #channels{background:var(--panel);border-right:1px solid var(--line-2);display:flex;flex-direction:column;min-height:0}
+  /* z-index:2 — колонка каналов над центральной (#main): тултипы из .voice-bar (напр. «Выйти из
+     голосового канала») переполняются вправо в область #main, и та, идя позже в DOM, перекрывала их. */
+  #channels{background:var(--panel);border-right:1px solid var(--line-2);display:flex;flex-direction:column;min-height:0;position:relative;z-index:2}
   .ch-header{height:50px;flex:0 0 auto;border-bottom:1px solid var(--line-2);display:flex;align-items:center;gap:8px;padding:0 14px;box-shadow:var(--sh-1);cursor:pointer}
   .ch-header:hover{background:var(--panel2)}
   .ch-header .chn{flex:1;font-weight:700;font-size:15px;color:var(--txt-h);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -480,7 +482,9 @@
   .vc-controls{display:flex;gap:8px;justify-content:center}
   .vc-controls .cbtn{width:42px;height:42px;flex:0 0 auto;border-radius:50%;display:flex;align-items:center;justify-content:center;background:var(--panel3);color:var(--txt);padding:0;box-shadow:var(--sh-1),inset 0 0 0 1px rgba(255,255,255,.05),inset 0 1px 0 rgba(255,255,255,.07);transition:background .18s,color .18s,transform .18s cubic-bezier(.34,1.4,.64,1),box-shadow .18s}
   .vc-controls .cbtn .ic{transition:transform .18s cubic-bezier(.34,1.4,.64,1)}
-  .vc-controls .cbtn:hover{background:var(--panel4);color:var(--txt-h);transform:translateY(-2px);box-shadow:var(--sh-2),inset 0 0 0 1px rgba(255,255,255,.08),inset 0 1px 0 rgba(255,255,255,.1)}
+  /* z-index:5 — transform на :hover создаёт stacking-context, запирающий ::after-тултип; без подъёма
+     тултип РАННЕЙ кнопки уходил ПОД следующие кнопки бара. Поднимаем ховернутую кнопку над соседями. */
+  .vc-controls .cbtn:hover{background:var(--panel4);color:var(--txt-h);transform:translateY(-2px);z-index:5;box-shadow:var(--sh-2),inset 0 0 0 1px rgba(255,255,255,.08),inset 0 1px 0 rgba(255,255,255,.1)}
   .vc-controls .cbtn:hover .ic{transform:scale(1.14)}
   .vc-controls .cbtn:active{transform:translateY(0) scale(.92)}
   .vc-controls .cbtn.danger-on{background:var(--red-fill);color:#fff;box-shadow:0 0 0 1px rgba(242,63,67,.5),0 0 14px rgba(242,63,67,.45)}
