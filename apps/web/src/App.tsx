@@ -158,13 +158,14 @@ function StatPill({ icon, n, label }: { icon?: 'green' | 'acc'; n: number; label
 }
 
 // Пустое состояние эфира — не белый лист: подсказка + фантомные плейсхолдеры, «будь первым».
-function LiveEmpty({ onOpen }: { onOpen?: () => void }) {
+// CTA показываем ТОЛЬКО как resume в подключённый сервер (осмысленно) — без «открыть рандомный».
+function LiveEmpty({ resume }: { resume?: { name: string; onOpen: () => void } | null }) {
   return (
     <div className="live-empty">
       <div className="le-body">
         <div className="le-ic"><Icon name="screen" /></div>
         <div className="le-txt"><b>Пока тихо</b><span>Никто не в эфире — будь первым</span></div>
-        {onOpen ? <button className="cta ghost" onClick={onOpen}>Открыть сервер</button> : null}
+        {resume ? <button className="cta ghost" onClick={resume.onOpen}>Вернуться в {resume.name}</button> : null}
       </div>
       <div className="le-ghost" /><div className="le-ghost" />
     </div>
@@ -198,7 +199,7 @@ function Home() {
   const totalOnline = servers.reduce((n, s) => n + (s.onlineCount || 0), 0);
   const totalUnread = servers.reduce((n, s) => n + (unread[s.id] || 0), 0);
   const firstName = me.displayName.split(' ')[0];
-  const bestOpen = connectedId || (ranked[0] ? ranked[0].id : null);
+  const connectedServer = connectedId ? servers.find((s) => s.id === connectedId) : null;
   const waiting = ranked.filter((s) => (unread[s.id] || 0) > 0);
 
   // Нет серверов — приветственный герой с двумя действиями (тот же .bigbtn).
@@ -244,7 +245,7 @@ function Home() {
         <div className={'home-sec' + (live.length ? ' hot' : '')}>Сейчас в эфире</div>
         {live.length
           ? <div className="live-grid">{live.map((it) => <LiveCard key={it.key} item={it} onOpen={() => openServer(it.server.id)} />)}</div>
-          : <LiveEmpty onOpen={bestOpen ? () => openServer(bestOpen) : undefined} />}
+          : <LiveEmpty resume={connectedServer ? { name: connectedServer.name, onOpen: () => openServer(connectedServer.id) } : null} />}
 
         {waiting.length ? <>
           <div className="home-sec" style={{ marginTop: 28 }}>Тебя ждут</div>
@@ -267,6 +268,13 @@ function Home() {
         <div className="srv-grid">
           {shown.length ? shown.map((s) => <ServerCard key={s.id} s={s} unread={unread} connected={connectedId === s.id} onOpen={() => openServer(s.id)} />)
             : <div className="sc-none" style={{ gridColumn: '1/-1', padding: 10 }}>Ничего не найдено по фильтру.</div>}
+        </div>
+
+        {/* дубль действий из хедера — крупными карточками в теле (быстрый доступ, не только мелкие кнопки сверху) */}
+        <div className="home-sec" style={{ marginTop: 28 }}>Добавить сервер</div>
+        <div className="home-actions">
+          <button className="bigbtn" onClick={() => setModal('create')}><div className="bi g"><Icon name="plus" /></div><div><b>Создать сервер</b><span>Свой сервер для друзей</span></div></button>
+          <button className="bigbtn" onClick={() => setModal('join')}><div className="bi a"><Icon name="link" /></div><div><b>Присоединиться</b><span>По коду или ссылке-приглашению</span></div></button>
         </div>
       </div>
     </section>
