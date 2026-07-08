@@ -269,18 +269,27 @@ export const useStore = create<AppState>((set, get) => ({
       // новый connectServer, который сам сделал disconnect+connect. Раньше тут был безусловный
       // disconnect по устаревшему connectedServerId — он убивал ЖИВУЮ комнату нового сервера.
       (async () => {
-        try {
-          const tk = await api.serverToken(id);
-          if (connEpoch !== myEpoch) return; // устарели до коннекта
-          await engine?.connect(tk.url, tk.token, id);
-          // устарели ПОКА коннектились — engine уже принадлежит новому connect, ничего не делаем
-        } catch {
-          // провал коннекта: сбрасываем connectedServerId, иначе повторный клик уходит в
-          // showConnectedServer (без реконнекта) и realtime мёртв до F5. Теперь клик = полный вход.
-          if (connEpoch === myEpoch && get().connectedServerId === id) {
-            set({ connectedServerId: null });
-            get().toast('Realtime-связь не поднялась — зайди на сервер заново', 'warn');
+        // Ретрай с backoff: одиночная транзиентная осечка (сетевой блип, таймаут WS-handshake
+        // LiveKit, пересборка контейнеров при деплое) НЕ должна сразу пугать тостом и рвать
+        // соединение — почти всегда лечится повтором. Тост только если все попытки провалились.
+        const delays = [1500, 3000, 5000]; // паузы ПОСЛЕ 1-й, 2-й, 3-й неудачи; 4 попытки, ~9.5с суммарно
+        for (let i = 0; i <= delays.length; i++) {
+          if (connEpoch !== myEpoch) return; // устарели — engine уже принадлежит новому connect
+          try {
+            const tk = await api.serverToken(id);
+            if (connEpoch !== myEpoch) return;
+            await engine?.connect(tk.url, tk.token, id);
+            return; // успех
+          } catch {
+            if (connEpoch !== myEpoch) return; // устарели во время попытки
+            if (i < delays.length) { await new Promise((r) => setTimeout(r, delays[i])); continue; }
           }
+        }
+        // все попытки провалились: сбрасываем connectedServerId, иначе повторный клик уходит в
+        // showConnectedServer (без реконнекта) и realtime мёртв до F5. Теперь клик = полный вход.
+        if (connEpoch === myEpoch && get().connectedServerId === id) {
+          set({ connectedServerId: null });
+          get().toast('Realtime-связь не поднялась — зайди на сервер заново', 'warn');
         }
       })();
       startMemberPoll(id);
