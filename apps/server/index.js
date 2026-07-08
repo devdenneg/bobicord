@@ -464,6 +464,10 @@ app.post('/api/servers/:id/read', requireAuth, (req, res) => {
   if (!isMember(req.user.id, req.params.id)) return res.status(403).json({ error: 'нет' });
   markRead(req.user.id, req.params.id, req.body.lastId);
   res.json({ ok: true });
+  // КРОСС-ДЕВАЙС: read_state в БД — источник правды. Мгновенно сообщаем ДРУГИМ устройствам этого юзера
+  // (notify-WS), что сервер прочитан → они сбрасывают unread и двигают дивайдер, даже для ПОДКЛЮЧЁННОГО
+  // сервера (его клиент ведёт unread локально и /unread-поллинг его пропускает — без этого badge завис бы).
+  try { const lr = _lastReadStmt.get(req.user.id, req.params.id); notifyUser(req.user.id, { t: 'read', serverId: req.params.id, lastRead: lr ? lr.last_read : 0 }); } catch (e) { /**/ }
 });
 // Лёгкий поллинг непрочитанных по всем серверам юзера (без LiveKit — только БД).
 app.get('/api/unread', requireAuth, (req, res) => {

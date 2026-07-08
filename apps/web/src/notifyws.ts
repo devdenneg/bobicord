@@ -24,6 +24,9 @@ export function connectNotifyWs() {
   try { ws = new WebSocket(url); } catch { scheduleReconnect(); return; }
   ws.onmessage = (ev) => {
     let d: any; try { d = JSON.parse(ev.data); } catch { return; }
+    // кросс-девайс: прочитано на другом устройстве этого юзера → сбрасываем unread локально (и для
+    // ПОДКЛЮЧЁННОГО сервера — тут дедуп по connectedServerId НЕ применяем, чтение общее по БД).
+    if (d.t === 'read') { if (d.serverId) useStore.getState().applyRemoteRead(d.serverId, d.lastRead || 0); return; }
     if (d.t !== 'notify') return;
     const st = useStore.getState();
     // текущий (подключённый) сервер обслуживает живой LiveKit-путь — тут не дублируем

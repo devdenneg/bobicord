@@ -53,6 +53,7 @@ interface AppState {
   refreshServers: () => Promise<void>;
   markRead: (serverId: string, lastId: number) => void;   // отметить прочитанным (в самом низу чата)
   bumpUnread: (serverId: string, n?: number) => void;     // +новое (чат/системное) когда не читаем сервер
+  applyRemoteRead: (serverId: string, lastRead: number) => void; // прочитано на ДРУГОМ устройстве (notify-WS)
   refreshMembers: () => Promise<void>;
   refreshServer: () => Promise<void>;
   createChannel: (name: string) => Promise<void>;
@@ -181,6 +182,13 @@ export const useStore = create<AppState>((set, get) => ({
     api.markRead(serverId, lastId).catch(() => {});
   },
   bumpUnread: (serverId, n = 1) => { set((s) => ({ unread: { ...s.unread, [serverId]: (s.unread[serverId] || 0) + n } })); updateAppBadge(); },
+  // кросс-девайс: прочитано на ДРУГОМ устройстве (notify-WS t:read, БД read_state — источник правды) →
+  // сбрасываем unread локально и двигаем базовую линию дивайдера. Работает И для ПОДКЛЮЧЁННОГО сервера
+  // (mergeUnread его пропускает — клиент ведёт unread сам, поэтому без этого badge завис бы до реконнекта).
+  applyRemoteRead: (serverId, lastRead) => {
+    set((s) => ({ unread: { ...s.unread, [serverId]: 0 }, lastRead: { ...s.lastRead, [serverId]: Math.max(s.lastRead[serverId] || 0, lastRead) } }));
+    updateAppBadge();
+  },
   refreshMembers: async () => { const a = get().active; if (!a) return; try { const d = await api.getServer(a.id); set({ members: d.members }); engine?.setMembers(d.members); } catch { /**/ } },
   refreshServer: async () => { const a = get().active; if (!a) return; try { const d = await api.getServer(a.id); set({ members: d.members, active: { ...d.server, myRole: d.myRole, myPerms: d.myPerms } }); engine?.setMembers(d.members); } catch { /**/ } },
 
