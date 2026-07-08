@@ -25,13 +25,13 @@ export function connectNotifyWs() {
   ws.onmessage = (ev) => {
     let d: any; try { d = JSON.parse(ev.data); } catch { return; }
     // кросс-девайс: прочитано на другом устройстве этого юзера → сбрасываем unread локально (и для
-    // ПОДКЛЮЧЁННОГО сервера — тут дедуп по connectedServerId НЕ применяем, чтение общее по БД).
+    // ПОДКЛЮЧЁННОГО сервера — тут дедуп по viewServerId НЕ применяем, чтение общее по БД).
     if (d.t === 'read') { if (d.serverId) useStore.getState().applyRemoteRead(d.serverId, d.lastRead || 0); return; }
     if (d.t !== 'notify') return;
     const st = useStore.getState();
     // текущий (подключённый) сервер обслуживает живой LiveKit-путь — тут не дублируем
-    if (d.serverId && d.serverId === st.connectedServerId) return;
-    // force: сюда доходят ТОЛЬКО не-текущие серверы (текущий отсеян выше по connectedServerId) —
+    if (d.serverId && d.serverId === st.viewServerId) return;
+    // force: сюда доходят ТОЛЬКО не-текущие серверы (текущий отсеян выше по viewServerId) —
     // их чат не виден, поэтому упоминание уведомляем даже в фокусе (обходим FOCUS_GATED).
     notify((d.kind as NotifKind) || 'mention', {
       title: `${d.title || 'Рилэй'}${d.serverName ? ' · ' + d.serverName : ''}`,

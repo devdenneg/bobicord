@@ -497,7 +497,7 @@ function SettingsModal() {
 // Предупреждение при переходе на ДРУГОЙ сервер, пока подключён к текущему.
 function SwitchServerModal() {
   const servers = useStore((s) => s.servers);
-  const fromId = useStore((s) => s.connectedServerId);
+  const fromId = useStore((s) => s.viewServerId);
   const targetId = useStore((s) => s.pendingSwitchId);
   const from = servers.find((x) => x.id === fromId);
   const target = servers.find((x) => x.id === targetId);

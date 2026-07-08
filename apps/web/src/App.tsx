@@ -9,6 +9,7 @@ import { Auth } from './components/Auth';
 import { Toasts } from './components/Toasts';
 import { ServerView } from './components/ServerView';
 import { VoiceDock } from './components/VoiceDock';
+import { useEngine } from './hooks';
 import { Modals } from './components/Modals';
 import { DownloadCard } from './components/DownloadFab';
 import { applyNativeUpdate } from './nativeUpdate';
@@ -22,7 +23,7 @@ function Rail() {
   const active = useStore((s) => s.active);
   const view = useStore((s) => s.view);
   const loadingServerId = useStore((s) => s.loadingServerId);
-  const connectedServerId = useStore((s) => s.connectedServerId);
+  const eng = useEngine();
   const me = useStore((s) => s.me)!;
   const openServer = useStore((s) => s.openServer);
   const goHome = useStore((s) => s.goHome);
@@ -37,8 +38,8 @@ function Rail() {
       {servers.map((s) => {
         const un = activeId === s.id ? 0 : (unread[s.id] || 0); // активный не бейджим (читаем его)
         return (
-        <button key={s.id} className={'railbtn tip-l' + (activeId === s.id ? ' active' : '') + (connectedServerId === s.id && activeId !== s.id ? ' connected' : '') + (un ? ' unread' : '')}
-          data-tip={connectedServerId === s.id && activeId !== s.id ? s.name + ' · подключён' : s.name}
+        <button key={s.id} className={'railbtn tip-l' + (activeId === s.id ? ' active' : '') + (eng.voiceServerId === s.id && activeId !== s.id ? ' connected' : '') + (un ? ' unread' : '')}
+          data-tip={eng.voiceServerId === s.id && activeId !== s.id ? s.name + ' · в голосе' : s.name}
           style={{ background: s.iconUrl ? '#0000' : avColor(s.name, s.iconColor) }} onClick={() => openServer(s.id)}>
           {s.iconUrl ? <img className="avimg" src={resolveUploadUrl(s.iconUrl)} alt="" /> : initial(s.name)}{s.onlineCount ? <span className="dot green" /> : null}
           {un ? <span className="rail-badge">{un > 99 ? '99+' : un}</span> : null}
@@ -210,7 +211,7 @@ function Home() {
   const me = useStore((s) => s.me)!;
   const servers = useStore((s) => s.servers);
   const unread = useStore((s) => s.unread);
-  const connectedId = useStore((s) => s.connectedServerId);
+  const connectedId = useStore((s) => s.viewServerId);
   const openServer = useStore((s) => s.openServer);
   const setModal = useStore((s) => s.setModal);
   const refreshServers = useStore((s) => s.refreshServers);

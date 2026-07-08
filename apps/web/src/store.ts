@@ -25,7 +25,7 @@ interface AppState {
   loadingServerId: string | null;
   // сервер, к которому реально подключены (комната/чат/голос). Переживает уход на главную —
   // соединение НЕ рвём, пока не переключишься на другой сервер или не выйдешь.
-  connectedServerId: string | null;
+  viewServerId: string | null;
   pendingSwitchId: string | null; // цель для модалки подтверждения переключения сервера
   updateReady: boolean;
   // доступное обновление НАТИВА (Tauri updater); obj — Update из @tauri-apps/plugin-updater
@@ -70,21 +70,21 @@ let memberTimer: number | null = null;
 // (connectServer/exitServer/logout). Фоновые async-хвосты (connect IIFE, member-poll) захватывают
 // эпоху на старте и сверяют перед записью в стор/engine — иначе протухший хвост прошлого сервера
 // пишет своё состояние поверх текущего или рвёт живую комнату. goHome НЕ бампит (соединение живёт).
-let connEpoch = 0;
+let viewEpoch = 0;
 
 // поллинг состава/пресенса активного сервера (5с). Работает только пока смотрим этот сервер.
 function startMemberPoll(id: string) {
   if (memberTimer) clearInterval(memberTimer);
-  const epoch = connEpoch;
+  const epoch = viewEpoch;
   const poll = async () => {
     const st = useStore.getState();
-    if (st.view !== 'server' || st.connectedServerId !== id || connEpoch !== epoch) return;
+    if (st.view !== 'server' || st.viewServerId !== id || viewEpoch !== epoch) return;
     try {
       const [srv, prs] = await Promise.all([api.getServer(id), api.presence(id)]);
       // повторный гард ПОСЛЕ await: за время сети юзер мог переключить/покинуть сервер — иначе
       // протухший ответ пишет состав/пресенс чужого сервера в стор и engine (чинилось только 5с спустя)
       const st2 = useStore.getState();
-      if (st2.view !== 'server' || st2.connectedServerId !== id || connEpoch !== epoch) return;
+      if (st2.view !== 'server' || st2.viewServerId !== id || viewEpoch !== epoch) return;
       // Обновляем и СВОИ роль/права (myRole/myPerms), не только channels: раньше спред ...st2.active
       // сохранял старые myRole/myPerms → выданные владельцем роль/права не появлялись до F5/реконнекта
       // (getServer их отдаёт, но поллер выбрасывал). Плюс имя/роли сервера — на случай их правки.
@@ -160,7 +160,7 @@ let unreadTimer: number | null = null;
 let toastSeq = 1;
 
 export const useStore = create<AppState>((set, get) => ({
-  view: 'loading', me: null, servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, connectedServerId: null, pendingSwitchId: null, updateReady: false, nativeUpdate: null, emoteSize: (localStorage.getItem('emoteSize') as 'sm' | 'md' | 'lg') || 'md', toasts: [], modal: null, joinPrefill: '', broadcastLive: false, unread: {}, lastRead: {},
+  view: 'loading', me: null, servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, viewServerId: null, pendingSwitchId: null, updateReady: false, nativeUpdate: null, emoteSize: (localStorage.getItem('emoteSize') as 'sm' | 'md' | 'lg') || 'md', toasts: [], modal: null, joinPrefill: '', broadcastLive: false, unread: {}, lastRead: {},
 
   toast: (text, kind) => {
     const id = toastSeq++;
@@ -258,7 +258,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   logout: async () => {
-    connEpoch++; engine?.disconnect();
+    viewEpoch++; engine?.disconnect();
     // отписываем web-push ПОКА токен ещё текущего юзера (api.pushUnsubscribe шлёт Bearer) —
     // иначе endpoint остаётся привязан к нему на сервере и его push летели бы следующему юзеру.
     // cap 2с, чтобы разлогин не подвисал на мёртвой сети.
@@ -272,8 +272,8 @@ export const useStore = create<AppState>((set, get) => ({
     const s = get();
     if (s.loadingServerId === id) return;                     // уже открываем этот сервер
     if (s.view === 'server' && s.active?.id === id) return;    // уже смотрим его
-    if (s.connectedServerId === id) { await get().showConnectedServer(id); return; } // подключены → показать без реконнекта
-    if (s.connectedServerId) { set({ modal: 'switchServer', pendingSwitchId: id }); return; } // подключены к другому → модалка
+    if (s.viewServerId === id) { await get().showConnectedServer(id); return; } // подключены → показать без реконнекта
+    if (s.viewServerId) { set({ modal: 'switchServer', pendingSwitchId: id }); return; } // подключены к другому → модалка
     await get().connectServer(id);                            // ни к чему не подключены → полный вход
   },
 
@@ -285,7 +285,7 @@ export const useStore = create<AppState>((set, get) => ({
     // подтянуть свежий состав/пресенс (соединение и история уже живые)
     try {
       const [srv, pres] = await Promise.all([api.getServer(id), api.presence(id).catch(() => null)]);
-      if (get().connectedServerId !== id || get().view !== 'server') return;
+      if (get().viewServerId !== id || get().view !== 'server') return;
       set({ members: srv.members, active: { ...srv.server, myRole: srv.myRole, myPerms: srv.myPerms } });
       engine?.setMembers(srv.members); if (pres) { engine?.setOnlineHint(pres.online); engine?.setVoiceHint(pres.voice || {}); }
     } catch { /**/ }
@@ -293,10 +293,10 @@ export const useStore = create<AppState>((set, get) => ({
 
   // Фактический (ре)коннект: рвём прошлое соединение и поднимаем новое.
   connectServer: async (id) => {
-    const myEpoch = ++connEpoch; // новый коннект — предыдущие async-хвосты устаревают
+    const myEpoch = ++viewEpoch; // новый коннект — предыдущие async-хвосты устаревают
     if (memberTimer) clearInterval(memberTimer);
     engine?.disconnect();
-    set({ view: 'server', loadingServer: true, loadingServerId: id, active: null, members: [], connectedServerId: id });
+    set({ view: 'server', loadingServer: true, loadingServerId: id, active: null, members: [], viewServerId: id });
     try {
       // сохранённые громкости из localStorage — синхронно, до сети (иначе слайдеры = 100%)
       const cache = JSON.parse(localStorage.getItem('srvset:' + id) || 'null');
@@ -324,28 +324,28 @@ export const useStore = create<AppState>((set, get) => ({
       // WebRTC-коннект к комнате — В ФОНЕ; гард по эпохе (переживает уход на главную через goHome,
       // который эпоху не бампит). Если эпоха сменилась (свитч/выход) — НЕ рвём engine: им уже владеет
       // новый connectServer, который сам сделал disconnect+connect. Раньше тут был безусловный
-      // disconnect по устаревшему connectedServerId — он убивал ЖИВУЮ комнату нового сервера.
+      // disconnect по устаревшему viewServerId — он убивал ЖИВУЮ комнату нового сервера.
       (async () => {
         // Ретрай с backoff: одиночная транзиентная осечка (сетевой блип, таймаут WS-handshake
         // LiveKit, пересборка контейнеров при деплое) НЕ должна сразу пугать тостом и рвать
         // соединение — почти всегда лечится повтором. Тост только если все попытки провалились.
         const delays = [1500, 3000, 5000]; // паузы ПОСЛЕ 1-й, 2-й, 3-й неудачи; 4 попытки, ~9.5с суммарно
         for (let i = 0; i <= delays.length; i++) {
-          if (connEpoch !== myEpoch) return; // устарели — engine уже принадлежит новому connect
+          if (viewEpoch !== myEpoch) return; // устарели — engine уже принадлежит новому connect
           try {
             const tk = await api.serverToken(id);
-            if (connEpoch !== myEpoch) return;
+            if (viewEpoch !== myEpoch) return;
             await engine?.connect(tk.url, tk.token, id);
             return; // успех
           } catch {
-            if (connEpoch !== myEpoch) return; // устарели во время попытки
+            if (viewEpoch !== myEpoch) return; // устарели во время попытки
             if (i < delays.length) { await new Promise((r) => setTimeout(r, delays[i])); continue; }
           }
         }
-        // все попытки провалились: сбрасываем connectedServerId, иначе повторный клик уходит в
+        // все попытки провалились: сбрасываем viewServerId, иначе повторный клик уходит в
         // showConnectedServer (без реконнекта) и realtime мёртв до F5. Теперь клик = полный вход.
-        if (connEpoch === myEpoch && get().connectedServerId === id) {
-          set({ connectedServerId: null });
+        if (viewEpoch === myEpoch && get().viewServerId === id) {
+          set({ viewServerId: null });
           get().toast('Realtime-связь не поднялась — зайди на сервер заново', 'warn');
         }
       })();
@@ -362,10 +362,10 @@ export const useStore = create<AppState>((set, get) => ({
 
   // Полное отключение от сервера + на главную (выход/удаление сервера/ошибка коннекта).
   exitServer: () => {
-    connEpoch++; // in-flight connect/poll прошлого сервера устаревают
+    viewEpoch++; // in-flight connect/poll прошлого сервера устаревают
     if (memberTimer) clearInterval(memberTimer);
     engine?.disconnect();
-    set({ active: null, members: [], loadingServer: false, loadingServerId: null, connectedServerId: null, view: 'home' });
+    set({ active: null, members: [], loadingServer: false, loadingServerId: null, viewServerId: null, view: 'home' });
     get().refreshServers();
   },
 
