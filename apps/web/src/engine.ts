@@ -548,6 +548,7 @@ export class Engine {
     this.voiceConnecting = true;
     this.voiceRoom = this.viewRoom;      // реюз коннекта смотримого сервера как голосового (без второго соединения)
     this.voiceServerId = targetServer;
+    this.liveKitT.setBroadcastRoom?.(this.voiceRoom); // браузер вещает в ГОЛОСОВУЮ комнату (не в смотримую при браузинге)
     this.emit(); // ОПТИМИСТИЧНО: сразу рисуем себя в канале + статус «подключение» (mic ещё публикуется)
     // viewRoom мог ещё подниматься (фоновый connect после свитча, ретраи ~9.5с): объект Room есть, но не
     // подключён (roomReady=false). Публикация mic/vc в неподнятую комнату молча провалилась бы — «зашёл»
@@ -604,6 +605,7 @@ export class Engine {
     // голосовая комната была voice-only (я смотрю ДРУГОЙ сервер) → рвём её; если это смотримая — оставляем как viewRoom
     if (vr !== this.viewRoom) { try { vr.disconnect(); } catch { /**/ } }
     this.voiceRoom = null; this.voiceServerId = null;
+    this.liveKitT.setBroadcastRoom?.(null); // вне голоса — вещание падает на смотримую комнату (fallback)
     this.screenAudioEls.forEach((a) => (a.muted = false));
     this.emit();
   }

@@ -84,6 +84,10 @@ export interface VideoTransport {
   startBroadcast(streamId: string, source: MediaStream): Promise<void>;
   stopBroadcast(streamId: string): Promise<void>;
   isBroadcasting(streamId: string): boolean;
+  /** Расцеп voice/view (S5): вещать надо в ГОЛОСОВУЮ комнату, а не в смотримую. Транспорт слушает
+   *  события/watch на смотримой комнате (attach), но broadcast-операции целятся в этот room. Только
+   *  LiveKit (браузер вещает через SFU). null = вещать в attached-комнату (обычный shared-случай). */
+  setBroadcastRoom?(room: Room | null): void;
   isRemoteBroadcasting(identity: string): boolean;
   getScreenStats(streamId: string): Promise<string | null>;
 

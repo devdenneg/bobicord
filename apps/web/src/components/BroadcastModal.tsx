@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useStore } from '../store';
+import { useEngine } from '../hooks';
 import { api } from '../api';
 import { Icon } from '../Icon';
 import { Backdrop } from './Backdrop';
@@ -126,6 +127,7 @@ export function BroadcastModal() {
   const close = () => useStore.getState().setModal(null);
   const me = useStore((s) => s.me)!;
   const active = useStore((s) => s.active)!;
+  const eng = useEngine();
   const live = useStore((s) => s.broadcastLive);
   const [cfg, setCfg] = useState<SavedConfig>(loadConfig);
   const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
@@ -172,10 +174,14 @@ export function BroadcastModal() {
       const res = RES_MAP[cfg.resolution];
       const source = buildSource(cfg);
       const audioTargetPid = deriveAudioPid(cfg, windows);
-      await startNativeBroadcast(me.username, me.username, active.id, { source, maxWidth: res.w, maxHeight: res.h, fps: cfg.fps, bitrateBps: cfg.bitrateKbps * 1000, autoBitrate: cfg.autoBitrate, audioTargetPid, maxDirectChildren: cfg.maxDirectChildren });
+      // Трансляция идёт на ГОЛОСОВОЙ сервер (voiceServerId), а не на смотримый: вещать можно только
+      // будучи в голосовом, и дерево стрима живёт на его сервере (иначе при браузинге по серверам
+      // трансляция уходила бы в чужую комнату). Фолбэк на active.id — только если вне голоса (не должно).
+      const bcSrv = eng.voiceServerId || active.id;
+      await startNativeBroadcast(me.username, me.username, bcSrv, { source, maxWidth: res.w, maxHeight: res.h, fps: cfg.fps, bitrateBps: cfg.bitrateKbps * 1000, autoBitrate: cfg.autoBitrate, audioTargetPid, maxDirectChildren: cfg.maxDirectChildren });
       saveConfig(cfg);
       useStore.getState().setBroadcastLive(true);
-      api.streamStart(active.id).catch(() => {}); // фоновый push участникам не в комнате
+      api.streamStart(bcSrv).catch(() => {}); // фоновый push участникам не в комнате
     } catch (e: any) { setErr(String(e?.message || e)); } finally { setBusy(false); }
   }
 
