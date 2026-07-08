@@ -267,14 +267,15 @@ export const useStore = create<AppState>((set, get) => ({
     setToken(null); location.reload();
   },
 
-  // Точка входа по клику на сервер. Решает: показать уже подключённый / предупредить о переключении / коннектить.
+  // Точка входа по клику на сервер. Просмотр СВОБОДНЫЙ (голос не рвём, модалки переключения больше нет):
+  // уже смотрю → no-op; смотримая комната уже на id (вернулся с главной) → мгновенный показ; иначе — вход
+  // (connectServer сам решит: реюз живой голосовой комнаты или новый view-коннект).
   openServer: async (id) => {
     const s = get();
     if (s.loadingServerId === id) return;                     // уже открываем этот сервер
     if (s.view === 'server' && s.active?.id === id) return;    // уже смотрим его
-    if (s.viewServerId === id) { await get().showConnectedServer(id); return; } // подключены → показать без реконнекта
-    if (s.viewServerId) { set({ modal: 'switchServer', pendingSwitchId: id }); return; } // подключены к другому → модалка
-    await get().connectServer(id);                            // ни к чему не подключены → полный вход
+    if (s.viewServerId === id) { await get().showConnectedServer(id); return; } // смотримая комната уже на id
+    await get().connectServer(id);
   },
 
   // Показать сервер, к которому уже подключены (вернулись с главной) — мгновенно, без реконнекта.
@@ -295,7 +296,10 @@ export const useStore = create<AppState>((set, get) => ({
   connectServer: async (id) => {
     const myEpoch = ++viewEpoch; // новый коннект — предыдущие async-хвосты устаревают
     if (memberTimer) clearInterval(memberTimer);
-    engine?.disconnect();
+    // Вход на СВОЙ голосовой сервер → реюз живой голосовой комнаты как смотримой (без 2-го коннекта к тому же
+    // srv = без само-дубля/эха). Иначе — отцепляем прежнюю смотримую; голос НЕ трогаем (браузинг больше не рвёт голос).
+    const reuse = !!engine && engine.getSnapshot().voiceServerId === id;
+    if (reuse) engine?.reuseVoiceAsView(); else engine?.detachView();
     set({ view: 'server', loadingServer: true, loadingServerId: id, active: null, members: [], viewServerId: id });
     try {
       // сохранённые громкости из localStorage — синхронно, до сети (иначе слайдеры = 100%)
@@ -321,11 +325,10 @@ export const useStore = create<AppState>((set, get) => ({
         localStorage.setItem('onboardedSrv', '1');
         engine?.sysMsg('👋 Ты в чате, но НЕ в голосовом. Нажми «Подключиться», чтобы говорить. Справа — кто в сети и кто в голосовом.');
       }
-      // WebRTC-коннект к комнате — В ФОНЕ; гард по эпохе (переживает уход на главную через goHome,
-      // который эпоху не бампит). Если эпоха сменилась (свитч/выход) — НЕ рвём engine: им уже владеет
-      // новый connectServer, который сам сделал disconnect+connect. Раньше тут был безусловный
-      // disconnect по устаревшему viewServerId — он убивал ЖИВУЮ комнату нового сервера.
-      (async () => {
+      // WebRTC-коннект к НОВОЙ смотримой комнате — В ФОНЕ; гард по эпохе (переживает уход на главную через
+      // goHome, который эпоху не бампит). Эпоха сменилась (свитч/выход) — НЕ рвём engine: им уже владеет
+      // новый connectServer. При РЕЮЗЕ (вход на свой голосовой сервер) коннект НЕ нужен — комната уже живая.
+      if (!reuse) (async () => {
         // Ретрай с backoff: одиночная транзиентная осечка (сетевой блип, таймаут WS-handshake
         // LiveKit, пересборка контейнеров при деплое) НЕ должна сразу пугать тостом и рвать
         // соединение — почти всегда лечится повтором. Тост только если все попытки провалились.
@@ -364,7 +367,10 @@ export const useStore = create<AppState>((set, get) => ({
   exitServer: () => {
     viewEpoch++; // in-flight connect/poll прошлого сервера устаревают
     if (memberTimer) clearInterval(memberTimer);
-    engine?.disconnect();
+    // Покидаю СМОТРИМЫЙ сервер (leave/delete/ошибка). Если я в голосе ИМЕННО на нём — выхожу и из голоса
+    // (полный teardown); иначе голос на другом сервере — оставляем, отцепляем только просмотр.
+    const voiceSrv = engine?.getSnapshot().voiceServerId;
+    if (voiceSrv && voiceSrv === get().viewServerId) engine?.disconnect(); else engine?.detachView();
     set({ active: null, members: [], loadingServer: false, loadingServerId: null, viewServerId: null, view: 'home' });
     get().refreshServers();
   },

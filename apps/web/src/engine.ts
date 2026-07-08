@@ -142,7 +142,8 @@ export class Engine {
   private keepOsc: OscillatorNode | null = null;
   private screenStream: MediaStream | null = null;
   private presenceTimer: number | null = null;
-  private serverId = ''; // текущий сервер (для api.streamStart → фоновый push о трансляции)
+  private viewServerId = '';                   // сервер, который смотрю (viewRoom) — теги notify чата/стримов
+  private voiceServerId: string | null = null; // сервер, где я в голосовом (voiceRoom) — broadcast + снапшот; null вне войса
   private gameTimer: number | null = null;
   private myGame: GameStatus | null = null; // игра на переднем плане (натив, если включено в настройках)
 
@@ -183,7 +184,7 @@ export class Engine {
         this.sysMsg(`📺 ${who} начал трансляцию — «▶ Смотреть» в списке`);
         playSound('streamOn');
         this.hooks.toast(who + ' начал трансляцию', 'info');
-        notify('stream', { title: who, body: 'начал(а) трансляцию', tag: 'stream:' + this.serverId }); // тег как у серверного push → local+push схлопываются в один баннер
+        notify('stream', { title: who, body: 'начал(а) трансляцию', tag: 'stream:' + this.viewServerId }); // тег как у серверного push → local+push схлопываются в один баннер
       }
     };
     const onStreamStop = (identity: string) => {
@@ -282,7 +283,7 @@ export class Engine {
     return {
       connected: !!this.viewRoom, roomReady: this.roomReady, reconnecting: this.reconnecting,
       voiceQuality: this.inVoice ? this.connQuality : 'unknown', voicePing: this.inVoice ? this.pingMs : null,
-      inVoice: this.inVoice, voiceConnecting: this.inVoice && this.voiceConnecting, myVoiceChannel: this.currentVc, voiceServerId: this.inVoice ? this.serverId : null, voiceChannels, deafened: this.deafened,
+      inVoice: this.inVoice, voiceConnecting: this.inVoice && this.voiceConnecting, myVoiceChannel: this.currentVc, voiceServerId: this.voiceServerId, voiceChannels, deafened: this.deafened,
       localMicMuted: this.localMicMuted(), pttDown: this.pttDown,
       presence, speaking, streams, watching, pending, watchers, messages: this.messages, chatHasMore: this.chatMore, chatTrimmed: this.trimmedFront,
       typing: [...this.typingUsers].filter(([n, exp]) => exp > Date.now() && n !== this.me.displayName).map(([n]) => n),
@@ -295,8 +296,10 @@ export class Engine {
       adaptiveStream: true, dynacast: true,
       publishDefaults: { dtx: true, red: true, simulcast: true, audioPreset: AudioPresets.musicHighQuality },
     });
-    this.viewRoom = this.voiceRoom = r; // 4a: держим равными (voiceServer===viewServer); реальный расцеп — 4c
-    this.serverId = serverId;
+    // connect поднимает ТОЛЬКО viewRoom (смотрю сервер). voiceRoom НЕ трогаем — им владеют join/leaveVoice:
+    // при входе в голос voiceRoom:=viewRoom (реюз), при уходе на другой сервер голосовая комната остаётся.
+    this.viewRoom = r;
+    this.viewServerId = serverId;
     this.liveKitT.attach(r, { me: this.me.username, serverId });
     this.treeT.attach(r, { me: this.me.username, serverId });
     // Хендлеры ветвятся по РОЛИ комнаты r: voice-работа при r===voiceRoom, view-работа при r===viewRoom.
@@ -340,14 +343,13 @@ export class Engine {
     // voiceRoom: подписка на уже опубликованные микрофоны (bootstrap). viewRoom: ре-энумерация стримов.
     if (r === this.voiceRoom) r.remoteParticipants.forEach((p) => p.trackPublications.forEach((pub) => this.onRemotePub(pub, p, true)));
     if (r === this.viewRoom) { this.liveKitT.onRoomConnected(); this.treeT.onRoomConnected(); }
-    // periodic self-heal подписок на микрофоны: атрибут vc (голосовой канал) мог доехать без события
-    // ParticipantAttributesChanged (гонка при быстрых прыжках между каналами / реконнекте) — тогда пир
-    // виден в канале, но его не слышно. setSubscribed идемпотентен, поэтому реконсиляция дёшева и безопасна.
+    // ОДИН engine-таймер на оба соединения (методы внутри бьют в нужную комнату: announceWatch/reconcile/
+    // selfHeal сами выбирают view/voice). connect зовётся на каждую смену смотримого сервера → чистим
+    // прежний, чтобы не плодить таймеры при браузинге в голосе. self-heal vc/подписок — см. selfHealVc.
+    if (this.presenceTimer) clearInterval(this.presenceTimer);
     this.presenceTimer = window.setInterval(() => { this.announceWatch(); this.cleanupWatchers(); if (this.inVoice) this.reconcileAllAudio(); this.selfHealVc(); }, 3000);
-    // Детект игры (натив): раз в 10с публикуем участник-атрибуты game/gicon → все (вкл. веб и
-    // late-joiner'ов) видят «играет в X». Веб detectGame → null (процессы не видит), но статус
-    // ДРУГИХ читает из атрибутов в build(). Гейтится тумблером shareGame.
-    if (isTauri) { this.pollGame(); this.gameTimer = window.setInterval(() => this.pollGame(), 10000); }
+    // Детект игры (натив): раз в 10с публикуем участник-атрибуты game/gicon → все видят «играет в X».
+    if (isTauri) { if (this.gameTimer) clearInterval(this.gameTimer); this.pollGame(); this.gameTimer = window.setInterval(() => this.pollGame(), 10000); }
     this.emit();
   }
   private async pollGame() {
@@ -367,6 +369,7 @@ export class Engine {
     this.emit();
   }
 
+  // Полный teardown (logout / выход с сервера, где я в голосе): рвём ОБЕ комнаты + всё состояние.
   disconnect() {
     if (this.presenceTimer) clearInterval(this.presenceTimer);
     if (this.gameTimer) { clearInterval(this.gameTimer); this.gameTimer = null; } this.myGame = null;
@@ -381,17 +384,47 @@ export class Engine {
     this.liveKitT.detach(); this.treeT.detach(); this.screenAudioEls.clear();
     this.watching.clear(); this.pendingWatch.clear(); this.watchT.clear(); this.streamWatchers.clear();
     this.perMute.clear(); this.messages = []; this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0;
-    // presence-хинты и typing принадлежат ПРЕДЫДУЩЕМУ серверу — иначе при свитче первый emit (по
-    // setMembers нового сервера) рисует их онлайн/в чужом голосовом канале до прихода нового /presence
     this.onlineHint.clear(); this.voiceHint = {}; this.typingUsers.clear();
     this.clearAudioUnlock();
     if (this.micRaw) { this.micRaw.getTracks().forEach((t) => t.stop()); this.micRaw = null; }
     if (this.micActx) { try { this.micActx.close(); } catch { /**/ } this.micActx = null; }
     this.micGain = null;
     this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.roomReady = false; this.deafened = false; this.manualMute = false; this.screenStream = null;
-    if (this.viewRoom) { try { this.viewRoom.disconnect(); } catch { /**/ } }
-    // 4a: комнаты равны → одна физическая; рвём её и обнуляем оба указателя. Раздельный teardown — в 4c.
-    this.viewRoom = this.voiceRoom = null; this.emit();
+    // рвём ОБЕ комнаты (при расцепе разные; при shared — одна, Set схлопнёт дубль)
+    new Set([this.viewRoom, this.voiceRoom].filter(Boolean)).forEach((rm) => { try { (rm as Room).disconnect(); } catch { /**/ } });
+    this.viewRoom = null; this.voiceRoom = null; this.viewServerId = ''; this.voiceServerId = null; this.emit();
+  }
+
+  // Уйти со СМОТРИМОГО сервера (браузинг на другой / на главную-с-выходом), НЕ трогая голос: чистим
+  // view-состояние (чат/стримы/presence-хинты/typing) и рвём viewRoom, ТОЛЬКО если она не голосовая.
+  detachView() {
+    this.messages = []; this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0;
+    this.watching.clear(); this.pendingWatch.clear(); this.watchT.clear(); this.streamWatchers.clear();
+    // presence-хинты и typing принадлежат ПРЕДЫДУЩЕМУ смотримому серверу
+    this.onlineHint.clear(); this.voiceHint = {}; this.typingUsers.clear();
+    this.liveKitT.detach(); this.treeT.detach();
+    document.querySelectorAll('#audioSink audio[data-origin="view"]').forEach((a) => a.remove()); // только стрим-аудио, не мик
+    this.screenAudioEls.clear();
+    this.roomReady = false;
+    const vw = this.viewRoom;
+    this.viewRoom = null; this.viewServerId = '';
+    if (vw && vw !== this.voiceRoom) { try { vw.disconnect(); } catch { /**/ } } // не рвём, если это голосовая комната (голос продолжается)
+    this.emit();
+  }
+
+  // Вернуться на просмотр СВОЕГО голосового сервера: смотримой становится живая голосовая комната (без
+  // второго коннекта к тому же srv → без само-дубля/эха). Отцепляем прежнюю смотримую, переносим
+  // video-транспорты на голосовую, ре-энум стримов. Чат/presence грузит стор (как обычный вход).
+  reuseVoiceAsView() {
+    this.detachView();
+    if (!this.voiceRoom) return; // голос успел уйти
+    this.viewRoom = this.voiceRoom;
+    this.viewServerId = this.voiceServerId || '';
+    this.roomReady = true; // голосовая комната уже подключена
+    this.liveKitT.attach(this.viewRoom, { me: this.me.username, serverId: this.viewServerId });
+    this.treeT.attach(this.viewRoom, { me: this.me.username, serverId: this.viewServerId });
+    this.liveKitT.onRoomConnected(); this.treeT.onRoomConnected();
+    this.emit();
   }
 
   /* ---------- presence helpers ---------- */
@@ -451,15 +484,19 @@ export class Engine {
   // локально), но ВСЕ остальные — нет: они читают participant-атрибут vc (или серверный voiceHint,
   // который тоже строится из атрибута), а он пуст. Ретрай был только на Reconnected — теперь и в 3с-self-heal.
   private selfHealVc() {
-    if (!this.voiceRoom) return;
-    // Двунаправленно: в войсе публикуем vc=currentVc; ВНЕ войса — vc='' (иначе если setAttributes({vc:''})
-    // при leaveVoice не долетел, покинувший «залипает» в канале у других до реконнекта — обратная сторона
-    // того же бага). deaf публикуем только пока в войсе.
-    const wantVc = this.inVoice ? (this.currentVc || '') : '';
-    const wantDeaf = (this.inVoice && this.deafened) ? '1' : '';
-    const attrs = this.voiceRoom.localParticipant.attributes || {};
-    if ((attrs.vc || '') !== wantVc || (attrs.deaf || '') !== wantDeaf) {
-      this.voiceRoom.localParticipant.setAttributes({ vc: wantVc, deaf: wantDeaf }).catch(() => {});
+    // voiceRoom: держим мой vc=currentVc + deaf, пока в войсе (гонка/rate-limit могли не долить setAttributes).
+    if (this.voiceRoom && this.inVoice) {
+      const wantDeaf = this.deafened ? '1' : '';
+      const a = this.voiceRoom.localParticipant.attributes || {};
+      if ((a.vc || '') !== (this.currentVc || '') || (a.deaf || '') !== wantDeaf)
+        this.voiceRoom.localParticipant.setAttributes({ vc: this.currentVc || '', deaf: wantDeaf }).catch(() => {});
+    }
+    // viewRoom, ЕСЛИ она НЕ голосовая (смотрю сервер, где не в войсе): моего голоса тут нет → vc/deaf ''
+    // (иначе после leaveVoice/браузинга «залипну» в канале у других на этом сервере — vc:'' мог не долететь).
+    if (this.viewRoom && this.viewRoom !== this.voiceRoom) {
+      const a = this.viewRoom.localParticipant.attributes || {};
+      if ((a.vc || '') !== '' || (a.deaf || '') !== '')
+        this.viewRoom.localParticipant.setAttributes({ vc: '', deaf: '' }).catch(() => {});
     }
   }
   private isStreaming(username: string): boolean {
@@ -497,33 +534,42 @@ export class Engine {
   /* ---------- VOICE join/leave/switch (несколько каналов на сервер) ---------- */
   // подключиться к голосовому каналу channelId; если уже в другом — переключиться без переподнятия микрофона
   async joinVoice(channelId: string) {
-    if (!channelId) return;
-    if (this.inVoice) { if (this.currentVc !== channelId) await this.switchVoice(channelId); return; }
+    if (!channelId || !this.viewRoom) return;
+    const targetServer = this.viewServerId; // вход в голос — на СМОТРИМОМ сервере (его каналы в ServerView)
+    // уже в голосовом на ЭТОМ же сервере → только смена канала (мик остаётся)
+    if (this.inVoice && this.voiceServerId === targetServer) {
+      if (this.currentVc !== channelId) await this.switchVoice(channelId);
+      return;
+    }
+    // в голосовом на ДРУГОМ сервере → покидаем его (Discord: молча переносим голос сюда)
+    if (this.inVoice && this.voiceServerId !== targetServer) await this.leaveVoice();
     this.currentVc = channelId;
     this.inVoice = true; this.manualMute = false; this.pttDown = false;
     this.voiceConnecting = true;
+    this.voiceRoom = this.viewRoom;      // реюз коннекта смотримого сервера как голосового (без второго соединения)
+    this.voiceServerId = targetServer;
     this.emit(); // ОПТИМИСТИЧНО: сразу рисуем себя в канале + статус «подключение» (mic ещё публикуется)
-    // После свитча серверов WebRTC-коннект к комнате идёт В ФОНЕ (ретраи ~9.5с): объект Room уже создан
-    // (non-null), но ещё НЕ подключён (roomReady=false). Публикация mic/vc в неподнятую комнату молча
-    // проваливается — по UI «зашёл», по факту нет (selfHealVc чинит только vc-атрибут, но не mic-трек).
-    // Ждём реального подключения, показывая «подключение»; не поднялась за таймаут — откат.
+    // viewRoom мог ещё подниматься (фоновый connect после свитча, ретраи ~9.5с): объект Room есть, но не
+    // подключён (roomReady=false). Публикация mic/vc в неподнятую комнату молча провалилась бы — «зашёл»
+    // по UI, по факту нет. Ждём готовности, показывая «подключение»; не поднялась за таймаут — откат.
     if (!this.roomReady) {
       const ready = await this.waitRoomReady(15000);
       if (this.currentVc !== channelId || !this.inVoice) return; // за время ожидания свитч/выход/передумал
       if (!ready || !this.voiceRoom) {
-        this.inVoice = false; this.currentVc = null; this.voiceConnecting = false;
+        this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.voiceRoom = null; this.voiceServerId = null;
         this.hooks.toast('Realtime-связь не поднялась — попробуй ещё раз', 'warn'); this.emit(); return;
       }
     }
-    if (!this.voiceRoom) { this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.emit(); return; }
+    if (!this.voiceRoom) { this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.voiceServerId = null; this.emit(); return; }
     try { await this.voiceRoom.localParticipant.setAttributes({ vc: channelId }); } catch { /**/ }
     try { await this.startMic(); }
     catch {
       this.inVoice = false; this.currentVc = null; this.voiceConnecting = false;
       try { await this.voiceRoom.localParticipant.setAttributes({ vc: '' }); } catch { /**/ }
+      this.voiceRoom = null; this.voiceServerId = null;
       this.hooks.toast('Нет доступа к микрофону', 'err'); this.emit(); return;
     }
-    this.reconcileAllAudio(); // подписываемся только на пиров этого же канала
+    this.reconcileAllAudio(); // подписываемся на пиров этого же канала (bootstrap мик-подписок)
     this.startConnPoll();
     this.lastVclaim = Date.now();
     this.dataSend({ t: 'vclaim', uid: this.me.id, session: this.sessionId() }); // забираем голос у своих других сессий (одна голосовая на аккаунт)
@@ -542,6 +588,7 @@ export class Engine {
   }
   async leaveVoice() {
     if (!this.voiceRoom || !this.inVoice) return;
+    const vr = this.voiceRoom; // фиксируем: ниже обнулим указатель (и, возможно, порвём комнату)
     // оптимистично: сразу убираем себя из канала (UI не ждёт async-очистку mic/треков)
     this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.deafened = false; this.manualMute = false; this.pttDown = false;
     playSound('exit'); // сам вышедший тоже слышит выход (остальные в канале — через onRemoteUnpub)
@@ -549,12 +596,14 @@ export class Engine {
     this.stopConnPoll();
     await this.stopShare().catch(() => {});
     this.stopMic();
-    this.voiceRoom.remoteParticipants.forEach((p) => { const rp = p.getTrackPublication(Track.Source.Microphone); if (rp) { try { (rp as any).setSubscribed(false); } catch { /**/ } } this.detachAnalyser(baseUid(p.identity)); });
-    // Belt-and-suspenders: сносим mic-аудиоэлементы сразу (не ждём async onUnsub). НЕ трогаем
-    // screenshare-элементы (стрим смотрится и без голосового) — их отличаем по screenAudioEls.
-    const screenEls = new Set(this.screenAudioEls.values());
-    document.querySelectorAll('#audioSink audio').forEach((a) => { if (!screenEls.has(a as HTMLAudioElement)) a.remove(); });
-    try { await this.voiceRoom.localParticipant.setAttributes({ vc: '', deaf: '' }); } catch { /**/ }
+    vr.remoteParticipants.forEach((p) => { const rp = p.getTrackPublication(Track.Source.Microphone); if (rp) { try { (rp as any).setSubscribed(false); } catch { /**/ } } this.detachAnalyser(baseUid(p.identity)); });
+    // Сносим мик-аудиоэлементы сразу (origin=voice), не ждём async onUnsub. Стрим-аудио (origin=view)
+    // НЕ трогаем — стрим смотрится и без голосового (и может жить в ДРУГОЙ, смотримой комнате).
+    document.querySelectorAll('#audioSink audio[data-origin="voice"]').forEach((a) => a.remove());
+    try { await vr.localParticipant.setAttributes({ vc: '', deaf: '' }); } catch { /**/ }
+    // голосовая комната была voice-only (я смотрю ДРУГОЙ сервер) → рвём её; если это смотримая — оставляем как viewRoom
+    if (vr !== this.viewRoom) { try { vr.disconnect(); } catch { /**/ } }
+    this.voiceRoom = null; this.voiceServerId = null;
     this.screenAudioEls.forEach((a) => (a.muted = false));
     this.emit();
   }
@@ -931,7 +980,7 @@ export class Engine {
     const surf = (vt.getSettings() as any).displaySurface || '';
     if (surf === 'monitor' || surf === 'window') this.hooks.toast('Выбран экран/окно (~15fps). Для 60fps выбирай «Вкладка Chrome»', 'warn'); else this.hooks.toast('Трансляция запущена', 'ok');
     playSound('streamOn');
-    if (this.serverId) api.streamStart(this.serverId).catch(() => {}); // фоновый push участникам не в комнате
+    if (this.voiceServerId) api.streamStart(this.voiceServerId).catch(() => {}); // фоновый push участникам не в комнате (broadcast на голосовом сервере)
     this.emit();
   }
   async stopShare() {
@@ -1120,7 +1169,7 @@ export class Engine {
     if (mentioned.length) {
       // звук тега играет само уведомление (notify) — как в Discord; на обычные сообщения не звучим
       this.hooks.toast(mentioned.length === 1 ? `${mentioned[0].who} упомянул тебя` : `Тебя упомянули · ${mentioned.length}`, 'info');
-      notify('mention', { title: mentioned.length === 1 ? String(mentioned[0].who) : 'Упоминания', body: mentioned.length === 1 ? String(mentioned[0].text || '').slice(0, 140) : `Тебя упомянули · ${mentioned.length}`, tag: 'mention:' + this.serverId });
+      notify('mention', { title: mentioned.length === 1 ? String(mentioned[0].who) : 'Упоминания', body: mentioned.length === 1 ? String(mentioned[0].text || '').slice(0, 140) : `Тебя упомянули · ${mentioned.length}`, tag: 'mention:' + this.viewServerId });
     }
     this.emit();
   }
@@ -1188,7 +1237,7 @@ export class Engine {
         this.pushMsg(d.name, d.text, false, d.color, own, d.img, undefined, d.uid, d.reply);
         if (!own && mentioned) { // тост+notify ТОЛЬКО когда тегнули/реплайнули; звук тега даёт само notify (Discord)
           this.hooks.toast(repliedToMe ? `${d.name} ответил тебе` : `${d.name} упомянул тебя`, 'info');
-          notify('mention', { title: d.name, body: String(d.text || '').slice(0, 140) || '🖼 изображение', tag: 'mention:' + this.serverId });
+          notify('mention', { title: d.name, body: String(d.text || '').slice(0, 140) || '🖼 изображение', tag: 'mention:' + this.viewServerId });
         }
       }
       else if (d.t === 'clear') { this.messages = []; this.emit(); this.sysMsg((d.by || 'Админ') + ' очистил чат'); }
