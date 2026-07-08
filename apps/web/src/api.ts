@@ -1,4 +1,4 @@
-import type { User, ServerSummary, Member, ServerDetail, InvitePreview, HistoryMessage, Role, VoiceChannel } from './types';
+import type { User, ServerSummary, Member, ServerDetail, InvitePreview, HistoryMessage, Role, VoiceChannel, Attachment } from './types';
 
 let token: string | null = localStorage.getItem('sess');
 export const getToken = () => token;
@@ -77,6 +77,17 @@ export const api = {
     if (!r.ok) throw new Error(d?.error || 'Ошибка ' + r.status);
     return d as { url: string };
   },
+  // произвольный файл-вложение (любое расширение, <=10MB) — раздаётся форс-скачиванием, не инлайн.
+  // Имя передаём отдельным заголовком (raw body = сами байты файла, без multipart).
+  uploadFile: async (file: File): Promise<{ url: string; name: string; size: number }> => {
+    const headers: Record<string, string> = { 'Content-Type': file.type || 'application/octet-stream', 'X-Attachment-Name': encodeURIComponent(file.name) };
+    if (token) headers['Authorization'] = 'Bearer ' + token;
+    const r = await fetch(API_BASE + '/api/upload-file', { method: 'POST', headers, body: file });
+    let d: any = {};
+    try { d = await r.json(); } catch { /* ignore */ }
+    if (!r.ok) throw new Error(d?.error || 'Ошибка ' + r.status);
+    return d as { url: string; name: string; size: number };
+  },
   createServer: (name: string) =>
     req<{ server: ServerSummary; invite: string; inviteExpires: number }>('POST', '/servers', { name }),
   getServer: (id: string) =>
@@ -119,7 +130,7 @@ export const api = {
     const q = qs.toString();
     return req<{ messages: HistoryMessage[]; hasMore: boolean }>('GET', `/servers/${id}/messages${q ? '?' + q : ''}`);
   },
-  postMessage: (id: string, text: string, em: Record<string, string>, image?: string, reply?: import('./types').ReplyRef, key?: string) => req<{ ok: boolean }>('POST', `/servers/${id}/messages`, { text, em, image, reply, key }),
+  postMessage: (id: string, text: string, em: Record<string, string>, image?: string, reply?: import('./types').ReplyRef, key?: string, files?: Attachment[]) => req<{ ok: boolean }>('POST', `/servers/${id}/messages`, { text, em, image, reply, key, files }),
   // Web Push (фоновые уведомления PWA/браузера)
   pushVapid: () => req<{ enabled: boolean; key: string }>('GET', '/push/vapid'),
   pushSubscribe: (sub: unknown, prefs: { mention: boolean; stream: boolean }) => req<{ ok: boolean }>('POST', '/push/subscribe', { sub, prefs }),

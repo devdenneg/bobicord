@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useStore, getEngine } from './store';
 import { getSettings, setSettings, subscribeSettings } from './settings';
 import { avColor, initial, normKey } from './util';
@@ -17,6 +17,9 @@ import { isTauri, setGlobalHotkeys, onGlobalHotkey, setDetectableGames } from '.
 import type { ServerSummary, OnlineMember, KeybindAction } from './types';
 import { LogoLoader } from './components/LogoLoader';
 import { initNotifications } from './notify';
+
+// версия принудительного сброса хоткеев на новые дефолты — см. эффект хоткеев ниже
+const HK_RESET_V = 1;
 
 function Rail() {
   const servers = useStore((s) => s.servers);
@@ -56,7 +59,7 @@ function Rail() {
 }
 
 // аватар: картинка или инициал на цветном фоне (единый рендер лиц/иконок главной)
-function Face({ url, name, color }: { url?: string; name: string; color: number }) {
+function Face({ url, name }: { url?: string; name: string; color: number }) {
   return url ? <img className="avimg" src={resolveUploadUrl(url)} alt="" /> : <>{initial(name)}</>;
 }
 const faceBg = (url: string | undefined, name: string, color: number) => (url ? '#0000' : avColor(name, color));
@@ -450,17 +453,32 @@ export function App() {
   // зайти под тем же аккаунтом на другой машине) и отправляем на сервер при изменении —
   // но только когда реально меняются keybinds/disableGlobalHotkeys, а не любая настройка
   // (иначе на каждый чих слайдера громкости улетал бы запрос).
+  //
+  // HK_RESET_V — принудительный одноразовый сброс хоткеев на новые дефолты (пустые бинды +
+  // выключенный глобальный хук): у аккаунтов, уже сохранивших старые бинды на сервере, remote
+  // не совпадёт с этой версией → игнорируем remote.keybinds/disableGlobalHotkeys (локальные
+  // дефолты из settings.ts уже новые) и штампуем версию обратно, чтобы сброс не повторялся на
+  // каждом логине. hkResetVRef держит актуальную версию для push-эффекта ниже (иначе он перезаписал
+  // бы блоб без штампа при следующем изменении бинда пользователем).
+  const hkResetVRef = useRef(HK_RESET_V);
   useEffect(() => {
     if (!me) return;
     let cancelled = false;
     api.getMySettings().then((d) => {
       if (cancelled) return;
       const remote = d?.data || {};
-      const s = getSettings();
-      const patch: Partial<ReturnType<typeof getSettings>> = {};
-      if (remote.keybinds) patch.keybinds = { ...s.keybinds, ...remote.keybinds };
-      if (typeof remote.disableGlobalHotkeys === 'boolean') patch.disableGlobalHotkeys = remote.disableGlobalHotkeys;
-      if (Object.keys(patch).length) setSettings(patch);
+      const needsReset = remote.hkResetV !== HK_RESET_V;
+      if (!needsReset) {
+        const s = getSettings();
+        const patch: Partial<ReturnType<typeof getSettings>> = {};
+        if (remote.keybinds) patch.keybinds = { ...s.keybinds, ...remote.keybinds };
+        if (typeof remote.disableGlobalHotkeys === 'boolean') patch.disableGlobalHotkeys = remote.disableGlobalHotkeys;
+        if (Object.keys(patch).length) setSettings(patch);
+      } else {
+        // локальные дефолты (settings.ts) уже пустые бинды + disableGlobalHotkeys:true — просто фиксируем версию на сервере
+        api.putMySettings({ keybinds: getSettings().keybinds, disableGlobalHotkeys: getSettings().disableGlobalHotkeys, hkResetV: HK_RESET_V }).catch(() => {});
+      }
+      hkResetVRef.current = HK_RESET_V;
     }).catch(() => {});
     return () => { cancelled = true; };
   }, [me]);
@@ -473,7 +491,7 @@ export function App() {
       const cur = snapshot();
       if (cur === last) return;
       last = cur;
-      api.putMySettings(JSON.parse(cur)).catch(() => {});
+      api.putMySettings({ ...JSON.parse(cur), hkResetV: hkResetVRef.current }).catch(() => {});
     };
     return subscribeSettings(push);
   }, [me]);

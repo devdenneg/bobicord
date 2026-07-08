@@ -159,6 +159,7 @@ for (const sql of [
   "ALTER TABLE servers ADD COLUMN icon_url TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE invites ADD COLUMN expires INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE messages ADD COLUMN client_key TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
 ]) { try { db.exec(sql); } catch (e) { /* column already exists */ } }
 
 // Идемпотентность отправки: клиент шлёт стабильный dedup-ключ (переживает retry). Partial-unique
@@ -554,6 +555,42 @@ app.post('/api/upload', requireAuth, express.raw({ type: Object.keys(MIME_EXT), 
   res.json({ url: '/api/uploads/' + name });
 });
 
+/* ---------------- FILE ATTACHMENTS (любые расширения, <=10MB) ----------------
+ * Отдельная директория от IMAGE UPLOADS выше и НЕ отдаётся через express.static —
+ * иначе загруженный .html/.svg исполнился бы на нашем origin (XSS). Раздача только
+ * через ручной роут ниже, всегда Content-Disposition: attachment + nosniff, независимо
+ * от реального типа файла. Картинки-вложения по-прежнему идут через /api/upload выше
+ * (инлайн-превью в чате), этот путь — для остальных расширений. */
+const FILES_DIR = path.join(DATA_DIR, 'files');
+try { fs.mkdirSync(FILES_DIR, { recursive: true }); } catch (e) {}
+const FILE_URL_RE = /^\/api\/files\/[a-zA-Z0-9._-]+$/;
+app.post('/api/upload-file', requireAuth, express.raw({ type: () => true, limit: '10mb' }), (req, res) => {
+  if (!Buffer.isBuffer(req.body) || req.body.length === 0) return res.status(400).json({ error: 'Пустой файл' });
+  const rawName = String(req.headers['x-attachment-name'] || '');
+  let origName = 'file';
+  try { origName = decodeURIComponent(rawName).slice(0, 255) || 'file'; } catch (e) { /* мусор в заголовке — дефолт */ }
+  const ext = (origName.match(/\.[a-zA-Z0-9]{1,10}$/) || [''])[0].toLowerCase();
+  const name = crypto.randomBytes(12).toString('hex') + ext;
+  try { fs.writeFileSync(path.join(FILES_DIR, name), req.body); }
+  catch (e) { return res.status(500).json({ error: 'Не удалось сохранить файл' }); }
+  res.json({ url: '/api/files/' + name, name: origName, size: req.body.length });
+});
+app.get('/api/files/:name', (req, res) => {
+  const name = req.params.name;
+  if (!/^[a-zA-Z0-9._-]+$/.test(name)) return res.status(400).end();
+  // path.resolve (не path.join) — express res.sendFile требует ПОЛНОСТЬЮ разрешённый абсолютный
+  // путь (строже, чем path.isAbsolute): на Windows drive-relative '\app\data\...' (DATA_DIR='/app/data'
+  // резолвится так при локальном запуске вне Docker) он бы отклонил с TypeError. path.resolve всегда
+  // дописывает диск/cwd, поэтому корректен и локально, и в проде (Linux, где путь и так абсолютный).
+  const p = path.resolve(FILES_DIR, name);
+  if (!fs.existsSync(p)) return res.status(404).end();
+  const dispName = String(req.query.name || name).replace(/[\r\n"\\]/g, '').slice(0, 255);
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Disposition', `attachment; filename="${dispName}"`);
+  res.sendFile(p);
+});
+
 /* ---------------- SERVERS ---------------- */
 const INVITE_TTL = 30 * 60 * 1000; // приглашение живёт 30 минут
 function makeInvite(sid, uid) {
@@ -820,21 +857,40 @@ app.get('/api/servers/:id/messages', requireAuth, (req, res) => {
   const minTs = Date.now() - WEEK_MS;
   // берём limit+1, чтобы понять, есть ли ещё более старые сообщения (hasMore)
   const rows = before > 0
-    ? db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,reply_to,created FROM messages WHERE server_id=? AND created>? AND id<? ORDER BY id DESC LIMIT ?').all(sid, minTs, before, limit + 1)
-    : db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,reply_to,created FROM messages WHERE server_id=? AND created>? ORDER BY id DESC LIMIT ?').all(sid, minTs, limit + 1);
+    ? db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created FROM messages WHERE server_id=? AND created>? AND id<? ORDER BY id DESC LIMIT ?').all(sid, minTs, before, limit + 1)
+    : db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created FROM messages WHERE server_id=? AND created>? ORDER BY id DESC LIMIT ?').all(sid, minTs, limit + 1);
   const hasMore = rows.length > limit;
   const page = rows.slice(0, limit).reverse(); // ASC: старые → новые (как рисуем в чате)
   res.json({
     hasMore,
-    messages: page.map(r => ({ id: r.id, uid: r.user_id, name: r.display_name, color: r.avatar_color, text: r.text, em: JSON.parse(r.emotes || '{}'), img: r.image || '', reply: r.reply_to ? JSON.parse(r.reply_to) : undefined, ts: r.created })),
+    messages: page.map(r => ({ id: r.id, uid: r.user_id, name: r.display_name, color: r.avatar_color, text: r.text, em: JSON.parse(r.emotes || '{}'), img: r.image || '', files: JSON.parse(r.attachments || '[]'), reply: r.reply_to ? JSON.parse(r.reply_to) : undefined, ts: r.created })),
   });
 });
+// вложения: до 5 на сообщение, url валиден для своего kind (картинки — /api/uploads/*, инлайн;
+// файлы — /api/files/*, форс-скачивание — см. FILE ATTACHMENTS выше), остальные поля — санитайз размера.
+function sanitizeAttachments(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const a of raw.slice(0, 5)) {
+    if (!a || typeof a !== 'object') continue;
+    const kind = a.kind === 'file' ? 'file' : 'image';
+    const url = String(a.url || '');
+    const urlOk = kind === 'image' ? UPLOAD_RE.test(url) : FILE_URL_RE.test(url);
+    if (!urlOk) continue;
+    const name = String(a.name || '').slice(0, 255);
+    const size = Number.isFinite(a.size) ? Math.max(0, Math.min(10 * 1024 * 1024, a.size)) : 0;
+    const mime = String(a.mime || '').slice(0, 100);
+    out.push({ url, name, size, mime, kind });
+  }
+  return out;
+}
 app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
   const sid = req.params.id;
   if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
   const text = String(req.body.text || '').slice(0, 1000);
   const image = (() => { const v = String(req.body.image || ''); return UPLOAD_RE.test(v) ? v : ''; })();
-  if (!text.trim() && !image) return res.status(400).json({ error: 'пусто' });
+  const attachments = sanitizeAttachments(req.body.files);
+  if (!text.trim() && !image && !attachments.length) return res.status(400).json({ error: 'пусто' });
   const em = JSON.stringify(req.body.em || {}).slice(0, 4000);
   // reply-ссылка на исходное сообщение (санитайзим, ограничиваем размер)
   const replyTo = (() => {
@@ -852,8 +908,8 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
   // OR IGNORE: повторный POST с тем же (server_id,user_id,client_key) схлопывается (retry после
   // потери ответа). info.changes===0 → это дубль: не чистим/не пушим повторно, но отвечаем ok
   // (сообщение уже в БД — для клиента это успех).
-  const info = db.prepare('INSERT OR IGNORE INTO messages(server_id,user_id,display_name,avatar_color,text,emotes,image,reply_to,created,client_key) VALUES(?,?,?,?,?,?,?,?,?,?)')
-    .run(sid, req.user.id, req.user.display_name, req.user.avatar_color, text, em, image, replyTo, now, clientKey);
+  const info = db.prepare('INSERT OR IGNORE INTO messages(server_id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,client_key) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
+    .run(sid, req.user.id, req.user.display_name, req.user.avatar_color, text, em, image, JSON.stringify(attachments), replyTo, now, clientKey);
   res.json({ ok: true });
   if (info.changes === 0) return; // дубль — дальше (cleanup/push) не нужно
   db.prepare('DELETE FROM messages WHERE server_id=? AND created<?').run(sid, now - WEEK_MS);
@@ -870,7 +926,7 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
       ids.delete(req.user.id); // не себе
       if (!ids.size) return;
       const targets = [...ids];
-      const body = text.slice(0, 140) || '🖼 изображение';
+      const body = text.slice(0, 140) || (image ? '🖼 изображение' : (attachments.length ? '📎 вложение' : ''));
       const nm = serverName(sid);
       for (const uid of targets) notifyUser(uid, { t: 'notify', kind: 'mention', serverId: sid, serverName: nm, title: req.user.display_name, body, msgId: info.lastInsertRowid });
       if (VAPID) pushToUsers('mention', targets, { kind: 'mention', title: req.user.display_name, body, serverId: sid, tag: 'mention:' + sid, url: '/?server=' + sid }).catch(() => {});

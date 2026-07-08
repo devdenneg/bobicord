@@ -184,10 +184,10 @@ export const useStore = create<AppState>((set, get) => ({
         saveTimer = window.setTimeout(() => { api.putSettings(a.id, vols).catch(() => {}); }, 800);
       },
       peerJoined: (id) => { if (!get().members.some((m) => m.username === id)) get().refreshMembers(); },
-      persistMessage: (text, em, image, reply, localId, key) => {
+      persistMessage: (text, em, image, reply, localId, key, files) => {
         const a = get().active;
         if (!a) { engine?.markSendResult(localId, false); return; }
-        api.postMessage(a.id, text, em, image, reply, key)
+        api.postMessage(a.id, text, em, image, reply, key, files)
           .then(() => engine?.markSendResult(localId, true))
           .catch(() => engine?.markSendResult(localId, false));
       },

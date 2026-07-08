@@ -2,7 +2,7 @@ import {
   Room, RoomEvent, Track, LocalAudioTrack, AudioPresets, ConnectionQuality,
   type RemoteParticipant, type Participant, type TrackPublication, type RemoteTrack,
 } from 'livekit-client';
-import type { User, Member, ChatMessage, Emote, HistoryMessage, ReplyRef } from './types';
+import type { User, Member, ChatMessage, Emote, HistoryMessage, ReplyRef, Attachment } from './types';
 import { baseUid } from './util';
 import { notify } from './notify';
 import { api } from './api';
@@ -56,7 +56,7 @@ interface EngineHooks {
   toast: (text: string, kind?: 'ok' | 'warn' | 'err' | 'info') => void;
   saveSettings: (vols: { users: Record<string, number>; streams: Record<string, number> }) => void;
   peerJoined: (identity: string) => void;
-  persistMessage: (text: string, em: Record<string, string>, image: string | undefined, reply: ReplyRef | undefined, localId: number, key: string) => void;
+  persistMessage: (text: string, em: Record<string, string>, image: string | undefined, reply: ReplyRef | undefined, localId: number, key: string, files?: Attachment[]) => void;
   refetchChat?: () => void; // догрузить свежие сообщения (после реконнекта — заполнить пропуск)
 }
 
@@ -1091,11 +1091,11 @@ export class Engine {
     if (!reply) return false;
     return (!!reply.uid && reply.uid === this.me.id) || reply.author === this.me.displayName;
   }
-  private pushMsg(who: string | null, text: string, sys: boolean, color?: number, mineOverride?: boolean, img?: string, ts?: number, uid?: string, reply?: ReplyRef): number {
+  private pushMsg(who: string | null, text: string, sys: boolean, color?: number, mineOverride?: boolean, img?: string, ts?: number, uid?: string, reply?: ReplyRef, files?: Attachment[]): number {
     const mine = mineOverride !== undefined ? mineOverride : (!sys && who === this.me.displayName);
     const mention = !sys && !mine && (this.textMentionsMe(text) || this.replyToMe(reply));
     const id = msgSeq++;
-    const next = [...this.messages, { id, uid, who, text, mine, sys, color, img, ts: ts ?? Date.now(), mention, reply }];
+    const next = [...this.messages, { id, uid, who, text, mine, sys, color, img, files, ts: ts ?? Date.now(), mention, reply }];
     // кап на память сессии; срез идёт с НАЧАЛА, поэтому копим trimmedFront — компонент на столько же
     // поднимет firstItemIndex virtuoso, иначе якорь скролла рассинхронится и контент прыгнет.
     const CAP = 1000;
@@ -1105,7 +1105,7 @@ export class Engine {
     return id;
   }
   // статус отправки моего сообщения (для «не отправлено · повторить»)
-  private pendingSend = new Map<number, { text: string; em: Record<string, string>; img?: string; reply?: ReplyRef; key: string }>();
+  private pendingSend = new Map<number, { text: string; em: Record<string, string>; img?: string; reply?: ReplyRef; key: string; files?: Attachment[] }>();
   private setMsgStatus(localId: number, status: 'failed' | undefined) {
     let changed = false;
     this.messages = this.messages.map((m) => (m.id === localId && m.status !== status ? (changed = true, { ...m, status }) : m));
@@ -1121,13 +1121,13 @@ export class Engine {
     // только повторный persist (без ре-broadcast): если первый dataSend прошёл, у живых
     // сообщение уже есть — повтор рассылки дал бы дубль. Упал именно POST в БД. Тот же key —
     // если первый POST на самом деле дошёл (потерян лишь ответ), сервер проигнорит дубль.
-    this.hooks.persistMessage(p.text, p.em, p.img, p.reply, localId, p.key);
+    this.hooks.persistMessage(p.text, p.em, p.img, p.reply, localId, p.key, p.files);
   }
   sysMsg(text: string) { this.pushMsg(null, text, true); }
   private mapHistory(list: HistoryMessage[]): ChatMessage[] {
     return list.map((m) => {
       if (m.em) for (const k in m.em) this.onEmoteResolve?.(k, m.em[k]);
-      return { id: msgSeq++, sid: m.id, uid: m.uid, who: m.name, text: m.text, mine: m.uid === this.me.id, sys: false, color: m.color, img: m.img, ts: m.ts, mention: m.uid !== this.me.id && (this.textMentionsMe(m.text) || this.replyToMe(m.reply)), reply: m.reply };
+      return { id: msgSeq++, sid: m.id, uid: m.uid, who: m.name, text: m.text, mine: m.uid === this.me.id, sys: false, color: m.color, img: m.img, files: m.files, ts: m.ts, mention: m.uid !== this.me.id && (this.textMentionsMe(m.text) || this.replyToMe(m.reply)), reply: m.reply };
     });
   }
   // начальная страница истории (последние N) — заменяет весь чат, ставит курсор на самое старое
@@ -1147,10 +1147,11 @@ export class Engine {
   mergeRecent(list: HistoryMessage[]) {
     if (!list.length) return;
     const haveSids = new Set(this.messages.map((m) => m.sid).filter((s): s is number => s != null));
-    const sig = (uid?: string, text?: string, img?: string) => `${uid || ''}${text || ''}${img || ''}`;
+    const filesSig = (files?: Attachment[]) => (files && files.length ? files.map((f) => f.url).join(',') : '');
+    const sig = (uid?: string, text?: string, img?: string, files?: Attachment[]) => `${uid || ''}${text || ''}${img || ''}${filesSig(files)}`;
     const liveBySig = new Map<string, ChatMessage[]>();
     for (const m of this.messages) {
-      if (m.sid == null && !m.sys && m.uid) { const k = sig(m.uid, m.text, m.img); (liveBySig.get(k) || liveBySig.set(k, []).get(k)!).push(m); }
+      if (m.sid == null && !m.sys && m.uid) { const k = sig(m.uid, m.text, m.img, m.files); (liveBySig.get(k) || liveBySig.set(k, []).get(k)!).push(m); }
     }
     const add: HistoryMessage[] = [];
     for (const m of list) {
@@ -1158,7 +1159,7 @@ export class Engine {
       // Свои сообщения НЕ пропускаем безусловно: при мультисессии своё сообщение с другого
       // устройства могло не дойти по data-каналу (обрыв) → его надо догрузить. Дубля не будет —
       // оптимистичная копия лежит в liveBySig и усыновит sid; реально пропущенное попадёт в add.
-      const bucket = liveBySig.get(sig(m.uid, m.text, m.img));
+      const bucket = liveBySig.get(sig(m.uid, m.text, m.img, m.files));
       if (bucket && bucket.length) { bucket.shift()!.sid = m.id; continue; } // усыновили sid, не дублируем
       add.push(m);
     }
@@ -1189,16 +1190,16 @@ export class Engine {
     this.emit();
     this.sysMsg((byName || this.me.displayName) + ' очистил чат');
   }
-  sendChatWithEmotes(text: string, em: Record<string, string>, img?: string, reply?: ReplyRef) {
-    if (!text.trim() && !img) return;
+  sendChatWithEmotes(text: string, em: Record<string, string>, img?: string, reply?: ReplyRef, files?: Attachment[]) {
+    if (!text.trim() && !img && !(files && files.length)) return;
     const t = text.trim();
     // realtime-раздача только при поднятой комнате; локальный эхо + persist работают и без неё —
     // в окне фоновой докрутки connect (сразу после входа в сервер) сообщение не теряется, ложится в БД.
-    if (this.viewRoom) this.dataSend({ t: 'chat', name: this.me.displayName, text: t, em, color: this.me.avatarColor, img, uid: this.me.id, reply });
-    const id = this.pushMsg(this.me.displayName, t, false, this.me.avatarColor, true, img, undefined, this.me.id, reply);
+    if (this.viewRoom) this.dataSend({ t: 'chat', name: this.me.displayName, text: t, em, color: this.me.avatarColor, img, files, uid: this.me.id, reply });
+    const id = this.pushMsg(this.me.displayName, t, false, this.me.avatarColor, true, img, undefined, this.me.id, reply, files);
     const key = newClientKey();
-    this.pendingSend.set(id, { text: t, em, img, reply, key });
-    this.hooks.persistMessage(t, em, img, reply, id, key);
+    this.pendingSend.set(id, { text: t, em, img, reply, key, files });
+    this.hooks.persistMessage(t, em, img, reply, id, key, files);
   }
   sendTyping() {
     if (!this.viewRoom) return;
@@ -1234,10 +1235,11 @@ export class Engine {
         const own = d.uid === this.me.id; // моё же сообщение с другой сессии — показываем как своё, без звука/меншена
         const repliedToMe = !own && this.replyToMe(d.reply);
         const mentioned = !own && (this.textMentionsMe(d.text) || repliedToMe);
-        this.pushMsg(d.name, d.text, false, d.color, own, d.img, undefined, d.uid, d.reply);
+        this.pushMsg(d.name, d.text, false, d.color, own, d.img, undefined, d.uid, d.reply, d.files);
         if (!own && mentioned) { // тост+notify ТОЛЬКО когда тегнули/реплайнули; звук тега даёт само notify (Discord)
           this.hooks.toast(repliedToMe ? `${d.name} ответил тебе` : `${d.name} упомянул тебя`, 'info');
-          notify('mention', { title: d.name, body: String(d.text || '').slice(0, 140) || '🖼 изображение', tag: 'mention:' + this.viewServerId });
+          const fallback = d.img ? '🖼 изображение' : (d.files && d.files.length ? '📎 вложение' : '');
+          notify('mention', { title: d.name, body: String(d.text || '').slice(0, 140) || fallback, tag: 'mention:' + this.viewServerId });
         }
       }
       else if (d.t === 'clear') { this.messages = []; this.emit(); this.sysMsg((d.by || 'Админ') + ' очистил чат'); }

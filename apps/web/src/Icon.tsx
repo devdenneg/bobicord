@@ -38,6 +38,8 @@ import KeyboardRounded from '@mui/icons-material/KeyboardRounded';
 import NotificationsRounded from '@mui/icons-material/NotificationsRounded';
 import ShieldRounded from '@mui/icons-material/ShieldRounded';
 import BadgeRounded from '@mui/icons-material/BadgeRounded';
+import AttachFileRounded from '@mui/icons-material/AttachFileRounded';
+import InsertDriveFileRounded from '@mui/icons-material/InsertDriveFileRounded';
 
 const MAP: Record<string, SvgIconComponent> = {
   mic: MicRounded, 'mic-sm': MicRounded, 'mic-off': MicOffRounded,
@@ -55,6 +57,7 @@ const MAP: Record<string, SvgIconComponent> = {
   palette: PaletteRounded, download: DownloadRounded, reply: ReplyRounded,
   trash: DeleteRounded, edit: EditRounded, keyboard: KeyboardRounded,
   bell: NotificationsRounded, shield: ShieldRounded, badge: BadgeRounded,
+  attach: AttachFileRounded, file: InsertDriveFileRounded,
 };
 
 export function Icon({ name, sm }: { name: string; sm?: boolean }) {

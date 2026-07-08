@@ -94,10 +94,21 @@ export interface Toast { id: number; text: string; kind: ToastKind }
 // ссылка на исходное сообщение при ответе (reply)
 export interface ReplyRef {
   author: string;  // displayName автора исходного сообщения
-  text: string;    // короткий сниппет исходного текста ('' если только картинка)
+  text: string;    // короткий сниппет исходного текста ('' если только картинка/файл)
   uid?: string;    // user id автора — для адресного уведомления (ответ = как тег)
   sid?: number;    // id строки в БД исходного — для перехода к оригиналу
-  img?: boolean;   // в исходном была картинка
+  img?: boolean;   // в исходном была картинка (legacy-поле img ИЛИ files с kind:'image')
+  hasFile?: boolean; // в исходном был файл-вложение (kind:'file')
+}
+
+// вложение к сообщению — картинка (инлайн-превью, /api/uploads/*) или произвольный файл
+// (форс-скачивание, /api/files/*). До 5 штук на сообщение (см. sanitizeAttachments на сервере).
+export interface Attachment {
+  url: string;
+  name: string;
+  size: number;
+  mime: string;
+  kind: 'image' | 'file';
 }
 
 export interface ChatMessage {
@@ -109,7 +120,8 @@ export interface ChatMessage {
   mine: boolean;
   sys: boolean;
   color?: number; // avatar color index of author
-  img?: string; // attached image URL
+  img?: string; // attached image URL (legacy, сообщения до введения files)
+  files?: Attachment[]; // вложения (картинки + файлы), новый путь
   ts?: number; // timestamp (ms)
   mention?: boolean; // упоминает меня (@ник) ИЛИ ответ на моё сообщение
   reply?: ReplyRef; // это ответ на другое сообщение
@@ -124,6 +136,7 @@ export interface HistoryMessage {
   text: string;
   em: Record<string, string>;
   img?: string;
+  files?: Attachment[];
   ts: number;
   reply?: ReplyRef;
 }

@@ -5,13 +5,35 @@ import { useStore, getEngine } from '../store';
 import { api, resolveUploadUrl } from '../api';
 import { useEngine } from '../hooks';
 import { Icon } from '../Icon';
-import { avColor, initial, prefersReducedMotion } from '../util';
+import { avColor, initial, prefersReducedMotion, downscaleImage } from '../util';
 import { emoteMap, emoteUrl } from '../emotes';
 import { EmotePicker } from './EmotePicker';
 import { getSettings, setSettings } from '../settings';
 import { applyNativeUpdate } from '../nativeUpdate';
-import type { ChatMessage, Emote, Member, ReplyRef, Role } from '../types';
+import type { Attachment, ChatMessage, Emote, Member, ReplyRef, Role } from '../types';
 import { PERM, hasPerm } from '../types';
+
+const MAX_ATTACH = 5;
+const MAX_ATTACH_SIZE = 10 * 1024 * 1024;
+
+// человекочитаемый размер файла для чипа вложения
+function fmtSize(bytes: number): string {
+  if (bytes < 1024) return bytes + ' Б';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + ' КБ';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' МБ';
+}
+
+// один вложенный в стейджинг файл: пока грузится — preview/локальный File, после — готовый Attachment
+interface StagedAttachment {
+  key: number;
+  kind: 'image' | 'file';
+  name: string;
+  size: number;
+  previewUrl?: string; // objectURL для картинок — превью до и во время аплоада
+  status: 'uploading' | 'ready' | 'error';
+  attachment?: Attachment;
+}
+let stageSeq = 1;
 
 function Avatar({ name, ci, url, size = 32, dot, live, liveApp }: { name: string; ci: number; url?: string; size?: number; dot?: string; live?: boolean; liveApp?: { appName?: string; appIcon?: string } | null }) {
   return (
@@ -527,6 +549,34 @@ function ImageLightbox({ src, onClose }: { src: string; onClose: () => void }) {
   );
 }
 
+// вложения сообщения: картинки — грид миниатюр (клик → лайтбокс), остальные файлы — чипы со
+// скачиванием (форс-download на сервере, см. GET /api/files/:name — не инлайн, любое расширение).
+function MessageAttachments({ files, onImageClick }: { files: Attachment[]; onImageClick: (url: string) => void }) {
+  const images = files.filter((f) => f.kind === 'image');
+  const others = files.filter((f) => f.kind === 'file');
+  return (
+    <div className="msg-files">
+      {images.length ? (
+        <div className="msg-img-grid">
+          {images.map((f, i) => (
+            <button key={i} className="msg-img-wrap" onClick={() => onImageClick(f.url)}>
+              <img className="msg-img" src={resolveUploadUrl(f.url)} alt="" loading="lazy" />
+            </button>
+          ))}
+        </div>
+      ) : null}
+      {others.map((f, i) => (
+        <a key={i} className="msg-file" href={resolveUploadUrl(f.url) + '?name=' + encodeURIComponent(f.name)} download={f.name} target="_blank" rel="noreferrer">
+          <Icon name="file" sm />
+          <span className="mf-name">{f.name}</span>
+          <span className="mf-size">{fmtSize(f.size)}</span>
+          <Icon name="download" sm />
+        </a>
+      ))}
+    </div>
+  );
+}
+
 const COMMANDS: { name: string; desc: string }[] = [
   { name: 'clear', desc: 'Очистить чат (нужна модерация)' },
   { name: 'help', desc: 'Список команд' },
@@ -568,7 +618,10 @@ function Chat() {
   const [pickAnchor, setPickAnchor] = useState<DOMRect | null | undefined>(undefined);
   const emoBtnRef = useRef<HTMLButtonElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
-  const [uploading, setUploading] = useState(false);
+  const attachFileRef = useRef<HTMLInputElement>(null);
+  const [staged, setStaged] = useState<StagedAttachment[]>([]);
+  const stagedRef = useRef<StagedAttachment[]>([]);
+  stagedRef.current = staged;
   const toast = useStore((s) => s.toast);
   const updateReady = useStore((s) => s.updateReady);
   const me = useStore((s) => s.me)!;
@@ -618,6 +671,8 @@ function Chat() {
     // дивайдера, см. initialTopMostItemIndex), иначе внизу
     const unreadHere = messages.filter((m) => m.sid != null && m.sid > baseline && !m.mine).length;
     setPill(unreadHere); setAtBottom(unreadHere === 0); atBottomRef.current = unreadHere === 0; setReplyTo(null);
+    // сброс стейджинга вложений при смене сервера — не тащим прикреплённые файлы между чатами
+    setStaged((s) => { s.forEach((it) => it.previewUrl && URL.revokeObjectURL(it.previewUrl)); return []; });
     prevLastId.current = null; prevTrim.current = 0; lastAckedRef.current = null; loadingOlder.current = false; setOlderBusy(false);
     // не даём startReached стрельнуть догрузкой прямо на маунте (пока идёт scroll-to-bottom и оседание)
     olderReady.current = false;
@@ -700,7 +755,13 @@ function Chat() {
   }, [E, activeId]);
 
   // --- reply (ответ на сообщение) ---
-  const buildReplyRef = (m: ChatMessage): ReplyRef => ({ author: m.who || '', text: (m.text || '').slice(0, 160), uid: m.uid, sid: m.sid, img: !!m.img });
+  const buildReplyRef = (m: ChatMessage): ReplyRef => ({
+    author: m.who || '', text: (m.text || '').slice(0, 160), uid: m.uid, sid: m.sid,
+    img: !!m.img || !!m.files?.some((f) => f.kind === 'image'),
+    hasFile: !!m.files?.some((f) => f.kind === 'file'),
+  });
+  // текстовый сниппет цитаты, когда исходное сообщение без текста (только вложения)
+  const replySnippet = (r: ReplyRef): string => r.text || (r.img && r.hasFile ? '🖼📎 Вложения' : r.img ? '🖼 Изображение' : r.hasFile ? '📎 Файл' : '');
   const startReply = useCallback((m: ChatMessage) => {
     setReplyTo(m);
     requestAnimationFrame(() => document.getElementById('msgIn')?.focus());
@@ -729,30 +790,59 @@ function Chat() {
       E.sysMsg(`Неизвестная команда: /${c}. Напиши /help для списка.`);
     }
   }
+  // Прикрепление вложений: пользователь ВЫБИРАЕТ файл(ы) → сразу появляются в панели превью
+  // над инпутом (стейджинг), аплоад стартует в фоне, но сообщение НЕ уходит, пока не нажат
+  // «Отправить». Картинки идут через существующий /api/upload (даунскейл в WebP + инлайн-показ),
+  // остальные расширения — через /api/upload-file (форс-скачивание, без сжатия). До MAX_ATTACH штук.
+  function stageFiles(files: File[], kind: 'image' | 'file') {
+    const room = MAX_ATTACH - stagedRef.current.length;
+    if (room <= 0) { toast(`Максимум ${MAX_ATTACH} вложений`, 'warn'); return; }
+    if (files.length > room) toast(`Максимум ${MAX_ATTACH} вложений — добавлены первые ${room}`, 'warn');
+    for (const f of files.slice(0, room)) {
+      if (f.size > MAX_ATTACH_SIZE) { toast(`${f.name}: больше 10 МБ`, 'warn'); continue; }
+      const key = stageSeq++;
+      const previewUrl = kind === 'image' ? URL.createObjectURL(f) : undefined;
+      setStaged((s) => [...s, { key, kind, name: f.name, size: f.size, previewUrl, status: 'uploading' }]);
+      (async () => {
+        try {
+          let attachment: Attachment;
+          if (kind === 'image') {
+            const small = await downscaleImage(f);
+            const { url } = await api.uploadImage(small);
+            attachment = { url, name: small.name, size: small.size, mime: small.type, kind: 'image' };
+          } else {
+            const { url, name, size } = await api.uploadFile(f);
+            attachment = { url, name, size, mime: f.type, kind: 'file' };
+          }
+          setStaged((s) => s.map((it) => (it.key === key ? { ...it, status: 'ready', attachment } : it)));
+        } catch (e: any) {
+          setStaged((s) => s.map((it) => (it.key === key ? { ...it, status: 'error' } : it)));
+          toast(e?.message || `Не удалось загрузить ${f.name}`, 'err');
+        }
+      })();
+    }
+  }
+  function removeStaged(key: number) {
+    setStaged((s) => {
+      const it = s.find((x) => x.key === key);
+      if (it?.previewUrl) URL.revokeObjectURL(it.previewUrl);
+      return s.filter((x) => x.key !== key);
+    });
+  }
+  useEffect(() => () => { stagedRef.current.forEach((it) => it.previewUrl && URL.revokeObjectURL(it.previewUrl)); }, []);
+
   function send() {
-    const t = text.trim(); if (!t) return;
+    const t = text.trim();
+    const pending = staged.some((s) => s.status === 'uploading');
+    if (pending) { toast('Дождись загрузки вложений', 'warn'); return; }
+    const ready = staged.filter((s) => s.status === 'ready' && s.attachment).map((s) => s.attachment!);
+    if (!t && !ready.length) return;
     if (t.startsWith('/')) { runCommand(t); setText(''); return; }
     const em: Record<string, string> = {};
     t.split(/\s+/).forEach((w) => { if (emoteMap.has(w)) em[w] = emoteMap.get(w)!; });
-    E.sendChatWithEmotes(t, em, undefined, replyTo ? buildReplyRef(replyTo) : undefined);
-    setText(''); setReplyTo(null);
+    E.sendChatWithEmotes(t, em, undefined, replyTo ? buildReplyRef(replyTo) : undefined, ready.length ? ready : undefined);
+    setText(''); setReplyTo(null); setStaged([]);
     scrollToBottom(); // req: после отправки всегда показываем конец
-  }
-
-  async function sendImage(file: File) {
-    if (!file.type.startsWith('image/')) { toast('Можно только картинки', 'warn'); return; }
-    if (file.size > 10 * 1024 * 1024) { toast('Картинка больше 10 МБ', 'warn'); return; }
-    setUploading(true);
-    try {
-      const { url } = await api.uploadImage(file);
-      const t = text.trim();
-      const em: Record<string, string> = {};
-      t.split(/\s+/).forEach((w) => { if (emoteMap.has(w)) em[w] = emoteMap.get(w)!; });
-      E.sendChatWithEmotes(t, em, url, replyTo ? buildReplyRef(replyTo) : undefined);
-      setText(''); setReplyTo(null);
-      scrollToBottom();
-    } catch (e: any) { toast(e?.message || 'Не удалось загрузить', 'err'); }
-    finally { setUploading(false); }
   }
 
   // slash-команды (только в начале строки, пока нет пробела)
@@ -845,15 +935,19 @@ function Chat() {
       const rep = m.reply;
       replyQuote = (
         <button className={'reply-quote' + (jumpable ? ' jumpable' : '')} disabled={!jumpable} onClick={jumpable ? () => jumpToReply(rep) : undefined}
-          title={rep.author + ': ' + (rep.text || (rep.img ? 'изображение' : ''))}>
+          title={rep.author + ': ' + replySnippet(rep)}>
           <span className="rq-bar" style={{ background: rColor }} />
           <span className="rq-author" style={{ color: rColor }}>{rep.author}</span>
-          <span className="rq-text">{rep.text || (rep.img ? '🖼 Изображение' : '')}</span>
+          <span className="rq-text">{replySnippet(rep)}</span>
         </button>
       );
     }
+    // сообщения с вложениями визуально «тяжелее» простого текста — при плотной Telegram-группировке
+    // (cont, 2px между сообщениями одного автора) несколько подряд идущих превью сливаются в кашу.
+    // Добавляем чуть больше воздуха сверху именно таким продолжениям, не трогая обычный текст.
+    const hasMedia = !!m.img || !!(m.files && m.files.length);
     return (
-      <div className={'virt-row' + (cont ? ' cont' : '')}>
+      <div className={'virt-row' + (cont ? ' cont' : '') + (cont && hasMedia ? ' cont-media' : '')}>
         <div className={'msg' + (m.sys ? ' sys' : '') + (m.mine ? ' me' : '') + (m.mention ? ' mentioned' : '') + (m.id === flashId ? ' flash' : '') + (m.status === 'failed' ? ' failed' : '')}>
           {!m.sys ? <div className="msg-av">{!cont ? <Avatar name={m.who || ''} ci={m.color ?? 0} url={author?.avatarUrl} size={36} /> : null}</div> : null}
           <div className="msg-body">
@@ -867,6 +961,7 @@ function Chat() {
                   </div>
                 ) : null}
                 {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox(m.img!)}><img className="msg-img" src={resolveUploadUrl(m.img)} alt="" loading="lazy" /></button> : null}
+                {m.files && m.files.length ? <MessageAttachments files={m.files} onImageClick={setLightbox} /> : null}
                 {m.status === 'failed' ? <div className="msg-failed"><Icon name="warn" sm />Не отправлено<button onClick={() => getEngine()?.retrySend(m.id)}>Повторить</button></div> : null}
               </div>
               {!m.sys ? <button className="msg-reply-btn" data-tip="Ответить" onMouseDown={(e) => e.preventDefault()} onClick={() => startReply(m)}><Icon name="reply" sm /></button> : null}
@@ -953,20 +1048,42 @@ function Chat() {
         <div className="reply-bar">
           <Icon name="reply" sm />
           <span className="rb-to">Ответ <b style={{ color: (byName.get(replyTo.who || '') && roleColorOf(byName.get(replyTo.who || '')!)) || avColor(replyTo.who || '', replyTo.color) }}>{replyTo.who}</b></span>
-          <span className="rb-text">{replyTo.text || (replyTo.img ? '🖼 изображение' : '')}</span>
+          <span className="rb-text">{replySnippet(buildReplyRef(replyTo))}</span>
           <button className="rb-close" data-tip="Отменить · Esc" onClick={() => setReplyTo(null)}><Icon name="close" sm /></button>
+        </div>
+      ) : null}
+      {staged.length ? (
+        <div className="attach-panel">
+          {staged.map((s) => (
+            <div key={s.key} className={'attach-chip' + (s.status === 'error' ? ' err' : '')}>
+              {s.kind === 'image' ? <img className="attach-thumb" src={s.previewUrl} alt="" /> : <div className="attach-file-ic"><Icon name="file" /></div>}
+              <div className="attach-meta">
+                <span className="attach-name">{s.name}</span>
+                <span className="attach-size">{s.status === 'error' ? 'Ошибка загрузки' : fmtSize(s.size)}</span>
+              </div>
+              {s.status === 'uploading' ? <span className="spin" /> : null}
+              <button className="attach-remove" data-tip="Убрать" onClick={() => removeStaged(s.key)}><Icon name="close" sm /></button>
+            </div>
+          ))}
         </div>
       ) : null}
       <div className="chat-in">
         <button id="emoBtn" ref={emoBtnRef} className={'emo-toggle' + (pickAnchor !== undefined ? ' on' : '')} data-tip="7TV эмоуты"
           onClick={() => setPickAnchor((a) => (a === undefined ? emoBtnRef.current!.getBoundingClientRect() : undefined))}><Icon name="smile" /></button>
-        <button className="emo-toggle" data-tip="Прикрепить картинку (или Ctrl+V)" disabled={uploading} onClick={() => fileRef.current?.click()}>{uploading ? <span className="spin" /> : <Icon name="image" />}</button>
-        <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; if (f) sendImage(f); e.target.value = ''; }} />
+        <button className="emo-toggle" data-tip="Прикрепить картинку (или Ctrl+V)" onClick={() => fileRef.current?.click()}><Icon name="image" /></button>
+        <button className="emo-toggle" data-tip="Прикрепить файл" onClick={() => attachFileRef.current?.click()}><Icon name="attach" /></button>
+        <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple style={{ display: 'none' }} onChange={(e) => { const files = Array.from(e.target.files || []); if (files.length) stageFiles(files, 'image'); e.target.value = ''; }} />
+        <input ref={attachFileRef} type="file" multiple style={{ display: 'none' }} onChange={(e) => { const files = Array.from(e.target.files || []); if (files.length) stageFiles(files, 'file'); e.target.value = ''; }} />
         <input id="msgIn" placeholder="Сообщение..." maxLength={1000} autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false} name="chat-message" value={text}
           onFocus={() => { if (!atBottomRef.current) scrollToBottom(); }}
-          onPaste={(e) => { const items = e.clipboardData?.items; if (!items) return; for (let i = 0; i < items.length; i++) { if (items[i].type.startsWith('image/')) { const f = items[i].getAsFile(); if (f) { e.preventDefault(); sendImage(f); } break; } } }}
+          onPaste={(e) => {
+            const items = e.clipboardData?.items; if (!items) return;
+            const imgs: File[] = [];
+            for (let i = 0; i < items.length; i++) { if (items[i].type.startsWith('image/')) { const f = items[i].getAsFile(); if (f) imgs.push(f); } }
+            if (imgs.length) { e.preventDefault(); stageFiles(imgs, 'image'); }
+          }}
           onChange={(e) => { const v = e.target.value; setText(v); if (v.trim()) E.sendTyping(); setMention(detectMention(v, e.target.selectionStart ?? v.length)); setMIdx(0); }} onKeyDown={onComposerKey} />
-        <button id="sendBtn" className={text.trim() ? '' : 'empty'} data-tip="Отправить · Enter" onClick={send}><Icon name="send" /></button>
+        <button id="sendBtn" className={(text.trim() || staged.some((s) => s.status !== 'error')) ? '' : 'empty'} data-tip="Отправить · Enter" onClick={send}><Icon name="send" /></button>
       </div>
       {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} onClose={() => setPickAnchor(undefined)}
         onPick={(e: Emote) => { setText((t) => t + (t && !t.endsWith(' ') ? ' ' : '') + e.name + ' '); }} /> : null}

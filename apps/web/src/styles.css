@@ -437,6 +437,7 @@
   .virt-msgs{flex:1;min-height:0;overflow-x:hidden}
   .virt-row{padding:11px 14px 0;position:relative}
   .virt-row.cont{padding-top:2px}          /* продолжение группы того же автора — плотнее */
+  .virt-row.cont-media{padding-top:10px}   /* продолжение с картинкой/файлом — больше воздуха, иначе превью сливаются в кашу */
   .virt-row .msg{animation:none}          /* иначе msgIn проигрывается на каждом въезде строки в вьюпорт */
   /* ---- reply (ответы на сообщения) ---- */
   .msg-reply-btn{flex:0 0 auto;align-self:center;width:28px;height:28px;padding:0;display:flex;align-items:center;justify-content:center;background:var(--panel3);color:var(--muted);border:1px solid var(--line-2);border-radius:8px;opacity:0;transition:opacity .12s,color .12s,background .12s}
@@ -490,7 +491,7 @@
   .msg-body{display:flex;flex-direction:column;min-width:0;max-width:calc(100% - 46px)}
   .msg.sys .msg-body{max-width:100%}
   .msg-main{display:flex;align-items:center;gap:6px;max-width:100%}
-  .msg-content{display:flex;flex-direction:column;gap:4px;min-width:0;max-width:100%}
+  .msg-content{display:flex;flex-direction:column;align-items:flex-start;gap:4px;min-width:0;max-width:100%}
   .msg .who{font-size:13px;font-weight:600;color:var(--accent-txt);margin-bottom:3px}
   /* свои: слева как все (с аватаром), различие — «· ты» у ника + акцентный тинт пузыря */
   .msg.me .who::after{content:' · ты';color:var(--muted);font-weight:400;font-size:11px}
@@ -509,8 +510,30 @@
   .msg.sys .tx::before{content:'';flex:0 0 auto;width:5px;height:5px;border-radius:50%;background:var(--muted);opacity:.55}
   .msg .tx img.emo{height:26px;vertical-align:-7px;margin:-2px 1px}
   .msg .tx.big img.emo{height:44px;vertical-align:-12px}
-  .msg-img-wrap{display:inline-block;margin-top:5px;max-width:min(340px,100%);border-radius:10px;overflow:hidden;border:1px solid var(--line-2);line-height:0;padding:0;background:none;cursor:zoom-in}
+  .msg-img-wrap{display:inline-block;max-width:min(340px,100%);border-radius:10px;overflow:hidden;border:1px solid var(--line-2);line-height:0;padding:0;background:none;cursor:zoom-in}
   .msg-img{display:block;max-width:100%;max-height:300px;object-fit:contain}
+  .msg-files{display:flex;flex-direction:column;gap:6px}
+  .msg-img-grid{display:flex;flex-wrap:wrap;gap:6px}
+  .msg-img-grid .msg-img-wrap{margin-top:0;max-width:180px}
+  .msg-img-grid .msg-img{max-height:180px}
+  .msg-file{display:flex;align-items:center;gap:9px;max-width:min(320px,100%);padding:8px 10px;background:var(--panel2);border:1px solid var(--line-2);border-radius:10px;color:var(--txt);transition:background .12s,border-color .12s}
+  .msg-file:hover{background:var(--panel3);border-color:var(--line)}
+  .msg-file .ic{flex:0 0 auto;color:var(--muted);font-size:19px}
+  .msg-file .mf-name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:500}
+  .msg-file .mf-size{flex:0 0 auto;font-size:11.5px;color:var(--muted)}
+  .msg-file:hover .ic:last-child{color:var(--accent-txt)}
+  /* панель прикреплённых вложений над инпутом чата — предпросмотр перед отправкой */
+  .attach-panel{display:flex;flex-wrap:wrap;gap:8px;margin:8px 12px 0;padding:10px;background:var(--panel2);border:1px solid var(--line-2);border-radius:10px}
+  .attach-chip{position:relative;display:flex;align-items:center;gap:8px;max-width:220px;padding:6px 28px 6px 6px;background:var(--panel3);border:1px solid var(--line-2);border-radius:9px}
+  .attach-chip.err{border-color:var(--red)}
+  .attach-thumb{width:36px;height:36px;border-radius:6px;object-fit:cover;flex:0 0 auto}
+  .attach-file-ic{width:36px;height:36px;border-radius:6px;background:var(--panel2);display:flex;align-items:center;justify-content:center;color:var(--muted);flex:0 0 auto}
+  .attach-meta{display:flex;flex-direction:column;min-width:0;gap:1px}
+  .attach-name{font-size:12.5px;font-weight:500;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:140px}
+  .attach-size{font-size:11px;color:var(--muted)}
+  .attach-chip .spin{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:14px;height:14px;margin:0}
+  .attach-remove{position:absolute;right:3px;top:3px;width:20px;height:20px;padding:0;display:flex;align-items:center;justify-content:center;border-radius:6px;background:none;color:var(--muted)}
+  .attach-remove:hover{background:var(--panel2);color:var(--txt-h)}
   .lightbox{position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.86);display:flex;align-items:center;justify-content:center;padding:28px;animation:lbFade .15s ease}
   .lightbox img{max-width:94vw;max-height:90vh;border-radius:10px;box-shadow:0 24px 70px rgba(0,0,0,.6);object-fit:contain;cursor:default}
   .lightbox .lb-close{position:fixed;top:16px;right:18px;width:42px;height:42px;border-radius:11px;background:rgba(0,0,0,.5);color:#fff;display:flex;align-items:center;justify-content:center;padding:0}
