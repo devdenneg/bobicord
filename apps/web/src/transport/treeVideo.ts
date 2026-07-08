@@ -123,6 +123,9 @@ export class TreeVideoTransport implements VideoTransport {
   private topologyCbs = new Set<(streamId: string) => void>();
   private reparentDeniedCbs = new Set<(streamId: string, reason: string) => void>();
   private nativeWatches = new Map<string, NativeWatchState>();
+  // Rust держит ОДИН watch-слот, stopNativeWatch() ГЛОБАЛЕН. Трекаем, какой стрим реально в слоте —
+  // чтобы стоп/teardown ЧУЖОГО стрима не рубил активный просмотр (bug: «стоп одного стрима гасит другой»).
+  private currentNativeWatch: string | null = null;
 
   private streamStartCbs = new Set<(identity: string, silent: boolean) => void>();
   private streamStopCbs = new Set<(identity: string) => void>();
@@ -145,7 +148,7 @@ export class TreeVideoTransport implements VideoTransport {
     this.helloTimer = window.setInterval(() => {
       const ws = this.discoveryWs;
       if (ws && ws.readyState === WebSocket.OPEN) { try { ws.send(JSON.stringify({ t: 'hello', serverId: this.serverId })); } catch { /**/ } }
-    }, 15000);
+    }, 10000);
   }
   onRoomConnected() { /* discovery socket already syncs live-stream backlog on connect */ }
   detach() {
@@ -188,7 +191,8 @@ export class TreeVideoTransport implements VideoTransport {
           this.liveStreams.delete(identity);
           this.streamStopCbs.forEach((cb) => cb(identity));
         }
-      }, 4000);
+      }, 7000); // окно бэклога: 4с рвало ЖИВОЙ стрим при медленном re-hello (badge/watch чужого стрима
+                // пропадал — «стоп одного рубит другие»); 7с + периодический re-hello подхватят обратно
     };
     // Сервер узнаёт, в каком сервере (гильдии) мы сидим, только из hello —
     // до него бэклог живых стримов не шлётся (см. tree.js onHello), а после join'а
@@ -575,6 +579,7 @@ export class TreeVideoTransport implements VideoTransport {
     try {
       await stopNativeWatch().catch(() => {});
       await startNativeWatch(streamId, this.me, this.serverId, NATIVE_RELAY_CAPACITY);
+      this.currentNativeWatch = streamId; // этот стрим теперь в Rust-слоте
     }
     catch { this.nativeUnwatch(streamId, st); }
   }
@@ -605,7 +610,9 @@ export class TreeVideoTransport implements VideoTransport {
     this.lastJb.delete(streamId);
     this.topologyByStream.delete(streamId);
     this.delVideo(streamId);
-    stopNativeWatch().catch(() => {});
+    // ГЛОБАЛЬНЫЙ Rust-стоп — ТОЛЬКО если рубим стрим, реально сидящий в слоте. Иначе teardown чужого
+    // (по discovery stream-end / реконсиляру / гонке) сносил бы АКТИВНЫЙ просмотр другого стрима.
+    if (this.currentNativeWatch === streamId) { this.currentNativeWatch = null; stopNativeWatch().catch(() => {}); }
   }
 
   /* ---------- topology / manual peer pick (Э8) ---------- */

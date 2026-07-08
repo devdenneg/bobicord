@@ -257,9 +257,8 @@ export class Engine {
       if (m.username === this.me.username) game = this.myGame;
       else { const gn = (p as any)?.attributes?.game; if (gn) game = { name: gn, icon: (p as any)?.attributes?.gicon || undefined }; }
       const streaming = this.isStreaming(m.username);
-      // Стример игры без явного game-атрибута (детект не успел/захват сменил foreground): берём игру из
-      // МЕТА стрима (захваченное окно = игра) — чтобы «играет в X» показывалось у стримеров, в т.ч. у себя.
-      if (!game && streaming) { const meta = this.getStreamAppMeta(m.username); if (meta?.appName) game = { name: meta.appName, icon: meta.appIcon }; }
+      // Игра показывается ТОЛЬКО из detect_game (атрибут/локальный myGame), НЕ из меты стрима: захваченное
+      // окно ≠ «во что играет» (по решению пользователя). Стример без игры — просто LIVE, без «играет в X».
       presence[m.username] = { online, inVoice: inV, micMuted: (!!mp && mp.isMuted) || deaf, streaming, deafened: deaf, game };
     }
     const speaking: Record<string, boolean> = {};
