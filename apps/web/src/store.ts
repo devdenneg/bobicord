@@ -142,12 +142,16 @@ function badgePng(nRaw: number): Promise<Uint8Array | null> {
     } catch { resolve(null); }
   });
 }
-// Слить серверные счётчики непрочитанного. Активный (connected) сервер клиент ведёт сам
-// (bumpUnread/markRead по факту чтения) — поллингом его не трогаем, иначе моргнёт до долёта markRead.
+// Слить серверные счётчики непрочитанного. Поллингом НЕ трогаем ТОЛЬКО сервер, чат которого сейчас
+// РЕАЛЬНО открыт (view==='server' && active===id) — там unread ведёт смонтированный ServerView
+// (bumpUnread/markRead по факту чтения), иначе моргнёт до долёта markRead. На главной / другом сервере
+// ServerView размонтирован → его сервер надо считать поллингом сервер-авторитетно (иначе, оставаясь
+// «подключённым» после goHome, он бы навсегда завис на старом счётчике — новые сообщения не считались).
 function mergeUnread(map: Record<string, number>) {
   const st = useStore.getState();
+  const viewing = st.view === 'server' ? st.active?.id : undefined;
   const next = { ...st.unread };
-  for (const id in map) if (id !== st.connectedServerId) next[id] = map[id];
+  for (const id in map) if (id !== viewing) next[id] = map[id];
   useStore.setState({ unread: next });
   updateAppBadge();
 }
