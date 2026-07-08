@@ -649,18 +649,49 @@
   .voice-bar{flex:0 0 auto;background:var(--bg2);border-top:1px solid var(--line-2);padding:8px 6px}
   /* Персистентный голос-док (VoiceDock, уровень App): виден на всех экранах пока в голосовом.
      На сервере снизу есть user-panel (#channels) → приподнимаем, чтоб не перекрыть; на главной — к низу. */
-  #voicedock{position:fixed;left:80px;bottom:14px;z-index:60;width:min(224px,calc(100vw - 96px));background:var(--bg2);border:1px solid var(--line-2);border-radius:14px;box-shadow:var(--sh-2);padding:8px;display:flex;flex-direction:column;gap:6px;animation:toastIn .2s cubic-bezier(.2,.8,.4,1)}
+  /* Голосовая панель (Discord-style): плавающий док #voicedock (server-view) + карточка .vd-homecard (главная). */
+  #voicedock{position:fixed;left:80px;bottom:14px;z-index:60;width:min(310px,calc(100vw - 96px));animation:toastIn .2s cubic-bezier(.2,.8,.4,1)}
   #voicedock.on-server{bottom:64px}
-  #voicedock .vd-info{display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:9px;cursor:pointer;min-width:0}
-  #voicedock .vd-info:hover{background:var(--panel3)}
-  #voicedock .vd-mark{width:28px;height:28px;flex:0 0 auto;border-radius:8px;display:flex;align-items:center;justify-content:center;background:rgba(35,165,89,.16);color:var(--green)}
-  #voicedock .vd-txt{min-width:0}
-  #voicedock .vd-txt b{display:block;font-size:12.5px;color:var(--green);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.25}
-  #voicedock .vd-txt span{display:block;font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  #voicedock .vc-controls{gap:6px;justify-content:space-between}
-  #voicedock .vc-controls .cbtn{width:36px;height:36px}
-  #voicedock .conn-ms{display:none}
-  @media(max-width:900px){#voicedock{left:8px;bottom:72px;width:min(224px,calc(100vw - 16px))}#voicedock.on-server{bottom:72px}}
+  @media(max-width:900px){#voicedock{left:8px;bottom:72px;width:min(310px,calc(100vw - 16px))}#voicedock.on-server{bottom:72px}}
+  .vd-homecard{margin-bottom:16px}
+  .vd-panel{background:var(--bg2);border:1px solid var(--line-2);border-radius:14px;box-shadow:var(--sh-2);padding:9px;display:flex;flex-direction:column;gap:8px}
+  .vd-panel.home{background:linear-gradient(180deg,rgba(35,165,89,.09),rgba(35,165,89,0) 60%),var(--panel);border-color:rgba(35,165,89,.3);border-radius:16px;padding:13px 14px}
+  .vd-status{display:flex;align-items:center;gap:6px}
+  .vd-info{flex:1;min-width:0;display:flex;align-items:center;gap:9px;padding:4px 6px;border-radius:10px;cursor:pointer;background:none;text-align:left}
+  .vd-info:hover{background:var(--panel3)}
+  .vd-mark{width:30px;height:30px;flex:0 0 auto;border-radius:9px;display:flex;align-items:center;justify-content:center;background:rgba(35,165,89,.16);color:var(--green)}
+  .vd-panel.home .vd-mark{width:40px;height:40px;border-radius:12px}
+  .vd-txt{min-width:0}
+  .vd-txt b{display:block;font-size:12.5px;font-weight:700;color:var(--green);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.3}
+  .vd-panel.home .vd-txt b{font-size:15px}
+  .vd-txt span{display:block;font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .vd-panel.home .vd-txt span{font-size:12.5px}
+  .vd-controls{display:flex;align-items:center;gap:7px}
+  .vd-panel.home .vd-controls{gap:9px}
+  .vd-btn{width:38px;height:38px;flex:0 0 auto;border-radius:10px;display:flex;align-items:center;justify-content:center;background:var(--panel3);color:var(--txt);padding:0;box-shadow:var(--sh-1),inset 0 0 0 1px rgba(255,255,255,.05);transition:background .16s,color .16s,transform .16s cubic-bezier(.34,1.4,.64,1),box-shadow .16s}
+  .vd-btn:hover{background:var(--panel4);color:var(--txt-h);transform:translateY(-1px)}
+  .vd-btn:active{transform:translateY(0) scale(.93)}
+  .vd-btn.danger-on{background:var(--red-fill);color:#fff;box-shadow:0 0 0 1px rgba(242,63,67,.5),0 0 12px rgba(242,63,67,.4)}
+  .vd-btn.danger-on:hover{background:var(--red)}
+  .vd-btn.ptt-idle{background:rgba(240,178,50,.18);color:var(--yellow);box-shadow:inset 0 0 0 1.5px var(--yellow)}
+  .vd-btn.ptt-live{box-shadow:0 0 0 2px var(--green),0 0 12px rgba(35,165,89,.5);animation:pttPulse .9s ease-in-out infinite}
+  .vd-btn.vd-leave{width:34px;height:34px;background:#3c1b22;color:var(--red)}
+  .vd-btn.vd-leave:hover{background:var(--red-fill);color:#fff}
+  .vd-btn.vd-set{margin-left:auto}
+  /* группа кнопка + ▾ (выбор устройства, как в Discord) */
+  .vd-grp{display:flex;align-items:stretch;border-radius:10px;background:var(--panel3);box-shadow:var(--sh-1),inset 0 0 0 1px rgba(255,255,255,.05)}
+  .vd-grp .vd-btn{background:none;box-shadow:none;border-radius:10px 0 0 10px}
+  .vd-grp .vd-btn:hover{background:var(--panel4);transform:none}
+  .vd-caret{width:19px;flex:0 0 auto;border-radius:0 10px 10px 0;background:none;color:var(--muted);display:flex;align-items:center;justify-content:center;border-left:1px solid var(--line-2)}
+  .vd-caret:hover,.vd-caret.on{background:var(--panel4);color:var(--txt-h)}
+  .vd-caret .ic{font-size:11px}
+  .vd-devwrap{position:relative;display:flex}
+  .vd-devmenu{position:absolute;left:0;top:calc(100% + 6px);z-index:75;min-width:210px;max-width:290px;max-height:250px;overflow-y:auto;background:var(--bg2);border:1px solid var(--line-2);border-radius:11px;box-shadow:var(--sh-2);padding:5px}
+  .vd-devmenu.up{top:auto;bottom:calc(100% + 6px)}
+  .vd-devh{font-size:10px;font-weight:700;letter-spacing:.5px;color:var(--muted);padding:5px 9px 3px}
+  .vd-devitem{display:block;width:100%;text-align:left;padding:7px 9px;border-radius:7px;background:none;color:var(--txt);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .vd-devitem:hover{background:var(--panel3)}
+  .vd-devitem.on{color:var(--green);background:rgba(35,165,89,.12)}
   .vc-controls{display:flex;gap:8px;justify-content:center}
   .vc-controls .cbtn{width:42px;height:42px;flex:0 0 auto;border-radius:50%;display:flex;align-items:center;justify-content:center;background:var(--panel3);color:var(--txt);padding:0;box-shadow:var(--sh-1),inset 0 0 0 1px rgba(255,255,255,.05),inset 0 1px 0 rgba(255,255,255,.07);transition:background .18s,color .18s,transform .18s cubic-bezier(.34,1.4,.64,1),box-shadow .18s}
   .vc-controls .cbtn .ic{transition:transform .18s cubic-bezier(.34,1.4,.64,1)}
