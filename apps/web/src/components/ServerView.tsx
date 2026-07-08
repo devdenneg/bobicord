@@ -552,8 +552,29 @@ function ImageLightbox({ src, onClose }: { src: string; onClose: () => void }) {
 // вложения сообщения: картинки — грид миниатюр (клик → лайтбокс), остальные файлы — чипы со
 // скачиванием (форс-download на сервере, см. GET /api/files/:name — не инлайн, любое расширение).
 function MessageAttachments({ files, onImageClick }: { files: Attachment[]; onImageClick: (url: string) => void }) {
+  const toast = useStore((s) => s.toast);
   const images = files.filter((f) => f.kind === 'image');
   const others = files.filter((f) => f.kind === 'file');
+  const [downloading, setDownloading] = useState<number | null>(null);
+  // Клик по <a target="_blank"> на внешний https:// origin в нативе (Tauri) молча блокируется —
+  // нет плагина shell/opener, некуда открыть новую вкладку/окно. Качаем сам байты через fetch() в
+  // Blob и триггерим сохранение локальной blob:-ссылкой — она same-document, никакой навигации/нового
+  // окна не требуется, работает одинаково в вебе и нативе.
+  async function downloadFile(i: number, f: Attachment) {
+    if (downloading != null) return;
+    setDownloading(i);
+    try {
+      const r = await fetch(resolveUploadUrl(f.url));
+      if (!r.ok) throw new Error('Ошибка ' + r.status);
+      const blob = await r.blob();
+      const objUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = objUrl; a.download = f.name;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(objUrl), 30000);
+    } catch { toast(`Не удалось скачать ${f.name}`, 'err'); }
+    finally { setDownloading(null); }
+  }
   return (
     <div className="msg-files">
       {images.length ? (
@@ -566,12 +587,12 @@ function MessageAttachments({ files, onImageClick }: { files: Attachment[]; onIm
         </div>
       ) : null}
       {others.map((f, i) => (
-        <a key={i} className="msg-file" href={resolveUploadUrl(f.url) + '?name=' + encodeURIComponent(f.name)} download={f.name} target="_blank" rel="noreferrer">
+        <button key={i} className="msg-file" disabled={downloading === i} onClick={() => downloadFile(i, f)}>
           <Icon name="file" sm />
           <span className="mf-name">{f.name}</span>
           <span className="mf-size">{fmtSize(f.size)}</span>
-          <Icon name="download" sm />
-        </a>
+          {downloading === i ? <span className="spin" style={{ margin: 0, width: 14, height: 14 }} /> : <Icon name="download" sm />}
+        </button>
       ))}
     </div>
   );
@@ -1100,7 +1121,7 @@ function Chat() {
           }}
           onChange={(e) => { const v = e.target.value; setText(v); if (v.trim()) E.sendTyping(); setMention(detectMention(v, e.target.selectionStart ?? v.length)); setMIdx(0); }} onKeyDown={onComposerKey} />
         <button id="sendBtn" className={(text.trim() || staged.some((s) => s.status !== 'error')) ? '' : 'empty'} data-tip={sendQueued ? 'Отправится, как только вложения загрузятся' : 'Отправить · Enter'} onClick={send}>
-          {sendQueued ? <span className="spin" /> : <Icon name="send" />}
+          {sendQueued ? <span className="spin" style={{ margin: 0, width: 14, height: 14 }} /> : <Icon name="send" />}
         </button>
       </div>
       {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} onClose={() => setPickAnchor(undefined)}
