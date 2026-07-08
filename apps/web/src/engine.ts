@@ -79,12 +79,13 @@ function mapQuality(q: ConnectionQuality): VoiceQuality {
 }
 
 export class Engine {
-  private room: Room | null = null;
-  // Расцеп голос/просмотр (см. two-room-decouple): voiceRoom — комната сервера, где я в голосовом;
-  // viewRoom — комната сервера, который смотрю. Пока ОДНА физическая комната (оба геттера → this.room),
-  // поведение идентично. На стадии реального расцепа станут раздельными полями (this.room уйдёт).
-  private get voiceRoom(): Room | null { return this.room; }
-  private get viewRoom(): Room | null { return this.room; }
+  // Две комнаты (two-room-decouple S4): viewRoom — комната сервера, который смотрю; voiceRoom — комната
+  // сервера, где я в голосовом. СОВПАДАЮТ (ОДИН объект Room) когда voiceServer===viewServer (частый
+  // случай) → оба указателя на один Room, хендлеры ветвятся `if(r===voiceRoom)`/`if(r===viewRoom)` и обе
+  // ветви истинны. Расходятся, когда я в голосе на A и ушёл смотреть B: voiceRoom=srv:A держится,
+  // viewRoom=srv:B — новый коннект. Пока (4a) держатся равными → поведение идентично.
+  private viewRoom: Room | null = null;
+  private voiceRoom: Room | null = null;
   private me: User;
   private members: Member[] = [];
   private hooks: EngineHooks;
@@ -290,54 +291,55 @@ export class Engine {
 
   /* ---------- connection ---------- */
   async connect(url: string, token: string, serverId: string) {
-    this.room = new Room({
+    const r = new Room({
       adaptiveStream: true, dynacast: true,
       publishDefaults: { dtx: true, red: true, simulcast: true, audioPreset: AudioPresets.musicHighQuality },
     });
-    const r = this.room;
+    this.viewRoom = this.voiceRoom = r; // 4a: держим равными (voiceServer===viewServer); реальный расцеп — 4c
     this.serverId = serverId;
     this.liveKitT.attach(r, { me: this.me.username, serverId });
     this.treeT.attach(r, { me: this.me.username, serverId });
-    r.on(RoomEvent.TrackSubscribed, this.onSub)
-      .on(RoomEvent.TrackUnsubscribed, this.onUnsub)
-      .on(RoomEvent.ParticipantConnected, (p) => { const u = baseUid(p.identity); if (u !== this.me.username && !this.hasOtherSession(u, p.identity)) this.hooks.toast((p.name || u) + ' в сети', 'ok'); this.hooks.peerJoined(u); this.emit(); })
-      .on(RoomEvent.ParticipantDisconnected, (p) => { const u = baseUid(p.identity); if (!this.hasOtherSession(u, p.identity)) this.cleanupPeer(u); this.emit(); })
-      // звук мута слышен только самому мутящемуся (не остальным) — играем при локальном событии
+    // Хендлеры ветвятся по РОЛИ комнаты r: voice-работа при r===voiceRoom, view-работа при r===viewRoom.
+    // Пока комнаты равны (4a) — обе ветви истинны, как раньше. При расцепе (4c) событие voice-only комнаты
+    // A не запустит view-логику (чат/presence), а view-only комнаты B — voice-логику (mic/vc/vclaim).
+    r.on(RoomEvent.TrackSubscribed, (track, pub, p) => this.onSub(track, pub, p, r))
+      .on(RoomEvent.TrackUnsubscribed, (track, pub, p) => this.onUnsub(track, pub, p, r))
+      .on(RoomEvent.ParticipantConnected, (p) => { if (r === this.viewRoom) { const u = baseUid(p.identity); if (u !== this.me.username && !this.hasOtherSession(u, p.identity)) this.hooks.toast((p.name || u) + ' в сети', 'ok'); this.hooks.peerJoined(u); } this.emit(); })
+      .on(RoomEvent.ParticipantDisconnected, (p) => { if (r === this.viewRoom) { const u = baseUid(p.identity); if (!this.hasOtherSession(u, p.identity)) this.cleanupPeer(u); } this.emit(); })
+      // звук мута слышен только самому мутящемуся — играем при локальном событии МОЕГО голосового трека
       .on(RoomEvent.TrackMuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.voiceRoom?.localParticipant && !this.deafToggling) playSound('mute'); this.emit(); })
       .on(RoomEvent.Reconnecting, () => { this.reconnecting = true; this.hooks.toast('Связь потеряна — переподключаюсь…', 'warn'); this.emit(); })
       .on(RoomEvent.Reconnected, () => {
         this.reconnecting = false;
-        // после реконнекта заново заявляем голосовой канал (vc-атрибут мог потеряться) и чиним
-        // подписки сразу, не дожидаясь периодического self-heal — иначе на пару секунд пропадёт звук/состав
-        if (this.inVoice && this.currentVc) {
+        // voiceRoom-реконнект: заново заявляем vc/deaf + reconcile + vclaim (иначе на пару секунд пропадёт
+        // звук/состав, и одна-голосовая могла разъехаться, пока мы лежали).
+        if (r === this.voiceRoom && this.inVoice && this.currentVc) {
           this.voiceRoom?.localParticipant.setAttributes({ vc: this.currentVc, deaf: this.deafened ? '1' : '' }).catch(() => {});
           this.reconcileAllAudio();
-          // переотправляем vclaim (одна голосовая на аккаунт): пока мы лежали, другая сессия могла
-          // зайти в голосовой и её vclaim до нас не дошёл — иначе обе сессии остались бы в войсе
           this.lastVclaim = Date.now();
           this.dataSend({ t: 'vclaim', uid: this.me.id, session: this.sessionId() });
         }
-        // ре-энумерация чужих screenshare-публикаций: стрим, появившийся во время обрыва, иначе не
-        // прошёл бы через onStreamStart (нет живого TrackPublished) — бейдж/«Смотреть» не появлялись
-        this.liveKitT.onRoomConnected();
-        this.hooks.refetchChat?.(); // догрузить сообщения, пришедшие во время обрыва
+        // viewRoom-реконнект: ре-энумерация чужих стримов (появившийся во время обрыва не прошёл бы через
+        // onStreamStart — нет живого TrackPublished) + догрузка чата, пришедшего во время обрыва.
+        if (r === this.viewRoom) { this.liveKitT.onRoomConnected(); this.hooks.refetchChat?.(); }
         this.hooks.toast('Связь восстановлена', 'ok'); this.emit();
       })
       .on(RoomEvent.Disconnected, () => { this.reconnecting = false; this.emit(); })
-      // размут мика слышен только самому (не остальным); при оглушении звук даёт toggleDeaf, тут глушим
+      // размут мика слышен только самому; при оглушении звук даёт toggleDeaf, тут глушим
       .on(RoomEvent.TrackUnmuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.voiceRoom?.localParticipant && !this.deafToggling) playSound('unmute'); this.emit(); })
-      .on(RoomEvent.ConnectionQualityChanged, (q, p) => { if (p === r.localParticipant) { this.connQuality = mapQuality(q); this.emit(); } })
-      .on(RoomEvent.TrackPublished, this.onRemotePub)
-      .on(RoomEvent.TrackUnpublished, this.onRemoteUnpub)
-      // пир сменил голосовой канал (атрибут vc) → пере-подписаться/отписаться от его микрофона
-      // (стримы server-wide и watch не трогаем — смотреть можно из любого канала)
-      .on(RoomEvent.ParticipantAttributesChanged, (_changed, p) => { if (p !== r.localParticipant) this.reconcilePeerAudio(p as Participant); this.emit(); })
-      .on(RoomEvent.DataReceived, this.onData);
+      // качество/пинг — метрика ГОЛОСОВОГО соединения (voiceRoom)
+      .on(RoomEvent.ConnectionQualityChanged, (q, p) => { if (r === this.voiceRoom && p === r.localParticipant) { this.connQuality = mapQuality(q); this.emit(); } })
+      .on(RoomEvent.TrackPublished, (pub, p) => { if (r === this.voiceRoom) this.onRemotePub(pub, p); })
+      .on(RoomEvent.TrackUnpublished, (pub, p) => { if (r === this.voiceRoom) this.onRemoteUnpub(pub, p); })
+      // пир сменил vc → пере-подписка на его микрофон, только в voiceRoom (в viewRoom чужого сервера
+      // микрофоны не слушаю). Дисплей ростера обновляет emit() (build читает vc из соответствующей комнаты).
+      .on(RoomEvent.ParticipantAttributesChanged, (_changed, p) => { if (p !== r.localParticipant && r === this.voiceRoom) this.reconcilePeerAudio(p as Participant); this.emit(); })
+      .on(RoomEvent.DataReceived, (payload) => this.onData(payload, r));
     await r.connect(url, token, { autoSubscribe: false });
     this.roomReady = true; // комната реально поднялась — можно снимать скелетоны голосового/сцены
-    r.remoteParticipants.forEach((p) => p.trackPublications.forEach((pub) => this.onRemotePub(pub, p, true)));
-    this.liveKitT.onRoomConnected();
-    this.treeT.onRoomConnected();
+    // voiceRoom: подписка на уже опубликованные микрофоны (bootstrap). viewRoom: ре-энумерация стримов.
+    if (r === this.voiceRoom) r.remoteParticipants.forEach((p) => p.trackPublications.forEach((pub) => this.onRemotePub(pub, p, true)));
+    if (r === this.viewRoom) { this.liveKitT.onRoomConnected(); this.treeT.onRoomConnected(); }
     // periodic self-heal подписок на микрофоны: атрибут vc (голосовой канал) мог доехать без события
     // ParticipantAttributesChanged (гонка при быстрых прыжках между каналами / реконнекте) — тогда пир
     // виден в канале, но его не слышно. setSubscribed идемпотентен, поэтому реконсиляция дёшева и безопасна.
@@ -387,8 +389,9 @@ export class Engine {
     if (this.micActx) { try { this.micActx.close(); } catch { /**/ } this.micActx = null; }
     this.micGain = null;
     this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.roomReady = false; this.deafened = false; this.manualMute = false; this.screenStream = null;
-    if (this.room) { try { this.room.disconnect(); } catch { /**/ } }
-    this.room = null; this.emit();
+    if (this.viewRoom) { try { this.viewRoom.disconnect(); } catch { /**/ } }
+    // 4a: комнаты равны → одна физическая; рвём её и обнуляем оба указателя. Раздельный teardown — в 4c.
+    this.viewRoom = this.voiceRoom = null; this.emit();
   }
 
   /* ---------- presence helpers ---------- */
@@ -841,18 +844,23 @@ export class Engine {
     if (pub.source === Track.Source.Microphone && this.inVoice && baseUid(p.identity) !== this.me.username) playSound('exit'); // вышел из голосового
     this.emit();
   };
-  private onSub = (track: RemoteTrack, pub: TrackPublication, p: RemoteParticipant) => {
+  private onSub = (track: RemoteTrack, pub: TrackPublication, p: RemoteParticipant, room?: Room) => {
     if (track.kind === Track.Kind.Audio) {
-      const a = track.attach(); a.autoplay = true; document.getElementById('audioSink')?.appendChild(a);
+      const a = track.attach(); a.autoplay = true;
+      const isScreen = pub.source === Track.Source.ScreenShareAudio;
+      // метка происхождения: teardown одной комнаты сносит из #audioSink только СВОИ элементы (стрим-аудио
+      // viewRoom vs мик-аудио voiceRoom), иначе уход со стрим-сервера снёс бы голос и наоборот.
+      a.setAttribute('data-origin', isScreen ? 'view' : 'voice');
+      document.getElementById('audioSink')?.appendChild(a);
       const out = getSettings().output; if ((a as any).setSinkId && out) (a as any).setSinkId(out).catch(() => {});
       const u = baseUid(p.identity);
-      if (pub.source === Track.Source.ScreenShareAudio) { this.screenAudioEls.set(u, a); a.muted = this.deafened; a.volume = this.streamVolOf(u); }
-      else if (!this.inVoice) { try { track.detach().forEach((el) => el.remove()); } catch { /**/ } this.emit(); return; } // in-flight mic-подписка после leaveVoice — не клеим элемент
+      if (isScreen) { this.screenAudioEls.set(u, a); a.muted = this.deafened; a.volume = this.streamVolOf(u); }
+      else if (!this.inVoice || room !== this.voiceRoom) { try { track.detach().forEach((el) => el.remove()); } catch { /**/ } this.emit(); return; } // mic клеим только в голосовой комнате и в войсе (in-flight после leave / чужая комната)
       else { (a as HTMLAudioElement).muted = this.deafened; this.applyVolumeToParticipant(p); this.attachAnalyser(u, (track as any).mediaStreamTrack); }
     }
     this.emit();
   };
-  private onUnsub = (track: RemoteTrack, pub: TrackPublication, p: RemoteParticipant) => {
+  private onUnsub = (track: RemoteTrack, pub: TrackPublication, p: RemoteParticipant, _room?: Room) => {
     track.detach().forEach((el) => el.remove());
     const u = baseUid(p.identity);
     if (pub.source === Track.Source.ScreenShareAudio) this.screenAudioEls.delete(u);
@@ -1155,9 +1163,22 @@ export class Engine {
     this.typingUsers.forEach((exp, n) => { if (exp <= now) { this.typingUsers.delete(n); ch = true; } });
     if (ch) this.emit();
   }
-  private onData = (payload: Uint8Array) => {
+  private onData = (payload: Uint8Array, room?: Room) => {
     try {
       const d = JSON.parse(new TextDecoder().decode(payload));
+      if (d.t === 'vclaim') {
+        // vclaim прилетает по voiceRoom (dataSend роутит vclaim→voiceRoom) — обрабатываем только от неё.
+        // Другая моя сессия зашла в голосовой → выхожу (одна голосовая на аккаунт). tie-break: если ГОНКА
+        // (я тоже только что заявил голос) — уступает сессия с меньшим session-id; вне гонки новый девайс побеждает.
+        if (room !== this.voiceRoom) return;
+        if (d.uid === this.me.id && this.inVoice) {
+          const race = Date.now() - this.lastVclaim < 800;
+          if (!race || String(d.session || '') > this.sessionId()) this.leaveVoice();
+        }
+        return;
+      }
+      // чат/clear/emote/watch/typing — данные ПРОСМАТРИВАЕМОГО сервера, приходят по viewRoom
+      if (room !== this.viewRoom) return;
       if (d.t === 'chat') {
         if (d.em) for (const k in d.em) this.onEmoteResolve?.(k, d.em[k]);
         this.typingUsers.delete(d.name);
@@ -1168,15 +1189,6 @@ export class Engine {
         if (!own && mentioned) { // тост+notify ТОЛЬКО когда тегнули/реплайнули; звук тега даёт само notify (Discord)
           this.hooks.toast(repliedToMe ? `${d.name} ответил тебе` : `${d.name} упомянул тебя`, 'info');
           notify('mention', { title: d.name, body: String(d.text || '').slice(0, 140) || '🖼 изображение', tag: 'mention:' + this.serverId });
-        }
-      }
-      else if (d.t === 'vclaim') {
-        // другая моя сессия зашла в голосовой → выхожу (одна голосовая на аккаунт).
-        // tie-break: если это ГОНКА (я тоже только что заявил голос) — уступает сессия с меньшим
-        // session-id; вне гонки (я просто сидел в голосовом) новый девайс всегда побеждает.
-        if (d.uid === this.me.id && this.inVoice) {
-          const race = Date.now() - this.lastVclaim < 800;
-          if (!race || String(d.session || '') > this.sessionId()) this.leaveVoice();
         }
       }
       else if (d.t === 'clear') { this.messages = []; this.emit(); this.sysMsg((d.by || 'Админ') + ' очистил чат'); }
