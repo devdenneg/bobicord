@@ -126,6 +126,7 @@ export class Engine {
   private analysers = new Map<string, { an: AnalyserNode; buf: Uint8Array; hold: number; src: MediaStreamAudioSourceNode }>();
   private spCtx: AudioContext | null = null;
   private spRAF: number | null = null;
+  private audioUnlock: (() => void) | null = null; // снятие разового gesture-анлока micActx (см. ensureVoiceAudioRunning)
   private spTick = 0;
   private speakingSet = new Set<string>();
 
@@ -369,6 +370,7 @@ export class Engine {
     // presence-хинты и typing принадлежат ПРЕДЫДУЩЕМУ серверу — иначе при свитче первый emit (по
     // setMembers нового сервера) рисует их онлайн/в чужом голосовом канале до прихода нового /presence
     this.onlineHint.clear(); this.voiceHint = {}; this.typingUsers.clear();
+    this.clearAudioUnlock();
     if (this.micRaw) { this.micRaw.getTracks().forEach((t) => t.stop()); this.micRaw = null; }
     if (this.micActx) { try { this.micActx.close(); } catch { /**/ } this.micActx = null; }
     this.micGain = null;
@@ -521,6 +523,9 @@ export class Engine {
   }
   // RTT до сервера из WebRTC-статистики микрофонного трека (remote-inbound-rtp), фолбэк — candidate-pair
   private async pollPing() {
+    // Watchdog: контекст публикации мика мог родиться/остаться 'suspended' (getUserMedia-промпт съел
+    // user-activation) → пиры не слышат, хотя локально «всё работает». Держим его running, пока в войсе.
+    if (this.inVoice && this.micActx && this.micActx.state !== 'running') this.ensureVoiceAudioRunning();
     const track = this.room?.localParticipant.getTrackPublication(Track.Source.Microphone)?.track;
     if (!track) return;
     try {
@@ -557,7 +562,10 @@ export class Engine {
     if (!this.room) return;
     this.micRaw = await navigator.mediaDevices.getUserMedia({ audio: this.micCapture() });
     this.micActx = new AudioContext();
-    this.micActx.resume?.().catch(() => {});
+    // Дожидаемся resume: getUserMedia выше (+ промпт разрешения) РВЁТ user-activation → этот
+    // контекст ПУБЛИКАЦИИ рождается 'suspended', а suspended MediaStreamDestination выдаёт ТИШИНУ
+    // (пиры не слышат, хотя зелёная обводка от ДРУГОГО контекста spCtx рисуется). См. ensureVoiceAudioRunning.
+    try { await this.micActx.resume?.(); } catch { /**/ }
     const src = this.micActx.createMediaStreamSource(this.micRaw);
     this.micGain = this.micActx.createGain();
     src.connect(this.micGain);
@@ -572,12 +580,35 @@ export class Engine {
     // индикатор «говорит» берём с сырого трека устройства
     this.attachAnalyser(this.me.username, this.micRaw.getAudioTracks()[0]);
     this.applyGate();
+    this.ensureVoiceAudioRunning(); // добить, если контекст всё ещё suspended (анлок на первый жест + watchdog)
   }
+  // Гарантирует, что контекст ПУБЛИКАЦИИ микрофона (micActx) реально запущен. Браузер держит
+  // AudioContext 'suspended' до пользовательского жеста в контексте страницы; startMic создаёт
+  // контекст ПОСЛЕ await getUserMedia (+ промпт) → активация потеряна, контекст молчит, пиры не
+  // слышат (а зелёный VAD-индикатор от отдельного spCtx работает — потому баг незаметен локально).
+  // Полный перезаход «чинил» через sticky-activation. Резюмируем сразу + разовый анлок на первый
+  // жест; conn-watchdog (pollPing) добивает, если контекст уснул повторно.
+  private ensureVoiceAudioRunning() {
+    const resume = () => { this.micActx?.resume?.().catch(() => {}); this.spCtx?.resume?.().catch(() => {}); };
+    resume();
+    if (this.audioUnlock || !this.micActx || this.micActx.state === 'running') return;
+    const unlock = () => { resume(); if (!this.micActx || this.micActx.state === 'running') this.clearAudioUnlock(); };
+    this.audioUnlock = () => {
+      document.removeEventListener('pointerdown', unlock, true);
+      document.removeEventListener('keydown', unlock, true);
+      document.removeEventListener('touchstart', unlock, true);
+    };
+    document.addEventListener('pointerdown', unlock, true);
+    document.addEventListener('keydown', unlock, true);
+    document.addEventListener('touchstart', unlock, true);
+  }
+  private clearAudioUnlock() { if (this.audioUnlock) { this.audioUnlock(); this.audioUnlock = null; } }
   private stopMic() {
     const p = this.micPub();
     if (p && p.track) { try { this.room?.localParticipant.unpublishTrack(p.track, true); } catch { /**/ } }
     this.detachAnalyser(this.me.username);
     this.vadOpen = false;
+    this.clearAudioUnlock();
     if (this.micRaw) { this.micRaw.getTracks().forEach((t) => t.stop()); this.micRaw = null; }
     if (this.micActx) { try { this.micActx.close(); } catch { /**/ } this.micActx = null; }
     this.micGain = null;
