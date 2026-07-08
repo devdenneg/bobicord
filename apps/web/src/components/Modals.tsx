@@ -384,7 +384,7 @@ function SettingsModal() {
           {tab === 'voice' && <>
             <h2><Icon name="mic-sm" />Голос и звук</h2>
             <div className="grp">
-              <div className="gt"><Icon name="mic-sm" sm /> Микрофон</div>
+              <div className="gt">Микрофон</div>
               <div className="fld"><label>Устройство ввода</label><select value={s.input} onChange={(e) => upd({ input: e.target.value }, () => E?.reapplyMic())}><option value="">По умолчанию</option>{ins.map((d) => <option key={d.deviceId} value={d.deviceId}>{d.label || d.deviceId}</option>)}</select></div>
               <MicMeter />
               <div className="fld" style={{ marginTop: 10 }}><label>Режим передачи</label>
@@ -392,7 +392,7 @@ function SettingsModal() {
                 {s.mode === 'ptt' ? <div className="ptt-hint">Удерживай <span className="kbd">{keyLabel(s.pttKey)}</span> · <button style={{ padding: '4px 10px', fontSize: 12 }} onClick={() => setBinding(true)}>{binding ? 'Нажми клавишу...' : 'Сменить'}</button></div> : null}
               </div>
             </div>
-            <div className="grp"><div className="gt"><Icon name="head" sm /> Звук</div>
+            <div className="grp"><div className="gt">Звук</div>
               <div className="fld"><label>Устройство вывода</label><select value={s.output} onChange={(e) => upd({ output: e.target.value }, () => E?.applyOutput())}><option value="">По умолчанию</option>{outs.map((d) => <option key={d.deviceId} value={d.deviceId}>{d.label || d.deviceId}</option>)}</select></div>
               <div className="fld"><label>Общая громкость: {s.master}%</label><input type="range" min={0} max={100} value={s.master} onChange={(e) => upd({ master: +e.target.value }, () => E?.applyMaster())} /></div>
               <div className="fld"><label>Громкость уведомлений: {s.notifyVolume}%</label><input type="range" min={0} max={100} value={s.notifyVolume} onChange={(e) => upd({ notifyVolume: +e.target.value })} onMouseUp={() => playSound('system')} /></div>

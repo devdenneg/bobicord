@@ -82,7 +82,10 @@ function startMemberPoll(id: string) {
       // протухший ответ пишет состав/пресенс чужого сервера в стор и engine (чинилось только 5с спустя)
       const st2 = useStore.getState();
       if (st2.view !== 'server' || st2.connectedServerId !== id || connEpoch !== epoch) return;
-      useStore.setState({ members: srv.members, active: st2.active && st2.active.id === id ? { ...st2.active, channels: srv.server.channels } : st2.active });
+      // Обновляем и СВОИ роль/права (myRole/myPerms), не только channels: раньше спред ...st2.active
+      // сохранял старые myRole/myPerms → выданные владельцем роль/права не появлялись до F5/реконнекта
+      // (getServer их отдаёт, но поллер выбрасывал). Плюс имя/роли сервера — на случай их правки.
+      useStore.setState({ members: srv.members, active: st2.active && st2.active.id === id ? { ...st2.active, ...srv.server, myRole: srv.myRole, myPerms: srv.myPerms } : st2.active });
       engine?.setMembers(srv.members); engine?.setOnlineHint(prs.online); engine?.setVoiceHint(prs.voice || {});
     } catch { /**/ }
   };

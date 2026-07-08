@@ -669,15 +669,17 @@
   .settings-nav button{display:flex;align-items:center;gap:11px;width:100%;padding:9px 12px;border-radius:9px;background:transparent;color:var(--muted);font-size:14px;font-weight:600;text-align:left;transition:background .14s,color .14s}
   .settings-nav button:hover{background:var(--panel2);color:var(--txt-h)}
   .settings-nav button.active{background:var(--accent);color:#fff;box-shadow:0 4px 12px -5px color-mix(in srgb,var(--accent) 80%,transparent)}
-  .settings-nav button .ic{font-size:18px;flex:0 0 auto}
-  .settings-main{position:relative;flex:1;min-width:0;overflow-y:auto;padding:26px 30px 32px}
-  .settings-main-inner{max-width:600px}
+  .settings-nav button .ic{font-size:20px;flex:0 0 auto}
+  .settings-nav button:not(.active) .ic{color:var(--txt)}
+  .settings-main{position:relative;flex:1;min-width:0;overflow-y:auto;padding:26px 32px 34px}
+  /* без max-width: контент заполняет ширину панели → одинаковый отступ слева и справа (раньше был
+     прижат влево кэпом 600px, справа зияло пустое место — выглядело как больший правый паддинг) */
+  .settings-main-inner{width:100%}
   .settings-main-inner>h2{margin:0 0 20px;font-size:21px}
   .settings-main-inner>h2 .ic{font-size:24px}
   .settings-main-inner .grp:first-of-type{border-top:none;margin-top:2px;padding-top:0}
-  /* в широком лейауте мелкие иконки-бейджи подсекций и лейблы теряются — крупнее */
-  .settings-main .gt{font-size:13px;letter-spacing:.6px;gap:11px;margin-bottom:15px}
-  .settings-main .gt .ic{font-size:19px;padding:7px;border-radius:10px}
+  /* подзаголовки секций — без иконок-бейджей (по просьбе), чистый акцентный текст */
+  .settings-main .gt{font-size:13px;letter-spacing:.6px;margin-bottom:15px}
   .settings-main .fld label{font-size:13px}
   .settings-x{position:absolute;top:16px;right:18px;width:34px;height:34px;padding:0;display:flex;align-items:center;justify-content:center;border-radius:50%;background:var(--panel2);color:var(--muted);z-index:2}
   .settings-x:hover{background:var(--panel3);color:var(--txt-h);transform:rotate(90deg)}
