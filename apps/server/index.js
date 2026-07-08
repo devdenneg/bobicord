@@ -227,15 +227,18 @@ async function onlineDetailed(serverId) {
       const tracks = p.tracks || [];
       const streaming = tracks.some(t => t.source === 3);
       const inVoice = tracks.some(t => t.source === 2) || !!(p.attributes && p.attributes.vc);
-      const cur = byUser.get(u) || { streaming: false, inVoice: false };
-      byUser.set(u, { streaming: cur.streaming || streaming, inVoice: cur.inVoice || inVoice });
+      // Игровой статус (натив-атрибуты game/gicon) — для блока «Играют сейчас» на главной (кросс-сервер).
+      const game = p.attributes && p.attributes.game ? String(p.attributes.game).slice(0, 64) : '';
+      const gicon = p.attributes && p.attributes.gicon ? String(p.attributes.gicon) : '';
+      const cur = byUser.get(u) || { streaming: false, inVoice: false, game: '', gicon: '' };
+      byUser.set(u, { streaming: cur.streaming || streaming, inVoice: cur.inVoice || inVoice, game: cur.game || game, gicon: cur.gicon || gicon });
     }
     for (const u of treeSrv.liveBroadcastersIn(serverId)) { const c = byUser.get(u) || { streaming: false, inVoice: false }; c.streaming = true; byUser.set(u, c); }
     const stmt = db.prepare('SELECT display_name, avatar_color, avatar_url FROM users WHERE username=?');
     const out = [];
     for (const [username, st] of byUser) {
       const r = stmt.get(username);
-      out.push({ username, displayName: r ? r.display_name : username, avatarColor: r ? r.avatar_color : 0, avatarUrl: r ? (r.avatar_url || '') : '', streaming: st.streaming, inVoice: st.inVoice });
+      out.push({ username, displayName: r ? r.display_name : username, avatarColor: r ? r.avatar_color : 0, avatarUrl: r ? (r.avatar_url || '') : '', streaming: st.streaming, inVoice: st.inVoice, game: st.game || undefined, gicon: st.gicon || undefined });
     }
     // сначала стримеры, потом в голосе, потом остальные — для превью
     out.sort((a, b) => (b.streaming - a.streaming) || (b.inVoice - a.inVoice));

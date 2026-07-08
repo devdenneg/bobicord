@@ -4,7 +4,7 @@ import { getSettings, setSettings, subscribeSettings } from './settings';
 import { avColor, initial, normKey } from './util';
 import { api, resolveUploadUrl } from './api';
 import { Icon, IconSprite } from './Icon';
-import { deriveLiveItems, rankServers, dominant, clusterOrder, type LiveItem } from './homeData';
+import { deriveLiveItems, deriveGames, rankServers, dominant, clusterOrder, type LiveItem, type GameGroup } from './homeData';
 import { Auth } from './components/Auth';
 import { Toasts } from './components/Toasts';
 import { ServerView } from './components/ServerView';
@@ -153,6 +153,23 @@ function ServerCard({ s, unread, connected, onOpen }: { s: ServerSummary; unread
   );
 }
 
+// «Играют сейчас» — прикольный кросс-серверный блок: карточка на игру (иконка + кластер игроков + счётчик).
+function GamesNow({ games }: { games: GameGroup[] }) {
+  return (
+    <div className="games-grid">
+      {games.map((g) => (
+        <div className="game-card" key={g.name} title={g.players.map((p) => p.displayName).join(', ')}>
+          <div className="gc-ic">{g.icon ? <img src={`data:image/png;base64,${g.icon}`} alt="" /> : <span className="gc-pad">🎮</span>}</div>
+          <div className="gc-body">
+            <div className="gc-nm">{g.name}</div>
+            <div className="gc-players"><Cluster members={g.players} cap={5} /><span className="gc-count">{g.players.length}</span></div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function StatPill({ icon, n, label }: { icon?: 'green' | 'acc'; n: number; label: string }) {
   return <span className="stat-pill">{icon ? <i className={'dot ' + (icon === 'green' ? 'green' : 'acc')} /> : null}<b>{n}</b> {label}</span>;
 }
@@ -179,6 +196,7 @@ function Home() {
   }, [refreshServers]);
 
   const live = useMemo(() => deriveLiveItems(servers, unread, connectedId), [servers, unread, connectedId]);
+  const games = useMemo(() => deriveGames(servers), [servers]);
   const ranked = useMemo(() => rankServers(servers, unread), [servers, unread]);
   const shown = useMemo(() => ranked.filter((s) => filter === 'unread' ? (unread[s.id] || 0) > 0 : filter === 'mine' ? s.role === 'owner' : true), [ranked, filter, unread]);
   const totalOnline = servers.reduce((n, s) => n + (s.onlineCount || 0), 0);
@@ -232,6 +250,11 @@ function Home() {
         {live.length ? <>
           <div className="home-sec hot">Сейчас в эфире</div>
           <div className="live-grid">{live.map((it) => <LiveCard key={it.key} item={it} onOpen={() => openServer(it.server.id)} />)}</div>
+        </> : null}
+
+        {games.length ? <>
+          <div className="home-sec">Играют сейчас</div>
+          <GamesNow games={games} />
         </> : null}
 
         {waiting.length ? <>

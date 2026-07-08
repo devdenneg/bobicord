@@ -263,6 +263,20 @@
   .cluster .mini-av.voice{border-color:var(--green)}
   .cluster .more{margin-left:14px;font-family:var(--num);font-variant-numeric:tabular-nums;color:var(--muted);font-size:12px;font-weight:600}
 
+  /* «Играют сейчас» — кросс-серверные карточки игр (иконка + кластер игроков + счётчик) */
+  .games-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));gap:12px}
+  .game-card{display:flex;align-items:center;gap:12px;background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-md);padding:12px 14px;box-shadow:var(--sh-1);min-width:0;transition:border-color var(--tr),transform var(--tr)}
+  .game-card:hover{border-color:var(--accent);transform:translateY(-2px)}
+  .gc-ic{width:46px;height:46px;border-radius:12px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;overflow:hidden;background:var(--panel2);box-shadow:inset 0 0 0 1px rgba(255,255,255,.05)}
+  .gc-ic img{width:100%;height:100%;object-fit:cover}
+  .gc-ic .gc-pad{font-size:22px}
+  .gc-body{min-width:0;flex:1;display:flex;flex-direction:column;gap:6px}
+  .gc-nm{font-size:14px;font-weight:700;color:var(--txt-h);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .gc-players{display:flex;align-items:center;gap:9px}
+  .gc-count{font-family:var(--num);font-variant-numeric:tabular-nums;font-size:12px;color:var(--muted);font-weight:600}
+  @media(max-width:900px){.games-grid{grid-template-columns:1fr 1fr}}
+  @media(max-width:560px){.games-grid{grid-template-columns:1fr}}
+
   /* S2 «Тебя ждут» — чипы непрочитанного */
   .catchup{display:flex;flex-wrap:wrap;gap:8px}
   .cu-chip{display:flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--line-2);border-radius:999px;padding:5px 12px 5px 5px;color:var(--txt);font-size:13px}
@@ -565,7 +579,7 @@
   @media(hover:none){.vchan-act{opacity:.7}}
   .vchan-list{padding:1px 2px 5px 6px;display:flex;flex-direction:column;gap:1px}
   .vchan-list .pi .head{gap:8px;padding:5px 7px}
-  .vchan-list .pi .av{width:26px;height:26px;font-size:11px}
+  .vchan-list .pi .av{width:30px;height:30px;font-size:12px}
   /* inline-инпуты: переименование + создание канала */
   .vchan-edit,.vchan-create input{flex:1;min-width:0;font-size:14px;font-weight:600;padding:4px 8px;border-radius:7px;background:var(--panel);border:1px solid var(--accent);color:var(--txt-h);width:auto}
   .vchan-create{display:flex;align-items:center;gap:7px;padding:6px 8px;border-radius:10px;background:var(--panel2)}
@@ -655,14 +669,22 @@
   /* ник + «играет в X» рядом (иконка сразу после ника); роли/контролы уезжают вправо */
   .pi .nm-row{flex:1;min-width:0;display:flex;align-items:center;gap:8px}
   .pi .nm-row .nm{flex:0 1 auto}
+  /* member-row (участники): ДВЕ строки — имя сверху, игра+роли снизу. У каждой строки свой overflow,
+     ничего не наслаивается на любой ширине; строка 2 не рендерится, если нет ни игры, ни ролей. */
+  .pi-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px;justify-content:center}
+  .pi-l1{display:flex;align-items:center;min-width:0}
+  .pi-l2{display:flex;align-items:center;gap:6px;min-width:0;min-height:17px}
+  .pi-l2 .pi-game.mem{flex:0 1 auto;max-width:62%}
+  .pi-ctl{flex:0 0 auto;display:flex;align-items:center;gap:2px}
   /* «играет в X»: в голосовом — только иконка (тултип), в участниках — иконка + название */
   .pi-game{flex:0 0 auto;display:inline-flex;align-items:center;gap:5px;min-width:0}
   .pi-game img{width:16px;height:16px;border-radius:4px;object-fit:contain;display:block}
   .pi-game .gpad{font-size:13px;line-height:1}
   .pi-game.mem{flex:0 1 auto;max-width:55%;padding:1px 7px 1px 5px;border-radius:9999px;background:var(--panel2);border:1px solid var(--line-2)}
   .pi-game.mem .pg-nm{font-size:11px;font-weight:600;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  /* тултип игры: якорим по ПРАВОМУ краю иконки (уходит влево, не за экран) + перенос строк */
-  .pi-game[data-tip]::after{left:auto;right:0;transform:translateY(3px);max-width:240px;white-space:normal;text-align:left;line-height:1.35}
+  /* тултип игры: width:max-content — иначе abspos ужимался к ширине крошечного .pi-game (иконка ~16px)
+     и текст переносился в столбик по 1 слову. Якорим по ПРАВОМУ краю (уходит влево, не за экран). */
+  .pi-game[data-tip]::after{left:auto;right:0;width:max-content;transform:translateY(3px);max-width:240px;white-space:normal;text-align:left;line-height:1.35}
   @media (hover:hover) and (pointer:fine){.pi-game[data-tip]:hover::after{transform:translateY(0)}}
   /* LIVE — НА аватаре (кольцо + мини-бейдж), а не в строке ника: ник всегда в приоритете, не перекрывается */
   .av.live{position:relative;box-shadow:0 0 0 2px var(--red),0 0 9px -2px rgba(242,63,67,.55);animation:avLive 2.2s ease-in-out infinite}
@@ -753,6 +775,8 @@
   /* бегущая строка ping-pong: паузы у обоих краёв, плавный ход между ними */
   @keyframes marq{0%,14%{transform:translateX(0)}86%,100%{transform:translateX(var(--marq,0))}}
   #members .pi .nm{flex:0 1 auto}
+  /* крупнее аватар в списке участников — уравновешивает двухстрочную строку (имя + игра/роли) */
+  #members .pi .av{width:38px;height:38px;font-size:15px}
   .mrow-roles{flex:1 1 0;min-width:0;display:flex;align-items:center;gap:5px;position:relative}
   .mrow-roles-ghost{position:absolute;left:0;top:0;display:flex;gap:5px;visibility:hidden;pointer-events:none;white-space:nowrap}
   .role-more{flex:0 0 auto;font-size:10.5px;font-weight:700;padding:1px 6px;border-radius:9999px;background:var(--panel3);color:var(--txt);cursor:default;line-height:1.55}
@@ -887,10 +911,16 @@
   #epickHint{font-size:10px;color:var(--muted);text-align:center;padding:5px;border-top:1px solid var(--line-2);letter-spacing:.5px}
   #epickLoad{grid-column:1/-1;text-align:center;color:var(--muted);font-size:13px;padding:20px}
 
-  /* toasts */
-  #toasts{position:fixed;top:calc(14px + env(safe-area-inset-top));left:50%;transform:translateX(-50%);z-index:80;display:flex;flex-direction:column;gap:8px;align-items:center;pointer-events:none}
-  .toast{background:#0a0d13ee;border:1px solid var(--line-2);backdrop-filter:blur(10px);color:var(--txt);padding:10px 16px;border-radius:12px;font-size:13.5px;box-shadow:var(--sh-2);display:flex;align-items:center;gap:9px;animation:tin .22s cubic-bezier(.2,.8,.4,1);max-width:88vw;transition:opacity .2s,transform .2s;pointer-events:auto}
+  /* toasts — зарезервированный стек СНИЗУ-СЛЕВА (за рейлом), новый снизу, стек вверх, без наслоений.
+     column-reverse: последний тост внизу у угла, старые уезжают вверх; контейнер не ловит клики,
+     каждый тост — ловит (клик = закрыть). Фикс-ширина → длинный текст переносится, не тянет вьюпорт. */
+  #toasts{position:fixed;left:calc(92px + env(safe-area-inset-left));bottom:calc(62px + env(safe-area-inset-bottom));top:auto;transform:none;z-index:80;display:flex;flex-direction:column;gap:8px;align-items:flex-start;width:min(360px,calc(100vw - 108px));pointer-events:none}
+  .toast{width:100%;background:#0a0d13ee;border:1px solid var(--line-2);backdrop-filter:blur(10px);color:var(--txt);padding:11px 15px;border-radius:12px;font-size:13.5px;box-shadow:var(--sh-2);display:flex;align-items:center;gap:9px;animation:toastIn .22s cubic-bezier(.2,.8,.4,1);transition:opacity .2s,transform .2s;pointer-events:auto;cursor:pointer}
+  .toast span{min-width:0;overflow-wrap:anywhere}
   .toast .ic{font-size:17px;flex:0 0 auto}.toast.ok .ic{color:var(--green)}.toast.warn .ic{color:var(--yellow)}.toast.err .ic{color:var(--red)}
+  @keyframes toastIn{from{opacity:0;transform:translateX(-14px) scale(.98)}to{opacity:1;transform:none}}
+  /* мобилка: рейла нет по краю — прижимаем к левому краю с safe-area, во всю доступную ширину */
+  @media (max-width:900px){#toasts{left:calc(12px + env(safe-area-inset-left));width:min(400px,calc(100vw - 24px));bottom:calc(66px + env(safe-area-inset-bottom))}}
 
   /* mobile */
   #mtabs{display:none}

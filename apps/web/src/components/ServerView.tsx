@@ -449,25 +449,32 @@ function MemberRow({ m, anim }: { m: Member; anim?: string }) {
     <div className={'pi ' + st + (streaming ? ' streaming' : '') + (anim ? ' ' + anim : '')} data-spk={m.username}>
       <div className="head" ref={hc.ref} onClick={self ? undefined : hc.onTap} onMouseEnter={self ? undefined : hc.onEnter} onMouseLeave={self ? undefined : hc.onLeave}>
         <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} dot={st} live={streaming} liveApp={streaming ? E.getStreamAppMeta(m.username) : null} />
-        <div className="nm-row">
-          <div className="nm" style={roleColorOf(m) ? { color: roleColorOf(m) } : undefined}>{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div>
-          {pr?.game ? (
-            <span className="pi-game mem" data-tip={'Играет в ' + pr.game.name}>
-              {pr.game.icon ? <img src={`data:image/png;base64,${pr.game.icon}`} alt="" /> : <span className="gpad">🎮</span>}
-              <span className="pg-nm">{pr.game.name}</span>
-            </span>
+        <div className="pi-main">
+          <div className="pi-l1"><div className="nm" style={roleColorOf(m) ? { color: roleColorOf(m) } : undefined}>{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div></div>
+          {/* вторая строка: игра + роли — отдельно от ника, не наслаиваются (у каждого свой overflow) */}
+          {(pr?.game || (m.roles && m.roles.length > 0)) ? (
+            <div className="pi-l2">
+              {pr?.game ? (
+                <span className="pi-game mem" data-tip={'Играет в ' + pr.game.name}>
+                  {pr.game.icon ? <img src={`data:image/png;base64,${pr.game.icon}`} alt="" /> : <span className="gpad">🎮</span>}
+                  <span className="pg-nm">{pr.game.name}</span>
+                </span>
+              ) : null}
+              <MemberRoles roles={m.roles || []} />
+            </div>
           ) : null}
         </div>
-        <MemberRoles roles={m.roles || []} />
-        {!self && streaming && !pr?.inVoice ? (
-          <button className={'watchbtn' + (watching ? ' on' : '')} disabled={pending}
-            aria-label={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}
-            data-tip={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}
-            onClick={(e) => { e.stopPropagation(); watching ? E.closeWatch(m.username) : E.watch(m.username); }}>
-            {pending ? <span className="spin" style={{ margin: 0, width: 13, height: 13 }} /> : <Icon name={watching ? 'eye-off' : 'eye'} />}
-          </button>
-        ) : null}
-        {canKick ? <button className="mkick" data-tip="Выгнать" onClick={kick}><Icon name="close" sm /></button> : null}
+        <div className="pi-ctl">
+          {!self && streaming && !pr?.inVoice ? (
+            <button className={'watchbtn' + (watching ? ' on' : '')} disabled={pending}
+              aria-label={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}
+              data-tip={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}
+              onClick={(e) => { e.stopPropagation(); watching ? E.closeWatch(m.username) : E.watch(m.username); }}>
+              {pending ? <span className="spin" style={{ margin: 0, width: 13, height: 13 }} /> : <Icon name={watching ? 'eye-off' : 'eye'} />}
+            </button>
+          ) : null}
+          {canKick ? <button className="mkick" data-tip="Выгнать" onClick={kick}><Icon name="close" sm /></button> : null}
+        </div>
       </div>
       {!self && hc.rect ? <ProfileCard m={m} rect={hc.rect} /> : null}
     </div>

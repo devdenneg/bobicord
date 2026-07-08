@@ -40,6 +40,8 @@ export interface OnlineMember {
   avatarUrl?: string;
   streaming: boolean;
   inVoice: boolean;
+  game?: string;   // игровой статус (натив) — для блока «Играют сейчас» на главной
+  gicon?: string;  // base64 PNG иконки игры
 }
 export interface ServerSummary {
   id: string;

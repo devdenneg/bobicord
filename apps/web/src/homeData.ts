@@ -76,6 +76,22 @@ export function dominant(s: ServerSummary, unread: Unread): Dominant {
   return { kind: 'quiet', n: 0 };
 }
 
+// «Играют сейчас»: группируем игроков по ИГРЕ через все серверы (дедуп по username — один человек
+// в неск. серверах = один игрок). Иконка — первая непустая. Сортировка по числу игроков.
+export type GameGroup = { name: string; icon?: string; players: OnlineMember[] };
+export function deriveGames(servers: ServerSummary[]): GameGroup[] {
+  const byGame = new Map<string, GameGroup>();
+  for (const s of servers) for (const m of s.online || []) {
+    if (!m.game) continue;
+    const key = m.game.toLowerCase();
+    let g = byGame.get(key);
+    if (!g) { g = { name: m.game, icon: m.gicon, players: [] }; byGame.set(key, g); }
+    if (!g.icon && m.gicon) g.icon = m.gicon;
+    if (!g.players.some((p) => p.username === m.username)) g.players.push(m);
+  }
+  return [...byGame.values()].sort((a, b) => b.players.length - a.players.length || a.name.localeCompare(b.name));
+}
+
 // Живой кластер: порядок стрим→голос→онлайн, стабильно по username (лица не прыгают).
 export function clusterOrder(members: OnlineMember[]): OnlineMember[] {
   const rank = (m: OnlineMember) => (m.streaming ? 0 : m.inVoice ? 1 : 2);
