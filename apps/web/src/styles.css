@@ -649,25 +649,20 @@
   .voice-bar{flex:0 0 auto;background:var(--bg2);border-top:1px solid var(--line-2);padding:8px 6px}
   /* Персистентный голос-док (VoiceDock, уровень App): виден на всех экранах пока в голосовом.
      На сервере снизу есть user-panel (#channels) → приподнимаем, чтоб не перекрыть; на главной — к низу. */
-  /* Голосовая панель (Discord-style): плавающий док #voicedock (server-view) + карточка .vd-homecard (главная). */
-  #voicedock{position:fixed;left:80px;bottom:14px;z-index:60;width:min(340px,calc(100vw - 96px));animation:toastIn .2s cubic-bezier(.2,.8,.4,1)}
-  #voicedock.on-server{bottom:64px}
-  @media(max-width:900px){#voicedock{left:8px;bottom:72px;width:min(340px,calc(100vw - 16px))}#voicedock.on-server{bottom:72px}}
-  .vd-homecard{margin-bottom:16px}
-  .vd-panel{background:var(--bg2);border:1px solid var(--line-2);border-radius:14px;box-shadow:var(--sh-2);padding:9px;display:flex;flex-direction:column;gap:8px}
-  .vd-panel.home{background:linear-gradient(180deg,rgba(35,165,89,.09),rgba(35,165,89,0) 60%),var(--panel);border-color:rgba(35,165,89,.3);border-radius:16px;padding:13px 14px}
+  /* Голосовая панель: на сервере — inline в колонке каналов (адаптируется по её ширине); на главной — компактный плавающий док в углу. */
+  #voicedock{position:fixed;left:80px;bottom:14px;z-index:60;width:min(288px,calc(100vw - 96px));animation:toastIn .2s cubic-bezier(.2,.8,.4,1)}
+  @media(max-width:900px){#voicedock{left:8px;bottom:72px;width:min(288px,calc(100vw - 16px))}}
+  .vd-inline{flex:0 0 auto;background:var(--bg2);border-top:1px solid var(--line-2)}
+  .vd-panel{padding:9px;display:flex;flex-direction:column;gap:8px;min-width:0}
+  #voicedock .vd-panel{background:var(--bg2);border:1px solid var(--line-2);border-radius:14px;box-shadow:var(--sh-2)}
   .vd-status{display:flex;align-items:center;gap:6px}
   .vd-info{flex:1;min-width:0;display:flex;align-items:center;gap:9px;padding:4px 6px;border-radius:10px;cursor:pointer;background:none;text-align:left}
   .vd-info:hover{background:var(--panel3)}
   .vd-mark{width:30px;height:30px;flex:0 0 auto;border-radius:9px;display:flex;align-items:center;justify-content:center;background:rgba(35,165,89,.16);color:var(--green)}
-  .vd-panel.home .vd-mark{width:40px;height:40px;border-radius:12px}
   .vd-txt{min-width:0}
-  .vd-txt b{display:block;font-size:12.5px;font-weight:700;color:var(--green);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.3}
-  .vd-panel.home .vd-txt b{font-size:15px}
+  .vd-txt b{display:block;font-size:12px;font-weight:700;color:var(--green);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.3}
   .vd-txt span{display:block;font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .vd-panel.home .vd-txt span{font-size:12.5px}
-  .vd-controls{display:flex;align-items:center;justify-content:center;gap:9px}
-  .vd-panel.home .vd-controls{gap:11px}
+  .vd-controls{display:flex;align-items:center;justify-content:center;gap:8px}
   .vd-btn{width:38px;height:38px;flex:0 0 auto;border-radius:10px;display:flex;align-items:center;justify-content:center;background:var(--panel3);color:var(--txt);padding:0;box-shadow:var(--sh-1),inset 0 0 0 1px rgba(255,255,255,.05);transition:background .16s,color .16s,transform .16s cubic-bezier(.34,1.4,.64,1),box-shadow .16s}
   .vd-btn:hover{background:var(--panel4);color:var(--txt-h);transform:translateY(-1px)}
   .vd-btn:active{transform:translateY(0) scale(.93)}

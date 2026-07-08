@@ -108,8 +108,8 @@ function VoiceControls({ up }: { up?: boolean }) {
   );
 }
 
-// Общая панель голоса (используется и в плавающем доке, и в карточке главной). variant меняет стиль.
-function VoicePanel({ variant }: { variant: 'dock' | 'home' }) {
+// Общая панель голоса (внутри колонки каналов на сервере И в плавающем углу на главной).
+function VoicePanel() {
   const eng = useEngine();
   const E = getEngine()!;
   const servers = useStore((s) => s.servers);
@@ -125,7 +125,7 @@ function VoicePanel({ variant }: { variant: 'dock' | 'home' }) {
   const qTip = (eng.voicePing != null ? eng.voicePing + ' мс' : '—') + ' · ' + qLabel;
   const status = eng.voiceConnecting ? 'Подключение…' : 'Голосовая связь подключена';
   return (
-    <div className={'vd-panel ' + variant}>
+    <div className="vd-panel">
       <div className="vd-status">
         <button className="vd-info" onClick={goToVoice} data-tip="К голосовому серверу">
           <span className="vd-mark"><Icon name="speaker" sm /></span>
@@ -134,22 +134,16 @@ function VoicePanel({ variant }: { variant: 'dock' | 'home' }) {
         <div className={'conn-ind q-' + q} data-tip={qTip} aria-label={'Качество связи: ' + qTip} tabIndex={0}><i /><i /><i /></div>
         <button className="vd-btn vd-leave" data-tip="Выйти из голосового" onClick={() => E.leaveVoice()}><Icon name="leave" sm /></button>
       </div>
-      <VoiceControls up={variant === 'dock'} />
+      <VoiceControls up />
     </div>
   );
 }
 
-// Плавающий док на уровне App (server-view). На главной прячем — там своя приоритетная карточка (VoiceHomeCard).
-export function VoiceDock() {
-  const eng = useEngine();
-  const view = useStore((s) => s.view);
-  if (!eng.inVoice || !eng.voiceServerId || view === 'home') return null;
-  return <div id="voicedock" className={view === 'server' ? 'on-server' : ''}><VoicePanel variant="dock" /></div>;
-}
-
-// Карточка голоса на ГЛАВНОЙ — приоритетно, в стиле главного меню.
-export function VoiceHomeCard() {
+// variant: 'inline' — внутри колонки каналов (server-view), адаптируется по её ширине;
+//          'floating' — компактный плавающий в левом нижнем углу (главная). Оба зовут одну VoicePanel.
+export function VoiceDock({ variant }: { variant: 'inline' | 'floating' }) {
   const eng = useEngine();
   if (!eng.inVoice || !eng.voiceServerId) return null;
-  return <div className="vd-homecard"><VoicePanel variant="home" /></div>;
+  if (variant === 'inline') return <div className="vd-inline"><VoicePanel /></div>;
+  return <div id="voicedock"><VoicePanel /></div>;
 }

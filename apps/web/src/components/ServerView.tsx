@@ -8,6 +8,7 @@ import { Icon } from '../Icon';
 import { avColor, initial, prefersReducedMotion, downscaleImage } from '../util';
 import { emoteMap, emoteUrl } from '../emotes';
 import { EmotePicker } from './EmotePicker';
+import { VoiceDock } from './VoiceDock';
 import { getSettings, setSettings } from '../settings';
 import { applyNativeUpdate } from '../nativeUpdate';
 import type { Attachment, ChatMessage, Emote, Member, ReplyRef, Role } from '../types';
@@ -1379,6 +1380,7 @@ function Channels() {
         <span className="chn">{active.name}</span><Icon name="info" sm />
       </div>
       <div className="ch-body"><VoiceChannels /></div>
+      <VoiceDock variant="inline" />
       <div className="user-panel">
         <div className="up-i" onClick={() => setModal('profile')}><b>{me.displayName}</b><span>В сети</span></div>
         <button className="up-btn" data-tip="Настройки звука" onClick={() => setModal('settings')}><Icon name="gear" sm /></button>

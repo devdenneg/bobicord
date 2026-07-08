@@ -8,7 +8,7 @@ import { deriveLiveItems, deriveGames, rankServers, dominant, clusterOrder, type
 import { Auth } from './components/Auth';
 import { Toasts } from './components/Toasts';
 import { ServerView } from './components/ServerView';
-import { VoiceDock, VoiceHomeCard } from './components/VoiceDock';
+import { VoiceDock } from './components/VoiceDock';
 import { useEngine } from './hooks';
 import { Modals } from './components/Modals';
 import { DownloadCard } from './components/DownloadFab';
@@ -280,8 +280,6 @@ function Home() {
       </header>
 
       <div className="home-body home-enter">
-        {/* приоритетно: если ты в голосовом — крупная карточка голоса вверху (контролы прямо тут) */}
-        <VoiceHomeCard />
         {/* акцентные баннеры: обновление (веб/натив) → промо десктоп-приложения (веб). null, если нечего показать */}
         <UpdateBanner />
         <DownloadCard />
@@ -512,7 +510,9 @@ export function App() {
             <Rail />
             {view === 'home' ? <Home /> : (loadingServer ? <ServerSkeleton /> : <ServerView />)}
           </div>
-          <VoiceDock />
+          {/* На сервере голос-панель живёт ВНУТРИ колонки каналов (ServerView, адаптируется по ширине).
+              На главной — компактный плавающий док в левом нижнем углу. */}
+          {view === 'home' ? <VoiceDock variant="floating" /> : null}
         </>
       )}
       <Modals />
