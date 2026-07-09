@@ -1337,6 +1337,26 @@ function TreePeerPanel({ identity, onClose }: { identity: string; onClose: () =>
         <button className="vb-btn" onClick={onClose}><Icon name="close" sm /></button>
       </div>
       {!topo || !topo.nodes.length ? <div style={{ opacity: .6 }}>Нет данных о дереве</div> : <>
+        {(() => {
+          // Кнопка «взять» есть только у узлов со свободным слотом. Когда их нет вовсе, панель
+          // раньше молча показывала «0/0» — юзер видел список и не понимал, почему подключиться
+          // к ретранслятору нельзя. Объясняем причину: браузеры — всегда листья (ёмкость 0 по
+          // инварианту), а нативный зритель получает слоты только при достаточном upload
+          // (tree.js::dynamicCapacity: нужен битрейт стрима × 1.3 на каждого ребёнка).
+          const anyPickable = topo.nodes.some((n) => n.id !== topo.you && n.id !== youNode?.parentId && !youDesc.has(n.id) && n.children < n.capacity);
+          if (anyPickable) return null;
+          const others = topo.nodes.filter((n) => n.id !== topo.you && !n.broadcaster && !n.virtual);
+          const allBrowsers = others.length > 0 && others.every((n) => !n.native);
+          return (
+            <div style={{ opacity: .6, lineHeight: 1.4, marginBottom: 6, fontSize: 11 }}>
+              {others.length === 0
+                ? 'Других зрителей нет — ретранслировать некому.'
+                : allBrowsers
+                  ? 'Зрители в браузере не ретранслируют (всегда листья дерева).'
+                  : 'Ни у кого нет свободных слотов: для ретрансляции нужен upload ≥ битрейта стрима.'}
+            </div>
+          );
+        })()}
         {[...topo.nodes].sort((a, b) => a.depth - b.depth).map((n) => {
           const isYou = n.id === topo.you;
           const isParent = youNode?.parentId === n.id;

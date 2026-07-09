@@ -580,8 +580,18 @@ export class TreeVideoTransport implements VideoTransport {
     try {
       const { getCachedProbe, measureUpload } = await import('./probe');
       const cached = getCachedProbe();
-      if (cached && cached.bweKbps > 0) availableOutgoing = Math.round(cached.bweKbps * 1000);
-      else void measureUpload().catch(() => {}); // прогрев кэша, fire-and-forget
+      // Кормим сервер ТОЛЬКО достоверным замером. Правило Д6 (tree.js::dynamicCapacity)
+      // трактует `0 < out < br×1.3` как ДОКАЗАННО слабый upload и режет ёмкость в 0 — зритель
+      // перестаёт быть ретранслятором, к нему нельзя подключиться. Скармливать туда результат,
+      // который probe сам пометил «возможно занижено», — значит доказывать слабость числом,
+      // которому сам не веришь. Занижают: симметричный NAT (замер шёл через TURN-relay) и
+      // DataChannel-фолбэк (goodput SCTP << BWE). Такие отдаём как 0 = «не измерен» → сервер
+      // даст консервативную ёмкость 1 (та же политика, что у зрителя вообще без кэша).
+      // Иначе получалась перверсия: НЕ замерил — ретранслируешь; замерил плохо — не можешь сутки
+      // (TTL кэша). Ёмкость 2 требует 2×br×1.3 и всё равно недостижима на таком линке.
+      const trusted = !!cached && cached.bweKbps > 0 && !cached.symmetricNat && cached.method !== 'datachannel';
+      if (trusted) availableOutgoing = Math.round(cached!.bweKbps * 1000);
+      else if (!cached) void measureUpload().catch(() => {}); // прогрев кэша, fire-and-forget
     } catch { /**/ }
     try {
       await stopNativeWatch().catch(() => {});
