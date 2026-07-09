@@ -16,8 +16,14 @@ import { isTauri } from '../native';
 const CACHE_KEY = 'probeUpload';
 const CACHE_TTL_MS = 24 * 3600 * 1000; // сутки
 const PROBE_MAX_BITRATE = 15_000_000;  // потолок трека — чтобы BWE было куда разгоняться
-const WARMUP_MS = 1000;                // первая секунда — прогрев (холодный старт probe-сессии)
-const MEASURE_MS = 4000;               // общий бюджет замера
+// Chromium GCC стартует с ~300 кбит/с и разгоняется мультипликативно. Без подсказки стартового
+// битрейта за 3с он до плато не доходит — замер занижал вдвое (живьём: 5.3 против реальных
+// 9.6 Мбит/с). Лечим тремя вещами: (1) x-google-start-bitrate в SDP — стартуем сразу высоко;
+// (2) длиннее окно; (3) плато (p90 хвоста), а не медиана разгона — см. plateau().
+const PROBE_START_KBPS = 8000;         // x-google-start-bitrate: с чего GCC начинает
+const PROBE_MIN_KBPS = 1000;           // x-google-min-bitrate: не проваливаться на старте
+const WARMUP_MS = 1500;                // прогрев: холодный старт probe-сессии + первый разгон
+const MEASURE_MS = 7000;               // общий бюджет замера (кэш суточный — 7с терпимо)
 const SAMPLE_MS = 200;                 // период чтения getStats
 
 export interface ProbeResult {
@@ -49,12 +55,33 @@ function treeWsUrl(): string {
 
 const DEFAULT_ICE: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
 
-/** Медиана массива (пустой → 0). */
-function median(xs: number[]): number {
+/** Оценка ПЛАТО ряда BWE. Медиана тут систематически занижает: ряд имеет форму «разгон →
+ *  плато», и её значение садится в середину разгона (живьём: 5.3 при реальных ~9.6 Мбит/с).
+ *  p90 живёт в плато, но устойчив к единичному выбросу availableOutgoingBitrate. */
+export function plateau(xs: number[]): number {
   if (!xs.length) return 0;
   const s = [...xs].sort((a, b) => a - b);
-  const m = Math.floor(s.length / 2);
-  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+  return s[Math.min(s.length - 1, Math.floor(s.length * 0.9))];
+}
+
+/** Вписывает x-google-start/min/max-bitrate в fmtp видео-секции offer'а. Chromium читает их и
+ *  стартует GCC с указанного битрейта вместо ~300 кбит/с — иначе за окно probe разгон не
+ *  успевает дойти до плато. Если подходящего fmtp нет — возвращает SDP как есть (безопасно). */
+export function mungeStartBitrate(sdp: string, startKbps: number, minKbps: number, maxKbps: number): string {
+  const lines = sdp.split(/\r\n|\n/);
+  const mIdx = lines.findIndex((l) => l.startsWith('m=video'));
+  if (mIdx < 0) return sdp;
+  const pts = lines[mIdx].split(' ').slice(3); // payload types видео-секции
+  let touched = false;
+  for (let i = mIdx + 1; i < lines.length; i++) {
+    if (lines[i].startsWith('m=')) break; // следующая секция — выходим
+    const m = /^a=fmtp:(\d+) (.*)$/.exec(lines[i]);
+    if (!m || !pts.includes(m[1])) continue;
+    if (m[2].includes('x-google-start-bitrate')) { touched = true; continue; }
+    lines[i] = `a=fmtp:${m[1]} ${m[2]};x-google-start-bitrate=${startKbps};x-google-min-bitrate=${minKbps};x-google-max-bitrate=${maxKbps}`;
+    touched = true;
+  }
+  return touched ? lines.join('\r\n') : sdp;
 }
 
 /** Синтетический высокоэнтропийный canvas-трек 60fps: гоняем шум, чтобы энкодер не сжимал
@@ -137,6 +164,8 @@ export async function measureUpload(opts?: { onPhase?: (p: string) => void }): P
         pc.addTransceiver(canvas.track, { direction: 'sendonly', sendEncodings: [{ maxBitrate: PROBE_MAX_BITRATE }] });
         try {
           const offer = await pc.createOffer();
+          // Стартовый битрейт GCC: без него разгон с ~300 кбит/с не доходит до плато за окно.
+          offer.sdp = mungeStartBitrate(offer.sdp!, PROBE_START_KBPS, PROBE_MIN_KBPS, Math.round(PROBE_MAX_BITRATE / 1000));
           await pc.setLocalDescription(offer);
           send({ t: 'probe-offer', sdp: pc.localDescription!.sdp });
         } catch (e) { fail(e); return; }
@@ -152,9 +181,9 @@ export async function measureUpload(opts?: { onPhase?: (p: string) => void }): P
           if (aob != null && aob > 0) samples.push({ t: Date.now() - t0, v: aob });
           if (Date.now() - t0 >= MEASURE_MS) {
             clearInterval(iv);
-            // Медиана последних 2с (после прогрева WARMUP_MS).
-            const window2s = samples.filter((s) => s.t >= WARMUP_MS).map((s) => s.v);
-            const bwe = median(window2s.length ? window2s : samples.map((s) => s.v));
+            // Плато (p90) хвоста после прогрева. Медиана давала середину разгона — занижение ~×2.
+            const tail = samples.filter((s) => s.t >= WARMUP_MS).map((s) => s.v);
+            const bwe = plateau(tail.length ? tail : samples.map((s) => s.v));
             if (bwe > 0) {
               done({ bweKbps: Math.round(bwe / 1000), method: 'bwe', symmetricNat, at: Date.now() });
             } else {
