@@ -217,6 +217,14 @@ export class Engine {
         : 'Не удалось переключить источник';
       this.hooks.toast(msg, 'warn');
     });
+    // Д4: рендишн недоступен (агент отказал / кап транскодов / апскейл) — тост + фолбэк на source.
+    this.treeT.onRenditionUnavailable?.((sid, rendition, reason) => {
+      this.hooks.toast(reason === 'no-upscale'
+        ? `Качество ${rendition}p недоступно (выше исходного)`
+        : `Качество ${rendition}p сейчас недоступно — вернул на исходное`, 'warn');
+      this.treeT.setQuality?.(sid, 'auto');
+      this.emit();
+    });
     this.snap = this.build();
   }
 
@@ -1047,6 +1055,21 @@ export class Engine {
   getStreamTopology(identity: string) { return this.transportFor(identity).getTopology?.(identity) ?? null; }
   getStreamParentId(identity: string) { return this.transportFor(identity).getParentId?.(identity) ?? null; }
   requestReparent(identity: string, targetId: string | null) { this.transportFor(identity).requestReparent?.(identity, targetId); }
+
+  /* ---------- Д4: выбор качества (только при просмотре через сервер) ---------- */
+  // Меню Авто/Source/1080/720/480/360 → transport делает unwatch+watch(quality, pinned).
+  setStreamQuality(identity: string, mode: string) { this.transportFor(identity).setQuality?.(identity, mode); this.emit(); }
+  getStreamQualityMode(identity: string): string { return this.transportFor(identity).getQualityMode?.(identity) ?? 'auto'; }
+  // Доступная лестница рендишнов стрима (из stream-live.renditions). null — не tree/неизвестно.
+  getStreamRenditions(identity: string): string[] | null { return this.treeT.getStreamMeta?.(identity)?.renditions ?? null; }
+  // Смотрим ли через сервер (родитель = vrelay/рендишн-корень) — только тогда меню качества активно.
+  isStreamViaServer(identity: string): boolean {
+    const topo = this.getStreamTopology(identity);
+    if (!topo || !topo.you) return false;
+    const you = topo.nodes.find((n) => n.id === topo.you);
+    const parent = you?.parentId ? topo.nodes.find((n) => n.id === you.parentId) : null;
+    return !!(parent && (parent.virtual || (parent as any).server));
+  }
 
   /* ---------- emotes (spray) ---------- */
   onEmote(cb: EmoteListener) { this.emoteListeners.add(cb); return () => { this.emoteListeners.delete(cb); }; }

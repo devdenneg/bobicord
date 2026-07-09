@@ -18,6 +18,7 @@ interface NativeWatchState {
   unlisten: Array<() => void>;
   closed: boolean;
   quality: string;              // Д3: рендишн, который смотрим (дефолт 'source')
+  pinned: boolean;              // Д4: ручной выбор качества (авто-ABR не трогает)
 }
 
 /** Метаданные приложения вещателя (окно): доходят в stream-live/бэклоге. */
@@ -58,6 +59,7 @@ interface WatchState {
   maxChildren: number;
   joined: boolean;                // join уже отправлен (шлём после welcome — см. sendWatchJoin)
   quality: string;                // Д3: рендишн-дерево, в которое джойнимся (дефолт 'source')
+  pinned: boolean;                // Д4: ручной выбор качества (авто-ABR не трогает)
 }
 
 
@@ -104,6 +106,7 @@ export class TreeVideoTransport implements VideoTransport {
   private topologyByStream = new Map<string, TreeTopology>();
   private topologyCbs = new Set<(streamId: string) => void>();
   private reparentDeniedCbs = new Set<(streamId: string, reason: string) => void>();
+  private renditionUnavailableCbs = new Set<(streamId: string, rendition: string, reason: string) => void>();
   private nativeWatches = new Map<string, NativeWatchState>();
   // Rust держит ОДИН watch-слот, stopNativeWatch() ГЛОБАЛЕН. Трекаем, какой стрим реально в слоте —
   // чтобы стоп/teardown ЧУЖОГО стрима не рубил активный просмотр (bug: «стоп одного стрима гасит другой»).
@@ -221,16 +224,16 @@ export class TreeVideoTransport implements VideoTransport {
   // Д3: UI-ключ у зрителя — базовый streamId; `quality` выбирает рендишн-дерево
   // (`streamId::quality` на сервере). Дефолт 'source' → поведение как «до». Смена
   // качества = unwatch()+watch() (Д4 добавит меню).
-  watch(streamId: string, quality: string = 'source') {
+  watch(streamId: string, quality: string = 'source', pinned: boolean = false) {
     if (this.watches.has(streamId) || this.nativeWatches.has(streamId)) return;
     // В Tauri видео/relay держит Rust (native passthrough): webview не джойнится в дерево
     // сам, а получает поток от локального Rust-пира через IPC (см. nativeWatch).
-    if (isTauri) { this.nativeWatch(streamId, quality); return; }
+    if (isTauri) { this.nativeWatch(streamId, quality, pinned); return; }
     let ws: WebSocket;
     try { ws = new WebSocket(treeWsUrl()); } catch { return; }
     const st: WatchState = {
       ws, pc: null, parentId: null, closed: false, iceServers: this.iceServers,
-      maxChildren: 0, joined: false, quality,
+      maxChildren: 0, joined: false, quality, pinned,
     };
     this.watches.set(streamId, st);
 
@@ -247,7 +250,7 @@ export class TreeVideoTransport implements VideoTransport {
       // сам заглохнет (guard). Не дублируем, если watch уже пересоздан.
       if (!this.closed && this.liveStreams.has(streamId)) {
         setTimeout(() => {
-          if (!this.closed && !this.watches.has(streamId) && !this.nativeWatches.has(streamId) && this.liveStreams.has(streamId)) this.watch(streamId, st.quality);
+          if (!this.closed && !this.watches.has(streamId) && !this.nativeWatches.has(streamId) && this.liveStreams.has(streamId)) this.watch(streamId, st.quality, st.pinned);
         }, 3000);
       }
     };
@@ -263,7 +266,7 @@ export class TreeVideoTransport implements VideoTransport {
     const symmetricNat = await this.natProbe.catch(() => false);
     if (st.closed) return;
     st.maxChildren = 0;
-    try { st.ws.send(JSON.stringify({ t: 'join', streamId, quality: st.quality, role: 'viewer', native: false, maxChildren: st.maxChildren, identity: this.me, symmetricNat, serverId: this.serverId })); } catch { /**/ }
+    try { st.ws.send(JSON.stringify({ t: 'join', streamId, quality: st.quality, pinned: st.pinned, role: 'viewer', native: false, maxChildren: st.maxChildren, identity: this.me, symmetricNat, serverId: this.serverId })); } catch { /**/ }
   }
 
   unwatch(streamId: string) {
@@ -402,8 +405,34 @@ export class TreeVideoTransport implements VideoTransport {
         this.reparentDeniedCbs.forEach((cb) => cb(streamId, msg.reason || ''));
         break;
       }
+      case 'rendition-unavailable': {
+        // Д4: рендишн не поднять (кап транскодов / апскейл / нет агента) — сообщаем наверх
+        // (тост + фолбэк на source в engine).
+        this.renditionUnavailableCbs.forEach((cb) => cb(streamId, msg.rendition || '', msg.reason || ''));
+        break;
+      }
     }
   }
+
+  /* ---------- quality (Д4) ---------- */
+  // Меню Авто/Source/1080/720/480/360 → смена = unwatch+watch(quality, pinned). Ключ — базовый
+  // streamId (составной ключ живёт на сервере). 'auto' = снять pin (сервер адаптирует ABR).
+  setQuality(streamId: string, mode: string) {
+    const pinned = mode !== 'auto';
+    const quality = mode === 'auto' ? 'source' : mode;
+    const cur = this.watches.get(streamId) || this.nativeWatches.get(streamId);
+    if (cur && cur.quality === quality && cur.pinned === pinned) return; // уже в этом режиме
+    this.unwatch(streamId);
+    this.watch(streamId, quality, pinned);
+  }
+  // Текущий режим для подсветки пункта меню. pinned → рендишн; иначе 'auto' (сервер мог
+  // авто-двигать между деревьями — в auto показываем «Авто», реальный рендишн прозрачен).
+  getQualityMode(streamId: string): string {
+    const st = this.watches.get(streamId) || this.nativeWatches.get(streamId);
+    if (!st) return 'auto';
+    return st.pinned ? st.quality : 'auto';
+  }
+  onRenditionUnavailable(cb: (streamId: string, rendition: string, reason: string) => void) { this.renditionUnavailableCbs.add(cb); return () => { this.renditionUnavailableCbs.delete(cb); }; }
 
   private async onParentOffer(streamId: string, st: WatchState, sdp: string) {
     const pc = new RTCPeerConnection({ iceServers: st.iceServers.length ? st.iceServers : DEFAULT_ICE_SERVERS });
@@ -440,8 +469,8 @@ export class TreeVideoTransport implements VideoTransport {
   }
 
   /* ---------- native watch (Tauri: Rust держит upstream+relay, webview рендерит) ---------- */
-  private async nativeWatch(streamId: string, quality: string = 'source') {
-    const st: NativeWatchState = { pc: null, unlisten: [], closed: false, quality };
+  private async nativeWatch(streamId: string, quality: string = 'source', pinned: boolean = false) {
+    const st: NativeWatchState = { pc: null, unlisten: [], closed: false, quality, pinned };
     this.nativeWatches.set(streamId, st);
     const offCb = (sid: string, sdp: string) => { if (sid === streamId && !st.closed) this.onNativeOffer(streamId, st, sdp); };
     const iceCb = (sid: string, candidate: any) => { if (sid === streamId && st.pc && candidate) st.pc.addIceCandidate(candidate).catch(() => {}); };
@@ -455,7 +484,7 @@ export class TreeVideoTransport implements VideoTransport {
       if (sid !== streamId || st.closed) return;
       this.unwatch(streamId);
       setTimeout(() => {
-        if (!this.closed && this.liveStreams.has(streamId) && !this.nativeWatches.has(streamId) && !this.watches.has(streamId)) this.watch(streamId, st.quality);
+        if (!this.closed && this.liveStreams.has(streamId) && !this.nativeWatches.has(streamId) && !this.watches.has(streamId)) this.watch(streamId, st.quality, st.pinned);
       }, 1500);
     };
     try {
@@ -470,7 +499,7 @@ export class TreeVideoTransport implements VideoTransport {
     // start нового и снести уже его (гонка при переключении A→B). Первый watch: слот пуст, no-op.
     try {
       await stopNativeWatch().catch(() => {});
-      await startNativeWatch(streamId, this.me, this.serverId, NATIVE_RELAY_CAPACITY, st.quality);
+      await startNativeWatch(streamId, this.me, this.serverId, NATIVE_RELAY_CAPACITY, st.quality, st.pinned);
       this.currentNativeWatch = streamId; // этот стрим теперь в Rust-слоте
     }
     catch { this.nativeUnwatch(streamId, st); }

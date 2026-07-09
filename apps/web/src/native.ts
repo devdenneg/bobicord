@@ -129,9 +129,9 @@ export async function stopNativeBroadcast(): Promise<void> {
 
 /** Стартует нативный relay-watch: Rust джойнится в дерево (viewer, native), ретранслирует
  *  детям и шлёт локальный offer в webview (событие relay-watch-offer). */
-export async function startNativeWatch(streamId: string, identity: string, serverId: string, maxChildren: number, quality: string = 'source'): Promise<void> {
+export async function startNativeWatch(streamId: string, identity: string, serverId: string, maxChildren: number, quality: string = 'source', pinned: boolean = false): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');
-  await invoke('start_watch', { streamId, wsUrl: treeWsUrl(), identity, serverId, maxChildren, quality });
+  await invoke('start_watch', { streamId, wsUrl: treeWsUrl(), identity, serverId, maxChildren, quality, pinned });
 }
 export async function stopNativeWatch(): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');

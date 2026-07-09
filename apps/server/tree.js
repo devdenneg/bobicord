@@ -93,6 +93,45 @@ function parseTreeKey(key) {
   return { streamId: key.slice(0, i), rendition: key.slice(i + 2) };
 }
 
+// Roadmap-flow-стриминга Д4: лестница рендишнов по требованию. Порядок сверху вниз (source
+// = passthrough вещателя, лучший; ниже — транскод-рендишны с падающим битрейтом/разрешением).
+// Пер-зрительский ABR двигает зрителя ВНИЗ (плохой линк) / ВВЕРХ (восстановление) на СОСЕДНИЙ
+// рунг этого массива, но только среди ДОСТУПНЫХ (лестница режется сверху по разрешению source).
+const RUNG_ORDER = ['source', '1080', '720', '480', '360'];
+// Высота рендишна (для «без апскейла»: рендишн доступен, только если его высота <= высоты source).
+const RENDITION_HEIGHT = { 1080: 1080, 720: 720, 480: 480, 360: 360 };
+// Дефолтный CBR-битрейт рендишна (бит/с) — совпадает с transcode.rs::rendition_default_bitrate.
+// Сервер шлёт агенту presetBitrate; агент при 0 берёт свой дефолт (страховка совместимости).
+const RENDITION_BITRATE = { 1080: 4_500_000, 720: 3_000_000, 480: 1_500_000, 360: 800_000 };
+// Состояния рендишна в реестре source-дерева.
+const RS_STARTING = 'starting'; // vrelay-rendition-start отправлен, ждём джойна рендишн-корня
+const RS_LIVE = 'live';         // рендишн-корень заджойнился в base::rendition, раздаёт
+const RS_STOPPING = 'stopping'; // vrelay-rendition-stop отправлен, дерево сносится
+// Гашение рендишна без потребителей: держим RENDITION_IDLE_MS, снимаем транскод. Тик и порог —
+// env-оверрайдабельны (ad-hoc-тест ускоряет гашение; прод-дефолт 30с/5с).
+const RENDITION_IDLE_MS = Number(process.env.TREE_RENDITION_IDLE_MS) || 30_000;
+const RENDITION_TICK_MS = Number(process.env.TREE_RENDITION_TICK_MS) || 5_000;
+
+// Пер-зрительский ABR (Д4): прямого ребёнка серверного узла (vrelay в source-дереве или
+// рендишн-корня в рендишн-дереве) с плохим линком переводим на рендишн НИЖЕ, с восстановившимся —
+// ВЫШЕ. Реюз EWMA-порогов source-ABR (ABR_LOSS_*, ABR_RTT_*, ABR_BAD_TICKS, STATS_TTL_MS) —
+// второй сглаживатель не заводим. Подъём медленнее спада (анти-болтанка), cooldown в диапазоне
+// роадмапа 15-30с.
+const ABR_GOOD_TICKS = 5;             // подряд «хороших» тиков до подъёма (спад — ABR_BAD_TICKS=2)
+const ABR_VIEWER_COOLDOWN_MS = 20_000; // гистерезис между переключениями качества одного зрителя
+
+// Доступная лестница рендишнов source-дерева с учётом «без апскейла». width/height вещателя
+// приходят в join (натив знает своё выходное разрешение). Нет данных (старый бандл) — НЕ режем
+// (ffmpeg всё равно не апскейлит: scale='min(W,iw)' — выдаст не больше source; риск лишь в
+// мисс-лейбле пункта меню). Всегда включает 'source'.
+function availableRungs(srcTree) {
+  const h = srcTree && srcTree.srcHeight ? srcTree.srcHeight : 0;
+  return RUNG_ORDER.filter((r) => r === DEFAULT_RENDITION || !h || RENDITION_HEIGHT[r] <= h);
+}
+function renditionAvailable(srcTree, rendition) {
+  return rendition === DEFAULT_RENDITION || availableRungs(srcTree).includes(rendition);
+}
+
 // Лог жизненного цикла дерева (join/leave/reparent/heartbeat/ABR/vrelay) в stdout →
 // docker compose logs token. Объём низкий (только события топологии, не stats/ice) —
 // всегда включён: прод-обрывы иначе недиагностируемы (раньше тут не было НИ ОДНОЙ строки).
@@ -407,6 +446,11 @@ class TreeManager {
   topology(streamId) {
     const t = this.trees.get(streamId);
     if (!t) return null;
+    // Д4: узел «серверный» (транскодер/раздатчик), если это vrelay (virtual) ИЛИ корень
+    // рендишн-дерева (broadcaster в base::rendition — это ffmpeg-рендишн-корень, virtual:false
+    // ради обхода self-loop в ensureVirtualAttached, но для UI это «через сервер»). Клиент по
+    // этому флагу решает, активно ли меню качества (родитель = сервер → активно).
+    const rendition = parseTreeKey(streamId).rendition;
     return [...t.nodes.values()].map((n) => ({
       id: n.id,
       identity: n.identity,
@@ -416,6 +460,7 @@ class TreeManager {
       capacity: this.capacityOf(n),
       native: !!n.native,
       virtual: !!n.virtual,
+      server: !!n.virtual || (n.id === t.broadcasterId && rendition !== DEFAULT_RENDITION),
       broadcaster: n.id === t.broadcasterId,
       availableOutgoing: n.availableOutgoing || 0,
       rtt: n.linkRtt || 0,
@@ -618,6 +663,176 @@ function attachTreeServer(httpServer, opts) {
     }
   }
 
+  // Д4: найти подключённого агента vrelay (control-сокет). null = фолбэк/транскод недоступен.
+  function findVrelayAgent() {
+    for (const ap of peers.values()) if (ap.isVrelayAgent && ap.ws.readyState === ap.ws.OPEN) return ap;
+    return null;
+  }
+
+  // Д4: доступная лестница рендишнов source-дерева (для stream-live.renditions[]).
+  function renditionsOf(baseSid) {
+    const srcTree = mgr.trees.get(treeKey(baseSid, DEFAULT_RENDITION));
+    return srcTree ? availableRungs(srcTree) : [DEFAULT_RENDITION];
+  }
+
+  // Д4: ленивый старт рендишна. Первый потребитель непустой/несуществующей рендишн →
+  // просим агента поднять транскод (vrelay-rendition-start) + шлём request-keyframe корню
+  // source (ffmpeg без IDR не начнёт декодировать — ЕДИНСТВЕННЫЙ легитимный keyframe-запрос
+  // из рендишн-контекста). Реестр живёт на source-дереве (оно «владеет» стримом). true =
+  // рендишн есть/поднимается; false = недоступен (нет source / апскейл / нет агента).
+  function ensureRendition(baseSid, rendition, preset) {
+    const srcTree = mgr.trees.get(treeKey(baseSid, DEFAULT_RENDITION));
+    if (!srcTree || !srcTree.broadcasterId) return false;
+    if (rendition === DEFAULT_RENDITION || !RENDITIONS.has(rendition)) return false;
+    if (!renditionAvailable(srcTree, rendition)) return false; // без апскейла
+    if (!srcTree.renditions) srcTree.renditions = new Map();
+    const now = Date.now();
+    const cur = srcTree.renditions.get(rendition);
+    if (cur && cur.state !== RS_STOPPING) { cur.lastConsumerAt = now; return true; }
+    const agent = findVrelayAgent();
+    if (!agent) { tlog(`[rendition] ${baseSid}::${rendition} нужен, но агент vrelay не подключён`); return false; }
+    const presetBitrate = preset || RENDITION_BITRATE[rendition] || 0;
+    srcTree.renditions.set(rendition, { state: RS_STARTING, lastConsumerAt: now, presetBitrate });
+    const bc = srcTree.nodes.get(srcTree.broadcasterId);
+    send(agent.id, { t: 'vrelay-rendition-start', streamId: baseSid, rendition, presetBitrate, serverId: bc ? bc.serverId : null });
+    send(srcTree.broadcasterId, { t: 'request-keyframe', streamId: baseSid }); // IDR для старта ffmpeg
+    tlog(`[rendition] ${baseSid}::${rendition} start -> агент ${agent.id} (preset ${Math.round(presetBitrate / 1000)} kbps)`);
+    return true;
+  }
+
+  // Д4: гашение рендишна (idle 30с без потребителей / отказ агента / уход source-вещателя):
+  // снимаем из реестра, просим агента убить ffmpeg+рендишн-корень (vrelay-rendition-stop),
+  // остаточным потребителям (если есть) шлём rendition-unavailable — упадут на source.
+  function teardownRendition(baseSid, rendition, reason) {
+    const srcTree = mgr.trees.get(treeKey(baseSid, DEFAULT_RENDITION));
+    const rkey = treeKey(baseSid, rendition);
+    const rtree = mgr.trees.get(rkey);
+    if (rtree) {
+      for (const nid of rtree.nodes.keys()) {
+        if (nid === rtree.broadcasterId) continue;
+        send(nid, { t: 'rendition-unavailable', streamId: baseSid, rendition, reason: reason || 'stopped' });
+      }
+    }
+    const agent = findVrelayAgent();
+    if (agent) send(agent.id, { t: 'vrelay-rendition-stop', streamId: baseSid, rendition });
+    if (srcTree && srcTree.renditions) srcTree.renditions.delete(rendition);
+    tlog(`[rendition] ${baseSid}::${rendition} stop (${reason || 'idle'})`);
+  }
+
+  // Д4: перевод зрителя МЕЖДУ рендишн-деревьями (деревья разные → leave из старого + join в
+  // новое; клиенту это assign-parent нового дерева, он пересоздаёт PC). Реюз менеджера:
+  // mgr.leave репарентит детей узла в СТАРОМ дереве (натив-relay), mgr.join сажает узел в
+  // новом (под рендишн-корень/vrelay или сиротой, пока корень поднимается). pinned=ручной
+  // выбор (авто-ABR его не трогает). Используется onSetQuality (ручной) и perViewerAbr (авто).
+  function moveNodeToRendition(baseSid, nodeId, targetRendition, opts) {
+    const p = peers.get(nodeId);
+    if (!p || !p.treeKey || p.role !== 'viewer') return false;
+    if (parseTreeKey(p.treeKey).streamId !== baseSid) return false;
+    const target = normRendition(targetRendition);
+    const srcTree = mgr.trees.get(treeKey(baseSid, DEFAULT_RENDITION));
+    if (!srcTree || !srcTree.broadcasterId) return false;
+    if (target !== DEFAULT_RENDITION) {
+      if (!renditionAvailable(srcTree, target)) { send(nodeId, { t: 'rendition-unavailable', streamId: baseSid, rendition: target, reason: 'no-upscale' }); return false; }
+      if (!ensureRendition(baseSid, target)) { send(nodeId, { t: 'rendition-unavailable', streamId: baseSid, rendition: target, reason: 'unavailable' }); return false; }
+    }
+    const oldKey = p.treeKey;
+    const newKey = treeKey(baseSid, target);
+    if (oldKey === newKey) { p.qualityPinned = !!opts.pinned; return true; }
+    const oldParentId = p.parent;
+    const { reparented } = mgr.leave(oldKey, nodeId);
+    if (oldParentId) send(oldParentId, { t: 'drop-peer', streamId: baseSid, peerId: nodeId });
+    reparented.forEach((child) => {
+      send(child.id, { t: 'assign-parent', streamId: baseSid, parentId: child.parent });
+      if (child.parent) send(child.parent, { t: 'assign-child', streamId: baseSid, childId: child.id });
+    });
+    p.parent = null; p.children = []; p.depth = 0; p.reparentCooldownUntil = 0;
+    p.rendition = target; p.treeKey = newKey; p.qualityPinned = !!opts.pinned;
+    const { parent } = mgr.join(newKey, p);
+    if (parent) {
+      send(nodeId, { t: 'assign-parent', streamId: baseSid, parentId: parent.id });
+      send(parent.id, { t: 'assign-child', streamId: baseSid, childId: nodeId });
+    } else {
+      send(nodeId, { t: 'assign-parent', streamId: baseSid, parentId: null }); // сирота: ждёт рендишн-корень
+    }
+    tlog(`[quality] ${p.identity} ${oldKey} -> ${newKey} (${opts.pinned ? 'pinned' : 'auto'})`);
+    broadcastTreeInfo(oldKey); broadcastTopology(oldKey); settleOrphans(oldKey);
+    broadcastTreeInfo(newKey); broadcastTopology(newKey); settleOrphans(newKey);
+    if (target !== DEFAULT_RENDITION && srcTree.renditions) { const e = srcTree.renditions.get(target); if (e) e.lastConsumerAt = Date.now(); }
+    return true;
+  }
+
+  // Д4: зритель просит сменить качество (ручной выбор в UI). rendition='auto' → снять pin +
+  // на source (авто-ABR дальше адаптирует). Иначе pin на выбранный рендишн. Валидацию/лестницу/
+  // ленивый старт делает moveNodeToRendition.
+  function onSetQuality(id, msg) {
+    const p = peers.get(id);
+    if (!p || !p.treeKey || p.role !== 'viewer') return;
+    const wantAuto = msg.rendition === 'auto';
+    const target = wantAuto ? DEFAULT_RENDITION : normRendition(msg.rendition);
+    moveNodeToRendition(p.streamId, id, target, { pinned: !wantAuto });
+  }
+
+  // Д4: агент не смог поднять рендишн (кап VRELAY_MAX_TRANSCODES / нет ingest / ffmpeg упал) —
+  // снимаем рендишн из реестра, потребителям rendition-unavailable (упадут на source).
+  function onVrelayRenditionFailed(id, msg) {
+    const p = peers.get(id);
+    if (!p || !p.isVrelayAgent) return;
+    const base = msg.streamId;
+    const rendition = normRendition(msg.rendition);
+    if (!base || rendition === DEFAULT_RENDITION) return;
+    tlog(`[rendition] ${base}::${rendition} FAILED от агента: ${msg.reason || ''}`);
+    teardownRendition(base, rendition, msg.reason || 'agent-failed');
+  }
+
+  // Д4: пер-зрительский ABR. Прямому ребёнку СЕРВЕРНОГО узла (vrelay в source / рендишн-корень)
+  // без пина и без детей (только листья — не рвём чужие поддеревья) с плохим линком → рендишн
+  // ниже; с восстановившимся → выше. Гистерезис (BAD/GOOD-тики) + cooldown. Двигаем на СОСЕДНИЙ
+  // доступный рунг. Стата берётся из stats родителя (vrelay/рендишн-корень репортят per-child
+  // loss/rtt). Собираем ходы, применяем после обхода (moveNodeToRendition мутирует деревья).
+  function perViewerAbr(now) {
+    const moves = [];
+    for (const [key, t] of mgr.trees) {
+      const { streamId: base, rendition: treeRend } = parseTreeKey(key);
+      const srcTree = mgr.trees.get(treeKey(base, DEFAULT_RENDITION));
+      if (!srcTree || !srcTree.serverFirst) continue; // ABR-лестница — только server-first
+      const rungs = availableRungs(srcTree);
+      const idx = rungs.indexOf(treeRend);
+      if (idx < 0) continue;
+      for (const node of t.nodes.values()) {
+        if (node.id === t.broadcasterId || node.qualityPinned) continue;
+        if (node.children && node.children.length) continue; // листья — не тащим поддерево
+        const parent = node.parent ? t.nodes.get(node.parent) : null;
+        if (!parent) continue;
+        const serverParent = parent.virtual || (parent.id === t.broadcasterId && treeRend !== DEFAULT_RENDITION);
+        if (!serverParent) continue; // под живым пиром качество структурно, менять нечего
+        if (!node.statsAt || now - node.statsAt > STATS_TTL_MS) { node.abrBad = 0; node.abrGood = 0; continue; }
+        const loss = node.linkLoss || 0, rtt = node.linkRtt || 0;
+        const bad = loss > ABR_LOSS_HI || rtt > ABR_RTT_HI;
+        const good = loss < ABR_LOSS_LO && rtt < ABR_RTT_LO;
+        if (bad) { node.abrBad = (node.abrBad || 0) + 1; node.abrGood = 0; }
+        else if (good) { node.abrGood = (node.abrGood || 0) + 1; node.abrBad = 0; }
+        else { node.abrBad = 0; node.abrGood = 0; }
+        if (node.reparentCooldownUntil && now < node.reparentCooldownUntil) continue;
+        let target = null;
+        if (node.abrBad >= ABR_BAD_TICKS && idx < rungs.length - 1) target = rungs[idx + 1];
+        else if (node.abrGood >= ABR_GOOD_TICKS && idx > 0) target = rungs[idx - 1];
+        if (target && target !== treeRend) {
+          node.abrBad = 0; node.abrGood = 0;
+          tlog(`[quality] ABR ${node.identity} ${treeRend}->${target} (loss=${(loss * 100).toFixed(1)}% rtt=${Math.round(rtt)}ms)`);
+          moves.push({ base, nodeId: node.id, target });
+        }
+      }
+    }
+    // moveNodeToRendition сбрасывает reparentCooldownUntil (свежее дерево) — cooldown против
+    // болтанки ставим ПОСЛЕ переезда, иначе следующий тик двигал бы узел снова.
+    for (const m of moves) {
+      if (moveNodeToRendition(m.base, m.nodeId, m.target, { pinned: false })) {
+        const p = peers.get(m.nodeId);
+        if (p) p.reparentCooldownUntil = Date.now() + ABR_VIEWER_COOLDOWN_MS;
+      }
+    }
+  }
+
   // Discovery-сокет (браузер/натив, никогда не joins) сообщает свой сервер здесь —
   // до этого сообщения бэклог живых стримов не шлём (см. wss.on('connection')).
   function onHello(id, msg) {
@@ -631,7 +846,7 @@ function attachTreeServer(httpServer, opts) {
       if (!t.broadcasterId) continue;
       if (parseTreeKey(key).rendition !== DEFAULT_RENDITION) continue;
       const bnode = t.nodes.get(t.broadcasterId);
-      if (bnode && bnode.serverId === node.serverId) send(id, { t: 'stream-live', streamId: bnode.streamId, identity: bnode.identity, initial: true, renditions: ['source'], appName: bnode.appName || null, appIcon: bnode.appIcon || null });
+      if (bnode && bnode.serverId === node.serverId) send(id, { t: 'stream-live', streamId: bnode.streamId, identity: bnode.identity, initial: true, renditions: renditionsOf(bnode.streamId), appName: bnode.appName || null, appIcon: bnode.appIcon || null });
     }
   }
 
@@ -671,8 +886,30 @@ function attachTreeServer(httpServer, opts) {
     // объявить себя «сервером» (получил бы приоритетный трафик и увидел бы vrelay-release).
     node.virtual = !!msg.virtual && node.ws.__uid === VRELAY_UID;
     node.vrelayPinned = false;
+    // Д4: ручной выбор качества (pin) переживает пересоздание watch-сокета (смена качества =
+    // unwatch+watch на клиенте): pin приходит в join нового дерева. Авто-ABR pinned не трогает.
+    node.qualityPinned = role === 'viewer' && !!msg.pinned;
+    node.abrBad = 0; node.abrGood = 0;
     node.parent = null; node.children = []; node.depth = 0;
     const { parent } = mgr.join(key, node);
+    // Д4: выходное разрешение вещателя (натив знает своё) — режем лестницу рендишнов сверху
+    // (без апскейла). Реестр рендишнов живёт на source-дереве. Нет width/height (старый бандл) —
+    // не режем (см. availableRungs).
+    if (role === 'broadcaster' && rendition === DEFAULT_RENDITION) {
+      const t = mgr.trees.get(key);
+      if (t) {
+        t.srcWidth = Number(msg.width) || 0;
+        t.srcHeight = Number(msg.height) || 0;
+        if (!t.renditions) t.renditions = new Map();
+      }
+    }
+    // Д4: рендишн-корень (broadcaster в base::rendition) заджойнился — помечаем рендишн live
+    // в реестре source-дерева (был starting с момента vrelay-rendition-start).
+    if (role === 'broadcaster' && rendition !== DEFAULT_RENDITION) {
+      const srcTree = mgr.trees.get(treeKey(streamId, DEFAULT_RENDITION));
+      const e = srcTree && srcTree.renditions && srcTree.renditions.get(rendition);
+      if (e) { e.state = RS_LIVE; tlog(`[rendition] ${streamId}::${rendition} live (корень заджойнился)`); }
+    }
     tlog(`[${key}] join ${id} ${role} identity=${node.identity} native=${node.native}${node.virtual ? ' VIRTUAL' : ''} cap=${mgr.capacityOf(node)} symNat=${node.symmetricNat} -> ${role === 'broadcaster' ? 'корень' : parent ? `parent ${parent.id} (depth ${node.depth})` : 'СИРОТА (нет кандидатов)'}`);
     if (parent) {
       if (parent.virtual) node.reparentCooldownUntil = Date.now() + DRAIN_COOLDOWN_MS;
@@ -721,11 +958,18 @@ function attachTreeServer(httpServer, opts) {
         }
       }
     }
+    // Д4: зритель заджойнился в рендишн-дерево (`base::rendition`) — ленивый старт транскода,
+    // если рендишн ещё не поднят. Зритель ждёт сиротой, пока рендишн-корень не заджойнится
+    // (settleOrphans досадит). Недоступен (нет source / апскейл / нет агента) → rendition-unavailable
+    // (клиент упадёт на source).
+    if (role === 'viewer' && rendition !== DEFAULT_RENDITION) {
+      if (!ensureRendition(streamId, rendition)) send(id, { t: 'rendition-unavailable', streamId, rendition, reason: 'unavailable' });
+    }
     // Discovery объявляет базовый streamId и ТОЛЬКО для source-дерева (рендишн-корень —
     // тоже role:broadcaster, но своего base::rendition-дерева, в discovery не светится:
-    // иначе дубль/мусор с identity вида `vrelay-480`). renditions[] — задел Д4.
+    // иначе дубль/мусор с identity вида `vrelay-480`). renditions[] — реальная лестница (Д4).
     if (role === 'broadcaster' && rendition === DEFAULT_RENDITION) {
-      broadcastToServer(node.serverId, { t: 'stream-live', streamId, identity: node.identity, initial: false, renditions: ['source'], appName: node.appName || null, appIcon: node.appIcon || null });
+      broadcastToServer(node.serverId, { t: 'stream-live', streamId, identity: node.identity, initial: false, renditions: renditionsOf(streamId), appName: node.appName || null, appIcon: node.appIcon || null });
     }
   }
 
@@ -875,24 +1119,17 @@ function attachTreeServer(httpServer, opts) {
     send(t.broadcasterId, { t: 'request-keyframe', streamId: p.streamId });
   }
 
-  // DEV-ТРИГГЕР Д2 (удаляется в Д8): шлём агенту vrelay команду поднять/погасить рендишн.
-  // Гейт DEV_RENDITION. streamId — базовый id живого стрима (ingest-сессия уже поднята Д1).
-  // msg: { t:'dev-rendition', streamId, rendition?='480', stop?, presetBitrate? }.
+  // DEV-ТРИГГЕР Д2 (удаляется в Д8): ручной подъём/гашение рендишна. Д4: адаптирован тонкой
+  // обёрткой над настоящим механизмом (ensureRendition/teardownRendition) — идёт через реестр
+  // рендишнов, не в обход него (иначе dev-старт не завёл бы запись реестра, а гашение по idle
+  // не сработало бы). Гейт DEV_RENDITION. msg: { t:'dev-rendition', streamId, rendition?='480', stop?, presetBitrate? }.
   function onDevRendition(id, msg) {
     if (!DEV_RENDITION) return;
     const streamId = msg.streamId;
     const rendition = typeof msg.rendition === 'string' ? msg.rendition : '480';
     if (!streamId) return;
-    let agent = null;
-    for (const p of peers.values()) if (p.isVrelayAgent && p.ws.readyState === p.ws.OPEN) { agent = p; break; }
-    if (!agent) { tlog(`[${streamId}] DEV-rendition: агент vrelay не подключён`); return; }
-    // Д3: source-дерево живого стрима под составным ключом. Агент поднимет рендишн-корень в
-    // дереве `streamId::rendition` (он джойнится base+quality=rendition — см. relay.rs).
-    const t = mgr.trees.get(treeKey(streamId, DEFAULT_RENDITION));
-    const bc = t && t.broadcasterId ? t.nodes.get(t.broadcasterId) : null;
-    const type = msg.stop ? 'vrelay-rendition-stop' : 'vrelay-rendition-start';
-    tlog(`[${streamId}] DEV-rendition ${type} rendition=${rendition} -> агент ${agent.id}`);
-    send(agent.id, { t: type, streamId, rendition, presetBitrate: Number(msg.presetBitrate) || 0, serverId: bc ? bc.serverId : (msg.serverId || null) });
+    if (msg.stop) { teardownRendition(streamId, rendition, 'dev-stop'); return; }
+    if (!ensureRendition(streamId, rendition, Number(msg.presetBitrate) || 0)) tlog(`[rendition] DEV ${streamId}::${rendition} не удалось поднять`);
   }
 
   // Д3: уход source-вещателя = смерть ВСЕХ рендишн-деревьев этого стрима (`base::*`, кроме
@@ -980,6 +1217,8 @@ function attachTreeServer(httpServer, opts) {
       else if (msg.t === 'request-reparent') onRequestReparent(id, msg);
       else if (msg.t === 'request-keyframe') onRequestKeyframe(id);
       else if (msg.t === 'vrelay-hello') onVrelayHello(id, msg);
+      else if (msg.t === 'set-quality') onSetQuality(id, msg);                       // Д4: ручной выбор качества
+      else if (msg.t === 'vrelay-rendition-failed') onVrelayRenditionFailed(id, msg); // Д4: агент не поднял рендишн
       else if (msg.t === 'dev-rendition') onDevRendition(id, msg); // DEV-ТРИГГЕР Д2 (гейт внутри)
     });
     // code 1006 = грязный обрыв TCP (без close-фрейма): краш клиента, потеря сети,
@@ -1001,8 +1240,32 @@ function attachTreeServer(httpServer, opts) {
         send(cmd.broadcasterId, { t: 'set-bitrate', streamId: parseTreeKey(key).streamId, bps: cmd.bitrate });
       }
     }
+    // Д4: пер-зрительский ABR — переводит прямых детей сервера между рендишн-деревьями по их
+    // личному линку (глобальный set-bitrate выше в server-first вырождается в линки корня;
+    // адаптация зрителей — здесь, чтобы один медленный зритель не тянул всех вниз).
+    perViewerAbr(Date.now());
   }, ABR_TICK_MS);
   abrTimer.unref?.(); // не держим процесс живым только ради ABR-тика
+
+  // Д4: гашение рендишнов без потребителей. Тик считает потребителей в каждом base::rendition
+  // (узлы кроме рендишн-корня, включая сирот, ждущих корень); есть потребители → освежаем
+  // lastConsumerAt, нет дольше RENDITION_IDLE_MS → teardownRendition (kill ffmpeg + снос дерева).
+  const renditionTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [key, t] of [...mgr.trees]) {
+      if (parseTreeKey(key).rendition !== DEFAULT_RENDITION) continue;
+      if (!t.renditions || !t.renditions.size) continue;
+      const base = parseTreeKey(key).streamId;
+      for (const [rendition, entry] of [...t.renditions]) {
+        const rtree = mgr.trees.get(treeKey(base, rendition));
+        let consumers = 0;
+        if (rtree) for (const n of rtree.nodes.values()) if (n.id !== rtree.broadcasterId) consumers++;
+        if (consumers > 0) { entry.lastConsumerAt = now; continue; }
+        if (now - entry.lastConsumerAt >= RENDITION_IDLE_MS) teardownRendition(base, rendition, 'idle');
+      }
+    }
+  }, RENDITION_TICK_MS);
+  renditionTimer.unref?.();
 
   // Э9: дренаж виртуала — живые пиры всегда предпочтительнее серверного фолбэка.
   // R1 (мягкий): <=1 ребёнка за тик на дерево уводим на живого кандидата (авто-reparent
@@ -1083,7 +1346,7 @@ function attachTreeServer(httpServer, opts) {
     return out;
   }
 
-  return { mgr, peers, wss, abrTimer, hbTimer, drainTimer, liveBroadcastersIn };
+  return { mgr, peers, wss, abrTimer, hbTimer, drainTimer, renditionTimer, liveBroadcastersIn };
 }
 
 module.exports = { attachTreeServer, TreeManager, MAX_DEPTH, NATIVE_CAPACITY, BROWSER_CAPACITY, treeKey, parseTreeKey };

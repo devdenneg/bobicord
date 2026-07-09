@@ -1155,6 +1155,7 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
   const [statsOn, setStatsOn] = useState(true);
   const [wOpen, setWOpen] = useState(false); // тач: «кто смотрит» по тапу
   const [treeOpen, setTreeOpen] = useState(false);
+  const [qualOpen, setQualOpen] = useState(false); // Д4: меню качества
   const [pickAnchor, setPickAnchor] = useState<DOMRect | null | undefined>(undefined);
   const sprayRef = useRef<HTMLButtonElement>(null);
   // контролы прячутся не только при уходе мыши с плитки (:hover в CSS), но и если мышь
@@ -1275,12 +1276,14 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
           </>
         ) : <span className="vb-lbl">🖥 Твоя трансляция</span>}
         <div className="vb-sp" />
+        {!isLocal ? <button className={'vb-btn' + (qualOpen ? ' active' : '')} data-tip="Качество" onClick={() => setQualOpen((v) => !v)}><Icon name="gear" sm /></button> : null}
         {!isLocal ? <button className={'vb-btn' + (treeOpen ? ' active' : '')} data-tip="Дерево трансляции — выбрать пира" onClick={() => setTreeOpen((v) => !v)}><Icon name="users" sm /></button> : null}
         <button className="vb-btn" data-tip="Картинка-в-картинке" onClick={togglePip}><Icon name="pip" sm /></button>
         <button className="vb-btn" data-tip="Во весь экран" onClick={toggleFs}><Icon name="fullscreen" sm /></button>
         {!isLocal ? <button className="vb-btn danger" data-tip="Закрыть трансляцию" onClick={() => E.closeWatch(identity)}><Icon name="close" sm /></button> : null}
       </div>
       {!isLocal && treeOpen ? <TreePeerPanel identity={identity} onClose={() => setTreeOpen(false)} /> : null}
+      {!isLocal && qualOpen ? <QualityMenu identity={identity} onClose={() => setQualOpen(false)} /> : null}
       <div className="statsbox">
         <button className="stats-toggle" data-tip={statsOn ? 'Скрыть статистику' : 'Показать статистику'} onClick={(e) => { e.stopPropagation(); setStatsOn((v) => !v); }}><Icon name="info" sm /></button>
         {statsOn && stats ? <div className="stats" dangerouslySetInnerHTML={{ __html: stats }} /> : null}
@@ -1355,6 +1358,41 @@ function TreePeerPanel({ identity, onClose }: { identity: string; onClose: () =>
           ? <button className="ghost" style={{ margin: '6px 0 0', width: '100%' }} onClick={() => E.requestReparent(identity, 'vrelay')}>🖥 Через сервер (fallback)</button>
           : null}
       </>}
+    </div>
+  );
+}
+
+// Д4: меню качества у зрителя (Авто / Source / 1080 / 720 / 480 / 360). Активно ТОЛЬКО когда
+// смотрим через сервер (родитель = vrelay/рендишн-корень, topology virtual|server). Под живым
+// пиром — задизейблено с подсказкой «качество наследуется от родителя». Пункты — из реальной
+// лестницы stream-live.renditions (не хардкод). Ключ — базовый identity (Д3-инвариант).
+function QualityMenu({ identity, onClose }: { identity: string; onClose: () => void }) {
+  useEngine(); // ре-рендер при смене топологии/качества
+  const E = getEngine()!;
+  const viaServer = E.isStreamViaServer(identity);
+  const mode = E.getStreamQualityMode(identity);
+  const renditions = E.getStreamRenditions(identity) || ['source'];
+  const label: Record<string, string> = { source: 'Исходное (source)', '1080': '1080p', '720': '720p', '480': '480p', '360': '360p' };
+  const items = ['auto', ...renditions];
+  return (
+    <div className="qualpanel" onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}
+      style={{ position: 'absolute', right: 8, bottom: 52, width: 220, background: 'rgba(20,22,28,.96)', border: '1px solid rgba(255,255,255,.1)', borderRadius: 10, padding: 10, zIndex: 5, color: '#fff', fontSize: 12 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+        <b>Качество</b>
+        <button className="vb-btn" onClick={onClose}><Icon name="close" sm /></button>
+      </div>
+      {!viaServer ? (
+        <div style={{ opacity: .6, lineHeight: 1.4 }}>Качество наследуется от родителя — выбор доступен только при просмотре через сервер.</div>
+      ) : items.map((it) => {
+        const active = mode === it;
+        return (
+          <button key={it} className="ghost" disabled={active}
+            style={{ margin: '2px 0', width: '100%', textAlign: 'left', fontWeight: active ? 700 : 400, color: active ? '#8fd3ff' : '#fff', opacity: 1 }}
+            onClick={() => { E.setStreamQuality(identity, it); onClose(); }}>
+            {it === 'auto' ? 'Авто' : (label[it] || `${it}p`)}{active ? ' ·' : ''}
+          </button>
+        );
+      })}
     </div>
   );
 }

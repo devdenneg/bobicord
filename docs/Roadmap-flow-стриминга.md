@@ -261,7 +261,7 @@
 
 ## Д4 — Рендишны по требованию + выбор качества у сервера + пер-зрительский ABR
 
-**Статус:** ⬜ не начат
+**Статус:** 🟡 код готов, компиляция/симуляция/ad-hoc-тесты зелёные; живой e2e/латентность на VPS не проверены
 **Цель / механизмы ТЗ:** лестница 1080/720/480(/360) по требованию; апскейла нет; гашение 30 с; выбор качества (ABR/ручной) ТОЛЬКО при подключении к серверу; source = passthrough.
 
 **Работы:**
@@ -274,11 +274,78 @@
 **Риски:** CPU-кап на одновременные ffmpeg (отказ «рендишн недоступен»); болтанка авто-ABR (мин. интервал переключений); два источника правды о детях vrelay — сервер главный, агент подчиняется.
 
 ### Выполнено:
-- —
+- **`apps/server/tree.js` — реестр рендишнов + лестница + ABR.** `RUNG_ORDER`, `RENDITION_HEIGHT`,
+  `RENDITION_BITRATE`, состояния `RS_STARTING/LIVE/STOPPING`. Реестр `t.renditions =
+  Map<rendition,{state,lastConsumerAt,presetBitrate}>` на source-дереве. **Без апскейла:** вещатель
+  шлёт `width/height` в join (натив — `max_width/max_height`); `availableRungs`/`renditionAvailable`
+  режут лестницу сверху по высоте source (нет данных = не режем, ffmpeg всё равно не апскейлит).
+  **Ленивый старт** `ensureRendition`: первый потребитель непустого рендишна → `vrelay-rendition-start`
+  агенту + `request-keyframe` корню source (ffmpeg без IDR не декодирует). **Гашение** `renditionTimer`
+  (5с тик, `.unref()`): 30с без потребителей → `teardownRendition` (`vrelay-rendition-stop`). **`set-quality`**
+  → `onSetQuality` → `moveNodeToRendition` (leave старого дерева + join нового = assign-parent, клиент
+  пересоздаёт PC; `pinned=true`). **Пер-зрительский ABR** `perViewerAbr` (в `abrTimer`): прямому
+  ЛИСТУ серверного узла (vrelay/рендишн-корень) без пина по личному loss/rtt — вниз (`ABR_BAD_TICKS=2`)
+  / вверх (`ABR_GOOD_TICKS=5`, медленнее — анти-болтанка) на соседний рунг; cooldown `ABR_VIEWER_COOLDOWN_MS=20с`;
+  реюз `ABR_LOSS_*`/`ABR_RTT_*`/`STATS_TTL_MS`. `stream-live.renditions[]` = реальная лестница (`renditionsOf`).
+  `onVrelayRenditionFailed` (агент→сервер): снятие рендишна + `rendition-unavailable` потребителям.
+  `topology()` +флаг `server` (vrelay ИЛИ рендишн-корень) — клиент по нему включает меню качества.
+  DEV-триггер `dev-rendition` адаптирован тонкой обёрткой над `ensureRendition`/`teardownRendition`.
+- **vrelay (`apps/relay/src/main.rs` + `relay-core`).** Локальный канал ingest→рендишн (Д2) подтверждён:
+  `rendition_start` реюзает ingest-сессию как источник транскода (второго upstream к вещателю нет),
+  дедуп по `streamId::rendition` (второй зритель НЕ порождает второй ffmpeg). `rendition_start` теперь
+  `Result` — при отказе (кап `VRELAY_MAX_TRANSCODES`/нет ingest/ffmpeg) агент шлёт серверу
+  `vrelay-rendition-failed`. Рендишн-корень (`start_rendition_root`) теперь репортит per-child loss/rtt
+  (`TreeCmd::Stats`) — иначе ABR не оценил бы зрителей рендишн-деревьев (подъём вверх невозможен).
+  `JoinParams`/`RelayConfig` +`width`/`height`/`pinned`; натив-вещатель шлёт своё разрешение, натив-зритель
+  — pin. `start_watch` (lib.rs) +`pinned`.
+- **Web.** `treeVideo.ts`: `watch(streamId, quality, pinned)`, `WatchState/NativeWatchState.pinned`,
+  join несёт `pinned`; `setQuality(streamId, mode)` = unwatch+watch (ключ — базовый streamId); `getQualityMode`
+  (pinned→рендишн, иначе 'auto'); `rendition-unavailable` → колбэк. `native.ts::startNativeWatch(...,pinned)`.
+  `videoTransport.ts`: `TreeNode.server`, методы `setQuality`/`getQualityMode`/`onRenditionUnavailable`.
+  `engine.ts`: `setStreamQuality`/`getStreamQualityMode`/`getStreamRenditions`/`isStreamViaServer`;
+  `onRenditionUnavailable` → тост + фолбэк на source. `ServerView.tsx`: `QualityMenu` (кнопка-шестерёнка
+  в vbar) — Авто/Source/1080/720/480/360 из реальной лестницы, активно ТОЛЬКО при `isStreamViaServer`
+  (родитель = сервер), под живым пиром — подсказка «качество наследуется от родителя».
+- **Верификация:** `node --check tree.js` OK; `node tree-sim.js` зелёный (reparent 63мс); `cargo check`
+  relay-core/relay/native + `cargo check --examples` relay-core — все EXIT 0; web `tsc --noEmit` EXIT 0.
+  Cargo.lock натива откачен (пре-дрейф, синк в CI). **Ad-hoc ws-тест 16/16 PASS:** (a) join 480 →
+  `vrelay-rendition-start`+`request-keyframe` корню; (b) второй зритель 480 → второго старта НЕТ;
+  (c) уход обоих → через idle `vrelay-rendition-stop` (720 при живом зрителе не гасится); (d) `set-quality`
+  переводит зрителя source→720; (e) source 720p → рендишн 1080 отклонён (`rendition-unavailable`);
+  (f) join без quality → source, parent=vrelay; +лестница в `stream-live.renditions` (streamB без 1080).
+
 ### Проблемы:
-- —
+- Живьём (реальный транскод/латентность/CPU/e2e <2с) не проверить: нет VPS/вещателя/ffmpeg локально.
+  Латентность рендишнов и «часы в кадре» на каждом рунге — блокирующий AC на пользователе (см. Д2 шаги).
+- **Натив + `rendition-unavailable`:** Rust не парсит это сообщение (нет IPC-проброса в webview), поэтому
+  нативный зритель при отказе рендишна упадёт не мгновенным тостом, а через orphan-exit (~20с) → ре-watch.
+  Смягчено тем, что UI показывает ТОЛЬКО доступные рендишны (лестница из stream-live), так что
+  ladder-отказ у клиента не случается — остаётся лишь агентов CPU-cap (редко). Проброс в натив — задел.
+- **Натив-зритель под server-ABR-move:** сервер двигает узел между деревьями через assign-parent (Rust
+  следует на медиа-уровне, IPC не нужен), но webview-лейбл качества остаётся 'auto' (реальный рендишн
+  прозрачен) — приемлемо (в режиме Авто меню и так показывает «Авто»). На WS-реконнекте (деплой) Rust
+  реджойнится со своим исходным quality (source) → вернётся в source-дерево; ABR переадаптирует. Отмечено.
+
 ### Решения:
-- —
+- **Смена качества = client-driven unwatch+watch** (браузер И натив, единообразно, реюз Д3, ноль нового
+  натив-plumbing; роадмап «на клиенте это unwatch+watch»). pin переживает пересоздание сокета через поле
+  `pinned` в join. `set-quality` реализован серверным хендлером (server-move через `moveNodeToRendition`,
+  общий с ABR) для протокола + ad-hoc-теста (AC d). Пер-зрительский ABR — **server-move** (leave+join
+  на сервере, assign-parent): и браузер, и натив следуют на медиа-уровне без клиентского сообщения.
+- **Меню качества активно по ТОПОЛОГИИ, не по хранимому quality:** узел «серверный» (`server` в topology)
+  если это vrelay ИЛИ корень рендишн-дерева (broadcaster в `base::rendition`). Так после server-ABR-move
+  браузера меню остаётся корректным (хранимый quality мог протухнуть). Подсветка выбранного пункта — по
+  `getQualityMode` (pinned→рендишн; auto→«Авто», реальный рендишн прозрачен, авто-двиг сервером не мешает).
+- **Рендишн-корень репортит per-child stats.** Иначе зрители рендишн-деревьев без loss/rtt — ABR не смог
+  бы поднять их обратно вверх при восстановлении линка (роадмап «подъём вверх с гистерезисом»).
+- **ABR только для ЛИСТЬЕВ под серверным узлом** (childless): не рвём чужие поддеревья (натив-relay с детьми
+  не двигаем). В server-first `reparentCooldownUntil` у таких узлов свободен (drainTimer пропускает
+  server-first) — реюзаем его под ABR-cooldown без конфликта.
+- **`request-keyframe` из рендишн-контекста — ЕДИНСТВЕННО легитимный** (`ensureRendition` шлёт корню source),
+  как требует роадмап («keyframe пер-рендишн»); дальше рендишн держит GOP ffmpeg (2с).
+- **Измеримость (замер D):** переключения качества и старт/стоп рендишнов логируются едиными grep-префиксами
+  `[quality]` (смена/ABR) и `[rendition]` (start/live/stop/failed) с identity и loss/rtt — снять e2e-часы
+  на VPS по ним.
 
 ---
 

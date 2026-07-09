@@ -18,6 +18,7 @@ async fn main() {
         max_children: 2,
         virtual_relay: false,
         quality: "source".into(),
+        pinned: false,
         available_outgoing: 8_000_000,
         idle_exit: None,
         reconnect: true,

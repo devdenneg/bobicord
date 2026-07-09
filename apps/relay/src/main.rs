@@ -98,7 +98,13 @@ async fn run_control(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditions)
                     let server_id = v.get("serverId").and_then(|x| x.as_str()).unwrap_or("").to_string();
                     if msg_t == Some("vrelay-rendition-start") {
                         let bitrate = v.get("presetBitrate").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-                        rendition_start(cfg, streams, renditions, stream_id, &rendition, bitrate, server_id).await;
+                        // Д4: отказ (кап VRELAY_MAX_TRANSCODES / нет ingest / ffmpeg не поднялся) —
+                        // сообщаем серверу vrelay-rendition-failed, тот снимет рендишн и скажет
+                        // зрителям (сервер главный, агент подчиняется).
+                        if let Err(reason) = rendition_start(cfg, streams, renditions, stream_id, &rendition, bitrate, server_id).await {
+                            let failed = json!({ "t": "vrelay-rendition-failed", "streamId": stream_id, "rendition": rendition, "reason": reason });
+                            let _ = write.send(Message::Text(failed.to_string().into())).await;
+                        }
                     } else {
                         rendition_stop(streams, renditions, stream_id, &rendition).await;
                     }
@@ -144,6 +150,7 @@ async fn activate(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditions, st
         max_children: cfg.max_children,
         virtual_relay: true,
         quality: "source".into(), // Д3: vrelay-ingest садится в source-дерево (`::source`)
+        pinned: false,
         available_outgoing: cfg.available_outgoing,
         // Д1 ingest: постоянный узел не гаснет по простою — только по vrelay-release/stream-end
         // (уход вещателя). Э9 activate: гаснет по idle, агент переактивируется.
@@ -173,23 +180,25 @@ async fn activate(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditions, st
     });
 }
 
-/// Д2 (dev): поднимает транскод-рендишн на активной ingest-сессии + отдельный рендишн-корень,
-/// раздающий его зрителям в дереве `streamId::rendition`. Дедуп по ключу.
-async fn rendition_start(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditions, stream_id: &str, rendition: &str, bitrate: u32, server_id: String) {
+/// Д4: поднимает транскод-рендишн на активной ingest-сессии (ЛОКАЛЬНЫЙ канал: транскод читает
+/// видео-RTP уже принятой ingest-сессии, второго upstream к вещателю нет) + отдельный
+/// рендишн-корень, раздающий его зрителям в дереве `streamId::rendition`. Дедуп по ключу
+/// (второй зритель того же рендишна НЕ порождает второй ffmpeg). Err = отказ (кап/нет ingest).
+async fn rendition_start(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditions, stream_id: &str, rendition: &str, bitrate: u32, server_id: String) -> Result<(), String> {
     let key = format!("{stream_id}::{rendition}");
     if renditions.lock().await.contains_key(&key) {
-        log::info!("rendition {key}: уже поднят");
-        return;
+        log::info!("rendition {key}: уже поднят"); // дедуп: второй зритель НЕ порождает второй ffmpeg
+        return Ok(());
     }
     let ingest = streams.lock().await.get(stream_id).cloned();
     let Some(ingest) = ingest else {
         log::warn!("rendition {key}: нет активной ingest-сессии для {stream_id} — рендишн невозможен");
-        return;
+        return Err("no-ingest".into());
     };
     let bitrate = if bitrate > 0 { bitrate } else { transcode::rendition_default_bitrate(rendition) };
     let (video, audio) = match ingest.start_rendition(rendition.to_string(), bitrate).await {
         Ok(t) => t,
-        Err(e) => { log::warn!("rendition {key}: транскод не поднялся: {e}"); return; }
+        Err(e) => { log::warn!("rendition {key}: транскод не поднялся: {e}"); return Err(e); }
     };
     let root = relay::start_rendition_root(RelayConfig {
         // Д3: составной ключ дерева формирует СЕРВЕР из base streamId + quality. Раньше (Д2) клеили
@@ -202,9 +211,10 @@ async fn rendition_start(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditi
         server_id,
         max_children: cfg.max_children,
         virtual_relay: false, // рендишн-корень = обычный натив-broadcaster (см. start_rendition_root)
+        pinned: false,
         available_outgoing: cfg.available_outgoing,
         idle_exit: None,
-        reconnect: false, // dev-рендишн эфемерен: гасится вручную/вслед за ingest
+        reconnect: false, // рендишн-корень эфемерен: гасится вручную/вслед за ingest
     }, video, audio);
     let fin = root.finished();
     renditions.lock().await.insert(key.clone(), root);
@@ -221,9 +231,10 @@ async fn rendition_start(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditi
             log::info!("rendition {key2}: рендишн-корень завершён — транскод снят");
         }
     });
+    Ok(())
 }
 
-/// Д2 (dev): гасит рендишн-корень + его транскод на ingest-сессии.
+/// Д4: гасит рендишн-корень + его транскод на ingest-сессии (по vrelay-rendition-stop).
 async fn rendition_stop(streams: &Streams, renditions: &Renditions, stream_id: &str, rendition: &str) {
     let key = format!("{stream_id}::{rendition}");
     if let Some(h) = renditions.lock().await.remove(&key) {

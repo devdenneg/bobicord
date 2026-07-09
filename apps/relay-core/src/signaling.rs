@@ -68,6 +68,13 @@ pub struct JoinParams {
     pub app_name: Option<String>,
     /// Иконка приложения: PNG 32×32 base64 (без data-URI-префикса), 1-3 КБ.
     pub app_icon: Option<String>,
+    /// Д4: выходное разрешение вещателя (натив знает своё) — сервер режет лестницу рендишнов
+    /// сверху (без апскейла). Только broadcaster source-дерева; viewer/vrelay/рендишн-корень — 0.
+    pub width: u32,
+    pub height: u32,
+    /// Д4: зритель закрепил (pin) качество вручную — авто-ABR его не трогает. Переживает
+    /// пересоздание watch-сокета (смена качества = unwatch+watch). broadcaster/vrelay — false.
+    pub pinned: bool,
 }
 
 const RECONNECT_BACKOFF_MAX_SEC: u64 = 15; // деплой рестартит сервер за секунды — догоняем быстро
@@ -118,6 +125,9 @@ pub fn connect(ws_url: String, join: JoinParams, reconnect: bool) -> (mpsc::Unbo
             "serverId": join.server_id,
             "appName": join.app_name,
             "appIcon": join.app_icon,
+            "width": join.width,
+            "height": join.height,
+            "pinned": join.pinned,
         });
 
         let mut connects = 0u32; // сколько раз успешно джойнились (>=1 => дальше Rejoined)

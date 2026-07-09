@@ -62,6 +62,9 @@ pub struct RelayConfig {
     /// Д3: рендишн-дерево (`streamId::quality`). viewer/vrelay-ingest — "source"; рендишн-корень
     /// (start_rendition_root) — имя рендишна ("480" и т.п.), тогда его дерево = `stream_id::quality`.
     pub quality: String,
+    /// Д4: зритель закрепил качество вручную (pin) — авто-ABR его не трогает. viewer-only;
+    /// vrelay-ingest/рендишн-корень — false.
+    pub pinned: bool,
     /// Что репортить серверу как availableOutgoing в stats (скоринг best-peer).
     pub available_outgoing: u32,
     /// Some(d): выйти из дерева, если нет живых детей дольше d (headless-агент). Живость —
@@ -566,12 +569,12 @@ impl RelayManager {
 /// локальный показ (только при ui=Some), ретранслирует детям. Возвращает RelayHandle для
 /// управления (сигналинг webview из JS, стоп, ожидание завершения).
 pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
-    let RelayConfig { stream_id, ws_url, identity, server_id, max_children, virtual_relay, quality, available_outgoing, idle_exit, reconnect } = cfg;
+    let RelayConfig { stream_id, ws_url, identity, server_id, max_children, virtual_relay, quality, pinned, available_outgoing, idle_exit, reconnect } = cfg;
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<RelayControl>();
     let finished = Arc::new(Notify::new());
     let fin = finished.clone();
 
-    let join = JoinParams { stream_id: stream_id.clone(), identity, server_id, role: "viewer", native: true, max_children, max_bitrate: 0, abr: false, virtual_relay, quality, server_ingest: false, app_name: None, app_icon: None };
+    let join = JoinParams { stream_id: stream_id.clone(), identity, server_id, role: "viewer", native: true, max_children, max_bitrate: 0, abr: false, virtual_relay, quality, server_ingest: false, app_name: None, app_icon: None, width: 0, height: 0, pinned };
     let (cmd_tx, mut evt_rx) = signaling::connect(ws_url, join, reconnect);
 
     tokio::spawn(async move {
@@ -715,7 +718,7 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
 /// родителя/webview/ABR/watchdog — только фанаут детям. Полноценные рендишн-деревья с
 /// реестром/гашением — Д3/Д4; здесь минимум, чтобы глазами увидеть транскод-картинку.
 pub fn start_rendition_root(cfg: RelayConfig, video: Arc<TrackLocalStaticRTP>, audio: Arc<TrackLocalStaticRTP>) -> RelayHandle {
-    let RelayConfig { stream_id, ws_url, identity, server_id, max_children, virtual_relay, quality, available_outgoing: _, idle_exit: _, reconnect } = cfg;
+    let RelayConfig { stream_id, ws_url, identity, server_id, max_children, virtual_relay, quality, pinned: _, available_outgoing: _, idle_exit: _, reconnect } = cfg;
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<RelayControl>();
     let finished = Arc::new(Notify::new());
     let fin = finished.clone();
@@ -727,7 +730,7 @@ pub fn start_rendition_root(cfg: RelayConfig, video: Arc<TrackLocalStaticRTP>, a
     // всей virtual-логики (ensureVirtualAttached/drainTimer/findVirtual). virtual_relay из cfg
     // игнорируем осознанно.
     let _ = virtual_relay;
-    let join = JoinParams { stream_id: stream_id.clone(), identity, server_id, role: "broadcaster", native: true, max_children, max_bitrate: 0, abr: false, virtual_relay: false, quality, server_ingest: false, app_name: None, app_icon: None };
+    let join = JoinParams { stream_id: stream_id.clone(), identity, server_id, role: "broadcaster", native: true, max_children, max_bitrate: 0, abr: false, virtual_relay: false, quality, server_ingest: false, app_name: None, app_icon: None, width: 0, height: 0, pinned: false };
     let (cmd_tx, mut evt_rx) = signaling::connect(ws_url, join, reconnect);
 
     tokio::spawn(async move {
@@ -763,7 +766,19 @@ pub fn start_rendition_root(cfg: RelayConfig, video: Arc<TrackLocalStaticRTP>, a
                         _ => {} // рендишн-корню прочие ctrl не адресованы
                     }
                 }
-                _ = stats_tick.tick() => { mgr.sweep_dead_children().await; }
+                _ = stats_tick.tick() => {
+                    mgr.sweep_dead_children().await;
+                    // Д4: рендишн-корень репортит per-child loss/rtt — сервер по ним ведёт
+                    // пер-зрительский ABR для зрителей в рендишн-деревьях (подъём вверх при
+                    // восстановлении линка требует свежей статы и здесь, не только в source).
+                    let mut to_child: Vec<Value> = Vec::with_capacity(mgr.children.len());
+                    for (id, pc) in &mgr.children {
+                        if let Some((loss, rtt)) = read_link_stats(pc).await {
+                            to_child.push(json!({ "id": id, "bitrate": 0, "rtt": rtt, "loss": loss }));
+                        }
+                    }
+                    let _ = mgr.cmd_tx.send(TreeCmd::Stats { to_child, available_outgoing: 0 });
+                }
             }
         }
         let _ = mgr.cmd_tx.send(TreeCmd::Leave);

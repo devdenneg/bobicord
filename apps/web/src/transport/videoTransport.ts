@@ -62,6 +62,8 @@ export interface TreeNode {
   native: boolean;
   /** Э9: виртуальный серверный fallback-relay (vrelay). */
   virtual?: boolean;
+  /** Д4: «серверный» узел (vrelay ИЛИ рендишн-корень) — родитель=сервер → меню качества активно. */
+  server?: boolean;
   broadcaster: boolean;
   availableOutgoing: number;
   rtt: number;
@@ -92,10 +94,18 @@ export interface VideoTransport {
   getScreenStats(streamId: string): Promise<string | null>;
 
   /** Д3: `quality` выбирает рендишн-дерево (`streamId::quality`). Дефолт 'source' —
-   *  поведение неотличимо от «до». Смена качества = unwatch+watch (Д4 добавит UI). LiveKit
-   *  игнорирует quality (SFU-путь, деревьев нет). */
-  watch(streamId: string, quality?: string): void;
+   *  поведение неотличимо от «до». Д4: `pinned` — ручной выбор (авто-ABR не трогает). Смена
+   *  качества = unwatch+watch. LiveKit игнорирует quality (SFU-путь, деревьев нет). */
+  watch(streamId: string, quality?: string, pinned?: boolean): void;
   unwatch(streamId: string): void;
+
+  /** Д4: сменить качество зрителя (меню Авто/Source/1080/720/480/360). mode='auto' — снять
+   *  pin, сервер адаптирует; иначе pin на рендишн. Реализовано как unwatch+watch. Только tree. */
+  setQuality?(streamId: string, mode: string): void;
+  /** Д4: текущий режим качества зрителя ('auto' | 'source' | '1080'|...). LiveKit — undefined. */
+  getQualityMode?(streamId: string): string | null;
+  /** Д4: рендишн недоступен (агент отказал/кап/апскейл) — reason для тоста + фолбэк на source. */
+  onRenditionUnavailable?(cb: (streamId: string, rendition: string, reason: string) => void): () => void;
 
   /** Только TreeVideoTransport (Э2.1) — позиция в дереве и живая RTP-статистика
    *  для дебаг-панели зрителя. LiveKit-транспорт их не реализует (там SFU, нет дерева). */
@@ -113,7 +123,7 @@ export interface VideoTransport {
 
   /** Только TreeVideoTransport — метаданные приложения вещателя (иконка/имя окна из
    *  stream-live). LiveKit не реализует: getDisplayMedia метаданных не даёт. */
-  getStreamMeta?(identity: string): { appName?: string; appIcon?: string } | null;
+  getStreamMeta?(identity: string): { appName?: string; appIcon?: string; renditions?: string[] } | null;
 
   getVideoTrack(key: string): LocalVideoTrack | RemoteTrack | MediaStreamVideoHandle | undefined;
   getStreams(): StreamInfo[];

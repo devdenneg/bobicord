@@ -191,6 +191,7 @@ async fn start_watch(
   server_id: String,
   max_children: Option<u32>,
   quality: Option<String>,
+  pinned: Option<bool>,
 ) -> Result<(), String> {
   let mut slot = state.0.lock().await;
   if let Some(old) = slot.take() { old.stop(); }
@@ -207,6 +208,8 @@ async fn start_watch(
     // Д3: рендишн, который смотрит зритель (`streamId::quality`). Дефолт "source" — старый
     // JS-бандл без поля = source (обратная совместимость).
     quality: quality.unwrap_or_else(|| "source".into()),
+    // Д4: ручной выбор качества (pin) — сервер не двигает такого зрителя авто-ABR.
+    pinned: pinned.unwrap_or(false),
     available_outgoing: 8_000_000,
     idle_exit: None, // натив смотрит стрим сам — уходим только по Stop
     reconnect: true, // рестарт сервера (деплой) не рвёт просмотр
