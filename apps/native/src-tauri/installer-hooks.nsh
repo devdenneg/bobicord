@@ -17,6 +17,11 @@
   CreateShortcut "$DESKTOP\Рилэй.lnk" "$INSTDIR\RelayApp.exe" "" "$0" 0
   CreateShortcut "$SMPROGRAMS\Рилэй.lnk" "$INSTDIR\RelayApp.exe" "" "$0" 0
   Pop $0
+  ; Запись в «Установленные приложения» (реестр Uninstall) Tauri пишет DisplayName=productName="RelayApp".
+  ; exe/папку/GUID/updater оставляем на RelayApp (не рвём цепочку обновлений), но ИМЯ в Параметрах Windows
+  ; переименовываем в бренд «Рилэй» — иначе юзер видит «Рилэй» в Пуске и «RelayApp» в Параметрах = «два приложения».
+  ; SHCTX + ${UNINSTKEY} — стандартные define'ы шаблона Tauri v2 (доступны в этой точке, после записи ключа).
+  WriteRegStr SHCTX "${UNINSTKEY}" "DisplayName" "Рилэй"
   System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)'
   nsExec::Exec '"$SYSDIR\ie4uinit.exe" -show'
 !macroend
