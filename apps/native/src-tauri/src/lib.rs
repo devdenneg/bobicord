@@ -2,6 +2,7 @@
 // pub — нужен examples/broadcast_smoke.rs (e2e-смоук без Tauri/webview/UI).
 pub mod broadcast;
 mod branding;
+pub mod diag;
 mod hotkeys;
 
 use tokio::sync::Mutex;
@@ -164,6 +165,8 @@ async fn start_broadcast(
       old.stop().await;
     }
   }
+  // Лог этой сессии — с нуля: хвост предыдущей только раздувает выгрузку на сервер.
+  diag::reset();
   let auto = auto_bitrate.unwrap_or(true);
   // Д5: лестница качества (смена fps/разрешения на set-bitrate) — ТОЛЬКО в ручном авто-битрейте.
   // Пресет-режимы ('smooth'/'quality') и server-first+CBR гасят её: адаптация зрителей идёт
@@ -205,6 +208,7 @@ async fn start_watch(
 ) -> Result<(), String> {
   let mut slot = state.0.lock().await;
   if let Some(old) = slot.take() { old.stop(); }
+  diag::reset(); // см. start_broadcast
   // UiSink: relay-ядро (relay-core) не знает про Tauri — события webview (relay-watch-offer/
   // -ice, relay-topology) уходят через колбэк-обёртку над app.emit.
   let ui: broadcast::relay::UiSink = {
@@ -333,16 +337,26 @@ pub fn run() {
       // Теперь плагин всегда активен — пишет в app_log_dir (см. tauri::path::app_log_dir,
       // обычно %LOCALAPPDATA%\com.relayapp.desktop\logs\*.log) плюс stdout, если запущен
       // из консоли.
+      // Дефолт плагина — 40 КБ на файл + RotationStrategy::KeepOne: это ~3 минуты
+      // вещания, после чего предыдущий кусок ВЫБРАСЫВАЕТСЯ. Разбор лагов захвата под
+      // игрой (строки `capture:`/`timing:` раз в 2с) требует всей сессии, а не её
+      // последних минут — интересное как раз в начале, когда игра стартовала.
+      // 5 МБ + KeepAll: сессия целиком, старые файлы остаются рядом.
       app.handle().plugin(
         tauri_plugin_log::Builder::default()
           .level(log::LevelFilter::Info)
+          .max_file_size(5_000_000)
+          .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
+          // Дублируем те же строки в кольцевой буфер сессии (diag.rs): фронтенд сдаёт
+          // их на сервер по окончании стрима/просмотра. Дефолтные Stdout/LogDir остаются.
+          .target(diag::log_target())
           .build(),
       )?;
       // Самолечение ярлыков (см. branding.rs) — на отдельном потоке, не блокируя старт окна.
       std::thread::spawn(branding::fix_shortcuts);
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![ping, list_monitors, list_windows, detect_game, set_detectable_games, start_broadcast, set_broadcast_source, stop_broadcast, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys, open_file, reveal_in_folder, paths_exist])
+    .invoke_handler(tauri::generate_handler![ping, list_monitors, list_windows, detect_game, set_detectable_games, start_broadcast, set_broadcast_source, stop_broadcast, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys, open_file, reveal_in_folder, paths_exist, diag::diag_take_log])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }

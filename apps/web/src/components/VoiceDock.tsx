@@ -5,6 +5,7 @@ import { useEngine } from '../hooks';
 import { Icon } from '../Icon';
 import { getSettings, setSettings } from '../settings';
 import { isTauri, onBroadcastStopped, stopNativeBroadcast } from '../native';
+import { endAnyBroadcasterSession } from '../diag';
 
 /* Вещание — только из нативного клиента (CLAUDE.md инвариант 2). Конфиг/статистика — в BroadcastModal. */
 function NativeBroadcastButton() {
@@ -15,7 +16,9 @@ function NativeBroadcastButton() {
     onBroadcastStopped((info) => {
       useStore.getState().setBroadcastLive(false);
       if (info.reason) useStore.getState().toast('Трансляция остановлена: ' + info.reason, 'err');
-      stopNativeBroadcast().catch(() => {});
+      // Трансляция умерла сама — самый интересный случай для разбора: сдаём лог сессии,
+      // где причина (`reason`) уже записана строками энкодера/захвата.
+      stopNativeBroadcast().catch(() => {}).finally(() => endAnyBroadcasterSession());
     }).then((u) => (unlisten = u));
     return () => unlisten?.();
   }, []);

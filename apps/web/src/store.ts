@@ -8,6 +8,7 @@ import { ensurePushSubscribed, unsubscribePush } from './push';
 import { connectNotifyWs, disconnectNotifyWs } from './notifyws';
 import { preloadSounds } from './sounds';
 import { isTauri, stopNativeBroadcast } from './native';
+import { endAnyBroadcasterSession, flushPendingDiag } from './diag';
 import type { User, ServerSummary, Member, ServerDetail, Toast, ToastKind } from './types';
 
 let engine: Engine | null = null;
@@ -176,6 +177,10 @@ export const useStore = create<AppState>((set, get) => ({
   setEmoteSize: (s) => { localStorage.setItem('emoteSize', s); set({ emoteSize: s }); },
 
   afterAuth: async (user) => {
+    // Досылаем диаг-сессии, не ушедшие в прошлый раз (сеть моргнула / апп закрыли на
+    // остановке стрима). Именно здесь: токен уже есть, иначе сервер вернул бы 401 и
+    // очередь очистилась бы впустую. Фоном — стартовать приложение это не задерживает.
+    flushPendingDiag().catch(() => {});
     engine = new Engine(user, {
       toast: (t, k) => get().toast(t, k),
       saveSettings: (vols) => {
@@ -194,7 +199,7 @@ export const useStore = create<AppState>((set, get) => ({
       },
       refetchChat: () => { const a = get().active; if (!a) return; api.getMessages(a.id, undefined, 30).then((d) => engine?.mergeRecent(d.messages)).catch(() => {}); },
       // выход из голосового → гасим нативную трансляцию (Rust-дерево) + сбрасываем флаг (browser-share гасит engine.stopShare)
-      endBroadcast: () => { if (isTauri) stopNativeBroadcast().catch(() => {}); get().setBroadcastLive(false); },
+      endBroadcast: () => { if (isTauri) stopNativeBroadcast().catch(() => {}).finally(() => endAnyBroadcasterSession()); get().setBroadcastLive(false); },
     });
     engine.onEmoteResolve = (name, id) => emoteMap.set(name, id);
     set({ me: user });

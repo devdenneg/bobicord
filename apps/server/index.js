@@ -25,7 +25,14 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
-app.use(express.json({ limit: '32kb' }));
+// POST /api/diag/session — единственный JSON-роут с большим телом (лог вещателя,
+// семплы getStats зрителя). Общий лимит 32kb отрезал бы его 413-м ещё до роута:
+// express.json ставится один раз на всё приложение и до матчинга путей. Поэтому
+// парсер выбирается по пути. Лимит для диага всё равно жёсткий — см. DIAG_MAX_BODY.
+const DIAG_MAX_BODY = '2mb';
+const jsonSmall = express.json({ limit: '32kb' });
+const jsonDiag = express.json({ limit: DIAG_MAX_BODY });
+app.use((req, res, next) => (req.path === '/api/diag/session' ? jsonDiag : jsonSmall)(req, res, next));
 
 const KEY = process.env.LK_KEY;
 const SECRET = process.env.LK_SECRET;
@@ -41,9 +48,16 @@ const DATA_DIR = '/app/data';
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 // сюда CI (build-windows.yml) заливает установщик натива + latest.json (updater-манифест)
 const RELEASES_DIR = path.join(DATA_DIR, 'releases');
+// Диагностика стрима: клиенты (вещатель и зрители) сдают сюда свои логи/семплы по
+// окончании сессии, чтобы одну и ту же жалобу («картинка подвисает») можно было
+// смотреть с обеих сторон одновременно. Каталог растёт без спроса — жёсткие капы ниже.
+const DIAG_DIR = path.join(DATA_DIR, 'diag');
+const DIAG_MAX_FILES = 400; // сессий на диске
+const DIAG_MAX_TOTAL_BYTES = 100 * 1024 * 1024;
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
 try { fs.mkdirSync(UPLOADS_DIR, { recursive: true }); } catch (e) {}
 try { fs.mkdirSync(RELEASES_DIR, { recursive: true }); } catch (e) {}
+try { fs.mkdirSync(DIAG_DIR, { recursive: true }); } catch (e) {}
 
 /* ---------------- DB ---------------- */
 const db = new Database(path.join(DATA_DIR, 'voice.db'));
@@ -614,6 +628,86 @@ app.post('/api/servers/:id/stream-start', requireAuth, async (req, res) => {
     for (const uid of targets) notifyUser(uid, { t: 'notify', kind: 'stream', serverId: sid, serverName: nm, title: req.user.display_name, body: 'начал(а) трансляцию' });
     if (VAPID) pushToUsers('stream', targets, { kind: 'stream', title: req.user.display_name, body: 'начал(а) трансляцию', serverId: sid, tag: 'stream:' + sid, url: '/?server=' + sid }).catch(() => {});
   } catch (e) { console.error('[notify] stream-start:', e && e.message); }
+});
+
+/* ---------------- диагностика стрима ---------------- */
+
+// Удаляет самые старые сессии, пока каталог не влезет в капы. Вызывается после каждой
+// записи: клиентов много, а диск на VPS общий с БД и загрузками — переполнение здесь
+// уронило бы всё остальное.
+function pruneDiag() {
+  let files;
+  try {
+    files = fs.readdirSync(DIAG_DIR)
+      .filter((n) => n.endsWith('.json'))
+      .map((n) => { const p = path.join(DIAG_DIR, n); const st = fs.statSync(p); return { p, size: st.size, mtime: st.mtimeMs }; })
+      .sort((a, b) => a.mtime - b.mtime); // старые первыми
+  } catch (e) { return; }
+  let total = files.reduce((s, f) => s + f.size, 0);
+  while (files.length && (files.length > DIAG_MAX_FILES || total > DIAG_MAX_TOTAL_BYTES)) {
+    const f = files.shift();
+    try { fs.unlinkSync(f.p); total -= f.size; } catch (e) { /* уже удалён */ }
+  }
+}
+
+const DIAG_ROLES = new Set(['broadcaster', 'viewer']);
+const DIAG_CLIENTS = new Set(['native', 'web']);
+const SAFE_ID = (s) => String(s || '').replace(/[^a-zA-Z0-9_.:-]/g, '').slice(0, 64);
+
+// Клиент сдаёт сессию по окончании стрима/просмотра. Тело уже ограничено DIAG_MAX_BODY
+// (express.json выше), здесь режем ещё и по числу элементов: 413 от парсера клиент
+// увидит как сетевую ошибку и потеряет весь лог, а усечённый лог лучше пустого.
+app.post('/api/diag/session', requireAuth, (req, res) => {
+  const b = req.body || {};
+  const role = String(b.role || '');
+  const client = String(b.client || '');
+  if (!DIAG_ROLES.has(role) || !DIAG_CLIENTS.has(client)) return res.status(400).json({ error: 'bad role/client' });
+  const streamId = SAFE_ID(b.streamId);
+  if (!streamId) return res.status(400).json({ error: 'bad streamId' });
+
+  const lines = Array.isArray(b.lines) ? b.lines.slice(-20000).map((l) => String(l).slice(0, 2000)) : [];
+  const samples = Array.isArray(b.samples) ? b.samples.slice(-2000) : [];
+  const payload = {
+    streamId, role, client,
+    userId: req.user.id,
+    username: req.user.username,
+    startedAt: Number(b.startedAt) || null,
+    endedAt: Number(b.endedAt) || Date.now(),
+    appVersion: String(b.appVersion || '').slice(0, 32),
+    userAgent: String(req.headers['user-agent'] || '').slice(0, 200),
+    lines, samples,
+  };
+  const name = `${payload.endedAt}-${streamId}-${role}-${SAFE_ID(req.user.username)}.json`;
+  try {
+    fs.writeFileSync(path.join(DIAG_DIR, name), JSON.stringify(payload));
+    pruneDiag();
+  } catch (e) {
+    console.error('[diag] write:', e && e.message);
+    return res.status(500).json({ error: 'write failed' });
+  }
+  res.json({ ok: true, name });
+});
+
+// Разбор жалоб: список сессий (новые первыми) и выгрузка одной. Только админ —
+// в логах вещателя лежат ICE-кандидаты, т.е. IP-адреса участников.
+app.get('/api/diag/sessions', requireAdmin, (req, res) => {
+  let out = [];
+  try {
+    out = fs.readdirSync(DIAG_DIR)
+      .filter((n) => n.endsWith('.json'))
+      .map((n) => { const st = fs.statSync(path.join(DIAG_DIR, n)); return { name: n, size: st.size, mtime: st.mtimeMs }; })
+      .sort((a, b) => b.mtime - a.mtime)
+      .slice(0, 200);
+  } catch (e) { /* каталог пуст */ }
+  res.json(out);
+});
+app.get('/api/diag/sessions/:name', requireAdmin, (req, res) => {
+  // :name приходит от клиента — path.basename отсекает любые ../ до join.
+  const name = path.basename(String(req.params.name || ''));
+  if (!name.endsWith('.json')) return res.status(400).json({ error: 'bad name' });
+  const p = path.join(DIAG_DIR, name);
+  if (!fs.existsSync(p)) return res.status(404).json({ error: 'нет' });
+  res.type('application/json').send(fs.readFileSync(p));
 });
 
 app.patch('/api/me', requireAuth, (req, res) => {

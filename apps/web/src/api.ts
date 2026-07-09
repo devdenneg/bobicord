@@ -155,4 +155,19 @@ export const api = {
   adminRemoveMember: (serverId: string, userId: string) => req<{ ok: boolean }>('DELETE', `/admin/servers/${serverId}/members/${userId}`),
   adminDeleteUser: (id: string) => req<{ ok: boolean }>('DELETE', `/admin/users/${id}`),
   adminSetAdmin: (id: string, admin: boolean) => req<{ ok: boolean; isAdmin: boolean }>('POST', `/admin/users/${id}/admin`, { admin }),
+  // Диагностика стрима: клиент сдаёт сессию по её окончании (см. diag.ts). Тело крупнее
+  // обычного (лог + семплы) — сервер парсит этот путь отдельным express.json({limit:'2mb'}).
+  diagSession: (payload: unknown) => req<{ ok: boolean; name: string }>('POST', '/diag/session', payload),
 };
+
+/** Отправка на выгрузке страницы (`pagehide`): обычный fetch браузер убьёт вместе с
+ *  документом, `keepalive` — доживёт. Цена: суммарный лимит тела keepalive-запросов
+ *  64 КБ, поэтому вызывающий обязан прислать усечённый payload (см. diag.ts).
+ *  sendBeacon не подходит — он не умеет ставить заголовок Authorization. */
+export function diagSessionKeepalive(payload: unknown): void {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  try {
+    void fetch(API_BASE + '/api/diag/session', { method: 'POST', headers, body: JSON.stringify(payload), keepalive: true });
+  } catch { /* страница уже уходит — жаловаться некому */ }
+}

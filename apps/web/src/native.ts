@@ -181,6 +181,17 @@ export async function onNativeWatchEnded(cb: (streamId: string) => void): Promis
   return un;
 }
 
+/* ---------- диагностика: лог сессии из Rust (diag.rs) ---------- */
+
+/** Забирает и очищает кольцевой буфер лога текущей сессии (включая строки webrtc-rs:
+ *  ICE/TURN-ошибки). Пусто в браузере. HTTP-отправку делает веб-сторона — там уже есть
+ *  session-JWT. */
+export async function diagTakeLog(): Promise<string[]> {
+  if (!isTauri) return [];
+  try { const { invoke } = await import('@tauri-apps/api/core'); return await invoke<string[]>('diag_take_log'); }
+  catch { return []; }
+}
+
 /* ---------- глобальные хоткеи мута (низкоуровневый WH_KEYBOARD_LL хук, только Windows) ---------- */
 
 import type { Keybinds } from './types';

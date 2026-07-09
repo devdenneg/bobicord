@@ -9,6 +9,7 @@ import {
   onNativeWatchOffer, onNativeWatchIce, onNativeTopology, onNativeWatchEnded,
 } from '../native';
 import { DropWindow, shouldReparentOnDrops, DROP_COOLDOWN_MS } from './dropDetector';
+import { startViewerSession, endViewerSession } from '../diag';
 
 // Ёмкость нативного relay (passthrough) — сколько зрителей он ретранслирует. Rust держит
 // upstream+фанаут; webview только рендерит. Больше браузерного (транскод дорог, натив нет).
@@ -238,6 +239,10 @@ export class TreeVideoTransport implements VideoTransport {
   // качества = unwatch()+watch() (Д4 добавит меню).
   watch(streamId: string, quality: string = 'source', pinned: boolean = false) {
     if (this.watches.has(streamId) || this.nativeWatches.has(streamId)) return;
+    // Диагностика просмотра (diag.ts): freezeCount/потери раз в 2с, сдаётся на сервер в
+    // unwatch. PC берём лениво — он появится позже (после assign-parent / offer от Rust),
+    // и у нативного зрителя это другой объект (лупбек webview↔Rust).
+    startViewerSession(streamId, () => this.watches.get(streamId)?.pc ?? this.nativeWatches.get(streamId)?.pc ?? null);
     // В Tauri видео/relay держит Rust (native passthrough): webview не джойнится в дерево
     // сам, а получает поток от локального Rust-пира через IPC (см. nativeWatch).
     if (isTauri) { this.nativeWatch(streamId, quality, pinned); return; }
@@ -286,6 +291,9 @@ export class TreeVideoTransport implements VideoTransport {
     if (nst) { this.nativeUnwatch(streamId, nst); return; }
     const st = this.watches.get(streamId);
     if (!st) return;
+    // Сессия закрывается ЗДЕСЬ, а не в teardownWatch: тот зовётся и при обрыве ws с
+    // последующим ре-watch — сдавали бы огрызок на каждый реконнект.
+    endViewerSession(streamId);
     st.closed = true;
     try { st.ws.send(JSON.stringify({ t: 'leave' })); } catch { /**/ }
     try { st.ws.close(); } catch { /**/ }
@@ -619,6 +627,7 @@ export class TreeVideoTransport implements VideoTransport {
     } catch { /**/ }
   }
   private nativeUnwatch(streamId: string, st: NativeWatchState) {
+    endViewerSession(streamId);
     st.closed = true;
     st.unlisten.forEach((u) => { try { u(); } catch { /**/ } });
     if (st.pc) { try { st.pc.close(); } catch { /**/ } }
