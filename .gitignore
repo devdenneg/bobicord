@@ -32,3 +32,8 @@ Thumbs.db
 # editors
 .vscode/
 .idea/
+
+# agent/tooling local state (не разделяется между машинами)
+.claude/
+.codegraph/
+.mcp.json

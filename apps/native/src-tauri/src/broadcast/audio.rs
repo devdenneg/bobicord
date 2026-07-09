@@ -498,6 +498,9 @@ pub fn run_capture_loop(stop: Arc<AtomicBool>, source: AudioSource, mut on_chunk
                 let cs = cstop.clone();
                 let cd = cdead.clone();
                 let join = std::thread::spawn(move || {
+                    // Клиент-поток крутит GetBuffer/GetNextPacketSize по clock'у WASAPI —
+                    // при голодании под игрой пакеты копятся и Mixer дропает старейшее.
+                    super::prio::ensure_thread_mmcss(super::prio::MmTask::ProAudio);
                     unsafe {
                         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
                     }

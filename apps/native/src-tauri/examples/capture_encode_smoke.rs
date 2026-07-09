@@ -16,7 +16,7 @@ fn main() {
     let source = capture::CaptureSource::Monitor { index: 1 };
     let stats = Arc::new(app_lib::broadcast::stats::SharedStats::default());
     let (shutdown_tx, _shutdown_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (mut sup, rx) = capture::CaptureSupervisor::new(1920, 1080, 30, stats, shutdown_tx);
+    let (mut sup, rx, buf_pool) = capture::CaptureSupervisor::new(1920, 1080, 30, stats, shutdown_tx);
     sup.start(source).expect("start capture");
     let force_keyframe = Arc::new(AtomicBool::new(true));
     let mut enc = H264Encoder::new(1920, 1080, 30, 6_000_000, force_keyframe).expect("encoder new");
@@ -27,7 +27,9 @@ fn main() {
     while std::time::Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(frame) => {
-                match enc.encode(&frame) {
+                let encoded = enc.encode(&frame);
+                buf_pool.put(frame.data); // вернуть буфер в оборот, как это делает mod.rs
+                match encoded {
                     Ok(chunks) => { n += 1; println!("frame {n}: {} chunks {:?}", chunks.len(), chunks.iter().map(|c| c.data.len()).collect::<Vec<_>>()); }
                     Err(e) => { println!("encode error: {e}"); break; }
                 }

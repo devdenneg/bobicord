@@ -52,10 +52,6 @@ const DIRECT_MIN = 1, DIRECT_MAX = 10;
 function loadConfig(): SavedConfig {
   try {
     const raw = JSON.parse(localStorage.getItem('bcastConfig') || '{}');
-    // Отличаем «старый сохранённый конфиг» (есть ключи, но нет presetMode — до Д5) от
-    // «нового пользователя» (localStorage пуст): у старого дефолт presetMode='manual', чтобы
-    // не подменить его привычные ручные битрейт/разрешение авто-пресетом; у нового — авто.
-    const hadSavedConfig = raw && typeof raw === 'object' && Object.keys(raw).length > 0;
     const savedMode = raw.presetMode;
     if (typeof raw.bitrateKbps !== 'number' && typeof raw.bitrateMbps === 'number') raw.bitrateKbps = raw.bitrateMbps * 1000;
     delete raw.bitrateMbps;
@@ -63,8 +59,10 @@ function loadConfig(): SavedConfig {
     c.bitrateKbps = Math.min(BITRATE_MAX_KBPS, Math.max(BITRATE_MIN_KBPS, Math.round(c.bitrateKbps / BITRATE_STEP_KBPS) * BITRATE_STEP_KBPS));
     c.maxDirectChildren = Math.min(DIRECT_MAX, Math.max(DIRECT_MIN, Math.round(c.maxDirectChildren)));
     c.allowDirectPeers = !!c.allowDirectPeers;
+    // Конфиг, сохранённый до Д5, не имеет presetMode — открываем на «Авто» (DEF_CONFIG),
+    // как и у нового пользователя. Явно выбранный режим (в т.ч. 'manual') восстанавливается.
     if (savedMode === 'smooth' || savedMode === 'quality' || savedMode === 'manual') c.presetMode = savedMode;
-    else c.presetMode = hadSavedConfig ? 'manual' : DEF_CONFIG.presetMode;
+    else c.presetMode = DEF_CONFIG.presetMode;
     return c;
   } catch { return DEF_CONFIG; }
 }

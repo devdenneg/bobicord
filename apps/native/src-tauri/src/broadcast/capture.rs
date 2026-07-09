@@ -4,10 +4,11 @@
 // (инвариант CLAUDE.md 7: масштабирование/кодирование на стороне вещателя).
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender, TrySendError};
+use rayon::prelude::*;
 use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
 use windows_capture::graphics_capture_api::{GraphicsCaptureApi, InternalCaptureControl};
@@ -149,6 +150,7 @@ pub fn process_full_path(pid: u32) -> Option<String> {
     }
 }
 
+use super::prio::{ensure_thread_mmcss, MmTask};
 use super::stats::StatsHandle;
 
 /// Источник кадров: монитор целиком либо отдельное окно (Э5.1 — захват окна).
@@ -195,11 +197,40 @@ pub struct QualityTargets {
     pub fps: Arc<AtomicU32>,
 }
 
+/// Оборотный пул NV12-буферов. Раньше на каждый принятый кадр делался
+/// `scratch.clone()` — на 1080p это ~3 МБ аллокации+освобождения 60 раз в секунду
+/// (180 МБ/с churn) прямо в колбэке WGC. Теперь буфер живёт по кругу: захват берёт
+/// его из `rx`, энкодер после `encode()` возвращает в `tx`. Канал ограничен — если
+/// вернуть некуда, буфер просто освобождается (следующий кадр аллоцирует новый).
+#[derive(Clone)]
+pub struct BufferPool {
+    tx: Sender<Vec<u8>>,
+    rx: Receiver<Vec<u8>>,
+}
+
+impl BufferPool {
+    /// Буфер нужной длины: из пула, если там лежит подходящий, иначе новый.
+    /// Содержимое не обнуляем — конвертация переписывает и Y, и UV целиком.
+    fn take(&self, len: usize) -> Vec<u8> {
+        let mut buf = self.rx.try_recv().unwrap_or_default();
+        if buf.len() != len {
+            buf.clear();
+            buf.resize(len, 0);
+        }
+        buf
+    }
+    /// Вернуть буфер в оборот. Пул полон — буфер уходит в drop, это нормально.
+    pub fn put(&self, buf: Vec<u8>) {
+        let _ = self.tx.try_send(buf);
+    }
+}
+
 pub struct CaptureFlags {
     pub tx: Sender<Nv12Frame>,
     pub stop: Arc<AtomicBool>,
     pub targets: QualityTargets,
     pub stats: StatsHandle,
+    pub pool: BufferPool,
 }
 
 pub struct ScreenCapture {
@@ -210,7 +241,7 @@ pub struct ScreenCapture {
     /// только на реальной смене цели (ABR-лестница), а не на каждом кадре.
     cur_fps: u32,
     stats: StatsHandle,
-    scratch: Vec<u8>,
+    pool: BufferPool,
     fps_window_start: Instant,
     fps_window_count: u32,
     /// Дедлайн-аккумулятор пейсинга: `target_period` = 1/target_fps, `next_deadline`
@@ -257,6 +288,10 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
+        // Frame pool у windows-capture 2.0 создан НЕ free-threaded, значит on_frame_arrived
+        // приезжает на том же потоке, что и Capture::start (см. spawn_session, там же
+        // основная регистрация). Дублируем на всякий случай: ensure идемпотентен.
+        ensure_thread_mmcss(MmTask::Games);
         let cur_fps = ctx.flags.targets.fps.load(Ordering::Relaxed).max(1);
         Ok(Self {
             tx: ctx.flags.tx,
@@ -264,7 +299,7 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
             targets: ctx.flags.targets,
             cur_fps,
             stats: ctx.flags.stats,
-            scratch: Vec::new(),
+            pool: ctx.flags.pool,
             fps_window_start: Instant::now(),
             fps_window_count: 0,
             target_period: Duration::from_secs_f64(1.0 / cur_fps as f64),
@@ -320,39 +355,58 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
             }
         }
 
+        // Тайминги секций (см. SharedStats): колбэк меряем от прохождения гейта, т.е. по
+        // кадрам, за которые мы реально платим. Долгий колбэк тормозит саму WGC-сессию —
+        // без этой метрики «мы не успеваем» неотличимо от «источник мало презентит».
+        let cb_start = now;
         let src_w = frame.width();
         let src_h = frame.height();
+        let rb_start = Instant::now();
         let mut buf = frame.buffer()?;
         let row_pitch = buf.row_pitch();
         let raw = buf.as_raw_buffer();
+        let readback_ns = rb_start.elapsed().as_nanos() as u64;
 
         // ABR-лестница: максимумы разрешения тоже живые — их смена даст новый out_w/out_h,
-        // LUT/scratch пересоберутся сами (ensure_luts), энкодер увидит смену размера кадра
-        // и переинициализируется по существующему resize-пути (mod.rs).
+        // LUT пересоберутся сами (ensure_luts), буфер возьмётся новой длины, энкодер увидит
+        // смену размера кадра и переинициализируется по существующему resize-пути (mod.rs).
         let (out_w, out_h) = scaled_dims(
             src_w, src_h,
             self.targets.max_width.load(Ordering::Relaxed),
             self.targets.max_height.load(Ordering::Relaxed),
         );
         let nv12_len = (out_w * out_h * 3 / 2) as usize;
-        if self.scratch.len() != nv12_len {
-            self.scratch = vec![0u8; nv12_len];
-        }
+        let mut dst = self.pool.take(nv12_len);
         self.ensure_luts(src_w, src_h, out_w, out_h);
-        bgra_to_nv12_luts(raw, row_pitch, out_w, out_h, &self.col_lut, &self.row_lut, &mut self.scratch);
+        let conv_start = Instant::now();
+        bgra_to_nv12_luts(raw, row_pitch, out_w, out_h, &self.col_lut, &self.row_lut, &mut dst);
+        let convert_ns = conv_start.elapsed().as_nanos() as u64;
 
         self.stats.out_width.store(out_w, Ordering::Relaxed);
         self.stats.out_height.store(out_h, Ordering::Relaxed);
 
-        // Канал ограничен (см. spawn_capture) — если энкодер отстаёт, лучше
-        // уронить кадр, чем копить задержку (инвариант «видео <= 3с»).
-        let frame_out = Nv12Frame { data: self.scratch.clone(), width: out_w, height: out_h, captured_at: Instant::now() };
-        if self.tx.try_send(frame_out).is_err() {
-            self.stats.capture_drops.fetch_add(1, Ordering::Relaxed);
-            log::debug!("capture: drop frame, encoder busy");
-        } else {
-            self.stats.capture_frames.fetch_add(1, Ordering::Relaxed);
+        // Канал ограничен (см. CaptureSupervisor::new) — если энкодер отстаёт, лучше
+        // уронить кадр, чем копить задержку (инвариант «видео < 2с»). Буфер уронённого
+        // кадра возвращаем в пул, иначе он вымывается ровно под нагрузкой.
+        let frame_out = Nv12Frame { data: dst, width: out_w, height: out_h, captured_at: Instant::now() };
+        match self.tx.try_send(frame_out) {
+            Ok(()) => { self.stats.capture_frames.fetch_add(1, Ordering::Relaxed); }
+            Err(TrySendError::Full(f)) => {
+                self.stats.capture_drops.fetch_add(1, Ordering::Relaxed);
+                self.pool.put(f.data);
+                log::debug!("capture: drop frame, encoder busy");
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.stats.capture_drops.fetch_add(1, Ordering::Relaxed);
+            }
         }
+
+        let cb_ns = cb_start.elapsed().as_nanos() as u64;
+        self.stats.cb_ns.fetch_add(cb_ns, Ordering::Relaxed);
+        self.stats.cb_max_ns.fetch_max(cb_ns, Ordering::Relaxed);
+        self.stats.readback_ns.fetch_add(readback_ns, Ordering::Relaxed);
+        self.stats.convert_ns.fetch_add(convert_ns, Ordering::Relaxed);
+        self.stats.cb_samples.fetch_add(1, Ordering::Relaxed);
 
         self.fps_window_count += 1;
         let elapsed = self.fps_window_start.elapsed();
@@ -387,11 +441,64 @@ fn scaled_dims(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     (w, h)
 }
 
+/// Пул воркеров под конвертацию кадра. Раньше `bgra_to_nv12_luts` поднимала до 12
+/// OS-потоков через `std::thread::scope` НА КАЖДЫЙ КАДР — на 60 fps это ~720
+/// spawn+join в секунду, и именно под нагрузкой от игры (когда планировщик отдаёт
+/// квант неохотно) создание потока стоит дороже всего. Пул создаётся один раз.
+///
+/// Воркеры регистрируются в MMCSS «Games» (start_handler): без этого они остаются
+/// потоками с NORMAL-приоритетом и голодают под игрой ровно так же, как голодал
+/// захват до этой правки — тогда весь смысл регистрации capture-потока терялся бы,
+/// потому что тяжёлая часть кадра считается именно здесь.
+static CONVERT_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+
+fn convert_pool() -> Option<&'static rayon::ThreadPool> {
+    CONVERT_POOL
+        .get_or_init(|| {
+            // Кап 12 — против лишнего дробления кадра на слишком мелкие бэнды.
+            let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 12);
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(cores)
+                .thread_name(|i| format!("nv12-convert-{i}"))
+                .start_handler(|_| ensure_thread_mmcss(MmTask::Games))
+                .build()
+                .map_err(|e| log::warn!("capture: пул конвертации не создан ({e}) — однопоточный путь"))
+                .ok()
+        })
+        .as_ref()
+}
+
+/// Один бэнд Y-плоскости: строки `[row0, row0 + y_chunk.len()/out_w)` выходного кадра.
+/// Бэнды не пересекаются, поэтому считаются независимо.
+fn y_band(
+    y_chunk: &mut [u8],
+    row0: usize,
+    out_w: usize,
+    pitch: usize,
+    src: &[u8],
+    col_lut: &[u32],
+    row_lut: &[u32],
+) {
+    let rows = y_chunk.len() / out_w;
+    for ry in 0..rows {
+        let base = row_lut[row0 + ry] as usize * pitch;
+        let out_base = ry * out_w;
+        for x in 0..out_w {
+            let off = base + col_lut[x] as usize;
+            let r = src[off + 2] as i32;
+            let g = src[off + 1] as i32;
+            let bl = src[off] as i32;
+            let yv = ((66 * r + 129 * g + 25 * bl + 128) >> 8) + 16;
+            y_chunk[out_base + x] = yv.clamp(0, 255) as u8;
+        }
+    }
+}
+
 /// BGRA8 (с учётом row_pitch) -> NV12, ближайший сосед через LUT-таблицы
 /// (`col_lut`/`row_lut` см. ScreenCapture::ensure_luts) — без деления в цикле.
 /// Формулы BT.601 (studio range), стандартные целочисленные коэффициенты.
 /// Y-плоскость (доминирующая по стоимости) считается параллельно по бэндам строк
-/// через `std::thread::scope`: раньше однопоточная скалярная конвертация с делением
+/// на `convert_pool`: раньше однопоточная скалярная конвертация с делением
 /// на пиксель упиралась в ~38 fps на 1080p. Хрома (1/4 объёма) — однопоточно.
 ///
 /// Замечание: `windows-capture` отдаёт кадр уже как ID3D11Texture2D
@@ -409,35 +516,33 @@ fn bgra_to_nv12_luts(
 ) {
     let out_w = out_w as usize;
     let out_h = out_h as usize;
+    // Свёрнутое/ещё не отрисованное окно отдаёт кадр 0x0 (энкодер такой пропускает
+    // отдельно). Здесь пустой кадр означал бы chunks_mut(0) — паника «chunk size must
+    // be non-zero». Выходим до дележа плоскостей.
+    if out_w == 0 || out_h == 0 {
+        return;
+    }
     let pitch = row_pitch as usize;
     let y_size = out_w * out_h;
     let (y_plane, uv_plane) = dst.split_at_mut(y_size);
 
-    // Число бэндов — по ядрам, но не больше числа строк; кап 12 против лишнего
-    // дробления. Каждый бэнд пишет непересекающийся диапазон строк Y.
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let bands = cores.clamp(1, 12).min(out_h.max(1));
-    let rows_per_band = out_h.div_ceil(bands);
-    std::thread::scope(|s| {
-        for (b, y_chunk) in y_plane.chunks_mut(rows_per_band * out_w).enumerate() {
-            let row0 = b * rows_per_band;
-            s.spawn(move || {
-                let rows = y_chunk.len() / out_w;
-                for ry in 0..rows {
-                    let base = row_lut[row0 + ry] as usize * pitch;
-                    let out_base = ry * out_w;
-                    for x in 0..out_w {
-                        let off = base + col_lut[x] as usize;
-                        let r = src[off + 2] as i32;
-                        let g = src[off + 1] as i32;
-                        let bl = src[off] as i32;
-                        let yv = ((66 * r + 129 * g + 25 * bl + 128) >> 8) + 16;
-                        y_chunk[out_base + x] = yv.clamp(0, 255) as u8;
-                    }
-                }
+    // Число бэндов — по воркерам пула, но не больше числа строк. Каждый бэнд пишет
+    // непересекающийся диапазон строк Y. Пул не поднялся — считаем в этом же потоке.
+    match convert_pool() {
+        Some(pool) => {
+            let bands = pool.current_num_threads().max(1).min(out_h.max(1));
+            let rows_per_band = out_h.div_ceil(bands);
+            pool.install(|| {
+                y_plane
+                    .par_chunks_mut(rows_per_band * out_w)
+                    .enumerate()
+                    .for_each(|(b, y_chunk)| {
+                        y_band(y_chunk, b * rows_per_band, out_w, pitch, src, col_lut, row_lut);
+                    });
             });
         }
-    });
+        None => y_band(y_plane, 0, out_w, pitch, src, col_lut, row_lut),
+    }
 
     for y in (0..out_h).step_by(2) {
         let base = row_lut[y] as usize * pitch;
@@ -592,6 +697,7 @@ fn try_start_capture<T: TryInto<GraphicsCaptureItemType>>(
 fn spawn_session(
     source: CaptureSource,
     tx: Sender<Nv12Frame>,
+    pool: BufferPool,
     targets: QualityTargets,
     // Пользовательский (максимальный) fps — для WGC min_interval. Живая цель
     // (targets.fps, ABR-лестница) может быть ниже — точный каденс держит программный
@@ -605,6 +711,10 @@ fn spawn_session(
     let stop2 = stop.clone();
 
     let handle = std::thread::spawn(move || {
+        // Этот же поток крутит message loop WGC и получает on_frame_arrived (frame pool
+        // создан не free-threaded). Без MMCSS он голодает под фуллскрин-игрой: WGC
+        // роняет презенты, `raw` в логе ниже проваливается. См. prio.rs.
+        ensure_thread_mmcss(MmTask::Games);
         // Троттл WGC ставим коарс — на 0.5×периода цели, а не ровно на период.
         // Раньше min_interval == 1/target_fps бился по фазе с vblank монитора:
         // когда порог совпадал с периодом обновления (60 fps на 60 Гц = 16.67 мс),
@@ -663,6 +773,7 @@ fn spawn_session(
                 stop: stop2.clone(),
                 targets: targets.clone(),
                 stats: stats.clone(),
+                pool: pool.clone(),
             };
             let result = match source {
                 CaptureSource::Monitor { index } => Monitor::from_index(index)
@@ -724,6 +835,8 @@ fn spawn_session(
 /// трансляцию и не трогая WebRTC-треки/дерево.
 pub struct CaptureSupervisor {
     tx: Sender<Nv12Frame>,
+    /// Оборотный пул NV12-буферов, общий для всех сессий (переживает смену источника).
+    pool: BufferPool,
     /// Живые цели качества (ABR-лестница) — общие для всех сессий супервайзера;
     /// клоны отдаются наружу через `targets()` (пишет сигналинг-цикл вещателя).
     targets: QualityTargets,
@@ -736,25 +849,30 @@ pub struct CaptureSupervisor {
 
 impl CaptureSupervisor {
     /// Создаёт канал (bounded(2) — как раньше: отставший энкодер роняет кадр, а не
-    /// копит задержку) и возвращает приёмник для энкодерного потока. Переданные
-    /// max_width/max_height/target_fps становятся стартовыми (и максимальными)
-    /// значениями живых целей качества.
+    /// копит задержку) и возвращает приёмник для энкодерного потока плюс пул буферов
+    /// (энкодер обязан возвращать в него `Nv12Frame::data` после кодирования).
+    /// Переданные max_width/max_height/target_fps становятся стартовыми (и
+    /// максимальными) значениями живых целей качества.
     pub fn new(
         max_width: u32,
         max_height: u32,
         target_fps: u32,
         stats: StatsHandle,
         shutdown_tx: tokio::sync::mpsc::UnboundedSender<Option<String>>,
-    ) -> (Self, crossbeam_channel::Receiver<Nv12Frame>) {
+    ) -> (Self, crossbeam_channel::Receiver<Nv12Frame>, BufferPool) {
         let (tx, rx) = crossbeam_channel::bounded(2);
+        // 4 буфера: 2 могут стоять в очереди кадров, 1 в работе у энкодера, 1 у захвата.
+        let (pool_tx, pool_rx) = crossbeam_channel::bounded(4);
+        let pool = BufferPool { tx: pool_tx, rx: pool_rx };
         let targets = QualityTargets {
             max_width: Arc::new(AtomicU32::new(max_width)),
             max_height: Arc::new(AtomicU32::new(max_height)),
             fps: Arc::new(AtomicU32::new(target_fps)),
         };
         (
-            Self { tx, targets, user_fps: target_fps, stats, shutdown_tx, cur: None },
+            Self { tx, pool: pool.clone(), targets, user_fps: target_fps, stats, shutdown_tx, cur: None },
             rx,
+            pool,
         )
     }
 
@@ -768,6 +886,7 @@ impl CaptureSupervisor {
         let session = spawn_session(
             source,
             self.tx.clone(),
+            self.pool.clone(),
             self.targets.clone(),
             self.user_fps,
             self.stats.clone(),
@@ -796,5 +915,102 @@ impl CaptureSupervisor {
     /// вместе с супервайзером (энкодер получит Disconnected как бэкап к enc_stop).
     pub fn stop(&mut self) {
         self.stop_current();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Эталон: то же преобразование, но одной прямой петлёй без бэндов и без пула.
+    /// Сверять с ним нужно потому, что Y-плоскость режется на бэнды по строкам, и
+    /// смещение `row0` у бэнда — единственное место, где параллельный путь может
+    /// разъехаться с исходным (кадр «поедет» полосами, а fps/битрейт останутся в норме).
+    fn reference_nv12(src: &[u8], pitch: usize, out_w: usize, out_h: usize, col_lut: &[u32], row_lut: &[u32]) -> Vec<u8> {
+        let mut dst = vec![0u8; out_w * out_h * 3 / 2];
+        let (y_plane, uv_plane) = dst.split_at_mut(out_w * out_h);
+        for y in 0..out_h {
+            for x in 0..out_w {
+                let off = row_lut[y] as usize * pitch + col_lut[x] as usize;
+                let (r, g, b) = (src[off + 2] as i32, src[off + 1] as i32, src[off] as i32);
+                y_plane[y * out_w + x] = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(0, 255) as u8;
+            }
+        }
+        for y in (0..out_h).step_by(2) {
+            for x in (0..out_w).step_by(2) {
+                let off = row_lut[y] as usize * pitch + col_lut[x] as usize;
+                let (r, g, b) = (src[off + 2] as i32, src[off + 1] as i32, src[off] as i32);
+                let idx = (y / 2) * out_w + x;
+                uv_plane[idx] = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+                uv_plane[idx + 1] = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+            }
+        }
+        dst
+    }
+
+    fn luts(src_w: u32, src_h: u32, out_w: u32, out_h: u32) -> (Vec<u32>, Vec<u32>) {
+        let col = (0..out_w).map(|x| (x as u64 * src_w as u64 / out_w as u64) as u32 * 4).collect();
+        let row = (0..out_h).map(|y| (y as u64 * src_h as u64 / out_h as u64) as u32).collect();
+        (col, row)
+    }
+
+    /// Псевдослучайный, но детерминированный BGRA-кадр с паддингом строки (row_pitch
+    /// у WGC почти всегда больше out_w*4 — путь с pitch обязан быть покрыт).
+    fn make_src(src_w: usize, src_h: usize, pitch: usize) -> Vec<u8> {
+        let mut src = vec![0u8; pitch * src_h];
+        let mut seed = 0x1234_5678u32;
+        for row in src.chunks_mut(pitch) {
+            for px in row[..src_w * 4].chunks_mut(4) {
+                for c in px.iter_mut() {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *c = (seed >> 24) as u8;
+                }
+            }
+        }
+        src
+    }
+
+    /// Разные out_h против числа воркеров пула: строк меньше бэндов, строк не кратно
+    /// бэндам, строк много. Все три случая по-разному режут `rows_per_band`.
+    #[test]
+    fn parallel_conversion_matches_reference() {
+        for &(src_w, src_h, out_w, out_h) in &[(16u32, 12u32, 8u32, 6u32), (64, 34, 32, 16), (100, 100, 50, 50), (8, 8, 8, 8)] {
+            let pitch = src_w as usize * 4 + 64; // паддинг строки
+            let src = make_src(src_w as usize, src_h as usize, pitch);
+            let (col_lut, row_lut) = luts(src_w, src_h, out_w, out_h);
+
+            let mut got = vec![0u8; (out_w * out_h * 3 / 2) as usize];
+            bgra_to_nv12_luts(&src, pitch as u32, out_w, out_h, &col_lut, &row_lut, &mut got);
+            let want = reference_nv12(&src, pitch, out_w as usize, out_h as usize, &col_lut, &row_lut);
+
+            assert_eq!(got, want, "расхождение на {src_w}x{src_h} -> {out_w}x{out_h}");
+        }
+    }
+
+    /// Кадр 0x0 (свёрнутое окно) не должен паниковать на chunks_mut(0).
+    #[test]
+    fn zero_sized_frame_is_noop() {
+        let mut dst: Vec<u8> = Vec::new();
+        bgra_to_nv12_luts(&[], 0, 0, 0, &[], &[], &mut dst);
+        assert!(dst.is_empty());
+    }
+
+    /// Буфер, возвращённый в пул, переиспользуется без аллокации; буфер другой длины
+    /// приводится к нужной. Пул пуст -> отдаёт новый.
+    #[test]
+    fn buffer_pool_recycles() {
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let pool = BufferPool { tx, rx };
+
+        let a = pool.take(100);
+        assert_eq!(a.len(), 100);
+        let ptr = a.as_ptr();
+        pool.put(a);
+        let b = pool.take(100);
+        assert_eq!(b.as_ptr(), ptr, "буфер должен переиспользоваться, а не аллоцироваться заново");
+
+        pool.put(b);
+        let c = pool.take(50); // смена разрешения — длина подгоняется
+        assert_eq!(c.len(), 50);
     }
 }

@@ -15,6 +15,34 @@ pub struct SharedStats {
     pub encoded_bytes: AtomicU64,
     pub out_width: AtomicU32,
     pub out_height: AtomicU32,
+    /// Тайминги секций горячего пути, наносекунды. Нужны, чтобы отличить «источник мало
+    /// презентит» от «мы не успеваем»: медленный колбэк on_frame_arrived тормозит саму
+    /// WGC-сессию, и оба случая дают одинаково низкий `raw` в логе захвата. Суммы и
+    /// счётчики — оконные: stats-тик читает их через swap(0), среднее = сумма/счётчик.
+    pub cb_ns: AtomicU64,
+    pub cb_max_ns: AtomicU64,
+    pub readback_ns: AtomicU64,
+    pub convert_ns: AtomicU64,
+    /// Кадры, дошедшие до конвертации (принятые fps-гейтом) = знаменатель cb/readback/convert.
+    pub cb_samples: AtomicU64,
+    pub encode_ns: AtomicU64,
+    pub encode_max_ns: AtomicU64,
+    /// Время `write_sample` (block_on на tokio-треке) — отдельно от энкода.
+    pub write_ns: AtomicU64,
+    /// Знаменатель encode/write.
+    pub encode_samples: AtomicU64,
+}
+
+impl SharedStats {
+    /// Забирает окно (сумму, максимум, счётчик) и обнуляет его под следующий тик.
+    /// Возвращает (avg_ms, max_ms).
+    pub fn take_window(sum_ns: &AtomicU64, max_ns: &AtomicU64, samples: u64) -> (f64, f64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let sum = sum_ns.swap(0, Relaxed);
+        let max = max_ns.swap(0, Relaxed);
+        let avg = if samples > 0 { sum as f64 / samples as f64 / 1e6 } else { 0.0 };
+        (avg, max as f64 / 1e6)
+    }
 }
 
 pub type StatsHandle = Arc<SharedStats>;

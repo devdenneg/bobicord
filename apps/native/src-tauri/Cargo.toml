@@ -47,6 +47,10 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "
 audiopus = "0.2.0"
 audiopus_sys = { version = "0.2.2", features = ["static"] }
 crossbeam-channel = "0.5.15"
+# Пул воркеров под BGRA->NV12 (broadcast/capture.rs). Раньше конвертация поднимала до 12
+# OS-потоков НА КАЖДЫЙ КАДР через thread::scope (~720 spawn/сек на 60fps). Версия уже
+# зафиксирована в Cargo.lock транзитивно (windows-capture тянет rayon).
+rayon = "1"
 windows-core = "=0.62.2"
 # Реестр для позитивного аллоулиста игр (GameConfigStore\Children\MatchedExeFullPath, см. broadcast/games.rs).
 # Эргономичная обёртка над windows-sys — надёжнее ручного RegOpenKeyExW/RegEnumKeyExW.

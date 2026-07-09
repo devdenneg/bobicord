@@ -9,6 +9,7 @@ pub mod encoder;
 pub mod games;
 pub mod icon;
 pub mod peer;
+pub mod prio;
 // relay-ядро и WS-сигналинг дерева вынесены в кросс-платформенный крейт relay-core
 // (Э9: общий код с headless-агентом vrelay). Реэкспорт сохраняет старые пути
 // broadcast::relay::* / broadcast::signaling::* для lib.rs и этого модуля.
@@ -86,6 +87,7 @@ use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITH
 pub use audio::AudioSource;
 pub use capture::CaptureSource;
 
+use self::prio::{ensure_thread_mmcss, MmTask};
 use self::signaling::TreeEvent;
 use self::stats::{SharedStats, StatsHandle};
 
@@ -187,6 +189,9 @@ fn spawn_audio_session(
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
     let handle = std::thread::spawn(move || {
+        // Звук лёгкий по CPU, но чувствителен к джиттеру: пропущенный 20мс-тик слышен.
+        // Под фуллскрин-игрой поток с NORMAL-приоритетом такие тики теряет. См. prio.rs.
+        ensure_thread_mmcss(MmTask::ProAudio);
         // RELAYAPP_DISABLE_AUDIO=1 — аварийный выключатель для отладки видео-пути
         // отдельно от звука; по умолчанию звук игры/системы идёт в стрим (см. audio.rs).
         if std::env::var("RELAYAPP_DISABLE_AUDIO").is_ok() {
@@ -277,7 +282,9 @@ pub async fn start(
 
     // Захват через супервайзер: он держит канал, под которым можно менять WGC-сессии
     // (монитор/окно) на лету — энкодер и WebRTC-треки этого не замечают (Э5.3).
-    let (mut cap_sup, cap_rx) = capture::CaptureSupervisor::new(max_width, max_height, fps, stats.clone(), shutdown_tx.clone());
+    // buf_pool — оборотный пул NV12-буферов: захват берёт, энкодер возвращает после
+    // encode(). Без него на каждый кадр аллоцировалось ~3 МБ (1080p) прямо в колбэке WGC.
+    let (mut cap_sup, cap_rx, buf_pool) = capture::CaptureSupervisor::new(max_width, max_height, fps, stats.clone(), shutdown_tx.clone());
     // Живые цели качества (ABR-лестница): пишет сигналинг-цикл, читают capture (на кадре)
     // и энкодер-поток (смена fps => пересоздание MFT с корректным rate-control).
     let quality_targets = cap_sup.targets();
@@ -329,6 +336,9 @@ pub async fn start(
     let eff_fps_enc = quality_targets.fps.clone();
 
     let encoder_thread = std::thread::spawn(move || {
+        // Тот же класс MMCSS, что и у захвата: под фуллскрин-игрой этот поток должен
+        // успевать забирать кадр из bounded(2), иначе захват их роняет. См. prio.rs.
+        ensure_thread_mmcss(MmTask::Games);
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             if let Err(e) = MFStartup(MF_VERSION, MFSTARTUP_FULL | MFSTARTUP_NOSOCKET) {
@@ -399,7 +409,9 @@ pub async fn start(
                         if !matches!(pending_resize, Some((pw, ph, _)) if pw == frame.width && ph == frame.height) {
                             pending_resize = Some((frame.width, frame.height, Instant::now()));
                         }
-                        continue; // размер ещё "гуляет" — не трогаем энкодер, кадр дропаем
+                        // размер ещё "гуляет" — не трогаем энкодер, кадр дропаем (буфер в пул)
+                        buf_pool.put(frame.data);
+                        continue;
                     }
                 } else {
                     pending_resize = None; // источник вернулся к размеру энкодера
@@ -411,6 +423,7 @@ pub async fn start(
                 // немедленного фатального отказа.
                 if frame.width == 0 || frame.height == 0 {
                     log::debug!("encoder: skip 0x0 frame (source not ready yet)");
+                    buf_pool.put(frame.data);
                     continue;
                 }
                 // Берём живую цель, не замороженный bitrate_bps: после ресайза окна MFT
@@ -433,19 +446,32 @@ pub async fn start(
                 None => frame_dur,
             };
             prev_captured_at = Some(frame.captured_at);
-            match encoder_ref.encode(&frame) {
+            let enc_start = Instant::now();
+            let encoded = encoder_ref.encode(&frame);
+            let encode_ns = enc_start.elapsed().as_nanos() as u64;
+            // Буфер отработал: кадр скопирован в MFT-сэмпл внутри encode(). Возвращаем в
+            // оборот ДО write_sample, чтобы захват не ждал пока мы толкаем байты в трек.
+            buf_pool.put(frame.data);
+            let mut write_ns = 0u64;
+            match encoded {
                 Ok(chunks) => {
                     for c in chunks {
                         stats_enc.encoded_frames.fetch_add(1, Ordering::Relaxed);
                         stats_enc.encoded_bytes.fetch_add(c.data.len() as u64, Ordering::Relaxed);
                         let sample = Sample { data: Bytes::from(c.data), duration: real_dur, ..Default::default() };
                         let track = video_track.clone();
+                        let w_start = Instant::now();
                         rt_handle.block_on(async { let _ = track.write_sample(&sample).await; });
+                        write_ns += w_start.elapsed().as_nanos() as u64;
                         fps_window_count += 1;
                     }
                 }
                 Err(e) => log::warn!("encoder: encode error: {e}"),
             }
+            stats_enc.encode_ns.fetch_add(encode_ns, Ordering::Relaxed);
+            stats_enc.encode_max_ns.fetch_max(encode_ns, Ordering::Relaxed);
+            stats_enc.write_ns.fetch_add(write_ns, Ordering::Relaxed);
+            stats_enc.encode_samples.fetch_add(1, Ordering::Relaxed);
             let elapsed = fps_window_start.elapsed();
             if elapsed.as_secs() >= 2 {
                 log::info!("encoder: {:.1} fps sent to track", fps_window_count as f64 / elapsed.as_secs_f64());
@@ -598,6 +624,24 @@ async fn run_signaling_loop(
                 };
                 prev_at = now; prev_cap = cap; prev_enc = enc; prev_bytes = bytes;
                 if let Some(app) = &app { let _ = app.emit("relay-broadcast-stats", &snapshot); }
+
+                // Тайминги секций горячего пути за окно. Читать так: бюджет кадра = 1000/fps мс
+                // (16.6 при 60). cb ≈ readback + convert; если cb близок к бюджету — упираемся
+                // в CPU-конверсию, и низкий capture_fps НЕ значит «источник мало презентит».
+                // Если cb мал, а capture_fps низкий — источник действительно мало отдаёт.
+                // Растущий dropped_frames при малом cb — отстаёт энкодер (смотри encode/write).
+                let cb_n = stats.cb_samples.swap(0, Ordering::Relaxed);
+                let (cb_avg, cb_max) = SharedStats::take_window(&stats.cb_ns, &stats.cb_max_ns, cb_n);
+                let readback_avg = stats.readback_ns.swap(0, Ordering::Relaxed) as f64 / cb_n.max(1) as f64 / 1e6;
+                let convert_avg = stats.convert_ns.swap(0, Ordering::Relaxed) as f64 / cb_n.max(1) as f64 / 1e6;
+                let enc_n = stats.encode_samples.swap(0, Ordering::Relaxed);
+                let (enc_avg, enc_max) = SharedStats::take_window(&stats.encode_ns, &stats.encode_max_ns, enc_n);
+                let write_avg = stats.write_ns.swap(0, Ordering::Relaxed) as f64 / enc_n.max(1) as f64 / 1e6;
+                if cb_n > 0 || enc_n > 0 {
+                    log::info!(
+                        "timing: cb {cb_avg:.1}/{cb_max:.1} мс (avg/max) = readback {readback_avg:.1} + convert {convert_avg:.1} | encode {enc_avg:.1}/{enc_max:.1} | write {write_avg:.1}"
+                    );
+                }
 
                 mgr.sweep_dead().await; // трупы child-PC (после реджойна drop-peer не придёт)
                 // Э8 ABR: реальные loss/rtt по каждому детскому линку (RTCP RR через get_stats) —
