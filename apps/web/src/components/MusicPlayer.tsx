@@ -14,6 +14,7 @@ export function MusicPlayer({ enabled }: { enabled: boolean }) {
   const m = useMusic();
   const playerRef = useRef<any>(null);
   const readyRef = useRef(false);
+  const hasPlayedRef = useRef(false); // хоть раз звук пошёл со звуком (autoplay-жест уже получен) → плашку больше не показываем
   const [open, setOpen] = useState(false);
   const [addUrl, setAddUrl] = useState('');
   const [err, setErr] = useState('');
@@ -42,8 +43,20 @@ export function MusicPlayer({ enabled }: { enabled: boolean }) {
       p.setVolume(volRef.current); if (volRef.current > 0) p.unMute?.();
       if (st.playing) p.playVideo?.(); else p.pauseVideo?.();
     } catch { /**/ }
-    // autoplay-политика у пиров: если должно играть, а не играет / замьючено — просим жест
-    window.setTimeout(() => { try { const pl = playerRef.current; if (useMusic.getState().playing && (pl?.getPlayerState?.() !== 1 || pl?.isMuted?.())) setNeedGesture(true); } catch { /**/ } }, 900);
+    // autoplay-политика: показываем «Включить звук» ТОЛЬКО если звук ни разу не пошёл (жест ещё не получен).
+    // После первого успешного проигрывания hasPlayedRef=true → плашка больше не мелькает при смене трека/паузе/сике
+    // (буферизация — это состояния 3/1, не блок). Проверяем один раз, с запасом, только для НЕразблокированного плеера.
+    if (st.playing && !hasPlayedRef.current) {
+      window.setTimeout(() => {
+        try {
+          const pl = playerRef.current; if (!pl) return;
+          if (!useMusic.getState().playing || hasPlayedRef.current) return;
+          const state = pl.getPlayerState?.();            // 1 играет, 3 буфер — норм; -1/5/2 — застряло; muted при vol>0 — браузер форс-мьютнул
+          const blockedMute = state === 1 && pl.isMuted?.() && volRef.current > 0;
+          if ((state !== 1 && state !== 3) || blockedMute) setNeedGesture(true);
+        } catch { /**/ }
+      }, 2500);
+    }
   };
 
   // создать IFrame-плеер один раз (только когда фича включена)
@@ -60,7 +73,8 @@ export function MusicPlayer({ enabled }: { enabled: boolean }) {
           onReady: () => { readyRef.current = true; try { playerRef.current.setVolume(volRef.current); } catch { /**/ } sync(); },
           onStateChange: (e: any) => {
             if (e.data === YT.PlayerState.ENDED) useMusic.getState().onEnded();
-            if (e.data === YT.PlayerState.PLAYING) setNeedGesture(false);
+            // Звук реально пошёл (не форс-мьют) → жест получен, плашку прячем навсегда.
+            if (e.data === YT.PlayerState.PLAYING) { const pl = playerRef.current; if (pl && !pl.isMuted?.()) { hasPlayedRef.current = true; setNeedGesture(false); } }
           },
         },
       });
@@ -105,9 +119,9 @@ export function MusicPlayer({ enabled }: { enabled: boolean }) {
           <div className="mus-sub">{cur ? (m.playing ? '♪ играет' : 'пауза') + (cur.by ? ' · ' + cur.by : '') : 'вставь ссылку YouTube'}</div>
         </div>
         <div className="mus-ctrls">
-          <button className="mus-b" onClick={() => useMusic.getState().prev()} disabled={m.index <= 0} data-tip="Назад">⏮</button>
-          <button className="mus-b play" onClick={() => useMusic.getState().toggle()} disabled={!m.queue.length} data-tip="Пауза/играть">{m.playing ? '⏸' : '▶'}</button>
-          <button className="mus-b" onClick={() => useMusic.getState().next()} disabled={m.index + 1 >= m.queue.length} data-tip="Дальше">⏭</button>
+          <button className="mus-b" onClick={() => useMusic.getState().prev()} disabled={m.index <= 0} data-tip="Назад"><Icon name="skip-prev" sm /></button>
+          <button className="mus-b play" onClick={() => useMusic.getState().toggle()} disabled={!m.queue.length} data-tip="Пауза/играть"><Icon name={m.playing ? 'pause' : 'play'} sm /></button>
+          <button className="mus-b" onClick={() => useMusic.getState().next()} disabled={m.index + 1 >= m.queue.length} data-tip="Дальше"><Icon name="skip-next" sm /></button>
         </div>
         <button className={'mus-caret' + (open ? ' on' : '')} onClick={() => setOpen((o) => !o)} data-tip={open ? 'Свернуть' : 'Развернуть'}><Icon name="chevron" sm /></button>
       </div>

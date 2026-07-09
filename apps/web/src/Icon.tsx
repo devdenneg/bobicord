@@ -42,8 +42,13 @@ import AttachFileRounded from '@mui/icons-material/AttachFileRounded';
 import InsertDriveFileRounded from '@mui/icons-material/InsertDriveFileRounded';
 import FolderRounded from '@mui/icons-material/FolderRounded';
 import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded';
+import PlayArrowRounded from '@mui/icons-material/PlayArrowRounded';
+import PauseRounded from '@mui/icons-material/PauseRounded';
+import SkipPreviousRounded from '@mui/icons-material/SkipPreviousRounded';
+import SkipNextRounded from '@mui/icons-material/SkipNextRounded';
 
 const MAP: Record<string, SvgIconComponent> = {
+  play: PlayArrowRounded, pause: PauseRounded, 'skip-prev': SkipPreviousRounded, 'skip-next': SkipNextRounded,
   mic: MicRounded, 'mic-sm': MicRounded, 'mic-off': MicOffRounded,
   head: HeadsetRounded, 'head-off': HeadsetOffRounded,
   screen: ScreenShareRounded, 'screen-stop': StopScreenShareRounded,

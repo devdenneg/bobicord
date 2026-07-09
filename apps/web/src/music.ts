@@ -64,14 +64,21 @@ export const useMusic = create<MusicState>((set, get) => {
 
     enterVc: (vc) => {
       set({ vc, queue: [], index: -1, playing: false, posRef: 0, startedAt: 0, rev: 0, seekTick: get().seekTick + 1 });
-      getEngine()?.sendMusic({ a: 'req', vc }); // подтянуть уже идущую сессию у тех, кто в канале
+      // Подтянуть уже идущую сессию у тех, кто в канале. Ретраим: data-канал голосовой после реконнекта
+      // поднимается не мгновенно — одиночный req мог потеряться (вернулся, а музыка не подхватилась).
+      const ask = () => { if (get().vc === vc) getEngine()?.sendMusic({ a: 'req', vc }); };
+      ask(); setTimeout(ask, 1200); setTimeout(ask, 3000);
     },
-    leaveVc: () => set({ vc: null, queue: [], index: -1, playing: false, posRef: 0 }),
+    // Вышел из голосового (или сменил канал) → полный сброс сессии плеера. seekTick++ гарантирует, что
+    // ещё живой (в момент размонтирования) MusicPlayer остановит видео.
+    leaveVc: () => set({ vc: null, queue: [], index: -1, playing: false, posRef: 0, startedAt: 0, rev: 0, seekTick: get().seekTick + 1 }),
 
     apply: (d) => {
       const s = get();
       if (d.a === 'req') {
-        if (d.vc === s.vc && s.queue.length && get().isController()) getEngine()?.sendMusic({ a: 'set', vc: s.vc, s: pack(s) });
+        // Отвечает ЛЮБОЙ с непустой сессией (не только контроллер): вернувшийся сам может быть
+        // контроллером-по-имени с пустым состоянием → иначе никто бы не ответил. Ответы идемпотентны (rev).
+        if (d.vc === s.vc && s.queue.length) getEngine()?.sendMusic({ a: 'set', vc: s.vc, s: pack(s) });
         return;
       }
       if (d.a === 'set') {
