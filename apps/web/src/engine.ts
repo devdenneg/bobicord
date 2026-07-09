@@ -13,6 +13,8 @@ import { playSound } from './sounds';
 import type { VideoTransport } from './transport/videoTransport';
 import { LiveKitVideoTransport } from './transport/livekitVideo';
 import { TreeVideoTransport } from './transport/treeVideo';
+import { createDenoiseNode, destroyDenoiseNode } from './denoise';
+import type { RnnoiseWorkletNode } from '@sapphi-red/web-noise-suppressor';
 
 export interface GameStatus { name: string; icon?: string }
 export interface PeerState { online: boolean; inVoice: boolean; micMuted: boolean; streaming: boolean; deafened: boolean; away: boolean; game?: GameStatus | null }
@@ -105,10 +107,13 @@ export class Engine {
   private pttDown = false;
   private watchTimers = new Map<string, number>();
 
-  // mic pipeline: raw device -> gain (громкость/мут) -> published track
+  // mic pipeline: raw device -> [denoise?] -> gain (громкость/мут) -> published track
+  //                                        \-> vadDest (отвод для VAD/метра, ДО гейта)
   private micRaw: MediaStream | null = null;
   private micActx: AudioContext | null = null;
   private micGain: GainNode | null = null;
+  private micDenoise: RnnoiseWorkletNode | null = null;
+  private micVadDest: MediaStreamAudioDestinationNode | null = null;
   private manualMute = false;
   private deafToggling = false; // окно подавления mute/unmute-звука от track.mute()/unmute() при оглушении (deaf сам играет fullMute/unmute)
 
@@ -172,6 +177,7 @@ export class Engine {
   private levelStream: MediaStream | null = null;
   private levelRAF: number | null = null;
   private levelHold = 0;
+  private levelDenoise: RnnoiseWorkletNode | null = null;
 
   constructor(me: User, hooks: EngineHooks) {
     this.me = me;
@@ -697,11 +703,22 @@ export class Engine {
   }
 
   /* ---------- MIC / DEAFEN / PTT ---------- */
-  // шумодав/эхо/автогромкость всегда включены (дефолт для всех)
+  // эхо/автогромкость всегда включены; браузерный NS — только в режиме 'basic' (в 'rnnoise' его
+  // выключаем, чтобы не было каскада с нашей нейросетью; в 'off' — вообще без обработки шума).
   // deviceId через { exact } — иначе браузер игнорит выбор и берёт устройство по умолчанию
-  private micCapture() { const s = getSettings(); return { deviceId: s.input ? { exact: s.input } : undefined, echoCancellation: true, noiseSuppression: true, autoGainControl: true }; }
+  // channelCount:1 — важно не только для экономии полосы: RnnoiseWorkletNode сконструирована на
+  // maxChannels:1 (см. denoise.ts), а реальные микрофоны часто отдают gUM-поток 2-канальным по
+  // умолчанию (даже физически моно-капсюль). При рассинхроне channel count шумодав обрабатывает
+  // только часть каналов — второй проходит необработанным и может доминировать в RMS/метре.
+  private micCapture() {
+    const s = getSettings();
+    return { deviceId: s.input ? { exact: s.input } : undefined, echoCancellation: true, noiseSuppression: s.nsMode === 'basic', autoGainControl: true, channelCount: 1 };
+  }
 
-  // строим цепочку: устройство -> analyser(VAD) + gain -> published track
+  // строим цепочку: устройство -> [denoise?] -> preGate -> gain (микс/мут) -> published track
+  //                                                     \-> vadDest (VAD/метр, ДО гейта — иначе
+  //                                                         гейт слушает уже замолченный gain=0 сигнал
+  //                                                         и залипает закрытым)
   private async startMic() {
     if (!this.voiceRoom) return;
     // Контекст ПУБЛИКАЦИИ создаём и резюмим ДО getUserMedia — пока жива user-activation от клика «войти
@@ -718,18 +735,31 @@ export class Engine {
       throw e;
     }
     const src = this.micActx.createMediaStreamSource(this.micRaw);
+    const ctx = this.micActx; // снимок — ниже единственный await, за время которого concurrent
+    // stopMic() (watchdog/повторный join) мог обнулить this.micActx; сверяем перед продолжением.
+    let preGate: AudioNode = src;
+    if (getSettings().nsMode === 'rnnoise') {
+      this.micDenoise = await createDenoiseNode(ctx);
+      if (this.micActx !== ctx) { destroyDenoiseNode(this.micDenoise); this.micDenoise = null; return; }
+      if (this.micDenoise) { src.connect(this.micDenoise); preGate = this.micDenoise; }
+      else this.hooks.toast('Шумодав недоступен — звук без обработки', 'warn');
+    }
     this.micGain = this.micActx.createGain();
-    src.connect(this.micGain);
+    preGate.connect(this.micGain);
     const dest = this.micActx.createMediaStreamDestination();
     this.micGain.connect(dest);
+    // VAD/метр — отвод ДО гейта (preGate), НЕ от micGain: гейт решает лишь что публикуется наружу,
+    // а не что видит сам детектор речи.
+    this.micVadDest = this.micActx.createMediaStreamDestination();
+    preGate.connect(this.micVadDest);
     const lat = new LocalAudioTrack(dest.stream.getAudioTracks()[0]);
     await this.voiceRoom.localParticipant.publishTrack(lat, { source: Track.Source.Microphone, dtx: true, red: true, audioPreset: AudioPresets.musicHighQuality });
     // свежий трек публикуется НЕмьютнутым на уровне LiveKit — если сейчас ручной мут/оглушение,
     // домьютить сразу (иначе после reapplyMic в муте пиры читают mp.isMuted=false → бейдж мута
     // пропадает у всех, хотя мы молчим через gain=0). applyGate решает лишь громкость, не LiveKit-mute.
     if (this.manualMute || this.deafened) { try { lat.mute(); } catch { /**/ } }
-    // индикатор «говорит» берём с сырого трека устройства
-    this.attachAnalyser(this.me.username, this.micRaw.getAudioTracks()[0]);
+    // индикатор «говорит» — с очищенного (после denoise) сигнала, ДО гейта
+    this.attachAnalyser(this.me.username, this.micVadDest.stream.getAudioTracks()[0]);
     this.applyGate();
     this.ensureVoiceAudioRunning(); // добить, если контекст всё ещё suspended (анлок на первый жест + watchdog)
   }
@@ -788,6 +818,8 @@ export class Engine {
     this.vadOpen = false;
     this.clearAudioUnlock();
     if (this.micRaw) { this.micRaw.getTracks().forEach((t) => t.stop()); this.micRaw = null; }
+    destroyDenoiseNode(this.micDenoise); this.micDenoise = null;
+    if (this.micVadDest) { try { this.micVadDest.disconnect(); } catch { /**/ } this.micVadDest = null; }
     if (this.micActx) { try { this.micActx.close(); } catch { /**/ } this.micActx = null; }
     this.micGain = null;
   }
@@ -821,21 +853,42 @@ export class Engine {
     if (!this.inVoice && this.levelListeners.size === 1) this.startLevelMeter();
     return () => { this.levelListeners.delete(cb); if (this.levelListeners.size === 0) this.stopLevelMeter(); };
   }
-  private startLevelMeter() {
-    navigator.mediaDevices.getUserMedia({ audio: this.micCapture() }).then((stream) => {
-      if (this.levelListeners.size === 0 || this.inVoice) { stream.getTracks().forEach((t) => t.stop()); return; }
-      this.levelStream = stream;
-      try {
-        this.levelCtx = this.levelCtx || new AudioContext();
-        this.levelCtx.resume?.().catch(() => {});
-        this.levelSrc = this.levelCtx.createMediaStreamSource(stream);
-        this.levelAnalyser = this.levelCtx.createAnalyser();
-        this.levelAnalyser.fftSize = 512; this.levelAnalyser.smoothingTimeConstant = 0.5;
-        this.levelBuf = new Uint8Array(this.levelAnalyser.fftSize);
-        this.levelSrc.connect(this.levelAnalyser);
-        this.levelRAF = requestAnimationFrame(this.levelLoop);
-      } catch { /**/ }
-    }).catch(() => this.hooks.toast('Нет доступа к микрофону', 'err'));
+  // Смена устройства/режима шумоподавления в настройках, пока превью-метр уже запущен (вне
+  // звонка), сама по себе метр не перезапускает — иначе он продолжил бы слушать старый gUM-поток
+  // со старыми constraints/денойзером. Дёргается из UI-обработчиков наравне с reapplyMic (тот
+  // покрывает случай "в звонке", этот — "вне звонка"); внутри звонка это не-op.
+  restartLevelMeter() {
+    if (this.inVoice || this.levelListeners.size === 0) return;
+    this.stopLevelMeter();
+    this.startLevelMeter();
+  }
+  // Превью-метр в настройках (вне звонка) прогоняем через тот же денойзер, что и в реальном
+  // звонке — иначе маркер порога чувствительности в настройках не совпадал бы с тем, что
+  // реально видит гейт во время разговора.
+  private async startLevelMeter() {
+    let stream: MediaStream;
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: this.micCapture() }); }
+    catch { this.hooks.toast('Нет доступа к микрофону', 'err'); return; }
+    if (this.levelListeners.size === 0 || this.inVoice) { stream.getTracks().forEach((t) => t.stop()); return; }
+    this.levelStream = stream;
+    try {
+      this.levelCtx = this.levelCtx || new AudioContext();
+      this.levelCtx.resume?.().catch(() => {});
+      this.levelSrc = this.levelCtx.createMediaStreamSource(stream);
+      let preAnalyser: AudioNode = this.levelSrc;
+      if (getSettings().nsMode === 'rnnoise') {
+        this.levelDenoise = await createDenoiseNode(this.levelCtx);
+        if (this.levelDenoise) { this.levelSrc.connect(this.levelDenoise); preAnalyser = this.levelDenoise; }
+        else this.hooks.toast('Шумодав недоступен — звук без обработки', 'warn');
+      }
+      // застали остановку/переключение режима, пока грузился denoise — не подключаем осиротевший граф
+      if (this.levelListeners.size === 0 || this.inVoice || this.levelStream !== stream) return;
+      this.levelAnalyser = this.levelCtx.createAnalyser();
+      this.levelAnalyser.fftSize = 512; this.levelAnalyser.smoothingTimeConstant = 0.5;
+      this.levelBuf = new Uint8Array(this.levelAnalyser.fftSize);
+      preAnalyser.connect(this.levelAnalyser);
+      this.levelRAF = requestAnimationFrame(this.levelLoop);
+    } catch { /**/ }
   }
   private levelLoop = () => {
     if (!this.levelAnalyser || !this.levelBuf) return;
@@ -855,6 +908,7 @@ export class Engine {
   private stopLevelMeter() {
     if (this.levelRAF) cancelAnimationFrame(this.levelRAF); this.levelRAF = null;
     if (this.levelSrc) { try { this.levelSrc.disconnect(); } catch { /**/ } this.levelSrc = null; }
+    destroyDenoiseNode(this.levelDenoise); this.levelDenoise = null;
     this.levelAnalyser = null; this.levelBuf = null; this.levelHold = 0;
     if (this.levelStream) { this.levelStream.getTracks().forEach((t) => t.stop()); this.levelStream = null; }
     if (this.levelCtx) { try { this.levelCtx.close(); } catch { /**/ } this.levelCtx = null; }

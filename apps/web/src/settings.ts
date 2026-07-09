@@ -3,7 +3,7 @@ import type { AudioSettings } from './types';
 // keybinds пустые по умолчанию (пользователь сам назначает) + глобальный хук вне приложения
 // выключен по умолчанию (disableGlobalHotkeys=true) — см. HK_RESET_V в App.tsx для форс-сброса
 // уже настроивших аккаунтов.
-const DEF: AudioSettings = { input: '', output: '', ns: true, ec: true, agc: true, mode: 'voice', pttKey: 'KeyV', master: 100, sensitivity: 10, sensitivityAuto: true, notifyVolume: 60, notif: false, notifMention: true, notifStream: true, notifUpdate: true, shareGame: true, keybinds: { muteMic: [], deafen: [] }, disableGlobalHotkeys: true };
+const DEF: AudioSettings = { input: '', output: '', nsMode: 'rnnoise', ec: true, agc: true, mode: 'voice', pttKey: 'KeyV', master: 100, sensitivity: 10, sensitivityAuto: true, notifyVolume: 60, notif: false, notifMention: true, notifStream: true, notifUpdate: true, shareGame: true, keybinds: { muteMic: [], deafen: [] }, disableGlobalHotkeys: true };
 const stored = JSON.parse(localStorage.getItem('audioSettings') || '{}');
 // keybinds/disableGlobalHotkeys — сознательно НЕ читаем из локального кэша при старте (в
 // отличие от остальных полей). Это привязано к аккаунту (см. App.tsx: GET/PUT /api/me/settings),

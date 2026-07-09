@@ -165,7 +165,7 @@ export type Presence = 'voice' | 'online' | 'offline';
 export interface AudioSettings {
   input: string;
   output: string;
-  ns: boolean;
+  nsMode: 'off' | 'basic' | 'rnnoise'; // шумоподавление: без обработки / встроенный браузерный NS / RNNoise-нейросеть
   ec: boolean;
   agc: boolean;
   mode: 'voice' | 'ptt';

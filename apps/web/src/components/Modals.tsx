@@ -410,6 +410,14 @@ function SettingsModal() {
             <div className="grp">
               <div className="gt">Микрофон</div>
               <div className="fld"><label>Устройство ввода</label><select value={s.input} onChange={(e) => upd({ input: e.target.value }, () => E?.reapplyMic())}><option value="">По умолчанию</option>{ins.map((d) => <option key={d.deviceId} value={d.deviceId}>{d.label || d.deviceId}</option>)}</select></div>
+              <div className="fld" style={{ marginTop: 10 }}><label>Шумоподавление</label>
+                <select value={s.nsMode} onChange={(e) => upd({ nsMode: e.target.value as AudioSettings['nsMode'] }, () => { E?.reapplyMic(); E?.restartLevelMeter(); })}>
+                  <option value="rnnoise">RNNoise (нейросеть)</option>
+                  <option value="basic">Базовый (браузер)</option>
+                  <option value="off">Нет</option>
+                </select>
+                <div className="mm-hint">RNNoise — нейросеть, режет фоновый гул (кулеры, гудение); Базовый — встроенный шумодав браузера; Нет — без обработки.</div>
+              </div>
               <MicMeter />
               <div className="fld" style={{ marginTop: 10 }}><label>Режим передачи</label>
                 <div className="seg"><button className={s.mode === 'voice' ? 'active' : ''} onClick={() => upd({ mode: 'voice' }, () => E?.onModeChanged())}>Активация голосом</button><button className={s.mode === 'ptt' ? 'active' : ''} onClick={() => upd({ mode: 'ptt' }, () => E?.onModeChanged())}>Push-to-Talk</button></div>
