@@ -12,6 +12,7 @@ import type { AudioSettings, InvitePreview, Role, Member, KeybindAction } from '
 import { PERM, PERM_LIST, hasPerm } from '../types';
 import { Backdrop } from './Backdrop';
 import { BroadcastModal } from './BroadcastModal';
+import { DownloadsModal } from './DownloadsModal';
 import { isTauri, setGlobalHotkeys } from '../native';
 import { enableNotifications, notifSupported, notifPermission } from '../notify';
 import { unsubscribePush, syncPushPrefs } from '../push';
@@ -527,6 +528,7 @@ export function Modals() {
     case 'settings': return <SettingsModal />;
     case 'broadcast': return <BroadcastModal />;
     case 'switchServer': return <SwitchServerModal />;
+    case 'downloads': return <DownloadsModal />;
     default: return null;
   }
 }

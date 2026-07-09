@@ -32,7 +32,7 @@ interface AppState {
   nativeUpdate: { version: string; obj: any } | null;
   emoteSize: 'sm' | 'md' | 'lg';
   toasts: Toast[];
-  modal: null | 'create' | 'join' | 'profile' | 'srvmenu' | 'invite' | 'srvsettings' | 'settings' | 'broadcast' | 'switchServer';
+  modal: null | 'create' | 'join' | 'profile' | 'srvmenu' | 'invite' | 'srvsettings' | 'settings' | 'broadcast' | 'switchServer' | 'downloads';
   joinPrefill: string;
   broadcastLive: boolean;
   unread: Record<string, number>; // непрочитанные по серверам (бейдж в рейле/таскбаре)

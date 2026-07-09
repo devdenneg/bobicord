@@ -293,6 +293,28 @@ async fn stop_broadcast(state: tauri::State<'_, BroadcastState>) -> Result<(), S
   Ok(())
 }
 
+// Журнал "Загрузки": открыть/показать в папке/проверить наличие ранее сохранённого вложения.
+// Через explorer.exe (не Win32 ShellExecuteW/tauri-plugin-shell) — без новых зависимостей и
+// без ACL-прав (std::process::Command не гейтится capabilities). explorer.exe <path> открывает
+// файл ассоциированной программой (то же, что двойной клик), explorer.exe /select,<path>
+// выделяет файл в проводнике — оба варианта не ждём (spawn, не output/wait): код возврата
+// explorer часто ненулевой даже при успехе, ориентируемся только на факт запуска процесса.
+
+#[tauri::command]
+fn open_file(path: String) -> Result<(), String> {
+  std::process::Command::new("explorer").arg(&path).spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn reveal_in_folder(path: String) -> Result<(), String> {
+  std::process::Command::new("explorer").args(["/select,", &path]).spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn paths_exist(paths: Vec<String>) -> Vec<bool> {
+  paths.iter().map(|p| std::path::Path::new(p).exists()).collect()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
@@ -320,7 +342,7 @@ pub fn run() {
       std::thread::spawn(branding::fix_shortcuts);
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![ping, list_monitors, list_windows, detect_game, set_detectable_games, start_broadcast, set_broadcast_source, stop_broadcast, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys])
+    .invoke_handler(tauri::generate_handler![ping, list_monitors, list_windows, detect_game, set_detectable_games, start_broadcast, set_broadcast_source, stop_broadcast, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys, open_file, reveal_in_folder, paths_exist])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }

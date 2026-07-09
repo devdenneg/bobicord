@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { useStore, getEngine } from '../store';
@@ -11,7 +11,8 @@ import { EmotePicker } from './EmotePicker';
 import { VoiceDock } from './VoiceDock';
 import { getSettings, setSettings } from '../settings';
 import { applyNativeUpdate } from '../nativeUpdate';
-import { isTauri, saveFileDialog } from '../native';
+import { isTauri, saveFileDialog, openFile, pathsExist } from '../native';
+import { getDownloads, addDownload, subscribeDownloads } from '../downloads';
 import type { Attachment, ChatMessage, Emote, Member, ReplyRef, Role } from '../types';
 import { PERM, hasPerm } from '../types';
 
@@ -557,15 +558,26 @@ function ImageLightbox({ src, onClose }: { src: string; onClose: () => void }) {
 // скачиванием (форс-download на сервере, см. GET /api/files/:name — не инлайн, любое расширение).
 function MessageAttachments({ files, onImageClick }: { files: Attachment[]; onImageClick: (url: string) => void }) {
   const toast = useStore((s) => s.toast);
+  const downloads = useSyncExternalStore(subscribeDownloads, getDownloads);
   const images = files.filter((f) => f.kind === 'image');
   const others = files.filter((f) => f.kind === 'file');
   const [downloading, setDownloading] = useState<number | null>(null);
   // В нативе (Tauri) — настоящий системный диалог «Сохранить как» (plugin-dialog + запись
   // байт через plugin-fs). В вебе — как и раньше: fetch() в Blob + локальная blob:-ссылка
   // (a.click(), same-document, без навигации/нового окна — <a target="_blank"> на внешний
-  // https:// origin в нативе молча блокируется, нет плагина shell/opener).
+  // https:// origin в нативе молча блокируется, нет плагина shell/opener). "Умная кнопка"
+  // (натив): повторный клик по уже скачанному вложению ОТКРЫВАЕТ файл с диска вместо повторного
+  // скачивания — если файл всё ещё на месте; если удалён/перемещён, тихо фолбэчимся на обычное
+  // скачивание. "Сохранить как" с выбором папки — при КАЖДОМ реальном скачивании (не тихо).
   async function downloadFile(i: number, f: Attachment) {
     if (downloading != null) return;
+    if (isTauri) {
+      const rec = downloads.find((d) => d.url === f.url && d.path);
+      if (rec?.path) {
+        const [exists] = await pathsExist([rec.path]);
+        if (exists) { await openFile(rec.path); return; }
+      }
+    }
     setDownloading(i);
     try {
       const r = await fetch(resolveUploadUrl(f.url));
@@ -574,7 +586,10 @@ function MessageAttachments({ files, onImageClick }: { files: Attachment[]; onIm
       if (isTauri) {
         const bytes = new Uint8Array(await blob.arrayBuffer());
         const path = await saveFileDialog(bytes, f.name);
-        if (path) toast(`Сохранено: ${f.name}`, 'ok');
+        if (path) {
+          addDownload({ url: f.url, name: f.name, size: f.size, mime: f.mime, savedAt: Date.now(), path });
+          toast(`Сохранено: ${f.name}`, 'ok');
+        }
         return;
       }
       const objUrl = URL.createObjectURL(blob);
@@ -582,6 +597,7 @@ function MessageAttachments({ files, onImageClick }: { files: Attachment[]; onIm
       a.href = objUrl; a.download = f.name;
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(objUrl), 30000);
+      addDownload({ url: f.url, name: f.name, size: f.size, mime: f.mime, savedAt: Date.now() });
       toast(`Сохранено: ${f.name}`, 'ok');
     } catch { toast(`Не удалось скачать ${f.name}`, 'err'); }
     finally { setDownloading(null); }
@@ -597,14 +613,17 @@ function MessageAttachments({ files, onImageClick }: { files: Attachment[]; onIm
           ))}
         </div>
       ) : null}
-      {others.map((f, i) => (
-        <button key={i} className="msg-file" disabled={downloading === i} onClick={() => downloadFile(i, f)}>
-          <Icon name="file" sm />
-          <span className="mf-name">{f.name}</span>
-          <span className="mf-size">{fmtSize(f.size)}</span>
-          {downloading === i ? <span className="spin" style={{ margin: 0, width: 14, height: 14 }} /> : <Icon name="download" sm />}
-        </button>
-      ))}
+      {others.map((f, i) => {
+        const already = isTauri && downloads.some((d) => d.url === f.url && d.path);
+        return (
+          <button key={i} className="msg-file" disabled={downloading === i} onClick={() => downloadFile(i, f)}>
+            <Icon name="file" sm />
+            <span className="mf-name">{f.name}</span>
+            <span className="mf-size">{fmtSize(f.size)}</span>
+            {downloading === i ? <span className="spin" style={{ margin: 0, width: 14, height: 14 }} /> : <Icon name={already ? 'open-in' : 'download'} sm />}
+          </button>
+        );
+      })}
     </div>
   );
 }
