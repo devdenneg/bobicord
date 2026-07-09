@@ -17,6 +17,14 @@ on:
       - .dockerignore
   workflow_dispatch:
 
+# Два пуша подряд запускали ДВА деплоя параллельно. Оба тегают образы `:latest` и делают
+# `docker compose pull` — если старый прогон финиширует последним, прод откатывается на
+# устаревший код. Сериализуем. cancel-in-progress: false намеренно: отмена посреди
+# `docker compose up -d` оставила бы прод в полусостоянии; лучше дождаться и накатить следом.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   IMAGE_SERVER: ghcr.io/devdenneg/bobicord-server
   IMAGE_WEB: ghcr.io/devdenneg/bobicord-web

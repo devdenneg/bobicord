@@ -5,6 +5,14 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Версия = 0.1.<git rev-list --count HEAD>, а релизы заливаются на VPS с rm:true. Два прогона
+# наперегонки: старый финиширует последним -> затирает latest.json более НИЗКОЙ версией ->
+# updater у юзеров видит откат. Сериализуем. cancel-in-progress: false — отмена посреди scp
+# оставила бы releases/ пустым (updater ловил бы 404).
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: windows-latest
