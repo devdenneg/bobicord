@@ -95,6 +95,7 @@ export class Engine {
   private voiceConnecting = false; // оптимистично зашли в канал, но mic ещё публикуется
   private lastVclaim = 0; // когда мы сами заявили голос (для tie-break гонки claim'ов между своими сессиями)
   private currentVc: string | null = null; // id голосового канала, в котором я сейчас (несколько каналов на сервер)
+  private myChannelPeers = new Set<string>(); // кто в моём голосовом канале (диф → entry/exit при входе/выходе/смене канала)
   private roomReady = false; // true только после успешного await r.connect() (не просто наличие объекта Room)
   private reconnecting = false;
   private connQuality: VoiceQuality = 'unknown'; // качество связи (обновляется по событию LiveKit)
@@ -309,7 +310,7 @@ export class Engine {
     r.on(RoomEvent.TrackSubscribed, (track, pub, p) => this.onSub(track, pub, p, r))
       .on(RoomEvent.TrackUnsubscribed, (track, pub, p) => this.onUnsub(track, pub, p, r))
       .on(RoomEvent.ParticipantConnected, (p) => { if (r === this.viewRoom) { const u = baseUid(p.identity); if (u !== this.me.username && !this.hasOtherSession(u, p.identity)) this.hooks.toast((p.name || u) + ' в сети', 'ok'); this.hooks.peerJoined(u); } this.emit(); })
-      .on(RoomEvent.ParticipantDisconnected, (p) => { if (r === this.viewRoom) { const u = baseUid(p.identity); if (!this.hasOtherSession(u, p.identity)) this.cleanupPeer(u); } this.emit(); })
+      .on(RoomEvent.ParticipantDisconnected, (p) => { if (r === this.viewRoom) { const u = baseUid(p.identity); if (!this.hasOtherSession(u, p.identity)) this.cleanupPeer(u); } if (r === this.voiceRoom) this.reconcileChannelSounds(); this.emit(); })
       // звук мута слышен только самому мутящемуся — играем при локальном событии МОЕГО голосового трека
       .on(RoomEvent.TrackMuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.voiceRoom?.localParticipant && !this.deafToggling) playSound('mute'); this.emit(); })
       .on(RoomEvent.Reconnecting, () => { this.reconnecting = true; this.hooks.toast('Связь потеряна — переподключаюсь…', 'warn'); this.emit(); })
@@ -337,7 +338,7 @@ export class Engine {
       .on(RoomEvent.TrackUnpublished, (pub, p) => { if (r === this.voiceRoom) this.onRemoteUnpub(pub, p); })
       // пир сменил vc → пере-подписка на его микрофон, только в voiceRoom (в viewRoom чужого сервера
       // микрофоны не слушаю). Дисплей ростера обновляет emit() (build читает vc из соответствующей комнаты).
-      .on(RoomEvent.ParticipantAttributesChanged, (_changed, p) => { if (p !== r.localParticipant && r === this.voiceRoom) this.reconcilePeerAudio(p as Participant); this.emit(); })
+      .on(RoomEvent.ParticipantAttributesChanged, (_changed, p) => { if (p !== r.localParticipant && r === this.voiceRoom) { this.reconcilePeerAudio(p as Participant); this.reconcileChannelSounds(); } this.emit(); })
       .on(RoomEvent.DataReceived, (payload) => this.onData(payload, r));
     await r.connect(url, token, { autoSubscribe: false });
     this.roomReady = true; // комната реально поднялась — можно снимать скелетоны голосового/сцены
@@ -348,7 +349,7 @@ export class Engine {
     // selfHeal сами выбирают view/voice). connect зовётся на каждую смену смотримого сервера → чистим
     // прежний, чтобы не плодить таймеры при браузинге в голосе. self-heal vc/подписок — см. selfHealVc.
     if (this.presenceTimer) clearInterval(this.presenceTimer);
-    this.presenceTimer = window.setInterval(() => { this.announceWatch(); this.cleanupWatchers(); if (this.inVoice) this.reconcileAllAudio(); this.selfHealVc(); }, 3000);
+    this.presenceTimer = window.setInterval(() => { this.announceWatch(); this.cleanupWatchers(); if (this.inVoice) { this.reconcileAllAudio(); this.reconcileChannelSounds(); } this.selfHealVc(); }, 3000);
     // Детект игры (натив): раз в 10с публикуем участник-атрибуты game/gicon → все видят «играет в X».
     if (isTauri) { if (this.gameTimer) clearInterval(this.gameTimer); this.pollGame(); this.gameTimer = window.setInterval(() => this.pollGame(), 10000); }
     this.emit();
@@ -479,6 +480,28 @@ export class Engine {
     if (!want) this.detachAnalyser(baseUid(p.identity));
   }
   private reconcileAllAudio() { this.voiceRoom?.remoteParticipants.forEach((p) => this.reconcilePeerAudio(p)); }
+  // Кто СЕЙЧАС в МОЁМ голосовом канале (base username). Для entry/exit при их входе/выходе — в т.ч. при
+  // СМЕНЕ канала: там мик не пере-публикуется (нет TrackPublished/Unpublished), меняется только vc-атрибут.
+  private currentChannelPeers(): Set<string> {
+    const s = new Set<string>();
+    if (!this.inVoice || !this.currentVc || !this.voiceRoom) return s;
+    this.voiceRoom.remoteParticipants.forEach((p) => {
+      const u = baseUid(p.identity);
+      if (u !== this.me.username && (p as any).attributes?.vc === this.currentVc) s.add(u);
+    });
+    return s;
+  }
+  // Диф членства моего канала → entry для вошедших, exit для вышедших (работает и на смену канала другими,
+  // и когда я сам переключаюсь — у тех, в чьём канале это отражается). seedOnly — заполнить БЕЗ звука
+  // (первичный вход / смена своего канала: не проигрывать entry по всем, кто уже был там).
+  private reconcileChannelSounds(seedOnly = false) {
+    const cur = this.currentChannelPeers();
+    if (!seedOnly) {
+      cur.forEach((u) => { if (!this.myChannelPeers.has(u)) playSound('entry'); });
+      this.myChannelPeers.forEach((u) => { if (!cur.has(u)) playSound('exit'); });
+    }
+    this.myChannelPeers = cur;
+  }
   // Self-heal публикации своего vc/deaf. Если опубликованный participant-атрибут не совпадает с
   // текущим состоянием — пере-заявляем. Симптом без этого: initial setAttributes({vc}) в joinVoice
   // мог не долететь до сервера (гонка при оптимистичном входе до готовности комнаты / rate-limit
@@ -573,6 +596,7 @@ export class Engine {
       this.hooks.toast('Нет доступа к микрофону', 'err'); this.emit(); return;
     }
     this.reconcileAllAudio(); // подписываемся на пиров этого же канала (bootstrap мик-подписок)
+    this.reconcileChannelSounds(true); // сеем состав канала БЕЗ звука (не проигрываем entry по всем, кто уже там)
     this.startConnPoll();
     this.lastVclaim = Date.now();
     this.dataSend({ t: 'vclaim', uid: this.me.id, session: this.sessionId() }); // забираем голос у своих других сессий (одна голосовая на аккаунт)
@@ -586,6 +610,7 @@ export class Engine {
     this.currentVc = channelId;
     try { await this.voiceRoom.localParticipant.setAttributes({ vc: channelId }); } catch { /**/ }
     this.reconcileAllAudio();
+    this.reconcileChannelSounds(true); // пере-сеем состав НОВОГО канала БЕЗ звука (мне не нужен бурст entry; другие услышат МЕНЯ через смену vc-атрибута)
     playSound('entry');
     this.emit();
   }
@@ -594,6 +619,7 @@ export class Engine {
     const vr = this.voiceRoom; // фиксируем: ниже обнулим указатель (и, возможно, порвём комнату)
     // оптимистично: сразу убираем себя из канала (UI не ждёт async-очистку mic/треков)
     this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.deafened = false; this.manualMute = false; this.pttDown = false;
+    this.myChannelPeers.clear(); // вышел — состав моего канала сброшен (другие услышат мой выход по unpub мика / vc'')
     playSound('exit'); // сам вышедший тоже слышит выход (остальные в канале — через onRemoteUnpub)
     this.emit();
     this.stopConnPoll();
@@ -889,13 +915,13 @@ export class Engine {
       // подписываемся на микрофон только если я в голосовом, НЕ оглох и пир в ТОМ ЖЕ канале
       if (!own && this.inVoice && !this.deafened && !!this.currentVc && (p as any).attributes?.vc === this.currentVc) {
         try { (pub as any).setSubscribed(true); } catch { /**/ }
-        if (!silent) playSound('entry');
       }
+      if (!own) this.reconcileChannelSounds(!!silent); // entry при живом входе пира в мой канал; seed на bootstrap (silent=true)
       this.emit();
     }
   };
   private onRemoteUnpub = (pub: TrackPublication, p: RemoteParticipant) => {
-    if (pub.source === Track.Source.Microphone && this.inVoice && baseUid(p.identity) !== this.me.username) playSound('exit'); // вышел из голосового
+    if (pub.source === Track.Source.Microphone) this.reconcileChannelSounds(); // exit если пир был в моём канале (вышел из голоса)
     this.emit();
   };
   private onSub = (track: RemoteTrack, pub: TrackPublication, p: RemoteParticipant, room?: Room) => {
