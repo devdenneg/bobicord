@@ -741,7 +741,17 @@ export class Engine {
     if (getSettings().nsMode === 'rnnoise') {
       this.micDenoise = await createDenoiseNode(ctx);
       if (this.micActx !== ctx) { destroyDenoiseNode(this.micDenoise); this.micDenoise = null; return; }
-      if (this.micDenoise) { src.connect(this.micDenoise); preGate = this.micDenoise; }
+      if (this.micDenoise) {
+        src.connect(this.micDenoise);
+        // RnnoiseWorkletNode(maxChannels:1) реально пишет обработанный сигнал только в канал 0
+        // своего выхода — канал 1 остаётся тишиной. Без явного сплита узел ниже по графу видит
+        // "2-канальный" выход с тишиной в правом, и апмикс на publish даёт звук в одно (левое) ухо.
+        // ChannelSplitterNode().connect(next) без явного output-индекса берёт ИМЕННО output 0 —
+        // чистый моно-сигнал канала 0, который затем штатно дублируется в оба канала на publish.
+        const split = this.micActx.createChannelSplitter(2);
+        this.micDenoise.connect(split);
+        preGate = split;
+      }
       else this.hooks.toast('Шумодав недоступен — звук без обработки', 'warn');
     }
     this.micGain = this.micActx.createGain();
@@ -878,7 +888,14 @@ export class Engine {
       let preAnalyser: AudioNode = this.levelSrc;
       if (getSettings().nsMode === 'rnnoise') {
         this.levelDenoise = await createDenoiseNode(this.levelCtx);
-        if (this.levelDenoise) { this.levelSrc.connect(this.levelDenoise); preAnalyser = this.levelDenoise; }
+        if (this.levelDenoise) {
+          this.levelSrc.connect(this.levelDenoise);
+          // см. startMic() — RnnoiseWorkletNode пишет только в канал 0, канал 1 тишина; без
+          // сплита анализатор усреднял бы вдвое заниженный уровень (0.5*(L+0)).
+          const split = this.levelCtx.createChannelSplitter(2);
+          this.levelDenoise.connect(split);
+          preAnalyser = split;
+        }
         else this.hooks.toast('Шумодав недоступен — звук без обработки', 'warn');
       }
       // застали остановку/переключение режима, пока грузился denoise — не подключаем осиротевший граф
