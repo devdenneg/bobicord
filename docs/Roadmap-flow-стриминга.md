@@ -114,7 +114,7 @@
 
 ## Д2 — Спайк серверного транскода (одна рендишн по ручному триггеру)
 
-**Статус:** ⬜ не начат
+**Статус:** 🟡 код готов, компиляция/симуляция зелёные; **латентность и CPU ЕЩЁ НЕ ЗАМЕРЕНЫ** (блокирующий AC — снимает пользователь на VPS с реальным вещателем, см. ниже)
 **Цель / механизмы ТЗ:** снять главный технический риск — конвейер RTP→ffmpeg→RTP внутри vrelay — до переделки деревьев.
 
 **Работы:**
@@ -128,11 +128,63 @@
 **Риски (главный майлстоун проекта):** тонкости RTP через локальный UDP (порядок пакетов, нет FEC — допустимо на лупбеке); Rust только через CI — закладывать время; провал латентности → план Б (GStreamer / нативный x264-биндинг) решается ЗДЕСЬ, до Д3.
 
 ### Выполнено:
-- —
+- **`apps/relay-core/src/transcode.rs` (НОВЫЙ)** — конвейер RTP→ffmpeg→RTP. `Feed` дублирует
+  входной видео-RTP в локальный UDP (sync non-blocking, pt форсится 102). ffmpeg: `libx264
+  -preset superfast -tune zerolatency` baseline, CBR+HRD (`nal-hrd=cbr:force-cfr=1`,
+  minrate=maxrate=bufsize=битрейт), scale без апскейла (`min(iw,W)/min(ih,H)
+  :force_original_aspect_ratio=decrease:force_divisible_by=2`), GOP 60, `-bf 0`, вывод
+  `-f rtp ...?pkt_size=1200 -payload_type 102`. Opus НЕ транскодируется. Надзор через
+  `tokio::process` (рестарт с backoff, лимит 10; `kill_on_drop` + явный kill; глобальный
+  кап `VRELAY_MAX_TRANSCODES`, дефолт 2). **Измеримость:** per-frame латентность по
+  marker-биту (EWMA), CPU из `/proc/<pid>/stat` (`#[cfg(linux)]`), счётчики in/out/restart —
+  всё префиксом `[transcode]`, лог раз в 3с.
+- **`relay.rs`** — врезка в on_track-цикл: при активном рендишне видео-RTP дублируется в feed
+  (гейт `feed_count`, 0 = passthrough как раньше, инвариант source цел). `RelayManager`
+  получил `renditions`/`video_feeds`; методы `start_rendition`/`stop_rendition`. Новый
+  `start_rendition_root` — джойн в дерево `streamId::rendition` как broadcaster(virtual),
+  фанаут транскод-видео + passthrough-audio источника. `RelayControl::Start/StopRendition`
+  + `RelayHandle::start_rendition/stop_rendition` (+ derive Clone). Шапка обновлена. При
+  старте рендишна — `request-keyframe` корню (без IDR ffmpeg не декодирует).
+- **`apps/relay/src/main.rs`** — control `vrelay-rendition-start/stop`: реюз ingest-сессии
+  как источника транскода + спавн рендишн-корня; дедуп по `streamId::rendition`; гашение
+  рендишнов вслед за ingest-сессией/по release. SIGINT гасит и рендишны.
+- **`apps/relay/Dockerfile`** — ffmpeg в runtime-слой (`--no-install-recommends`, чистка apt).
+- **`apps/server/tree.js`** — DEV-триггер `dev-rendition` (гейт `TREE_DEV_RENDITION=1`) →
+  шлёт агенту `vrelay-rendition-start/stop`. Помечен `DEV-ТРИГГЕР Д2, удаляется в Д8`.
+- **`apps/relay-core/examples/transcode_smoke.rs` (НОВЫЙ)** — offline-смоук: testsrc→H.264-RTP
+  → наш Feed → transcode → проверка out_pkts>0 + печать латентности. Требует ffmpeg.
+- **Верификация:** `cargo check` relay-core / relay / native — все EXIT 0 (натив реэкспортит
+  relay-core, компилится); `cargo check --examples` relay-core EXIT 0; `node --check tree.js`
+  чисто; `node tree-sim.js` зелёный (legacy-регрессия цела). `Cargo.lock` натива не тронут
+  (пре-существующий дрейф синкается в CI).
+- **⚠ НЕ ЗАМЕРЕНО ЛОКАЛЬНО (блокирующий AC):** добавка латентности транскода (цель ≤300 мс),
+  CPU ffmpeg 720p30, живая 480p-картинка зрителю. Нет VPS/вещателя/ffmpeg локально. Снимает
+  пользователь на VPS:
+  1. Деплой (в окно без стримов), env `TREE_SERVER_FIRST=1`, `TREE_DEV_RENDITION=1`.
+  2. Нативный вещатель стримит → ingest-сессия поднята.
+  3. Из dev-консоли послать в /tree (авторизованный WS) `{t:'dev-rendition', streamId:'<id>', rendition:'480'}`.
+  4. Снять цифры: `docker compose logs token 2>&1 | grep '\[transcode\]'` (latency≈/cpu=/in_pps/out_pps/restarts).
+  5. Смотреть `streamId::480` вторым зрителем (dev) — проверить живую картинку.
+  6. Записать latency/CPU СЮДА; если latency >300 мс — решение о плане Б до Д3.
 ### Проблемы:
-- —
+- Локально не собрать/не прогнать живьём: нет Rust-toolchain для natив (только CI), нет
+  ffmpeg на dev-машине (smoke-пример написан, но локально не запускался), нет VPS/вещателя.
 ### Решения:
-- —
+- **Канал rendition-команд — control-WS агента** (рядом с `vrelay-ingest`), НЕ per-stream
+  tree-сессия: `rendition-start` адресован streamId с уже поднятой ingest-сессией; агент
+  достаёт её `RelayHandle` из своей карты `streams` и дёргает `start_rendition` (oneshot-ответ
+  с треками), затем спавнит отдельный рендишн-корень. Так «сервер→агент» и доступ к живой
+  ingest-сессии совмещены без нового сокета.
+- **Транскод живёт на ingest-сессии, рендишн-корень — отдельная сессия**: треки шарятся через
+  `Arc<TrackLocalStaticRTP>` (транскод пишет, корень фанаутит). Audio — тот же passthrough
+  Arc источника (Opus через ffmpeg НЕ идёт); A/V-рассинхрон на добавку латентности транскода
+  допустим для спайка.
+- **Гейт транскода — `feed_count`/`RelayConfig.virtual_relay`-путь**: нативный passthrough-узел
+  рендишны не поднимает (их шлёт только vrelay-агент), горячий on_track-путь при 0 рендишнов
+  берёт быстрый atomic-гейт без лока — passthrough не деградирует.
+- **Keyframe при старте рендишна** — `request-keyframe` корню source-дерева (реюз механизма
+  relay-core); дальше рендишн держит свой GOP 60 (2с) — новый зритель рендишна ждёт ≤2с, IDR
+  форсить в рендишн-дереве нечем (мы не энкодер-источник, а ffmpeg с фиксированным GOP).
 
 ---
 

@@ -65,6 +65,12 @@ const VRELAY_TARGET = 'vrelay';    // сентинел targetParentId в request
 // legacy даже при TREE_SERVER_FIRST=1 (обратная совместимость, см. Деплой-дисциплина роадмапа).
 const SERVER_FIRST = process.env.TREE_SERVER_FIRST === '1';
 
+// DEV-ТРИГГЕР Д2 (удаляется в Д8): ручной подъём/гашение ОДНОЙ транскод-рендишн-сессии на
+// vrelay, чтобы глазами проверить конвейер RTP→ffmpeg→RTP до переделки деревьев (Д3/Д4).
+// Гейт TREE_DEV_RENDITION=1 (по умолчанию выкл). Составной ключ streamId::rendition и
+// полноценный реестр рендишнов — это Д3/Д4, здесь только «дёрнуть агента и увидеть картинку».
+const DEV_RENDITION = process.env.TREE_DEV_RENDITION === '1';
+
 function newPeerId() { return 'p_' + crypto.randomBytes(6).toString('hex'); }
 
 // Лог жизненного цикла дерева (join/leave/reparent/heartbeat/ABR/vrelay) в stdout →
@@ -816,6 +822,24 @@ function attachTreeServer(httpServer, opts) {
     send(t.broadcasterId, { t: 'request-keyframe', streamId: p.streamId });
   }
 
+  // DEV-ТРИГГЕР Д2 (удаляется в Д8): шлём агенту vrelay команду поднять/погасить рендишн.
+  // Гейт DEV_RENDITION. streamId — базовый id живого стрима (ingest-сессия уже поднята Д1).
+  // msg: { t:'dev-rendition', streamId, rendition?='480', stop?, presetBitrate? }.
+  function onDevRendition(id, msg) {
+    if (!DEV_RENDITION) return;
+    const streamId = msg.streamId;
+    const rendition = typeof msg.rendition === 'string' ? msg.rendition : '480';
+    if (!streamId) return;
+    let agent = null;
+    for (const p of peers.values()) if (p.isVrelayAgent && p.ws.readyState === p.ws.OPEN) { agent = p; break; }
+    if (!agent) { tlog(`[${streamId}] DEV-rendition: агент vrelay не подключён`); return; }
+    const t = mgr.trees.get(streamId);
+    const bc = t && t.broadcasterId ? t.nodes.get(t.broadcasterId) : null;
+    const type = msg.stop ? 'vrelay-rendition-stop' : 'vrelay-rendition-start';
+    tlog(`[${streamId}] DEV-rendition ${type} rendition=${rendition} -> агент ${agent.id}`);
+    send(agent.id, { t: type, streamId, rendition, presetBitrate: Number(msg.presetBitrate) || 0, serverId: bc ? bc.serverId : (msg.serverId || null) });
+  }
+
   function onLeave(id, reason = 'leave') {
     const p = peers.get(id);
     if (!p || !p.streamId) { peers.delete(id); return; }
@@ -873,6 +897,7 @@ function attachTreeServer(httpServer, opts) {
       else if (msg.t === 'request-reparent') onRequestReparent(id, msg);
       else if (msg.t === 'request-keyframe') onRequestKeyframe(id);
       else if (msg.t === 'vrelay-hello') onVrelayHello(id, msg);
+      else if (msg.t === 'dev-rendition') onDevRendition(id, msg); // DEV-ТРИГГЕР Д2 (гейт внутри)
     });
     // code 1006 = грязный обрыв TCP (без close-фрейма): краш клиента, потеря сети,
     // heartbeat-terminate (см. hbTimer — он логирует свой terminate отдельно).

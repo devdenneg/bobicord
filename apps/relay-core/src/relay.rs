@@ -8,14 +8,20 @@
 //
 // Keyframe: relay сам IDR не генерит (не энкодит) — при подключении нового ребёнка просит
 // keyframe у корня через сервер (request-keyframe -> tree.js -> broadcaster force IDR).
+//
+// Roadmap-flow-стриминга Д2: ОПЦИОНАЛЬНАЯ транскод-ветка — ТОЛЬКО для vrelay-рендишнов.
+// source-фанаут остаётся passthrough (инвариант не нарушён для нативного узла); при активной
+// рендишн-сессии видео-RTP от родителя ДУБЛИРУЕТСЯ в локальный ffmpeg (transcode.rs), а его
+// выход раздаётся отдельной рендишн-сессией (start_rendition_root). Нативный клиент рендишны
+// не поднимает никогда (их дёргает только vrelay-агент через ctrl).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
 use webrtc::api::{APIBuilder, API};
@@ -37,6 +43,7 @@ use webrtc::track::track_remote::TrackRemote;
 
 use crate::link::{now_ms, parse_ice_server, read_link_stats, H264_FMTP};
 use crate::signaling::{self, JoinParams, TreeCmd, TreeEvent};
+use crate::transcode::{self, Feed, Transcode};
 
 /// Сток UI-событий хоста: (event, payload). В нативе — обёртка над `AppHandle::emit`
 /// (события relay-watch-offer/-ice/relay-topology для webview); None — headless, локальный
@@ -66,13 +73,23 @@ pub struct RelayConfig {
 
 /// Управляющие сообщения в relay-цикл от хоста (в нативе — Tauri-команды: сигналинг
 /// локального webview PC приходит из JS через invoke; остановка — из stop_watch).
+/// Ответ на StartRendition: транскод-трек видео (H.264 рендишн) + passthrough audio-трек
+/// источника (Opus не транскодируется). vrelay отдаёт их в start_rendition_root.
+type RenditionTracks = (Arc<TrackLocalStaticRTP>, Arc<TrackLocalStaticRTP>);
+
 pub enum RelayControl {
     WebviewAnswer { sdp: String },
     WebviewIce { candidate: Value },
     RequestReparent { target: Option<String> },
+    /// Д2: поднять транскод-рендишн на ЭТОЙ (ingest) сессии. Ответ — рендишн-треки для
+    /// отдельной рендишн-сессии. Только для vrelay (нативный узел эти ctrl не шлёт).
+    StartRendition { rendition: String, bitrate: u32, reply: oneshot::Sender<Result<RenditionTracks, String>> },
+    /// Д2: погасить транскод-рендишн.
+    StopRendition { rendition: String },
     Stop,
 }
 
+#[derive(Clone)]
 pub struct RelayHandle {
     ctrl_tx: mpsc::UnboundedSender<RelayControl>,
     finished: Arc<Notify>,
@@ -84,6 +101,15 @@ impl RelayHandle {
     pub fn webview_ice(&self, candidate: Value) { let _ = self.ctrl_tx.send(RelayControl::WebviewIce { candidate }); }
     pub fn request_reparent(&self, target: Option<String>) { let _ = self.ctrl_tx.send(RelayControl::RequestReparent { target }); }
     pub fn stop(&self) { let _ = self.ctrl_tx.send(RelayControl::Stop); }
+    /// Д2: просит ingest-сессию поднять транскод-рендишн, ждёт его треки (или ошибку —
+    /// нет источника/лимит транскодов). Используется vrelay-агентом.
+    pub async fn start_rendition(&self, rendition: String, bitrate: u32) -> Result<RenditionTracks, String> {
+        let (reply, rx) = oneshot::channel();
+        self.ctrl_tx.send(RelayControl::StartRendition { rendition, bitrate, reply })
+            .map_err(|_| "relay-сессия закрыта".to_string())?;
+        rx.await.map_err(|_| "relay-сессия закрыта до ответа".to_string())?
+    }
+    pub fn stop_rendition(&self, rendition: String) { let _ = self.ctrl_tx.send(RelayControl::StopRendition { rendition }); }
     /// Завершение relay-цикла (leave отправлен, PC закрыты). Один ожидающий: notify_one
     /// хранит один пермит, так что notified() сработает и если цикл кончился раньше await.
     pub fn finished(&self) -> Arc<Notify> { self.finished.clone() }
@@ -108,6 +134,13 @@ struct RelayManager {
     upstream_state: Arc<AtomicU8>,
     /// Момент последней смены upstream_state (мс) — чтобы отмерить длительность Disconnected.
     upstream_since_ms: Arc<AtomicU64>,
+    /// Д2: активные транскод-рендишны (rendition -> Transcode). Только vrelay-ingest сессия.
+    renditions: HashMap<String, Transcode>,
+    /// Д2: входы транскодов (rendition -> Feed) — читает on_track-цикл, дублируя видео-RTP
+    /// в ffmpeg. Shared Arc: on_track-задачи спавнятся при каждом (ре)коннекте к родителю.
+    video_feeds: Arc<Mutex<HashMap<String, Arc<Feed>>>>,
+    /// Быстрый гейт для горячего пути on_track: 0 = ни одного рендишна, лок не берём.
+    feed_count: Arc<AtomicUsize>,
 }
 
 // Кодировка upstream_state.
@@ -116,7 +149,9 @@ const UP_DISCONNECTED: u8 = 2;
 const UP_FAILED: u8 = 3;
 
 impl RelayManager {
-    fn new(stream_id: String, cmd_tx: mpsc::UnboundedSender<TreeCmd>, ui: Option<UiSink>) -> Result<Self, String> {
+    /// `injected` (Д2 рендишн-корень): готовые треки (транскод-видео + passthrough-audio)
+    /// вместо новых — фанаут рендишна берёт медиа из ffmpeg, а не из upstream.
+    fn new(stream_id: String, cmd_tx: mpsc::UnboundedSender<TreeCmd>, ui: Option<UiSink>, injected: Option<RenditionTracks>) -> Result<Self, String> {
         let mut m = MediaEngine::default();
         m.register_codec(
             RTCRtpCodecParameters {
@@ -150,16 +185,21 @@ impl RelayManager {
         let registry = register_default_interceptors(Registry::new(), &mut m).map_err(|e| e.to_string())?;
         let api = APIBuilder::new().with_media_engine(m).with_interceptor_registry(registry).build();
 
-        let video_track = Arc::new(TrackLocalStaticRTP::new(
-            RTCRtpCodecCapability { mime_type: MIME_TYPE_H264.to_owned(), clock_rate: 90000, sdp_fmtp_line: H264_FMTP.to_owned(), ..Default::default() },
-            "video".to_owned(),
-            stream_id.clone(),
-        ));
-        let audio_track = Arc::new(TrackLocalStaticRTP::new(
-            RTCRtpCodecCapability { mime_type: MIME_TYPE_OPUS.to_owned(), clock_rate: 48000, channels: 2, ..Default::default() },
-            "audio".to_owned(),
-            stream_id.clone(),
-        ));
+        let (video_track, audio_track) = match injected {
+            Some((v, a)) => (v, a),
+            None => (
+                Arc::new(TrackLocalStaticRTP::new(
+                    RTCRtpCodecCapability { mime_type: MIME_TYPE_H264.to_owned(), clock_rate: 90000, sdp_fmtp_line: H264_FMTP.to_owned(), ..Default::default() },
+                    "video".to_owned(),
+                    stream_id.clone(),
+                )),
+                Arc::new(TrackLocalStaticRTP::new(
+                    RTCRtpCodecCapability { mime_type: MIME_TYPE_OPUS.to_owned(), clock_rate: 48000, channels: 2, ..Default::default() },
+                    "audio".to_owned(),
+                    stream_id.clone(),
+                )),
+            ),
+        };
 
         Ok(Self {
             api,
@@ -176,7 +216,43 @@ impl RelayManager {
             last_kf_ms: Arc::new(AtomicU64::new(0)),
             upstream_state: Arc::new(AtomicU8::new(0)),
             upstream_since_ms: Arc::new(AtomicU64::new(0)),
+            renditions: HashMap::new(),
+            video_feeds: Arc::new(Mutex::new(HashMap::new())),
+            feed_count: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// Д2: поднять транскод-рендишн на этой (ingest) сессии. Дублирует входное видео в
+    /// ffmpeg, возвращает рендишн-видео-трек + passthrough audio-трек источника для
+    /// отдельной рендишн-сессии. Идемпотентна по имени рендишна.
+    async fn start_rendition(&mut self, rendition: String, bitrate: u32) -> Result<RenditionTracks, String> {
+        if self.renditions.contains_key(&rendition) {
+            return Err(format!("рендишн {rendition} уже активен"));
+        }
+        let rtrack = Arc::new(TrackLocalStaticRTP::new(
+            transcode::h264_cap(),
+            "video".to_owned(),
+            format!("{}::{}", self.stream_id, rendition),
+        ));
+        let (tc, feed) = Transcode::start(&rendition, bitrate, rtrack.clone()).await?;
+        self.video_feeds.lock().unwrap().insert(rendition.clone(), Arc::new(feed));
+        self.feed_count.store(self.video_feeds.lock().unwrap().len(), Ordering::Relaxed);
+        self.renditions.insert(rendition.clone(), tc);
+        // Без IDR от источника ffmpeg не начнёт декодировать — просим keyframe у корня
+        // (tree.js форвардит вещателю). Rate-limit на дереве прикроет от шторма.
+        let _ = self.cmd_tx.send(TreeCmd::RequestKeyframe);
+        log::info!("relay: рендишн {rendition} поднят (транскод активен)");
+        Ok((rtrack, self.audio_track.clone()))
+    }
+
+    /// Д2: погасить транскод-рендишн (kill ffmpeg, снять feed).
+    async fn stop_rendition(&mut self, rendition: &str) {
+        self.video_feeds.lock().unwrap().remove(rendition);
+        self.feed_count.store(self.video_feeds.lock().unwrap().len(), Ordering::Relaxed);
+        if let Some(tc) = self.renditions.remove(rendition) {
+            tc.stop();
+            log::info!("relay: рендишн {rendition} снят");
+        }
     }
 
     fn set_ice_servers(&mut self, servers: &[Value]) {
@@ -202,9 +278,15 @@ impl RelayManager {
         // те уже привязаны к downstream PC (дети + webview) и фанаутятся туда.
         let video_local = self.video_track.clone();
         let audio_local = self.audio_track.clone();
+        // Д2: горячий путь дублирования видео-RTP в транскод(ы). feed_count — быстрый гейт
+        // (0 = ни одного рендишна → лок не берём, passthrough как раньше, инвариант цел).
+        let video_feeds = self.video_feeds.clone();
+        let feed_count = self.feed_count.clone();
         pc.on_track(Box::new(move |track: Arc<TrackRemote>, _r: Arc<RTCRtpReceiver>, _t: Arc<RTCRtpTransceiver>| {
             let video_local = video_local.clone();
             let audio_local = audio_local.clone();
+            let video_feeds = video_feeds.clone();
+            let feed_count = feed_count.clone();
             Box::pin(async move {
                 let is_video = track.kind() == RTPCodecType::Video;
                 tokio::spawn(async move {
@@ -217,6 +299,10 @@ impl RelayManager {
                                     if webrtc::Error::ErrClosedPipe.to_string() != e.to_string() {
                                         log::debug!("relay: write_rtp: {e}");
                                     }
+                                }
+                                // Д2: побочная ветка транскода — не мешает passthrough выше.
+                                if is_video && feed_count.load(Ordering::Relaxed) > 0 {
+                                    for f in video_feeds.lock().unwrap().values() { f.send_video(&packet); }
                                 }
                             }
                             Err(_) => break, // upstream закрылся
@@ -466,6 +552,10 @@ impl RelayManager {
         if let Some(pc) = self.upstream.take() { let _ = pc.close().await; }
         if let Some(pc) = self.webview.take() { let _ = pc.close().await; }
         for (_, pc) in self.children.drain() { let _ = pc.close().await; }
+        // Д2: гасим ffmpeg-транскоды (kill), иначе зомби-процессы на VPS.
+        self.video_feeds.lock().unwrap().clear();
+        self.feed_count.store(0, Ordering::Relaxed);
+        for (_, tc) in self.renditions.drain() { tc.stop(); }
     }
 }
 
@@ -482,7 +572,7 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
     let (cmd_tx, mut evt_rx) = signaling::connect(ws_url, join, reconnect);
 
     tokio::spawn(async move {
-        let mut mgr = match RelayManager::new(stream_id, cmd_tx, ui) {
+        let mut mgr = match RelayManager::new(stream_id, cmd_tx, ui, None) {
             Ok(m) => m,
             Err(e) => { log::error!("relay: init: {e}"); fin.notify_one(); return; }
         };
@@ -540,6 +630,12 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
                         Some(RelayControl::WebviewAnswer { sdp }) => mgr.on_webview_answer(sdp).await,
                         Some(RelayControl::WebviewIce { candidate }) => mgr.on_webview_ice(candidate).await,
                         Some(RelayControl::RequestReparent { target }) => { let _ = mgr.cmd_tx.send(TreeCmd::RequestReparent { target }); }
+                        // Д2: транскод-рендишн на ingest-сессии (только vrelay дёргает).
+                        Some(RelayControl::StartRendition { rendition, bitrate, reply }) => {
+                            let res = mgr.start_rendition(rendition, bitrate).await;
+                            let _ = reply.send(res);
+                        }
+                        Some(RelayControl::StopRendition { rendition }) => mgr.stop_rendition(&rendition).await,
                         Some(RelayControl::Stop) | None => break,
                     }
                 }
@@ -602,6 +698,72 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
         if watch_ended {
             if let Some(ui) = &mgr.ui { ui("relay-watch-ended", json!({ "streamId": mgr.stream_id })); }
         }
+        fin.notify_one();
+    });
+
+    RelayHandle { ctrl_tx, finished }
+}
+
+/// Roadmap-flow-стриминга Д2 (dev-путь): рендишн-КОРЕНЬ — джойнится в дерево
+/// `streamId::rendition` как broadcaster (virtual:true) и фанаутит уже готовые треки
+/// (транскод-видео + passthrough-audio источника) прямым зрителям. Медиа НЕ из upstream, а
+/// из ffmpeg ingest-сессии (треки переданы извне). Отдельный слим-цикл: у корня нет
+/// родителя/webview/ABR/watchdog — только фанаут детям. Полноценные рендишн-деревья с
+/// реестром/гашением — Д3/Д4; здесь минимум, чтобы глазами увидеть транскод-картинку.
+pub fn start_rendition_root(cfg: RelayConfig, video: Arc<TrackLocalStaticRTP>, audio: Arc<TrackLocalStaticRTP>) -> RelayHandle {
+    let RelayConfig { stream_id, ws_url, identity, server_id, max_children, virtual_relay, available_outgoing: _, idle_exit: _, reconnect } = cfg;
+    let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<RelayControl>();
+    let finished = Arc::new(Notify::new());
+    let fin = finished.clone();
+
+    // role=broadcaster → tree.js делает узел корнем дерева streamId::rendition. native:true
+    // (иначе capacityOf=0). ВАЖНО: virtual:false — рендишн-корень НЕ виртуал-узел: с
+    // virtual:true tree.js в ensureVirtualAttached сделал бы его собственным родителем/ребёнком
+    // (self-loop, findVirtual==broadcaster). Как обычный натив-broadcaster он проходит мимо
+    // всей virtual-логики (ensureVirtualAttached/drainTimer/findVirtual). virtual_relay из cfg
+    // игнорируем осознанно.
+    let _ = virtual_relay;
+    let join = JoinParams { stream_id: stream_id.clone(), identity, server_id, role: "broadcaster", native: true, max_children, max_bitrate: 0, abr: false, virtual_relay: false, server_ingest: false, app_name: None, app_icon: None };
+    let (cmd_tx, mut evt_rx) = signaling::connect(ws_url, join, reconnect);
+
+    tokio::spawn(async move {
+        let mut mgr = match RelayManager::new(stream_id.clone(), cmd_tx, None, Some((video, audio))) {
+            Ok(m) => m,
+            Err(e) => { log::error!("relay: рендишн-корень init: {e}"); fin.notify_one(); return; }
+        };
+        log::info!("relay: рендишн-корень {stream_id} поднят (фанаут транскода зрителям)");
+        let mut stats_tick = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            tokio::select! {
+                evt = evt_rx.recv() => {
+                    match evt {
+                        Some(TreeEvent::Welcome { ice_servers }) => mgr.set_ice_servers(&ice_servers),
+                        Some(TreeEvent::AssignChild { child_id }) => mgr.on_assign_child(child_id).await,
+                        Some(TreeEvent::SdpAnswer { from, sdp }) => mgr.on_child_answer(from, sdp).await,
+                        Some(TreeEvent::Ice { from, candidate }) => mgr.on_ice(from, candidate).await,
+                        Some(TreeEvent::DropPeer { peer_id }) => mgr.on_drop_peer(peer_id).await,
+                        // Корень рендишна не имеет родителя; keyframe для рендишна даёт GOP
+                        // ffmpeg (2с) — форсить IDR нечем (мы не в source-дереве).
+                        Some(TreeEvent::RequestKeyframe) | Some(TreeEvent::SetBitrate { .. })
+                        | Some(TreeEvent::AssignParent { .. }) | Some(TreeEvent::SdpOffer { .. })
+                        | Some(TreeEvent::Topology { .. }) => {}
+                        Some(TreeEvent::Release) => { log::info!("relay: рендишн-корень {stream_id} — release"); break; }
+                        Some(TreeEvent::StreamEnd) => { log::info!("relay: рендишн-корень {stream_id} — stream-end"); break; }
+                        Some(TreeEvent::Rejoined) => log::warn!("relay: рендишн-корень {stream_id} реджойн"),
+                        Some(TreeEvent::Closed) | None => break,
+                    }
+                }
+                ctrl = ctrl_rx.recv() => {
+                    match ctrl {
+                        Some(RelayControl::Stop) | None => break,
+                        _ => {} // рендишн-корню прочие ctrl не адресованы
+                    }
+                }
+                _ = stats_tick.tick() => { mgr.sweep_dead_children().await; }
+            }
+        }
+        let _ = mgr.cmd_tx.send(TreeCmd::Leave);
+        mgr.close_all().await;
         fin.notify_one();
     });
 

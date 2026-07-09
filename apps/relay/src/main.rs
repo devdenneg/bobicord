@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 
 use relay_core::relay::{self, RelayConfig, RelayHandle};
+use relay_core::transcode;
 
 const VRELAY_UID: &str = "virtual-relay"; // должен совпадать с VRELAY_UID в tree.js
 
@@ -66,10 +67,14 @@ fn mint_token(secret: &str) -> String {
 }
 
 type Streams = Arc<Mutex<HashMap<String, RelayHandle>>>;
+/// Д2 (dev): рендишн-корни, ключ `streamId::rendition`. Отдельная relay-сессия на каждый
+/// поднятый транскод-рендишн (реюз ingest-транскода как источника). Полноценный реестр
+/// рендишнов — Д3/Д4; здесь минимум под ручной dev-триггер.
+type Renditions = Arc<Mutex<HashMap<String, RelayHandle>>>;
 
 /// Одна жизнь control-соединения: hello -> цикл (pong на ping, vrelay-activate -> сессия).
 /// Возврат = соединение умерло (вызывающий реконнектится с backoff).
-async fn run_control(cfg: &Arc<Cfg>, streams: &Streams) -> Result<(), String> {
+async fn run_control(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditions) -> Result<(), String> {
     let url = format!("{}?token={}", cfg.ws_url, mint_token(&cfg.session_secret));
     let (ws, _) = tokio_tungstenite::connect_async(&url).await.map_err(|e| e.to_string())?;
     let (mut write, mut read) = ws.split();
@@ -85,10 +90,24 @@ async fn run_control(cfg: &Arc<Cfg>, streams: &Streams) -> Result<(), String> {
             }
             Ok(Message::Text(txt)) => {
                 let Ok(v) = serde_json::from_str::<Value>(&txt) else { continue };
+                let msg_t = v.get("t").and_then(|x| x.as_str());
+                // Д2 (dev): поднять/погасить транскод-рендишн поверх активной ingest-сессии.
+                if msg_t == Some("vrelay-rendition-start") || msg_t == Some("vrelay-rendition-stop") {
+                    let Some(stream_id) = v.get("streamId").and_then(|x| x.as_str()) else { continue };
+                    let rendition = v.get("rendition").and_then(|x| x.as_str()).unwrap_or("480").to_string();
+                    let server_id = v.get("serverId").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    if msg_t == Some("vrelay-rendition-start") {
+                        let bitrate = v.get("presetBitrate").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                        rendition_start(cfg, streams, renditions, stream_id, &rendition, bitrate, server_id).await;
+                    } else {
+                        rendition_stop(streams, renditions, stream_id, &rendition).await;
+                    }
+                    continue;
+                }
                 // vrelay-activate (Э9): fallback-сессия — гаснет по idle, без реконнекта.
                 // vrelay-ingest (Д1 server-first): ПОСТОЯННЫЙ медиаузел — без idle-exit,
                 // переживает обрыв WS (реконнект+реджойн). Завершается по vrelay-release/stream-end.
-                let (kind, persistent) = match v.get("t").and_then(|x| x.as_str()) {
+                let (kind, persistent) = match msg_t {
                     Some("vrelay-activate") => ("activate", false),
                     Some("vrelay-ingest") => ("ingest", true),
                     _ => continue,
@@ -96,7 +115,7 @@ async fn run_control(cfg: &Arc<Cfg>, streams: &Streams) -> Result<(), String> {
                 let Some(stream_id) = v.get("streamId").and_then(|x| x.as_str()) else { continue };
                 let server_id = v.get("serverId").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 log::info!("control: {kind} {stream_id}");
-                activate(cfg, streams, stream_id, server_id, persistent).await;
+                activate(cfg, streams, renditions, stream_id, server_id, persistent).await;
             }
             Ok(Message::Close(_)) | Err(_) => break,
             _ => {}
@@ -109,7 +128,7 @@ async fn run_control(cfg: &Arc<Cfg>, streams: &Streams) -> Result<(), String> {
 /// `persistent` (Д1 ingest): постоянный медиаузел — без idle-exit, с реконнектом WS.
 /// Иначе (Э9 activate): fallback-сессия — гаснет по idle, без реконнекта (агент
 /// переактивируется по следующему vrelay-activate).
-async fn activate(cfg: &Arc<Cfg>, streams: &Streams, stream_id: &str, server_id: String, persistent: bool) {
+async fn activate(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditions, stream_id: &str, server_id: String, persistent: bool) {
     let mut map = streams.lock().await;
     if map.contains_key(stream_id) { return; } // уже ретранслируем это дерево
     if map.len() >= cfg.max_streams {
@@ -134,14 +153,81 @@ async fn activate(cfg: &Arc<Cfg>, streams: &Streams, stream_id: &str, server_id:
     map.insert(stream_id.to_string(), handle);
     drop(map);
     // Сессия кончилась (idle-exit / vrelay-release / обрыв WS) — чистим карту, повторная
-    // активация того же дерева снова пройдёт.
+    // активация того же дерева снова пройдёт. Д2: заодно гасим все рендишн-корни этого
+    // стрима (их транскоды жили на этой ingest-сессии).
     let streams = streams.clone();
+    let renditions = renditions.clone();
     let sid = stream_id.to_string();
     tokio::spawn(async move {
         fin.notified().await;
         streams.lock().await.remove(&sid);
+        let prefix = format!("{sid}::");
+        let mut rmap = renditions.lock().await;
+        let dead: Vec<String> = rmap.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
+        for k in dead {
+            if let Some(h) = rmap.remove(&k) { h.stop(); log::info!("rendition {k}: снят вслед за ingest-сессией"); }
+        }
+        drop(rmap);
         log::info!("stream {sid}: сессия завершена");
     });
+}
+
+/// Д2 (dev): поднимает транскод-рендишн на активной ingest-сессии + отдельный рендишн-корень,
+/// раздающий его зрителям в дереве `streamId::rendition`. Дедуп по ключу.
+async fn rendition_start(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditions, stream_id: &str, rendition: &str, bitrate: u32, server_id: String) {
+    let key = format!("{stream_id}::{rendition}");
+    if renditions.lock().await.contains_key(&key) {
+        log::info!("rendition {key}: уже поднят");
+        return;
+    }
+    let ingest = streams.lock().await.get(stream_id).cloned();
+    let Some(ingest) = ingest else {
+        log::warn!("rendition {key}: нет активной ingest-сессии для {stream_id} — рендишн невозможен");
+        return;
+    };
+    let bitrate = if bitrate > 0 { bitrate } else { transcode::rendition_default_bitrate(rendition) };
+    let (video, audio) = match ingest.start_rendition(rendition.to_string(), bitrate).await {
+        Ok(t) => t,
+        Err(e) => { log::warn!("rendition {key}: транскод не поднялся: {e}"); return; }
+    };
+    let root = relay::start_rendition_root(RelayConfig {
+        stream_id: key.clone(),
+        ws_url: format!("{}?token={}", cfg.ws_url, mint_token(&cfg.session_secret)),
+        identity: format!("vrelay-{rendition}"),
+        server_id,
+        max_children: cfg.max_children,
+        virtual_relay: false, // рендишн-корень = обычный натив-broadcaster (см. start_rendition_root)
+        available_outgoing: cfg.available_outgoing,
+        idle_exit: None,
+        reconnect: false, // dev-рендишн эфемерен: гасится вручную/вслед за ingest
+    }, video, audio);
+    let fin = root.finished();
+    renditions.lock().await.insert(key.clone(), root);
+    log::info!("rendition {key}: поднят (транскод {bitrate} bps + рендишн-корень)");
+    // Рендишн-корень сам завершился (release/stream-end) — чистим карту и гасим транскод.
+    let renditions = renditions.clone();
+    let ingest2 = ingest.clone();
+    let rnd = rendition.to_string();
+    let key2 = key.clone();
+    tokio::spawn(async move {
+        fin.notified().await;
+        if renditions.lock().await.remove(&key2).is_some() {
+            ingest2.stop_rendition(rnd);
+            log::info!("rendition {key2}: рендишн-корень завершён — транскод снят");
+        }
+    });
+}
+
+/// Д2 (dev): гасит рендишн-корень + его транскод на ingest-сессии.
+async fn rendition_stop(streams: &Streams, renditions: &Renditions, stream_id: &str, rendition: &str) {
+    let key = format!("{stream_id}::{rendition}");
+    if let Some(h) = renditions.lock().await.remove(&key) {
+        h.stop();
+    }
+    if let Some(ingest) = streams.lock().await.get(stream_id).cloned() {
+        ingest.stop_rendition(rendition.to_string());
+    }
+    log::info!("rendition {key}: остановлен (dev)");
 }
 
 #[tokio::main]
@@ -152,10 +238,11 @@ async fn main() {
         Err(e) => { eprintln!("vrelay: {e}"); std::process::exit(1); }
     };
     let streams: Streams = Arc::new(Mutex::new(HashMap::new()));
+    let renditions: Renditions = Arc::new(Mutex::new(HashMap::new()));
 
     let mut backoff = 1u64;
     loop {
-        let res = run_control(&cfg, &streams).await;
+        let res = run_control(&cfg, &streams, &renditions).await;
         match &res {
             Ok(()) => { backoff = 1; log::warn!("control: соединение закрыто — реконнект через {backoff}с"); }
             Err(e) => log::warn!("control: {e} — реконнект через {backoff}с"),
@@ -163,7 +250,8 @@ async fn main() {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(backoff)) => {}
             _ = tokio::signal::ctrl_c() => {
-                log::info!("SIGINT — останавливаю {} сессий", streams.lock().await.len());
+                log::info!("SIGINT — останавливаю {} сессий, {} рендишнов", streams.lock().await.len(), renditions.lock().await.len());
+                for (_, h) in renditions.lock().await.drain() { h.stop(); }
                 for (_, h) in streams.lock().await.drain() { h.stop(); }
                 return;
             }

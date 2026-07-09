@@ -12,6 +12,8 @@ RUN cargo build --release --manifest-path apps/relay/Cargo.toml
 FROM debian:bookworm-slim
 # ca-certificates — на случай TREE_WS_URL по wss:// (rustls webpki); по умолчанию агент
 # ходит на локальный ws://127.0.0.1:3000/tree того же хоста.
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+# ffmpeg (Roadmap-flow-стриминга Д2) — серверный транскод рендишнов (RTP→ffmpeg→RTP,
+# libx264). Только runtime-бинарь, без -dev пакетов (образ и так жирнеет). Чистим списки apt.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates ffmpeg && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/apps/relay/target/release/vrelay /usr/local/bin/vrelay
 ENTRYPOINT ["vrelay"]
