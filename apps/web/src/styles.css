@@ -1179,3 +1179,52 @@
     #server.on{grid-template-columns:216px 1fr var(--mem-w,244px)}   /* фикс-ширина каналов, минуя --ch-w */
     .rz-ch{display:none}                                             /* ресайзер каналов скрыт (ширина фиксирована) */
   }
+
+/* ── Админ-панель (/admin) — минимальная ── */
+.admin{max-width:880px;margin:0 auto;padding:22px 20px 60px;height:100%;overflow-y:auto}
+.admin-head{display:flex;align-items:center;gap:14px;margin-bottom:20px}
+.admin-head h1{flex:1;font-size:22px;font-weight:800;color:var(--txt-h)}
+.admin-back{display:inline-flex;align-items:center;gap:4px;font-size:13px;color:var(--muted);padding:6px 10px;border-radius:var(--r-sm);background:var(--panel2)}
+.admin-back:hover{background:var(--panel3);color:var(--txt-h)}
+.admin-back .ic{transform:rotate(90deg)}
+.admin-refresh{width:34px;height:34px;display:flex;align-items:center;justify-content:center;border-radius:var(--r-sm);background:var(--panel2);color:var(--muted)}
+.admin-refresh:hover{background:var(--panel3);color:var(--txt-h)}
+.admin-msg{padding:30px;text-align:center;color:var(--muted)}
+.admin-msg.err{color:var(--red)}
+.admin-stats{display:flex;gap:12px;margin-bottom:16px}
+.admin-stat{flex:1;background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-md);padding:14px 16px;display:flex;flex-direction:column;gap:2px}
+.admin-stat b{font-size:26px;font-weight:800;color:var(--txt-h);font-family:var(--num)}
+.admin-stat span{font-size:12.5px;color:var(--muted)}
+.admin-tabs{display:flex;gap:6px;margin-bottom:14px}
+.admin-tabs button{font-size:13.5px;font-weight:600;color:var(--muted);padding:7px 16px;border-radius:999px;background:var(--panel2)}
+.admin-tabs button.on{background:var(--accent);color:#fff}
+.admin-list{display:flex;flex-direction:column;gap:8px}
+.admin-srv{background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-md);overflow:hidden}
+.admin-srv-h{display:flex;align-items:center;gap:11px;padding:11px 13px;cursor:pointer}
+.admin-srv-h:hover{background:var(--panel2)}
+.admin-ic{width:38px;height:38px;border-radius:11px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff;overflow:hidden}
+.admin-srv-nm{flex:1;min-width:0}
+.admin-srv-nm b{display:block;font-size:15px;color:var(--txt-h);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.admin-srv-nm span{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
+.admin-chev{color:var(--muted);transition:transform var(--tr);flex:0 0 auto}
+.admin-chev.open{transform:rotate(180deg)}
+.admin-del{width:32px;height:32px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;border-radius:8px;background:var(--panel3);color:var(--muted)}
+.admin-del:hover:not(:disabled){background:var(--red-fill);color:#fff}
+.admin-del:disabled{opacity:.35;cursor:not-allowed}
+.admin-members{border-top:1px solid var(--line-2);padding:6px 10px 10px 58px;display:flex;flex-direction:column;gap:2px}
+.admin-mrow{display:flex;align-items:center;gap:9px;padding:5px 4px}
+.admin-mav{width:26px;height:26px;border-radius:50%;flex:0 0 auto;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff;overflow:hidden}
+.admin-mnm{flex:1;min-width:0;font-size:13.5px;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.admin-mnm i{color:var(--muted);font-style:normal;font-size:12px}
+.admin-badge{font-size:10.5px;font-weight:700;padding:2px 7px;border-radius:999px;text-transform:uppercase;letter-spacing:.3px;flex:0 0 auto}
+.admin-badge.owner{background:color-mix(in srgb,var(--yellow) 18%,transparent);color:var(--yellow)}
+.admin-badge.admin{background:color-mix(in srgb,var(--accent) 20%,transparent);color:var(--accent-txt);margin-left:8px}
+.admin-x{width:24px;height:24px;flex:0 0 auto;border-radius:6px;font-size:16px;line-height:1;color:var(--muted);background:var(--panel3)}
+.admin-x:hover{background:var(--red-fill);color:#fff}
+.admin-urow{display:flex;align-items:center;gap:11px;background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-md);padding:10px 13px}
+.admin-unm{flex:1;min-width:0}
+.admin-unm b{display:flex;align-items:center;font-size:14.5px;color:var(--txt-h)}
+.admin-unm span{font-size:12px;color:var(--muted);display:block}
+.admin-adm{font-size:12.5px;font-weight:600;color:var(--txt);background:var(--panel2);padding:7px 12px;border-radius:var(--r-sm);flex:0 0 auto;white-space:nowrap}
+.admin-adm:hover:not(:disabled){background:var(--panel3)}
+.admin-adm:disabled{opacity:.35;cursor:not-allowed}

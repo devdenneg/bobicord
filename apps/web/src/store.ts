@@ -16,7 +16,7 @@ export const getEngine = () => engine;
 let saveTimer: number | null = null;
 
 interface AppState {
-  view: 'loading' | 'auth' | 'home' | 'server';
+  view: 'loading' | 'auth' | 'home' | 'server' | 'admin';
   me: User | null;
   servers: ServerSummary[];
   active: ServerDetail | null;
@@ -52,6 +52,7 @@ interface AppState {
   confirmSwitchServer: () => void;                     // подтверждение модалки переключения
   exitServer: () => void;                              // полное отключение от сервера + на главную (leave/delete/ошибка)
   goHome: () => void;
+  goAdmin: () => void;                                 // открыть админ-панель (/admin, только для админов)
   refreshServers: () => Promise<void>;
   markRead: (serverId: string, lastId: number, all?: boolean) => void;   // отметить прочитанным (в самом низу чата); all — «прочитать всё» (сервер last_read=MAX)
   bumpUnread: (serverId: string, n?: number) => void;     // +новое (чат/системное) когда не читаем сервер
@@ -378,7 +379,8 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   // На главную БЕЗ отключения от сервера — соединение (чат/голос/пресенс) живёт, возврат мгновенный.
-  goHome: () => { if (memberTimer) clearInterval(memberTimer); set({ view: 'home' }); get().refreshServers(); },
+  goHome: () => { if (memberTimer) clearInterval(memberTimer); if (location.pathname !== '/') history.replaceState({}, '', '/'); set({ view: 'home' }); get().refreshServers(); },
+  goAdmin: () => { if (location.pathname !== '/admin') history.pushState({}, '', '/admin'); set({ view: 'admin' }); },
 }));
 
 // доступное обновление тоже добавляет +1 к бейджу таскбара

@@ -8,6 +8,7 @@ import { deriveLiveItems, deriveGames, rankServers, dominant, clusterOrder, type
 import { Auth } from './components/Auth';
 import { Toasts } from './components/Toasts';
 import { ServerView } from './components/ServerView';
+import { AdminPage } from './components/AdminPage';
 import { VoiceDock } from './components/VoiceDock';
 import { useEngine } from './hooks';
 import { Modals } from './components/Modals';
@@ -31,6 +32,7 @@ function Rail() {
   const openServer = useStore((s) => s.openServer);
   const goHome = useStore((s) => s.goHome);
   const setModal = useStore((s) => s.setModal);
+  const goAdmin = useStore((s) => s.goAdmin);
   const unread = useStore((s) => s.unread);
   // подсвечиваем сервер только когда реально смотрим его (на главной — home активна)
   const activeId = view === 'server' ? (active?.id || loadingServerId) : null;
@@ -51,6 +53,7 @@ function Rail() {
       })}
       <button className="railbtn rail-add tip-l" data-tip="Создать / войти" onClick={() => setModal('create')}><Icon name="plus" /></button>
       <div className="rail-grow" />
+      {me.isAdmin ? <button className="railbtn rail-admin tip-l" data-tip="Админка" onClick={goAdmin}><Icon name="users" /></button> : null}
       {/* Настройки — глобально в рейле (доступны и на главной, не только внутри сервера) */}
       <button className="railbtn rail-set tip-l" data-tip="Настройки" onClick={() => setModal('settings')}><Icon name="gear" /></button>
       <button className="railbtn rail-me tip-l" data-tip="Профиль" style={{ background: me.avatarUrl ? '#0000' : avColor(me.displayName, me.avatarColor) }} onClick={() => setModal('profile')}>{me.avatarUrl ? <img className="avimg" src={resolveUploadUrl(me.avatarUrl)} alt="" /> : initial(me.displayName)}</button>
@@ -403,6 +406,12 @@ export function App() {
     if (isTauri) api.detectableGames().then((d) => { if (d?.games?.length) setDetectableGames(d.games); }).catch(() => {});
   }, [me]);
 
+  // Прямой заход по /admin (ввод URL или reload): открываем админку, если юзер админ. Иначе игнор —
+  // останется home (кнопку в рейле всё равно видят только админы, серверные ручки за requireAdmin).
+  useEffect(() => {
+    if (me?.isAdmin && location.pathname.startsWith('/admin')) useStore.getState().goAdmin();
+  }, [me]);
+
   // hotkeys (мут микрофона / заглушить звук — настраиваемые комбинации из keybinds, + PTT) —
   // active while logged in. Работает ВСЕГДА, пока окно в фокусе (keydown на window иначе и не
   // придёт) — независимо от чекбокса «глобально»: нативный WH_KEYBOARD_LL-хук (см. эффект ниже)
@@ -517,11 +526,11 @@ export function App() {
         <>
           <div id="app" className="on">
             <Rail />
-            {view === 'home' ? <Home /> : (loadingServer ? <ServerSkeleton /> : <ServerView />)}
+            {view === 'admin' ? <AdminPage /> : view === 'home' ? <Home /> : (loadingServer ? <ServerSkeleton /> : <ServerView />)}
           </div>
           {/* На сервере голос-панель живёт ВНУТРИ колонки каналов (ServerView, адаптируется по ширине).
               На главной — компактный плавающий док в левом нижнем углу. */}
-          {view === 'home' ? <VoiceDock variant="floating" /> : null}
+          {view === 'home' || view === 'admin' ? <VoiceDock variant="floating" /> : null}
         </>
       )}
       <Modals />

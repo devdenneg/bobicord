@@ -1,4 +1,4 @@
-import type { User, ServerSummary, Member, ServerDetail, InvitePreview, HistoryMessage, Role, VoiceChannel, Attachment } from './types';
+import type { User, ServerSummary, Member, ServerDetail, InvitePreview, HistoryMessage, Role, VoiceChannel, Attachment, AdminOverview } from './types';
 
 let token: string | null = localStorage.getItem('sess');
 export const getToken = () => token;
@@ -149,4 +149,10 @@ export const api = {
   },
   // аллоулист игр Discord (дистиллят с сервера) — натив матчит запущенные процессы для детекта игры
   detectableGames: () => req<{ games: { name: string; exes: string[] }[] }>('GET', '/detectable-games'),
+  // --- Админка (denis + кому выдали) ---
+  adminOverview: () => req<AdminOverview>('GET', '/admin/overview'),
+  adminDeleteServer: (id: string) => req<{ ok: boolean }>('DELETE', `/admin/servers/${id}`),
+  adminRemoveMember: (serverId: string, userId: string) => req<{ ok: boolean }>('DELETE', `/admin/servers/${serverId}/members/${userId}`),
+  adminDeleteUser: (id: string) => req<{ ok: boolean }>('DELETE', `/admin/users/${id}`),
+  adminSetAdmin: (id: string, admin: boolean) => req<{ ok: boolean; isAdmin: boolean }>('POST', `/admin/users/${id}/admin`, { admin }),
 };

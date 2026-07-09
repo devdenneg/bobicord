@@ -164,7 +164,11 @@ for (const sql of [
   "ALTER TABLE invites ADD COLUMN expires INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE messages ADD COLUMN client_key TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
+  "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0",
 ]) { try { db.exec(sql); } catch (e) { /* column already exists */ } }
+
+// Бутстрап супер-админа: denis всегда админ (идемпотентно на каждом старте); остальным админку выдаёт админ из /admin.
+try { db.prepare("UPDATE users SET is_admin=1 WHERE username=?").run('denis'); } catch (e) {}
 
 // Идемпотентность отправки: клиент шлёт стабильный dedup-ключ (переживает retry). Partial-unique
 // индекс (только для непустого ключа — старые/безключевые сообщения не задеты) даёт INSERT OR IGNORE
@@ -210,6 +214,14 @@ function authUser(req) {
 function requireAuth(req, res, next) {
   const u = authUser(req);
   if (!u) return res.status(401).json({ error: 'Не авторизован' });
+  req.user = u; next();
+}
+// Админ = флаг is_admin ИЛИ бутстрап-логин denis (на случай, если флаг ещё не засеян).
+const BOOTSTRAP_ADMIN = 'denis';
+function requireAdmin(req, res, next) {
+  const u = authUser(req);
+  if (!u) return res.status(401).json({ error: 'Не авторизован' });
+  if (!u.is_admin && u.username !== BOOTSTRAP_ADMIN) return res.status(403).json({ error: 'Только админ' });
   req.user = u; next();
 }
 const rsc = new RoomServiceClient(WS_URL.replace('wss://', 'https://'), KEY, SECRET);
@@ -342,11 +354,23 @@ function notifyUser(userId, payload) {
 }
 function serverName(sid) { const s = db.prepare('SELECT name FROM servers WHERE id=?').get(sid); return s ? s.name : 'Сервер'; }
 
-const pubUser = u => ({ id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '', bio: u.bio });
+const pubUser = u => ({ id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '', bio: u.bio, isAdmin: !!u.is_admin || u.username === BOOTSTRAP_ADMIN });
 const UPLOAD_RE = /^\/api\/uploads\/[a-zA-Z0-9._-]+$/; // локальный путь к загрузке
 const pubServer = s => ({ id: s.id, name: s.name, ownerId: s.owner_id, iconColor: s.icon_color, iconUrl: s.icon_url || '', description: s.description || '' });
 function isMember(uid, sid) { return !!db.prepare('SELECT 1 FROM memberships WHERE user_id=? AND server_id=?').get(uid, sid); }
 function memberCount(sid) { return db.prepare('SELECT COUNT(*) c FROM memberships WHERE server_id=?').get(sid).c; }
+// Полный каскад-снос сервера (все связанные таблицы по server_id). Имена таблиц — литералы, не ввод.
+function purgeServer(sid) {
+  for (const t of ['memberships', 'invites', 'server_settings', 'roles', 'member_roles', 'messages', 'voice_channels', 'read_state']) db.prepare(`DELETE FROM ${t} WHERE server_id=?`).run(sid);
+  db.prepare('DELETE FROM servers WHERE id=?').run(sid);
+}
+// Полный снос юзера: сначала его сервера-владения (иначе осиротеют), потом все его записи.
+function purgeUser(uid) {
+  for (const s of db.prepare('SELECT id FROM servers WHERE owner_id=?').all(uid)) purgeServer(s.id);
+  for (const t of ['memberships', 'member_roles', 'server_settings', 'messages', 'read_state']) db.prepare(`DELETE FROM ${t} WHERE user_id=?`).run(uid);
+  for (const t of ['user_settings', 'push_subs', 'push_prefs']) db.prepare(`DELETE FROM ${t} WHERE user_id=?`).run(uid);
+  db.prepare('DELETE FROM users WHERE id=?').run(uid);
+}
 // Непрочитанные: чат-сообщения сервера НОВЕЕ last_read юзера и НЕ его собственные. Системных
 // событий (стрим/обновление) в БД нет — их клиент добавляет к бейджу локально.
 const _lastReadStmt = db.prepare('SELECT last_read FROM read_state WHERE user_id=? AND server_id=?');
@@ -488,6 +512,68 @@ app.get('/api/unread', requireAuth, (req, res) => {
   const out = {};
   for (const r of rows) out[r.server_id] = unreadCount(req.user.id, r.server_id);
   res.json(out);
+});
+
+/* ---------------- ADMIN (denis + кому выдали) — минимальная панель ---------------- */
+// Обзор: все сервера (владелец + участники) + все юзеры + сводка. Для «скок серверов/людей».
+app.get('/api/admin/overview', requireAdmin, (req, res) => {
+  const servers = db.prepare('SELECT * FROM servers ORDER BY created DESC').all().map((s) => {
+    const owner = db.prepare('SELECT id,username,display_name FROM users WHERE id=?').get(s.owner_id);
+    const members = db.prepare('SELECT u.id,u.username,u.display_name,m.role FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.server_id=? ORDER BY m.joined ASC').all(s.id)
+      .map((r) => ({ id: r.id, username: r.username, displayName: r.display_name, role: r.role }));
+    return {
+      id: s.id, name: s.name, iconUrl: s.icon_url || '', iconColor: s.icon_color, created: s.created,
+      owner: owner ? { id: owner.id, username: owner.username, displayName: owner.display_name } : null,
+      memberCount: members.length, members,
+    };
+  });
+  const users = db.prepare('SELECT * FROM users ORDER BY created ASC').all().map((u) => ({
+    id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '',
+    isAdmin: !!u.is_admin, created: u.created,
+    serverCount: db.prepare('SELECT COUNT(*) c FROM memberships WHERE user_id=?').get(u.id).c,
+    ownedCount: db.prepare('SELECT COUNT(*) c FROM servers WHERE owner_id=?').get(u.id).c,
+  }));
+  res.json({ stats: { servers: servers.length, users: users.length }, servers, users });
+});
+
+// Удалить сервер целиком (каскад).
+app.delete('/api/admin/servers/:id', requireAdmin, (req, res) => {
+  const s = db.prepare('SELECT id FROM servers WHERE id=?').get(req.params.id);
+  if (!s) return res.status(404).json({ error: 'нет' });
+  purgeServer(s.id);
+  res.json({ ok: true });
+});
+
+// Убрать участника из сервера (владельца нельзя — сноси сервер целиком).
+app.delete('/api/admin/servers/:id/members/:userId', requireAdmin, (req, res) => {
+  const s = db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id);
+  if (!s) return res.status(404).json({ error: 'нет' });
+  const uid = req.params.userId;
+  if (uid === s.owner_id) return res.status(400).json({ error: 'Это владелец — удали сервер целиком' });
+  db.prepare('DELETE FROM memberships WHERE user_id=? AND server_id=?').run(uid, s.id);
+  db.prepare('DELETE FROM member_roles WHERE user_id=? AND server_id=?').run(uid, s.id);
+  db.prepare('DELETE FROM server_settings WHERE user_id=? AND server_id=?').run(uid, s.id);
+  res.json({ ok: true });
+});
+
+// Удалить юзера с сайта (каскад + его сервера-владения). denis и себя нельзя.
+app.delete('/api/admin/users/:id', requireAdmin, (req, res) => {
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'нет' });
+  if (u.username === BOOTSTRAP_ADMIN) return res.status(400).json({ error: 'Нельзя удалить бутстрап-админа' });
+  if (u.id === req.user.id) return res.status(400).json({ error: 'Нельзя удалить себя' });
+  purgeUser(u.id);
+  res.json({ ok: true });
+});
+
+// Выдать/забрать админку. denis всегда админ.
+app.post('/api/admin/users/:id/admin', requireAdmin, (req, res) => {
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'нет' });
+  if (u.username === BOOTSTRAP_ADMIN) return res.status(400).json({ error: 'denis всегда админ' });
+  const admin = req.body.admin ? 1 : 0;
+  db.prepare('UPDATE users SET is_admin=? WHERE id=?').run(admin, u.id);
+  res.json({ ok: true, isAdmin: !!admin });
 });
 
 /* ---------- Web Push: подписка PWA/браузера на фоновые уведомления ---------- */

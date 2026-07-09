@@ -5,7 +5,21 @@ export interface User {
   avatarColor: number;
   avatarUrl?: string;
   bio: string;
+  isAdmin?: boolean;
 }
+
+// Админ-панель (/admin) — обзор всех серверов/юзеров
+export interface AdminMember { id: string; username: string; displayName: string; role: string }
+export interface AdminServer {
+  id: string; name: string; iconUrl?: string; iconColor: number; created: number;
+  owner: { id: string; username: string; displayName: string } | null;
+  memberCount: number; members: AdminMember[];
+}
+export interface AdminUser {
+  id: string; username: string; displayName: string; avatarColor: number; avatarUrl?: string;
+  isAdmin: boolean; created: number; serverCount: number; ownedCount: number;
+}
+export interface AdminOverview { stats: { servers: number; users: number }; servers: AdminServer[]; users: AdminUser[] }
 
 // права роли (битовая маска, синхронно с server/index.js PERM)
 export const PERM = { MANAGE_SERVER: 1, MANAGE_ROLES: 2, MANAGE_MEMBERS: 4, MANAGE_MESSAGES: 8, CREATE_INVITE: 16, MANAGE_CHANNELS: 32 } as const;
