@@ -242,9 +242,20 @@
 
   /* S1 живой эфир */
   .live-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
-  .live-card{position:relative;background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-lg);padding:15px 17px;box-shadow:var(--sh-2),var(--hair);display:flex;flex-direction:column;gap:13px;min-height:118px}
-  .live-card.stream{border-top:1.5px solid var(--live)}
-  .live-card:hover{border-color:var(--accent)}
+  .live-card{position:relative;overflow:hidden;isolation:isolate;background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-lg);padding:15px 17px;box-shadow:var(--sh-2),var(--hair);display:flex;flex-direction:column;gap:13px;min-height:118px;transition:transform .3s cubic-bezier(.2,.7,.3,1),box-shadow .35s ease,border-color .35s ease}
+  .live-card > *{position:relative;z-index:1}
+  /* аврора-фон: мягкие цветные пятна медленно дрейфуют — карточка «дышит» и зовёт зайти */
+  .live-card::before{content:'';position:absolute;inset:-45%;z-index:0;pointer-events:none;opacity:.5;filter:blur(16px);background:radial-gradient(38% 46% at 22% 26%,color-mix(in srgb,var(--accent) 60%,transparent),transparent 70%),radial-gradient(34% 42% at 82% 24%,color-mix(in srgb,var(--accent-txt) 45%,transparent),transparent 70%),radial-gradient(48% 54% at 60% 100%,color-mix(in srgb,var(--accent) 38%,transparent),transparent 72%);animation:lcAurora 15s ease-in-out infinite alternate}
+  /* глянцевый блик-свип на ховере */
+  .live-card::after{content:'';position:absolute;inset:0;z-index:2;pointer-events:none;border-radius:inherit;opacity:0;transform:translateX(-120%);background:linear-gradient(115deg,transparent 32%,rgba(255,255,255,.10) 48%,rgba(255,255,255,.02) 55%,transparent 70%)}
+  .live-card:hover{transform:translateY(-3px);border-color:color-mix(in srgb,var(--accent) 55%,var(--line-2))}
+  .live-card:hover::after{opacity:1;animation:lcSweep 1.05s ease}
+  /* STREAM: красная аврора + дыхание-свечение (сильнее зовёт) */
+  .live-card.stream{border-color:color-mix(in srgb,var(--live) 38%,var(--line-2));animation:lcBreath 3.6s ease-in-out infinite}
+  .live-card.stream::before{opacity:.62;background:radial-gradient(40% 48% at 20% 24%,color-mix(in srgb,var(--live) 62%,transparent),transparent 70%),radial-gradient(34% 44% at 84% 20%,color-mix(in srgb,#ff8aa0 52%,transparent),transparent 70%),radial-gradient(52% 56% at 62% 102%,color-mix(in srgb,var(--accent) 42%,transparent),transparent 72%)}
+  .live-card.stream:hover{border-color:color-mix(in srgb,var(--live) 65%,transparent)}
+  /* VOICE-only: зелёная аврора, спокойнее */
+  .live-card.voice::before{opacity:.46;background:radial-gradient(38% 46% at 22% 28%,color-mix(in srgb,var(--green) 52%,transparent),transparent 70%),radial-gradient(40% 48% at 80% 80%,color-mix(in srgb,var(--accent) 40%,transparent),transparent 72%)}
   .lc-top{display:flex;align-items:center;gap:9px}
   .lc-srvic{width:28px;height:28px;border-radius:8px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12.5px;color:#fff;overflow:hidden}
   .lc-srv{flex:1;min-width:0;font-size:13.5px;font-weight:700;color:var(--txt-h);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -264,6 +275,19 @@
   .cta:hover{background:var(--accent-h)}
   .cta.ghost{background:var(--panel2);color:var(--txt)}
   .cta.ghost:hover{background:var(--panel3)}
+  /* CTA живой карточки — градиент + подъём; для стрима красный (кнопка «Смотреть» зовёт сильнее) */
+  .live-card .cta{position:relative;overflow:hidden;background:linear-gradient(135deg,var(--accent),var(--accent-h));box-shadow:0 4px 14px -5px color-mix(in srgb,var(--accent) 70%,transparent);transition:transform .2s ease,box-shadow .25s ease,filter .2s ease}
+  .live-card .cta:hover{filter:brightness(1.08);transform:translateY(-1px);box-shadow:0 7px 18px -5px color-mix(in srgb,var(--accent) 78%,transparent)}
+  .live-card .cta:active{transform:translateY(0) scale(.97)}
+  .live-card.stream .cta{background:linear-gradient(135deg,var(--live),#e5384f);box-shadow:0 4px 15px -4px var(--live)}
+  .live-card.stream .cta:hover{box-shadow:0 8px 20px -4px var(--live)}
+  /* пилюля LIVE и кольцо стримера — мягкое свечение */
+  .live-card.stream .live-pill{box-shadow:0 0 14px -4px var(--live)}
+  .lc-av.live{animation:lcRing 3.6s ease-in-out infinite}
+  @keyframes lcAurora{0%{transform:translate(0,0) scale(1)}50%{transform:translate(3%,-2%) scale(1.09)}100%{transform:translate(-3%,3%) scale(1.05)}}
+  @keyframes lcSweep{to{transform:translateX(120%)}}
+  @keyframes lcBreath{0%,100%{box-shadow:var(--sh-2),var(--hair)}50%{box-shadow:var(--sh-2),var(--hair),0 0 24px -3px color-mix(in srgb,var(--live) 42%,transparent)}}
+  @keyframes lcRing{0%,100%{box-shadow:0 0 0 2px var(--panel),0 0 0 4px var(--live)}50%{box-shadow:0 0 0 2px var(--panel),0 0 0 4px var(--live),0 0 14px 2px var(--live-glow)}}
 
   /* нет эфира — тонкая строка-шёпот (демотирована вниз, не пустой герой) */
   .live-quiet{display:flex;align-items:center;gap:10px;margin-top:26px;padding:11px 14px;background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-md);color:var(--muted);font-size:13px}
