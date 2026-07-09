@@ -7,6 +7,7 @@
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::null_mut;
+use std::sync::OnceLock;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -16,12 +17,12 @@ use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
     BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HGDIOBJ,
 };
-use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON};
+use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES};
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, DrawIconEx, GetClassLongPtrW, SendMessageTimeoutW, DI_NORMAL, GCLP_HICON,
     GCLP_HICONSM, HICON, ICON_BIG, ICON_SMALL2, SMTO_ABORTIFHUNG, WM_GETICON,
@@ -34,14 +35,48 @@ const ICON_SZ: i32 = 32;
 pub fn window_icon_png_base64(hwnd: isize, pid: u32) -> Option<String> {
     unsafe {
         let (hicon, owned) = get_hicon(hwnd, pid)?;
-        let png = hicon_to_png(hicon);
+        let rgba = hicon_to_rgba(hicon);
         // DestroyIcon только для иконок, которые создали мы (SHGetFileInfo). Иконки окна и
         // класса принадлежат чужому окну — их трогать нельзя.
         if owned {
             let _ = DestroyIcon(hicon);
         }
-        png.map(|bytes| STANDARD.encode(bytes))
+        let rgba = rgba?;
+        // Генерик-иконка Windows (exe без своей иконки — дефолтный «пустой» значок) → считаем, что
+        // иконки НЕТ: вызывающий (detect_game) не покажет игру. Эталон генерика рендерим тем же путём
+        // (SHGetFileInfo с USEFILEATTRIBUTES) → байты сравнимы точно.
+        if generic_exe_icon_rgba().map_or(false, |g| *g == rgba) {
+            return None;
+        }
+        encode_png(&rgba).map(|bytes| STANDARD.encode(bytes))
     }
+}
+
+/// RGBA дефолтной («генерик») exe-иконки Windows — рендерим один раз и кэшируем. Через
+/// SHGFI_USEFILEATTRIBUTES + FILE_ATTRIBUTE_NORMAL: возвращает системный значок для .exe БЕЗ
+/// обращения к диску (детерминированно на этой машине), тем же hicon_to_rgba, что и игры.
+fn generic_exe_icon_rgba() -> Option<&'static Vec<u8>> {
+    static GENERIC: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+    GENERIC
+        .get_or_init(|| unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let wpath: Vec<u16> = "generic.exe".encode_utf16().chain(std::iter::once(0)).collect();
+            let mut sfi = SHFILEINFOW::default();
+            let r = SHGetFileInfoW(
+                PCWSTR(wpath.as_ptr()),
+                FILE_ATTRIBUTE_NORMAL,
+                Some(&mut sfi),
+                size_of::<SHFILEINFOW>() as u32,
+                SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES,
+            );
+            if r == 0 || sfi.hIcon.is_invalid() {
+                return None;
+            }
+            let rgba = hicon_to_rgba(sfi.hIcon);
+            let _ = DestroyIcon(sfi.hIcon);
+            rgba
+        })
+        .as_ref()
 }
 
 /// Возвращает (HICON, owned): owned=true — иконку создали мы и обязаны DestroyIcon.
@@ -109,8 +144,9 @@ unsafe fn process_exe_path(pid: u32) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..size as usize]))
 }
 
-/// HICON -> PNG (RGBA) через DrawIconEx на 32x32 top-down DIB.
-unsafe fn hicon_to_png(hicon: HICON) -> Option<Vec<u8>> {
+/// HICON -> сырые RGBA-байты 32x32 (4 байта/пиксель) через DrawIconEx на top-down DIB.
+/// PNG-кодирование и сравнение с генериком — на вызывающей стороне.
+unsafe fn hicon_to_rgba(hicon: HICON) -> Option<Vec<u8>> {
     let screen = GetDC(None);
     let hdc = CreateCompatibleDC(Some(screen));
     ReleaseDC(None, screen);
@@ -155,7 +191,7 @@ unsafe fn hicon_to_png(hicon: HICON) -> Option<Vec<u8>> {
                 rgba[i] = 255;
             }
         }
-        out = encode_png(&rgba);
+        out = Some(rgba);
     }
 
     SelectObject(hdc, old);

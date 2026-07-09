@@ -104,7 +104,9 @@ fn detect_game() -> Option<GameInfo> {
 
   // 1) Discord-аллоулист: любой ЗАПУЩЕННЫЙ процесс = известная игра. Ловит в любом режиме (окно/фуллскрин/фон).
   if let Some((name, pid)) = broadcast::games::match_running_game(me_pid) {
-    return Some(GameInfo { name: name.chars().take(48).collect(), icon: broadcast::icon::window_icon_png_base64(0, pid) });
+    // нет иконки (не извлеклась / генерик Windows) → игру не показываем нигде (решение пользователя)
+    return broadcast::icon::window_icon_png_base64(0, pid)
+      .map(|icon| GameInfo { name: name.chars().take(48).collect(), icon: Some(icon) });
   }
 
   // 2) GameConfigStore: окно, чей полный путь exe Windows сама признала игрой. foreground первым
@@ -121,7 +123,9 @@ fn detect_game() -> Option<GameInfo> {
         broadcast::capture::process_full_path(pid).map_or(false, |p| allow.contains(&p.to_lowercase()))
       });
       if is_game {
-        return Some(game_info_from(hwnd, &title, &exe_stem(&process), pid));
+        let gi = game_info_from(hwnd, &title, &exe_stem(&process), pid);
+        if gi.icon.is_some() { return Some(gi); }
+        continue; // генерик/пустая иконка — этого кандидата пропускаем, ищем окно с настоящей иконкой
       }
     }
   }
