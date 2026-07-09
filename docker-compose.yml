@@ -58,9 +58,12 @@ services:
     environment:
       - SESSION_SECRET=${SESSION_SECRET}
       - TREE_WS_URL=ws://127.0.0.1:3000/tree
-      # Д1: server-first делает vrelay постоянным медиаузлом — поднят кап прямых детей.
-      - VRELAY_MAX_CHILDREN=${VRELAY_MAX_CHILDREN:-32}
-      # Исходящая полоса узла (Мбит/с) для скоринга best-peer — egress VPS ~ битрейт × дети.
+      # Д1: server-first делает vrelay постоянным медиаузлом. Фолбэк консервативный:
+      # egress ≈ битрейт × дети, а при server-first через виртуала идёт ВЕСЬ видеотрафик.
+      # Переоценка = потери у всех зрителей; недооценка безопасна (дерево ветвится, Д6).
+      # Поднимать в .env только после замера полосы VPS (формула — в .env.example).
+      - VRELAY_MAX_CHILDREN=${VRELAY_MAX_CHILDREN:-12}
+      # Исходящая полоса узла (Мбит/с) для скоринга best-peer — НЕ ограничитель, а вес.
       - VRELAY_OUT_MBPS=${VRELAY_OUT_MBPS:-50}
       - RUST_LOG=info
 
