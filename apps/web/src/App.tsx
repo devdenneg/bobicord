@@ -150,8 +150,11 @@ function ServerCard({ s, unread, connected, onOpen }: { s: ServerSummary; unread
   const on = s.online || [];
   const d = dominant(s, unread);
   const isLive = d.kind === 'live' || d.kind === 'voice';
+  const coverUrl = s.iconUrl ? resolveUploadUrl(s.iconUrl) : ''; // обложка сервера как фон-декор карточки
+  const tint = avColor(s.name, s.iconColor);                     // цвет-подложка (фолбэк без обложки + glow)
   return (
-    <button className={'srv-card' + (isLive ? ' is-live' : '') + (connected ? ' is-connected' : '')} onClick={onOpen}>
+    <button className={'srv-card' + (isLive ? ' is-live' : '') + (connected ? ' is-connected' : '') + (coverUrl ? ' has-cover' : '')} onClick={onOpen} style={{ ['--tint' as any]: tint }}>
+      <span className="sc-cover" aria-hidden="true" style={coverUrl ? { backgroundImage: `url("${coverUrl}")` } : undefined} />
       <div className="sc-h">
         <div className="sc-ic" style={{ background: faceBg(s.iconUrl, s.name, s.iconColor), overflow: 'hidden' }}><Face url={s.iconUrl} name={s.name} color={s.iconColor} /></div>
         <div style={{ minWidth: 0, flex: 1 }}>

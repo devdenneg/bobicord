@@ -182,8 +182,18 @@
   .home-sec{font-size:12px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--muted);margin:0 0 12px}
   /* bento: активные (live/voice) карточки span-2, dense затыкает дыры → взвешенная сетка, не однообразная */
   .srv-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(288px,100%),1fr));gap:14px;grid-auto-flow:dense}
-  .srv-card{background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-md);padding:16px;text-align:left;box-shadow:var(--sh-1);display:flex;flex-direction:column;gap:10px;align-items:stretch;transition:background var(--tr),border-color var(--tr),transform var(--tr),box-shadow var(--tr)}
-  .srv-card:hover{background:var(--panel2);border-color:var(--accent);transform:translateY(-2px)}
+  .srv-card{position:relative;overflow:hidden;isolation:isolate;background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-md);padding:16px;text-align:left;box-shadow:var(--sh-1);display:flex;flex-direction:column;gap:10px;align-items:stretch;transition:background var(--tr),border-color var(--tr),transform var(--tr),box-shadow var(--tr)}
+  .srv-card > *{position:relative;z-index:1}
+  .srv-card > .sc-cover{z-index:0}
+  /* декор-обложка: размытая копия иконки сервера как фон карточки + ken-burns; фолбэк без обложки — цвет-подложка --tint */
+  .sc-cover{position:absolute;inset:0;pointer-events:none;background-position:center;background-size:cover;filter:blur(28px) saturate(1.35);opacity:.28;transform:scale(1.6);transition:opacity .4s ease,filter .4s ease}
+  .srv-card.has-cover .sc-cover{animation:scKen 24s ease-in-out infinite alternate}
+  .srv-card:not(.has-cover) .sc-cover{background:radial-gradient(130% 100% at 50% -10%,color-mix(in srgb,var(--tint) 60%,transparent),transparent 68%);filter:blur(34px);opacity:.5}
+  .srv-card:hover .sc-cover{opacity:.44}
+  .srv-card.is-live .sc-cover{opacity:.34}
+  .srv-card.is-live:hover .sc-cover{opacity:.52}
+  @keyframes scKen{0%{transform:scale(1.5) translate(-2%,-1%)}100%{transform:scale(1.82) translate(2%,2.5%)}}
+  .srv-card:hover{background:var(--panel2);border-color:color-mix(in srgb,var(--tint) 55%,var(--accent));transform:translateY(-3px);box-shadow:0 14px 30px -16px color-mix(in srgb,var(--tint) 70%,transparent),var(--sh-2)}
   .srv-card.is-live{grid-column:span 2;box-shadow:var(--sh-2),var(--hair)}
   .srv-card.is-connected .sc-ic{box-shadow:0 0 0 2px var(--panel),0 0 0 4px var(--green)}
   @media(max-width:1024px){.srv-card.is-live{grid-column:auto}}
