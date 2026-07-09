@@ -12,14 +12,15 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
+use relay_core::probe::{self, ProbeSession};
 use relay_core::relay::{self, RelayConfig, RelayHandle};
 use relay_core::transcode;
 
@@ -82,7 +83,23 @@ async fn run_control(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditions)
     write.send(Message::Text(hello.to_string().into())).await.map_err(|e| e.to_string())?;
     log::info!("control: подключён к {} (ёмкость {})", cfg.ws_url, cfg.max_children);
 
-    while let Some(m) = read.next().await {
+    // Д5: очередь исходящих (probe-answer/probe-ice формируются в probe-задачах через канал,
+    // пишутся здесь — единственный владелец WS-sink). Реюз паттерна ingest-релея.
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+    // Д5: активные probe-сессии по peer-id вещателя (from). Прунятся по таймауту/выходу.
+    let mut probes: HashMap<String, (ProbeSession, Instant)> = HashMap::new();
+    // Д5: ICE-серверы из welcome — probe-answerer их использует (host-кандидат VPS предпочтётся
+    // Chromium'ом → probe идёт на публичный IP host-сети, не через TURN, как требует роадмап).
+    let mut ice_servers: Vec<Value> = Vec::new();
+
+    loop {
+      tokio::select! {
+        // Исходящие сообщения probe-сессий (ICE от нашего answerer'а) — пишем в WS.
+        Some(out) = out_rx.recv() => {
+            if write.send(Message::Text(out.into())).await.is_err() { break; }
+        }
+        m = read.next() => {
+        let Some(m) = m else { break };
         match m {
             Ok(Message::Ping(d)) => {
                 // Heartbeat tree.js: без явного pong сервер терминирует сокет за ~10с.
@@ -91,6 +108,37 @@ async fn run_control(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditions)
             Ok(Message::Text(txt)) => {
                 let Ok(v) = serde_json::from_str::<Value>(&txt) else { continue };
                 let msg_t = v.get("t").and_then(|x| x.as_str());
+                // Д5: ICE-серверы из welcome для probe-приёмника.
+                if msg_t == Some("welcome") {
+                    if let Some(arr) = v.get("iceServers").and_then(|x| x.as_array()) { ice_servers = arr.clone(); }
+                    continue;
+                }
+                // Д5: preflight-probe замера upload вещателя. probe-start будит приёмник (ждём
+                // offer), probe-offer поднимает answerer (дропает трек), probe-ice — трикл.
+                if msg_t == Some("probe-start") { continue; }
+                if msg_t == Some("probe-offer") {
+                    probes.retain(|_, (_, born)| born.elapsed() < Duration::from_secs(20)); // прун протухших
+                    let (Some(from), Some(sdp)) = (
+                        v.get("from").and_then(|x| x.as_str()),
+                        v.get("sdp").and_then(|x| x.as_str()),
+                    ) else { continue };
+                    match probe::answer(sdp.to_string(), &ice_servers, from.to_string(), out_tx.clone()).await {
+                        Ok((answer_sdp, sess)) => {
+                            let ans = json!({ "t": "probe-answer", "to": from, "sdp": answer_sdp });
+                            if write.send(Message::Text(ans.to_string().into())).await.is_err() { break; }
+                            if let Some((old, _)) = probes.insert(from.to_string(), (sess, Instant::now())) { old.close().await; }
+                            log::info!("control: probe-сессия для {from}");
+                        }
+                        Err(e) => log::warn!("control: probe answer для {from} не удался: {e}"),
+                    }
+                    continue;
+                }
+                if msg_t == Some("probe-ice") {
+                    if let (Some(from), Some(cand)) = (v.get("from").and_then(|x| x.as_str()), v.get("candidate")) {
+                        if let Some((sess, _)) = probes.get(from) { sess.add_ice(cand.clone()).await; }
+                    }
+                    continue;
+                }
                 // Д2 (dev): поднять/погасить транскод-рендишн поверх активной ingest-сессии.
                 if msg_t == Some("vrelay-rendition-start") || msg_t == Some("vrelay-rendition-stop") {
                     let Some(stream_id) = v.get("streamId").and_then(|x| x.as_str()) else { continue };
@@ -126,7 +174,11 @@ async fn run_control(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditions)
             Ok(Message::Close(_)) | Err(_) => break,
             _ => {}
         }
-    }
+        } // m = read.next()
+      } // tokio::select!
+    } // loop
+    // Д5: закрываем оставшиеся probe-PC при выходе из control-цикла (обрыв WS/реконнект).
+    for (_, (sess, _)) in probes.drain() { sess.close().await; }
     Ok(())
 }
 

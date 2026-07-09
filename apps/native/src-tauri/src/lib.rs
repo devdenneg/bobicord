@@ -147,6 +147,9 @@ async fn start_broadcast(
   auto_bitrate: Option<bool>,
   audio_target_pid: Option<u32>,
   max_direct_children: Option<u32>,
+  // Roadmap-flow-стриминга Д5: режим пресета ('smooth'|'quality'|'manual'). Пресет-режимы
+  // отключают клиентскую QualityLadder (адаптация зрителей — через серверные рендишны Д4).
+  preset_mode: Option<String>,
 ) -> Result<(), String> {
   let mut slot = state.0.lock().await;
   if let Some(h) = slot.as_ref() {
@@ -161,17 +164,23 @@ async fn start_broadcast(
       old.stop().await;
     }
   }
+  let auto = auto_bitrate.unwrap_or(true);
+  // Д5: лестница качества (смена fps/разрешения на set-bitrate) — ТОЛЬКО в ручном авто-битрейте.
+  // Пресет-режимы ('smooth'/'quality') и server-first+CBR гасят её: адаптация зрителей идёт
+  // через серверные рендишны (Д4). Гейт роадмапа: !manual ИЛИ !abr → выключить.
+  let manual = preset_mode.as_deref().unwrap_or("manual") == "manual";
   let config = broadcast::StreamConfig {
     max_width: max_width.clamp(320, 3840),
     max_height: max_height.clamp(180, 2160),
     fps: fps.clamp(5, 60),
     bitrate_bps: bitrate_bps.clamp(500_000, 20_000_000),
-    auto_bitrate: auto_bitrate.unwrap_or(true),
+    auto_bitrate: auto,
     audio_source: match audio_target_pid {
       Some(pid) => broadcast::AudioSource::IncludeProcess(pid),
       None => broadcast::AudioSource::ExcludeSelfViaInclude,
     },
     max_direct_children: max_direct_children.unwrap_or(4).clamp(1, 10),
+    ladder_enabled: manual && auto,
   };
   let handle = broadcast::start(Some(app), stream_id, ws_url, identity, server_id, source, config).await?;
   *slot = Some(handle);

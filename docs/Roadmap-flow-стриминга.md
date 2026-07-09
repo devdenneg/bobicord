@@ -351,7 +351,7 @@
 
 ## Д5 — Авто-пресет вещателя: probe + развилка «Плавность/Качество»
 
-**Статус:** ⬜ не начат (зависит от Д1; параллелится с Д3/Д4)
+**Статус:** 🟡 код готов; typecheck/cargo/симуляция/юнит-тест pickPreset/ad-hoc probe-релей зелёные; живой замер vs speedtest и медиапуть probe на VPS не проверены (на пользователе)
 **Цель / механизмы ТЗ:** дефолтный flow — замер upload → полезный битрейт 75% → развилка; расширенные настройки = текущий ручной режим.
 
 **Работы:**
@@ -364,11 +364,82 @@
 **Риски:** probe через TURN занижает оценку (probe идёт на публичный IP host-сети — проверить симметричный NAT вещателя); canvas-трек может не разогнать BWE за 4 с; холодный старт probe-сессии (+1 с).
 
 ### Выполнено:
-- —
+- **Таблица пресетов — единый источник (`apps/web/src/presets.ts`).** `PRESETS` (1080p60/6000,
+  720p60/4500, 1080p30/4500, 720p30/3000, 480p30/1500, 360p30/800) + `pickPreset(usefulKbps,
+  mode, sourceHeight?)`. `smooth` предпочитает 60fps (роняет разрешение, при непролезании 60fps
+  падает на 30fps-лестницу), `quality` — только 30fps (роняет fps ради разрешения). Без апскейла
+  над `sourceHeight`; флор = 360p30. **Копия таблицы в `tree.js`** (`PRESET_TABLE`) с предупреждением
+  о дублировании + валидация `RENDITION_BITRATE` = 30fps-пресеты той же высоты (warn при рассинхроне).
+- **Probe (webview вещателя) — `apps/web/src/transport/probe.ts`.** `measureUpload()`: выделенный
+  WS к /tree → `probe-start` → PC-offerer с синтетическим canvas-треком 60fps (высокоэнтропийный
+  шум) и `maxBitrate` 15 Мбит (`addTransceiver sendEncodings`) → `probe-offer` → `probe-answer` →
+  ICE. 4с читает `candidate-pair.availableOutgoingBitrate`, берёт **медиану последних 2с** (прогрев
+  1с отброшен). **Фолбэк** — DataChannel-throughput (пуш 16КБ-чанков под cap, goodput за 2.5с).
+  Кэш `localStorage` (TTL сутки) + `remeasure()`. Реюз `natDetect.ts` (флаг symmetricNat в результат).
+- **Сервер — релей probe (`tree.js`).** `onProbe` по образцу `onSignal`: вещатель (обычный сокет,
+  без `to`) → единственному vrelay-агенту с пометкой `from`; агент (isVrelayAgent) → вещателю по
+  явному `to`. `probe-unavailable`, если агента нет. Диспетч `probe-start/offer/answer/ice`. Не
+  требует join (probe до старта вещания).
+- **Агент — probe-приёмник (`apps/relay-core/src/probe.rs` + `apps/relay/src/main.rs`).** `probe::
+  answer()` — PC-answerer: setRemote(offer)→answer, принятый трек **читается и дропается**,
+  локальные ICE уходят строками в out-канал. **Отдельный MediaEngine с `register_default_codecs`**
+  (transport-cc/nack/pli) — GCC-BWE вещателя требует transport-wide feedback ОТ приёмника
+  (passthrough-relay его срезает `rtcp_feedback:vec![]`). Таймаут `PROBE_TIMEOUT`=15с (самозакрытие
+  PC). `run_control` переведён на `tokio::select!` (read + out-канал probe-сообщений), карта
+  `probes` по peer-id вещателя с пруном протухших; ICE-серверы из welcome (host-кандидат VPS →
+  probe на публичный IP, не TURN). Закрытие probe-PC при выходе из control-цикла.
+- **BroadcastModal — redesign flow.** Источник → авто-замер при открытии (спиннер, кэш) →
+  `useful = 0.75×BWE` → развилка **Плавность**/**Качество** (chosenPreset = pickPreset). Кнопка
+  «повторить замер». `SavedConfig.presetMode: 'smooth'|'quality'|'manual'` (миграция localStorage
+  цела). **«Расширенные настройки»** (`<details>`, открыт в manual) = текущие ручные контролы
+  (разрешение/fps/битрейт/автобитрейт/прямые подключения); изменение битрейт/разрешение/fps
+  переводит в `manual`, звук/прямые-подключения ортогональны. `start()` в пресет-режиме шлёт
+  width/height/fps/bitrate из пресета (CBR, autoBitrate off) + `presetMode`; в manual — как раньше.
+- **Натив — CBR/HRD + гейт лестницы.** `encoder.rs`: CBR уже был; добавлен HRD-буфер
+  `CODECAPI_AVEncCommonBufferSize` ≈ 1× битрейт (low-latency VBV, `let _ =` — часть MFT игнорит).
+  `mod.rs`: `StreamConfig.ladder_enabled`, гейт `if ladder_enabled { ladder.apply() }` (целевой
+  CBR-битрейт от set-bitrate применяется всегда — гейтим только смену fps/разрешения). `lib.rs`
+  `start_broadcast` принимает `preset_mode`; `ladder_enabled = manual && auto_bitrate` (пресет
+  ИЛИ !abr → выключено, как требует роадмап). `start_watch`/рендишн-корень не тронуты.
+- **Верификация:** `npm run typecheck` (web) EXIT 0; `node --check tree.js` OK; `node tree-sim.js`
+  зелёный (валидация PRESET_TABLE без warn); `cargo check` relay-core/relay/native + `--examples`
+  relay-core — все EXIT 0 (native: пре-существующие dead_code-warnings, Cargo.lock откачен).
+  **Юнит-тест pickPreset 13/13 PASS** (`presets.test.mjs`, node+esbuild): `pickPreset(6000,'smooth')`
+  →1080p60/6000, `pickPreset(6000,'quality',1080)`→1080p30/4500, 5000/smooth→720p60, 4000/smooth→
+  720p30, source=720 без 1080-пресетов, флор 360p30. **Ad-hoc probe-релей 7/7 PASS**: без агента→
+  probe-unavailable; probe-start/offer доходят агенту с from; probe-answer{to}/probe-ice обе стороны;
+  probe не ломает последующий join вещателя.
+
 ### Проблемы:
-- —
+- **Живой замер vs speedtest (±25%) — блокирующий AC на пользователе.** Нет VPS/агента/вещателя
+  локально; медиапуть probe (canvas-трек → BWE) прогнать негде. Ad-hoc-тест проверил ТОЛЬКО
+  маршрутизацию сигналинга, не реальный BWE. Риск роадмапа «canvas-трек может не разогнать BWE за
+  4с» смягчён: приёмник даёт transport-cc (register_default_codecs), высокоэнтропийный шум-трек,
+  медиана окна; если BWE=0 — фолбэк DataChannel-throughput. Требует замера на реальном канале.
+- **Probe через TURN / симметричный NAT.** Агент отдаёт host-кандидат (публичный IP VPS) — ICE
+  вещателя предпочтёт прямой путь. При симметричном NAT вещателя probe уйдёт через TURN и ЗАНИЗИТ
+  оценку; detectSymmetricNat помечает результат (UI-предупреждение), но авто-компенсации нет — на пользователе.
+- **Дублирование таблицы пресетов web↔tree.js** — осознанное (нет общего рантайма JS↔Node-сервер;
+  tree.js — CommonJS, presets.ts — ESM-модуль веб-бандла). Защита: warn-валидация в tree.js при
+  старте + предупреждающие комментарии в ОБОИХ файлах. Синхронизировать вручную при правках.
+
 ### Решения:
-- —
+- **Probe меряется из webview (Chromium GCC-BWE), приёмник — Rust-агент с ПОЛНЫМ фидбэком.**
+  register_default_codecs в probe.rs (не H264-only stripped, как passthrough-relay) — иначе
+  send-side BWE вещателя не разгоняется (нет transport-cc от приёмника). Это ключ к рабочему замеру.
+- **Релей probe = паттерн onSignal, но адресация вещатель→единственный агент (from), агент→by-to.**
+  Не второй релей: probe-сокет вещателя не joins (probe до старта вещания), поэтому отдельный
+  `onProbe` без гейта `p.streamId`; агент отвечает по peer-id вещателя, узнанному из `from`.
+- **`run_control` агента переведён на select(read + out-канал).** ICE probe-answerer'а рождаются в
+  колбэках PC (другая задача) — пишутся в WS через mpsc, как ingest-релей; единственный владелец
+  WS-sink остаётся в цикле. Карта probes по from, прун >20с, закрытие при выходе.
+- **presetMode гейтит лестницу и в UI, и в нативе.** Пресет = CBR (autoBitrate off) → сервер не
+  шлёт set-bitrate (abr:false) → лестница и так не сработала бы; явный `ladder_enabled = manual &&
+  auto` — belt-and-suspenders (роадмап требует явный гейт). Изменение ручного битрейта/разрешения/
+  fps в UI переводит presetMode в 'manual' (звук/прямые-подключения ортогональны — не сбрасывают пресет).
+- **Без апскейла на клиенте.** pickPreset режет по sourceHeight; в UI source-разрешение монитора/окна
+  неизвестно (MonitorInfo без размеров) → не режем в UI, но натив (scaled_dims) и сервер (Д4
+  availableRungs) апскейл не делают — пресет-width/height уходят как МАКС-капы.
 
 ---
 

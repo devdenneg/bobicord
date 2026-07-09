@@ -7,3 +7,5 @@ pub mod signaling;
 // Roadmap-flow-стриминга Д2: серверный транскод рендишнов (RTP→ffmpeg→RTP) — только для
 // vrelay (virtual_relay:true), нативный passthrough-узел его никогда не активирует.
 pub mod transcode;
+// Roadmap-flow-стриминга Д5: probe-приёмник замера upload вещателя (PC-answerer, дропает трек).
+pub mod probe;

@@ -108,6 +108,12 @@ pub struct StreamConfig {
     /// Э8: лимит прямых детей корня в дереве (задаётся вещателем в UI). Overflow-зрители
     /// уходят глубже через relay-узлы. Ёмкость объявляется серверу в join (см. signaling).
     pub max_direct_children: u32,
+    /// Roadmap-flow-стриминга Д5: применять ли клиентскую QualityLadder на set-bitrate.
+    /// В пресет-режиме (Плавность/Качество) и в server-first+CBR лестница НЕ нужна — адаптация
+    /// зрителей идёт через серверные рендишны (Д4). Включена только в ручном авто-битрейте
+    /// (presetMode == 'manual' && auto_bitrate). Целевой битрейт от set-bitrate применяется
+    /// к CBR-энкодеру всегда — гейт снимает лишь смену fps/разрешения лестницей.
+    pub ladder_enabled: bool,
 }
 
 pub struct BroadcastHandle {
@@ -254,7 +260,7 @@ pub async fn start(
     source: CaptureSource,
     config: StreamConfig,
 ) -> Result<BroadcastHandle, String> {
-    let StreamConfig { max_width, max_height, fps, bitrate_bps, auto_bitrate, audio_source, max_direct_children } = config;
+    let StreamConfig { max_width, max_height, fps, bitrate_bps, auto_bitrate, audio_source, max_direct_children, ladder_enabled } = config;
     // Разделяемая подпись источника — обновляется при смене источника на лету (set_source).
     let source_label = Arc::new(std::sync::Mutex::new(describe_source(&source)));
     // ABR (Э8): живая цель битрейта. Стартует с выбранного пользователем значения (оно же —
@@ -472,7 +478,7 @@ pub async fn start(
     let alive_loop = alive.clone();
     let meta = DebugMeta { stream_id, source_label: source_label.clone(), target_bitrate_bps: bitrate_bps };
     let ladder = QualityLadder { user_fps: fps, user_w: max_width, user_h: max_height, targets: quality_targets, step: 0 };
-    tokio::spawn(run_signaling_loop(mgr, evt_rx, shutdown_rx, app, stats, meta, alive_loop, force_keyframe.clone(), target_bitrate, ladder));
+    tokio::spawn(run_signaling_loop(mgr, evt_rx, shutdown_rx, app, stats, meta, alive_loop, force_keyframe.clone(), target_bitrate, ladder, ladder_enabled));
 
     Ok(BroadcastHandle {
         enc_stop,
@@ -521,6 +527,7 @@ async fn run_signaling_loop(
     force_keyframe: Arc<AtomicBool>,
     target_bitrate: Arc<AtomicU32>,
     mut ladder: QualityLadder,
+    ladder_enabled: bool,
 ) {
     let mut stats_tick = tokio::time::interval(Duration::from_secs(2));
     let mut prev_at = Instant::now();
@@ -547,8 +554,11 @@ async fn run_signaling_loop(
                         let clamped = bps.clamp(BITRATE_FLOOR, meta.target_bitrate_bps);
                         target_bitrate.store(clamped, Ordering::Relaxed);
                         // Лестница качества: битрейт упал — режем fps/разрешение вслед
-                        // (стабильность важнее чёткости; см. QualityLadder).
-                        ladder.apply(clamped);
+                        // (стабильность важнее чёткости; см. QualityLadder). Д5: в пресет-режиме
+                        // (Плавность/Качество) и server-first+CBR лестница отключена — адаптация
+                        // зрителей идёт через серверные рендишны (Д4), а не сменой fps/разрешения
+                        // на вещателе. Целевой битрейт (CBR) выше уже применён — гейтим только лестницу.
+                        if ladder_enabled { ladder.apply(clamped); }
                     }
                     // Рестарт сервера пережит: реджойнились свежим корнем, старое дерево
                     // сервер потерял — зрители переджойнятся и придут свежими assign-child.

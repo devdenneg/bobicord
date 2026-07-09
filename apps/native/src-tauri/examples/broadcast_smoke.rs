@@ -25,6 +25,7 @@ async fn main() {
         auto_bitrate: true,
         audio_source: broadcast::AudioSource::ExcludeSelfViaInclude,
         max_direct_children: 4,
+        ladder_enabled: true, // смоук — ручной авто-битрейт, лестница активна
     };
 
     println!("[smoke] starting broadcast stream_id={stream_id} ws_url={ws_url} monitor={monitor_index}");

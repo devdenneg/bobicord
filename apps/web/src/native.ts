@@ -55,6 +55,8 @@ export interface StreamConfig {
   audioTargetPid?: number;
   /** Э8: лимит прямых детей корня в дереве (overflow-зрители уходят глубже через relay). */
   maxDirectChildren?: number;
+  /** Д5: режим пресета ('smooth'|'quality'|'manual'). Пресеты гасят клиентскую QualityLadder. */
+  presetMode?: 'smooth' | 'quality' | 'manual';
 }
 
 export interface BroadcastStats {
@@ -110,6 +112,7 @@ export async function startNativeBroadcast(streamId: string, identity: string, s
     autoBitrate: config.autoBitrate ?? true,
     audioTargetPid: config.audioTargetPid ?? null,
     maxDirectChildren: config.maxDirectChildren ?? null,
+    presetMode: config.presetMode ?? 'manual',
   });
 }
 

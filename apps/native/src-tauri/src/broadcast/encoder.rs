@@ -88,6 +88,11 @@ impl H264Encoder {
                 // CBR вместо дефолтного VBR — статичный битрейт (не плавает с содержимым сцены),
                 // предсказуемая нагрузка на дерево/TURN.
                 let _ = api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &VARIANT::from(eAVEncCommonRateControlMode_CBR.0));
+                // Roadmap-flow-стриминга Д5: HRD-буфер ≈ 1× битрейт (1с VBV) для low-latency CBR —
+                // ограничивает разброс размера кадров (без него CBR-энкодер может копить крупные
+                // спайки, пробивающие слабый линк зрителя). Часть MFT (NVENC/AMF/QSV) свойство
+                // игнорирует или не поддерживает — не критично, полагаемся на CBR-контроль (let _ =).
+                let _ = api.SetValue(&CODECAPI_AVEncCommonBufferSize, &VARIANT::from(bitrate_bps));
                 // Периодический IDR (GOP) как страховка от потери keyframe: основной путь
                 // восстановления — PLI от зрителя (peer.rs читает RTCP и форсит IDR), но если
                 // PLI/force потерялся, без периодического GOP зритель фризит до следующего

@@ -103,6 +103,24 @@ const RENDITION_HEIGHT = { 1080: 1080, 720: 720, 480: 480, 360: 360 };
 // Дефолтный CBR-битрейт рендишна (бит/с) — совпадает с transcode.rs::rendition_default_bitrate.
 // Сервер шлёт агенту presetBitrate; агент при 0 берёт свой дефолт (страховка совместимости).
 const RENDITION_BITRATE = { 1080: 4_500_000, 720: 3_000_000, 480: 1_500_000, 360: 800_000 };
+
+// Roadmap-flow-стриминга Д5: таблица пресетов вещателя (H.264/CBR). ⚠ ДУБЛИРУЕТСЯ в
+// apps/web/src/presets.ts (PRESETS) — источник истины ТАМ; здесь КОПИЯ для валидации
+// битрейтов рендишнов. При ЛЮБОМ изменении значений синхронизируй ОБЕ копии.
+const PRESET_TABLE = [
+  { width: 1920, height: 1080, fps: 60, bitrateKbps: 6000 },
+  { width: 1280, height: 720,  fps: 60, bitrateKbps: 4500 },
+  { width: 1920, height: 1080, fps: 30, bitrateKbps: 4500 },
+  { width: 1280, height: 720,  fps: 30, bitrateKbps: 3000 },
+  { width: 854,  height: 480,  fps: 30, bitrateKbps: 1500 },
+  { width: 640,  height: 360,  fps: 30, bitrateKbps: 800 },
+];
+// Рендишны = 30fps-пресеты той же высоты (единый источник). Расхождение = баг синка таблиц.
+for (const [rung, bps] of Object.entries(RENDITION_BITRATE)) {
+  const preset = PRESET_TABLE.find((p) => p.fps === 30 && p.height === RENDITION_HEIGHT[rung]);
+  if (preset && preset.bitrateKbps * 1000 !== bps)
+    console.warn(`[tree] Д5: RENDITION_BITRATE[${rung}]=${bps} != пресет ${preset.bitrateKbps * 1000} — рассинхрон таблиц web↔tree.js`);
+}
 // Состояния рендишна в реестре source-дерева.
 const RS_STARTING = 'starting'; // vrelay-rendition-start отправлен, ждём джойна рендишн-корня
 const RS_LIVE = 'live';         // рендишн-корень заджойнился в base::rendition, раздаёт
@@ -979,6 +997,23 @@ function attachTreeServer(httpServer, opts) {
     send(msg.to, { t: msg.t, streamId: p.streamId, from: id, type: msg.type, sdp: msg.sdp, candidate: msg.candidate });
   }
 
+  // Roadmap-flow-стриминга Д5: релей preflight-probe замера upload. Как onSignal, но адресация:
+  // вещатель (webview, обычный сокет) шлёт probe-* БЕЗ `to` — маршрутизируем единственному
+  // vrelay-агенту, помечая `from` (агент — probe-приёмник, дропает трек). Агент отвечает с
+  // явным `to` (peer-id вещателя, узнал из from) — шлём адресату. probe-start будит приёмник,
+  // probe-offer/answer/ice — SDP/ICE. Не требует join (probe идёт до старта вещания).
+  function onProbe(id, msg) {
+    const p = peers.get(id);
+    if (!p) return;
+    if (p.isVrelayAgent) { // агент → вещатель (по явному to)
+      if (msg.to) send(msg.to, { t: msg.t, from: id, sdp: msg.sdp, candidate: msg.candidate });
+      return;
+    }
+    const agent = findVrelayAgent(); // вещатель → агент
+    if (!agent) { send(id, { t: 'probe-unavailable', reason: 'no-agent' }); return; }
+    send(agent.id, { t: msg.t, from: id, sdp: msg.sdp, candidate: msg.candidate });
+  }
+
   // Э8: приём stats от узла — availableOutgoing его самого + rtt/loss на линках к его детям
   // (используется best-peer скорингом и решением о миграции). peers и t.nodes держат один и
   // тот же объект узла, так что пишем прямо в него.
@@ -1219,6 +1254,7 @@ function attachTreeServer(httpServer, opts) {
       else if (msg.t === 'vrelay-hello') onVrelayHello(id, msg);
       else if (msg.t === 'set-quality') onSetQuality(id, msg);                       // Д4: ручной выбор качества
       else if (msg.t === 'vrelay-rendition-failed') onVrelayRenditionFailed(id, msg); // Д4: агент не поднял рендишн
+      else if (msg.t === 'probe-start' || msg.t === 'probe-offer' || msg.t === 'probe-answer' || msg.t === 'probe-ice') onProbe(id, msg); // Д5: замер upload
       else if (msg.t === 'dev-rendition') onDevRendition(id, msg); // DEV-ТРИГГЕР Д2 (гейт внутри)
     });
     // code 1006 = грязный обрыв TCP (без close-фрейма): краш клиента, потеря сети,
