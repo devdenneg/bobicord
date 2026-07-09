@@ -115,27 +115,33 @@ function DominantBadge({ s, unread }: { s: ServerSummary; unread: Record<string,
   return <span className="dominant quiet">тихо</span>;
 }
 
-// Живая карточка эфира (герой S1): стрим или голос, с CTA-прыжком.
+// Живая карточка эфира (герой главной): ОДНА на сервер — обложка+имя сервера, бейджи LIVE/голос,
+// ведущий стример (если есть), кластер активных, CTA-прыжок.
 function LiveCard({ item, onOpen }: { item: LiveItem; onOpen: () => void }) {
   const s = item.server;
-  if (item.kind === 'stream') {
-    const m = item.member;
-    const others = (s.online || []).filter((x) => x.username !== m.username);
-    return (
-      <div className="live-card stream">
-        <div className="lc-top"><span className="live-pill"><i className="live-dot" />LIVE</span><span className="lc-srv">{s.name}</span></div>
-        <div className="lc-lead">
-          <span className="lc-av live" style={{ background: faceBg(m.avatarUrl, m.displayName, m.avatarColor) }}><Face url={m.avatarUrl} name={m.displayName} color={m.avatarColor} /></span>
-          <div className="lc-who"><b>{m.displayName}</b><span>Трансляция{item.alsoVoice ? ' · и в голосе' : ''}</span></div>
-        </div>
-        <div className="lc-foot">{others.length ? <Cluster members={others} cap={6} /> : <span />}<button className="cta" onClick={onOpen}>Смотреть</button></div>
-      </div>
-    );
-  }
+  const hasStream = item.streamers.length > 0;
+  const active = [...item.streamers, ...item.voice]; // все активные — для кластера лиц
+  const lead = item.streamers[0];                    // ведущий стример (если стримят несколько — «+N»)
   return (
-    <div className="live-card voice">
-      <div className="lc-top"><span className="live-pill voice-pill"><Icon name="mic-sm" sm />{item.members.length} в голосе</span><span className="lc-srv">{s.name}</span></div>
-      <div className="lc-foot"><Cluster members={item.members} cap={6} /><button className="cta" onClick={onOpen}>Зайти</button></div>
+    <div className={'live-card' + (hasStream ? ' stream' : ' voice')}>
+      <div className="lc-top">
+        <span className="lc-srvic" style={{ background: faceBg(s.iconUrl, s.name, s.iconColor) }}><Face url={s.iconUrl} name={s.name} color={s.iconColor} /></span>
+        <span className="lc-srv">{s.name}</span>
+        <span className="lc-badges">
+          {hasStream ? <span className="live-pill"><i className="live-dot" />LIVE</span> : null}
+          {item.voice.length ? <span className="live-pill voice-pill"><Icon name="mic-sm" sm />{item.voice.length}</span> : null}
+        </span>
+      </div>
+      {lead ? (
+        <div className="lc-lead">
+          <span className="lc-av live" style={{ background: faceBg(lead.avatarUrl, lead.displayName, lead.avatarColor) }}><Face url={lead.avatarUrl} name={lead.displayName} color={lead.avatarColor} /></span>
+          <div className="lc-who"><b>{lead.displayName}{item.streamers.length > 1 ? ` +${item.streamers.length - 1}` : ''}</b><span>Трансляция{lead.inVoice ? ' · и в голосе' : ''}</span></div>
+        </div>
+      ) : null}
+      <div className="lc-foot">
+        {active.length ? <Cluster members={active} cap={6} /> : <span />}
+        <button className="cta" onClick={onOpen}>{hasStream ? 'Смотреть' : 'Зайти'}</button>
+      </div>
     </div>
   );
 }

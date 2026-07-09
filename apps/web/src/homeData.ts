@@ -2,9 +2,8 @@
 // данных /me (store.servers[].online[]). Никакой сети — только derive из presence. См. Home() в App.tsx.
 import type { ServerSummary, OnlineMember } from './types';
 
-export type LiveItem =
-  | { kind: 'stream'; key: string; server: ServerSummary; member: OnlineMember; alsoVoice: boolean }
-  | { kind: 'voice'; key: string; server: ServerSummary; members: OnlineMember[] };
+// ОДИН эфир-item на сервер: агрегирует стримеров И голосовых (раньше были 2 отдельные карточки).
+export type LiveItem = { key: string; server: ServerSummary; streamers: OnlineMember[]; voice: OnlineMember[] };
 
 export type Dominant =
   | { kind: 'live'; n: number }
@@ -22,26 +21,22 @@ function interest(s: ServerSummary, unread: Unread, connectedId: string | null):
     + Math.min((s.onlineCount || 0) / 50, 1);
 }
 
-// Живой эфир по всем серверам: стримы (на человека) + голосовые (на сервер, без стримеров).
-// Стримы выше голоса (перишейбл-хедлайн приложения). Стабильный тайбрейк по id — без тряски на поллинге.
+// Живой эфир: ОДНА карточка на сервер, агрегирует стримеров + голосовых. Серверы со стримом выше
+// (перишейбл-хедлайн), потом по числу активных / интересу. Стабильный тайбрейк по id — без тряски.
 export function deriveLiveItems(servers: ServerSummary[], unread: Unread, connectedId: string | null): LiveItem[] {
-  const streams: Extract<LiveItem, { kind: 'stream' }>[] = [];
-  const voices: Extract<LiveItem, { kind: 'voice' }>[] = [];
+  const items: LiveItem[] = [];
   for (const s of servers) {
     const on = s.online || [];
-    for (const m of on) if (m.streaming) streams.push({ kind: 'stream', key: s.id + ':' + m.username, server: s, member: m, alsoVoice: m.inVoice });
-    const vc = on.filter((m) => m.inVoice && !m.streaming);
-    if (vc.length) voices.push({ kind: 'voice', key: s.id + ':vc', server: s, members: vc });
+    const streamers = on.filter((m) => m.streaming);
+    const voice = on.filter((m) => m.inVoice && !m.streaming);
+    if (streamers.length || voice.length) items.push({ key: s.id, server: s, streamers, voice });
   }
-  streams.sort((a, b) =>
-    interest(b.server, unread, connectedId) - interest(a.server, unread, connectedId)
-    || (b.server.onlineCount || 0) - (a.server.onlineCount || 0)
-    || a.server.id.localeCompare(b.server.id));
-  voices.sort((a, b) =>
-    b.members.length - a.members.length
+  items.sort((a, b) =>
+    (b.streamers.length ? 1 : 0) - (a.streamers.length ? 1 : 0)                    // со стримом — выше
+    || (b.streamers.length + b.voice.length) - (a.streamers.length + a.voice.length) // больше активных
     || interest(b.server, unread, connectedId) - interest(a.server, unread, connectedId)
     || a.server.id.localeCompare(b.server.id));
-  return [...streams.slice(0, 6), ...voices];
+  return items.slice(0, 8);
 }
 
 // Тир сервера для сортировки сетки (live-first). live>voice>unread>online>quiet.
