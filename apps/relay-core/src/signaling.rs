@@ -57,6 +57,10 @@ pub struct JoinParams {
     /// Э9: серверный виртуальный fallback-relay. Сервер верит флагу только при
     /// JWT-uid 'virtual-relay' (tree.js) — обычные клиенты шлют false.
     pub virtual_relay: bool,
+    /// Д1 (server-first): вещатель сигналит серверу, что стрим идёт «через сервер»
+    /// (стример → сервер → зрители). Шлёт ТОЛЬКО натив-вещатель; сервер включает
+    /// server-first-режим лишь при своём TREE_SERVER_FIRST=1. relay-viewer/vrelay — false.
+    pub server_ingest: bool,
     /// Имя стримящегося приложения (окна) — только broadcaster, зрителям уходит в stream-live.
     pub app_name: Option<String>,
     /// Иконка приложения: PNG 32×32 base64 (без data-URI-префикса), 1-3 КБ.
@@ -105,6 +109,7 @@ pub fn connect(ws_url: String, join: JoinParams, reconnect: bool) -> (mpsc::Unbo
             "maxBitrate": join.max_bitrate,
             "abr": join.abr,
             "virtual": join.virtual_relay,
+            "serverIngest": join.server_ingest,
             "identity": join.identity,
             "serverId": join.server_id,
             "appName": join.app_name,

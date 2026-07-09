@@ -85,11 +85,18 @@ async fn run_control(cfg: &Arc<Cfg>, streams: &Streams) -> Result<(), String> {
             }
             Ok(Message::Text(txt)) => {
                 let Ok(v) = serde_json::from_str::<Value>(&txt) else { continue };
-                if v.get("t").and_then(|x| x.as_str()) == Some("vrelay-activate") {
-                    let Some(stream_id) = v.get("streamId").and_then(|x| x.as_str()) else { continue };
-                    let server_id = v.get("serverId").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                    activate(cfg, streams, stream_id, server_id).await;
-                }
+                // vrelay-activate (Э9): fallback-сессия — гаснет по idle, без реконнекта.
+                // vrelay-ingest (Д1 server-first): ПОСТОЯННЫЙ медиаузел — без idle-exit,
+                // переживает обрыв WS (реконнект+реджойн). Завершается по vrelay-release/stream-end.
+                let (kind, persistent) = match v.get("t").and_then(|x| x.as_str()) {
+                    Some("vrelay-activate") => ("activate", false),
+                    Some("vrelay-ingest") => ("ingest", true),
+                    _ => continue,
+                };
+                let Some(stream_id) = v.get("streamId").and_then(|x| x.as_str()) else { continue };
+                let server_id = v.get("serverId").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                log::info!("control: {kind} {stream_id}");
+                activate(cfg, streams, stream_id, server_id, persistent).await;
             }
             Ok(Message::Close(_)) | Err(_) => break,
             _ => {}
@@ -99,14 +106,17 @@ async fn run_control(cfg: &Arc<Cfg>, streams: &Streams) -> Result<(), String> {
 }
 
 /// Поднимает relay-сессию для дерева, если её ещё нет и лимит не выбран.
-async fn activate(cfg: &Arc<Cfg>, streams: &Streams, stream_id: &str, server_id: String) {
+/// `persistent` (Д1 ingest): постоянный медиаузел — без idle-exit, с реконнектом WS.
+/// Иначе (Э9 activate): fallback-сессия — гаснет по idle, без реконнекта (агент
+/// переактивируется по следующему vrelay-activate).
+async fn activate(cfg: &Arc<Cfg>, streams: &Streams, stream_id: &str, server_id: String, persistent: bool) {
     let mut map = streams.lock().await;
     if map.contains_key(stream_id) { return; } // уже ретранслируем это дерево
     if map.len() >= cfg.max_streams {
         log::warn!("stream {stream_id}: отказ — лимит VRELAY_MAX_STREAMS={} выбран", cfg.max_streams);
         return;
     }
-    log::info!("stream {stream_id}: активация (серверов в работе: {})", map.len());
+    log::info!("stream {stream_id}: активация{} (серверов в работе: {})", if persistent { " (ingest, постоянная)" } else { "" }, map.len());
     let handle = relay::start(None, RelayConfig {
         stream_id: stream_id.to_string(),
         ws_url: format!("{}?token={}", cfg.ws_url, mint_token(&cfg.session_secret)),
@@ -115,8 +125,10 @@ async fn activate(cfg: &Arc<Cfg>, streams: &Streams, stream_id: &str, server_id:
         max_children: cfg.max_children,
         virtual_relay: true,
         available_outgoing: cfg.available_outgoing,
-        idle_exit: Some(cfg.idle),
-        reconnect: false, // сессия гаснет с WS; агент переактивируется по vrelay-activate
+        // Д1 ingest: постоянный узел не гаснет по простою — только по vrelay-release/stream-end
+        // (уход вещателя). Э9 activate: гаснет по idle, агент переактивируется.
+        idle_exit: if persistent { None } else { Some(cfg.idle) },
+        reconnect: persistent, // ingest переживает деплой (реконнект+реджойн); activate гаснет с WS
     });
     let fin = handle.finished();
     map.insert(stream_id.to_string(), handle);

@@ -20,6 +20,9 @@ services:
       - TURN_SECRET=${TURN_SECRET}
       - TURN_URLS=${TURN_URLS}
       - TURN_TTL_SEC=${TURN_TTL_SEC:-600}
+      # Roadmap-flow-стриминга Д1: server-first (стример → сервер → зрители). По умолчанию 0
+      # (legacy). Флаг снимается/ставится вручную — Д1 не включает режим в проде.
+      - TREE_SERVER_FIRST=${TREE_SERVER_FIRST:-0}
     volumes:
       - ./data:/app/data
     ports:
@@ -50,7 +53,10 @@ services:
     environment:
       - SESSION_SECRET=${SESSION_SECRET}
       - TREE_WS_URL=ws://127.0.0.1:3000/tree
-      - VRELAY_MAX_CHILDREN=${VRELAY_MAX_CHILDREN:-8}
+      # Д1: server-first делает vrelay постоянным медиаузлом — поднят кап прямых детей.
+      - VRELAY_MAX_CHILDREN=${VRELAY_MAX_CHILDREN:-32}
+      # Исходящая полоса узла (Мбит/с) для скоринга best-peer — egress VPS ~ битрейт × дети.
+      - VRELAY_OUT_MBPS=${VRELAY_OUT_MBPS:-50}
       - RUST_LOG=info
 
   caddy:

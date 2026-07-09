@@ -295,6 +295,9 @@ pub async fn start(
         max_bitrate: bitrate_bps, // потолок ABR = выбранный пользователем битрейт
         abr: auto_bitrate,
         virtual_relay: false,
+        // Д1 (server-first): натив всегда сигналит «вещаю через сервер». Сервер сам решает
+        // по своему TREE_SERVER_FIRST, включать ли режим; старый сервер поле проигнорирует.
+        server_ingest: true,
         app_name, app_icon,
     };
     // reconnect=true: деплой рестартит сервер — вещание переживает обрыв WS (реджойн),

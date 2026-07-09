@@ -50,7 +50,7 @@
 
 ## Д0 — Документы + браузер снова строго лист (снос Э8)
 
-**Статус:** ⬜ не начат
+**Статус:** 🟡 код готов (`0fc2e4e`), живой AC не проверен
 **Цель / механизмы ТЗ:** зафиксировать новые инварианты; «браузер — лист».
 
 **Работы:**
@@ -63,17 +63,25 @@
 **Риски:** нагрузка на vrelay растёт уже здесь (приемлемо — Д1 делает его постоянным).
 
 ### Выполнено:
-- —
+- Коммит `0fc2e4e` (не запушен).
+- `CLAUDE.md`: инварианты №1 (сервер = постоянный медиаузел, не фолбэк), №3 (браузер строго лист, Э8-исключение убрано), №4/№7 (сервер транскодирует рендишны по требованию, source passthrough), №9 (цель <2с), №10 (задел на `streamId::rendition`). Non-goals: убран «транскод на сервере». Этот роадмап объявлен главным рабочим доком.
+- `git rm docs/Evolution-TZ.md docs/audio-capture-fix.md docs/fps-fix.md` (решение из примечания — закоммитить удаление). Сам роадмап добавлен в историю (был untracked).
+- `treeVideo.ts`: снесён Э8-relay — `serveChild`, `reportChildStats`+statsTimer, `BROWSER_RELAY_CAPACITY`, `canEncodeH264`, поля `recvVideo`/`recvAudio`/`children`/`pendingChildren` в `WatchState`. join браузера всегда `maxChildren:0`. `assign-child` → no-op-лог. `sdp`/`ice`/`drop-peer` упрощены до parent-ветки. Натив-путь и `preferH264` не тронуты.
+- `tree.js`: `capacityOf` — гард `if (!node.native) return 0` после ветки `virtual`, до symmetricNat/maxChildren.
+- Верификация: `npm --prefix apps/web run typecheck` EXIT 0; `node --check apps/server/tree.js` чисто; `node apps/server/tree-sim.js` зелёный (браузерные узлы `cap=0`).
+
 ### Проблемы:
-- —
+- `apps/web/node_modules` был неполон (`@tauri-apps/plugin-dialog`/`-fs`/`-notification` в package.json, но не установлены) — typecheck падал ДО правок. Вылечено `npm install`, package.json/lockfile не тронуты.
+
 ### Решения:
-- —
+- `assign-child` оставлен как no-op с `console.warn` (не удалён) — наблюдаемый след, если старый сервер/бандл его пришлёт.
+- Гард в `capacityOf` — по флагу `node.native`, а не только через константу `BROWSER_CAPACITY=0` (защита от регрессий).
 
 ---
 
 ## Д1 — vrelay = постоянный медиаузел; инверсия топологии под флагом (passthrough)
 
-**Статус:** ⬜ не начат
+**Статус:** 🟡 код готов, компиляция/симуляция зелёные, живой e2e не проверен
 **Цель / механизмы ТЗ:** «стример → сервер → зрители» на passthrough, без транскода. Самая рискованная инфраструктурная часть (постоянный серверный медиапуть, ёмкость VPS) проверяется первой.
 
 **Работы:**
@@ -86,11 +94,21 @@
 **Риски:** исходящая полоса VPS (30×6 Мбит = 180 Мбит — замерить, задать кап); deploy.yml рвёт живой ingest; `reconnect:true` — новая ветка поведения (проверить sweep мёртвых детей relay.rs:399-409).
 
 ### Выполнено:
-- —
+- `apps/server/tree.js`: флаг `SERVER_FIRST = process.env.TREE_SERVER_FIRST==='1'` (лог режима при старте `attachTreeServer`). `onJoin` вещателя парсит `serverIngest`; при `SERVER_FIRST && serverIngest && role==='broadcaster'` → `t.serverFirst=true`, дефолт `maxChildren=1` (если клиент не прислал своё). Сразу после join вещателя — `requestVrelayActivation` (без ожидания сирот). `requestVrelayActivation` шлёт `vrelay-ingest` для server-first-дерева (иначе legacy `vrelay-activate`). `scoreParent(cand, serverFirst)` — виртуалу бонус `-VIRTUAL_SERVER_FIRST_BONUS` (−500) вместо штрафа `VIRTUAL_COST`; `pickParent` пробрасывает `t.serverFirst`. Виртуал в server-first помечается `vrelayPinned=true` в onJoin. `drainTimer` пропускает server-first-деревья целиком. `VIRTUAL_CHILDREN_CAP` 16→`Number(process.env.VRELAY_CHILDREN_CAP)||32`.
+- `apps/relay/src/main.rs`: новое control-сообщение `vrelay-ingest` → `activate(..., persistent:true)` с `idle_exit:None, reconnect:true`. Legacy `vrelay-activate` → `persistent:false` (без изменений семантики). `activate` параметризован `persistent`, без копипасты.
+- `apps/relay-core/src/signaling.rs`: `JoinParams.server_ingest: bool`, сериализуется как `serverIngest`. Обновлены оба конструктора: `relay.rs` (viewer/vrelay → `false`), `broadcast/mod.rs` (broadcaster → `true`).
+- `apps/native/.../broadcast/mod.rs`: натив-вещатель шлёт `server_ingest: true` (сервер сам решает по своему флагу).
+- `apps/web/.../BroadcastModal.tsx`: слайдер «Прямых подключений» уведён под `<details>` «Дополнительно» (функциональность сохранена).
+- `docker-compose.yml` + `.env.example`: `TREE_SERVER_FIRST` (дефолт 0) у token-сервиса; `VRELAY_MAX_CHILDREN` 8→32, добавлен `VRELAY_OUT_MBPS`; документирован `VRELAY_CHILDREN_CAP`.
+- Верификация: `node --check tree.js` OK; `node tree-sim.js` зелёный (legacy-регрессия); ad-hoc server-first ws-тест PASS (вещатель с `serverIngest` → сервер шлёт `vrelay-ingest` не `vrelay-activate`; виртуал = прямой ребёнок корня ДО первого зрителя; первый зритель parent=виртуал; дефолт корня cap=1); `cargo check` relay-core/relay/native все EXIT 0; web `tsc --noEmit` EXIT 0.
+
 ### Проблемы:
-- —
+- `apps/native/src-tauri/Cargo.lock` при локальном `cargo check` регенерировался (пре-существующий дрейф: плагины dialog/fs/notification в Cargo.toml не были в lock). Не относится к Д1 — откачен, синк лока идёт через CI (`build-windows.yml` `cargo fetch`).
+
 ### Решения:
-- —
+- `serverIngest` живёт в общем `JoinParams` (relay-core делит натив-вещатель и vrelay), но шлёт его только вещатель (`true`); vrelay/relay-viewer — `false`.
+- Немедленная активация переиспользует `requestVrelayActivation`/`ensureVirtualAttached` (не новый путь); тип сообщения выбирается по `t.serverFirst`.
+- `reconnect:true` для ingest НЕ мешает teardown: завершение сессии идёт по событиям `Release`/`StreamEnd` (broadcasterLost шлёт `vrelay-release`) и `Stop`, а не по обрыву транспорта — reconnect влияет только на переживание блипа WS (что и нужно постоянному узлу). `Release`/`StreamEnd` в relay.rs делают `break` независимо от `reconnect`. Живой e2e (медиапуть ingest, полоса, teardown на реальном VPS) — на пользователе.
 
 ---
 

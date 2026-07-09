@@ -275,9 +275,18 @@ export function BroadcastModal() {
         ? 'Битрейт снижается автоматически под худший линк дерева (и восстанавливается). Значение выше — потолок.'
         : 'Битрейт фиксирован. При плохой сети у зрителей возможны потери/буферизация.'}</p>
     </div>
-    <div className="fld"><label>Прямых подключений: {cfg.maxDirectChildren}</label>
-      <input type="range" min={DIRECT_MIN} max={DIRECT_MAX} step={1} value={cfg.maxDirectChildren} onChange={(e) => setCfg((c) => ({ ...c, maxDirectChildren: +e.target.value }))} />
-      <p className="msub" style={{ margin: '8px 0 0' }}>Сколько зрителей берут поток напрямую с тебя. Остальные — через ретранслирующих зрителей (дерево, глубже).</p>
+    {/* Roadmap-flow-стриминга Д1: в server-first поток идёт через сервер (vrelay), «прямые
+        подключения» больше не главная ручка — уводим под «Дополнительно». Функциональность
+        сохранена (в legacy-режиме сервера слайдер по-прежнему задаёт ёмкость корня). */}
+    <div className="fld">
+      <details>
+        <summary style={{ cursor: 'pointer' }} className="msub">Дополнительно</summary>
+        <div style={{ marginTop: 8 }}>
+          <label>Прямых подключений: {cfg.maxDirectChildren}</label>
+          <input type="range" min={DIRECT_MIN} max={DIRECT_MAX} step={1} value={cfg.maxDirectChildren} onChange={(e) => setCfg((c) => ({ ...c, maxDirectChildren: +e.target.value }))} />
+          <p className="msub" style={{ margin: '8px 0 0' }}>Сколько зрителей берут поток напрямую с тобой. Остальные — через ретранслирующих зрителей (дерево, глубже) или через сервер.</p>
+        </div>
+      </details>
     </div>
     <div className="fld"><label>Звук</label>
       <div className="seg">

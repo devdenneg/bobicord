@@ -45,12 +45,25 @@ const VIRTUAL_COST = 1000;         // штраф виртуала в scoreParent
                                    // ~740 (depth<=300 + natCost 250 + load 40 + loss 50 + rtt ~100),
                                    // 1000 гарантирует проигрыш ЛЮБОМУ живому relay, но виртуал
                                    // остаётся единственным кандидатом, когда живых нет
-const VIRTUAL_CHILDREN_CAP = 16;   // кап ёмкости виртуала (датацентр — выше пользовательского MAX_CHILDREN_CAP)
+// Roadmap-flow-стриминга Д1: в server-first-дереве виртуал (vrelay) — ПРЕДПОЧТИТЕЛЬНЫЙ
+// родитель. Отрицательная стоимость (бонус) бьёт любого живого пира: «стример → сервер →
+// зрители». Применяется ТОЛЬКО когда t.serverFirst (legacy сохраняет штраф VIRTUAL_COST).
+const VIRTUAL_SERVER_FIRST_BONUS = 500;
+const VIRTUAL_CHILDREN_CAP = Number(process.env.VRELAY_CHILDREN_CAP) || 32; // кап ёмкости виртуала
+                                   // (датацентр — выше пользовательского MAX_CHILDREN_CAP); env для Д1
 const DRAIN_TICK_MS = 5000;        // темп дренажа детей виртуала на живые пиры
 const DRAIN_COOLDOWN_MS = 15_000;  // гистерезис: свежепосаженного под виртуала не дёргаем сразу
 const VRELAY_ACTIVATE_TIMEOUT_MS = 15_000; // активация «в полёте»: не слать повторный activate, пока не истёк
 const VRELAY_UID = 'virtual-relay'; // JWT-uid агента: флагу virtual в join верим только при нём
 const VRELAY_TARGET = 'vrelay';    // сентинел targetParentId в request-reparent = «хочу через сервер»
+
+// Roadmap-flow-стриминга Д1: инверсия топологии «стример → сервер → зрители». Под флагом
+// TREE_SERVER_FIRST vrelay становится постоянным pinned медиаузлом (не fallback с дренажом):
+// вещатель шлёт serverIngest:true, сервер шлёт агенту vrelay-ingest (постоянная сессия),
+// виртуал садится прямым ребёнком корня ДО первого зрителя, дренаж/idle-exit отключены.
+// Режим включается ТОЛЬКО для деревьев с serverIngest — старый клиент без поля работает по
+// legacy даже при TREE_SERVER_FIRST=1 (обратная совместимость, см. Деплой-дисциплина роадмапа).
+const SERVER_FIRST = process.env.TREE_SERVER_FIRST === '1';
 
 function newPeerId() { return 'p_' + crypto.randomBytes(6).toString('hex'); }
 
@@ -130,7 +143,7 @@ class TreeManager {
 
   // Скоринг кандидата в родители (меньше — лучше). Приоритеты: меньшая глубина (латентность),
   // затем меньшая загрузка и лучшее качество (больше свободного выхода, меньше loss/rtt).
-  scoreParent(cand) {
+  scoreParent(cand, serverFirst = false) {
     const cap = this.capacityOf(cand) || 1;
     const depthCost = cand.depth * 100;                 // мелкое дерево сильно предпочтительнее
     const loadCost = (cand.children.length / cap) * 40; // не перегружать один узел
@@ -143,7 +156,8 @@ class TreeManager {
     // лишь когда другого relay нет вовсе (тогда capacityOf уже гарантировал наличие TURN).
     const natCost = cand.symmetricNat ? 250 : 0;
     // Э9: виртуал (серверный fallback) проигрывает любому живому relay — см. VIRTUAL_COST.
-    const virtualCost = cand.virtual ? VIRTUAL_COST : 0;
+    // Д1 (server-first): виртуал, наоборот, ПРЕДПОЧТИТЕЛЬНЕЕ любого пира — отрицательный бонус.
+    const virtualCost = cand.virtual ? (serverFirst ? -VIRTUAL_SERVER_FIRST_BONUS : VIRTUAL_COST) : 0;
     return depthCost + loadCost + lossCost + rttCost + natCost + virtualCost - outBonus;
   }
 
@@ -163,7 +177,7 @@ class TreeManager {
       if (cand.children.length >= this.capacityOf(cand)) continue;
       if (cand.depth + 1 + height > MAX_DEPTH) continue;
       if (!this.attachedToRoot(t, cand)) continue; // сирота/повисшая цепочка — не родитель
-      const s = this.scoreParent(cand);
+      const s = this.scoreParent(cand, !!t.serverFirst);
       if (s < bestScore) { bestScore = s; best = cand; }
     }
     return best;
@@ -402,6 +416,7 @@ function attachTreeServer(httpServer, opts) {
   const wss = new WebSocketServer({ noServer: true });
   const mgr = new TreeManager(!!(turnSecret && turnUrls.length));
   const peers = new Map(); // peerId -> node {id, ws, streamId, role, native, identity, parent, children, depth, maxChildren, stats...}
+  tlog(`режим видео-дерева: ${SERVER_FIRST ? 'server-first (TREE_SERVER_FIRST=1) — vrelay постоянный медиаузел для стримов с serverIngest' : 'legacy (vrelay = fallback с дренажом)'}; vrelay children cap=${VIRTUAL_CHILDREN_CAP}`);
 
   // Временные TURN-креды выдаются только авторизованным (Evolution-TZ Э3 AC) — привязаны
   // к id из уже проверенного session-JWT, генерятся заново на каждое ws-подключение.
@@ -457,8 +472,11 @@ function attachTreeServer(httpServer, opts) {
     if (!agent) { tlog(`[${streamId}] фолбэк нужен, но агент vrelay не подключён`); return false; }
     const bc = t.nodes.get(t.broadcasterId);
     t.vrelayActivateAt = now;
-    tlog(`[${streamId}] vrelay-activate -> агент ${agent.id}`);
-    send(agent.id, { t: 'vrelay-activate', streamId, serverId: bc ? bc.serverId : null });
+    // Д1: server-first-дереву нужен ПОСТОЯННЫЙ медиаузел — шлём vrelay-ingest (агент поднимает
+    // сессию с idle_exit:None, reconnect:true). Legacy — прежний vrelay-activate (fallback с idle).
+    const msgType = t.serverFirst ? 'vrelay-ingest' : 'vrelay-activate';
+    tlog(`[${streamId}] ${msgType} -> агент ${agent.id}`);
+    send(agent.id, { t: msgType, streamId, serverId: bc ? bc.serverId : null });
     return true;
   }
 
@@ -583,6 +601,17 @@ function attachTreeServer(httpServer, opts) {
     node.symmetricNat = !!symmetricNat;
     node.serverId = serverId || node.serverId || null;
     node.maxChildren = typeof maxChildren === 'number' ? maxChildren : undefined;
+    // Д1 server-first: вещатель с serverIngest:true при включённом флаге переводит ДЕРЕВО в
+    // режим «стример → сервер → зрители». Помечаем дерево до join'а (scoreParent/pickParent
+    // читают t.serverFirst). Дефолт ёмкости корня в этом режиме = 1 (единственный слот под
+    // vrelay), но ручное значение из UI уважаем. Обратная совместимость: нет serverIngest —
+    // legacy даже при TREE_SERVER_FIRST=1.
+    node.serverIngest = !!msg.serverIngest;
+    if (SERVER_FIRST && node.serverIngest && role === 'broadcaster') {
+      const tj = mgr.tree(streamId);
+      tj.serverFirst = true;
+      if (node.maxChildren === undefined) node.maxChildren = 1;
+    }
     node.maxBitrate = typeof maxBitrate === 'number' ? maxBitrate : 0; // Э8 ABR: потолок вещателя
     node.abr = !!abr;                                                  // Э8 ABR: авто-адаптация вкл
     // Метаданные стримящегося приложения (иконка/имя окна) — только от вещателя; капы
@@ -608,12 +637,24 @@ function attachTreeServer(httpServer, opts) {
     // Новый узел мог дать ёмкость (relay-способный зритель) или это вернувшийся вещатель —
     // размещаем зависших сирот. Для вещателя это подхватывает зрителей, ждавших стрим.
     settleOrphans(streamId);
+    // Д1 server-first: вещатель вошёл — сразу поднимаем постоянный vrelay-ingest медиаузел,
+    // НЕ дожидаясь сирот (в legacy vrelay будится только при отсутствии живых кандидатов).
+    // requestVrelayActivation сам выберет тип сообщения (vrelay-ingest для serverFirst).
+    {
+      const t = mgr.trees.get(streamId);
+      if (role === 'broadcaster' && t && t.serverFirst) {
+        tlog(`[${streamId}] server-first: поднимаю постоянный vrelay-ingest`);
+        requestVrelayActivation(streamId);
+      }
+    }
     // Э9: виртуал вошёл — активация состоялась; выполняем отложенные ручные запросы
     // «через сервер» (зрители, попросившие vrelay до его джойна).
     if (node.virtual) {
       const t = mgr.trees.get(streamId);
       if (t) {
         t.vrelayActivateAt = 0;
+        // Д1: в server-first виртуал — постоянный pinned узел (дренаж его не трогает).
+        if (t.serverFirst) node.vrelayPinned = true;
         ensureVirtualAttached(streamId); // дерево могло быть забито — выселяем жертву из-под корня
         if (t.vrelayPending && t.vrelayPending.size) {
           const now = Date.now();
@@ -861,6 +902,9 @@ function attachTreeServer(httpServer, opts) {
   const drainTimer = setInterval(() => {
     const now = Date.now();
     for (const [streamId, t] of mgr.trees) {
+      // Д1: в server-first vrelay — постоянный медиаузел, не дренируется и не выселяется
+      // (дренаж/idle-exit только для legacy-фолбэка). Пропускаем такое дерево целиком.
+      if (t.serverFirst) continue;
       const virt = findVirtual(t);
       if (!virt || !virt.children.length) continue;
       let moved = false;
