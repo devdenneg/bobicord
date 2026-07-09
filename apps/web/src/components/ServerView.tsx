@@ -394,6 +394,11 @@ function MemberRow({ m, anim }: { m: Member; anim?: string }) {
   const pending = !!eng.pending[m.username];
   const canKick = !!active && active.ownerId === me.id && !self && m.role !== 'owner';
   const hc = useHoverCard();
+  // Стример: игру показываем ТОЛЬКО оверлеем на аватаре (LIVE + иконка игры) — отдельная гейм-пилюля
+  // была бы дублем (очевидно, стримит то, во что играет). Оверлею даём фолбэк pr.game (мета-иконка
+  // стрима бывает пустой). Не-стример игрок → обычная гейм-пилюля ниже.
+  const liveApp = streaming ? (() => { const meta = E.getStreamAppMeta(m.username); return { appName: meta?.appName || pr?.game?.name, appIcon: meta?.appIcon || pr?.game?.icon }; })() : null;
+  const showGamePill = !!pr?.game && !streaming;
   async function kick(e: React.MouseEvent) {
     e.stopPropagation();
     if (!active) return;
@@ -404,14 +409,14 @@ function MemberRow({ m, anim }: { m: Member; anim?: string }) {
   return (
     <div className={'pi ' + st + (streaming ? ' streaming' : '') + (anim ? ' ' + anim : '')} data-spk={m.username}>
       <div className="head" ref={hc.ref} onClick={self ? undefined : hc.onTap} onMouseEnter={self ? undefined : hc.onEnter} onMouseLeave={self ? undefined : hc.onLeave}>
-        <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} dot={st} live={streaming} liveApp={streaming ? E.getStreamAppMeta(m.username) : null} />
+        <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} dot={st} live={streaming} liveApp={liveApp} />
         <div className="pi-main">
           {/* нет игры → роли ИНЛАЙН сразу после ника (одна строка). Есть игра → ник ↑, игра+роли ↓. */}
           <div className="pi-l1">
             <div className="nm" style={roleColorOf(m) ? { color: roleColorOf(m) } : undefined}>{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div>
-            {!pr?.game && m.roles && m.roles.length > 0 ? <MemberRoles roles={m.roles} /> : null}
+            {!showGamePill && m.roles && m.roles.length > 0 ? <MemberRoles roles={m.roles} /> : null}
           </div>
-          {pr?.game ? (
+          {pr?.game && !streaming ? (
             <div className="pi-l2">
               <span className="pi-game mem" data-tip={'Играет в ' + pr.game.name}>
                 {pr.game.icon ? <img src={`data:image/png;base64,${pr.game.icon}`} alt="" /> : <span className="gpad">🎮</span>}
