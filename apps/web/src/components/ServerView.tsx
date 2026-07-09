@@ -161,17 +161,15 @@ function VoiceParticipantRow({ m, anim }: { m: Member; anim?: string }) {
         onKeyDown={(e) => { if (remote && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); setOpen((v) => !v); } }}>
         <div className={'av' + (streaming ? ' live' : '')} style={{ background: m.avatarUrl ? '#0000' : avColor(m.displayName, m.avatarColor) }}>
           {m.avatarUrl ? <img className="avimg" src={resolveUploadUrl(m.avatarUrl)} alt="" /> : initial(m.displayName)}
-          {(() => { if (!streaming) return null; const meta = E.getStreamAppMeta(m.username); const gicon = meta?.appIcon || pr?.game?.icon; const gname = meta?.appName || pr?.game?.name; return <>
-            <span className="av-live" title={gname ? `Стримит ${gname}` : 'В эфире'}>LIVE</span>
-            {gicon ? <img src={`data:image/png;base64,${gicon}`} alt="" title={gname ? `Стримит ${gname}` : undefined} style={{ position: 'absolute', right: -3, bottom: -3, width: 14, height: 14, borderRadius: 3, border: '2px solid var(--bg-alt, #111)', objectFit: 'contain' }} /> : null}
-          </>; })()}
+          {streaming ? (() => { const meta = E.getStreamAppMeta(m.username); const gname = meta?.appName || pr?.game?.name; return <span className="av-live" title={gname ? `Стримит ${gname}` : 'В эфире'}>LIVE</span>; })() : null}
         </div>
         <div className="vc-id">
           <div className="nm" title={m.displayName}>{m.displayName}{isLocal && !connecting ? ' (ты)' : ''}</div>
           {connecting ? <span className="vc-connecting">подключение…</span> : null}
         </div>
-        {/* Правый статус-блок: фикс-колонки. Слот-A (стример→«смотреть» / игрок→иконка игры) стоит слева от
-            зарезервированных mic(visibility:hidden) и chev → все иконки одного типа в одной вертикали, не пляшут по нику. */}
+        {/* Правый статус-блок: фикс-колонки [watch][game][mic][chev]. game стоит вплотную к
+            зарезервированным mic(visibility:hidden)+chev → игро-иконки всех рядов в одной вертикали
+            (не пляшут по длине ника); watch-кнопка — отдельная ячейка слева, стример видит И игру, И «зайти». */}
         {remote && streaming ? (
           <button className={'watchbtn' + (watching ? ' on' : '')} disabled={pending}
             aria-label={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}
@@ -179,7 +177,8 @@ function VoiceParticipantRow({ m, anim }: { m: Member; anim?: string }) {
             onClick={(e) => { e.stopPropagation(); watching ? E.closeWatch(m.username) : E.watch(m.username); }}>
             {pending ? <span className="spin" style={{ margin: 0, width: 13, height: 13 }} /> : <Icon name={watching ? 'eye-off' : 'eye'} />}
           </button>
-        ) : pr?.game ? (
+        ) : null}
+        {pr?.game ? (
           <span className="vcg" data-tip={'Играет в ' + pr.game.name}>{pr.game.icon ? <img src={`data:image/png;base64,${pr.game.icon}`} alt="" /> : <span className="gpad">🎮</span>}</span>
         ) : null}
         {connecting
