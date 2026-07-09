@@ -201,6 +201,7 @@ async fn start_watch(
   max_children: Option<u32>,
   quality: Option<String>,
   pinned: Option<bool>,
+  available_outgoing: Option<u32>,
 ) -> Result<(), String> {
   let mut slot = state.0.lock().await;
   if let Some(old) = slot.take() { old.stop(); }
@@ -219,7 +220,11 @@ async fn start_watch(
     quality: quality.unwrap_or_else(|| "source".into()),
     // Д4: ручной выбор качества (pin) — сервер не двигает такого зрителя авто-ABR.
     pinned: pinned.unwrap_or(false),
-    available_outgoing: 8_000_000,
+    // Roadmap-flow-стриминга Д6: реальный upload зрителя (из Д5-probe-кэша webview, передан из
+    // JS). БОЛЬШЕ НЕ фейковые 8 Мбит: webrtc-rs BWE незрел (webrtc-ice 0.17 отдаёт
+    // available_outgoing_bitrate=0.0), поэтому источник истины — Chromium-GCC-probe из webview.
+    // 0 = не измерен → сервер даёт консервативную ёмкость 1 (не раздуваем ветвление на фейке).
+    available_outgoing: available_outgoing.unwrap_or(0),
     idle_exit: None, // натив смотрит стрим сам — уходим только по Stop
     reconnect: true, // рестарт сервера (деплой) не рвёт просмотр
   });

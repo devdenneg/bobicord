@@ -138,6 +138,24 @@ const RENDITION_TICK_MS = Number(process.env.TREE_RENDITION_TICK_MS) || 5_000;
 const ABR_GOOD_TICKS = 5;             // подряд «хороших» тиков до подъёма (спад — ABR_BAD_TICKS=2)
 const ABR_VIEWER_COOLDOWN_MS = 20_000; // гистерезис между переключениями качества одного зрителя
 
+// Roadmap-flow-стриминга Д6: супер-сидеры + авто-ретрансляция 1→2 при запасе upload.
+// Прямые слоты серверного узла (vrelay в source-дереве / рендишн-корень) держим за
+// СИЛЬНЕЙШИМИ по upload зрителями; слабых вытесняем в глубину, сильных из глубины поднимаем.
+const D6_SWAP_HYSTERESIS = 1.25;      // сильный должен быть ≥25% лучше вытесняемого (анти-болтанка,
+                                      // роадмап-риск «шумные оценки upload → болтанка»)
+const D6_SWAP_COOLDOWN_MS = 30_000;   // между рокировками одного узла (реюз reparentCooldownUntil,
+                                      // общий с Д4-ABR — перемещения Д4 и Д6 не дерутся за узел)
+// Динамическая ёмкость (maxChildren) server-first ЗРИТЕЛЯ считается СЕРВЕРОМ из его upload
+// (availableOutgoing в stats) и битрейта смотримого рендишна: ветвление 1→2 только при запасе
+// upload ≥ 2× битрейта рендишна × запас. Считаем на сервере, а не на клиенте: сервер знает и
+// upload зрителя (stats), и битрейт рендишна (RENDITION_BITRATE / maxBitrate вещателя), тогда
+// как клиент битрейт source-рендишна (CBR вещателя) точно не знает.
+const D6_UPLOAD_HEADROOM = 1.3;       // +30% запаса поверх номинала (роадмап)
+// Больший вес upload в scoreParent для server-first (роадмап Д6: «outBonus — больший вес внутри
+// рендишн-дерева»): при равной глубине сильный по upload выигрывает родительство явно, но вклад
+// держим ниже стоимости уровня (depth*100), чтобы латентность (мелкое дерево) оставалась главной.
+const OUT_BONUS_WEIGHT_SF = 4;
+
 // Доступная лестница рендишнов source-дерева с учётом «без апскейла». width/height вещателя
 // приходят в join (натив знает своё выходное разрешение). Нет данных (старый бандл) — НЕ режем
 // (ffmpeg всё равно не апскейлит: scale='min(W,iw)' — выдаст не больше source; риск лишь в
@@ -183,8 +201,105 @@ class TreeManager {
     // браузерных бандлов, которые могли ещё присылать maxChildren>0 в join.
     if (!node.native) return 0;
     if (node.symmetricNat && !this.turnEnabled) return 0; // без TURN симметричный = лист
-    if (typeof node.maxChildren === 'number') return Math.max(0, Math.min(node.maxChildren, MAX_CHILDREN_CAP));
-    return NATIVE_CAPACITY;
+    // Объявленная ёмкость (лимит из UI/натива) — верхняя граница ЧЕСТНОСТИ: клиент может
+    // соврать upload, но не выйдет за свой же кап и жёсткий MAX_CHILDREN_CAP.
+    const declared = typeof node.maxChildren === 'number' ? Math.max(0, Math.min(node.maxChildren, MAX_CHILDREN_CAP)) : NATIVE_CAPACITY;
+    // Roadmap-flow-стриминга Д6: server-first ЗРИТЕЛЮ ёмкость считает СЕРВЕР из его upload
+    // (dynamicCapacity). Легаси/не-зритель → dyn=null → объявленная (старое поведение).
+    const dyn = this.dynamicCapacity(node);
+    return dyn == null ? declared : Math.min(declared, dyn);
+  }
+
+  // Roadmap-flow-стриминга Д6: битрейт (бит/с) рендишна, который смотрит узел. Рендишн-дерево —
+  // фиксированный CBR из таблицы; source — потолок вещателя (или дефолт для старого клиента).
+  watchedBitrate(t, rendition) {
+    if (rendition && rendition !== DEFAULT_RENDITION) return RENDITION_BITRATE[rendition] || 0;
+    const bc = t && t.broadcasterId ? t.nodes.get(t.broadcasterId) : null;
+    return bc && bc.maxBitrate > 0 ? bc.maxBitrate : ABR_DEFAULT_MAX;
+  }
+
+  // Roadmap-flow-стриминга Д6: динамическая ёмкость server-first ЗРИТЕЛЯ из его upload
+  // (availableOutgoing) и битрейта смотримого рендишна. Возвращает null, если правило
+  // неприменимо (легаси-source-дерево / не-зритель) — тогда capacityOf берёт объявленную.
+  //   out >= 2×br×запас → 2 (ветвление 1→2 при доказанном запасе upload);
+  //   out >= 1×br×запас → 1 (upload есть, но только на одного ребёнка);
+  //   out  > 0          → 0 (ДОКАЗАННО слабый upload — детей не даём, роадмап AC);
+  //   out <= 0          → 1 (upload НЕ измерен — консервативный дефолт: базовое дерево всё
+  //                          равно ветвится, но не раздуваем до 2 на неизвестной/фейковой цифре).
+  dynamicCapacity(node) {
+    if (node.role !== 'viewer') return null;
+    const t = node.treeKey ? this.trees.get(node.treeKey) : null;
+    if (!t) return null;
+    const rendition = node.rendition || DEFAULT_RENDITION;
+    const serverFirst = rendition !== DEFAULT_RENDITION || !!t.serverFirst;
+    if (!serverFirst) return null; // легаси source-дерево — прежнее поведение (объявленная ёмкость)
+    const br = this.watchedBitrate(t, rendition);
+    if (!br) return null;
+    const out = node.availableOutgoing || 0;
+    if (out <= 0) return 1;                          // не измерен → консервативный дефолт 1
+    if (out >= 2 * br * D6_UPLOAD_HEADROOM) return 2; // доказанный запас → ветвление 1→2
+    if (out >= br * D6_UPLOAD_HEADROOM) return 1;
+    return 0;                                        // доказанно слабый → детей не получает
+  }
+
+  // Roadmap-flow-стриминга Д6: серверный узел дерева, чьи ПРЯМЫЕ слоты арбитрируем — vrelay
+  // (virtual) в source-server-first-дереве или рендишн-корень (broadcaster) в рендишн-дереве.
+  serverNode(key) {
+    const t = this.trees.get(key);
+    if (!t || !t.broadcasterId) return null;
+    if (parseTreeKey(key).rendition !== DEFAULT_RENDITION) return t.nodes.get(t.broadcasterId) || null;
+    if (!t.serverFirst) return null;
+    for (const n of t.nodes.values()) if (n.virtual) return n;
+    return null;
+  }
+
+  // Roadmap-flow-стриминга Д6: план ОДНОЙ рокировки прямого слота серверного узла (чистая
+  // политика без сайд-эффектов — для теста и для arbitrateServerSlots-исполнителя). Условия:
+  // прямые слоты сервера ЗАНЯТЫ и в глубине есть лист-натив с upload ≥ 1.25× худшего прямого
+  // ребёнка, вне cooldown, способный ретранслировать. Жертва — слабейший прямой ЛИСТ (или
+  // узел с наименьшим поддеревом), чтобы не морозить чужое поддерево. Возвращает
+  // {victimId, candidateId, ...} либо null.
+  planServerSlotSwap(key, now) {
+    const t = this.trees.get(key);
+    if (!t) return null;
+    const server = this.serverNode(key);
+    if (!server || !this.attachedToRoot(t, server)) return null;
+    if (server.children.length < this.capacityOf(server)) return null; // свободный слот — сирота сядет сам, рокировка не нужна
+    const uploadOf = (n) => n.availableOutgoing || 0;
+    // Прямые дети-кандидаты на вытеснение: не серверные и не запиненные «через сервер» (свой выбор).
+    const directs = server.children.map((cid) => t.nodes.get(cid)).filter((c) => c && !c.virtual && !c.vrelayPinned);
+    if (!directs.length) return null;
+    const worstUpload = Math.min(...directs.map(uploadOf)); // порог сравнения (роадмап: худший прямой ребёнок)
+    // Жертва: приоритет ЛИСТА (без поддерева); среди листьев — слабейший upload; если листьев
+    // нет — узел с наименьшим поддеревом (меньше морозим), затем слабейший upload.
+    const leaves = directs.filter((c) => c.children.length === 0);
+    let victim;
+    if (leaves.length) victim = leaves.reduce((m, c) => (uploadOf(c) < uploadOf(m) ? c : m));
+    else victim = directs.reduce((m, c) => {
+      const hc = this.subtreeHeight(t, c.id), hm = this.subtreeHeight(t, m.id);
+      if (hc !== hm) return hc < hm ? c : m;
+      return uploadOf(c) < uploadOf(m) ? c : m;
+    });
+    if (victim.reparentCooldownUntil && now < victim.reparentCooldownUntil) return null; // жертва свежедёрнута — ждём
+    // Кандидат: сильнейший по upload ЛИСТ-НАТИВ в глубине (браузер не ретранслирует → не в
+    // relay-слот, роадмап D), ≥1.25× worstUpload, вне cooldown, реально способный отдать (cap≥1).
+    let candidate = null;
+    for (const n of t.nodes.values()) {
+      if (n.id === t.broadcasterId || n.virtual) continue;
+      if (n.parent === server.id) continue;             // уже прямой ребёнок сервера
+      if (!n.native) continue;                           // браузер — только лист, не поднимаем в relay-слот
+      if (n.vrelayPinned) continue;                      // сам выбрал текущего родителя
+      if (n.children && n.children.length) continue;     // поднимаем ЛИСТ (не тащим поддерево вверх)
+      if (n.reparentCooldownUntil && now < n.reparentCooldownUntil) continue;
+      const out = uploadOf(n);
+      if (out <= 0) continue;
+      if (out < worstUpload * D6_SWAP_HYSTERESIS) continue; // гистерезис 25%
+      if (this.capacityOf(n) < 1) continue;              // не сможет ретранслировать — рокировка бессмысленна
+      if (server.depth + 1 > MAX_DEPTH) continue;         // влезает прямым ребёнком сервера
+      if (!candidate || out > uploadOf(candidate)) candidate = n;
+    }
+    if (!candidate || candidate.id === victim.id) return null;
+    return { victimId: victim.id, candidateId: candidate.id, worstUpload, victimUpload: uploadOf(victim), candidateUpload: uploadOf(candidate) };
   }
 
   // Все потомки узла (для запрета циклов при ручном reparent — нельзя стать ребёнком
@@ -230,7 +345,9 @@ class TreeManager {
     const cap = this.capacityOf(cand) || 1;
     const depthCost = cand.depth * 100;                 // мелкое дерево сильно предпочтительнее
     const loadCost = (cand.children.length / cap) * 40; // не перегружать один узел
-    const outBonus = Math.min(cand.availableOutgoing || 0, 20_000_000) / 1_000_000; // Мбит выхода
+    // Д6: в server-first upload весит больше (супер-сидеры — сильные вверх). Вклад держим ниже
+    // depthCost (уровень = 100), чтобы латентность оставалась главной; при равной глубине решает upload.
+    const outBonus = (Math.min(cand.availableOutgoing || 0, 20_000_000) / 1_000_000) * (serverFirst ? OUT_BONUS_WEIGHT_SF : 1); // Мбит выхода
     const lossCost = (cand.linkLoss || 0) * 50;         // потери на входящем линке кандидата
     const rttCost = (cand.linkRtt || 0) / 20;
     // Симметричный NAT как РОДИТЕЛЬ = offerer через TURN-relay: работает только при живом TURN,
@@ -851,6 +968,50 @@ function attachTreeServer(httpServer, opts) {
     }
   }
 
+  // Roadmap-flow-стриминга Д6: супер-сидеры. Исполнитель плана planServerSlotSwap — поднимает
+  // сильного из глубины в прямой слот серверного узла, вытесняет слабого в глубину. Строго
+  // ВНУТРИ одного рендишн-дерева (качество не меняется — наследование структурно, Д3). ≤1
+  // рокировки на дерево за тик (анти-болтанка). Cooldown ставится на ОБА узла (общий с Д4-ABR
+  // reparentCooldownUntil → перемещения Д4 и Д6 не дерутся). Возвращает число рокировок (тест).
+  function arbitrateServerSlots(now) {
+    let swaps = 0;
+    for (const [key, t] of mgr.trees) {
+      // Легаси-source-дерево (vrelay = fallback) не арбитрируем — им занимается drainTimer.
+      if (parseTreeKey(key).rendition === DEFAULT_RENDITION && !t.serverFirst) continue;
+      const plan = mgr.planServerSlotSwap(key, now);
+      if (!plan) continue;
+      const server = mgr.serverNode(key);
+      const victim = t.nodes.get(plan.victimId);
+      const candidate = t.nodes.get(plan.candidateId);
+      if (!server || !victim || !candidate) continue;
+      const sid = parseTreeKey(key).streamId;
+      // Освобождаем слот: жертву делаем сиротой (drop-peer серверу — он закроет её child-PC).
+      server.children = server.children.filter((cid) => cid !== victim.id);
+      send(server.id, { t: 'drop-peer', streamId: sid, peerId: victim.id });
+      victim.parent = null; victim.depth = 0;
+      // Поднимаем кандидата в освободившийся слот серверного узла (штатный reparent).
+      const res = mgr.reparent(key, candidate.id, server.id, now);
+      if (!res.ok) {
+        // Откат: возвращаем жертву под сервер (кандидат не влез — редко, гонка глубины).
+        server.children.push(victim.id); victim.parent = server.id; victim.depth = server.depth + 1;
+        send(victim.id, { t: 'assign-parent', streamId: sid, parentId: server.id });
+        send(server.id, { t: 'assign-child', streamId: sid, childId: victim.id });
+        continue;
+      }
+      candidate.vrelayPinned = false; // поднят авто-арбитражем, не ручным «через сервер»
+      candidate.reparentCooldownUntil = now + D6_SWAP_COOLDOWN_MS;
+      victim.reparentCooldownUntil = now + D6_SWAP_COOLDOWN_MS;
+      tlog(`[${key}] Д6 супер-сидер: ↑${candidate.identity} (up=${Math.round(plan.candidateUpload / 1000)}k) в слот сервера, ↓${victim.identity} (up=${Math.round(plan.victimUpload / 1000)}k) в глубину`);
+      // applyReparent шлёт сообщения кандидату/серверу/старому родителю + settleOrphans разместит
+      // осиротевшую жертву (у поднятого кандидата теперь есть свободная ёмкость, cap≥1).
+      applyReparent(key, candidate.id, res);
+      // Жертва с поддеревом (редко — обычно вытесняем лист): пересчёт глубин её ветки после посадки.
+      if (victim.parent && victim.children && victim.children.length) mgr.updateSubtreeDepth(t, victim.id);
+      swaps++;
+    }
+    return swaps;
+  }
+
   // Discovery-сокет (браузер/натив, никогда не joins) сообщает свой сервер здесь —
   // до этого сообщения бэклог живых стримов не шлём (см. wss.on('connection')).
   function onHello(id, msg) {
@@ -1279,7 +1440,12 @@ function attachTreeServer(httpServer, opts) {
     // Д4: пер-зрительский ABR — переводит прямых детей сервера между рендишн-деревьями по их
     // личному линку (глобальный set-bitrate выше в server-first вырождается в линки корня;
     // адаптация зрителей — здесь, чтобы один медленный зритель не тянул всех вниз).
-    perViewerAbr(Date.now());
+    // perViewerAbr (Д4, качество) идёт ПЕРЕД arbitrateServerSlots (Д6, топология): оба узла
+    // помечают reparentCooldownUntil при переезде и проверяют его перед своим — свежедёрнутый
+    // одним не берётся другим в этом же и следующих тиках (общее поле = взаимоисключение).
+    const nowT = Date.now();
+    perViewerAbr(nowT);
+    arbitrateServerSlots(nowT); // Д6: супер-сидеры — сильные upload в прямые слоты сервера
   }, ABR_TICK_MS);
   abrTimer.unref?.(); // не держим процесс живым только ради ABR-тика
 
@@ -1382,7 +1548,7 @@ function attachTreeServer(httpServer, opts) {
     return out;
   }
 
-  return { mgr, peers, wss, abrTimer, hbTimer, drainTimer, renditionTimer, liveBroadcastersIn };
+  return { mgr, peers, wss, abrTimer, hbTimer, drainTimer, renditionTimer, liveBroadcastersIn, arbitrateServerSlots };
 }
 
 module.exports = { attachTreeServer, TreeManager, MAX_DEPTH, NATIVE_CAPACITY, BROWSER_CAPACITY, treeKey, parseTreeKey };

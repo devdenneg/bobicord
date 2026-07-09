@@ -497,9 +497,21 @@ export class TreeVideoTransport implements VideoTransport {
     // Rust держит ОДИН watch-слот (WatchState). Явно останавливаем прошлый ПЕРЕД стартом нового
     // и ждём — иначе fire-and-forget stopNativeWatch предыдущего стрима мог прийти на Rust ПОСЛЕ
     // start нового и снести уже его (гонка при переключении A→B). Первый watch: слот пуст, no-op.
+    // Roadmap-flow-стриминга Д6: реальный upload зрителя из Д5-probe-кэша (тот же механизм, что
+    // мерил вещатель — webrtc-rs BWE незрел, Chromium GCC надёжнее). Есть свежий кэш → отдаём
+    // серверу (он решит ёмкость: запас upload → ветвление 1→2). Нет кэша → фоновый замер прогреет
+    // его к следующему watch/reconnect (в текущую сессию не вносим — RelayConfig берёт значение
+    // при старте; активный замер не блокирует картину). 0 = не измерен → сервер даёт ёмкость 1.
+    let availableOutgoing = 0;
+    try {
+      const { getCachedProbe, measureUpload } = await import('./probe');
+      const cached = getCachedProbe();
+      if (cached && cached.bweKbps > 0) availableOutgoing = Math.round(cached.bweKbps * 1000);
+      else void measureUpload().catch(() => {}); // прогрев кэша, fire-and-forget
+    } catch { /**/ }
     try {
       await stopNativeWatch().catch(() => {});
-      await startNativeWatch(streamId, this.me, this.serverId, NATIVE_RELAY_CAPACITY, st.quality, st.pinned);
+      await startNativeWatch(streamId, this.me, this.serverId, NATIVE_RELAY_CAPACITY, st.quality, st.pinned, availableOutgoing);
       this.currentNativeWatch = streamId; // этот стрим теперь в Rust-слоте
     }
     catch { this.nativeUnwatch(streamId, st); }
