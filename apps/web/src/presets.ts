@@ -19,12 +19,19 @@ export interface Preset {
 
 // Порядок = убывание «стоимости» (сверху — самый требовательный). Значения совпадают с
 // RENDITION_BITRATE в tree.js для 30fps-рунгов (рендишны = 30fps-пресеты той же высоты).
+//
+// Нижние 60fps-ступени (480p60/360p60) обязательны: без них самый дешёвый 60fps — 720p60
+// (4500 кбит/с), и на тонком канале режим «Плавность» физически не мог дать 60 fps —
+// молча падал на 30fps-лестницу и совпадал с «Качеством» (наблюдалось живьём при
+// useful=4000: оба режима давали 720p30). 60 fps стоит ~1.6× от 30 fps той же высоты.
 export const PRESETS: Preset[] = [
   { width: 1920, height: 1080, fps: 60, bitrateKbps: 6000, label: '1080p60' },
   { width: 1280, height: 720,  fps: 60, bitrateKbps: 4500, label: '720p60' },
   { width: 1920, height: 1080, fps: 30, bitrateKbps: 4500, label: '1080p30' },
   { width: 1280, height: 720,  fps: 30, bitrateKbps: 3000, label: '720p30' },
+  { width: 854,  height: 480,  fps: 60, bitrateKbps: 2500, label: '480p60' },
   { width: 854,  height: 480,  fps: 30, bitrateKbps: 1500, label: '480p30' },
+  { width: 640,  height: 360,  fps: 60, bitrateKbps: 1200, label: '360p60' },
   { width: 640,  height: 360,  fps: 30, bitrateKbps: 800,  label: '360p30' },
 ];
 

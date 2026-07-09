@@ -110,8 +110,10 @@ const PRESET_TABLE = [
   { width: 1280, height: 720,  fps: 60, bitrateKbps: 4500 },
   { width: 1920, height: 1080, fps: 30, bitrateKbps: 4500 },
   { width: 1280, height: 720,  fps: 30, bitrateKbps: 3000 },
-  { width: 854,  height: 480,  fps: 30, bitrateKbps: 1500 },
-  { width: 640,  height: 360,  fps: 30, bitrateKbps: 800 },
+  { width: 854,  height: 480,  fps: 60, bitrateKbps: 2500 }, // нижние 60fps-ступени: без них
+  { width: 854,  height: 480,  fps: 30, bitrateKbps: 1500 }, // «Плавность» на тонком канале
+  { width: 640,  height: 360,  fps: 60, bitrateKbps: 1200 }, // не могла дать 60 fps и молча
+  { width: 640,  height: 360,  fps: 30, bitrateKbps: 800 },  // совпадала с «Качеством»
 ];
 // Рендишны = 30fps-пресеты той же высоты (единый источник). Расхождение = баг синка таблиц.
 for (const [rung, bps] of Object.entries(RENDITION_BITRATE)) {
