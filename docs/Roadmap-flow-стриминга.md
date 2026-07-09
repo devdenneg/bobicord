@@ -543,7 +543,7 @@
 
 ## Д7 — Отбраковка родителя по дропам кадров
 
-**Статус:** ⬜ не начат (зависит от Д4)
+**Статус:** 🟡 код готов; юнит-тест детектора / d7-test / node --check / tree-sim / d6-test / typecheck / cargo (все крейты + examples) зелёные; живое душение uplink (clumsy/NetLimiter) не проверено (на пользователе)
 **Цель / механизмы ТЗ:** порог 5% дропов за 3 с → поиск иного пути.
 
 **Работы:**
@@ -554,11 +554,98 @@
 **Риски:** `framesDropped` в Chromium включает рендерные дропы слабого ПК — второй сигнал `packetsLost` обязателен.
 
 ### Выполнено:
-- —
+- **`apps/web/src/transport/dropDetector.ts` (НОВЫЙ) — чистая логика детектора.** `DropWindow`
+  (скользящее окно 3с кумулятивных `framesDropped/framesDecoded/packetsLost`, вытеснение старых
+  сэмплов относительно новейшего) + `shouldReparentOnDrops({deltas, hidden, now, cooldownUntil})`:
+  `dropRate = droppedΔ/(droppedΔ+decodedΔ) > 0.05` **И** `packetsLostΔ > 0`; гейты — `hidden`
+  (скрытая вкладка), cooldown 10с, неполное окно (`spanMs < 2400`). Дельты клэмпятся в 0 (смена
+  трека/PC обнуляет счётчики). Без DOM — юнит-тестируется.
+- **`apps/web/src/transport/treeVideo.ts` — общий 1с-детектор на оба пути.** Единый `dropTimer`
+  (не per-watch — утечки таймеров тут известны), стартует в `attach`, чистится в `detach`. Тик
+  `dropDetectorTick`: для каждого смотримого стрима (`watches` ∪ `nativeWatches`) читает
+  `inbound-rtp` video из соответствующего PC, кормит `DropWindow`, оценивает. Триггер →
+  `requestReparent(streamId, null, 'frame-drops')`. Гейт `document.visibilityState==='hidden'` —
+  окно сбрасывается (не тащим фоновые дельты в момент возврата в visible). Гейт `parentIsServer`
+  (по топологии `server`/`virtual`): прямой ребёнок vrelay/рендишн-корня НЕ мигрирует (сервер уже
+  лучший → зацикливание reparent на того же; реакция — понижение рендишна, Д4 perViewerAbr).
+  Клиентский cooldown 10с (`dropCooldownUntil`). Окна/cooldown чистятся в `unwatch`/`teardownWatch`/
+  `nativeUnwatch` (`clearDropState`). `requestReparent` получил опц. `reason` (в ws-сообщение; в
+  натив-IPC не пробрасывается).
+- **`apps/server/tree.js` — лог + серверная отбраковка для натива.** `onRequestReparent`: при
+  `reason==='frame-drops'` — grep-лог `[frame-drops] request-reparent …` (текущий родитель уже
+  исключается: `reparent(…, null)` → `pickParent(t, node, node.parent)` — проверено). `onStats`
+  принимает опц. `framesDroppedPct` (роадмап-протокол). Новый `frameDropReparent(now)` (в abrTimer
+  после perViewerAbr/arbitrateServerSlots): натив-узел под ПИРОМ (не серверным) со свежим upstream
+  `linkLoss > ABR_LOSS_HI` **И** (framesDroppedPct>5% если шлётся, иначе loss-only) → после
+  `ABR_BAD_TICKS(2)` подряд, вне общего `reparentCooldownUntil` → `reparent(null)`, лог
+  `[frame-drops] reparent …`, ≤1 миграции на дерево за тик. Поле узла `framesDroppedPct/framesDropAt/
+  dropBadTicks`. Экспорт `frameDropReparent` для теста.
+- **`apps/web/src/transport/dropDetector.test.mjs` (НОВЫЙ) — юнит-тест (node+esbuild), 11/11 PASS:**
+  (a) 6%+потери>0 → true; (b) 6%+потери==0 → **false** (рендерные дропы слабого ПК); (c) 3%+потери>0
+  → false; (d) hidden → false; (e) cooldown блокирует / после cooldown срабатывает; (f) окно 3с
+  скользит (всплеск t=0 вытесняется при t=4000, старейший=1000, size=4) + неполное окно (span<2400)
+  → false.
+- **`apps/server/d7-test.js` (НОВЫЙ) — ad-hoc серверный тест frameDropReparent, 11/11 PASS:**
+  (A) натив-лист под пиром с дропами → миграция за 2 тика, новый родитель ≠ старый (P1 исключён),
+  лог reason=frame-drops, cooldown выставлен; (B) высокий loss но дропы<5% → НЕТ (второй сигнал);
+  (C) loss<порога → НЕТ; (D) под vrelay → НЕТ (Д4-территория); (E) браузер → НЕТ (клиент судит сам);
+  (F) протухшая upstream-стата → НЕТ; (G) loss-only (без framesDroppedPct) → миграция.
+- **Верификация:** `node apps/web/src/transport/dropDetector.test.mjs` 11/11 EXIT 0; `node --check
+  tree.js` OK; `node tree-sim.js` зелёный; `node d6-test.js` 0 FAIL (регрессия Д6 цела); `node
+  d7-test.js` 11/11 EXIT 0; `npm run typecheck` (web) EXIT 0; `cargo check` relay-core/relay/native
+  + `--examples` relay-core — все EXIT 0 (Rust не менялся; Cargo.lock натива откачен, пре-дрейф).
+
 ### Проблемы:
-- —
+- **Живое душение uplink (clumsy/NetLimiter) — на пользователе.** Реальная миграция за ≤10с при
+  задушенном родителе-пире и восстановление картинки — блокирующий AC, локально не прогнать (нет
+  VPS/агента/вещателя/реальной сети). Проверены детерминированно: пороговая логика (юнит-тест a-f),
+  серверная политика/исполнитель (d7-test A-G).
+- **Натив без framesDroppedPct-форварда через Rust.** Webview натива не имеет своего WS к серверу
+  (его держит Rust), а форвард framesDroppedPct webview→Rust→stats — это Rust-правки (CI-only,
+  локально не проверить), сознательно НЕ вносились в этот майлстоун. Поэтому серверный
+  `frameDropReparent` для натива сегодня опирается на upstream `linkLoss` (сервер и так его знает из
+  `toChild` родителя) как сетевой сигнал; `framesDroppedPct` учитывается, ЕСЛИ узел его пришлёт
+  (тест G — loss-only путь; тесты A-F — с framesDroppedPct). Хард-фейлы upstream у натива и так
+  добивает существующий Rust-watchdog (relay.rs, Failed/долгий Disconnected → авто-reparent).
+
 ### Решения:
-- —
+1. **Слепота нативного пути (webview-PC на лупбеке) решена СЕРВЕРНЫМ детектором для натива +
+   КЛИЕНТСКИМ для браузера — оси не пересекаются.** Браузерный зритель: его webview-PC — реальный
+   upstream к родителю → видит `packetsLost`, судит сам (`dropDetector` → `requestReparent`). Натив:
+   webview-PC — лупбек Rust↔webview (`packetsLost≈0`, сетевых потерь НЕ видит) → клиентский детектор
+   для него ЕСТЕСТВЕННО молчит (второй сигнал не набирается — рендерные дропы не мигрируют, что и
+   требует роадмап-риск). Реальную отбраковку родителя у натива делает СЕРВЕР по upstream `linkLoss`
+   (родитель репортит `toChild` loss/rtt — данные уже были, новых Rust-правок не нужно) +
+   `framesDroppedPct` (опц.). Выбор серверного варианта (роадмап «предпочтительно») — потому что он
+   без Rust-изменений (недоступны локально) даёт натив НЕ слепым уже сегодня, а не «после будущего
+   форварда». Клиентский детектор в tree читает и `nativeWatches.get(streamId)?.pc` (роадмап
+   «общий на оба пути»), но для натива не срабатывает по устройству лупбека.
+2. **Развод с Д4 (perViewerAbr) и Д6 (arbitrateServerSlots) — по ОСИ + общий cooldown.** Д4 трогает
+   только листья под СЕРВЕРНЫМ узлом (реакция — рендишн), Д7-frameDropReparent — только узлы под
+   ПИРОМ (реакция — reparent): множества родителей не пересекаются, драться не за что. Браузер
+   обрабатывается КЛИЕНТОМ, серверный `frameDropReparent` берёт только `native` → нет двойного
+   триггера. Д6 двигает узлы в/из серверных слотов; общий `reparentCooldownUntil` (свежедёрнутый
+   одним пропускается другим). Cooldown, а не приоритет: сломанная картинка важна, но thrash-защита
+   важнее — badTicks(2)+cooldown+≤1/дерево/тик; хард-обрывы у натива всё равно ловит быстрый
+   Rust-watchdog, так что «медленная» soft-реакция допустима.
+3. **Каскад и зацикливание исключены.** Каскад: `reparent` тащит поддерево С СОБОЙ
+   (`updateSubtreeDepth`), детей не сиротит → мигрировавший узел не роняет своих детей; несколько
+   детей одного плохого родителя мигрируют независимо (это верно — все бегут от плохого), но каждый
+   уносит своё поддерево. `≤1` миграции на дерево за тик. Зацикливание «прямой ребёнок vrelay →
+   reparent → тот же vrelay»: гейт `parentIsServer` на клиенте И пропуск серверного родителя в
+   `frameDropReparent` — прямой ребёнок сервера НЕ мигрирует, ждёт понижения рендишна (Д4). Кейс
+   «корень + 1 зритель» (no-candidate): клиент под сервером не дёргает reparent; под пиром сервер
+   вернёт `no-candidate` → оставляет как есть (существующий `reattach`-фолбэк в `onRequestReparent`
+   для ICE-restart не тронут).
+4. **Риски.** Ложные миграции слабого ПК: обязательный второй сигнал `packetsLost>0` (браузер) /
+   `linkLoss>порога` (сервер) — рендерные дропы без сетевых потерь НЕ мигрируют (юнит-тест b,
+   d7-тест B/C). `framesDropped` в Chromium: используется только как ПЕРВЫЙ сигнал, решение всегда
+   требует второго; порог 5% + окно 3с + cooldown 10с гасят всплески. Свёрнутая вкладка: `hidden`-гейт
+   + сброс окна на возврат в visible (юнит-тест d).
+5. **Осталось непроверенным (на пользователе):** живое душение uplink родителя-пира (clumsy/
+   NetLimiter) — реальная миграция ≤10с и восстановление картинки; отсутствие ложных миграций при
+   свёрнутой вкладке в реальном Chromium. Детерминированная логика (пороги, политика, исполнитель) —
+   зелёная.
 
 ---
 

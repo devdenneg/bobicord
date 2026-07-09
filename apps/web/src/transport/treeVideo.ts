@@ -8,6 +8,7 @@ import {
   isTauri, startNativeWatch, stopNativeWatch, nativeWatchAnswer, nativeWatchIce, nativeWatchReparent,
   onNativeWatchOffer, onNativeWatchIce, onNativeTopology, onNativeWatchEnded,
 } from '../native';
+import { DropWindow, shouldReparentOnDrops, DROP_COOLDOWN_MS } from './dropDetector';
 
 // Ёмкость нативного relay (passthrough) — сколько зрителей он ретранслирует. Rust держит
 // upstream+фанаут; webview только рендерит. Больше браузерного (транскод дорог, натив нет).
@@ -92,6 +93,10 @@ export class TreeVideoTransport implements VideoTransport {
   private closed = false;
   private discoveryWs: WebSocket | null = null;
   private helloTimer: number | null = null; // периодический ре-hello: самолечение пропущенных stream-live
+  private dropTimer: number | null = null;   // Д7: 1с-опрос дропов кадров (общий на все watch'и)
+  // Д7: скользящее окно дропов + клиентский cooldown на стрим (ключ — базовый streamId).
+  private dropWindows = new Map<string, DropWindow>();
+  private dropCooldownUntil = new Map<string, number>();
   /** Живые стримы гильдии + метаданные приложения из stream-live (иконка/имя — Э-icon). */
   private liveStreams = new Map<string, StreamMeta>();
   private watches = new Map<string, WatchState>();
@@ -134,11 +139,18 @@ export class TreeVideoTransport implements VideoTransport {
       const ws = this.discoveryWs;
       if (ws && ws.readyState === WebSocket.OPEN) { try { ws.send(JSON.stringify({ t: 'hello', serverId: this.serverId })); } catch { /**/ } }
     }, 10000);
+    // Д7: единый 1с-таймер детектора дропов на все watch'и (один таймер, а не per-watch —
+    // per-watch таймеры в этом файле уже были источником утечек). Отбраковка плохого родителя.
+    if (this.dropTimer) clearInterval(this.dropTimer);
+    this.dropTimer = window.setInterval(() => this.dropDetectorTick(), 1000);
   }
   onRoomConnected() { /* discovery socket already syncs live-stream backlog on connect */ }
   detach() {
     this.closed = true;
     if (this.helloTimer) { clearInterval(this.helloTimer); this.helloTimer = null; }
+    if (this.dropTimer) { clearInterval(this.dropTimer); this.dropTimer = null; }
+    this.dropWindows.clear();
+    this.dropCooldownUntil.clear();
     if (this.discoveryWs) { try { this.discoveryWs.close(); } catch { /**/ } this.discoveryWs = null; }
     this.watches.forEach((_w, streamId) => this.unwatch(streamId));
     this.watches.clear();
@@ -281,6 +293,7 @@ export class TreeVideoTransport implements VideoTransport {
     this.watches.delete(streamId);
     this.treeInfoByStream.delete(streamId);
     this.lastJb.delete(streamId);
+    this.clearDropState(streamId);
     this.delVideo(streamId);
   }
   private teardownWatch(streamId: string, st: WatchState) {
@@ -288,8 +301,11 @@ export class TreeVideoTransport implements VideoTransport {
     this.watches.delete(streamId);
     this.treeInfoByStream.delete(streamId);
     this.lastJb.delete(streamId);
+    this.clearDropState(streamId);
     this.delVideo(streamId);
   }
+  // Д7: чистим окно/cooldown детектора дропов (утечка таймеров/окон — известная категория багов тут).
+  private clearDropState(streamId: string) { this.dropWindows.delete(streamId); this.dropCooldownUntil.delete(streamId); }
 
   /** Последний известный tree-info (позиция в дереве) для смотрибельного стрима. */
   getTreeInfo(streamId: string): TreeInfo | null {
@@ -339,6 +355,59 @@ export class TreeVideoTransport implements VideoTransport {
       }
     }
     return null;
+  }
+
+  /* ---------- Д7: детектор дропов кадров (отбраковка плохого родителя) ---------- */
+  // Общий 1с-тик для ОБОИХ путей: у браузерного зрителя watch.pc — реальный upstream к
+  // родителю (видит сетевые потери), у нативного nativeWatch.pc — ЛОКАЛЬНЫЙ лупбек webview↔Rust
+  // (packetsLost там ~0, реальные потери на upstream Rust↔родитель). Поэтому детектор ЕСТЕСТВЕННО
+  // молчит для натива (второй сигнал packetsLost не набирается — рендерные дропы слабого ПК не
+  // мигрируют), а отбраковку плохого родителя у нативного зрителя делает СЕРВЕР по upstream
+  // loss + framesDroppedPct (tree.js frameDropReparent) — так натив не слепой (см. отчёт Д7).
+  private async dropDetectorTick() {
+    if (this.closed) return;
+    const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+    const now = Date.now();
+    // Собираем стримы, которые сейчас смотрим (браузер + натив); ключ — базовый streamId.
+    const ids = new Set<string>([...this.watches.keys(), ...this.nativeWatches.keys()]);
+    for (const streamId of ids) {
+      const pc = this.watches.get(streamId)?.pc ?? this.nativeWatches.get(streamId)?.pc ?? null;
+      if (!pc) continue;
+      let win = this.dropWindows.get(streamId);
+      if (!win) { win = new DropWindow(); this.dropWindows.set(streamId, win); }
+      // Скрытая вкладка легитимно дропает кадры — сбрасываем окно, чтобы не тащить фоновые дельты
+      // в момент возврата в visible (роадмап: «при возврате в visible — сбросить окно»).
+      if (hidden) { win.reset(); continue; }
+      let report: RTCStatsReport;
+      try { report = await pc.getStats(); } catch { continue; }
+      let sample: { framesDropped: number; framesDecoded: number; packetsLost: number } | null = null;
+      for (const stat of report.values()) {
+        if (stat.type === 'inbound-rtp' && stat.kind === 'video') {
+          sample = { framesDropped: stat.framesDropped || 0, framesDecoded: stat.framesDecoded || 0, packetsLost: stat.packetsLost || 0 };
+          break;
+        }
+      }
+      if (!sample) continue;
+      win.push({ t: now, ...sample });
+      const cooldownUntil = this.dropCooldownUntil.get(streamId) || 0;
+      if (!shouldReparentOnDrops({ deltas: win.deltas(), hidden, now, cooldownUntil })) continue;
+      // Прямой ребёнок СЕРВЕРНОГО узла (vrelay/рендишн-корень): pickParent лучшего не найдёт
+      // (сервер и так лучший) → reparent зациклился бы «тот же родитель». Правильная реакция —
+      // понижение рендишна (Д4 perViewerAbr на сервере). Не мигрируем, ждём сервер.
+      if (this.parentIsServer(streamId)) { this.dropCooldownUntil.set(streamId, now + DROP_COOLDOWN_MS); win.reset(); continue; }
+      this.dropCooldownUntil.set(streamId, now + DROP_COOLDOWN_MS);
+      win.reset();
+      this.requestReparent(streamId, null, 'frame-drops');
+    }
+  }
+  // Родитель этого стрима — серверный узел (vrelay/рендишн-корень)? Читаем из топологии.
+  private parentIsServer(streamId: string): boolean {
+    const topo = this.topologyByStream.get(streamId);
+    if (!topo || !topo.you) return false;
+    const you = topo.nodes.find((n) => n.id === topo.you);
+    if (!you || !you.parentId) return false;
+    const parent = topo.nodes.find((n) => n.id === you.parentId);
+    return !!(parent && (parent.server || parent.virtual));
   }
 
   private onWatchMessage(streamId: string, st: WatchState, ev: MessageEvent) {
@@ -542,6 +611,7 @@ export class TreeVideoTransport implements VideoTransport {
     this.treeInfoByStream.delete(streamId);
     this.lastJb.delete(streamId);
     this.topologyByStream.delete(streamId);
+    this.clearDropState(streamId);
     this.delVideo(streamId);
     // ГЛОБАЛЬНЫЙ Rust-стоп — ТОЛЬКО если рубим стрим, реально сидящий в слоте. Иначе teardown чужого
     // (по discovery stream-end / реконсиляру / гонке) сносил бы АКТИВНЫЙ просмотр другого стрима.
@@ -559,10 +629,12 @@ export class TreeVideoTransport implements VideoTransport {
     if (!topo || !topo.you) return null;
     return topo.nodes.find((n) => n.id === topo.you)?.parentId ?? null;
   }
-  requestReparent(streamId: string, targetId: string | null) {
+  requestReparent(streamId: string, targetId: string | null, reason?: string) {
+    // Натив: reason в IPC не пробрасывается (нативную отбраковку по дропам делает сервер —
+    // frameDropReparent); тут только ручной/ICE-fail reparent через Rust.
     if (this.nativeWatches.has(streamId)) { nativeWatchReparent(targetId).catch(() => {}); return; }
     const st = this.watches.get(streamId);
-    if (st) { try { st.ws.send(JSON.stringify({ t: 'request-reparent', streamId, targetParentId: targetId })); } catch { /**/ } }
+    if (st) { try { st.ws.send(JSON.stringify({ t: 'request-reparent', streamId, targetParentId: targetId, reason })); } catch { /**/ } }
   }
   onTopology(cb: (streamId: string) => void) { this.topologyCbs.add(cb); return () => { this.topologyCbs.delete(cb); }; }
   onReparentDenied(cb: (streamId: string, reason: string) => void) { this.reparentDeniedCbs.add(cb); return () => { this.reparentDeniedCbs.delete(cb); }; }

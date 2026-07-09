@@ -138,6 +138,14 @@ const RENDITION_TICK_MS = Number(process.env.TREE_RENDITION_TICK_MS) || 5_000;
 const ABR_GOOD_TICKS = 5;             // подряд «хороших» тиков до подъёма (спад — ABR_BAD_TICKS=2)
 const ABR_VIEWER_COOLDOWN_MS = 20_000; // гистерезис между переключениями качества одного зрителя
 
+// Roadmap-flow-стриминга Д7: серверная отбраковка плохого родителя для НАТИВНОГО зрителя.
+// Браузер судит сам по своему upstream-PC (treeVideo.ts dropDetector); у натива webview-PC —
+// лупбек Rust↔webview (packetsLost≈0, сетевых потерь не видит), поэтому отбраковку по дропам
+// делает СЕРВЕР по upstream-статистике узла (linkLoss из toChild родителя, всегда была) +
+// опциональному framesDroppedPct из stats. Два сигнала (роадмап-риск): framesDroppedPct
+// включает рендерные дропы → без linkLoss>порога это не вина родителя.
+const FRAME_DROP_PCT_HI = 5;          // >5% дропнутых кадров за окно (роадмап-порог)
+
 // Roadmap-flow-стриминга Д6: супер-сидеры + авто-ретрансляция 1→2 при запасе upload.
 // Прямые слоты серверного узла (vrelay в source-дереве / рендишн-корень) держим за
 // СИЛЬНЕЙШИМИ по upload зрителями; слабых вытесняем в глубину, сильных из глубины поднимаем.
@@ -1012,6 +1020,62 @@ function attachTreeServer(httpServer, opts) {
     return swaps;
   }
 
+  // Roadmap-flow-стриминга Д7: серверная отбраковка плохого родителя для НАТИВНОГО зрителя.
+  // Браузер судит сам (treeVideo.ts dropDetector по своему upstream-PC); натив webview-PC —
+  // лупбек Rust↔webview (packetsLost≈0), сетевых потерь не видит → решает СЕРВЕР по upstream
+  // linkLoss (из toChild родителя) + опц. framesDroppedPct. Разведение с Д4/Д6:
+  //  - Д4 perViewerAbr трогает ТОЛЬКО листья под СЕРВЕРНЫМ узлом (vrelay/рендишн-корень) —
+  //    там reparent бессмыслен (сервер уже лучший), реакция = понижение рендишна. Здесь — ТОЛЬКО
+  //    узлы под ПИРОМ (не серверным). Оси не пересекаются → не дерутся.
+  //  - Д6 двигает узлы в/из серверных слотов; общий reparentCooldownUntil (свежедёрнутый пропускается).
+  //  - Браузер обрабатывается клиентом → серверный детектор берёт ТОЛЬКО native (без двойного триггера).
+  // Каскад/зацикливание: reparent тащит поддерево С СОБОЙ (updateSubtreeDepth) — детей не сиротит;
+  // ≤1 миграции на дерево за тик; badTicks-гистерезис против одиночного всплеска; cooldown против
+  // «reparent → тот же/сервер → reparent». Возвращает число миграций (тест).
+  function frameDropReparent(now) {
+    let moved = 0;
+    for (const [key, t] of mgr.trees) {
+      if (!t.broadcasterId) continue;
+      const { rendition } = parseTreeKey(key);
+      let target = null;
+      for (const node of t.nodes.values()) {
+        if (node.id === t.broadcasterId || node.virtual) continue;
+        if (!node.native) continue;                       // браузер судит сам (dropDetector) — не дублируем
+        const parent = node.parent ? t.nodes.get(node.parent) : null;
+        if (!parent) continue;                            // сирота — settleOrphans/vrelay посадит
+        // Родитель = серверный узел? Тогда это территория Д4 (понижение рендишна), не отбраковка.
+        const serverParent = parent.virtual || (parent.id === t.broadcasterId && rendition !== DEFAULT_RENDITION);
+        if (serverParent) continue;
+        // Свежесть upstream-статистики (родитель ещё репортит toChild loss/rtt по этому узлу).
+        if (!node.statsAt || now - node.statsAt > STATS_TTL_MS) { node.dropBadTicks = 0; continue; }
+        const loss = node.linkLoss || 0;
+        // Второй сигнал ОБЯЗАТЕЛЕН: реальные потери на upstream (loss>ABR_LOSS_HI) — картинка
+        // рвётся по вине родителя. framesDroppedPct (если узел его шлёт) подтверждает, что дропы
+        // именно кадров, а не восстановленные FEC потери; loss без него — уже достаточный сетевой
+        // сигнал у сервера (у него нет своего framesDropped, только линк).
+        const dropFresh = node.framesDropAt && now - node.framesDropAt <= STATS_TTL_MS;
+        const dropBad = dropFresh ? (node.framesDroppedPct || 0) > FRAME_DROP_PCT_HI : true;
+        const bad = loss > ABR_LOSS_HI && dropBad;
+        if (bad) node.dropBadTicks = (node.dropBadTicks || 0) + 1;
+        else { node.dropBadTicks = 0; continue; }
+        if (node.dropBadTicks < ABR_BAD_TICKS) continue;  // не по одному всплеску (роадмап-риск)
+        if (node.reparentCooldownUntil && now < node.reparentCooldownUntil) continue; // общий с Д4/Д6
+        target = node; break;                             // ≤1 миграции на дерево за тик
+      }
+      if (!target) continue;
+      const res = mgr.reparent(key, target.id, null, now); // null → pickParent исключает текущего родителя
+      if (!res.ok) {
+        // no-candidate/cooldown — оставляем как есть (нет лучшего пира; Rust-watchdog добьёт хард-фейл).
+        continue;
+      }
+      target.dropBadTicks = 0;
+      tlog(`[frame-drops] reparent ${target.id} (${target.identity}) в [${key}]: ${res.oldParentId || '-'} -> ${res.newParentId} (loss=${((target.linkLoss || 0) * 100).toFixed(1)}% dropPct=${(target.framesDroppedPct || 0).toFixed(1)})`);
+      applyReparent(key, target.id, res);
+      moved++;
+    }
+    return moved;
+  }
+
   // Discovery-сокет (браузер/натив, никогда не joins) сообщает свой сервер здесь —
   // до этого сообщения бэклог живых стримов не шлём (см. wss.on('connection')).
   function onHello(id, msg) {
@@ -1182,6 +1246,9 @@ function attachTreeServer(httpServer, opts) {
     const p = peers.get(id);
     if (!p) return;
     if (typeof msg.availableOutgoing === 'number') p.availableOutgoing = msg.availableOutgoing;
+    // Д7: узел (натив) репортит свой процент дропнутых кадров декодера. Опционально — старые
+    // клиенты не шлют; используется вместе с upstream linkLoss в frameDropReparent.
+    if (typeof msg.framesDroppedPct === 'number') { p.framesDroppedPct = msg.framesDroppedPct; p.framesDropAt = Date.now(); }
     if (Array.isArray(msg.toChild)) {
       for (const s of msg.toChild) {
         const c = peers.get(s.id);
@@ -1250,6 +1317,10 @@ function attachTreeServer(httpServer, opts) {
     if (msg.targetParentId === VRELAY_TARGET) return onRequestVrelay(id);
     const key = p.treeKey;
     const now = Date.now();
+    // Д7: браузерный зритель просит миграцию по дропам кадров (отбраковка плохого родителя).
+    // Диагностический grep-префикс. Текущий родитель уже исключается в reparent(...,null) →
+    // pickParent(t, node, node.parent) (см. mgr.reparent), так что авто-выбор не вернёт того же.
+    if (msg.reason === 'frame-drops') tlog(`[frame-drops] request-reparent ${id} (${p.identity}) в [${key}] от родителя ${p.parent || '-'}`);
     const res = mgr.reparent(key, id, msg.targetParentId || null, now);
     if (!res.ok) {
       // Реаттач к тому же родителю. Кейс «корень + единственный зритель»: pickParent
@@ -1402,6 +1473,7 @@ function attachTreeServer(httpServer, opts) {
       id, ws, streamId: null, treeKey: null, rendition: null, role: null, native: false, identity: id, serverId: null,
       parent: null, children: [], depth: 0,
       maxChildren: undefined, maxBitrate: 0, abr: false, availableOutgoing: 0, linkRtt: 0, linkLoss: 0, reparentCooldownUntil: 0,
+      framesDroppedPct: 0, framesDropAt: 0, dropBadTicks: 0, // Д7: серверная отбраковка родителя (натив)
     });
     ws.on('message', (raw) => {
       let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
@@ -1446,6 +1518,7 @@ function attachTreeServer(httpServer, opts) {
     const nowT = Date.now();
     perViewerAbr(nowT);
     arbitrateServerSlots(nowT); // Д6: супер-сидеры — сильные upload в прямые слоты сервера
+    frameDropReparent(nowT);    // Д7: серверная отбраковка плохого родителя для натив-зрителя
   }, ABR_TICK_MS);
   abrTimer.unref?.(); // не держим процесс живым только ради ABR-тика
 
@@ -1548,7 +1621,7 @@ function attachTreeServer(httpServer, opts) {
     return out;
   }
 
-  return { mgr, peers, wss, abrTimer, hbTimer, drainTimer, renditionTimer, liveBroadcastersIn, arbitrateServerSlots };
+  return { mgr, peers, wss, abrTimer, hbTimer, drainTimer, renditionTimer, liveBroadcastersIn, arbitrateServerSlots, frameDropReparent };
 }
 
 module.exports = { attachTreeServer, TreeManager, MAX_DEPTH, NATIVE_CAPACITY, BROWSER_CAPACITY, treeKey, parseTreeKey };
