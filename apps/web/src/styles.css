@@ -596,6 +596,10 @@
   .dl-actions{flex:0 0 auto;display:flex;align-items:center;gap:2px}
   .dl-act{width:28px;height:28px;padding:0;display:flex;align-items:center;justify-content:center;border-radius:8px;background:transparent;color:var(--muted);transition:background .12s,color .12s}
   .dl-act:hover{background:var(--panel3);color:var(--txt-h)}
+  /* тултип якорим к правому краю кнопки (а не центрируем) — кнопки у самого правого края
+     модалки, центрированный тултип вылезал за .box и рождал фантомный горизонтальный скролл */
+  .dl-act[data-tip]::after{left:auto;right:0;transform:translateY(3px)}
+  @media (hover:hover) and (pointer:fine){.dl-act[data-tip]:hover::after{transform:translateY(0)}}
   .dl-act:disabled{opacity:.35;pointer-events:none}
   .dl-empty{padding:22px 8px;text-align:center;color:var(--muted);font-size:13px}
   /* панель прикреплённых вложений над инпутом чата — предпросмотр перед отправкой */
