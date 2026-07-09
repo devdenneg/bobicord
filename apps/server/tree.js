@@ -39,11 +39,14 @@ const STATS_TTL_MS = 10_000;       // linkLoss/linkRtt старше — счит
 const KF_FORWARD_MIN_MS = 1000;    // rate-limit проброса request-keyframe к корню на ДЕРЕВО: IDR дорог
                                    // (100-300КБ спайк всем зрителям), N relay-узлов иначе суммируются
 
+// LEGACY (снос после раскатки натив-клиента ≥ vX): Э9-фолбэк vrelay = fallback с дренажом.
+// Ветка живёт только для стримов старых клиентов (join БЕЗ serverIngest) при server-first
+// дефолт-on. Новые (нативные) стримы идут server-first (vrelay = постоянный медиаузел).
 // Э9 — виртуальный серверный fallback-relay (vrelay): headless-агент на VPS, джойнится в
 // дерево как viewer с ёмкостью и passthrough-ретранслирует. Строго фолбэк: живые пиры
 // всегда предпочитаются (VIRTUAL_COST), активация только когда сироты без кандидатов
 // (или зритель явно попросил «через сервер»), дренаж уводит детей на живые пиры.
-const VIRTUAL_COST = 1000;         // штраф виртуала в scoreParent: потолок score живого кандидата
+const VIRTUAL_COST = 1000;         // LEGACY: штраф виртуала в scoreParent: потолок score живого кандидата
                                    // ~740 (depth<=300 + natCost 250 + load 40 + loss 50 + rtt ~100),
                                    // 1000 гарантирует проигрыш ЛЮБОМУ живому relay, но виртуал
                                    // остаётся единственным кандидатом, когда живых нет
@@ -53,25 +56,20 @@ const VIRTUAL_COST = 1000;         // штраф виртуала в scoreParent
 const VIRTUAL_SERVER_FIRST_BONUS = 500;
 const VIRTUAL_CHILDREN_CAP = Number(process.env.VRELAY_CHILDREN_CAP) || 32; // кап ёмкости виртуала
                                    // (датацентр — выше пользовательского MAX_CHILDREN_CAP); env для Д1
-const DRAIN_TICK_MS = 5000;        // темп дренажа детей виртуала на живые пиры
+const DRAIN_TICK_MS = 5000;        // LEGACY: темп дренажа детей виртуала на живые пиры
 const DRAIN_COOLDOWN_MS = 15_000;  // гистерезис: свежепосаженного под виртуала не дёргаем сразу
 const VRELAY_ACTIVATE_TIMEOUT_MS = 15_000; // активация «в полёте»: не слать повторный activate, пока не истёк
 const VRELAY_UID = 'virtual-relay'; // JWT-uid агента: флагу virtual в join верим только при нём
 const VRELAY_TARGET = 'vrelay';    // сентинел targetParentId в request-reparent = «хочу через сервер»
 
-// Roadmap-flow-стриминга Д1: инверсия топологии «стример → сервер → зрители». Под флагом
+// Roadmap-flow-стриминга Д1/Д8: инверсия топологии «стример → сервер → зрители». Под флагом
 // TREE_SERVER_FIRST vrelay становится постоянным pinned медиаузлом (не fallback с дренажом):
 // вещатель шлёт serverIngest:true, сервер шлёт агенту vrelay-ingest (постоянная сессия),
 // виртуал садится прямым ребёнком корня ДО первого зрителя, дренаж/idle-exit отключены.
+// Д8: режим — ДЕФОЛТ (server-first по умолчанию). Откат = TREE_SERVER_FIRST=0 (legacy).
 // Режим включается ТОЛЬКО для деревьев с serverIngest — старый клиент без поля работает по
-// legacy даже при TREE_SERVER_FIRST=1 (обратная совместимость, см. Деплой-дисциплина роадмапа).
-const SERVER_FIRST = process.env.TREE_SERVER_FIRST === '1';
-
-// DEV-ТРИГГЕР Д2 (удаляется в Д8): ручной подъём/гашение ОДНОЙ транскод-рендишн-сессии на
-// vrelay, чтобы глазами проверить конвейер RTP→ffmpeg→RTP до переделки деревьев (Д3/Д4).
-// Гейт TREE_DEV_RENDITION=1 (по умолчанию выкл). Составной ключ streamId::rendition и
-// полноценный реестр рендишнов — это Д3/Д4, здесь только «дёрнуть агента и увидеть картинку».
-const DEV_RENDITION = process.env.TREE_DEV_RENDITION === '1';
+// LEGACY даже при server-first дефолт-on (обратная совместимость, см. Деплой-дисциплина роадмапа).
+const SERVER_FIRST = process.env.TREE_SERVER_FIRST !== '0';
 
 function newPeerId() { return 'p_' + crypto.randomBytes(6).toString('hex'); }
 
@@ -199,8 +197,8 @@ class TreeManager {
   // Ёмкость узла (сколько прямых детей он держит). Симметричный NAT (Evolution-TZ Э3):
   // узел недостижим как relay-родитель для третьих сторон — всегда лист (0). Иначе —
   // объявленный узлом maxChildren (вещатель задаёт лимит прямых зрителей в UI; натив-relay
-  // и браузер-relay сообщают свою ёмкость сами), с потолком MAX_CHILDREN_CAP. Fallback на
-  // старые константы, если maxChildren не пришёл (обратная совместимость).
+  // сообщает свою ёмкость сам; браузер — всегда лист, Д0), с потолком MAX_CHILDREN_CAP.
+  // Fallback на старые константы, если maxChildren не пришёл (обратная совместимость).
   capacityOf(node) {
     // Э9: виртуал — серверный процесс без NAT, кап у него свой (выше пользовательского).
     if (node.virtual) return Math.max(0, Math.min(typeof node.maxChildren === 'number' ? node.maxChildren : 8, VIRTUAL_CHILDREN_CAP));
@@ -363,8 +361,9 @@ class TreeManager {
     // не-симметричный узел даже на уровень глубже предпочитался — симметричный берём в родители
     // лишь когда другого relay нет вовсе (тогда capacityOf уже гарантировал наличие TURN).
     const natCost = cand.symmetricNat ? 250 : 0;
-    // Э9: виртуал (серверный fallback) проигрывает любому живому relay — см. VIRTUAL_COST.
-    // Д1 (server-first): виртуал, наоборот, ПРЕДПОЧТИТЕЛЬНЕЕ любого пира — отрицательный бонус.
+    // Д1 (server-first, дефолт Д8): виртуал ПРЕДПОЧТИТЕЛЬНЕЕ любого пира — отрицательный бонус.
+    // LEGACY (снос после раскатки натив-клиента ≥ vX): в legacy-дереве (старый клиент без
+    // serverIngest) виртуал, наоборот, проигрывает любому живому relay — штраф VIRTUAL_COST.
     const virtualCost = cand.virtual ? (serverFirst ? -VIRTUAL_SERVER_FIRST_BONUS : VIRTUAL_COST) : 0;
     return depthCost + loadCost + lossCost + rttCost + natCost + virtualCost - outBonus;
   }
@@ -630,7 +629,7 @@ function attachTreeServer(httpServer, opts) {
   const wss = new WebSocketServer({ noServer: true });
   const mgr = new TreeManager(!!(turnSecret && turnUrls.length));
   const peers = new Map(); // peerId -> node {id, ws, streamId, role, native, identity, parent, children, depth, maxChildren, stats...}
-  tlog(`режим видео-дерева: ${SERVER_FIRST ? 'server-first (TREE_SERVER_FIRST=1) — vrelay постоянный медиаузел для стримов с serverIngest' : 'legacy (vrelay = fallback с дренажом)'}; vrelay children cap=${VIRTUAL_CHILDREN_CAP}`);
+  tlog(`режим видео-дерева: ${SERVER_FIRST ? 'server-first (ДЕФОЛТ, Д8) — vrelay постоянный медиаузел для стримов с serverIngest; стримы старых клиентов (без serverIngest) — LEGACY-fallback' : 'legacy (TREE_SERVER_FIRST=0) — vrelay = fallback с дренажом'}; vrelay children cap=${VIRTUAL_CHILDREN_CAP}`);
 
   // Временные TURN-креды выдаются только авторизованным (Evolution-TZ Э3 AC) — привязаны
   // к id из уже проверенного session-JWT, генерятся заново на каждое ws-подключение.
@@ -691,7 +690,8 @@ function attachTreeServer(httpServer, opts) {
     const bc = t.nodes.get(t.broadcasterId);
     t.vrelayActivateAt = now;
     // Д1: server-first-дереву нужен ПОСТОЯННЫЙ медиаузел — шлём vrelay-ingest (агент поднимает
-    // сессию с idle_exit:None, reconnect:true). Legacy — прежний vrelay-activate (fallback с idle).
+    // сессию с idle_exit:None, reconnect:true). LEGACY (снос после раскатки натив-клиента ≥ vX):
+    // прежний vrelay-activate (fallback с idle-exit) — для стримов старых клиентов без serverIngest.
     // streamId в сообщении — БАЗОВЫЙ id (агент джойнится в `::source` квалити по умолчанию).
     const msgType = t.serverFirst ? 'vrelay-ingest' : 'vrelay-activate';
     tlog(`[${key}] ${msgType} -> агент ${agent.id}`);
@@ -1386,19 +1386,6 @@ function attachTreeServer(httpServer, opts) {
     send(t.broadcasterId, { t: 'request-keyframe', streamId: p.streamId });
   }
 
-  // DEV-ТРИГГЕР Д2 (удаляется в Д8): ручной подъём/гашение рендишна. Д4: адаптирован тонкой
-  // обёрткой над настоящим механизмом (ensureRendition/teardownRendition) — идёт через реестр
-  // рендишнов, не в обход него (иначе dev-старт не завёл бы запись реестра, а гашение по idle
-  // не сработало бы). Гейт DEV_RENDITION. msg: { t:'dev-rendition', streamId, rendition?='480', stop?, presetBitrate? }.
-  function onDevRendition(id, msg) {
-    if (!DEV_RENDITION) return;
-    const streamId = msg.streamId;
-    const rendition = typeof msg.rendition === 'string' ? msg.rendition : '480';
-    if (!streamId) return;
-    if (msg.stop) { teardownRendition(streamId, rendition, 'dev-stop'); return; }
-    if (!ensureRendition(streamId, rendition, Number(msg.presetBitrate) || 0)) tlog(`[rendition] DEV ${streamId}::${rendition} не удалось поднять`);
-  }
-
   // Д3: уход source-вещателя = смерть ВСЕХ рендишн-деревьев этого стрима (`base::*`, кроме
   // `::source`). Иначе они повиснут (их корни-рендишн — отдельные узлы, drop-peer сами не
   // получат от source-коллапса). Сносим узлы + просим агента погасить транскод-рендишны.
@@ -1488,7 +1475,6 @@ function attachTreeServer(httpServer, opts) {
       else if (msg.t === 'set-quality') onSetQuality(id, msg);                       // Д4: ручной выбор качества
       else if (msg.t === 'vrelay-rendition-failed') onVrelayRenditionFailed(id, msg); // Д4: агент не поднял рендишн
       else if (msg.t === 'probe-start' || msg.t === 'probe-offer' || msg.t === 'probe-answer' || msg.t === 'probe-ice') onProbe(id, msg); // Д5: замер upload
-      else if (msg.t === 'dev-rendition') onDevRendition(id, msg); // DEV-ТРИГГЕР Д2 (гейт внутри)
     });
     // code 1006 = грязный обрыв TCP (без close-фрейма): краш клиента, потеря сети,
     // heartbeat-terminate (см. hbTimer — он логирует свой terminate отдельно).
@@ -1542,6 +1528,8 @@ function attachTreeServer(httpServer, opts) {
   }, RENDITION_TICK_MS);
   renditionTimer.unref?.();
 
+  // LEGACY (снос после раскатки натив-клиента ≥ vX): дренаж виртуала — только для legacy-деревьев
+  // (старый клиент без serverIngest); server-first-деревья пропускаются целиком (t.serverFirst).
   // Э9: дренаж виртуала — живые пиры всегда предпочтительнее серверного фолбэка.
   // R1 (мягкий): <=1 ребёнка за тик на дерево уводим на живого кандидата (авто-reparent
   // сам исключит виртуала как текущего родителя). Pinned («через сервер» руками) и

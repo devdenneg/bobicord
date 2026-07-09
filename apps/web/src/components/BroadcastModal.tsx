@@ -33,6 +33,9 @@ interface SavedConfig {
   audioPid: number | null;
   /** Э8: лимит прямых зрителей корня; остальные уходят глубже через relay-узлы. */
   maxDirectChildren: number;
+  /** Д8: opt-in прямых подключений к стримеру. Выкл (дефолт) — server-first: единственный
+   *  слот корня отдан vrelay (maxChildren=1). Вкл — maxChildren = 1 (vrelay) + maxDirectChildren. */
+  allowDirectPeers: boolean;
   /** Д5: режим пресета. 'smooth'/'quality' — из развилки после замера (CBR-пресет по таблице);
    *  'manual' — ручные слайдеры (текущее поведение). Определяет, чем стартует трансляция. */
   presetMode: PresetMode | 'manual';
@@ -40,7 +43,7 @@ interface SavedConfig {
 // audioMode дефолтом 'auto': звук выбирается сам по источнику (окно → PID окна, монитор →
 // EXCLUDE себя), пользователю не нужно вручную указывать процесс. Ручной выбор остаётся
 // под «Дополнительно» на случай, когда нужен звук строго одного приложения.
-const DEF_CONFIG: SavedConfig = { sourceKind: 'monitor', monitorIndex: 0, windowHwnd: null, resolution: '1080', fps: 30, bitrateKbps: 6000, autoBitrate: false, audioMode: 'auto', audioPid: null, maxDirectChildren: 2, presetMode: 'smooth' };
+const DEF_CONFIG: SavedConfig = { sourceKind: 'monitor', monitorIndex: 0, windowHwnd: null, resolution: '1080', fps: 30, bitrateKbps: 6000, autoBitrate: false, audioMode: 'auto', audioPid: null, maxDirectChildren: 2, allowDirectPeers: false, presetMode: 'smooth' };
 // Диапазоны слайдеров. Сохранённый в localStorage конфиг мог содержать старые
 // пресеты (bitrateMbps 3/6/10, ранее 15/20; 1 прямое подключение) — мигрируем и
 // клампим, иначе на бэкенд уходит невалидное значение.
@@ -54,6 +57,7 @@ function loadConfig(): SavedConfig {
     const c: SavedConfig = { ...DEF_CONFIG, ...raw };
     c.bitrateKbps = Math.min(BITRATE_MAX_KBPS, Math.max(BITRATE_MIN_KBPS, Math.round(c.bitrateKbps / BITRATE_STEP_KBPS) * BITRATE_STEP_KBPS));
     c.maxDirectChildren = Math.min(DIRECT_MAX, Math.max(DIRECT_MIN, Math.round(c.maxDirectChildren)));
+    c.allowDirectPeers = !!c.allowDirectPeers;
     if (c.presetMode !== 'smooth' && c.presetMode !== 'quality' && c.presetMode !== 'manual') c.presetMode = 'smooth';
     return c;
   } catch { return DEF_CONFIG; }
@@ -220,7 +224,11 @@ export function BroadcastModal() {
       // будучи в голосовом, и дерево стрима живёт на его сервере (иначе при браузинге по серверам
       // трансляция уходила бы в чужую комнату). Фолбэк на active.id — только если вне голоса (не должно).
       const bcSrv = eng.voiceServerId || active.id;
-      await startNativeBroadcast(me.username, me.username, bcSrv, { source, maxWidth: w, maxHeight: h, fps, bitrateBps, autoBitrate, audioTargetPid, maxDirectChildren: cfg.maxDirectChildren, presetMode: preset ? cfg.presetMode : 'manual' });
+      // Д8: server-first — единственный слот корня отдан vrelay (maxChildren=1). Opt-in
+      // «прямые подключения» открывает N слотов вещателя: maxChildren = 1 (vrelay) + N.
+      // Натив клампит max_children в [1..10], сервер — в [0..MAX_CHILDREN_CAP].
+      const directSlots = cfg.allowDirectPeers ? 1 + cfg.maxDirectChildren : 1;
+      await startNativeBroadcast(me.username, me.username, bcSrv, { source, maxWidth: w, maxHeight: h, fps, bitrateBps, autoBitrate, audioTargetPid, maxDirectChildren: directSlots, presetMode: preset ? cfg.presetMode : 'manual' });
       saveConfig(cfg);
       useStore.getState().setBroadcastLive(true);
       api.streamStart(bcSrv).catch(() => {}); // фоновый push участникам не в комнате
@@ -322,6 +330,19 @@ export function BroadcastModal() {
       }{chosenPreset ? ` → ${chosenPreset.label}, ${(chosenPreset.bitrateKbps / 1000).toFixed(1)} Мбит/с CBR` : (cfg.presetMode !== 'manual' && !measuring ? ' → нужен замер' : '')}</p>
     </div>
 
+    {/* Roadmap-flow-стриминга Д8: opt-in прямых подключений к стримеру. Дефолт — «через сервер»
+        (server-first: единственный слот корня под vrelay). Вкл — вещатель открывает N прямых
+        слотов (N = слайдер «Прямых подключений» в расширенных настройках). */}
+    <div className="fld"><label>Прямые подключения к тебе</label>
+      <div className="seg">
+        <button className={!cfg.allowDirectPeers ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, allowDirectPeers: false }))}>Только через сервер</button>
+        <button className={cfg.allowDirectPeers ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, allowDirectPeers: true }))}>Разрешить ({cfg.maxDirectChildren} слот.)</button>
+      </div>
+      <p className="msub" style={{ margin: '8px 0 0' }}>{cfg.allowDirectPeers
+        ? `Зрители могут брать поток напрямую с тебя (до ${cfg.maxDirectChildren} прямых слотов; число — в расширенных настройках). Остальные — через сервер.`
+        : 'Все зрители получают поток через сервер (меньше нагрузки на твою отдачу, стабильнее). Прямые подключения выключены.'}</p>
+    </div>
+
     {/* Расширенные настройки = текущий ручной режим (Д5). Изменение битрейт/разрешение/fps
         переключает presetMode в 'manual'; звук и прямые подключения ортогональны пресету. */}
     <div className="fld">
@@ -353,7 +374,7 @@ export function BroadcastModal() {
           </div>
           <div className="fld"><label>Прямых подключений: {cfg.maxDirectChildren}</label>
             <input type="range" min={DIRECT_MIN} max={DIRECT_MAX} step={1} value={cfg.maxDirectChildren} onChange={(e) => setCfg((c) => ({ ...c, maxDirectChildren: +e.target.value }))} />
-            <p className="msub" style={{ margin: '8px 0 0' }}>Сколько зрителей берут поток напрямую с тобой. Остальные — через ретранслирующих зрителей (дерево, глубже) или через сервер.</p>
+            <p className="msub" style={{ margin: '8px 0 0' }}>Сколько зрителей берут поток напрямую с тобой (действует только при включённом тумблере «Прямые подключения»). Остальные — через сервер/ретранслирующих зрителей.</p>
           </div>
         </div>
       </details>

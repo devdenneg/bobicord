@@ -20,9 +20,10 @@ services:
       - TURN_SECRET=${TURN_SECRET}
       - TURN_URLS=${TURN_URLS}
       - TURN_TTL_SEC=${TURN_TTL_SEC:-600}
-      # Roadmap-flow-стриминга Д1: server-first (стример → сервер → зрители). По умолчанию 0
-      # (legacy). Флаг снимается/ставится вручную — Д1 не включает режим в проде.
-      - TREE_SERVER_FIRST=${TREE_SERVER_FIRST:-0}
+      # Roadmap-flow-стриминга Д8: server-first (стример → сервер → зрители) — ДЕФОЛТ on.
+      # Дефолт в коде (tree.js: TREE_SERVER_FIRST !== '0'); откат на legacy = выставить 0.
+      # Действует только для стримов с serverIngest (нативный клиент); старые бандлы — legacy.
+      - TREE_SERVER_FIRST=${TREE_SERVER_FIRST:-1}
     volumes:
       - ./data:/app/data
     ports:
@@ -39,7 +40,11 @@ services:
     environment:
       - TURN_SECRET=${TURN_SECRET}
       - TURN_REALM=${TURN_REALM:-relayapp.local}
-    command: ["sh", "-c", "turnserver -c /etc/turnserver.conf --static-auth-secret=$${TURN_SECRET} --realm=$${TURN_REALM}"]
+      # Д8: публичный IP VPS для relay-кандидатов coturn. Пусто = флаг --external-ip НЕ
+      # добавляется (иначе coturn падает на пустом значении). Проставь реальный IP в .env.
+      - TURN_EXTERNAL_IP=${TURN_EXTERNAL_IP:-}
+    # ${VAR:+...} подставляет --external-ip ТОЛЬКО если TURN_EXTERNAL_IP непуст (иначе строки нет).
+    command: ["sh", "-c", "turnserver -c /etc/turnserver.conf --static-auth-secret=$${TURN_SECRET} --realm=$${TURN_REALM} $${TURN_EXTERNAL_IP:+--external-ip=$${TURN_EXTERNAL_IP}}"]
 
   # Э9: виртуальный fallback-relay — джойнится в relay-дерево, когда у зрителей нет живых
   # relay-пиров (или зритель явно выбрал «через сервер»), и passthrough-ретранслирует RTP.

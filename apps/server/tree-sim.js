@@ -7,7 +7,7 @@
 const http = require('http');
 const jwt = require('jsonwebtoken');
 const WebSocket = require('ws');
-const { attachTreeServer, MAX_DEPTH } = require('./tree');
+const { attachTreeServer, MAX_DEPTH, TreeManager, treeKey } = require('./tree');
 
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-secret-change';
 const N = parseInt(process.argv[2], 10) || 20;
@@ -124,7 +124,71 @@ async function main() {
 
   clients.forEach((c) => { try { c.ws.close(); } catch { /**/ } });
   server.close();
+
+  // Roadmap-flow-стриминга Д8: регрессия рендишн-деревьев (server-first). Проверяем на уровне
+  // менеджера (без WS/агента/ffmpeg): source-дерево + рендишн-дерево `base::720` — раздельные
+  // Tree в mgr.trees; vrelay pinned прямым ребёнком корня; структурная ИЗОЛЯЦИЯ КАЧЕСТВ —
+  // узел из `::720` не может стать родителем узла из `::source` (разные деревья).
+  renditionTreesTest();
+
   if (!process.exitCode) console.log('[sim] OK');
+}
+
+// Прямой (без WS) тест рендишн-деревьев над TreeManager: изоляция качеств + vrelay pinned.
+function renditionTreesTest() {
+  const mgr = new TreeManager();
+  const base = 'rs';
+  const srcKey = treeKey(base, 'source');
+  const rKey = treeKey(base, '720');
+  const now = Date.now();
+  let fails = 0;
+  const check = (name, cond) => { console.log(`[sim] рендишн: ${cond ? 'OK' : 'FAIL'} — ${name}`); if (!cond) { fails++; process.exitCode = 1; } };
+
+  const mk = (id, over) => Object.assign({
+    id, identity: id, role: 'viewer', native: true, virtual: false, maxChildren: undefined,
+    children: [], parent: null, depth: 0, availableOutgoing: 0, symmetricNat: false,
+    linkLoss: 0, linkRtt: 0, rendition: 'source', treeKey: srcKey, streamId: base,
+    vrelayPinned: false, qualityPinned: false,
+  }, over);
+
+  // --- source-дерево (server-first): корень cap=1 (слот под vrelay), vrelay, зрители ---
+  mgr.join(srcKey, mk('bc', { role: 'broadcaster', maxChildren: 1 }));
+  const srcT = mgr.trees.get(srcKey);
+  srcT.serverFirst = true; // server-first (Д8-дефолт) — vrelay предпочтительный родитель
+  mgr.join(srcKey, mk('vr', { virtual: true, maxChildren: 8 }));
+  srcT.nodes.get('vr').vrelayPinned = true; // Д1: pinned постоянный медиаузел
+  mgr.join(srcKey, mk('v1', { availableOutgoing: 0 }));
+  mgr.join(srcKey, mk('v2', { native: false }));
+
+  check('vrelay — прямой ребёнок корня (depth 1, pinned)',
+    srcT.nodes.get('vr').parent === 'bc' && srcT.nodes.get('vr').depth === 1 && srcT.nodes.get('vr').vrelayPinned);
+  check('server-first зритель садится под vrelay (не под корень)',
+    srcT.nodes.get('v1').parent === 'vr' && srcT.nodes.get('v2').parent === 'vr');
+
+  // --- рендишн-дерево base::720: рендишн-корень (ffmpeg vrelay-агента, native:true, virtual:false
+  // ради обхода self-loop в ensureVirtualAttached) + свои зрители ---
+  mgr.join(rKey, mk('rr', { role: 'broadcaster', native: true, rendition: '720', treeKey: rKey }));
+  mgr.join(rKey, mk('rv1', { rendition: '720', treeKey: rKey }));
+  const rT = mgr.trees.get(rKey);
+
+  check('source и ::720 — РАЗДЕЛЬНЫЕ деревья в mgr.trees',
+    srcT !== rT && mgr.trees.has(srcKey) && mgr.trees.has(rKey));
+  check('узлы ::720 отсутствуют в source-дереве и наоборот',
+    !srcT.nodes.has('rr') && !srcT.nodes.has('rv1') && !rT.nodes.has('bc') && !rT.nodes.has('vr'));
+  check('зритель ::720 садится под рендишн-корень', rT.nodes.get('rv1').parent === 'rr');
+
+  // Изоляция качеств: узел из ::720 (rr) НЕ может стать родителем узла из ::source (v1).
+  const cross = mgr.reparent(srcKey, 'v1', 'rr', now);
+  check('reparent source-узла к ::720-узлу ОТКЛОНЁН (изоляция качеств)',
+    cross.ok === false && cross.reason === 'target-gone');
+  // pickParent для source-сироты возвращает только узлы source-дерева (никогда rr/rv1).
+  const orphan = mk('v3', {});
+  mgr.trees.get(srcKey).nodes.set('v3', orphan);
+  const picked = mgr.pickParent(srcT, orphan);
+  check('pickParent(source) возвращает только узлы source-дерева',
+    !!picked && srcT.nodes.has(picked.id) && !rT.nodes.has(picked.id));
+
+  console.log(`[sim] рендишн-деревья: ${fails === 0 ? 'все проверки зелёные' : fails + ' FAIL'}`);
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });
