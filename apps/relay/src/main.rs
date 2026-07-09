@@ -143,6 +143,7 @@ async fn activate(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditions, st
         server_id,
         max_children: cfg.max_children,
         virtual_relay: true,
+        quality: "source".into(), // Д3: vrelay-ingest садится в source-дерево (`::source`)
         available_outgoing: cfg.available_outgoing,
         // Д1 ingest: постоянный узел не гаснет по простою — только по vrelay-release/stream-end
         // (уход вещателя). Э9 activate: гаснет по idle, агент переактивируется.
@@ -191,7 +192,11 @@ async fn rendition_start(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditi
         Err(e) => { log::warn!("rendition {key}: транскод не поднялся: {e}"); return; }
     };
     let root = relay::start_rendition_root(RelayConfig {
-        stream_id: key.clone(),
+        // Д3: составной ключ дерева формирует СЕРВЕР из base streamId + quality. Раньше (Д2) клеили
+        // `::rendition` в сам stream_id — теперь шлём базовый id и quality=rendition отдельно, сервер
+        // ставит корня в дерево `stream_id::rendition` (унифицировано с онлайн-зрителями рендишна).
+        stream_id: stream_id.to_string(),
+        quality: rendition.to_string(),
         ws_url: format!("{}?token={}", cfg.ws_url, mint_token(&cfg.session_secret)),
         identity: format!("vrelay-{rendition}"),
         server_id,

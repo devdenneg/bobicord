@@ -190,6 +190,7 @@ async fn start_watch(
   identity: String,
   server_id: String,
   max_children: Option<u32>,
+  quality: Option<String>,
 ) -> Result<(), String> {
   let mut slot = state.0.lock().await;
   if let Some(old) = slot.take() { old.stop(); }
@@ -203,6 +204,9 @@ async fn start_watch(
     stream_id, ws_url, identity, server_id,
     max_children: max_children.unwrap_or(4).clamp(0, 10),
     virtual_relay: false,
+    // Д3: рендишн, который смотрит зритель (`streamId::quality`). Дефолт "source" — старый
+    // JS-бандл без поля = source (обратная совместимость).
+    quality: quality.unwrap_or_else(|| "source".into()),
     available_outgoing: 8_000_000,
     idle_exit: None, // натив смотрит стрим сам — уходим только по Stop
     reconnect: true, // рестарт сервера (деплой) не рвёт просмотр

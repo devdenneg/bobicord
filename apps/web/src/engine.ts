@@ -951,7 +951,10 @@ export class Engine {
   /* ---------- streams (thin facades over VideoTransport) ---------- */
   getVideoTrack(key: string) { return this.liveKitT.getVideoTrack(key) ?? this.treeT.getVideoTrack(key); }
 
-  watch(identity: string) {
+  // Д3: quality пробрасывается в транспорт (выбор рендишн-дерева). Дефолт 'source' — UI-ключ
+  // остаётся базовым identity; смена качества (Д4) = closeWatch()+watch(identity, q). transportFor
+  // не меняется (пин по identity).
+  watch(identity: string, quality: string = 'source') {
     // Смотрим ТОЛЬКО ОДИН стрим одновременно: закрываем все прочие открытые/подключающиеся.
     // Это и требование продукта, и защита: grid верстается лишь под 1-2 плитки, а каждый tree-watch
     // держит свой PC/relay — множественный просмотр перегружал и путал teardown при остановке одного.
@@ -962,7 +965,7 @@ export class Engine {
     this.watching.add(identity); this.pendingWatch.add(identity);
     const t = this.transportFor(identity);
     this.watchT.set(identity, t); // пин: unwatch/статы пойдут в тот же транспорт, даже если объявление пропадёт
-    t.watch(identity);
+    t.watch(identity, quality);
     if (!localStorage.getItem('sprayTip')) { localStorage.setItem('sprayTip', '1'); this.hooks.toast('Кинь эмоут зрителям — 😃 в углу трансляции', 'info'); }
     this.emit();
     const timer = window.setTimeout(() => {

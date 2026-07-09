@@ -124,7 +124,8 @@ export class LiveKitVideoTransport implements VideoTransport {
   }
 
   /* ---------- watching (remote) ---------- */
-  watch(streamId: string) {
+  watch(streamId: string, _quality?: string) {
+    // Д3: quality игнорируется — LiveKit-путь идёт через SFU, деревьев/рендишнов нет.
     const p = this.byUser(streamId); if (!p) return;
     const v = p.getTrackPublication(Track.Source.ScreenShare), a = p.getTrackPublication(Track.Source.ScreenShareAudio);
     [v, a].forEach((pub) => { if (pub) { try { (pub as any).setSubscribed(true); } catch { /**/ } } });

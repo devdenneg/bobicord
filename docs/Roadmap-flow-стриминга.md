@@ -190,7 +190,7 @@
 
 ## Д3 — Деревья пер-качество: `streamId::rendition` (поведенчески нейтрально)
 
-**Статус:** ⬜ не начат
+**Статус:** 🟡 код готов, компиляция/симуляция/ad-hoc-тесты зелёные; живой e2e-смоук на VPS не проверен
 **Цель / механизмы ТЗ:** измерение «качество» в сигналинге и менеджере без смены пользовательского поведения (существует только `source`). «Обмен строго внутри одного качества» — структурно.
 
 **Работы:**
@@ -203,11 +203,59 @@
 **Риски:** рассинхрон версий при раскатке — сервер обязан принимать join без `quality`; проверить маршрутизацию `request-keyframe`/`stats` по составному ключу.
 
 ### Выполнено:
-- —
+- **`apps/server/tree.js`** — ключ `mgr.trees` → составной `streamId::rendition`. Хелперы
+  `treeKey(streamId, rendition='source')` / `parseTreeKey(key)` (lastIndexOf('::'), устойчив к
+  Д2-рендишн-корню с `::` в id) экспортированы для тестов. `RENDITIONS={source,1080,720,480,360}`
+  + `normRendition` (мусор/нет поля → `source`, обратная совместимость). `MAX_DEPTH` 4→5 (считается
+  внутри рендишн-дерева). Узел хранит `streamId` (базовый), `rendition`, `treeKey`. Все внутренние
+  функции (`requestVrelayActivation`, `ensureVirtualAttached`, `settleOrphans`, `broadcastTreeInfo`,
+  `broadcastTopology`, `applyReparent`, `onRequestVrelay`, `onRequestReparent`, `onRequestKeyframe`,
+  `onLeave`, `abrTimer`, `drainTimer`, `onVrelayHello`) работают по составному ключу; **клиентские
+  сообщения несут БАЗОВЫЙ streamId** (составной ключ в UI не течёт). Discovery (`onHello`/`stream-live`/
+  `stream-end`) агрегирует по базовому id и объявляется ТОЛЬКО для source-дерева (+ `renditions:['source']`
+  задел Д4). `liveBroadcastersIn` — только source-вещатели. `requestVrelayActivation` отказывает
+  не-source-дереву (vrelay-ingest — концепция source-дерева). Уход source-вещателя сносит все
+  рендишн-деревья `base::*` (`teardownRenditionTrees` + `vrelay-rendition-stop` агенту).
+- **`apps/web`** — `VideoTransport.watch(streamId, quality='source')` (интерфейс + Tree + LiveKit,
+  где quality игнорируется). `engine.watch(identity, quality='source')` пробрасывает. `TreeVideoTransport`:
+  `WatchState.quality`/`NativeWatchState.quality`, `sendWatchJoin` шлёт `quality`, re-watch на обрыве
+  сохраняет качество; `nativeWatch(streamId, quality)` → `startNativeWatch(...,quality)`. `StreamMeta.renditions`
+  (задел Д4) из `stream-live`. UI-ключ у зрителя остался базовым (`liveStreams`/`watches`/`nativeWatches`/`watchT`).
+- **Rust** — `JoinParams.quality: String` (сериализуется `quality`), `RelayConfig.quality`. `relay::start`
+  (viewer/vrelay) и `start_rendition_root` пробрасывают quality; `start_watch(..., quality: Option<String>)`
+  (дефолт `source`). Натив-вещатель (`broadcast/mod.rs`) и vrelay-ingest (`main.rs activate`) — `quality:"source"`.
+  **Д2-рендишн-корень унифицирован**: `main.rs rendition_start` шлёт БАЗОВЫЙ `stream_id` + `quality=rendition`
+  (раньше клеил `::rendition` в сам stream_id) — сервер сам ставит корня в дерево `stream_id::rendition`.
+- **`apps/server/tree-sim.js`** — под `MAX_DEPTH` (импорт из tree.js), join без quality = source (тест обр.
+  совместимости); зелёный, ключи в логах `sim-stream::source`.
+- **Верификация:** `node --check tree.js` OK; `node tree-sim.js` зелёный; `npm run typecheck` (web) EXIT 0;
+  `cargo check` relay-core / relay / native + `cargo check --examples` relay-core — все EXIT 0 (только
+  пре-существующие dead_code-warnings в native). **Ad-hoc обр. совместимости** (13/13 PASS): join БЕЗ поля
+  quality → дерево `::source`, parent=broadcaster; join `quality:'source'` → то же дерево; `quality:'720'`
+  → ОТДЕЛЬНОЕ дерево (структурная изоляция качеств); `assign-parent.streamId` = базовый (не составной);
+  хелперы treeKey/parseTreeKey round-trip. Cargo.lock натива откачен (пре-дрейф, синк в CI).
 ### Проблемы:
-- —
+- Локально Rust собирается (`cargo check` доступен) — компиляцию проверил, но живой медиапуть/e2e на VPS
+  не гонялся (нет вещателя/ffmpeg/сервера). Поведенческая нейтральность подтверждена структурно (ad-hoc) +
+  симулятором, но полный живой смоук (вещание, 2 зрителя, reparent, vrelay, ручные переключения) — на пользователе.
 ### Решения:
-- —
+- **Составной ключ — деталь сервера, наружу течёт только базовый streamId.** Клиенты (браузер/натив)
+  джойнятся базовым id + `quality`; во ВСЕХ серверных сообщениях (`assign-*`, `tree-info`, `tree-topology`,
+  `drop-peer`, `stream-*`, `set-bitrate`) поле `streamId` — базовое. Критично для натив-топологии
+  (`topoCb` сверяет `payload.streamId` с базовым id из watch) — иначе топология у нативного зрителя терялась.
+- **Discovery объявляет только source-деревья.** Рендишн-корень — тоже `role:broadcaster`, но своего
+  `base::rendition`-дерева; без гейта он породил бы дубль `stream-live` с мусорным identity (`vrelay-480`),
+  а его `stream-end` погасил бы у зрителей ЖИВОЙ source-стрим. Гейт по `rendition==='source'`.
+- **Keyframe пер-рендишн — структурно.** `onRequestKeyframe` шлёт корню ЭТОГО дерева: для source — нативному
+  вещателю (форсит IDR), для рендишн-дерева — рендишн-корню (ffmpeg игнорирует, держит GOP). Так PLI из
+  рендишна НЕ уходит нативному вещателю (нет IDR-шторма). Rate-limit `lastKfForwardAt` — на каждом дереве свой.
+- **Д2-рендишн-корень адаптирован под ключ, не сломан.** Раньше он клеил `::480` в stream_id и джойнился
+  в дерево-строку; теперь шлёт базовый id + quality=rendition, унифицировавшись с онлайн-зрителями рендишна
+  (общий хелпер формирования ключа — на сервере). Dev-триггер `dev-rendition` работает (гейт `TREE_DEV_RENDITION`),
+  `mgr.trees.get(treeKey(streamId,'source'))` для поиска source-дерева живого стрима.
+- **Уход source-вещателя гасит рендишн-деревья.** `teardownRenditionTrees(base)` сносит узлы `base::*` +
+  шлёт агенту `vrelay-rendition-stop` (дублирует агентову ingest-fin-очистку — belt-and-suspenders против
+  повисших рендишн-деревьев с зрителями).
 
 ---
 

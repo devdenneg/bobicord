@@ -91,7 +91,10 @@ export interface VideoTransport {
   isRemoteBroadcasting(identity: string): boolean;
   getScreenStats(streamId: string): Promise<string | null>;
 
-  watch(streamId: string): void;
+  /** Д3: `quality` выбирает рендишн-дерево (`streamId::quality`). Дефолт 'source' —
+   *  поведение неотличимо от «до». Смена качества = unwatch+watch (Д4 добавит UI). LiveKit
+   *  игнорирует quality (SFU-путь, деревьев нет). */
+  watch(streamId: string, quality?: string): void;
   unwatch(streamId: string): void;
 
   /** Только TreeVideoTransport (Э2.1) — позиция в дереве и живая RTP-статистика

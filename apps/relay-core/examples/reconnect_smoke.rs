@@ -17,6 +17,7 @@ async fn main() {
         server_id: "srv1".into(),
         max_children: 2,
         virtual_relay: false,
+        quality: "source".into(),
         available_outgoing: 8_000_000,
         idle_exit: None,
         reconnect: true,

@@ -17,10 +17,16 @@ interface NativeWatchState {
   pc: RTCPeerConnection | null; // локальный показ: webview answerer к Rust-offerer
   unlisten: Array<() => void>;
   closed: boolean;
+  quality: string;              // Д3: рендишн, который смотрим (дефолт 'source')
 }
 
 /** Метаданные приложения вещателя (окно): доходят в stream-live/бэклоге. */
-export interface StreamMeta { appName?: string; appIcon?: string }
+export interface StreamMeta {
+  appName?: string;
+  appIcon?: string;
+  /** Д3 (задел Д4): доступные рендишны стрима из stream-live. Пока всегда ['source']. */
+  renditions?: string[];
+}
 
 /**
  * P2P relay-tree implementation of VideoTransport (Roadmap-flow-стриминга Д0: browser is
@@ -51,6 +57,7 @@ interface WatchState {
   iceServers: RTCIceServer[];
   maxChildren: number;
   joined: boolean;                // join уже отправлен (шлём после welcome — см. sendWatchJoin)
+  quality: string;                // Д3: рендишн-дерево, в которое джойнимся (дефолт 'source')
 }
 
 
@@ -179,8 +186,9 @@ export class TreeVideoTransport implements VideoTransport {
       } else if (msg.t === 'stream-live') {
         announced.add(msg.identity);
         const fresh = !this.liveStreams.has(msg.identity);
-        // meta обновляем и для уже известного стрима — повторный announce после rejoin вещателя
-        this.liveStreams.set(msg.identity, { appName: msg.appName || undefined, appIcon: msg.appIcon || undefined });
+        // meta обновляем и для уже известного стрима — повторный announce после rejoin вещателя.
+        // Д3 (задел Д4): renditions[] сохраняем, пока не используем (UI-выбор качества — Д4).
+        this.liveStreams.set(msg.identity, { appName: msg.appName || undefined, appIcon: msg.appIcon || undefined, renditions: Array.isArray(msg.renditions) ? msg.renditions : undefined });
         if (fresh) this.streamStartCbs.forEach((cb) => cb(msg.identity, !!msg.initial));
       } else if (msg.t === 'stream-end') {
         // unwatch ДО удаления из liveStreams: engine.onStreamStop роутит unwatch через
@@ -210,16 +218,19 @@ export class TreeVideoTransport implements VideoTransport {
   async getScreenStats(_streamId: string): Promise<string | null> { return null; }
 
   /* ---------- watching (remote, leaf) ---------- */
-  watch(streamId: string) {
+  // Д3: UI-ключ у зрителя — базовый streamId; `quality` выбирает рендишн-дерево
+  // (`streamId::quality` на сервере). Дефолт 'source' → поведение как «до». Смена
+  // качества = unwatch()+watch() (Д4 добавит меню).
+  watch(streamId: string, quality: string = 'source') {
     if (this.watches.has(streamId) || this.nativeWatches.has(streamId)) return;
     // В Tauri видео/relay держит Rust (native passthrough): webview не джойнится в дерево
     // сам, а получает поток от локального Rust-пира через IPC (см. nativeWatch).
-    if (isTauri) { this.nativeWatch(streamId); return; }
+    if (isTauri) { this.nativeWatch(streamId, quality); return; }
     let ws: WebSocket;
     try { ws = new WebSocket(treeWsUrl()); } catch { return; }
     const st: WatchState = {
       ws, pc: null, parentId: null, closed: false, iceServers: this.iceServers,
-      maxChildren: 0, joined: false,
+      maxChildren: 0, joined: false, quality,
     };
     this.watches.set(streamId, st);
 
@@ -236,7 +247,7 @@ export class TreeVideoTransport implements VideoTransport {
       // сам заглохнет (guard). Не дублируем, если watch уже пересоздан.
       if (!this.closed && this.liveStreams.has(streamId)) {
         setTimeout(() => {
-          if (!this.closed && !this.watches.has(streamId) && !this.nativeWatches.has(streamId) && this.liveStreams.has(streamId)) this.watch(streamId);
+          if (!this.closed && !this.watches.has(streamId) && !this.nativeWatches.has(streamId) && this.liveStreams.has(streamId)) this.watch(streamId, st.quality);
         }, 3000);
       }
     };
@@ -245,14 +256,14 @@ export class TreeVideoTransport implements VideoTransport {
 
   // Отправка join после welcome (Roadmap Д0: браузер снова строго лист — maxChildren всегда 0,
   // никакого re-serve детям). symmetricNat/serverId остаются — сервер их применяет и для листьев
-  // (диагностика NAT, discovery по гильдии).
+  // (диагностика NAT, discovery по гильдии). Д3: quality выбирает рендишн-дерево (дефолт 'source').
   private async sendWatchJoin(streamId: string, st: WatchState) {
     if (st.joined || st.closed) return;
     st.joined = true;
     const symmetricNat = await this.natProbe.catch(() => false);
     if (st.closed) return;
     st.maxChildren = 0;
-    try { st.ws.send(JSON.stringify({ t: 'join', streamId, role: 'viewer', native: false, maxChildren: st.maxChildren, identity: this.me, symmetricNat, serverId: this.serverId })); } catch { /**/ }
+    try { st.ws.send(JSON.stringify({ t: 'join', streamId, quality: st.quality, role: 'viewer', native: false, maxChildren: st.maxChildren, identity: this.me, symmetricNat, serverId: this.serverId })); } catch { /**/ }
   }
 
   unwatch(streamId: string) {
@@ -429,8 +440,8 @@ export class TreeVideoTransport implements VideoTransport {
   }
 
   /* ---------- native watch (Tauri: Rust держит upstream+relay, webview рендерит) ---------- */
-  private async nativeWatch(streamId: string) {
-    const st: NativeWatchState = { pc: null, unlisten: [], closed: false };
+  private async nativeWatch(streamId: string, quality: string = 'source') {
+    const st: NativeWatchState = { pc: null, unlisten: [], closed: false, quality };
     this.nativeWatches.set(streamId, st);
     const offCb = (sid: string, sdp: string) => { if (sid === streamId && !st.closed) this.onNativeOffer(streamId, st, sdp); };
     const iceCb = (sid: string, candidate: any) => { if (sid === streamId && st.pc && candidate) st.pc.addIceCandidate(candidate).catch(() => {}); };
@@ -444,7 +455,7 @@ export class TreeVideoTransport implements VideoTransport {
       if (sid !== streamId || st.closed) return;
       this.unwatch(streamId);
       setTimeout(() => {
-        if (!this.closed && this.liveStreams.has(streamId) && !this.nativeWatches.has(streamId) && !this.watches.has(streamId)) this.watch(streamId);
+        if (!this.closed && this.liveStreams.has(streamId) && !this.nativeWatches.has(streamId) && !this.watches.has(streamId)) this.watch(streamId, st.quality);
       }, 1500);
     };
     try {
@@ -459,7 +470,7 @@ export class TreeVideoTransport implements VideoTransport {
     // start нового и снести уже его (гонка при переключении A→B). Первый watch: слот пуст, no-op.
     try {
       await stopNativeWatch().catch(() => {});
-      await startNativeWatch(streamId, this.me, this.serverId, NATIVE_RELAY_CAPACITY);
+      await startNativeWatch(streamId, this.me, this.serverId, NATIVE_RELAY_CAPACITY, st.quality);
       this.currentNativeWatch = streamId; // этот стрим теперь в Rust-слоте
     }
     catch { this.nativeUnwatch(streamId, st); }

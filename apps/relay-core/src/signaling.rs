@@ -57,6 +57,9 @@ pub struct JoinParams {
     /// Э9: серверный виртуальный fallback-relay. Сервер верит флагу только при
     /// JWT-uid 'virtual-relay' (tree.js) — обычные клиенты шлют false.
     pub virtual_relay: bool,
+    /// Д3: рендишн-дерево (`streamId::quality`). Дефолт "source" (вещатель и обычный зритель).
+    /// Нет поля → сервер трактует как "source" (обратная совместимость со старым бандлом).
+    pub quality: String,
     /// Д1 (server-first): вещатель сигналит серверу, что стрим идёт «через сервер»
     /// (стример → сервер → зрители). Шлёт ТОЛЬКО натив-вещатель; сервер включает
     /// server-first-режим лишь при своём TREE_SERVER_FIRST=1. relay-viewer/vrelay — false.
@@ -109,6 +112,7 @@ pub fn connect(ws_url: String, join: JoinParams, reconnect: bool) -> (mpsc::Unbo
             "maxBitrate": join.max_bitrate,
             "abr": join.abr,
             "virtual": join.virtual_relay,
+            "quality": join.quality,
             "serverIngest": join.server_ingest,
             "identity": join.identity,
             "serverId": join.server_id,

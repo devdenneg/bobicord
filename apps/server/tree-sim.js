@@ -7,7 +7,7 @@
 const http = require('http');
 const jwt = require('jsonwebtoken');
 const WebSocket = require('ws');
-const { attachTreeServer } = require('./tree');
+const { attachTreeServer, MAX_DEPTH } = require('./tree');
 
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-secret-change';
 const N = parseInt(process.argv[2], 10) || 20;
@@ -70,11 +70,11 @@ async function main() {
   await new Promise((r) => setTimeout(r, 500)); // дать дереву осесть
 
   const maxDepth = Math.max(...clients.map((c) => c.depth || 0));
-  console.log(`[sim] дерево построено: ${clients.length} узлов, глубина=${maxDepth} (лимит 4)`);
+  console.log(`[sim] дерево построено: ${clients.length} узлов, глубина=${maxDepth} (лимит ${MAX_DEPTH})`);
   console.log(`[sim] структура (id -> parentId):`);
   clients.forEach((c) => console.log(`  ${c.role.padEnd(10)} native=${String(c.native).padEnd(5)} id=${c.id} parent=${c.parentId || '(root)'}`));
 
-  if (maxDepth > 4) { console.error('[sim] FAIL: глубина превышает лимит 4'); process.exitCode = 1; }
+  if (maxDepth > MAX_DEPTH) { console.error(`[sim] FAIL: глубина превышает лимит ${MAX_DEPTH}`); process.exitCode = 1; }
 
   // убиваем случайный ВНУТРЕННИЙ узел (тот, у кого есть дети) и меряем reparent-тайминг
   const internal = viewers.find((v) => clients.some((c) => c.parentId === v.id));

@@ -59,6 +59,9 @@ pub struct RelayConfig {
     pub max_children: u32,
     /// Э9: серверный виртуальный fallback-relay (уходит в join как "virtual": true).
     pub virtual_relay: bool,
+    /// Д3: рендишн-дерево (`streamId::quality`). viewer/vrelay-ingest — "source"; рендишн-корень
+    /// (start_rendition_root) — имя рендишна ("480" и т.п.), тогда его дерево = `stream_id::quality`.
+    pub quality: String,
     /// Что репортить серверу как availableOutgoing в stats (скоринг best-peer).
     pub available_outgoing: u32,
     /// Some(d): выйти из дерева, если нет живых детей дольше d (headless-агент). Живость —
@@ -563,12 +566,12 @@ impl RelayManager {
 /// локальный показ (только при ui=Some), ретранслирует детям. Возвращает RelayHandle для
 /// управления (сигналинг webview из JS, стоп, ожидание завершения).
 pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
-    let RelayConfig { stream_id, ws_url, identity, server_id, max_children, virtual_relay, available_outgoing, idle_exit, reconnect } = cfg;
+    let RelayConfig { stream_id, ws_url, identity, server_id, max_children, virtual_relay, quality, available_outgoing, idle_exit, reconnect } = cfg;
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<RelayControl>();
     let finished = Arc::new(Notify::new());
     let fin = finished.clone();
 
-    let join = JoinParams { stream_id: stream_id.clone(), identity, server_id, role: "viewer", native: true, max_children, max_bitrate: 0, abr: false, virtual_relay, server_ingest: false, app_name: None, app_icon: None };
+    let join = JoinParams { stream_id: stream_id.clone(), identity, server_id, role: "viewer", native: true, max_children, max_bitrate: 0, abr: false, virtual_relay, quality, server_ingest: false, app_name: None, app_icon: None };
     let (cmd_tx, mut evt_rx) = signaling::connect(ws_url, join, reconnect);
 
     tokio::spawn(async move {
@@ -705,13 +708,14 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
 }
 
 /// Roadmap-flow-стриминга Д2 (dev-путь): рендишн-КОРЕНЬ — джойнится в дерево
-/// `streamId::rendition` как broadcaster (virtual:true) и фанаутит уже готовые треки
+/// `streamId::rendition` (Д3: base `stream_id` + `quality`=rendition, сервер клеит ключ)
+/// как broadcaster (virtual:true) и фанаутит уже готовые треки
 /// (транскод-видео + passthrough-audio источника) прямым зрителям. Медиа НЕ из upstream, а
 /// из ffmpeg ingest-сессии (треки переданы извне). Отдельный слим-цикл: у корня нет
 /// родителя/webview/ABR/watchdog — только фанаут детям. Полноценные рендишн-деревья с
 /// реестром/гашением — Д3/Д4; здесь минимум, чтобы глазами увидеть транскод-картинку.
 pub fn start_rendition_root(cfg: RelayConfig, video: Arc<TrackLocalStaticRTP>, audio: Arc<TrackLocalStaticRTP>) -> RelayHandle {
-    let RelayConfig { stream_id, ws_url, identity, server_id, max_children, virtual_relay, available_outgoing: _, idle_exit: _, reconnect } = cfg;
+    let RelayConfig { stream_id, ws_url, identity, server_id, max_children, virtual_relay, quality, available_outgoing: _, idle_exit: _, reconnect } = cfg;
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<RelayControl>();
     let finished = Arc::new(Notify::new());
     let fin = finished.clone();
@@ -723,7 +727,7 @@ pub fn start_rendition_root(cfg: RelayConfig, video: Arc<TrackLocalStaticRTP>, a
     // всей virtual-логики (ensureVirtualAttached/drainTimer/findVirtual). virtual_relay из cfg
     // игнорируем осознанно.
     let _ = virtual_relay;
-    let join = JoinParams { stream_id: stream_id.clone(), identity, server_id, role: "broadcaster", native: true, max_children, max_bitrate: 0, abr: false, virtual_relay: false, server_ingest: false, app_name: None, app_icon: None };
+    let join = JoinParams { stream_id: stream_id.clone(), identity, server_id, role: "broadcaster", native: true, max_children, max_bitrate: 0, abr: false, virtual_relay: false, quality, server_ingest: false, app_name: None, app_icon: None };
     let (cmd_tx, mut evt_rx) = signaling::connect(ws_url, join, reconnect);
 
     tokio::spawn(async move {

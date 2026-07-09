@@ -10,7 +10,9 @@ const jwt = require('jsonwebtoken');
 const { WebSocketServer } = require('ws');
 const { turnCredentials } = require('./turnCreds');
 
-const MAX_DEPTH = 4;          // инвариант CLAUDE.md: задержка видео <= 3с => глубина дерева <= 4
+const MAX_DEPTH = 5;          // Roadmap-flow-стриминга Д3: считается ВНУТРИ каждого рендишн-дерева
+                             // от его корня. Латентность держим не глубиной, а тем, что server-first
+                             // дефолт — глубина 1-2 (vrelay раздаёт прямым зрителям). Было 4 (Э8).
 const NATIVE_CAPACITY = 4;    // дефолт для нативного relay-узла, если join не прислал maxChildren
 const BROWSER_CAPACITY = 0;   // дефолт для браузера: лист (пока treeVideo не пришлёт maxChildren>0)
 const MAX_CHILDREN_CAP = 10;  // жёсткий потолок на объявленную ёмкость (защита от абьюза; = максимум слайдера в UI)
@@ -72,6 +74,24 @@ const SERVER_FIRST = process.env.TREE_SERVER_FIRST === '1';
 const DEV_RENDITION = process.env.TREE_DEV_RENDITION === '1';
 
 function newPeerId() { return 'p_' + crypto.randomBytes(6).toString('hex'); }
+
+// Roadmap-flow-стриминга Д3: ключ дерева = `streamId::rendition`. Деревья пер-качество —
+// «обмен строго внутри одного качества» получается структурно (pickParent/reparent живут
+// внутри одного Tree). Вещатель и дефолтный зритель — в `::source`; поведение неотличимо
+// от «до». Аллоулист рендишнов; мусор в join.quality трактуем как 'source' (обратная
+// совместимость: старый бандл без поля = source).
+const RENDITIONS = new Set(['source', '1080', '720', '480', '360']);
+const DEFAULT_RENDITION = 'source';
+function normRendition(q) { return typeof q === 'string' && RENDITIONS.has(q) ? q : DEFAULT_RENDITION; }
+function treeKey(streamId, rendition = DEFAULT_RENDITION) { return `${streamId}::${normRendition(rendition)}`; }
+// streamId = LiveKit identity вида `username#nonce` — `::` в нём нет (проверено допущение),
+// но Д2-рендишн-корень раньше клеил `::480` в сам streamId; lastIndexOf('::') устойчив и к
+// такому случаю (отрезает только последний сегмент-рендишн).
+function parseTreeKey(key) {
+  const i = key.lastIndexOf('::');
+  if (i < 0) return { streamId: key, rendition: DEFAULT_RENDITION };
+  return { streamId: key.slice(0, i), rendition: key.slice(i + 2) };
+}
 
 // Лог жизненного цикла дерева (join/leave/reparent/heartbeat/ABR/vrelay) в stdout →
 // docker compose logs token. Объём низкий (только события топологии, не stats/ice) —
@@ -466,23 +486,28 @@ function attachTreeServer(httpServer, opts) {
   }
 
   // Просит агента vrelay заджойниться в дерево. true = виртуал есть/активация уже в полёте/
-  // отправлена; false = агента нет (фолбэк недоступен).
-  function requestVrelayActivation(streamId) {
-    const t = mgr.trees.get(streamId);
+  // отправлена; false = агента нет (фолбэк недоступен). Аргумент — составной ключ дерева.
+  function requestVrelayActivation(key) {
+    // Д3: vrelay-ingest/activate — концепция ТОЛЬКО source-дерева (агент джойнится в `::source`
+    // с квалити source). Рендишн-деревья (Д4) поднимает сам агент через vrelay-rendition-*, а не
+    // активацией; активировать vrelay в них нельзя — он ушёл бы в чужое дерево `base::source`.
+    if (parseTreeKey(key).rendition !== DEFAULT_RENDITION) return false;
+    const t = mgr.trees.get(key);
     if (!t || !t.broadcasterId) return false;
     if (findVirtual(t)) return true;
     const now = Date.now();
     if (t.vrelayActivateAt && now - t.vrelayActivateAt < VRELAY_ACTIVATE_TIMEOUT_MS) return true;
     let agent = null;
     for (const p of peers.values()) if (p.isVrelayAgent && p.ws.readyState === p.ws.OPEN) { agent = p; break; }
-    if (!agent) { tlog(`[${streamId}] фолбэк нужен, но агент vrelay не подключён`); return false; }
+    if (!agent) { tlog(`[${key}] фолбэк нужен, но агент vrelay не подключён`); return false; }
     const bc = t.nodes.get(t.broadcasterId);
     t.vrelayActivateAt = now;
     // Д1: server-first-дереву нужен ПОСТОЯННЫЙ медиаузел — шлём vrelay-ingest (агент поднимает
     // сессию с idle_exit:None, reconnect:true). Legacy — прежний vrelay-activate (fallback с idle).
+    // streamId в сообщении — БАЗОВЫЙ id (агент джойнится в `::source` квалити по умолчанию).
     const msgType = t.serverFirst ? 'vrelay-ingest' : 'vrelay-activate';
-    tlog(`[${streamId}] ${msgType} -> агент ${agent.id}`);
-    send(agent.id, { t: msgType, streamId, serverId: bc ? bc.serverId : null });
+    tlog(`[${key}] ${msgType} -> агент ${agent.id}`);
+    send(agent.id, { t: msgType, streamId: bc ? bc.streamId : parseTreeKey(key).streamId, serverId: bc ? bc.serverId : null });
     return true;
   }
 
@@ -496,20 +521,21 @@ function attachTreeServer(httpServer, opts) {
   //     у зрителя свободен) → виртуал ПОТОМОК зрителя → его же «через сервер» = цикл, хаб потерян.
   // Отцепляем виртуала откуда бы он ни висел и сажаем прямо под корень; нет слота у корня —
   // выселяем одну не-виртуальную жертву-лист (её поддерево уедет под виртуала через settleOrphans).
-  function ensureVirtualAttached(streamId) {
-    const t = mgr.trees.get(streamId);
+  function ensureVirtualAttached(key) {
+    const t = mgr.trees.get(key);
     if (!t || !t.broadcasterId) return;
     const virt = findVirtual(t);
     if (!virt) return;
     const bc = t.nodes.get(t.broadcasterId);
     if (!bc) return;
     if (virt.parent === bc.id) return; // уже прямой ребёнок корня — ничего не делаем
+    const sid = parseTreeKey(key).streamId; // базовый id в клиентских сообщениях (не составной ключ)
 
     // (б) Виртуал зарыт под зрителя — отцепляем от текущего родителя (drop-peer старому родителю),
     // делаем сиротой, дальше общий путь усаживает под корень.
     if (virt.parent) {
       const op = t.nodes.get(virt.parent);
-      if (op) { op.children = op.children.filter((cid) => cid !== virt.id); send(op.id, { t: 'drop-peer', streamId, peerId: virt.id }); }
+      if (op) { op.children = op.children.filter((cid) => cid !== virt.id); send(op.id, { t: 'drop-peer', streamId: sid, peerId: virt.id }); }
       virt.parent = null; virt.depth = 0;
     }
 
@@ -524,65 +550,71 @@ function attachTreeServer(httpServer, opts) {
       }
       if (victimId == null) return; // у корня только виртуал/пусто — слота нет, выселять некого
       const victim = t.nodes.get(victimId);
-      tlog(`[${streamId}] виртуал ${virt.id} — у корня нет слота, выселяю жертву ${victimId} (${victim.identity})`);
+      tlog(`[${key}] виртуал ${virt.id} — у корня нет слота, выселяю жертву ${victimId} (${victim.identity})`);
       bc.children = bc.children.filter((cid) => cid !== victimId);
       victim.parent = null; victim.depth = 0;
-      send(t.broadcasterId, { t: 'drop-peer', streamId, peerId: victimId });
+      send(t.broadcasterId, { t: 'drop-peer', streamId: sid, peerId: victimId });
     }
 
     virt.parent = bc.id; virt.depth = 1; bc.children.push(virt.id);
     mgr.updateSubtreeDepth(t, virt.id);
-    send(virt.id, { t: 'assign-parent', streamId, parentId: bc.id });
-    send(bc.id, { t: 'assign-child', streamId, childId: virt.id });
-    tlog(`[${streamId}] виртуал ${virt.id} усажен прямым ребёнком корня (depth 1)`);
-    settleOrphans(streamId); // выселенная жертва и любые сироты сядут под виртуала (единственный слот)
+    send(virt.id, { t: 'assign-parent', streamId: sid, parentId: bc.id });
+    send(bc.id, { t: 'assign-child', streamId: sid, childId: virt.id });
+    tlog(`[${key}] виртуал ${virt.id} усажен прямым ребёнком корня (depth 1)`);
+    settleOrphans(key); // выселенная жертва и любые сироты сядут под виртуала (единственный слот)
     if (victimId) { const v = t.nodes.get(victimId); if (v && v.parent) mgr.updateSubtreeDepth(t, victimId); } // placeOrphans не пересчитывает глубины поддерева жертвы
-    broadcastTreeInfo(streamId);
-    broadcastTopology(streamId);
+    broadcastTreeInfo(key);
+    broadcastTopology(key);
   }
 
   // Размещает зависших сирот (см. mgr.placeOrphans) и рассылает им assign-parent, их новым
   // родителям — assign-child. Дёргается после каждого изменения топологии, где могла
   // появиться ёмкость (новый узел вошёл, кто-то ушёл/переехал).
-  function settleOrphans(streamId) {
-    const placed = mgr.placeOrphans(streamId);
+  function settleOrphans(key) {
+    const placed = mgr.placeOrphans(key);
+    const sid = parseTreeKey(key).streamId;
     const now = Date.now();
     for (const { node, parentId } of placed) {
       // Свежепосаженного под виртуала не дёргаем дренажом сразу (анти-болтанка).
-      const t = mgr.trees.get(streamId);
+      const t = mgr.trees.get(key);
       const parent = t && t.nodes.get(parentId);
       if (parent && parent.virtual) node.reparentCooldownUntil = now + DRAIN_COOLDOWN_MS;
-      tlog(`[${streamId}] сирота ${node.id} (${node.identity}) -> parent ${parentId}`);
-      send(node.id, { t: 'assign-parent', streamId, parentId });
-      send(parentId, { t: 'assign-child', streamId, childId: node.id });
+      tlog(`[${key}] сирота ${node.id} (${node.identity}) -> parent ${parentId}`);
+      send(node.id, { t: 'assign-parent', streamId: sid, parentId });
+      send(parentId, { t: 'assign-child', streamId: sid, childId: node.id });
     }
-    if (placed.length) { broadcastTreeInfo(streamId); broadcastTopology(streamId); }
+    if (placed.length) { broadcastTreeInfo(key); broadcastTopology(key); }
     // Э9: сироты остались (кандидатов нет вовсе) — будим виртуальный fallback-relay.
-    const t = mgr.trees.get(streamId);
+    // (requestVrelayActivation сам откажет не-source-дереву — рендишн-сироты просто ждут, Д4.)
+    const t = mgr.trees.get(key);
     if (t && t.broadcasterId && !findVirtual(t)) {
       for (const n of t.nodes.values()) {
-        if (n.id !== t.broadcasterId && !n.parent) { requestVrelayActivation(streamId); break; }
+        if (n.id !== t.broadcasterId && !n.parent) { requestVrelayActivation(key); break; }
       }
     }
   }
 
-  function broadcastTreeInfo(streamId) {
-    const info = mgr.info(streamId);
+  function broadcastTreeInfo(key) {
+    const info = mgr.info(key);
     if (!info) return;
+    const sid = parseTreeKey(key).streamId; // базовый id клиенту (не составной ключ — не течёт в UI)
     for (const [pid, p] of peers) {
-      if (p.streamId === streamId) {
-        send(pid, { t: 'tree-info', streamId, depth: info.depth, myDepth: p.depth, children: p.children.length, health: 'ok' });
+      if (p.treeKey === key) {
+        send(pid, { t: 'tree-info', streamId: sid, depth: info.depth, myDepth: p.depth, children: p.children.length, health: 'ok' });
       }
     }
   }
 
   // Э8: полная топология дерева — зритель видит, у кого берёт стрим, и может вручную
-  // выбрать другого пира (см. onRequestReparent). Шлём всем, кто на этом streamId.
-  function broadcastTopology(streamId) {
-    const nodes = mgr.topology(streamId);
+  // выбрать другого пира (см. onRequestReparent). Шлём всем узлам этого дерева (по составному
+  // ключу). streamId в сообщении — БАЗОВЫЙ: натив-топология фильтруется по payload.streamId,
+  // который зритель сверяет с базовым id, переданным в watch (treeVideo topoCb).
+  function broadcastTopology(key) {
+    const nodes = mgr.topology(key);
     if (!nodes) return;
+    const sid = parseTreeKey(key).streamId;
     for (const [pid, p] of peers) {
-      if (p.streamId === streamId) send(pid, { t: 'tree-topology', streamId, you: pid, nodes });
+      if (p.treeKey === key) send(pid, { t: 'tree-topology', streamId: sid, you: pid, nodes });
     }
   }
 
@@ -592,18 +624,29 @@ function attachTreeServer(httpServer, opts) {
     const node = peers.get(id);
     if (!node) return;
     node.serverId = msg.serverId || null;
-    for (const [sid, t] of mgr.trees) {
+    // Discovery агрегирует по БАЗОВОМУ streamId: объявляем только source-деревья (рендишн-деревья —
+    // деталь транспорта, свой broadcaster=рендишн-корень, в discovery не светятся). renditions[] —
+    // задел Д4 (пока всегда ['source']).
+    for (const [key, t] of mgr.trees) {
       if (!t.broadcasterId) continue;
+      if (parseTreeKey(key).rendition !== DEFAULT_RENDITION) continue;
       const bnode = t.nodes.get(t.broadcasterId);
-      if (bnode && bnode.serverId === node.serverId) send(id, { t: 'stream-live', streamId: sid, identity: bnode.identity, initial: true, appName: bnode.appName || null, appIcon: bnode.appIcon || null });
+      if (bnode && bnode.serverId === node.serverId) send(id, { t: 'stream-live', streamId: bnode.streamId, identity: bnode.identity, initial: true, renditions: ['source'], appName: bnode.appName || null, appIcon: bnode.appIcon || null });
     }
   }
 
   function onJoin(id, msg) {
     const { streamId, role, native, identity, symmetricNat, serverId, maxChildren, maxBitrate, abr } = msg;
     if (!streamId || (role !== 'broadcaster' && role !== 'viewer')) return;
+    // Д3: ключ дерева = `streamId::rendition`. Нет поля quality (старый бандл) → 'source'
+    // (обратная совместимость). Мусор в quality нормализуется в 'source' (normRendition).
+    // Базовый streamId уходит в клиентские сообщения/discovery; составной ключ — только для
+    // менеджера/маршрутизации внутри сервера (в UI не течёт).
+    const rendition = normRendition(msg.quality);
+    const key = treeKey(streamId, rendition);
     const node = peers.get(id);
-    node.streamId = streamId; node.role = role; node.native = !!native; node.identity = identity || id;
+    node.streamId = streamId; node.rendition = rendition; node.treeKey = key;
+    node.role = role; node.native = !!native; node.identity = identity || id;
     node.symmetricNat = !!symmetricNat;
     node.serverId = serverId || node.serverId || null;
     node.maxChildren = typeof maxChildren === 'number' ? maxChildren : undefined;
@@ -614,7 +657,7 @@ function attachTreeServer(httpServer, opts) {
     // legacy даже при TREE_SERVER_FIRST=1.
     node.serverIngest = !!msg.serverIngest;
     if (SERVER_FIRST && node.serverIngest && role === 'broadcaster') {
-      const tj = mgr.tree(streamId);
+      const tj = mgr.tree(key);
       tj.serverFirst = true;
       if (node.maxChildren === undefined) node.maxChildren = 1;
     }
@@ -629,8 +672,8 @@ function attachTreeServer(httpServer, opts) {
     node.virtual = !!msg.virtual && node.ws.__uid === VRELAY_UID;
     node.vrelayPinned = false;
     node.parent = null; node.children = []; node.depth = 0;
-    const { parent } = mgr.join(streamId, node);
-    tlog(`[${streamId}] join ${id} ${role} identity=${node.identity} native=${node.native}${node.virtual ? ' VIRTUAL' : ''} cap=${mgr.capacityOf(node)} symNat=${node.symmetricNat} -> ${role === 'broadcaster' ? 'корень' : parent ? `parent ${parent.id} (depth ${node.depth})` : 'СИРОТА (нет кандидатов)'}`);
+    const { parent } = mgr.join(key, node);
+    tlog(`[${key}] join ${id} ${role} identity=${node.identity} native=${node.native}${node.virtual ? ' VIRTUAL' : ''} cap=${mgr.capacityOf(node)} symNat=${node.symmetricNat} -> ${role === 'broadcaster' ? 'корень' : parent ? `parent ${parent.id} (depth ${node.depth})` : 'СИРОТА (нет кандидатов)'}`);
     if (parent) {
       if (parent.virtual) node.reparentCooldownUntil = Date.now() + DRAIN_COOLDOWN_MS;
       send(id, { t: 'assign-parent', streamId, parentId: parent.id });
@@ -638,30 +681,31 @@ function attachTreeServer(httpServer, opts) {
     } else {
       send(id, { t: 'assign-parent', streamId, parentId: null });
     }
-    broadcastTreeInfo(streamId);
-    broadcastTopology(streamId);
+    broadcastTreeInfo(key);
+    broadcastTopology(key);
     // Новый узел мог дать ёмкость (relay-способный зритель) или это вернувшийся вещатель —
     // размещаем зависших сирот. Для вещателя это подхватывает зрителей, ждавших стрим.
-    settleOrphans(streamId);
+    settleOrphans(key);
     // Д1 server-first: вещатель вошёл — сразу поднимаем постоянный vrelay-ingest медиаузел,
     // НЕ дожидаясь сирот (в legacy vrelay будится только при отсутствии живых кандидатов).
-    // requestVrelayActivation сам выберет тип сообщения (vrelay-ingest для serverFirst).
+    // requestVrelayActivation сам выберет тип сообщения (vrelay-ingest для serverFirst) и
+    // откажет не-source-дереву (рендишн-корень server-first не помечается).
     {
-      const t = mgr.trees.get(streamId);
+      const t = mgr.trees.get(key);
       if (role === 'broadcaster' && t && t.serverFirst) {
-        tlog(`[${streamId}] server-first: поднимаю постоянный vrelay-ingest`);
-        requestVrelayActivation(streamId);
+        tlog(`[${key}] server-first: поднимаю постоянный vrelay-ingest`);
+        requestVrelayActivation(key);
       }
     }
     // Э9: виртуал вошёл — активация состоялась; выполняем отложенные ручные запросы
     // «через сервер» (зрители, попросившие vrelay до его джойна).
     if (node.virtual) {
-      const t = mgr.trees.get(streamId);
+      const t = mgr.trees.get(key);
       if (t) {
         t.vrelayActivateAt = 0;
         // Д1: в server-first виртуал — постоянный pinned узел (дренаж его не трогает).
         if (t.serverFirst) node.vrelayPinned = true;
-        ensureVirtualAttached(streamId); // дерево могло быть забито — выселяем жертву из-под корня
+        ensureVirtualAttached(key); // дерево могло быть забито — выселяем жертву из-под корня
         if (t.vrelayPending && t.vrelayPending.size) {
           const now = Date.now();
           const attached = mgr.attachedToRoot(t, node);
@@ -670,14 +714,19 @@ function attachTreeServer(httpServer, opts) {
             if (!pn) continue;
             if (!attached) { send(pid, { t: 'reparent-denied', streamId, reason: 'no-vrelay' }); continue; }
             if (pn.parent === id) { pn.vrelayPinned = true; continue; }
-            const res = mgr.reparent(streamId, pid, id, now);
-            if (res.ok) { pn.vrelayPinned = true; applyReparent(streamId, pid, res); }
+            const res = mgr.reparent(key, pid, id, now);
+            if (res.ok) { pn.vrelayPinned = true; applyReparent(key, pid, res); }
           }
           t.vrelayPending.clear();
         }
       }
     }
-    if (role === 'broadcaster') broadcastToServer(node.serverId, { t: 'stream-live', streamId, identity: node.identity, initial: false, appName: node.appName || null, appIcon: node.appIcon || null });
+    // Discovery объявляет базовый streamId и ТОЛЬКО для source-дерева (рендишн-корень —
+    // тоже role:broadcaster, но своего base::rendition-дерева, в discovery не светится:
+    // иначе дубль/мусор с identity вида `vrelay-480`). renditions[] — задел Д4.
+    if (role === 'broadcaster' && rendition === DEFAULT_RENDITION) {
+      broadcastToServer(node.serverId, { t: 'stream-live', streamId, identity: node.identity, initial: false, renditions: ['source'], appName: node.appName || null, appIcon: node.appIcon || null });
+    }
   }
 
   function onSignal(id, msg) {
@@ -709,14 +758,15 @@ function attachTreeServer(httpServer, opts) {
 
   // Рассылка успешной миграции (общая для ручного/авто reparent, дренажа и vrelay-путей):
   // старому родителю drop-peer, узлу assign-parent, новому родителю assign-child.
-  function applyReparent(streamId, nodeId, res) {
-    tlog(`[${streamId}] reparent ${nodeId}: ${res.oldParentId || '-'} -> ${res.newParentId}`);
-    if (res.oldParentId) send(res.oldParentId, { t: 'drop-peer', streamId, peerId: nodeId });
-    send(nodeId, { t: 'assign-parent', streamId, parentId: res.newParentId });
-    if (res.newParentId) send(res.newParentId, { t: 'assign-child', streamId, childId: nodeId });
-    broadcastTreeInfo(streamId);
-    broadcastTopology(streamId);
-    settleOrphans(streamId); // миграция могла освободить слот — подхватываем сирот
+  function applyReparent(key, nodeId, res) {
+    const sid = parseTreeKey(key).streamId;
+    tlog(`[${key}] reparent ${nodeId}: ${res.oldParentId || '-'} -> ${res.newParentId}`);
+    if (res.oldParentId) send(res.oldParentId, { t: 'drop-peer', streamId: sid, peerId: nodeId });
+    send(nodeId, { t: 'assign-parent', streamId: sid, parentId: res.newParentId });
+    if (res.newParentId) send(res.newParentId, { t: 'assign-child', streamId: sid, childId: nodeId });
+    broadcastTreeInfo(key);
+    broadcastTopology(key);
+    settleOrphans(key); // миграция могла освободить слот — подхватываем сирот
   }
 
   // Э9: зритель явно попросил «смотреть через сервер» (targetParentId='vrelay'). Виртуал
@@ -725,24 +775,25 @@ function attachTreeServer(httpServer, opts) {
   // не уводим обратно, пока сам не мигрирует.
   function onRequestVrelay(id) {
     const p = peers.get(id);
-    if (!p || !p.streamId) return;
-    const t = mgr.trees.get(p.streamId);
+    if (!p || !p.treeKey) return;
+    const key = p.treeKey;
+    const t = mgr.trees.get(key);
     if (!t || !t.broadcasterId) return;
     let virt = findVirtual(t);
     const now = Date.now();
     // Всегда усаживаем виртуала прямым ребёнком корня перед reparent: он мог быть сиротой (забитое
     // дерево) ИЛИ зарыт под самого запросившего (тогда attachedToRoot=true, но reparent на него дал
     // бы цикл). ensureVirtualAttached идемпотентен — если виртуал уже под корнем, ничего не делает.
-    if (virt) { ensureVirtualAttached(p.streamId); virt = findVirtual(t); }
+    if (virt) { ensureVirtualAttached(key); virt = findVirtual(t); }
     if (virt && mgr.attachedToRoot(t, virt)) {
       if (p.parent === virt.id) { p.vrelayPinned = true; return; }
-      const res = mgr.reparent(p.streamId, id, virt.id, now);
+      const res = mgr.reparent(key, id, virt.id, now);
       if (!res.ok) { send(id, { t: 'reparent-denied', streamId: p.streamId, reason: res.reason }); return; }
       p.vrelayPinned = true;
-      applyReparent(p.streamId, id, res);
+      applyReparent(key, id, res);
       return;
     }
-    if (!requestVrelayActivation(p.streamId)) {
+    if (!requestVrelayActivation(key)) {
       send(id, { t: 'reparent-denied', streamId: p.streamId, reason: 'no-vrelay' });
       return;
     }
@@ -755,10 +806,11 @@ function attachTreeServer(httpServer, opts) {
   // Э9: targetParentId='vrelay' — запрос «через сервер» (см. onRequestVrelay).
   function onRequestReparent(id, msg) {
     const p = peers.get(id);
-    if (!p || !p.streamId) return;
+    if (!p || !p.treeKey) return;
     if (msg.targetParentId === VRELAY_TARGET) return onRequestVrelay(id);
+    const key = p.treeKey;
     const now = Date.now();
-    const res = mgr.reparent(p.streamId, id, msg.targetParentId || null, now);
+    const res = mgr.reparent(key, id, msg.targetParentId || null, now);
     if (!res.ok) {
       // Реаттач к тому же родителю. Кейс «корень + единственный зритель»: pickParent
       // исключает текущего родителя, других кандидатов нет → no-candidate, и зритель с
@@ -767,26 +819,26 @@ function attachTreeServer(httpServer, opts) {
       // PC = фактический ICE-restart (мы answerer, restart_ice сами инициировать не можем).
       // Топология не меняется. Cooldown как у обычной миграции — против спама.
       if (!msg.targetParentId && res.reason === 'no-candidate' && p.parent) {
-        const t = mgr.trees.get(p.streamId);
+        const t = mgr.trees.get(key);
         const parent = t && t.nodes.get(p.parent);
         if (parent && (!p.reparentCooldownUntil || now >= p.reparentCooldownUntil)) {
           p.reparentCooldownUntil = now + REPARENT_COOLDOWN_MS;
-          tlog(`[${p.streamId}] reattach ${id} (${p.identity}) к тому же родителю ${p.parent} (ICE-restart, no-candidate)`);
+          tlog(`[${key}] reattach ${id} (${p.identity}) к тому же родителю ${p.parent} (ICE-restart, no-candidate)`);
           send(p.parent, { t: 'drop-peer', streamId: p.streamId, peerId: id });      // родитель закрывает старый child-PC
           send(id, { t: 'assign-parent', streamId: p.streamId, parentId: p.parent }); // узел сбрасывает upstream, ждёт offer
           send(p.parent, { t: 'assign-child', streamId: p.streamId, childId: id });   // родитель поднимает свежий PC + offer
           return;
         }
       }
-      tlog(`[${p.streamId}] reparent-denied ${id} (${p.identity}) target=${msg.targetParentId || 'auto'} reason=${res.reason}`);
+      tlog(`[${key}] reparent-denied ${id} (${p.identity}) target=${msg.targetParentId || 'auto'} reason=${res.reason}`);
       send(id, { t: 'reparent-denied', streamId: p.streamId, reason: res.reason }); return;
     }
     // Pin «через сервер» живёт, пока зритель сам не мигрировал; ручной выбор виртуала
     // по его peer-id из панели дерева — тоже осознанный выбор, пиним.
-    const t = mgr.trees.get(p.streamId);
+    const t = mgr.trees.get(key);
     const newParent = t && t.nodes.get(res.newParentId);
     p.vrelayPinned = !!(newParent && newParent.virtual && msg.targetParentId);
-    applyReparent(p.streamId, id, res);
+    applyReparent(key, id, res);
   }
 
   // Э9: control-сокет агента vrelay представился. Гейт по JWT-uid — как у флага virtual
@@ -798,11 +850,11 @@ function attachTreeServer(httpServer, opts) {
     p.vrelayCapacity = typeof msg.capacity === 'number' ? msg.capacity : 8;
     tlog(`агент vrelay подключён: ${id} capacity=${p.vrelayCapacity}`);
     // Агент (пере)подключился — деревья могли ждать фолбэк (сироты/ручные запросы).
-    for (const [sid, t] of mgr.trees) {
+    for (const [key, t] of mgr.trees) {
       if (!t.broadcasterId || findVirtual(t)) continue;
       let needs = !!(t.vrelayPending && t.vrelayPending.size);
       if (!needs) for (const n of t.nodes.values()) { if (n.id !== t.broadcasterId && !n.parent) { needs = true; break; } }
-      if (needs) requestVrelayActivation(sid);
+      if (needs) requestVrelayActivation(key); // сам откажет не-source-дереву
     }
   }
 
@@ -810,12 +862,13 @@ function attachTreeServer(httpServer, opts) {
   // нового ребёнка просит keyframe у корня. Релеим прямо вещателю (он форсит IDR глобально).
   function onRequestKeyframe(id) {
     const p = peers.get(id);
-    if (!p || !p.streamId) return;
-    const t = mgr.trees.get(p.streamId);
+    if (!p || !p.treeKey) return;
+    const t = mgr.trees.get(p.treeKey);
     if (!t || !t.broadcasterId) return;
-    // Rate-limit на дерево: relay-узлы лимитируют себя по 1с каждый, но N узлов дают
-    // до N IDR/с корню (у него на этом пути лимита нет) — IDR-шторм пробивает слабые
-    // линки, порождая новые PLI (спираль). Корень и так держит GOP 4с как страховку.
+    // Д3: корень дерева = broadcaster ЭТОГО дерева. Для source-дерева — нативный вещатель
+    // (форсит IDR). Для рендишн-дерева корень = рендишн-корень (vrelay/ffmpeg), который
+    // request-keyframe игнорирует (держит свой GOP) — так PLI из рендишна НЕ уходит нативному
+    // вещателю (нет IDR-шторма через деревья). Rate-limit lastKfForwardAt — на КАЖДОМ дереве свой.
     const now = Date.now();
     if (t.lastKfForwardAt && now - t.lastKfForwardAt < KF_FORWARD_MIN_MS) return;
     t.lastKfForwardAt = now;
@@ -833,46 +886,76 @@ function attachTreeServer(httpServer, opts) {
     let agent = null;
     for (const p of peers.values()) if (p.isVrelayAgent && p.ws.readyState === p.ws.OPEN) { agent = p; break; }
     if (!agent) { tlog(`[${streamId}] DEV-rendition: агент vrelay не подключён`); return; }
-    const t = mgr.trees.get(streamId);
+    // Д3: source-дерево живого стрима под составным ключом. Агент поднимет рендишн-корень в
+    // дереве `streamId::rendition` (он джойнится base+quality=rendition — см. relay.rs).
+    const t = mgr.trees.get(treeKey(streamId, DEFAULT_RENDITION));
     const bc = t && t.broadcasterId ? t.nodes.get(t.broadcasterId) : null;
     const type = msg.stop ? 'vrelay-rendition-stop' : 'vrelay-rendition-start';
     tlog(`[${streamId}] DEV-rendition ${type} rendition=${rendition} -> агент ${agent.id}`);
     send(agent.id, { t: type, streamId, rendition, presetBitrate: Number(msg.presetBitrate) || 0, serverId: bc ? bc.serverId : (msg.serverId || null) });
   }
 
+  // Д3: уход source-вещателя = смерть ВСЕХ рендишн-деревьев этого стрима (`base::*`, кроме
+  // `::source`). Иначе они повиснут (их корни-рендишн — отдельные узлы, drop-peer сами не
+  // получат от source-коллапса). Сносим узлы + просим агента погасить транскод-рендишны.
+  function teardownRenditionTrees(baseSid, serverId) {
+    let agent = null;
+    for (const ap of peers.values()) if (ap.isVrelayAgent && ap.ws.readyState === ap.ws.OPEN) { agent = ap; break; }
+    for (const [key, t] of [...mgr.trees]) {
+      const { streamId: base, rendition } = parseTreeKey(key);
+      if (base !== baseSid || rendition === DEFAULT_RENDITION) continue;
+      for (const nid of [...t.nodes.keys()]) {
+        send(nid, { t: 'drop-peer', streamId: baseSid, peerId: nid });
+        send(nid, { t: 'stream-end', streamId: baseSid, identity: base });
+      }
+      t.nodes.clear(); t.broadcasterId = null;
+      mgr.trees.delete(key);
+      if (agent) send(agent.id, { t: 'vrelay-rendition-stop', streamId: baseSid, rendition });
+      tlog(`[${key}] снесён вслед за уходом source-вещателя ${baseSid}`);
+    }
+  }
+
   function onLeave(id, reason = 'leave') {
     const p = peers.get(id);
-    if (!p || !p.streamId) { peers.delete(id); return; }
+    if (!p || !p.treeKey) { peers.delete(id); return; }
     peers.delete(id);
-    tlog(`[${p.streamId}] leave ${id} (${p.identity}${p.role === 'broadcaster' ? ', ВЕЩАТЕЛЬ' : ''}${p.virtual ? ', VIRTUAL' : ''}) причина: ${reason}; детей: ${p.children.length}`);
+    const key = p.treeKey;
+    const sid = p.streamId; // базовый id в клиентских сообщениях (не составной ключ)
+    tlog(`[${key}] leave ${id} (${p.identity}${p.role === 'broadcaster' ? ', ВЕЩАТЕЛЬ' : ''}${p.virtual ? ', VIRTUAL' : ''}) причина: ${reason}; детей: ${p.children.length}`);
     const oldParentId = p.parent;
-    const pendingTree = mgr.trees.get(p.streamId);
+    const pendingTree = mgr.trees.get(key);
     if (pendingTree && pendingTree.vrelayPending) pendingTree.vrelayPending.delete(id); // Э9: ушедший не ждёт vrelay
-    const { reparented, dropped, broadcasterLost } = mgr.leave(p.streamId, id);
+    const { reparented, dropped, broadcasterLost } = mgr.leave(key, id);
     if (broadcasterLost) {
-      tlog(`[${p.streamId}] дерево обрушено (ушёл вещатель), зрителей сброшено: ${dropped.length}`);
+      tlog(`[${key}] дерево обрушено (ушёл вещатель), зрителей сброшено: ${dropped.length}`);
       dropped.forEach((peerId) => {
-        send(peerId, { t: 'drop-peer', streamId: p.streamId, peerId: id });
+        send(peerId, { t: 'drop-peer', streamId: sid, peerId: id });
         // Конец вещания — терминальный сигнал и в watch-сокет: drop-peer ловят только
         // зрители глубины 1 (у остальных parentId — id relay-узла, не вещателя), а
         // discovery-stream-end зритель мог пропустить (окно реконнекта).
-        send(peerId, { t: 'stream-end', streamId: p.streamId, identity: p.identity });
+        send(peerId, { t: 'stream-end', streamId: sid, identity: p.identity });
         // Э9: виртуалу при обрушении дерева нужен явный release — drop-peer по каждому его
         // ребёнку сервер не шлёт, и без release он ждал бы своего idle-таймаута впустую.
         const dp = peers.get(peerId);
-        if (dp && dp.virtual) send(peerId, { t: 'vrelay-release', streamId: p.streamId });
+        if (dp && dp.virtual) send(peerId, { t: 'vrelay-release', streamId: sid });
       });
-      broadcastToServer(p.serverId, { t: 'stream-end', streamId: p.streamId, identity: p.identity });
+      // Discovery-конец объявляем только для source-дерева (рендишн-корень в discovery не
+      // светился — его stream-end погасил бы у зрителей ЖИВОЙ source-стрим). Заодно сносим
+      // рендишн-деревья этого стрима.
+      if (p.rendition === DEFAULT_RENDITION) {
+        broadcastToServer(p.serverId, { t: 'stream-end', streamId: sid, identity: p.identity });
+        teardownRenditionTrees(sid, p.serverId);
+      }
       return;
     }
-    if (oldParentId) send(oldParentId, { t: 'drop-peer', streamId: p.streamId, peerId: id });
+    if (oldParentId) send(oldParentId, { t: 'drop-peer', streamId: sid, peerId: id });
     reparented.forEach((child) => {
-      send(child.id, { t: 'assign-parent', streamId: p.streamId, parentId: child.parent });
-      if (child.parent) send(child.parent, { t: 'assign-child', streamId: p.streamId, childId: child.id });
+      send(child.id, { t: 'assign-parent', streamId: sid, parentId: child.parent });
+      if (child.parent) send(child.parent, { t: 'assign-child', streamId: sid, childId: child.id });
     });
-    broadcastTreeInfo(p.streamId);
-    broadcastTopology(p.streamId);
-    settleOrphans(p.streamId); // ушедший освободил ёмкость — подхватываем сирот
+    broadcastTreeInfo(key);
+    broadcastTopology(key);
+    settleOrphans(key); // ушедший освободил ёмкость — подхватываем сирот
   }
 
   wss.on('connection', (ws) => {
@@ -883,7 +966,7 @@ function attachTreeServer(httpServer, opts) {
     ws.isAlive = true;
     ws.on('pong', () => { ws.isAlive = true; });
     peers.set(id, {
-      id, ws, streamId: null, role: null, native: false, identity: id, serverId: null,
+      id, ws, streamId: null, treeKey: null, rendition: null, role: null, native: false, identity: id, serverId: null,
       parent: null, children: [], depth: 0,
       maxChildren: undefined, maxBitrate: 0, abr: false, availableOutgoing: 0, linkRtt: 0, linkLoss: 0, reparentCooldownUntil: 0,
     });
@@ -907,11 +990,15 @@ function attachTreeServer(httpServer, opts) {
 
   // Э8 ABR: раз в тик пересчитываем целевой битрейт каждого дерева и шлём корню, если сменился.
   const abrTimer = setInterval(() => {
-    for (const streamId of mgr.trees.keys()) {
-      const cmd = mgr.abrTick(streamId);
+    for (const key of mgr.trees.keys()) {
+      // Д3: ABR/set-bitrate — только для source-дерева. Рендишн-корень = ffmpeg с фикс. GOP/CBR,
+      // set-bitrate ему бессмыслен (abrTick и так вернёт null: у рендишн-корня abr:false). Гейт
+      // для явности и на случай будущих рендишн-корней с abr.
+      if (parseTreeKey(key).rendition !== DEFAULT_RENDITION) continue;
+      const cmd = mgr.abrTick(key);
       if (cmd) {
-        tlog(`[${streamId}] ABR -> ${Math.round(cmd.bitrate / 1000)} kbps (worst loss=${(cmd.worstLoss * 100).toFixed(1)}% rtt=${Math.round(cmd.worstRtt)}ms)`);
-        send(cmd.broadcasterId, { t: 'set-bitrate', streamId, bps: cmd.bitrate });
+        tlog(`[${key}] ABR -> ${Math.round(cmd.bitrate / 1000)} kbps (worst loss=${(cmd.worstLoss * 100).toFixed(1)}% rtt=${Math.round(cmd.worstRtt)}ms)`);
+        send(cmd.broadcasterId, { t: 'set-bitrate', streamId: parseTreeKey(key).streamId, bps: cmd.bitrate });
       }
     }
   }, ABR_TICK_MS);
@@ -926,21 +1013,22 @@ function attachTreeServer(httpServer, opts) {
   // занял единственный слот корня, пришедшему нативу некуда сесть, виртуал не пустеет».
   const drainTimer = setInterval(() => {
     const now = Date.now();
-    for (const [streamId, t] of mgr.trees) {
+    for (const [key, t] of mgr.trees) {
       // Д1: в server-first vrelay — постоянный медиаузел, не дренируется и не выселяется
       // (дренаж/idle-exit только для legacy-фолбэка). Пропускаем такое дерево целиком.
       if (t.serverFirst) continue;
       const virt = findVirtual(t);
       if (!virt || !virt.children.length) continue;
+      const sid = parseTreeKey(key).streamId;
       let moved = false;
       for (const cid of [...virt.children]) {
         const child = t.nodes.get(cid);
         if (!child || child.vrelayPinned) continue;
         if (child.reparentCooldownUntil && now < child.reparentCooldownUntil) continue;
-        const res = mgr.reparent(streamId, cid, null, now);
+        const res = mgr.reparent(key, cid, null, now);
         if (res.ok) {
           child.reparentCooldownUntil = now + DRAIN_COOLDOWN_MS;
-          applyReparent(streamId, cid, res);
+          applyReparent(key, cid, res);
           moved = true;
           break;
         }
@@ -957,8 +1045,8 @@ function attachTreeServer(httpServer, opts) {
         free += Math.max(0, mgr.capacityOf(n) - used);
       }
       if (free >= virt.children.length) {
-        tlog(`[${streamId}] дренаж R2: живой ёмкости хватает (${free} >= ${virt.children.length}) — vrelay-release ${virt.id}`);
-        send(virt.id, { t: 'vrelay-release', streamId });
+        tlog(`[${key}] дренаж R2: живой ёмкости хватает (${free} >= ${virt.children.length}) — vrelay-release ${virt.id}`);
+        send(virt.id, { t: 'vrelay-release', streamId: sid });
       }
     }
   }, DRAIN_TICK_MS);
@@ -988,7 +1076,9 @@ function attachTreeServer(httpServer, opts) {
   function liveBroadcastersIn(serverId) {
     const out = new Set();
     for (const p of peers.values()) {
-      if (p.role === 'broadcaster' && p.serverId === serverId && p.identity) out.add(String(p.identity).split('#')[0]);
+      // Д3: только source-вещатели (рендишн-корни — тоже role:broadcaster, но их identity
+      // вида `vrelay-480` в превью не место). Дедуп по базовому username — на стрим один source.
+      if (p.role === 'broadcaster' && p.rendition === DEFAULT_RENDITION && p.serverId === serverId && p.identity) out.add(String(p.identity).split('#')[0]);
     }
     return out;
   }
@@ -996,4 +1086,4 @@ function attachTreeServer(httpServer, opts) {
   return { mgr, peers, wss, abrTimer, hbTimer, drainTimer, liveBroadcastersIn };
 }
 
-module.exports = { attachTreeServer, TreeManager, MAX_DEPTH, NATIVE_CAPACITY, BROWSER_CAPACITY };
+module.exports = { attachTreeServer, TreeManager, MAX_DEPTH, NATIVE_CAPACITY, BROWSER_CAPACITY, treeKey, parseTreeKey };
