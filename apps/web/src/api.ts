@@ -15,7 +15,7 @@ export function setToken(t: string | null) {
 // (Caddy), поэтому база пустая. Явный VITE_API_BASE_URL переопределяет оба случая.
 // Тот же приём, что и treeWsUrl() в native.ts для ws-дерева.
 const IS_TAURI = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
-const PROD_API = 'https://138-16-170-21.sslip.io';
+const PROD_API = 'https://reelay.online'; // прод-бэкенд для НАТИВНОЙ сборки (веб — относит. пути); легаси sslip.io Caddy тоже отдаёт
 const API_BASE = (import.meta as any).env?.VITE_API_BASE_URL || (IS_TAURI ? PROD_API : '');
 
 // Сервер отдаёт относительные пути (`/api/uploads/<name>`, см. index.js) — в вебе это

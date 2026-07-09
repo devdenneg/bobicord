@@ -1,5 +1,7 @@
-# замени домен на свой (или IP.sslip.io); запечён в web-образ
-138-16-170-21.sslip.io {
+# Основной домен reelay.online (+ www) и легаси 138-16-170-21.sslip.io (нативные клиенты со старым
+# запечённым URL продолжают работать); все три → один backend, Caddy берёт Let's Encrypt на каждый.
+# Запечён в web-образ.
+reelay.online, www.reelay.online, 138-16-170-21.sslip.io {
 	handle /rtc* {
 		reverse_proxy 127.0.0.1:7880
 	}

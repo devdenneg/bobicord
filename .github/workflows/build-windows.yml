@@ -75,8 +75,8 @@ jobs:
           # Абсолютные URL для натив-webview: location.host = tauri.localhost (bundle без
           # reverse-proxy), поэтому REST/WS дерева указываем на прод явно. Vite впекает
           # VITE_-префиксные из process.env в beforeBuildCommand-сборку веба.
-          VITE_TREE_WS_URL: wss://138-16-170-21.sslip.io/tree
-          VITE_API_BASE_URL: https://138-16-170-21.sslip.io
+          VITE_TREE_WS_URL: wss://reelay.online/tree
+          VITE_API_BASE_URL: https://reelay.online
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
@@ -94,7 +94,7 @@ jobs:
           cat > out/latest.json <<EOF
           { "version": "$v", "notes": "Автосборка main",
             "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "platforms": { "windows-x86_64": { "signature": "$sig", "url": "https://138-16-170-21.sslip.io/api/app/$(basename "$exe")" } } }
+            "platforms": { "windows-x86_64": { "signature": "$sig", "url": "https://reelay.online/api/app/$(basename "$exe")" } } }
           EOF
 
       # Payload (exe + latest.json) отдаём как артефакт — заливку на VPS делает

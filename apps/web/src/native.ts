@@ -98,7 +98,7 @@ function treeWsUrl(): string {
   const override = (import.meta as any).env?.VITE_TREE_WS_URL as string | undefined;
   // В нативе location.host = tauri://localhost (нет reverse-proxy) — тот же дефолт на
   // прод-сервер, что и API_BASE в api.ts (см. там). Явный VITE_TREE_WS_URL переопределяет.
-  const nativeDefault = isTauri ? 'wss://138-16-170-21.sslip.io/tree' : null;
+  const nativeDefault = isTauri ? 'wss://reelay.online/tree' : null;
   const base = override || nativeDefault || ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/tree');
   const token = getToken() || '';
   return base + (base.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);

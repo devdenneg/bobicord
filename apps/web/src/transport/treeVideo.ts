@@ -69,7 +69,7 @@ function treeWsUrl(): string {
   // В нативе location.host = tauri.localhost (bundle без reverse-proxy) — фолбэк на прод-сервер,
   // тот же, что nativeWsUrl в native.ts. Без него discovery/viewer-сокеты webview шли бы в
   // tauri.localhost → liveStreams пуст → активные стримы и LIVE-бейджи не видны в натив-приложении.
-  const nativeDefault = isTauri ? 'wss://138-16-170-21.sslip.io/tree' : null;
+  const nativeDefault = isTauri ? 'wss://reelay.online/tree' : null;
   const base = override || nativeDefault || ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/tree');
   const token = getToken() || '';
   return base + (base.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
