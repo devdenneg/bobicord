@@ -218,11 +218,13 @@ export class Engine {
       this.hooks.toast(msg, 'warn');
     });
     // Д4: рендишн недоступен (агент отказал / кап транскодов / апскейл) — тост + фолбэк на source.
+    // Д-фикс: возвращаем ЯВНО на 'source' (пин), а не 'auto': 'auto' = «сервер решает», и ABR мог
+    // бы снова попробовать недоступный рендишн (петля чёрного экрана). Пин на source детерминированен.
     this.treeT.onRenditionUnavailable?.((sid, rendition, reason) => {
       this.hooks.toast(reason === 'no-upscale'
         ? `Качество ${rendition}p недоступно (выше исходного)`
-        : `Качество ${rendition}p сейчас недоступно — вернул на исходное`, 'warn');
-      this.treeT.setQuality?.(sid, 'auto');
+        : `Качество ${rendition}p недоступно (сервер без транскода) — вернул на исходное`, 'warn');
+      this.treeT.setQuality?.(sid, 'source');
       this.emit();
     });
     this.snap = this.build();

@@ -79,7 +79,10 @@ async fn run_control(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditions)
     let url = format!("{}?token={}", cfg.ws_url, mint_token(&cfg.session_secret));
     let (ws, _) = tokio_tungstenite::connect_async(&url).await.map_err(|e| e.to_string())?;
     let (mut write, mut read) = ws.split();
-    let hello = json!({ "t": "vrelay-hello", "capacity": cfg.max_children });
+    // maxTranscodes — транскод-ёмкость агента (кап одновременных ffmpeg-рендишнов). Сервер по
+    // ней гейтит рендишн-лестницу: 0 (прод, 1 vCPU) → зрителям объявляется только исходное
+    // качество, меню не предлагает 720/480 (иначе выбор → сирота в дереве без корня → чёрный экран).
+    let hello = json!({ "t": "vrelay-hello", "capacity": cfg.max_children, "maxTranscodes": transcode::max_transcodes() });
     write.send(Message::Text(hello.to_string().into())).await.map_err(|e| e.to_string())?;
     log::info!("control: подключён к {} (ёмкость {})", cfg.ws_url, cfg.max_children);
 

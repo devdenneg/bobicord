@@ -813,9 +813,15 @@ function attachTreeServer(httpServer, opts) {
   }
 
   // Д4: доступная лестница рендишнов source-дерева (для stream-live.renditions[]).
+  // Д-фикс: транскод-рендишны существуют, ТОЛЬКО если подключён агент vrelay с ненулевой
+  // транскод-ёмкостью. Нет агента / maxTranscodes===0 (прод, 1 vCPU) → отдаём лишь ['source']:
+  // клиент не предложит 720/480, которые агент физически не поднимет (иначе сирота → чёрный экран).
   function renditionsOf(baseSid) {
     const srcTree = mgr.trees.get(treeKey(baseSid, DEFAULT_RENDITION));
-    return srcTree ? availableRungs(srcTree) : [DEFAULT_RENDITION];
+    if (!srcTree) return [DEFAULT_RENDITION];
+    const agent = findVrelayAgent();
+    if (!agent || !(agent.vrelayMaxTranscodes > 0)) return [DEFAULT_RENDITION];
+    return availableRungs(srcTree);
   }
 
   // Д4: ленивый старт рендишна. Первый потребитель непустой/несуществующей рендишн →
@@ -834,6 +840,10 @@ function attachTreeServer(httpServer, opts) {
     if (cur && cur.state !== RS_STOPPING) { cur.lastConsumerAt = now; return true; }
     const agent = findVrelayAgent();
     if (!agent) { tlog(`[rendition] ${baseSid}::${rendition} нужен, но агент vrelay не подключён`); return false; }
+    // Д-фикс: агент без транскод-ёмкости (VRELAY_MAX_TRANSCODES=0) отказывает СРАЗУ — не дёргаем
+    // его vrelay-rendition-start (он всё равно ответит failed), не переводим зрителя между
+    // деревьями. Второй эшелон: даже если клиент запросил рендишн по устаревшему меню.
+    if (!(agent.vrelayMaxTranscodes > 0)) { tlog(`[rendition] ${baseSid}::${rendition} нужен, но агент без транскод-ёмкости (maxTranscodes=0)`); return false; }
     const presetBitrate = preset || RENDITION_BITRATE[rendition] || 0;
     srcTree.renditions.set(rendition, { state: RS_STARTING, lastConsumerAt: now, presetBitrate });
     const bc = srcTree.nodes.get(srcTree.broadcasterId);
@@ -1359,13 +1369,32 @@ function attachTreeServer(httpServer, opts) {
     if (!p || p.ws.__uid !== VRELAY_UID) return;
     p.isVrelayAgent = true;
     p.vrelayCapacity = typeof msg.capacity === 'number' ? msg.capacity : 8;
-    tlog(`агент vrelay подключён: ${id} capacity=${p.vrelayCapacity}`);
+    // Д-фикс: транскод-ёмкость агента (кап одновременных ffmpeg). Старый агент без поля →
+    // консервативный дефолт 0: не объявляем зрителям рендишн-лестницу, которую агент не
+    // подтвердил, что умеет поднять (source всегда работает; ложное предложение 720/480 →
+    // сирота в дереве без корня → чёрный экран). На проде VRELAY_MAX_TRANSCODES=0 (1 vCPU).
+    p.vrelayMaxTranscodes = typeof msg.maxTranscodes === 'number' ? msg.maxTranscodes : 0;
+    tlog(`агент vrelay подключён: ${id} capacity=${p.vrelayCapacity} maxTranscodes=${p.vrelayMaxTranscodes}`);
     // Агент (пере)подключился — деревья могли ждать фолбэк (сироты/ручные запросы).
     for (const [key, t] of mgr.trees) {
       if (!t.broadcasterId || findVirtual(t)) continue;
       let needs = !!(t.vrelayPending && t.vrelayPending.size);
       if (!needs) for (const n of t.nodes.values()) { if (n.id !== t.broadcasterId && !n.parent) { needs = true; break; } }
       if (needs) requestVrelayActivation(key); // сам откажет не-source-дереву
+    }
+    // Транскод-ёмкость изменилась (агент появился/сменил кап) — рендишн-лестница пересчиталась;
+    // ре-анонсим stream-live, иначе клиент держит устаревшее меню качества. Раз на (пере)коннект.
+    reannounceRenditions();
+  }
+
+  // Д-фикс: разослать актуальную рендишн-лестницу (stream-live) по source-деревьям. Зовётся при
+  // смене транскод-ёмкости агента (hello) и при его отвале (лестница схлопывается в ['source']).
+  function reannounceRenditions() {
+    for (const [key, t] of mgr.trees) {
+      if (!t.broadcasterId || parseTreeKey(key).rendition !== DEFAULT_RENDITION) continue;
+      const bnode = t.nodes.get(t.broadcasterId);
+      if (!bnode) continue;
+      broadcastToServer(bnode.serverId, { t: 'stream-live', streamId: bnode.streamId, identity: bnode.identity, initial: false, renditions: renditionsOf(bnode.streamId), appName: bnode.appName || null, appIcon: bnode.appIcon || null });
     }
   }
 
@@ -1408,6 +1437,9 @@ function attachTreeServer(httpServer, opts) {
 
   function onLeave(id, reason = 'leave') {
     const p = peers.get(id);
+    // Д-фикс: агент vrelay держит control-сокет БЕЗ treeKey (в дерево не joins). Его отвал
+    // схлопывает рендишн-лестницу в ['source'] — ре-анонсим, иначе у клиента залипает меню.
+    if (p && p.isVrelayAgent) { tlog(`агент vrelay отключился: ${id} — лестница рендишнов схлопывается в [source]`); peers.delete(id); reannounceRenditions(); return; }
     if (!p || !p.treeKey) { peers.delete(id); return; }
     peers.delete(id);
     const key = p.treeKey;

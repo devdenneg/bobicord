@@ -1372,8 +1372,11 @@ function QualityMenu({ identity, onClose }: { identity: string; onClose: () => v
   const viaServer = E.isStreamViaServer(identity);
   const mode = E.getStreamQualityMode(identity);
   const renditions = E.getStreamRenditions(identity) || ['source'];
+  // Д-фикс: сервер без транскода (VRELAY_MAX_TRANSCODES=0 / нет агента) объявляет ТОЛЬКО ['source'].
+  // Пункт «Авто» тогда бессмыслен (двигать некуда) — прячем его и показываем внятную подсказку.
+  const onlySource = renditions.length === 1 && renditions[0] === 'source';
   const label: Record<string, string> = { source: 'Исходное (source)', '1080': '1080p', '720': '720p', '480': '480p', '360': '360p' };
-  const items = ['auto', ...renditions];
+  const items = onlySource ? ['source'] : ['auto', ...renditions];
   return (
     <div className="qualpanel" onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}
       style={{ position: 'absolute', right: 8, bottom: 52, width: 220, background: 'rgba(20,22,28,.96)', border: '1px solid rgba(255,255,255,.1)', borderRadius: 10, padding: 10, zIndex: 5, color: '#fff', fontSize: 12 }}>
@@ -1383,6 +1386,8 @@ function QualityMenu({ identity, onClose }: { identity: string; onClose: () => v
       </div>
       {!viaServer ? (
         <div style={{ opacity: .6, lineHeight: 1.4 }}>Качество наследуется от родителя — выбор доступен только при просмотре через сервер.</div>
+      ) : onlySource ? (
+        <div style={{ opacity: .6, lineHeight: 1.4 }}>Транскод на сервере отключён — доступно только исходное качество.</div>
       ) : items.map((it) => {
         const active = mode === it;
         return (

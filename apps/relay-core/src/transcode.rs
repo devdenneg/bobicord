@@ -46,7 +46,10 @@ const MAX_RESTARTS: u64 = 10;
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static MAX_TRANSCODES: OnceLock<usize> = OnceLock::new();
 
-fn max_transcodes() -> usize {
+/// Кап одновременных ffmpeg-транскодов (VRELAY_MAX_TRANSCODES, дефолт 2). Публична: агент
+/// (main.rs) читает её, чтобы сообщить серверу свою транскод-ёмкость в vrelay-hello — сервер
+/// не объявляет зрителям рендишн-лестницу, которую агент физически не поднимет (0 = нет транскода).
+pub fn max_transcodes() -> usize {
     *MAX_TRANSCODES.get_or_init(|| {
         std::env::var("VRELAY_MAX_TRANSCODES").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
     })
