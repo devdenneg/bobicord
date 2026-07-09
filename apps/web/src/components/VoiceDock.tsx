@@ -139,7 +139,7 @@ function VoicePanel() {
         <button className="vd-btn vd-leave" data-tip="Выйти из голосового" onClick={() => E.leaveVoice()}><Icon name="leave" sm /></button>
       </div>
       <VoiceControls up />
-      <MusicPlayer />
+      <MusicPlayer enabled={!!srv?.musicEnabled} />
     </div>
   );
 }

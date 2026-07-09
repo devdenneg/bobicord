@@ -92,7 +92,7 @@ export const api = {
     req<{ server: ServerSummary; invite: string; inviteExpires: number }>('POST', '/servers', { name }),
   getServer: (id: string) =>
     req<{ server: ServerDetail; members: Member[]; myRole: string; myPerms: number }>('GET', '/servers/' + id),
-  patchServer: (id: string, patch: { name?: string; description?: string; iconColor?: number; iconUrl?: string }) =>
+  patchServer: (id: string, patch: { name?: string; description?: string; iconColor?: number; iconUrl?: string; musicEnabled?: boolean }) =>
     req<{ server: ServerDetail }>('PATCH', '/servers/' + id, patch),
   leaveServer: (id: string) => req<{ ok: boolean }>('POST', `/servers/${id}/leave`),
   kickMember: (id: string, userId: string) => req<{ ok: boolean }>('POST', `/servers/${id}/kick`, { userId }),

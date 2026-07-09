@@ -179,6 +179,7 @@ for (const sql of [
   "ALTER TABLE messages ADD COLUMN client_key TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
   "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE servers ADD COLUMN music_enabled INTEGER NOT NULL DEFAULT 0",
 ]) { try { db.exec(sql); } catch (e) { /* column already exists */ } }
 
 // Бутстрап супер-админа: denis всегда админ (идемпотентно на каждом старте); остальным админку выдаёт админ из /admin.
@@ -399,7 +400,7 @@ function serverName(sid) { const s = db.prepare('SELECT name FROM servers WHERE 
 
 const pubUser = u => ({ id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '', bio: u.bio, isAdmin: !!u.is_admin || u.username === BOOTSTRAP_ADMIN });
 const UPLOAD_RE = /^\/api\/uploads\/[a-zA-Z0-9._-]+$/; // локальный путь к загрузке
-const pubServer = s => ({ id: s.id, name: s.name, ownerId: s.owner_id, iconColor: s.icon_color, iconUrl: s.icon_url || '', description: s.description || '' });
+const pubServer = s => ({ id: s.id, name: s.name, ownerId: s.owner_id, iconColor: s.icon_color, iconUrl: s.icon_url || '', description: s.description || '', musicEnabled: !!s.music_enabled });
 function isMember(uid, sid) { return !!db.prepare('SELECT 1 FROM memberships WHERE user_id=? AND server_id=?').get(uid, sid); }
 function memberCount(sid) { return db.prepare('SELECT COUNT(*) c FROM memberships WHERE server_id=?').get(sid).c; }
 // Полный каскад-снос сервера (все связанные таблицы по server_id). Имена таблиц — литералы, не ввод.
@@ -889,8 +890,9 @@ app.patch('/api/servers/:id', requireAuth, (req, res) => {
   let iu = null;
   if (req.body.iconUrl != null) { const v = String(req.body.iconUrl); if (v === '' || UPLOAD_RE.test(v)) iu = v; else return res.status(400).json({ error: 'Неверная обложка' }); }
   if (name !== null && name.length < 2) return res.status(400).json({ error: 'Название минимум 2 символа' });
-  db.prepare('UPDATE servers SET name=COALESCE(?,name), description=COALESCE(?,description), icon_color=COALESCE(?,icon_color), icon_url=COALESCE(?,icon_url) WHERE id=?')
-    .run(name, desc, ic, iu, s.id);
+  const music = req.body.musicEnabled != null ? (req.body.musicEnabled ? 1 : 0) : null;
+  db.prepare('UPDATE servers SET name=COALESCE(?,name), description=COALESCE(?,description), icon_color=COALESCE(?,icon_color), icon_url=COALESCE(?,icon_url), music_enabled=COALESCE(?,music_enabled) WHERE id=?')
+    .run(name, desc, ic, iu, music, s.id);
   const ns = db.prepare('SELECT * FROM servers WHERE id=?').get(s.id);
   res.json({ server: { ...pubServer(ns), memberCount: memberCount(s.id) } });
 });

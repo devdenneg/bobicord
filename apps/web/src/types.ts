@@ -65,6 +65,7 @@ export interface ServerSummary {
   iconColor: number;
   iconUrl?: string;
   description?: string;
+  musicEnabled?: boolean; // совместное прослушивание YouTube включено на сервере (по умолчанию нет)
   role: string;
   memberCount: number;
   online?: OnlineMember[];
@@ -91,6 +92,7 @@ export interface ServerDetail {
   iconColor: number;
   iconUrl?: string;
   description?: string;
+  musicEnabled?: boolean;
   memberCount: number;
   myRole: string;
   myPerms?: number;
