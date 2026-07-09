@@ -185,15 +185,19 @@
   .srv-card{position:relative;overflow:hidden;isolation:isolate;background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-md);padding:16px;text-align:left;box-shadow:var(--sh-1);display:flex;flex-direction:column;gap:10px;align-items:stretch;transition:background var(--tr),border-color var(--tr),transform var(--tr),box-shadow var(--tr)}
   .srv-card > *{position:relative;z-index:1}
   .srv-card > .sc-cover{z-index:0}
-  /* декор-обложка: размытая копия иконки сервера как фон карточки + ken-burns; фолбэк без обложки — цвет-подложка --tint */
-  .sc-cover{position:absolute;inset:0;pointer-events:none;background-position:center;background-size:cover;filter:blur(28px) saturate(1.35);opacity:.28;transform:scale(1.6);transition:opacity .4s ease,filter .4s ease}
-  .srv-card.has-cover .sc-cover{animation:scKen 24s ease-in-out infinite alternate}
-  .srv-card:not(.has-cover) .sc-cover{background:radial-gradient(130% 100% at 50% -10%,color-mix(in srgb,var(--tint) 60%,transparent),transparent 68%);filter:blur(34px);opacity:.5}
-  .srv-card:hover .sc-cover{opacity:.44}
-  .srv-card.is-live .sc-cover{opacity:.34}
-  .srv-card.is-live:hover .sc-cover{opacity:.52}
-  @keyframes scKen{0%{transform:scale(1.5) translate(-2%,-1%)}100%{transform:scale(1.82) translate(2%,2.5%)}}
-  .srv-card:hover{background:var(--panel2);border-color:color-mix(in srgb,var(--tint) 55%,var(--accent));transform:translateY(-3px);box-shadow:0 14px 30px -16px color-mix(in srgb,var(--tint) 70%,transparent),var(--sh-2)}
+  /* обложка = ЯРКИЙ баннер вверху карточки, мягко тает в фон (mask); контент читается поверх (скрим+тень) */
+  .sc-cover{position:absolute;inset:0 0 auto 0;height:104px;pointer-events:none;background-position:center;background-size:cover;filter:blur(18px) saturate(1.4) brightness(.8);opacity:.9;transform:scale(1.4);transform-origin:50% 25%;-webkit-mask-image:linear-gradient(180deg,#000 42%,transparent);mask-image:linear-gradient(180deg,#000 42%,transparent);transition:opacity .35s ease,filter .35s ease}
+  .sc-cover::after{content:'';position:absolute;inset:0;background:linear-gradient(180deg,rgba(0,0,0,.42),rgba(0,0,0,.12) 60%,transparent)}
+  .srv-card.has-cover .sc-cover{animation:scKen 22s ease-in-out infinite alternate}
+  .srv-card:not(.has-cover) .sc-cover{background:linear-gradient(135deg,color-mix(in srgb,var(--tint) 82%,transparent),color-mix(in srgb,var(--tint) 20%,transparent));filter:saturate(1.3);opacity:.85}
+  .srv-card.has-cover .sc-nm{text-shadow:0 1px 4px rgba(0,0,0,.6)}
+  .srv-card.has-cover .sc-sub{text-shadow:0 1px 3px rgba(0,0,0,.5)}
+  .srv-card:hover .sc-cover{opacity:1;filter:blur(16px) saturate(1.5) brightness(.9)}
+  @keyframes scKen{0%{transform:scale(1.4) translate(-2%,0)}100%{transform:scale(1.52) translate(2%,-2%)}}
+  /* ховер: с обложкой — нейтральный подъём (цвет уже даёт баннер, не мешаем хеш-цветом --tint) */
+  .srv-card:hover{background:var(--panel2);border-color:color-mix(in srgb,var(--accent) 60%,var(--line-2));transform:translateY(-3px);box-shadow:0 14px 30px -16px rgba(0,0,0,.55),var(--sh-2)}
+  /* без обложки — --tint это реальный цвет карточки, подсвечиваем им */
+  .srv-card:not(.has-cover):hover{border-color:color-mix(in srgb,var(--tint) 55%,var(--accent));box-shadow:0 14px 30px -16px color-mix(in srgb,var(--tint) 65%,transparent),var(--sh-2)}
   .srv-card.is-live{grid-column:span 2;box-shadow:var(--sh-2),var(--hair)}
   .srv-card.is-connected .sc-ic{box-shadow:0 0 0 2px var(--panel),0 0 0 4px var(--green)}
   @media(max-width:1024px){.srv-card.is-live{grid-column:auto}}
