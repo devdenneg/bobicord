@@ -2,7 +2,7 @@
 // через service worker). Фоновый push (приложение закрыто / iOS PWA в фоне) — отдельная инфра
 // (Web Push/VAPID), тут не реализован: на iOS свёрнутая PWA JS не исполняет, локальные уведомления
 // там не сработают вообще.
-import { isTauri } from './native';
+import { isTauri, foregroundFullscreen } from './native';
 import { getSettings, setSettings } from './settings';
 import { ensurePushSubscribed } from './push';
 import { playSound } from './sounds';
@@ -121,22 +121,24 @@ export async function notify(kind: NotifKind, opts: { title: string; body: strin
   try {
     const s = getSettings();
     if (!s.notif || !s[KIND_PREF[kind]]) return false; // мастер или тип выключены — тихо
-    // Фокус-гейт mention («виден чат») применим ТОЛЬКО к текущему просматриваемому серверу. Для
-    // упоминания в ДРУГОМ сервере (notify-WS, force:true) чат не виден — уведомляем даже в фокусе.
-    if (FOCUS_GATED[kind] && focused() && !opts.force) return false; // смотришь чат — Discord канал в фокусе не пингует
+    // Mention/@all — звук-пинг ВСЕГДА (даже когда смотришь чат): быть @упомянутым/в @all важно (как Discord).
+    // Визуальную карточку ниже фокус-гейтим и не показываем поверх фуллскрин-игры — но звук уже дан.
+    if (kind === 'mention') playSound('tag');
+    // Фокус-гейт — только для ВИЗУАЛЬНОЙ карточки mention (в фокусе баннер не нужен, звук уже сыгран).
+    // force:true (notify-WS из другого сервера) — чат не виден, показываем даже в фокусе.
+    if (FOCUS_GATED[kind] && focused() && !opts.force) return false;
     if (isTauri) {
+      // Фуллскрин-приложение (игра) на переднем плане → окно-карточка свернёт его (Windows выкидывает
+      // exclusive-fullscreen из полного экрана). Окно НЕ создаём; звук уже сыгран, toast-фолбэк тоже не шлём.
+      if (await foregroundFullscreen()) return false;
       // кастомная карточка в стиле приложения; если окно не создалось (нет прав/ошибка) — системный toast
       const shown = await showNativeCard(kind, opts.title, opts.body);
-      if (shown) { if (kind === 'mention') playSound('tag'); } // карточка беззвучна → звук тега из приложения (один пинг)
-      else {
+      if (!shown) {
         try { const m = await import('@tauri-apps/plugin-notification'); if (await m.isPermissionGranted()) await m.sendNotification({ title: opts.title, body: opts.body }); } catch { /**/ } // toast звучит сам (ОС)
       }
       return shown;
     }
-    if (typeof Notification === 'undefined' || Notification.permission !== 'granted') {
-      if (kind === 'mention') playSound('tag'); // нет веб-уведомлений (нет прав/не поддерживается) → пинг из приложения
-      return false;
-    }
+    if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return false;
     const data: NotificationOptions = { body: opts.body, icon: '/icon-256.png', badge: '/icon-128.png', tag: opts.tag, ...( { renotify: !!opts.tag } as any) };
     // предпочитаем показ через service worker (переживает бэкграунд вкладки, кликабелен → фокус окна)
     const reg = await navigator.serviceWorker?.getRegistration?.();

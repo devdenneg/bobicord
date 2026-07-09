@@ -1163,7 +1163,7 @@ export class Engine {
   // упоминание меня: @username / @displayName / @everyone|@all|@все
   textMentionsMe(text: string): boolean {
     if (!text) return false;
-    if (/@(everyone|all|все)\b/i.test(text)) return true;
+    if (/@(everyone|all|все)(?![\p{L}\p{N}_])/iu.test(text)) return true; // \b не Unicode-aware → @все не ловилось; lookahead корректен для лат+кириллицы
     const low = text.toLowerCase();
     const u = (this.me.username || '').toLowerCase();
     const d = (this.me.displayName || '').toLowerCase();

@@ -76,6 +76,11 @@ fn is_fullscreen_window(hwnd_i: isize) -> bool {
     }
 }
 
+/// Foreground-окно фуллскрин (игра)? Гейт для окна-уведомления: оно свернуло бы exclusive-fullscreen игру.
+pub fn foreground_is_fullscreen() -> bool {
+    foreground_window().map_or(false, |(hwnd, ..)| is_fullscreen_window(hwnd))
+}
+
 /// Все ПОЛНОЭКРАННЫЕ окна (кандидаты в игры). НЕ завязано на foreground — иначе таб в наш апп
 /// сбрасывал бы статус. title может быть пустым у elevated/анти-чит игр (UIPI блокирует
 /// GetWindowText) — имя тогда берётся из exe в lib.rs; process_name работает кросс-integrity

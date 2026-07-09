@@ -22,6 +22,13 @@ export async function setDetectableGames(games: { name: string; exes: string[] }
   try { const { invoke } = await import('@tauri-apps/api/core'); await invoke('set_detectable_games', { games }); }
   catch { /**/ }
 }
+// Фуллскрин-приложение (игра) на переднем плане? Окно-карточка уведомления свернуло бы exclusive-fullscreen
+// игру → notify это чекает и не создаёт окно (звук всё равно играет). false в браузере / при ошибке.
+export async function foregroundFullscreen(): Promise<boolean> {
+  if (!isTauri) return false;
+  try { const { invoke } = await import('@tauri-apps/api/core'); return await invoke<boolean>('foreground_fullscreen'); }
+  catch { return false; }
+}
 
 export interface MonitorInfo { index: number; name: string }
 

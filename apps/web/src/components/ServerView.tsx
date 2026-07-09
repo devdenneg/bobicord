@@ -10,6 +10,7 @@ import { emoteMap, emoteUrl } from '../emotes';
 import { EmotePicker } from './EmotePicker';
 import { VoiceDock } from './VoiceDock';
 import { getSettings, setSettings } from '../settings';
+import { playSound } from '../sounds';
 import { applyNativeUpdate } from '../nativeUpdate';
 import { isTauri, saveFileDialog, openFile, pathsExist } from '../native';
 import { getDownloads, addDownload, subscribeDownloads, type DownloadItem } from '../downloads';
@@ -732,6 +733,7 @@ function Chat() {
   const prevLastId = useRef<number | null>(null);    // id последнего сообщения — детект append vs prepend
   const prevTrim = useRef(0);                         // сколько среза уже учтено в firstItemIndex
   const lastAckedRef = useRef<number | null>(null);   // последний месседж (local id), для которого послан readAll — не спамим POST
+  const lastTagAt = useRef(0);                         // троттл звука-пинга сообщений (не в фокусе) — не строчить пулемётом
   // автокомплит упоминаний (@ник)
   const [mention, setMention] = useState<{ q: string; start: number } | null>(null);
   const [mIdx, setMIdx] = useState(0);
@@ -793,6 +795,9 @@ function Chat() {
     if (prevLastId.current !== null && last !== prevLastId.current && lastMsg && !lastMsg.mine && !lastMsg.sys) {
       if (!atBottomRef.current) setPill((p) => p + 1);       // индикатор скролла: есть сообщения ниже
       if (!seenNow() && activeId) bumpUnreadStore(activeId);  // непрочитанное: не в фокусе или не внизу
+      // Discord-стиль: апп свёрнут/не в фокусе, но ты на сервере → пинг на КАЖДОЕ сообщение (звук тега).
+      // Меншены исключаем — у них свой пинг из notify (иначе двойной звук). Троттл — не строчить пулемётом.
+      if (!document.hasFocus() && !lastMsg.mention) { const now = Date.now(); if (now - lastTagAt.current > 900) { lastTagAt.current = now; playSound('tag'); } }
     }
     prevLastId.current = last;
   }, [messages, activeId, bumpUnreadStore]);

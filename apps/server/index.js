@@ -339,7 +339,7 @@ function mentionedIds(text, members) {
   const out = new Set();
   const raw = String(text || '');
   if (!raw) return out;
-  if (/@(everyone|all|все)\b/i.test(raw)) { for (const m of members) out.add(m.id); return out; }
+  if (/@(everyone|all|все)(?![\p{L}\p{N}_])/iu.test(raw)) { for (const m of members) out.add(m.id); return out; } // \b не Unicode-aware → @все не ловилось; lookahead корректен для лат+кириллицы
   const low = raw.toLowerCase();
   const tokens = new Set(); let mm; const re = /@([^\s@]+)/g;
   while ((mm = re.exec(low))) tokens.add(mm[1]);

@@ -133,6 +133,13 @@ fn detect_game() -> Option<GameInfo> {
   None
 }
 
+// Foreground-приложение фуллскрин (игра)? notify не показывает окно-карточку поверх — иначе Windows
+// свернёт exclusive-fullscreen игру. Звук уведомления при этом всё равно играет (см. notify.ts).
+#[tauri::command]
+fn foreground_fullscreen() -> bool {
+  broadcast::capture::foreground_is_fullscreen()
+}
+
 struct BroadcastState(Mutex<Option<broadcast::BroadcastHandle>>);
 struct WatchState(Mutex<Option<broadcast::relay::RelayHandle>>);
 
@@ -360,7 +367,7 @@ pub fn run() {
       std::thread::spawn(branding::fix_shortcuts);
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![ping, list_monitors, list_windows, detect_game, set_detectable_games, start_broadcast, set_broadcast_source, stop_broadcast, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys, open_file, reveal_in_folder, paths_exist, diag::diag_take_log])
+    .invoke_handler(tauri::generate_handler![ping, list_monitors, list_windows, detect_game, foreground_fullscreen, set_detectable_games, start_broadcast, set_broadcast_source, stop_broadcast, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys, open_file, reveal_in_folder, paths_exist, diag::diag_take_log])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }
