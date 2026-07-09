@@ -40,11 +40,15 @@ services:
     environment:
       - TURN_SECRET=${TURN_SECRET}
       - TURN_REALM=${TURN_REALM:-relayapp.local}
-      # Д8: публичный IP VPS для relay-кандидатов coturn. Пусто = флаг --external-ip НЕ
-      # добавляется (иначе coturn падает на пустом значении). Проставь реальный IP в .env.
+      # Д8: --external-ip. Нужен ТОЛЬКО если coturn за NAT (приватный адрес на интерфейсе).
+      # При host-сети и публичном IPv4 прямо на интерфейсе — оставить пустым. Пусто = флаг
+      # НЕ добавляется (coturn падает на пустом значении).
       - TURN_EXTERNAL_IP=${TURN_EXTERNAL_IP:-}
-    # ${VAR:+...} подставляет --external-ip ТОЛЬКО если TURN_EXTERNAL_IP непуст (иначе строки нет).
-    command: ["sh", "-c", "turnserver -c /etc/turnserver.conf --static-auth-secret=$${TURN_SECRET} --realm=$${TURN_REALM} $${TURN_EXTERNAL_IP:+--external-ip=$${TURN_EXTERNAL_IP}}"]
+      # Привязка к публичному интерфейсу: без неё coturn слушает и docker-мосты (172.x),
+      # раздавая недостижимые relay-кандидаты. Пусто = слушать всё (прежнее поведение).
+      - TURN_LISTEN_IP=${TURN_LISTEN_IP:-}
+    # ${VAR:+...} подставляет флаг ТОЛЬКО если переменная непуста (иначе строки нет вовсе).
+    command: ["sh", "-c", "turnserver -c /etc/turnserver.conf --static-auth-secret=$${TURN_SECRET} --realm=$${TURN_REALM} $${TURN_EXTERNAL_IP:+--external-ip=$${TURN_EXTERNAL_IP}} $${TURN_LISTEN_IP:+--listening-ip=$${TURN_LISTEN_IP} --relay-ip=$${TURN_LISTEN_IP}}"]
 
   # Э9: виртуальный fallback-relay — джойнится в relay-дерево, когда у зрителей нет живых
   # relay-пиров (или зритель явно выбрал «через сервер»), и passthrough-ретранслирует RTP.
