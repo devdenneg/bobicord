@@ -161,9 +161,9 @@ function VoiceParticipantRow({ m, anim }: { m: Member; anim?: string }) {
         onKeyDown={(e) => { if (remote && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); setOpen((v) => !v); } }}>
         <div className={'av' + (streaming ? ' live' : '')} style={{ background: m.avatarUrl ? '#0000' : avColor(m.displayName, m.avatarColor) }}>
           {m.avatarUrl ? <img className="avimg" src={resolveUploadUrl(m.avatarUrl)} alt="" /> : initial(m.displayName)}
-          {(() => { const meta = streaming ? E.getStreamAppMeta(m.username) : null; return <>
-            {streaming ? <span className="av-live" title={meta?.appName ? `Стримит ${meta.appName}` : 'В эфире'}>LIVE</span> : null}
-            {streaming && meta?.appIcon ? <img src={`data:image/png;base64,${meta.appIcon}`} alt="" title={meta.appName ? `Стримит ${meta.appName}` : undefined} style={{ position: 'absolute', right: -3, bottom: -3, width: 14, height: 14, borderRadius: 3, border: '2px solid var(--bg-alt, #111)', objectFit: 'contain' }} /> : null}
+          {(() => { if (!streaming) return null; const meta = E.getStreamAppMeta(m.username); const gicon = meta?.appIcon || pr?.game?.icon; const gname = meta?.appName || pr?.game?.name; return <>
+            <span className="av-live" title={gname ? `Стримит ${gname}` : 'В эфире'}>LIVE</span>
+            {gicon ? <img src={`data:image/png;base64,${gicon}`} alt="" title={gname ? `Стримит ${gname}` : undefined} style={{ position: 'absolute', right: -3, bottom: -3, width: 14, height: 14, borderRadius: 3, border: '2px solid var(--bg-alt, #111)', objectFit: 'contain' }} /> : null}
           </>; })()}
         </div>
         <div className="vc-id">
