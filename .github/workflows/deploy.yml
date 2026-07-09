@@ -82,14 +82,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # держим docker-compose.yml на VPS в актуальном состоянии (.env/livekit.yaml не трогаем)
+      # держим docker-compose.yml и coturn/turnserver.conf на VPS в актуальном состоянии
+      # (.env/livekit.yaml не трогаем — они правятся руками на хосте).
+      # turnserver.conf — bind-mount из ./coturn; без копирования правки конфига coturn
+      # молча не доезжали, хотя coturn/** и триггерит этот workflow.
       - name: Copy compose to VPS
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
-          source: docker-compose.yml
+          source: "docker-compose.yml,coturn/turnserver.conf"
           target: /opt/voice
 
       - name: Deploy over SSH
@@ -104,4 +107,8 @@ jobs:
             cd /opt/voice
             docker compose pull
             docker compose up -d
+            # turnserver.conf — bind-mount: compose не видит его изменений и не пересоздаёт
+            # coturn, если сама сервис-секция не менялась. Рестартим явно (~1с простоя TURN;
+            # деплой всё равно рвёт деревья пересозданием token).
+            docker compose restart coturn
             docker image prune -f
