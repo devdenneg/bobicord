@@ -52,13 +52,19 @@ const DIRECT_MIN = 1, DIRECT_MAX = 10;
 function loadConfig(): SavedConfig {
   try {
     const raw = JSON.parse(localStorage.getItem('bcastConfig') || '{}');
+    // Отличаем «старый сохранённый конфиг» (есть ключи, но нет presetMode — до Д5) от
+    // «нового пользователя» (localStorage пуст): у старого дефолт presetMode='manual', чтобы
+    // не подменить его привычные ручные битрейт/разрешение авто-пресетом; у нового — авто.
+    const hadSavedConfig = raw && typeof raw === 'object' && Object.keys(raw).length > 0;
+    const savedMode = raw.presetMode;
     if (typeof raw.bitrateKbps !== 'number' && typeof raw.bitrateMbps === 'number') raw.bitrateKbps = raw.bitrateMbps * 1000;
     delete raw.bitrateMbps;
     const c: SavedConfig = { ...DEF_CONFIG, ...raw };
     c.bitrateKbps = Math.min(BITRATE_MAX_KBPS, Math.max(BITRATE_MIN_KBPS, Math.round(c.bitrateKbps / BITRATE_STEP_KBPS) * BITRATE_STEP_KBPS));
     c.maxDirectChildren = Math.min(DIRECT_MAX, Math.max(DIRECT_MIN, Math.round(c.maxDirectChildren)));
     c.allowDirectPeers = !!c.allowDirectPeers;
-    if (c.presetMode !== 'smooth' && c.presetMode !== 'quality' && c.presetMode !== 'manual') c.presetMode = 'smooth';
+    if (savedMode === 'smooth' || savedMode === 'quality' || savedMode === 'manual') c.presetMode = savedMode;
+    else c.presetMode = hadSavedConfig ? 'manual' : DEF_CONFIG.presetMode;
     return c;
   } catch { return DEF_CONFIG; }
 }
@@ -155,6 +161,17 @@ export function BroadcastModal() {
   const chosenPreset = (cfg.presetMode !== 'manual' && usefulKbps != null)
     ? pickPreset(usefulKbps, cfg.presetMode as PresetMode)
     : null;
+
+  // Явные вкладки режима вещания. Активный таб выводится из presetMode (единый источник
+  // истины) — отдельного поля состояния нет. Переключение таба меняет presetMode.
+  const tab: 'auto' | 'manual' = cfg.presetMode === 'manual' ? 'manual' : 'auto';
+  const selectAuto = () => setCfg((c) => ({ ...c, presetMode: c.presetMode === 'manual' ? 'smooth' : c.presetMode }));
+  const selectManual = () => setCfg((c) => ({ ...c, presetMode: 'manual' }));
+  // Явная итоговая строка «что применится» для каждого таба.
+  const autoSummary = chosenPreset
+    ? `Будет: ${chosenPreset.label}, ${(chosenPreset.bitrateKbps / 1000).toFixed(1)} Мбит/с CBR`
+    : measuring ? 'Будет: определю после замера скорости' : 'Будет: нужен замер скорости';
+  const manualSummary = `Будет: ${RES_MAP[cfg.resolution].label}, ${cfg.fps} fps, ${cfg.bitrateKbps / 1000} Мбит/с${cfg.autoBitrate ? ' (макс., авто-адаптация)' : ' CBR'}`;
 
   // Замер upload: спиннер 3-5с, затем развилка. useCache=false — принудительный ре-замер.
   async function runMeasure(useCache = true) {
@@ -303,82 +320,81 @@ export function BroadcastModal() {
     <h2><Icon name="screen" />Трансляция экрана</h2>
     {sourceFields}
 
-    {/* Roadmap-flow-стриминга Д5: замер upload → полезный битрейт 75% → развилка Плавность/Качество. */}
-    <div className="fld"><label>Скорость отдачи</label>
-      {measuring
-        ? <p className="msub" style={{ margin: 0 }}>Замеряю скорость сети… (3–5 с){measurePhase ? ` · ${measurePhase}` : ''}</p>
-        : probe
-          ? <p className="msub" style={{ margin: 0 }}>
-              ~{(probe.bweKbps / 1000).toFixed(1)} Мбит/с{probe.method === 'datachannel' ? ' (прибл.)' : ''}
-              {probe.symmetricNat ? ' · ⚠ симметричный NAT (возможно занижено)' : ''}
-              {usefulKbps != null ? ` · полезно ${(usefulKbps / 1000).toFixed(1)} Мбит/с` : ''}
-              {' '}<button className="linklike" style={{ background: 'none', border: 'none', color: 'var(--accent, #5865f2)', cursor: 'pointer', padding: 0 }} onClick={remeasure}>повторить замер</button>
-            </p>
-          : <button className="ghost" style={{ margin: 0 }} onClick={() => runMeasure(false)}>Замерить скорость</button>}
-    </div>
-    <div className="fld"><label>Режим</label>
-      <div className="seg">
-        <button className={cfg.presetMode === 'smooth' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, presetMode: 'smooth' }))}>Плавность</button>
-        <button className={cfg.presetMode === 'quality' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, presetMode: 'quality' }))}>Качество</button>
-      </div>
-      <p className="msub" style={{ margin: '8px 0 0' }}>{
-        cfg.presetMode === 'manual'
-          ? 'Ручной режим (расширенные настройки ниже). Выбери «Плавность» или «Качество» для авто-пресета.'
-          : (cfg.presetMode === 'smooth'
-              ? 'Плавность: 60 fps, разрешение подстраивается под скорость.'
-              : 'Качество: 30 fps, максимальное разрешение под скорость.')
-      }{chosenPreset ? ` → ${chosenPreset.label}, ${(chosenPreset.bitrateKbps / 1000).toFixed(1)} Мбит/с CBR` : (cfg.presetMode !== 'manual' && !measuring ? ' → нужен замер' : '')}</p>
-    </div>
-
-    {/* Roadmap-flow-стриминга Д8: opt-in прямых подключений к стримеру. Дефолт — «через сервер»
-        (server-first: единственный слот корня под vrelay). Вкл — вещатель открывает N прямых
-        слотов (N = слайдер «Прямых подключений» в расширенных настройках). */}
+    {/* Roadmap-flow-стриминга Д8: opt-in прямых подключений — про ТОПОЛОГИЮ, а не про качество,
+        поэтому вне табов авто/ручной (применяется в обоих режимах). Дефолт — «через сервер»
+        (server-first: единственный слот корня под vrelay). Вкл — вещатель открывает N прямых слотов. */}
     <div className="fld"><label>Прямые подключения к тебе</label>
       <div className="seg">
         <button className={!cfg.allowDirectPeers ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, allowDirectPeers: false }))}>Только через сервер</button>
         <button className={cfg.allowDirectPeers ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, allowDirectPeers: true }))}>Разрешить ({cfg.maxDirectChildren} слот.)</button>
       </div>
       <p className="msub" style={{ margin: '8px 0 0' }}>{cfg.allowDirectPeers
-        ? `Зрители могут брать поток напрямую с тебя (до ${cfg.maxDirectChildren} прямых слотов; число — в расширенных настройках). Остальные — через сервер.`
+        ? `Зрители могут брать поток напрямую с тебя (до ${cfg.maxDirectChildren} прямых слотов). Остальные — через сервер.`
         : 'Все зрители получают поток через сервер (меньше нагрузки на твою отдачу, стабильнее). Прямые подключения выключены.'}</p>
+      {cfg.allowDirectPeers && <div style={{ marginTop: 8 }}>
+        <label className="msub">Прямых слотов: {cfg.maxDirectChildren}</label>
+        <input type="range" min={DIRECT_MIN} max={DIRECT_MAX} step={1} value={cfg.maxDirectChildren} onChange={(e) => setCfg((c) => ({ ...c, maxDirectChildren: +e.target.value }))} />
+      </div>}
     </div>
 
-    {/* Расширенные настройки = текущий ручной режим (Д5). Изменение битрейт/разрешение/fps
-        переключает presetMode в 'manual'; звук и прямые подключения ортогональны пресету. */}
-    <div className="fld">
-      <details open={cfg.presetMode === 'manual'}>
-        <summary style={{ cursor: 'pointer' }} className="msub">Расширенные настройки (ручной режим)</summary>
-        <div style={{ marginTop: 8 }}>
-          <div className="fld"><label>Разрешение</label>
-            <select value={cfg.resolution} onChange={(e) => setCfg((c) => ({ ...c, resolution: e.target.value as Resolution, presetMode: 'manual' }))}>
-              {(Object.keys(RES_MAP) as Resolution[]).map((k) => <option key={k} value={k}>{RES_MAP[k].label}</option>)}
-            </select>
-          </div>
-          <div className="fld"><label>FPS</label>
-            <div className="seg">
-              <button className={cfg.presetMode === 'manual' && cfg.fps === 30 ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, fps: 30, presetMode: 'manual' }))}>30</button>
-              <button className={cfg.presetMode === 'manual' && cfg.fps === 60 ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, fps: 60, presetMode: 'manual' }))}>60</button>
-            </div>
-          </div>
-          <div className="fld"><label>{cfg.autoBitrate ? 'Битрейт (макс.)' : 'Битрейт'}: {cfg.bitrateKbps / 1000} Мбит/с</label>
-            <input type="range" min={BITRATE_MIN_KBPS} max={BITRATE_MAX_KBPS} step={BITRATE_STEP_KBPS} value={cfg.bitrateKbps} onChange={(e) => setCfg((c) => ({ ...c, bitrateKbps: +e.target.value, presetMode: 'manual' }))} />
-          </div>
-          <div className="fld"><label>Автобитрейт</label>
-            <div className="seg">
-              <button className={cfg.presetMode === 'manual' && cfg.autoBitrate ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, autoBitrate: true, presetMode: 'manual' }))}>Авто</button>
-              <button className={cfg.presetMode === 'manual' && !cfg.autoBitrate ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, autoBitrate: false, presetMode: 'manual' }))}>Фиксированный</button>
-            </div>
-            <p className="msub" style={{ margin: '8px 0 0' }}>{cfg.autoBitrate
-              ? 'Битрейт снижается автоматически под худший линк дерева (и восстанавливается). Значение выше — потолок.'
-              : 'Битрейт фиксирован. При плохой сети у зрителей возможны потери/буферизация.'}</p>
-          </div>
-          <div className="fld"><label>Прямых подключений: {cfg.maxDirectChildren}</label>
-            <input type="range" min={DIRECT_MIN} max={DIRECT_MAX} step={1} value={cfg.maxDirectChildren} onChange={(e) => setCfg((c) => ({ ...c, maxDirectChildren: +e.target.value }))} />
-            <p className="msub" style={{ margin: '8px 0 0' }}>Сколько зрителей берут поток напрямую с тобой (действует только при включённом тумблере «Прямые подключения»). Остальные — через сервер/ретранслирующих зрителей.</p>
-          </div>
-        </div>
-      </details>
+    {/* Roadmap-flow-стриминга Д5: явные взаимоисключающие вкладки — Авто (замер→развилка→пресет)
+        и Ручной (слайдеры). Активный таб = presetMode; применяется ТОЛЬКО он (см. start()). */}
+    <div className="fld"><label>Настройки вещания</label>
+      <div className="seg">
+        <button className={tab === 'auto' ? 'active' : ''} onClick={selectAuto}>Авто</button>
+        <button className={tab === 'manual' ? 'active' : ''} onClick={selectManual}>Ручной</button>
+      </div>
     </div>
+
+    {tab === 'auto' ? <>
+      <div className="fld"><label>Скорость отдачи</label>
+        {measuring
+          ? <p className="msub" style={{ margin: 0 }}>Замеряю скорость сети… (3–5 с){measurePhase ? ` · ${measurePhase}` : ''}</p>
+          : probe
+            ? <p className="msub" style={{ margin: 0 }}>
+                ~{(probe.bweKbps / 1000).toFixed(1)} Мбит/с{probe.method === 'datachannel' ? ' (прибл.)' : ''}
+                {probe.symmetricNat ? ' · ⚠ симметричный NAT (возможно занижено)' : ''}
+                {usefulKbps != null ? ` · полезно ${(usefulKbps / 1000).toFixed(1)} Мбит/с` : ''}
+                {' '}<button className="linklike" style={{ background: 'none', border: 'none', color: 'var(--accent, #5865f2)', cursor: 'pointer', padding: 0 }} onClick={remeasure}>повторить замер</button>
+              </p>
+            : <button className="ghost" style={{ margin: 0 }} onClick={() => runMeasure(false)}>Замерить скорость</button>}
+      </div>
+      <div className="fld"><label>Режим</label>
+        <div className="seg">
+          <button className={cfg.presetMode === 'smooth' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, presetMode: 'smooth' }))}>Плавность</button>
+          <button className={cfg.presetMode === 'quality' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, presetMode: 'quality' }))}>Качество</button>
+        </div>
+        <p className="msub" style={{ margin: '8px 0 0' }}>{cfg.presetMode === 'quality'
+          ? 'Качество: 30 fps, максимальное разрешение под скорость.'
+          : 'Плавность: 60 fps, разрешение подстраивается под скорость.'}</p>
+      </div>
+      <div style={{ marginTop: 10, padding: '8px 10px', borderRadius: 8, background: 'var(--accent-soft, rgba(88,101,242,.18))', fontSize: 13, fontWeight: 600 }}>{autoSummary}</div>
+    </> : <>
+      <div className="fld"><label>Разрешение</label>
+        <select value={cfg.resolution} onChange={(e) => setCfg((c) => ({ ...c, resolution: e.target.value as Resolution }))}>
+          {(Object.keys(RES_MAP) as Resolution[]).map((k) => <option key={k} value={k}>{RES_MAP[k].label}</option>)}
+        </select>
+      </div>
+      <div className="fld"><label>FPS</label>
+        <div className="seg">
+          <button className={cfg.fps === 30 ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, fps: 30 }))}>30</button>
+          <button className={cfg.fps === 60 ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, fps: 60 }))}>60</button>
+        </div>
+      </div>
+      <div className="fld"><label>{cfg.autoBitrate ? 'Битрейт (макс.)' : 'Битрейт'}: {cfg.bitrateKbps / 1000} Мбит/с</label>
+        <input type="range" min={BITRATE_MIN_KBPS} max={BITRATE_MAX_KBPS} step={BITRATE_STEP_KBPS} value={cfg.bitrateKbps} onChange={(e) => setCfg((c) => ({ ...c, bitrateKbps: +e.target.value }))} />
+      </div>
+      <div className="fld"><label>Автобитрейт</label>
+        <div className="seg">
+          <button className={cfg.autoBitrate ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, autoBitrate: true }))}>Авто</button>
+          <button className={!cfg.autoBitrate ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, autoBitrate: false }))}>Фиксированный</button>
+        </div>
+        <p className="msub" style={{ margin: '8px 0 0' }}>{cfg.autoBitrate
+          ? 'Битрейт снижается автоматически под худший линк дерева (и восстанавливается). Значение выше — потолок.'
+          : 'Битрейт фиксирован. При плохой сети у зрителей возможны потери/буферизация.'}</p>
+      </div>
+      <div style={{ marginTop: 10, padding: '8px 10px', borderRadius: 8, background: 'var(--accent-soft, rgba(88,101,242,.18))', fontSize: 13, fontWeight: 600 }}>{manualSummary}</div>
+    </>}
     <div className="fld"><label>Звук</label>
       <div className="seg">
         <button className={cfg.audioMode === 'auto' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, audioMode: 'auto' }))}>Авто (по источнику)</button>
