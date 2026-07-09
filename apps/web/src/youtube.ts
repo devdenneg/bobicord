@@ -38,11 +38,14 @@ export function parseVideoId(input: string): string | null {
   return null;
 }
 
-/** Название трека без API-ключа (oEmbed, CORS-разрешён). Фолбэк — сам id. */
+/** Название трека без API-ключа (oEmbed, CORS-разрешён). Фолбэк — сам id. Таймаут 6с — иначе зависший
+ *  запрос держал бы лоадер добавления вечно. */
 export async function fetchTitle(videoId: string): Promise<string> {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 6000);
   try {
-    const r = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`);
+    const r = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`, { signal: ctl.signal });
     if (r.ok) { const d = await r.json(); if (d && d.title) return String(d.title); }
-  } catch { /**/ }
+  } catch { /**/ } finally { clearTimeout(t); }
   return videoId;
 }

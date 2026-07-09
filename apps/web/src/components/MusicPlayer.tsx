@@ -9,6 +9,10 @@ import { Icon } from '../Icon';
 const YT_ELEM = 'yt-music-player';
 const fmt = (s: number) => { s = Math.max(0, Math.floor(s || 0)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
 const getVol = () => { const v = parseInt(localStorage.getItem('musicVol') || '10', 10); return isNaN(v) ? 10 : Math.max(0, Math.min(100, v)); };
+// Ползунок (0..100, «человеческий» %) → реальная громкость YT (0..100). Перцептивная кривая: слух ~логарифмический,
+// а музыкальные треки громкие → линейный setVolume(1) уже отчётливо слышно. Понижаем мастер (потолок 40) и
+// поджимаем низ (γ=1.4): 1% → ~0 (почти тишина), 10% (дефолт) → ~2 (тихий фон), 50% → ~15, 100% → 40 (потолок).
+const ytVol = (pct: number) => Math.round(40 * Math.pow(Math.max(0, Math.min(100, pct)) / 100, 1.4));
 
 export function MusicPlayer({ enabled }: { enabled: boolean }) {
   const m = useMusic();
@@ -17,6 +21,7 @@ export function MusicPlayer({ enabled }: { enabled: boolean }) {
   const hasPlayedRef = useRef(false); // хоть раз звук пошёл со звуком (autoplay-жест уже получен) → плашку больше не показываем
   const [open, setOpen] = useState(false);
   const [addUrl, setAddUrl] = useState('');
+  const [adding, setAdding] = useState(false); // идёт запрос названия трека — блокируем повторное добавление
   const [err, setErr] = useState('');
   const [needGesture, setNeedGesture] = useState(false);
   const [pos, setPos] = useState(0);
@@ -26,7 +31,7 @@ export function MusicPlayer({ enabled }: { enabled: boolean }) {
 
   const applyVol = (v: number) => {
     volRef.current = v; setVol(v); localStorage.setItem('musicVol', String(v));
-    try { const p = playerRef.current; if (p && readyRef.current) { p.setVolume(v); if (v > 0) p.unMute?.(); } } catch { /**/ }
+    try { const p = playerRef.current; if (p && readyRef.current) { p.setVolume(ytVol(v)); if (v > 0 && hasPlayedRef.current) p.unMute?.(); } } catch { /**/ }
   };
 
   // синхронизируем плеер с состоянием сессии (трек / позиция / пауза) + громкость
@@ -40,20 +45,25 @@ export function MusicPlayer({ enabled }: { enabled: boolean }) {
       const loaded = p.getVideoData?.()?.video_id || '';
       if (loaded !== c.id) p.loadVideoById({ videoId: c.id, startSeconds: posSec });
       else { const d = Math.abs((p.getCurrentTime?.() || 0) - posSec); if (d > 1.5) p.seekTo(posSec, true); }
-      p.setVolume(volRef.current); if (volRef.current > 0) p.unMute?.();
+      p.setVolume(ytVol(volRef.current));
+      if (hasPlayedRef.current) { if (volRef.current > 0) p.unMute?.(); } // звук уже разблокирован — держим unmute
+      else if (volRef.current > 0) p.unMute?.();                          // оптимистично пробуем со звуком (высокий MEI разрешит)
       if (st.playing) p.playVideo?.(); else p.pauseVideo?.();
     } catch { /**/ }
-    // autoplay-политика: показываем «Включить звук» ТОЛЬКО если звук ни разу не пошёл (жест ещё не получен).
-    // После первого успешного проигрывания hasPlayedRef=true → плашка больше не мелькает при смене трека/паузе/сике
-    // (буферизация — это состояния 3/1, не блок). Проверяем один раз, с запасом, только для НЕразблокированного плеера.
+    // autoplay-политика браузера. playVideo идёт в iframe через postMessage → теряет user-activation, поэтому
+    // старт СО ЗВУКОМ у большинства (низкий media-engagement) блокируется, а клик по «Включить звук» напрямую
+    // playVideo тоже не разблокирует. Решение: если через 2.5с звук не пошёл сам — крутим ВИДЕО ТИХО (muted-autoplay
+    // активацию не требует, всегда ок) и показываем плашку; она затем лишь снимет mute (unMute у уже играющего видео
+    // активацию НЕ требует). Проверка один раз и только пока звук ни разу не шёл — паузу/сик/смену трека не дёргает.
     if (st.playing && !hasPlayedRef.current) {
       window.setTimeout(() => {
         try {
           const pl = playerRef.current; if (!pl) return;
           if (!useMusic.getState().playing || hasPlayedRef.current) return;
-          const state = pl.getPlayerState?.();            // 1 играет, 3 буфер — норм; -1/5/2 — застряло; muted при vol>0 — браузер форс-мьютнул
-          const blockedMute = state === 1 && pl.isMuted?.() && volRef.current > 0;
-          if ((state !== 1 && state !== 3) || blockedMute) setNeedGesture(true);
+          const state = pl.getPlayerState?.();
+          if (state === 1 && !pl.isMuted?.()) { hasPlayedRef.current = true; setNeedGesture(false); return; } // MEI разрешил звук сам
+          try { pl.mute?.(); pl.playVideo?.(); } catch { /**/ }  // заблокировано → гарантируем тихое проигрывание в синхроне
+          setNeedGesture(true);
         } catch { /**/ }
       }, 2500);
     }
@@ -70,7 +80,7 @@ export function MusicPlayer({ enabled }: { enabled: boolean }) {
         width: '256', height: '144',
         playerVars: { controls: 0, disablekb: 1, modestbranding: 1, rel: 0, playsinline: 1, iv_load_policy: 3 },
         events: {
-          onReady: () => { readyRef.current = true; try { playerRef.current.setVolume(volRef.current); } catch { /**/ } sync(); },
+          onReady: () => { readyRef.current = true; try { playerRef.current.setVolume(ytVol(volRef.current)); } catch { /**/ } sync(); },
           onStateChange: (e: any) => {
             if (e.data === YT.PlayerState.ENDED) useMusic.getState().onEnded();
             // Звук реально пошёл (не форс-мьют) → жест получен, плашку прячем навсегда.
@@ -99,13 +109,18 @@ export function MusicPlayer({ enabled }: { enabled: boolean }) {
   }, [enabled]);
 
   const onAdd = async () => {
-    if (!addUrl.trim()) return;
+    if (adding || !addUrl.trim()) return; // не даём копить клики, пока грузится название текущего
+    setAdding(true);
     const e = await useMusic.getState().add(addUrl);
+    setAdding(false);
     if (e) setErr(e); else { setErr(''); setAddUrl(''); }
   };
   const gesture = () => {
-    try { const p = playerRef.current; if (p && readyRef.current) { p.unMute?.(); p.setVolume(volRef.current); p.seekTo(useMusic.getState().currentPos(), true); p.playVideo?.(); } } catch { /**/ }
-    setNeedGesture(false);
+    // Видео к этому моменту уже крутится ТИХО (см. sync-фолбэк) → снятие mute активацию не требует и проходит.
+    // Прячем плашку не сразу, а по факту размьюта (isMuted=false) — иначе спрятали бы при неудаче.
+    try { const p = playerRef.current; if (p && readyRef.current) { p.unMute?.(); p.setVolume(ytVol(volRef.current)); p.seekTo(useMusic.getState().currentPos(), true); p.playVideo?.(); } } catch { /**/ }
+    const confirm = () => { try { const pl = playerRef.current; if (pl && !pl.isMuted?.()) { hasPlayedRef.current = true; setNeedGesture(false); } } catch { /**/ } };
+    window.setTimeout(confirm, 250); window.setTimeout(confirm, 800);
   };
 
   if (!enabled) return null;
@@ -141,8 +156,8 @@ export function MusicPlayer({ enabled }: { enabled: boolean }) {
             <span className="mus-t">{vol}%</span>
           </div>
           <div className="mus-add">
-            <input placeholder="Ссылка YouTube…" value={addUrl} onChange={(e) => { setAddUrl(e.target.value); setErr(''); }} onKeyDown={(e) => { if (e.key === 'Enter') onAdd(); }} />
-            <button onClick={onAdd} data-tip="Добавить в очередь"><Icon name="plus" sm /></button>
+            <input placeholder="Ссылка YouTube…" value={addUrl} disabled={adding} onChange={(e) => { setAddUrl(e.target.value); setErr(''); }} onKeyDown={(e) => { if (e.key === 'Enter') onAdd(); }} />
+            <button onClick={onAdd} disabled={adding || !addUrl.trim()} data-tip="Добавить в очередь">{adding ? <span className="mus-spin" /> : <Icon name="plus" sm />}</button>
           </div>
           {err ? <div className="mus-err">{err}</div> : null}
           <div className="mus-queue">

@@ -1307,7 +1307,11 @@
 .mus-add input{flex:1;min-width:0;background:var(--panel2);border:1px solid var(--line-2);border-radius:8px;padding:7px 10px;font-size:12px;color:var(--txt)}
 .mus-add input:focus{border-color:var(--accent);outline:none}
 .mus-add button{width:34px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;border-radius:8px;background:var(--accent);color:#fff}
-.mus-add button:hover{background:var(--accent-h)}
+.mus-add button:hover:not(:disabled){background:var(--accent-h)}
+.mus-add button:disabled{opacity:.5;cursor:not-allowed}
+.mus-add input:disabled{opacity:.6;cursor:not-allowed}
+.mus-spin{width:14px;height:14px;border-radius:50%;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;animation:musSpin .6s linear infinite}
+@keyframes musSpin{to{transform:rotate(360deg)}}
 .mus-err{font-size:11px;color:var(--red);margin-top:5px}
 .mus-queue{margin-top:9px;max-height:180px;overflow-y:auto;overflow-x:hidden;display:flex;flex-direction:column;gap:1px}
 .mus-empty{font-size:11.5px;color:var(--muted);padding:10px 4px;text-align:center}
