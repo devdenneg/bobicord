@@ -642,10 +642,12 @@ export class Engine {
   /* ---------- качество связи в голосовом (индикатор + пинг) ---------- */
   private startConnPoll() {
     if (this.connTimer) return;
+    document.addEventListener('visibilitychange', this.onVisible);
     this.pollPing();
     this.connTimer = window.setInterval(() => this.pollPing(), 2500);
   }
   private stopConnPoll() {
+    document.removeEventListener('visibilitychange', this.onVisible);
     if (this.connTimer) { clearInterval(this.connTimer); this.connTimer = null; }
     this.pingMs = null; this.connQuality = 'unknown';
   }
@@ -654,6 +656,7 @@ export class Engine {
     // Watchdog: контекст публикации мика мог родиться/остаться 'suspended' (getUserMedia-промпт съел
     // user-activation) → пиры не слышат, хотя локально «всё работает». Держим его running, пока в войсе.
     if (this.inVoice && this.micActx && this.micActx.state !== 'running') this.ensureVoiceAudioRunning();
+    if (this.inVoice) void this.checkMicAlive(true); // мобилка: пере-снять мик, если источник умер на бэкграунде
     const track = this.voiceRoom?.localParticipant.getTrackPublication(Track.Source.Microphone)?.track;
     if (!track) return;
     try {
@@ -731,6 +734,33 @@ export class Engine {
     document.addEventListener('touchstart', unlock, true);
   }
   private clearAudioUnlock() { if (this.audioUnlock) { this.audioUnlock(); this.audioUnlock = null; } }
+  // Мобилка: свернул PWA (ушёл в TG) → на переднем плане gUM-источник мог УМЕРЕТЬ: iOS закрывает
+  // захват перманентно (readyState='ended'), часть Android держит «залипший» muted. micActx резюмит
+  // watchdog, но мёртвый источник шлёт ТИШИНУ в publish-destination → пиры не слышат (сам слышишь
+  // всех — downstream цел). Лечение — пере-снять мик (re-getUserMedia). ended рестартим сразу; muted
+  // даём авто-размуту (обычно снимается за тик), «залипший» >2 тиков (~5с) — рестартим.
+  private micRestarting = false;
+  private micMutedTicks = 0;
+  private async checkMicAlive(fromWatchdog = false) {
+    if (!this.inVoice || !this.voiceRoom || this.micRestarting || !this.micActx) return;
+    const t = this.micRaw?.getAudioTracks()[0];
+    const ended = !t || t.readyState === 'ended';
+    if (!ended && t && t.muted && fromWatchdog) this.micMutedTicks++;
+    else if (t && !t.muted) this.micMutedTicks = 0;
+    if (!ended && this.micMutedTicks < 2) return;
+    this.micRestarting = true; this.micMutedTicks = 0;
+    try { this.stopMic(); await this.startMic(); } catch { /**/ }
+    finally { this.micRestarting = false; }
+  }
+  // Возврат PWA на передний план: мгновенно резюмим контексты + проверяем живость источника
+  // (не ждём до 2.5с следующего watchdog-тика). muted-рестарт тут не делаем — только ended.
+  private onVisible = () => {
+    if (document.hidden || !this.inVoice) return;
+    this.micActx?.resume?.().catch(() => {});
+    this.spCtx?.resume?.().catch(() => {});
+    void this.checkMicAlive(false);
+    this.ensureVoiceAudioRunning();
+  };
   private stopMic() {
     const p = this.micPub();
     if (p && p.track) { try { this.voiceRoom?.localParticipant.unpublishTrack(p.track, true); } catch { /**/ } }

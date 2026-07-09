@@ -1428,7 +1428,7 @@ export function ServerView() {
   const eng = useEngine();
   const setModal = useStore((s) => s.setModal);
   const [minimized, setMin] = useState(false);
-  const [mtab, setMtab] = useState<'channels' | 'main' | 'members'>('main');
+  const [mtab, setMtab] = useState<'channels' | 'main' | 'members'>('channels'); // мобилка: по умолчанию вкладка «Голос»
   const hasStreams = eng.streams.length > 0;
   const split = hasStreams && !minimized;
   useEffect(() => { if (!hasStreams) setMin(false); }, [hasStreams]);
