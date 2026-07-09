@@ -181,6 +181,39 @@ function renditionAvailable(srcTree, rendition) {
 // всегда включён: прод-обрывы иначе недиагностируемы (раньше тут не было НИ ОДНОЙ строки).
 function tlog(msg) { console.log(`[tree] ${msg}`); }
 
+// Порог «линк плох» для строки здоровья (см. treeHealth). Ниже него молчим: на тике 2с
+// здоровое дерево дало бы 43k строк в сутки на пустом месте.
+const HEALTH_LOSS = 0.01;   // 1% потерь
+const HEALTH_RTT = 200;     // мс
+// Живое дерево подтверждаем изредка: «нет строк» иначе неотличимо от «сигналинг умер».
+const HEALTH_BASELINE_MS = 60_000;
+
+/**
+ * Здоровье дерева раз в тик. Данные уже есть: onStats кладёт в каждый узел linkLoss/linkRtt
+ * (EWMA потерь на линке ОТ ЕГО РОДИТЕЛЯ — vrelay репортит по каждому зрителю, вещатель по
+ * своим прямым детям). До этого они использовались только для ABR и молча выбрасывались,
+ * поэтому «у всех зрителей фризы» на сервере выглядело как тишина.
+ *
+ * Печатаем только проблемные тики (+ baseline раз в минуту), иначе зальём VPS.
+ */
+function treeHealth(tree, key) {
+  const now = Date.now();
+  const bad = [];
+  let children = 0;
+  for (const n of tree.nodes.values()) {
+    if (n.parent) children++;
+    if (!n.statsAt || now - n.statsAt > STATS_TTL_MS) continue; // протухший сэмпл — не сигнал
+    if ((n.linkLoss || 0) > HEALTH_LOSS || (n.linkRtt || 0) > HEALTH_RTT) {
+      bad.push(`${n.identity || n.id}<-${n.parent || '?'} loss=${((n.linkLoss || 0) * 100).toFixed(1)}% rtt=${Math.round(n.linkRtt || 0)}мс`);
+    }
+  }
+  const due = !tree.healthAt || now - tree.healthAt >= HEALTH_BASELINE_MS;
+  if (!bad.length && !due) return;
+  tree.healthAt = now;
+  const target = tree.targetBitrate ? `${Math.round(tree.targetBitrate / 1000)} kbps` : '-';
+  tlog(`[health ${key}] узлов ${tree.nodes.size}, линков ${children}, цель ${target}` + (bad.length ? ` | ПЛОХИЕ: ${bad.join('; ')}` : ' | линки чисты'));
+}
+
 class Tree {
   constructor(streamId) { this.streamId = streamId; this.nodes = new Map(); this.broadcasterId = null; }
 }
@@ -1537,7 +1570,10 @@ function attachTreeServer(httpServer, opts) {
 
   // Э8 ABR: раз в тик пересчитываем целевой битрейт каждого дерева и шлём корню, если сменился.
   const abrTimer = setInterval(() => {
-    for (const key of mgr.trees.keys()) {
+    for (const [key, tree] of mgr.trees) {
+      // Здоровье — для ВСЕХ деревьев, включая рендишн-: зритель на 720p фризит по своему
+      // линку, и abrTick для него молчит (у рендишн-корня abr:false). Гейт ниже — только ABR.
+      treeHealth(tree, key);
       // Д3: ABR/set-bitrate — только для source-дерева. Рендишн-корень = ffmpeg с фикс. GOP/CBR,
       // set-bitrate ему бессмыслен (abrTick и так вернёт null: у рендишн-корня abr:false). Гейт
       // для явности и на случай будущих рендишн-корней с abr.

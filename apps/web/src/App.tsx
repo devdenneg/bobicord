@@ -56,6 +56,7 @@ function Rail() {
       {me.isAdmin ? <button className="railbtn rail-admin tip-l" data-tip="Админка" onClick={goAdmin}><Icon name="users" /></button> : null}
       {/* Настройки — глобально в рейле (доступны и на главной, не только внутри сервера) */}
       <button className="railbtn rail-set tip-l" data-tip="Настройки" onClick={() => setModal('settings')}><Icon name="gear" /></button>
+      <button className="railbtn rail-dl tip-l" data-tip="Загрузки" onClick={() => setModal('downloads')}><Icon name="download" /></button>
       <button className="railbtn rail-me tip-l" data-tip="Профиль" style={{ background: me.avatarUrl ? '#0000' : avColor(me.displayName, me.avatarColor) }} onClick={() => setModal('profile')}>{me.avatarUrl ? <img className="avimg" src={resolveUploadUrl(me.avatarUrl)} alt="" /> : initial(me.displayName)}</button>
     </nav>
   );

@@ -5,6 +5,7 @@ import { api } from '../api';
 import { Icon } from '../Icon';
 import { Backdrop } from './Backdrop';
 import { listMonitors, listWindows, startNativeBroadcast, setNativeBroadcastSource, stopNativeBroadcast, onBroadcastStats } from '../native';
+import { startBroadcasterSession, endAnyBroadcasterSession } from '../diag';
 import type { MonitorInfo, WindowInfo, BroadcastStats, CaptureSource } from '../native';
 import { pickPreset, type PresetMode } from '../presets';
 import { measureUpload, getCachedProbe, clearCachedProbe, type ProbeResult } from '../transport/probe';
@@ -244,6 +245,9 @@ export function BroadcastModal() {
       // Натив клампит max_children в [1..10], сервер — в [0..MAX_CHILDREN_CAP].
       const directSlots = cfg.allowDirectPeers ? 1 + cfg.maxDirectChildren : 1;
       await startNativeBroadcast(me.username, me.username, bcSrv, { source, maxWidth: w, maxHeight: h, fps, bitrateBps, autoBitrate, audioTargetPid, maxDirectChildren: directSlots, presetMode: preset ? cfg.presetMode : 'manual' });
+      // streamId вещателя == me.username (см. вызов выше). Сессия закроется в любой из
+      // трёх точек стопа (кнопка / store.endBroadcast / relay-broadcast-stopped).
+      startBroadcasterSession(me.username);
       saveConfig(cfg);
       useStore.getState().setBroadcastLive(true);
       api.streamStart(bcSrv).catch(() => {}); // фоновый push участникам не в комнате
@@ -262,7 +266,10 @@ export function BroadcastModal() {
   async function stop() {
     setBusy(true);
     try { await stopNativeBroadcast(); useStore.getState().setBroadcastLive(false); close(); }
-    catch (e: any) { setErr(String(e?.message || e)); } finally { setBusy(false); }
+    catch (e: any) { setErr(String(e?.message || e)); }
+    // ПОСЛЕ остановки: stop_broadcast джойнит потоки, и самые ценные строки (почему
+    // энкодер встал, как рвались ICE-кандидаты) пишутся именно на закрытии.
+    finally { endAnyBroadcasterSession(); setBusy(false); }
   }
 
   // Пикер источника (сегмент Экран/Окно + монитор/окно) — общий для формы старта и

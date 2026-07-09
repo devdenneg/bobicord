@@ -322,7 +322,7 @@ pub async fn start(
     // энкод/захват не прерываются, зрители переджойнятся сами.
     let (cmd_tx, evt_rx) = signaling::connect(ws_url, join, true);
 
-    let mgr = peer::PeerManager::new(&stream_id, cmd_tx.clone(), force_keyframe.clone())?;
+    let mgr = peer::PeerManager::new(&stream_id, cmd_tx.clone(), force_keyframe.clone(), stats.clone())?;
     let video_track = mgr.video_track.clone();
     let audio_track = mgr.audio_track.clone();
 
@@ -458,6 +458,7 @@ pub async fn start(
                     for c in chunks {
                         stats_enc.encoded_frames.fetch_add(1, Ordering::Relaxed);
                         stats_enc.encoded_bytes.fetch_add(c.data.len() as u64, Ordering::Relaxed);
+                        if c.is_keyframe { stats_enc.keyframes.fetch_add(1, Ordering::Relaxed); }
                         let sample = Sample { data: Bytes::from(c.data), duration: real_dur, ..Default::default() };
                         let track = video_track.clone();
                         let w_start = Instant::now();
@@ -558,6 +559,10 @@ async fn run_signaling_loop(
     let mut stats_tick = tokio::time::interval(Duration::from_secs(2));
     let mut prev_at = Instant::now();
     let (mut prev_cap, mut prev_enc, mut prev_bytes) = (0u64, 0u64, 0u64);
+    // capture_drops кумулятивен и уходил только в DebugSnapshot (дебаг-панель). В логе
+    // его не было вовсе — по файлу нельзя было сказать, ронял ли захват кадры. Дельта
+    // за окно попадает в строку `timing:` рядом с секциями, которые её объясняют.
+    let mut prev_drops = 0u64;
     // Причина самостоятельной остановки — раньше фронт узнавал только "трансляция
     // умерла", без "почему", и молча откатывался в форму настроек (см. StopInfo ниже).
     // Присваивается только на выходных ветках (break), поэтому без инициализатора —
@@ -578,7 +583,14 @@ async fn run_signaling_loop(
                     // в [FLOOR, потолок] — сервер уже клампит, но не доверяем сети вслепую.
                     Some(TreeEvent::SetBitrate { bps }) => {
                         let clamped = bps.clamp(BITRATE_FLOOR, meta.target_bitrate_bps);
-                        target_bitrate.store(clamped, Ordering::Relaxed);
+                        // Логируем только реальную смену цели: сервер шлёт set-bitrate каждый
+                        // тик. Просадка цели = сервер увидел худший линк в дереве — коррелирует
+                        // с фризами у зрителей, но `encoder: bitrate ->` показывал бы её лишь
+                        // когда ICodecAPI принял значение (не в пресет-режиме).
+                        let prev = target_bitrate.swap(clamped, Ordering::Relaxed);
+                        if prev != clamped {
+                            log::info!("net: сервер снизил цель {:.1} -> {:.1} Мбит/с", prev as f64 / 1e6, clamped as f64 / 1e6);
+                        }
                         // Лестница качества: битрейт упал — режем fps/разрешение вслед
                         // (стабильность важнее чёткости; см. QualityLadder). Д5: в пресет-режиме
                         // (Плавность/Качество) и server-first+CBR лестница отключена — адаптация
@@ -637,9 +649,12 @@ async fn run_signaling_loop(
                 let enc_n = stats.encode_samples.swap(0, Ordering::Relaxed);
                 let (enc_avg, enc_max) = SharedStats::take_window(&stats.encode_ns, &stats.encode_max_ns, enc_n);
                 let write_avg = stats.write_ns.swap(0, Ordering::Relaxed) as f64 / enc_n.max(1) as f64 / 1e6;
+                let drops = snapshot.dropped_frames;
+                let drops_delta = drops.saturating_sub(prev_drops);
+                prev_drops = drops;
                 if cb_n > 0 || enc_n > 0 {
                     log::info!(
-                        "timing: cb {cb_avg:.1}/{cb_max:.1} мс (avg/max) = readback {readback_avg:.1} + convert {convert_avg:.1} | encode {enc_avg:.1}/{enc_max:.1} | write {write_avg:.1}"
+                        "timing: cb {cb_avg:.1}/{cb_max:.1} мс (avg/max) = readback {readback_avg:.1} + convert {convert_avg:.1} | encode {enc_avg:.1}/{enc_max:.1} | write {write_avg:.1} | drops +{drops_delta} (всего {drops})"
                     );
                 }
 
@@ -647,7 +662,32 @@ async fn run_signaling_loop(
                 // Э8 ABR: реальные loss/rtt по каждому детскому линку (RTCP RR через get_stats) —
                 // сервер агрегирует worst-link по дереву и решает целевой битрейт. Раньше слали нули.
                 let cur_target = target_bitrate.load(Ordering::Relaxed);
-                let to_child: Vec<serde_json::Value> = mgr.link_stats().await.into_iter()
+                let links = mgr.link_stats().await;
+
+                // Сетевая половина картины. Захват/энкодер могут показывать идеальные цифры,
+                // пока зрители фризят: потеря пакета вниз по дереву -> декодер ждёт IDR ->
+                // «подвисло на секунду». Единственные улики — loss/rtt по линку и поток PLI.
+                // Раньше loss/rtt уходили только серверу, а PLI логировался на debug (при
+                // LevelFilter::Info — молча). По файлу лога отличить «сеть сыпется» от
+                // «вещатель не успевает» было нечем.
+                let pli = stats.pli_count.swap(0, Ordering::Relaxed);
+                let keyframes = stats.keyframes.swap(0, Ordering::Relaxed);
+                let links_str = if links.is_empty() {
+                    "нет RR".to_string()
+                } else {
+                    links.iter()
+                        .map(|(id, loss, rtt)| format!("{id} loss={:.1}% rtt={rtt:.0}мс", loss * 100.0))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                log::info!(
+                    "net: детей {} | {links_str} | битрейт {:.1}/{:.1} Мбит (факт/цель) | PLI +{pli} | IDR +{keyframes}",
+                    snapshot.children,
+                    snapshot.bitrate_actual_bps / 1e6,
+                    cur_target as f64 / 1e6,
+                );
+
+                let to_child: Vec<serde_json::Value> = links.into_iter()
                     .map(|(id, loss, rtt)| json!({ "id": id, "bitrate": cur_target, "rtt": rtt, "loss": loss }))
                     .collect();
                 let _ = mgr.send_stats(to_child, cur_target);

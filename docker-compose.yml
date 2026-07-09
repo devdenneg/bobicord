@@ -1,9 +1,24 @@
+# Ротация логов Docker. Без неё драйвер json-file пишет БЕЗ ОГРАНИЧЕНИЙ: контейнеры с
+# restart:unless-stopped живут месяцами, а диагностика стрима (строки `[health]` дерева и
+# `ingest ...` у vrelay) объём только добавила. Переполнение диска на VPS убило бы и БД, и
+# загрузки, и сам деплой.
+#
+# Бюджет ~1.5 ГБ на все сервисы (max-size × max-file), плюс каталог data/diag с
+# собственным капом 100 МБ (см. pruneDiag в apps/server/index.js) — суммарно под 2 ГБ.
+# max-file:2 = один активный файл + один повёрнутый, то есть история не меньше max-size.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "100m"
+    max-file: "2"
+
 services:
   livekit:
     image: livekit/livekit-server:latest
     command: --config /etc/livekit.yaml
     network_mode: host
     restart: unless-stopped
+    logging: *logging
     volumes:
       # своя копия livekit.example.yaml с реальными ключами (в .gitignore)
       - ./livekit.yaml:/etc/livekit.yaml:ro
@@ -12,6 +27,7 @@ services:
     image: ghcr.io/devdenneg/bobicord-server:latest
     pull_policy: always
     restart: unless-stopped
+    logging: *logging
     environment:
       - LK_KEY=${LK_KEY}
       - LK_SECRET=${LK_SECRET}
@@ -35,6 +51,7 @@ services:
     image: coturn/coturn:latest
     network_mode: host
     restart: unless-stopped
+    logging: *logging
     volumes:
       - ./coturn/turnserver.conf:/etc/turnserver.conf:ro
     environment:
@@ -59,6 +76,13 @@ services:
     pull_policy: always
     network_mode: host
     restart: unless-stopped
+    # Медиаузел: сюда пишутся строки `ingest ...` (разрывы RTP, отдача детям) — самый
+    # многословный сервис и самый нужный при разборе фризов. Отдаём ему больше истории.
+    logging:
+      driver: json-file
+      options:
+        max-size: "200m"
+        max-file: "3"
     environment:
       - SESSION_SECRET=${SESSION_SECRET}
       - TREE_WS_URL=ws://127.0.0.1:3000/tree
@@ -85,6 +109,7 @@ services:
     pull_policy: always
     network_mode: host
     restart: unless-stopped
+    logging: *logging
     volumes:
       - caddy_data:/data
       - caddy_config:/config

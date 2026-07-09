@@ -181,6 +181,17 @@ export async function onNativeWatchEnded(cb: (streamId: string) => void): Promis
   return un;
 }
 
+/* ---------- диагностика: лог сессии из Rust (diag.rs) ---------- */
+
+/** Забирает и очищает кольцевой буфер лога текущей сессии (включая строки webrtc-rs:
+ *  ICE/TURN-ошибки). Пусто в браузере. HTTP-отправку делает веб-сторона — там уже есть
+ *  session-JWT. */
+export async function diagTakeLog(): Promise<string[]> {
+  if (!isTauri) return [];
+  try { const { invoke } = await import('@tauri-apps/api/core'); return await invoke<string[]>('diag_take_log'); }
+  catch { return []; }
+}
+
 /* ---------- глобальные хоткеи мута (низкоуровневый WH_KEYBOARD_LL хук, только Windows) ---------- */
 
 import type { Keybinds } from './types';
@@ -214,4 +225,27 @@ export async function saveFileDialog(bytes: Uint8Array, defaultName: string): Pr
   const { writeFile } = await import('@tauri-apps/plugin-fs');
   await writeFile(path, bytes);
   return path;
+}
+
+/* ---------- журнал "Загрузки" (натив): открыть/показать в папке/проверить наличие ---------- */
+
+/** Открывает файл в ассоциированной программе (Rust ShellExecuteW). No-op в браузере. */
+export async function openFile(path: string): Promise<void> {
+  if (!isTauri) return;
+  const { invoke } = await import('@tauri-apps/api/core');
+  await invoke('open_file', { path });
+}
+
+/** Открывает проводник с выделенным файлом (explorer /select). No-op в браузере. */
+export async function revealInFolder(path: string): Promise<void> {
+  if (!isTauri) return;
+  const { invoke } = await import('@tauri-apps/api/core');
+  await invoke('reveal_in_folder', { path });
+}
+
+/** Батч-проверка наличия файлов на диске (по индексам, как paths). [] в браузере. */
+export async function pathsExist(paths: string[]): Promise<boolean[]> {
+  if (!isTauri || !paths.length) return [];
+  const { invoke } = await import('@tauri-apps/api/core');
+  return invoke<boolean[]>('paths_exist', { paths });
 }

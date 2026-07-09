@@ -40,6 +40,8 @@ import ShieldRounded from '@mui/icons-material/ShieldRounded';
 import BadgeRounded from '@mui/icons-material/BadgeRounded';
 import AttachFileRounded from '@mui/icons-material/AttachFileRounded';
 import InsertDriveFileRounded from '@mui/icons-material/InsertDriveFileRounded';
+import FolderRounded from '@mui/icons-material/FolderRounded';
+import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded';
 
 const MAP: Record<string, SvgIconComponent> = {
   mic: MicRounded, 'mic-sm': MicRounded, 'mic-off': MicOffRounded,
@@ -58,6 +60,7 @@ const MAP: Record<string, SvgIconComponent> = {
   trash: DeleteRounded, edit: EditRounded, keyboard: KeyboardRounded,
   bell: NotificationsRounded, shield: ShieldRounded, badge: BadgeRounded,
   attach: AttachFileRounded, file: InsertDriveFileRounded,
+  folder: FolderRounded, 'open-in': OpenInNewRounded,
 };
 
 export function Icon({ name, sm }: { name: string; sm?: boolean }) {

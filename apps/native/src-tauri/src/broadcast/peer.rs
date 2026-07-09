@@ -27,6 +27,7 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 use webrtc::track::track_local::TrackLocal;
 
 use super::signaling::TreeCmd;
+use super::stats::StatsHandle;
 // Общие хелперы (read_link_stats/now_ms/parse_ice_server/H264_FMTP) вынесены в relay-core
 // (link.rs) — общий код с relay-ядром и headless-агентом. Реэкспорт сохраняет старые пути.
 pub use relay_core::link::{now_ms, read_link_stats};
@@ -43,10 +44,11 @@ pub struct PeerManager {
     /// Момент последнего форса IDR по PLI (мс от эпохи) — rate-limit против шторма
     /// PLI от N детей (без него каждый зритель с потерями держал бы сплошные IDR).
     last_pli_ms: Arc<AtomicU64>,
+    stats: StatsHandle,
 }
 
 impl PeerManager {
-    pub fn new(stream_id: &str, cmd_tx: UnboundedSender<TreeCmd>, force_keyframe: Arc<AtomicBool>) -> Result<Self, String> {
+    pub fn new(stream_id: &str, cmd_tx: UnboundedSender<TreeCmd>, force_keyframe: Arc<AtomicBool>, stats: StatsHandle) -> Result<Self, String> {
         let mut m = MediaEngine::default();
         m.register_codec(
             RTCRtpCodecParameters {
@@ -100,6 +102,7 @@ impl PeerManager {
             cmd_tx,
             force_keyframe,
             last_pli_ms: Arc::new(AtomicU64::new(0)),
+            stats,
         })
     }
 
@@ -126,6 +129,7 @@ impl PeerManager {
                 let fk = self.force_keyframe.clone();
                 let last_pli = self.last_pli_ms.clone();
                 let child_dbg = child_id.clone();
+                let pli_stats = self.stats.clone();
                 tokio::spawn(async move {
                     while let Ok((pkts, _)) = sender.read_rtcp().await {
                         let want_idr = pkts.iter().any(|p| {
@@ -134,6 +138,10 @@ impl PeerManager {
                                 || a.downcast_ref::<FullIntraRequest>().is_some()
                         });
                         if want_idr {
+                            // Считаем ДО rate-limit: подавленные запросы — тоже потери,
+                            // и именно их шторм отличает «сеть сыпется» от «один зритель
+                            // подключился». Иначе счётчик упирался бы в 1/с.
+                            pli_stats.pli_count.fetch_add(1, Ordering::Relaxed);
                             let now = now_ms();
                             let prev = last_pli.load(Ordering::Relaxed);
                             if now.saturating_sub(prev) >= 1000 {

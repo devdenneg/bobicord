@@ -31,6 +31,14 @@ pub struct SharedStats {
     pub write_ns: AtomicU64,
     /// Знаменатель encode/write.
     pub encode_samples: AtomicU64,
+    /// PLI/FIR от детей за окно = «потерял keyframe, дай IDR». Прямая улика потерь ВНИЗ
+    /// по дереву: захват и энкодер при этом могут показывать идеальные цифры, а зритель
+    /// фризит до следующего IDR. Считаются ВСЕ запросы, включая подавленные rate-limit'ом
+    /// (1с на корень) — иначе шторм PLI выглядел бы как единичный запрос.
+    pub pli_count: AtomicU64,
+    /// Сколько IDR реально ушло в трек за окно (по MFSampleExtension_CleanPoint).
+    /// Частые IDR без смены разрешения = мы отвечаем на PLI, т.е. пакеты теряются.
+    pub keyframes: AtomicU64,
 }
 
 impl SharedStats {

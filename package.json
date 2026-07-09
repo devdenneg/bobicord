@@ -7,6 +7,7 @@
     "dev": "npm --prefix apps/web run dev",
     "build": "npm --prefix apps/web run build",
     "typecheck": "npm --prefix apps/web run typecheck",
+    "diag": "node scripts/diag.mjs",
     "up": "docker compose up -d --build",
     "down": "docker compose down",
     "logs": "docker compose logs -f"
