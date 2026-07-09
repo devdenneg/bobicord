@@ -389,7 +389,7 @@ function MemberRow({ m, anim }: { m: Member; anim?: string }) {
   const toast = useStore((s) => s.toast);
   const refreshMembers = useStore((s) => s.refreshMembers);
   const pr = eng.presence[m.username];
-  const st = pr?.inVoice ? 'voice' : pr?.online ? 'online' : 'offline';
+  const st = pr?.inVoice ? 'voice' : pr?.away ? 'away' : pr?.online ? 'online' : 'offline';
   const streaming = pr?.streaming;
   const self = m.username === me.username;
   const watching = !!eng.watching[m.username];

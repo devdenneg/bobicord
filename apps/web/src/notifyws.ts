@@ -9,10 +9,18 @@ import { useStore } from './store';
 let ws: WebSocket | null = null;
 let reconnectTimer: number | null = null;
 let closed = false;
+let presenceAway = false; // последнее заявленное idle-состояние (шлём серверу для away/жёлтого статуса)
 
 function scheduleReconnect() {
   if (reconnectTimer || closed) return;
   reconnectTimer = window.setTimeout(() => { reconnectTimer = null; connectNotifyWs(); }, 4000);
+}
+
+// Away-статус (см. idle.ts): апп давно не трогали → away:true (жёлтый). Шлём по глобальному notify-WS,
+// сервер помечает сессию idle и отдаёт away в presence. На реконнекте переотправляем в onopen.
+export function sendPresence(away: boolean): void {
+  presenceAway = away;
+  if (ws && ws.readyState === WebSocket.OPEN) { try { ws.send(JSON.stringify({ t: 'presence', away })); } catch { /**/ } }
 }
 
 export function connectNotifyWs() {
@@ -22,6 +30,7 @@ export function connectNotifyWs() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   const url = webOrigin().replace(/^http/, 'ws') + '/ws?token=' + encodeURIComponent(token);
   try { ws = new WebSocket(url); } catch { scheduleReconnect(); return; }
+  ws.onopen = () => { try { ws!.send(JSON.stringify({ t: 'presence', away: presenceAway })); } catch { /**/ } }; // переотправляем текущий idle-статус
   ws.onmessage = (ev) => {
     let d: any; try { d = JSON.parse(ev.data); } catch { return; }
     // кросс-девайс: прочитано на другом устройстве этого юзера → сбрасываем unread локально (и для

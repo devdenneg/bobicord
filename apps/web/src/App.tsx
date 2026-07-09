@@ -46,7 +46,7 @@ function Rail() {
         <button key={s.id} className={'railbtn tip-l' + (activeId === s.id ? ' active' : '') + (eng.voiceServerId === s.id && activeId !== s.id ? ' connected' : '') + (un ? ' unread' : '')}
           data-tip={eng.voiceServerId === s.id && activeId !== s.id ? s.name + ' · в голосе' : s.name}
           style={{ background: s.iconUrl ? '#0000' : avColor(s.name, s.iconColor) }} onClick={() => openServer(s.id)}>
-          {s.iconUrl ? <img className="avimg" src={resolveUploadUrl(s.iconUrl)} alt="" /> : initial(s.name)}{s.onlineCount ? <span className="dot green" /> : null}
+          {s.iconUrl ? <img className="avimg" src={resolveUploadUrl(s.iconUrl)} alt="" /> : initial(s.name)}{(s.online || []).some((m) => m.inVoice) ? <span className="dot green" /> : null}
           {un ? <span className="rail-badge">{un > 99 ? '99+' : un}</span> : null}
         </button>
         );
@@ -78,9 +78,9 @@ function Cluster({ members, cap = 5 }: { members: OnlineMember[]; cap?: number }
   return (
     <div className="cluster">
       {shown.map((m) => (
-        <span key={m.username} className={'mini-av' + (m.streaming ? ' live' : m.inVoice ? ' voice' : '')}
+        <span key={m.username} className={'mini-av' + (m.streaming ? ' live' : m.inVoice ? ' voice' : m.away ? ' away' : '')}
           style={{ background: faceBg(m.avatarUrl, m.displayName, m.avatarColor) }}
-          title={m.displayName + (m.streaming ? ' · трансляция' : m.inVoice ? ' · в голосе' : ' · в сети')}>
+          title={m.displayName + (m.streaming ? ' · трансляция' : m.inVoice ? ' · в голосе' : m.away ? ' · нет на месте' : ' · в сети')}>
           <Face url={m.avatarUrl} name={m.displayName} color={m.avatarColor} />
         </span>
       ))}
@@ -101,7 +101,7 @@ function PresenceRow({ on }: { on: OnlineMember[] }) {
           <div key={m.username} className="sc-tip-row">
             <span className="sc-tip-av" style={{ background: faceBg(m.avatarUrl, m.displayName, m.avatarColor) }}><Face url={m.avatarUrl} name={m.displayName} color={m.avatarColor} /></span>
             <span className="sc-tip-nm">{m.displayName}</span>
-            <span className={'sc-tip-st' + (m.streaming ? ' live' : m.inVoice ? ' voice' : '')}>{m.streaming ? 'трансляция' : m.inVoice ? 'в голосе' : 'в сети'}</span>
+            <span className={'sc-tip-st' + (m.streaming ? ' live' : m.inVoice ? ' voice' : m.away ? ' away' : '')}>{m.streaming ? 'трансляция' : m.inVoice ? 'в голосе' : m.away ? 'нет на месте' : 'в сети'}</span>
           </div>
         ))}
       </div>

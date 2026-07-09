@@ -118,7 +118,7 @@ export const api = {
   // аккаунтные настройки (хоткеи и т.п.) — следуют за юзером на любом устройстве, не за localStorage
   getMySettings: () => req<{ data: any }>('GET', '/me/settings'),
   putMySettings: (data: any) => req<{ ok: boolean }>('PUT', '/me/settings', { data }),
-  presence: (id: string) => req<{ online: string[]; voice?: Record<string, string> }>('GET', `/servers/${id}/presence`),
+  presence: (id: string) => req<{ online: string[]; voice?: Record<string, string>; away?: string[] }>('GET', `/servers/${id}/presence`),
   // all:true — «прочитать всё» (сервер выставит last_read=MAX id, покрывая живые сообщения без sid). Возвращает актуальный lastRead.
   markRead: (id: string, lastId: number, all?: boolean) => req<{ ok: boolean; lastRead: number }>('POST', `/servers/${id}/read`, { lastId, all }),
   getUnread: () => req<Record<string, number>>('GET', '/unread'),

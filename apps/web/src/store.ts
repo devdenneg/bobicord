@@ -6,6 +6,7 @@ import { setSettings } from './settings';
 import { notifPermission } from './notify';
 import { ensurePushSubscribed, unsubscribePush } from './push';
 import { connectNotifyWs, disconnectNotifyWs } from './notifyws';
+import { startIdleWatch } from './idle';
 import { preloadSounds } from './sounds';
 import { isTauri, stopNativeBroadcast } from './native';
 import { endAnyBroadcasterSession, flushPendingDiag } from './diag';
@@ -91,7 +92,7 @@ function startMemberPoll(id: string) {
       // сохранял старые myRole/myPerms → выданные владельцем роль/права не появлялись до F5/реконнекта
       // (getServer их отдаёт, но поллер выбрасывал). Плюс имя/роли сервера — на случай их правки.
       useStore.setState({ members: srv.members, active: st2.active && st2.active.id === id ? { ...st2.active, ...srv.server, myRole: srv.myRole, myPerms: srv.myPerms } : st2.active });
-      engine?.setMembers(srv.members); engine?.setOnlineHint(prs.online); engine?.setVoiceHint(prs.voice || {});
+      engine?.setMembers(srv.members); engine?.setOnlineHint(prs.online); engine?.setAwayHint(prs.away || []); engine?.setVoiceHint(prs.voice || {});
     } catch { /**/ }
   };
   memberTimer = window.setInterval(poll, 5000);
@@ -211,6 +212,7 @@ export const useStore = create<AppState>((set, get) => ({
     // выданном разрешении; master включаем, т.к. на этом устройстве уведомления уже разрешены.
     if (notifPermission() === 'granted') { setSettings({ notif: true }); localStorage.removeItem('notifOptOut'); ensurePushSubscribed(); }
     connectNotifyWs(); // глобальный live-канал уведомлений (любой сервер, даже не подключённый)
+    startIdleWatch();  // away-детект: апп давно не трогали → жёлтый статус (шлётся по notify-WS)
     preloadSounds(); // прогреть звуки (fetch+decode+нормализация громкости) — первый проигрыш без задержки
     const pend = sessionStorage.getItem('pendingInvite');
     if (pend) { sessionStorage.removeItem('pendingInvite'); set({ modal: 'join', joinPrefill: pend }); }
@@ -296,7 +298,7 @@ export const useStore = create<AppState>((set, get) => ({
       const [srv, pres] = await Promise.all([api.getServer(id), api.presence(id).catch(() => null)]);
       if (get().viewServerId !== id || get().view !== 'server') return;
       set({ members: srv.members, active: { ...srv.server, myRole: srv.myRole, myPerms: srv.myPerms } });
-      engine?.setMembers(srv.members); if (pres) { engine?.setOnlineHint(pres.online); engine?.setVoiceHint(pres.voice || {}); }
+      engine?.setMembers(srv.members); if (pres) { engine?.setOnlineHint(pres.online); engine?.setAwayHint(pres.away || []); engine?.setVoiceHint(pres.voice || {}); }
     } catch { /**/ }
   },
 
@@ -324,7 +326,7 @@ export const useStore = create<AppState>((set, get) => ({
       const active: ServerDetail = { ...d.server, myRole: d.myRole, myPerms: d.myPerms };
       if (settings?.data && (settings.data.users || settings.data.streams)) engine?.setVols(settings.data);
       engine?.setMembers(d.members);
-      if (pres) { engine?.setOnlineHint(pres.online); engine?.setVoiceHint(pres.voice || {}); }
+      if (pres) { engine?.setOnlineHint(pres.online); engine?.setAwayHint(pres.away || []); engine?.setVoiceHint(pres.voice || {}); }
       engine?.loadHistory(hist.messages, hist.hasMore);
       if (hist.messages.length === 0) engine?.sysMsg('Ты на сервере «' + active.name + '». Чат доступен сразу — голос по кнопке «Подключиться».');
       // ВСЁ критичное готово → показываем сервер немедленно (не ждём комнату)

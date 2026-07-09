@@ -54,6 +54,7 @@ export interface OnlineMember {
   avatarUrl?: string;
   streaming: boolean;
   inVoice: boolean;
+  away?: boolean;  // «нет на месте» (idle) — жёлтый статус
   game?: string;   // игровой статус (натив) — для блока «Играют сейчас» на главной
   gicon?: string;  // base64 PNG иконки игры
 }

@@ -188,6 +188,8 @@ try { db.prepare("UPDATE users SET is_admin=1 WHERE username=?").run('denis'); }
 // индекс (только для непустого ключа — старые/безключевые сообщения не задеты) даёт INSERT OR IGNORE
 // схлопнуть повторный POST, если первый дошёл в БД, а ответ до клиента не добрался.
 try { db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_ckey ON messages(server_id, user_id, client_key) WHERE client_key <> ''"); } catch (e) {}
+// memberships PK = (user_id, server_id) → выборка по server_id (appOpenMembers, memberCount — часто в /me/presence) сканировала бы; индекс по server_id ускоряет.
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_mem_server ON memberships(server_id)"); } catch (e) {}
 
 /* one-time migration of legacy users.json -> users table */
 (function migrateLegacy() {
@@ -246,6 +248,24 @@ async function onlineIn(serverId) {
   try { const ps = await rsc.listParticipants('srv:' + serverId); return [...new Set(ps.map(p => baseIdentity(p.identity)))]; }
   catch (e) { return []; }
 }
+// Статус юзера по notify-WS: null = офлайн (нет сокетов); false = онлайн (есть активный сокет);
+// true = away/«нет на месте» (ВСЕ сокеты idle — клиент прислал {presence,away:true}).
+function userAwayState(userId) {
+  const set = notifyConns.get(userId);
+  if (!set || !set.size) return null;
+  for (const ws of set) if (!ws._away) return false; // хотя бы одна активная сессия → онлайн
+  return true;
+}
+// Члены сервера с открытым аппом (notify-WS) → глобально «в сети», БЕЗ привязки к подключению к
+// серверу/голосу. Возвращает Map(username → away:boolean). notifyConns заполняется на /ws (ниже);
+// функция вызывается в рантайме, когда notifyConns уже определён.
+function appOpenMembers(serverId) {
+  if (!notifyConns.size) return new Map();
+  const rows = db.prepare('SELECT u.id, u.username FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.server_id=?').all(serverId);
+  const out = new Map();
+  for (const r of rows) { const a = userAwayState(r.id); if (a !== null) out.set(r.username, a); }
+  return out;
+}
 // Детальный online-состав для превью на главной: аватар/имя + чем занят (стрим/голос). Стрим —
 // LiveKit ScreenShare-трек (браузерное вещание) ИЛИ активный tree-broadcaster (нативное). Голос —
 // mic-трек или vc-атрибут. Сессии одного юзера сводим к одному. LK TrackSource: MICROPHONE=2, SCREEN_SHARE=3.
@@ -265,11 +285,18 @@ async function onlineDetailed(serverId) {
       byUser.set(u, { streaming: cur.streaming || streaming, inVoice: cur.inVoice || inVoice, game: cur.game || game, gicon: cur.gicon || gicon });
     }
     for (const u of treeSrv.liveBroadcastersIn(serverId)) { const c = byUser.get(u) || { streaming: false, inVoice: false }; c.streaming = true; byUser.set(u, c); }
+    // Глобальный онлайн + away: члены с открытым аппом (notify-WS), даже если не в LiveKit-комнате.
+    // away (жёлтый) — только для idle-онлайн; кто в голосе/стриме имеет свой статус (не жёлтый).
+    for (const [u, away] of appOpenMembers(serverId)) {
+      const c = byUser.get(u) || { streaming: false, inVoice: false, game: '', gicon: '' };
+      c.away = !!(away && !c.streaming && !c.inVoice);
+      byUser.set(u, c);
+    }
     const stmt = db.prepare('SELECT display_name, avatar_color, avatar_url FROM users WHERE username=?');
     const out = [];
     for (const [username, st] of byUser) {
       const r = stmt.get(username);
-      out.push({ username, displayName: r ? r.display_name : username, avatarColor: r ? r.avatar_color : 0, avatarUrl: r ? (r.avatar_url || '') : '', streaming: st.streaming, inVoice: st.inVoice, game: st.game || undefined, gicon: st.gicon || undefined });
+      out.push({ username, displayName: r ? r.display_name : username, avatarColor: r ? r.avatar_color : 0, avatarUrl: r ? (r.avatar_url || '') : '', streaming: st.streaming, inVoice: st.inVoice, away: st.away || undefined, game: st.game || undefined, gicon: st.gicon || undefined });
     }
     // сначала стримеры, потом в голосе, потом остальные — для превью
     out.sort((a, b) => (b.streaming - a.streaming) || (b.inVoice - a.inVoice));
@@ -284,7 +311,9 @@ async function voiceStateIn(serverId) {
     const ps = await rsc.listParticipants('srv:' + serverId);
     const online = new Set(), voice = {};
     for (const p of ps) { const u = baseIdentity(p.identity); online.add(u); const vc = p.attributes && p.attributes.vc; if (vc) voice[u] = vc; }
-    return { online: [...online], voice };
+    const away = [];
+    for (const [u, aw] of appOpenMembers(serverId)) { online.add(u); if (aw && !voice[u]) away.push(u); } // глобальный онлайн + away (idle, не в голосе)
+    return { online: [...online], voice, away };
   } catch (e) { return { online: [], voice: {} }; }
 }
 /* ---------------- Web Push (VAPID) — фоновые уведомления для PWA (iOS/Android) и закрытого приложения ----------------
@@ -1182,11 +1211,12 @@ server.on('upgrade', (req, socket, head) => {
   const uid = p.id || (p.u && (db.prepare('SELECT id FROM users WHERE username=?').get(p.u) || {}).id);
   if (!uid) { socket.destroy(); return; }
   notifyWss.handleUpgrade(req, socket, head, (ws) => {
+    ws._away = false; // idle-статус сессии: клиент шлёт {t:'presence',away} при бездействии. Юзер «away» (жёлтый), если ВСЕ его сокеты idle.
     let set = notifyConns.get(uid); if (!set) { set = new Set(); notifyConns.set(uid, set); }
     set.add(ws);
     ws.on('close', () => { const s = notifyConns.get(uid); if (s) { s.delete(ws); if (!s.size) notifyConns.delete(uid); } });
     ws.on('error', () => { try { ws.close(); } catch (e) {} });
-    ws.on('message', () => { /* клиент только слушает (ping игнорим) */ });
+    ws.on('message', (data) => { try { const d = JSON.parse(data); if (d && d.t === 'presence') ws._away = !!d.away; } catch (e) { /* ping/мусор игнорим */ } });
   });
 });
 // heartbeat: закрываем мёртвые notify-сокеты, иначе висят в notifyConns

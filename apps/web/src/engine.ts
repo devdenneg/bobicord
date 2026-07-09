@@ -15,7 +15,7 @@ import { LiveKitVideoTransport } from './transport/livekitVideo';
 import { TreeVideoTransport } from './transport/treeVideo';
 
 export interface GameStatus { name: string; icon?: string }
-export interface PeerState { online: boolean; inVoice: boolean; micMuted: boolean; streaming: boolean; deafened: boolean; game?: GameStatus | null }
+export interface PeerState { online: boolean; inVoice: boolean; micMuted: boolean; streaming: boolean; deafened: boolean; away: boolean; game?: GameStatus | null }
 export interface StreamInfo { key: string; identity: string; isLocal: boolean; appName?: string; appIcon?: string }
 export type VoiceQuality = 'excellent' | 'good' | 'poor' | 'lost' | 'unknown';
 export interface Snapshot {
@@ -152,6 +152,7 @@ export class Engine {
   VOLS = { users: {} as Record<string, number>, streams: {} as Record<string, number> };
   private perMute = new Set<string>();
   private onlineHint = new Set<string>();
+  private awayHint = new Set<string>();  // серверный хинт: члены «нет на месте» (idle, из /presence.away)
   private voiceHint: Record<string, string> = {}; // серверный хинт {username: channelId}: состав голосовых до подъёма локальной комнаты
 
   private emoteListeners = new Set<EmoteListener>();
@@ -233,6 +234,7 @@ export class Engine {
   setMe(me: User) { this.me = me; }
   setMembers(m: Member[]) { this.members = m; this.emit(); }
   setOnlineHint(ids: string[]) { this.onlineHint = new Set(ids); this.emit(); }
+  setAwayHint(ids: string[]) { this.awayHint = new Set(ids); this.emit(); }
   setVoiceHint(v: Record<string, string>) { this.voiceHint = v || {}; this.emit(); }
   setVols(v: { users?: Record<string, number>; streams?: Record<string, number> }) {
     this.VOLS.users = v.users || {}; this.VOLS.streams = v.streams || {};
@@ -281,7 +283,8 @@ export class Engine {
       const streaming = this.isStreaming(m.username);
       // Игра показывается ТОЛЬКО из detect_game (атрибут/локальный myGame), НЕ из меты стрима: захваченное
       // окно ≠ «во что играет» (по решению пользователя). Стример без игры — просто LIVE, без «играет в X».
-      presence[m.username] = { online, inVoice: inV, micMuted: (!!mp && mp.isMuted) || deaf, streaming, deafened: deaf, game };
+      const away = !inV && !streaming && this.awayHint.has(m.username); // idle-онлайн («нет на месте», жёлтый)
+      presence[m.username] = { online, inVoice: inV, micMuted: (!!mp && mp.isMuted) || deaf, streaming, deafened: deaf, away, game };
     }
     const speaking: Record<string, boolean> = {};
     this.speakingSet.forEach((u) => (speaking[u] = true));
@@ -397,7 +400,7 @@ export class Engine {
     this.liveKitT.detach(); this.treeT.detach(); this.screenAudioEls.clear();
     this.watching.clear(); this.pendingWatch.clear(); this.watchT.clear(); this.streamWatchers.clear();
     this.perMute.clear(); this.messages = []; this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0;
-    this.onlineHint.clear(); this.voiceHint = {}; this.typingUsers.clear();
+    this.onlineHint.clear(); this.awayHint.clear(); this.voiceHint = {}; this.typingUsers.clear();
     this.clearAudioUnlock();
     if (this.micRaw) { this.micRaw.getTracks().forEach((t) => t.stop()); this.micRaw = null; }
     if (this.micActx) { try { this.micActx.close(); } catch { /**/ } this.micActx = null; }
@@ -414,7 +417,7 @@ export class Engine {
     this.messages = []; this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0;
     this.watching.clear(); this.pendingWatch.clear(); this.watchT.clear(); this.streamWatchers.clear();
     // presence-хинты и typing принадлежат ПРЕДЫДУЩЕМУ смотримому серверу
-    this.onlineHint.clear(); this.voiceHint = {}; this.typingUsers.clear();
+    this.onlineHint.clear(); this.awayHint.clear(); this.voiceHint = {}; this.typingUsers.clear();
     this.liveKitT.detach(); this.treeT.detach();
     document.querySelectorAll('#audioSink audio[data-origin="view"]').forEach((a) => a.remove()); // только стрим-аудио, не мик
     this.screenAudioEls.clear();
