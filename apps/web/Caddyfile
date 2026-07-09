@@ -1,7 +1,10 @@
-# Основной домен reelay.online (+ www) и легаси 138-16-170-21.sslip.io (нативные клиенты со старым
-# запечённым URL продолжают работать); все три → один backend, Caddy берёт Let's Encrypt на каждый.
-# Запечён в web-образ.
-reelay.online, www.reelay.online, 138-16-170-21.sslip.io {
+# reelay.online (+ www) — основной домен: полный апп. Легаси 138-16-170-21.sslip.io оставлен рабочим
+# для старых нативных клиентов, LiveKit (LK_WS_URL) и updater — но визит в БРАУЗЕРЕ на sslip.io редиректит
+# на reelay.online (только корень/SPA; backend-пути /api,/tree,/ws,/rtc НЕ редиректим — WS/API их не переживут).
+# Caddy сам берёт Let's Encrypt на каждый хост. Запечён в web-образ.
+
+# Общие backend-прокси (одинаковы для обоих доменов)
+(backend) {
 	handle /rtc* {
 		reverse_proxy 127.0.0.1:7880
 	}
@@ -19,11 +22,23 @@ reelay.online, www.reelay.online, 138-16-170-21.sslip.io {
 	handle /ws* {
 		reverse_proxy 127.0.0.1:3000
 	}
+}
+
+reelay.online, www.reelay.online {
+	import backend
 	handle {
 		root * /srv
 		header Cache-Control "no-store, no-cache, must-revalidate"
 		header Pragma "no-cache"
 		try_files {path} /index.html
 		file_server
+	}
+}
+
+138-16-170-21.sslip.io {
+	import backend
+	# всё, что не backend (корень + SPA-маршруты), — на нормальный домен
+	handle {
+		redir https://reelay.online{uri} permanent
 	}
 }
