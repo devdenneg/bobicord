@@ -82,9 +82,13 @@ class TreeManager {
   capacityOf(node) {
     // Э9: виртуал — серверный процесс без NAT, кап у него свой (выше пользовательского).
     if (node.virtual) return Math.max(0, Math.min(typeof node.maxChildren === 'number' ? node.maxChildren : 8, VIRTUAL_CHILDREN_CAP));
+    // Roadmap-flow-стриминга Д0: браузер снова строго лист (снос Э8-relay). Жёсткий гард по
+    // флагам узла, а не только BROWSER_CAPACITY=0 константа — защита от старых закэшированных
+    // браузерных бандлов, которые могли ещё присылать maxChildren>0 в join.
+    if (!node.native) return 0;
     if (node.symmetricNat && !this.turnEnabled) return 0; // без TURN симметричный = лист
     if (typeof node.maxChildren === 'number') return Math.max(0, Math.min(node.maxChildren, MAX_CHILDREN_CAP));
-    return node.native ? NATIVE_CAPACITY : BROWSER_CAPACITY;
+    return NATIVE_CAPACITY;
   }
 
   // Все потомки узла (для запрета циклов при ручном reparent — нельзя стать ребёнком

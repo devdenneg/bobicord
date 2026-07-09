@@ -23,15 +23,12 @@ interface NativeWatchState {
 export interface StreamMeta { appName?: string; appIcon?: string }
 
 /**
- * P2P relay-tree implementation of VideoTransport (Evolution-TZ Э2/Э8).
+ * P2P relay-tree implementation of VideoTransport (Roadmap-flow-стриминга Д0: browser is
+ * strictly a leaf again — the Э8 browser transcode-relay fallback has been removed).
  *
  * The browser NEVER broadcasts (native-only, invariant 2) — `startBroadcast` throws.
- * It DOES relay as a fallback (Э8, отклонение от инв.3 по решению пользователя): a
- * browser viewer can re-serve the stream it receives to a few children by re-adding the
- * received MediaStreamTrack into child RTCPeerConnections. This is TRANSCODE relay
- * (Chromium decodes+re-encodes per hop) — worse latency/quality than native passthrough,
- * so browser capacity is kept small and scored low. In Tauri, relay is done by Rust
- * (native passthrough) and this JS path never serves children.
+ * It also never relays: a browser viewer always joins with `maxChildren:0`. In Tauri,
+ * relay is done by Rust (native passthrough); the browser JS path never serves children.
  *
  * Signaling: WS to `/tree` (apps/server/tree.js). Two kinds of connection:
  *  - one long-lived "discovery" socket (no `join`) that listens for
@@ -45,8 +42,6 @@ export interface StreamMeta { appName?: string; appIcon?: string }
  */
 
 const DEFAULT_ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
-// Ёмкость браузерного relay: мало (транскод дорог по CPU/задержке). 0 при симметричном NAT.
-const BROWSER_RELAY_CAPACITY = 2;
 
 interface WatchState {
   ws: WebSocket;
@@ -54,13 +49,8 @@ interface WatchState {
   parentId: string | null;
   closed: boolean;
   iceServers: RTCIceServer[];
-  recvVideo: MediaStreamTrack | null;   // принятые треки — переотдаём детям (Э8 relay)
-  recvAudio: MediaStreamTrack | null;
-  children: Map<string, RTCPeerConnection>; // downstream (к нашим детям) — мы offerer
-  pendingChildren: Set<string>;   // assign-child пришёл раньше, чем появился трек
   maxChildren: number;
   joined: boolean;                // join уже отправлен (шлём после welcome — см. sendWatchJoin)
-  statsTimer: ReturnType<typeof setInterval> | null; // отчёт loss/rtt по детям (Э8 ABR)
 }
 
 
@@ -75,8 +65,7 @@ function treeWsUrl(): string {
   return base + (base.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
 }
 
-// Форс H.264 (инвариант 4) на всех видео-трансиверах PC — и на приёме от родителя
-// (receiver.track video), и на отдаче детям (sender.track video, relay-хоп).
+// Форс H.264 (инвариант 4) на видео-трансивере PC при приёме от родителя (receiver.track video).
 function preferH264(pc: RTCPeerConnection) {
   const caps = (window as any).RTCRtpReceiver?.getCapabilities?.('video');
   const h264 = (caps?.codecs || []).filter((c: any) => c.mimeType.toLowerCase() === 'video/h264');
@@ -86,20 +75,6 @@ function preferH264(pc: RTCPeerConnection) {
     if (!isVideo) return;
     try { t.setCodecPreferences(h264); } catch { /**/ }
   });
-}
-
-// Может ли этот браузер ЭНКОДИТЬ H.264 (инвариант 4 — трек детям идёт в H.264). Relay-хоп
-// заставляет узел энкодить (serveChild=offerer+preferH264); часть Android-устройств (напр.
-// Huawei/Kirin) H.264 декодят (смотреть могут), но НЕ энкодят — как relay-родитель они дают
-// чёрный экран ребёнку. `RTCRtpSender.getCapabilities` перечисляет именно SEND-кодеки, поэтому
-// отсутствие H.264 тут = не можем быть relay-родителем. Неизвестно (нет API) → считаем что можем
-// (не переужесточать десктопы). Только decode (preferH264 через Receiver) для этого не годится.
-function canEncodeH264(): boolean {
-  try {
-    const caps = (window as any).RTCRtpSender?.getCapabilities?.('video');
-    if (!caps || !Array.isArray(caps.codecs)) return true; // не интроспектируется — не режем
-    return caps.codecs.some((c: any) => (c.mimeType || '').toLowerCase() === 'video/h264');
-  } catch { return true; }
 }
 
 export class TreeVideoTransport implements VideoTransport {
@@ -244,15 +219,9 @@ export class TreeVideoTransport implements VideoTransport {
     try { ws = new WebSocket(treeWsUrl()); } catch { return; }
     const st: WatchState = {
       ws, pc: null, parentId: null, closed: false, iceServers: this.iceServers,
-      recvVideo: null, recvAudio: null, children: new Map(), pendingChildren: new Set(), maxChildren: 0, joined: false,
-      statsTimer: null,
+      maxChildren: 0, joined: false,
     };
     this.watches.set(streamId, st);
-    // Э8 ABR: браузерный relay раньше НЕ слал stats — его линки к детям были невидимы
-    // серверу (worst-link ABR и best-peer скоринг их не учитывали): деградация под
-    // браузерным родителем не роняла битрейт и не триггерила миграцию. Тот же темп
-    // (2с), что у нативных узлов.
-    st.statsTimer = setInterval(() => { void this.reportChildStats(st); }, 2000);
 
     // join шлём НЕ в onopen, а после welcome (см. sendWatchJoin): welcome несёт актуальные
     // iceServers, и только зная, есть ли TURN, можно решить ёмкость relay при симметричном NAT.
@@ -274,50 +243,16 @@ export class TreeVideoTransport implements VideoTransport {
     ws.onerror = () => { try { ws.close(); } catch { /**/ } };
   }
 
-  // Отправка join после welcome. Ёмкость relay при симметричном NAT: обычно 0 (узел
-  // недостижим как offerer для третьей стороны через srflx), НО с TURN обе стороны берут
-  // relay-кандидаты — симметричный узел релеить может, поэтому при наличии TURN ёмкость не
-  // зануляем. В Tauri relay держит Rust — webview детей не обслуживает (0). Сервер применяет
-  // ту же логику к symmetricNat (tree.js capacityOf), поэтому шлём и флаг, и maxChildren.
+  // Отправка join после welcome (Roadmap Д0: браузер снова строго лист — maxChildren всегда 0,
+  // никакого re-serve детям). symmetricNat/serverId остаются — сервер их применяет и для листьев
+  // (диагностика NAT, discovery по гильдии).
   private async sendWatchJoin(streamId: string, st: WatchState) {
     if (st.joined || st.closed) return;
     st.joined = true;
     const symmetricNat = await this.natProbe.catch(() => false);
     if (st.closed) return;
-    const hasTurn = st.iceServers.some((s) => {
-      const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
-      return urls.some((u) => /^turns?:/i.test(u || ''));
-    });
-    // Relay-родитель обязан энкодить H.264 (см. canEncodeH264): устройства, которые H.264 только
-    // декодят (Huawei/часть Android), остаются листом — смотреть могут, детей брать нет, иначе
-    // ребёнок получает чёрный экран (соединение встаёт, но энкодер не выдаёт кадры).
-    const cantRelay = isTauri || (symmetricNat && !hasTurn) || !canEncodeH264();
-    st.maxChildren = cantRelay ? 0 : BROWSER_RELAY_CAPACITY;
+    st.maxChildren = 0;
     try { st.ws.send(JSON.stringify({ t: 'join', streamId, role: 'viewer', native: false, maxChildren: st.maxChildren, identity: this.me, symmetricNat, serverId: this.serverId })); } catch { /**/ }
-  }
-  // Отчёт серверу о качестве линков к нашим детям (Э8 ABR + best-peer). Взгляд
-  // отправителя: remote-inbound-rtp = RTCP RR от ребёнка (fractionLost 0..1,
-  // roundTripTime в секундах). availableOutgoingBitrate — BWE-оценка аплинка.
-  private async reportChildStats(st: WatchState) {
-    if (st.closed || !st.children.size || st.ws.readyState !== WebSocket.OPEN) return;
-    const toChild: Array<{ id: string; bitrate: number; rtt: number; loss: number }> = [];
-    let availOut = 0;
-    for (const [id, pc] of st.children) {
-      let report: RTCStatsReport;
-      try { report = await pc.getStats(); } catch { continue; }
-      let loss = -1, rtt = 0;
-      for (const s of report.values() as Iterable<any>) {
-        if (s.type === 'remote-inbound-rtp' && s.kind === 'video') {
-          loss = Math.max(loss, typeof s.fractionLost === 'number' ? s.fractionLost : 0);
-          if (typeof s.roundTripTime === 'number') rtt = Math.max(rtt, s.roundTripTime * 1000);
-        } else if (s.type === 'candidate-pair' && s.nominated && typeof s.availableOutgoingBitrate === 'number') {
-          availOut = Math.max(availOut, s.availableOutgoingBitrate);
-        }
-      }
-      if (loss >= 0) toChild.push({ id, bitrate: 0, rtt, loss }); // нет RR — линк ещё поднимается, пропуск
-    }
-    if (!toChild.length && !availOut) return;
-    try { st.ws.send(JSON.stringify({ t: 'stats', toChild, availableOutgoing: Math.round(availOut) })); } catch { /**/ }
   }
 
   unwatch(streamId: string) {
@@ -326,29 +261,20 @@ export class TreeVideoTransport implements VideoTransport {
     const st = this.watches.get(streamId);
     if (!st) return;
     st.closed = true;
-    if (st.statsTimer) { clearInterval(st.statsTimer); st.statsTimer = null; }
     try { st.ws.send(JSON.stringify({ t: 'leave' })); } catch { /**/ }
     try { st.ws.close(); } catch { /**/ }
     if (st.pc) { try { st.pc.close(); } catch { /**/ } }
-    this.closeChildren(st);
     this.watches.delete(streamId);
     this.treeInfoByStream.delete(streamId);
     this.lastJb.delete(streamId);
     this.delVideo(streamId);
   }
   private teardownWatch(streamId: string, st: WatchState) {
-    if (st.statsTimer) { clearInterval(st.statsTimer); st.statsTimer = null; }
     if (st.pc) { try { st.pc.close(); } catch { /**/ } st.pc = null; }
-    this.closeChildren(st);
     this.watches.delete(streamId);
     this.treeInfoByStream.delete(streamId);
     this.lastJb.delete(streamId);
     this.delVideo(streamId);
-  }
-  private closeChildren(st: WatchState) {
-    st.children.forEach((pc) => { try { pc.close(); } catch { /**/ } });
-    st.children.clear();
-    st.pendingChildren.clear();
   }
 
   /** Последний известный tree-info (позиция в дереве) для смотрибельного стрима. */
@@ -415,32 +341,27 @@ export class TreeVideoTransport implements VideoTransport {
         break;
       }
       case 'assign-child': {
-        // Нас назначили родителем для childId — переотдаём ему принятый поток (Э8 relay).
-        if (msg.childId) this.serveChild(streamId, st, msg.childId);
+        // Roadmap Д0: браузер — строго лист (maxChildren:0 в join), сервер никогда не должен
+        // назначить нам ребёнка. Безопасный no-op-лог на случай старого закэшированного бандла
+        // сервера/старой сессии — не дёргаем удалённый re-serve путь.
+        if (msg.childId) console.warn(`[tree] assign-child проигнорирован (браузер — лист): ${msg.childId}`);
         break;
       }
       case 'sdp': {
-        if (msg.from === st.parentId && msg.type === 'offer') { this.onParentOffer(streamId, st, msg.sdp); return; }
-        // answer от нашего ребёнка (мы ему offerer)
-        const childPc = st.children.get(msg.from);
-        if (childPc && msg.type === 'answer') childPc.setRemoteDescription({ type: 'answer', sdp: msg.sdp }).catch(() => {});
+        // Единственный upstream — от родителя (мы всегда лист, детей не обслуживаем).
+        if (msg.from === st.parentId && msg.type === 'offer') { this.onParentOffer(streamId, st, msg.sdp); }
         break;
       }
       case 'ice': {
         if (!msg.candidate) return;
-        if (msg.from === st.parentId && st.pc) { st.pc.addIceCandidate(msg.candidate).catch(() => {}); return; }
-        const childPc = st.children.get(msg.from);
-        if (childPc) childPc.addIceCandidate(msg.candidate).catch(() => {});
+        if (msg.from === st.parentId && st.pc) st.pc.addIceCandidate(msg.candidate).catch(() => {});
         break;
       }
       case 'drop-peer': {
-        // Ребёнок ушёл/переехал — закрываем его downstream-PC.
-        const childPc = st.children.get(msg.peerId);
-        if (childPc) { try { childPc.close(); } catch { /**/ } st.children.delete(msg.peerId); st.pendingChildren.delete(msg.peerId); break; }
-        // Иначе это наш родитель (в т.ч. корень-вещатель) пропал. Если дерево ещё живо,
-        // следом придёт 'assign-parent' с новым родителем — тот хендлер закроет старый PC.
-        // Если это конец вещания целиком, сервер шлёт то же сообщение каждому зрителю —
-        // закрываем watch-сокет сразу (onclose делает полный teardown), иначе <video>
+        // Мы всегда лист — это может быть только наш родитель (в т.ч. корень-вещатель), пропавший.
+        // Если дерево ещё живо, следом придёт 'assign-parent' с новым родителем — тот хендлер
+        // закроет старый PC. Если это конец вещания целиком, сервер шлёт то же сообщение каждому
+        // зрителю — закрываем watch-сокет сразу (onclose делает полный teardown), иначе <video>
         // застревает на последнем кадре навсегда.
         if (msg.peerId === st.parentId) { try { st.ws.close(); } catch { /**/ } }
         break;
@@ -494,18 +415,9 @@ export class TreeVideoTransport implements VideoTransport {
       }
     };
     pc.ontrack = (e) => {
-      if (e.track.kind === 'audio') {
-        st.recvAudio = e.track; // звук игры/системы — переотдаём детям (relay)
-        return;
-      }
       if (e.track.kind !== 'video') return;
-      st.recvVideo = e.track;
       const handle = new MediaStreamVideoHandle(e.streams[0] || new MediaStream([e.track]));
       this.addVideo(streamId, handle, streamId, false);
-      // Дети, назначенные до появления трека — обслуживаем теперь.
-      const pending = [...st.pendingChildren];
-      st.pendingChildren.clear();
-      pending.forEach((childId) => this.serveChild(streamId, st, childId));
     };
     try {
       await pc.setRemoteDescription({ type: 'offer', sdp });
@@ -514,42 +426,6 @@ export class TreeVideoTransport implements VideoTransport {
       await pc.setLocalDescription(answer);
       st.ws.send(JSON.stringify({ t: 'sdp', streamId, to: st.parentId, type: 'answer', sdp: pc.localDescription!.sdp }));
     } catch { /**/ }
-  }
-
-  // Э8 relay: переотдаём принятый поток ребёнку childId (мы — offerer, транскод-хоп).
-  private async serveChild(streamId: string, st: WatchState, childId: string) {
-    if (st.children.has(childId)) return;
-    if (!st.recvVideo) { st.pendingChildren.add(childId); return; } // ждём трек от родителя
-    const pc = new RTCPeerConnection({ iceServers: st.iceServers.length ? st.iceServers : DEFAULT_ICE_SERVERS });
-    st.children.set(childId, pc);
-    try {
-      // Транскод-хоп: под узкий канал Chromium должен ронять разрешение, а не fps
-      // (плавность важнее чёткости — та же философия, что ABR-лестница вещателя).
-      try { (st.recvVideo as any).contentHint = 'motion'; } catch { /**/ }
-      const sender = pc.addTrack(st.recvVideo);
-      try {
-        const params = sender.getParameters();
-        (params as any).degradationPreference = 'maintain-framerate';
-        void sender.setParameters(params);
-      } catch { /**/ }
-      if (st.recvAudio) pc.addTrack(st.recvAudio);
-      preferH264(pc);
-      pc.onicecandidate = (e) => {
-        if (!e.candidate) return;
-        try { st.ws.send(JSON.stringify({ t: 'ice', streamId, to: childId, candidate: e.candidate })); } catch { /**/ }
-      };
-      pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-          if (st.children.get(childId) === pc) { try { pc.close(); } catch { /**/ } st.children.delete(childId); }
-        }
-      };
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      st.ws.send(JSON.stringify({ t: 'sdp', streamId, to: childId, type: 'offer', sdp: pc.localDescription!.sdp }));
-    } catch {
-      try { pc.close(); } catch { /**/ }
-      st.children.delete(childId);
-    }
   }
 
   /* ---------- native watch (Tauri: Rust держит upstream+relay, webview рендерит) ---------- */
@@ -620,7 +496,7 @@ export class TreeVideoTransport implements VideoTransport {
     if (this.currentNativeWatch === streamId) { this.currentNativeWatch = null; stopNativeWatch().catch(() => {}); }
   }
 
-  /* ---------- topology / manual peer pick (Э8) ---------- */
+  /* ---------- topology / manual peer pick ---------- */
   private setTopology(streamId: string, topo: TreeTopology) {
     this.topologyByStream.set(streamId, topo);
     this.topologyCbs.forEach((cb) => cb(streamId));
