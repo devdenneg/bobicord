@@ -45,11 +45,6 @@ export function removeDownload(id: string): void {
   persist();
 }
 
-export function clearDownloads(): void {
-  items = [];
-  persist();
-}
-
 // Патч набора записей (напр. missingSince при проверке существования файлов) — по id.
 export function patchDownloads(patches: Record<string, Partial<DownloadItem>>): void {
   items = items.map((d) => (patches[d.id] ? { ...d, ...patches[d.id] } : d));

@@ -578,7 +578,7 @@
   .msg-file:hover .ic:last-child{opacity:1;color:var(--accent-txt)}
   @media (hover:none) and (pointer:coarse){.msg-file .ic:last-child{opacity:1}}
   /* модалка "Загрузки" — журнал скачанных вложений (веб+натив), см. DownloadsModal.tsx */
-  .dl-list{display:flex;flex-direction:column;gap:6px;max-height:52vh;overflow-y:auto;margin-top:4px}
+  .dl-list{display:flex;flex-direction:column;gap:6px;max-height:52vh;overflow-y:auto;overflow-x:hidden;margin-top:4px}
   .dl-row{display:flex;align-items:center;gap:10px;padding:8px 10px;background:var(--panel2);border:1px solid var(--line-2);border-radius:10px}
   .dl-row>.ic{flex:0 0 auto;color:var(--muted);font-size:19px}
   .dl-main{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:1px}
@@ -608,6 +608,9 @@
   .lightbox img{max-width:94vw;max-height:90vh;border-radius:10px;box-shadow:0 24px 70px rgba(0,0,0,.6);object-fit:contain;cursor:default}
   .lightbox .lb-close{position:fixed;top:16px;right:18px;width:42px;height:42px;border-radius:11px;background:rgba(0,0,0,.5);color:#fff;display:flex;align-items:center;justify-content:center;padding:0}
   .lightbox .lb-close:hover{background:rgba(0,0,0,.75)}
+  .lightbox .lb-dl{position:fixed;top:16px;right:70px;width:42px;height:42px;border-radius:11px;background:rgba(0,0,0,.5);color:#fff;display:flex;align-items:center;justify-content:center;padding:0}
+  .lightbox .lb-dl:hover{background:rgba(0,0,0,.75)}
+  .lightbox .lb-dl:disabled{opacity:.6;pointer-events:none}
   .lightbox .lb-open{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);color:#fff;background:rgba(0,0,0,.5);padding:8px 16px;border-radius:9px;font-size:13px;font-weight:500}
   .lightbox .lb-open:hover{background:rgba(0,0,0,.75)}
   @keyframes lbFade{from{opacity:0}to{opacity:1}}

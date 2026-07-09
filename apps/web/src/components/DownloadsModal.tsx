@@ -4,7 +4,7 @@ import { resolveUploadUrl } from '../api';
 import { Icon } from '../Icon';
 import { Backdrop } from './Backdrop';
 import { isTauri, openFile, revealInFolder, pathsExist } from '../native';
-import { getDownloads, removeDownload, clearDownloads, subscribeDownloads, patchDownloads, type DownloadItem } from '../downloads';
+import { getDownloads, removeDownload, subscribeDownloads, patchDownloads, type DownloadItem } from '../downloads';
 
 function fmtSize(bytes: number): string {
   if (bytes < 1024) return bytes + ' Б';
@@ -89,7 +89,6 @@ export function DownloadsModal() {
           })}
         </div>
       ) : <div className="dl-empty">Тут появятся файлы, которые ты сохранишь из чата.</div>}
-      {items.length ? <button className="ghost" style={{ marginTop: 12 }} onClick={clearDownloads}><Icon name="trash" sm />Очистить список</button> : null}
       <button className="close" onClick={close}>Готово</button>
     </Backdrop>
   );

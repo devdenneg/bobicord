@@ -12,7 +12,7 @@ import { VoiceDock } from './VoiceDock';
 import { getSettings, setSettings } from '../settings';
 import { applyNativeUpdate } from '../nativeUpdate';
 import { isTauri, saveFileDialog, openFile, pathsExist } from '../native';
-import { getDownloads, addDownload, subscribeDownloads } from '../downloads';
+import { getDownloads, addDownload, subscribeDownloads, type DownloadItem } from '../downloads';
 import type { Attachment, ChatMessage, Emote, Member, ReplyRef, Role } from '../types';
 import { PERM, hasPerm } from '../types';
 
@@ -543,16 +543,65 @@ function fmtTime(ts?: number): string {
   if (!ts) return '';
   try { return new Date(ts).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }); } catch { return ''; }
 }
-function ImageLightbox({ src, onClose }: { src: string; onClose: () => void }) {
+// Единая логика "сохранить вложение" — общая для чипов файлов в чате и кнопки в лайтбоксе
+// картинки. В нативе (Tauri) — настоящий системный диалог «Сохранить как» (plugin-dialog +
+// запись байт через plugin-fs). В вебе — fetch() в Blob + локальная blob:-ссылка (a.click(),
+// same-document, без навигации/нового окна — <a target="_blank"> на внешний https:// origin в
+// нативе молча блокируется, нет плагина shell/opener). "Умная кнопка" (натив): если вложение уже
+// скачано и файл всё ещё на месте — ОТКРЫВАЕТ его с диска вместо повторного скачивания.
+// Возвращает true, если состоялось реальное скачивание (для тоста "Сохранено"), false — если
+// просто открыли уже существующий файл.
+async function saveAttachment(f: Attachment, downloads: DownloadItem[]): Promise<boolean> {
+  if (isTauri) {
+    const rec = downloads.find((d) => d.url === f.url && d.path);
+    if (rec?.path) {
+      const [exists] = await pathsExist([rec.path]);
+      if (exists) { await openFile(rec.path); return false; }
+    }
+  }
+  const r = await fetch(resolveUploadUrl(f.url));
+  if (!r.ok) throw new Error('Ошибка ' + r.status);
+  const blob = await r.blob();
+  if (isTauri) {
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    const path = await saveFileDialog(bytes, f.name);
+    if (path) addDownload({ url: f.url, name: f.name, size: f.size, mime: f.mime, savedAt: Date.now(), path });
+    return !!path;
+  }
+  const objUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = objUrl; a.download = f.name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(objUrl), 30000);
+  addDownload({ url: f.url, name: f.name, size: f.size, mime: f.mime, savedAt: Date.now() });
+  return true;
+}
+
+function ImageLightbox({ attachment, onClose }: { attachment: Attachment; onClose: () => void }) {
+  const toast = useStore((s) => s.toast);
+  const downloads = useSyncExternalStore(subscribeDownloads, getDownloads);
+  const [busy, setBusy] = useState(false);
   useEffect(() => {
     const k = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
     window.addEventListener('keydown', k);
     return () => window.removeEventListener('keydown', k);
   }, [onClose]);
-  const url = resolveUploadUrl(src);
+  const url = resolveUploadUrl(attachment.url);
+  async function onDownload() {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const saved = await saveAttachment(attachment, downloads);
+      if (saved) toast(`Сохранено: ${attachment.name}`, 'ok');
+    } catch { toast(`Не удалось скачать ${attachment.name}`, 'err'); }
+    finally { setBusy(false); }
+  }
   return (
     <div className="lightbox" role="dialog" aria-modal="true" onClick={onClose}>
       <button className="lb-close" aria-label="Закрыть" onClick={onClose}><Icon name="close" /></button>
+      <button className="lb-dl" aria-label="Скачать" disabled={busy} onClick={(e) => { e.stopPropagation(); onDownload(); }}>
+        {busy ? <span className="spin" style={{ margin: 0, width: 16, height: 16 }} /> : <Icon name="download" />}
+      </button>
       <a className="lb-open" href={url} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>Открыть оригинал</a>
       <img src={url} alt="" onClick={(e) => e.stopPropagation()} />
     </div>
@@ -561,49 +610,18 @@ function ImageLightbox({ src, onClose }: { src: string; onClose: () => void }) {
 
 // вложения сообщения: картинки — грид миниатюр (клик → лайтбокс), остальные файлы — чипы со
 // скачиванием (форс-download на сервере, см. GET /api/files/:name — не инлайн, любое расширение).
-function MessageAttachments({ files, onImageClick }: { files: Attachment[]; onImageClick: (url: string) => void }) {
+function MessageAttachments({ files, onImageClick }: { files: Attachment[]; onImageClick: (a: Attachment) => void }) {
   const toast = useStore((s) => s.toast);
   const downloads = useSyncExternalStore(subscribeDownloads, getDownloads);
   const images = files.filter((f) => f.kind === 'image');
   const others = files.filter((f) => f.kind === 'file');
   const [downloading, setDownloading] = useState<number | null>(null);
-  // В нативе (Tauri) — настоящий системный диалог «Сохранить как» (plugin-dialog + запись
-  // байт через plugin-fs). В вебе — как и раньше: fetch() в Blob + локальная blob:-ссылка
-  // (a.click(), same-document, без навигации/нового окна — <a target="_blank"> на внешний
-  // https:// origin в нативе молча блокируется, нет плагина shell/opener). "Умная кнопка"
-  // (натив): повторный клик по уже скачанному вложению ОТКРЫВАЕТ файл с диска вместо повторного
-  // скачивания — если файл всё ещё на месте; если удалён/перемещён, тихо фолбэчимся на обычное
-  // скачивание. "Сохранить как" с выбором папки — при КАЖДОМ реальном скачивании (не тихо).
   async function downloadFile(i: number, f: Attachment) {
     if (downloading != null) return;
-    if (isTauri) {
-      const rec = downloads.find((d) => d.url === f.url && d.path);
-      if (rec?.path) {
-        const [exists] = await pathsExist([rec.path]);
-        if (exists) { await openFile(rec.path); return; }
-      }
-    }
     setDownloading(i);
     try {
-      const r = await fetch(resolveUploadUrl(f.url));
-      if (!r.ok) throw new Error('Ошибка ' + r.status);
-      const blob = await r.blob();
-      if (isTauri) {
-        const bytes = new Uint8Array(await blob.arrayBuffer());
-        const path = await saveFileDialog(bytes, f.name);
-        if (path) {
-          addDownload({ url: f.url, name: f.name, size: f.size, mime: f.mime, savedAt: Date.now(), path });
-          toast(`Сохранено: ${f.name}`, 'ok');
-        }
-        return;
-      }
-      const objUrl = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = objUrl; a.download = f.name;
-      document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(() => URL.revokeObjectURL(objUrl), 30000);
-      addDownload({ url: f.url, name: f.name, size: f.size, mime: f.mime, savedAt: Date.now() });
-      toast(`Сохранено: ${f.name}`, 'ok');
+      const saved = await saveAttachment(f, downloads);
+      if (saved) toast(`Сохранено: ${f.name}`, 'ok');
     } catch { toast(`Не удалось скачать ${f.name}`, 'err'); }
     finally { setDownloading(null); }
   }
@@ -612,7 +630,7 @@ function MessageAttachments({ files, onImageClick }: { files: Attachment[]; onIm
       {images.length ? (
         <div className="msg-img-grid">
           {images.map((f, i) => (
-            <button key={i} className="msg-img-wrap" onClick={() => onImageClick(f.url)}>
+            <button key={i} className="msg-img-wrap" onClick={() => onImageClick(f)}>
               <img className="msg-img" src={resolveUploadUrl(f.url)} alt="" loading="lazy" />
             </button>
           ))}
@@ -670,7 +688,7 @@ function Chat() {
   const eng = useEngine();
   const E = getEngine()!;
   const [text, setText] = useState('');
-  const [lightbox, setLightbox] = useState<string | null>(null);
+  const [lightbox, setLightbox] = useState<Attachment | null>(null);
   const [pickAnchor, setPickAnchor] = useState<DOMRect | null | undefined>(undefined);
   const emoBtnRef = useRef<HTMLButtonElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -1046,7 +1064,7 @@ function Chat() {
                     {m.sys ? m.text : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : 'link' in p ? <a key={i} className="msg-link" href={p.link} target="_blank" rel="noreferrer">{p.link}</a> : 'mention' in p ? <span key={i} className="mention-tag">{p.mention}</span> : <img key={i} className="emo" src={emoteUrl(p.emo)} alt={p.name} title={p.name} loading="lazy" decoding="async" />))}
                   </div>
                 ) : null}
-                {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox(m.img!)}><img className="msg-img" src={resolveUploadUrl(m.img)} alt="" loading="lazy" /></button> : null}
+                {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox({ url: m.img!, name: m.img!.split('/').pop() || 'image', size: 0, mime: 'image/*', kind: 'image' })}><img className="msg-img" src={resolveUploadUrl(m.img)} alt="" loading="lazy" /></button> : null}
                 {m.files && m.files.length ? <MessageAttachments files={m.files} onImageClick={setLightbox} /> : null}
                 {m.status === 'failed' ? <div className="msg-failed"><Icon name="warn" sm />Не отправлено<button onClick={() => getEngine()?.retrySend(m.id)}>Повторить</button></div> : null}
               </div>
@@ -1175,7 +1193,7 @@ function Chat() {
       </div>
       {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} onClose={() => setPickAnchor(undefined)}
         onPick={(e: Emote) => { setText((t) => t + (t && !t.endsWith(' ') ? ' ' : '') + e.name + ' '); }} /> : null}
-      {lightbox ? <ImageLightbox src={lightbox} onClose={() => setLightbox(null)} /> : null}
+      {lightbox ? <ImageLightbox attachment={lightbox} onClose={() => setLightbox(null)} /> : null}
     </div>
   );
 }
