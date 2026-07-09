@@ -879,16 +879,28 @@ function attachTreeServer(httpServer, opts) {
   // mgr.leave репарентит детей узла в СТАРОМ дереве (натив-relay), mgr.join сажает узел в
   // новом (под рендишн-корень/vrelay или сиротой, пока корень поднимается). pinned=ручной
   // выбор (авто-ABR его не трогает). Используется onSetQuality (ручной) и perViewerAbr (авто).
-  function moveNodeToRendition(baseSid, nodeId, targetRendition, opts) {
+  function moveNodeToRendition(baseSid, nodeId, targetRendition, opts = {}) {
     const p = peers.get(nodeId);
     if (!p || !p.treeKey || p.role !== 'viewer') return false;
     if (parseTreeKey(p.treeKey).streamId !== baseSid) return false;
     const target = normRendition(targetRendition);
     const srcTree = mgr.trees.get(treeKey(baseSid, DEFAULT_RENDITION));
     if (!srcTree || !srcTree.broadcasterId) return false;
+    // notify=false для СЕРВЕРНЫХ ходов (perViewerAbr): зритель рендишн не просил, и получив
+    // rendition-unavailable он рвал watch ради возврата на source, где и так был → стрим падал.
+    // Отказ авто-хода — внутреннее дело сервера: логируем, зрителя не трогаем.
+    const notify = opts.notify !== false;
     if (target !== DEFAULT_RENDITION) {
-      if (!renditionAvailable(srcTree, target)) { send(nodeId, { t: 'rendition-unavailable', streamId: baseSid, rendition: target, reason: 'no-upscale' }); return false; }
-      if (!ensureRendition(baseSid, target)) { send(nodeId, { t: 'rendition-unavailable', streamId: baseSid, rendition: target, reason: 'unavailable' }); return false; }
+      if (!renditionAvailable(srcTree, target)) {
+        if (notify) send(nodeId, { t: 'rendition-unavailable', streamId: baseSid, rendition: target, reason: 'no-upscale' });
+        else tlog(`[quality] авто-ход ${baseSid}::${target} отклонён (апскейл) — зритель остаётся`);
+        return false;
+      }
+      if (!ensureRendition(baseSid, target)) {
+        if (notify) send(nodeId, { t: 'rendition-unavailable', streamId: baseSid, rendition: target, reason: 'unavailable' });
+        else tlog(`[quality] авто-ход ${baseSid}::${target} отклонён (рендишн недоступен) — зритель остаётся`);
+        return false;
+      }
     }
     const oldKey = p.treeKey;
     const newKey = treeKey(baseSid, target);
@@ -950,7 +962,13 @@ function attachTreeServer(httpServer, opts) {
       const { streamId: base, rendition: treeRend } = parseTreeKey(key);
       const srcTree = mgr.trees.get(treeKey(base, DEFAULT_RENDITION));
       if (!srcTree || !srcTree.serverFirst) continue; // ABR-лестница — только server-first
-      const rungs = availableRungs(srcTree);
+      // ВАЖНО: renditionsOf, НЕ availableRungs. availableRungs режет лестницу только по
+      // разрешению source (без апскейла) и НИЧЕГО не знает про транскод-ёмкость агента.
+      // При VRELAY_MAX_TRANSCODES=0 она возвращала 1080/720/480 → ABR на плохом линке
+      // «понижал» зрителя в несуществующее дерево → ensureRendition отказывал →
+      // rendition-unavailable → клиент рвал watch → СТРИМ ЗАКРЫВАЛСЯ (прод, 2026-07-09).
+      // renditionsOf гейтится агентом: без транскода вернёт ['source'] → ABR инертен.
+      const rungs = renditionsOf(base);
       const idx = rungs.indexOf(treeRend);
       if (idx < 0) continue;
       for (const node of t.nodes.values()) {
@@ -981,7 +999,8 @@ function attachTreeServer(httpServer, opts) {
     // moveNodeToRendition сбрасывает reparentCooldownUntil (свежее дерево) — cooldown против
     // болтанки ставим ПОСЛЕ переезда, иначе следующий тик двигал бы узел снова.
     for (const m of moves) {
-      if (moveNodeToRendition(m.base, m.nodeId, m.target, { pinned: false })) {
+      // notify:false — авто-ход, зритель его не запрашивал (см. moveNodeToRendition).
+      if (moveNodeToRendition(m.base, m.nodeId, m.target, { pinned: false, notify: false })) {
         const p = peers.get(m.nodeId);
         if (p) p.reparentCooldownUntil = Date.now() + ABR_VIEWER_COOLDOWN_MS;
       }

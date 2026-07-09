@@ -491,6 +491,11 @@ export class TreeVideoTransport implements VideoTransport {
     const quality = mode === 'auto' ? 'source' : mode;
     const cur = this.watches.get(streamId) || this.nativeWatches.get(streamId);
     if (cur && cur.quality === quality && cur.pinned === pinned) return; // уже в этом режиме
+    // Смена ОДНОГО pin при том же качестве не требует пересоздания watch. Раньше сюда попадал
+    // фолбэк «вернул на source», когда зритель УЖЕ был на source (pinned=false → true): watch
+    // сносился и поднимался заново, а у натива watch-слот один глобальный → стрим закрывался
+    // (прод, 2026-07-09). Дерево не меняется — правим pin на месте.
+    if (cur && cur.quality === quality) { cur.pinned = pinned; return; }
     this.unwatch(streamId);
     this.watch(streamId, quality, pinned);
   }
