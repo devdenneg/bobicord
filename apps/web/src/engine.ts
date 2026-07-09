@@ -1326,6 +1326,8 @@ export class Engine {
         }
         return;
       }
+      // music (совместное прослушивание YouTube) — по voiceRoom; scoped по vc уже внутри music-store
+      if (d.t === 'music') { if (room === this.voiceRoom) this.onMusicMessage?.(d); return; }
       // чат/clear/emote/watch/typing — данные ПРОСМАТРИВАЕМОГО сервера, приходят по viewRoom
       if (room !== this.viewRoom) return;
       if (d.t === 'chat') {
@@ -1348,10 +1350,12 @@ export class Engine {
     } catch { /**/ }
   };
   onEmoteResolve: ((name: string, id: string) => void) | null = null;
+  onMusicMessage: ((d: any) => void) | null = null;   // music.ts подписывается: приём синка сессии прослушивания
+  sendMusic(obj: any) { this.dataSend({ ...obj, t: 'music' }); } // рассылка по voiceRoom (scoped по vc внутри music.ts)
   // reliable для состояния, которое нельзя терять: чат (сообщения), vclaim (одна голосовая на
   // аккаунт — потеря датаграммы оставила бы две сессии в войсе), clear (чистка чата).
   // vclaim принадлежит голосовой сессии → voiceRoom; чат/clear/typing/emote/watch — просматриваемому серверу → viewRoom
-  private dataSend(obj: any) { const room = obj.t === 'vclaim' ? this.voiceRoom : this.viewRoom; if (!room) return; try { room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify(obj)), { reliable: obj.t === 'chat' || obj.t === 'vclaim' || obj.t === 'clear' }); } catch { /**/ } }
+  private dataSend(obj: any) { const room = (obj.t === 'vclaim' || obj.t === 'music') ? this.voiceRoom : this.viewRoom; if (!room) return; try { room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify(obj)), { reliable: obj.t === 'chat' || obj.t === 'vclaim' || obj.t === 'clear' || obj.t === 'music' }); } catch { /**/ } }
 
   emoteImg(id: string) { return emoteUrl(id); }
 }

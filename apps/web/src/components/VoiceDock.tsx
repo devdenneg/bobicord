@@ -3,6 +3,7 @@ import { Room } from 'livekit-client';
 import { useStore, getEngine } from '../store';
 import { useEngine } from '../hooks';
 import { Icon } from '../Icon';
+import { MusicPlayer } from './MusicPlayer';
 import { getSettings, setSettings } from '../settings';
 import { isTauri, onBroadcastStopped, stopNativeBroadcast } from '../native';
 import { endAnyBroadcasterSession } from '../diag';
@@ -138,6 +139,7 @@ function VoicePanel() {
         <button className="vd-btn vd-leave" data-tip="Выйти из голосового" onClick={() => E.leaveVoice()}><Icon name="leave" sm /></button>
       </div>
       <VoiceControls up />
+      <MusicPlayer />
     </div>
   );
 }
