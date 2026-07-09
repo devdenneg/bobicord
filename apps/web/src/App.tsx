@@ -275,7 +275,7 @@ function Home() {
     <section id="home">
       <header className="home-hd">
         <div className="home-brand"><LogoLoader size={40} speedMs={8000} /><span>Рилэй</span></div>
-        <span className="hd-greet">здарова, {firstName}</span>
+        <span className="hd-greet">Привет, {firstName}</span>
         <div className="stat-strip">
           <StatPill n={servers.length} label="серверов" />
           <StatPill icon="green" n={totalOnline} label="в сети" />
