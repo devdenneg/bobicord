@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Notify};
@@ -44,6 +44,74 @@ use webrtc::track::track_remote::TrackRemote;
 use crate::link::{now_ms, parse_ice_server, read_link_stats, H264_FMTP};
 use crate::signaling::{self, JoinParams, TreeCmd, TreeEvent};
 use crate::transcode::{self, Feed, Transcode};
+
+/// Здоровье ВХОДЯЩЕГО потока: разрывы в RTP-нумерации и отказы фанаута детям.
+///
+/// Зачем. Когда зрители жалуются на фризы, все косвенные метрики (loss из RTCP, PLI,
+/// фризы декодера) отвечают лишь «где-то теряется». Разрыв `sequence_number` на ВХОДЕ
+/// relay-узла отвечает однозначно: пропуски есть — теряет линк от родителя (для vrelay
+/// это аплинк вещателя); пропусков нет, а зрители фризят — виноват этот узел или линк
+/// вниз. Стоимость — одно сравнение на пакет.
+struct IngestMonitor {
+    label: String,
+    last_seq: Option<u16>,
+    packets: u64,
+    lost: u64,
+    reordered: u64,
+    bytes: u64,
+    write_errs: u64,
+    window_start: Instant,
+    /// Тихий поток надо иногда подтверждать: иначе «нет строк» неотличимо от «узел умер».
+    last_baseline: Instant,
+}
+
+impl IngestMonitor {
+    fn new(label: String) -> Self {
+        let now = Instant::now();
+        Self { label, last_seq: None, packets: 0, lost: 0, reordered: 0, bytes: 0, write_errs: 0, window_start: now, last_baseline: now }
+    }
+
+    fn on_packet(&mut self, seq: u16, len: usize) {
+        self.packets += 1;
+        self.bytes += len as u64;
+        if let Some(prev) = self.last_seq {
+            // wrapping_sub корректно переживает разворот 65535 -> 0.
+            let d = seq.wrapping_sub(prev);
+            match d {
+                0 => {}                                  // дубликат
+                1 => {}                                  // всё на месте
+                // Разрыв вперёд = потерянные пакеты. Половина пространства номеров отделяет
+                // «потеря» от «пришёл старый пакет» (переупорядочивание сети).
+                _ if d < 0x8000 => self.lost += (d - 1) as u64,
+                _ => { self.reordered += 1; return; }     // опоздавший — last_seq не двигаем
+            }
+        }
+        self.last_seq = Some(seq);
+    }
+
+    /// Окно 2с — как stats-тик вещателя и зрителя, чтобы `scripts/diag.mjs` сводил их
+    /// без интерполяции. Печатаем только проблемные окна (иначе прод зальёт логами),
+    /// плюс baseline раз в 30с как признак жизни.
+    fn tick(&mut self) {
+        const WINDOW: Duration = Duration::from_secs(2);
+        const BASELINE: Duration = Duration::from_secs(30);
+        if self.window_start.elapsed() < WINDOW { return; }
+        let secs = self.window_start.elapsed().as_secs_f64().max(0.001);
+        let noisy = self.lost > 0 || self.write_errs > 0;
+        if noisy || self.last_baseline.elapsed() >= BASELINE {
+            let kbit = (self.bytes as f64 * 8.0 / 1000.0) / secs;
+            let total = self.packets + self.lost;
+            let loss_pct = if total > 0 { self.lost as f64 * 100.0 / total as f64 } else { 0.0 };
+            log::info!(
+                "ingest {}: пакетов {} | потеряно {} ({loss_pct:.2}%) | переупорядочено {} | {kbit:.0} кбит/с | ошибок отдачи детям {}",
+                self.label, self.packets, self.lost, self.reordered, self.write_errs,
+            );
+            self.last_baseline = Instant::now();
+        }
+        self.packets = 0; self.lost = 0; self.reordered = 0; self.bytes = 0; self.write_errs = 0;
+        self.window_start = Instant::now();
+    }
+}
 
 /// Сток UI-событий хоста: (event, payload). В нативе — обёртка над `AppHandle::emit`
 /// (события relay-watch-offer/-ice/relay-topology для webview); None — headless, локальный
@@ -288,21 +356,31 @@ impl RelayManager {
         // (0 = ни одного рендишна → лок не берём, passthrough как раньше, инвариант цел).
         let video_feeds = self.video_feeds.clone();
         let feed_count = self.feed_count.clone();
+        let ingest_sid = self.stream_id.clone();
+        let ingest_parent = from.clone();
         pc.on_track(Box::new(move |track: Arc<TrackRemote>, _r: Arc<RTCRtpReceiver>, _t: Arc<RTCRtpTransceiver>| {
             let video_local = video_local.clone();
             let audio_local = audio_local.clone();
             let video_feeds = video_feeds.clone();
             let feed_count = feed_count.clone();
+            let ingest_sid = ingest_sid.clone();
+            let ingest_parent = ingest_parent.clone();
             Box::pin(async move {
                 let is_video = track.kind() == RTPCodecType::Video;
                 tokio::spawn(async move {
+                    let kind = if is_video { "video" } else { "audio" };
+                    let mut mon = IngestMonitor::new(format!("{ingest_sid} {kind} <- {ingest_parent}"));
                     loop {
                         match track.read_rtp().await {
                             Ok((packet, _)) => {
+                                mon.on_packet(packet.header.sequence_number, packet.payload.len());
                                 let res = if is_video { video_local.write_rtp(&packet).await } else { audio_local.write_rtp(&packet).await };
                                 if let Err(e) = res {
                                     // ErrClosedPipe = ни одного связанного sender (нет детей/webview) — не ошибка
                                     if webrtc::Error::ErrClosedPipe.to_string() != e.to_string() {
+                                        // Считаем, а не пишем строку на пакет: отдача 30 кадров/с
+                                        // с ошибкой залила бы лог мгновенно. Сводка — в tick().
+                                        mon.write_errs += 1;
                                         log::debug!("relay: write_rtp: {e}");
                                     }
                                 }
@@ -310,8 +388,14 @@ impl RelayManager {
                                 if is_video && feed_count.load(Ordering::Relaxed) > 0 {
                                     for f in video_feeds.lock().unwrap().values() { f.send_video(&packet); }
                                 }
+                                mon.tick();
                             }
-                            Err(_) => break, // upstream закрылся
+                            // Раньше был молчаливый `break`: upstream отваливался, зрители
+                            // фризили, а в логе — ни строки. Причина обрыва решает, куда смотреть.
+                            Err(e) => {
+                                log::warn!("ingest {ingest_sid} {kind}: upstream {ingest_parent} закрылся: {e}");
+                                break;
+                            }
                         }
                     }
                 });
@@ -787,4 +871,57 @@ pub fn start_rendition_root(cfg: RelayConfig, video: Arc<TrackLocalStaticRTP>, a
     });
 
     RelayHandle { ctrl_tx, finished }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IngestMonitor;
+
+    fn feed(seqs: &[u16]) -> (u64, u64, u64) {
+        let mut m = IngestMonitor::new("test".into());
+        for &s in seqs { m.on_packet(s, 100); }
+        (m.packets, m.lost, m.reordered)
+    }
+
+    #[test]
+    fn no_loss_on_consecutive() {
+        let (p, lost, re) = feed(&[10, 11, 12, 13]);
+        assert_eq!((p, lost, re), (4, 0, 0));
+    }
+
+    #[test]
+    fn counts_gap() {
+        // 10 -> 14: пропущены 11,12,13
+        let (_, lost, re) = feed(&[10, 14]);
+        assert_eq!((lost, re), (3, 0));
+    }
+
+    /// Разворот номера: 65534, 65535, 0, 1 — непрерывная последовательность, не потеря
+    /// 65534 пакетов. Это ровно то место, где наивное `seq - prev` сломалось бы.
+    #[test]
+    fn wraparound_is_not_loss() {
+        let (_, lost, re) = feed(&[65534, 65535, 0, 1]);
+        assert_eq!((lost, re), (0, 0));
+    }
+
+    /// Пропуск ЧЕРЕЗ разворот: 65535 -> 2 = потеряны 0 и 1.
+    #[test]
+    fn gap_across_wraparound() {
+        let (_, lost, _) = feed(&[65535, 2]);
+        assert_eq!(lost, 2);
+    }
+
+    /// Опоздавший пакет (сеть переупорядочила) — не потеря и не двигает last_seq назад,
+    /// иначе следующий нормальный пакет насчитал бы гигантский разрыв.
+    #[test]
+    fn reorder_not_counted_as_loss() {
+        let (_, lost, re) = feed(&[10, 11, 9, 12]);
+        assert_eq!((lost, re), (0, 1));
+    }
+
+    #[test]
+    fn duplicate_ignored() {
+        let (_, lost, re) = feed(&[10, 10, 11]);
+        assert_eq!((lost, re), (0, 0));
+    }
 }
