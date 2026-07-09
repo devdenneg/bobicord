@@ -795,6 +795,11 @@
   .pi.clickable .head:hover .chev{opacity:.8}.pi.open .chev{opacity:1;transform:rotate(180deg)}
   .pi .micst{width:28px;height:28px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;color:var(--red)}
   .pi .micst:not(.off){visibility:hidden}.pi .micst .ic{font-size:15px}
+  /* игро-иконка в голосовом ряду — фикс-слот 28px (как watch/mic/chev), чтоб иконки стояли колонкой */
+  .pi .vcg{width:28px;height:28px;flex:0 0 auto;display:flex;align-items:center;justify-content:center}
+  .pi .vcg img{width:17px;height:17px;border-radius:5px;object-fit:contain;display:block}
+  .pi .vcg .gpad{font-size:15px;line-height:1}
+  .pi .chev-pad{visibility:hidden}
   /* строка громкости — плавно раскрывается/уезжает */
   .pi .exp{display:flex;align-items:center;gap:10px;max-height:0;overflow:hidden;opacity:0;padding:0 8px 0 8px;transition:max-height .22s ease,opacity .18s ease,padding .22s ease}
   .pi.open .exp{max-height:56px;opacity:1;padding:4px 8px 12px 8px}

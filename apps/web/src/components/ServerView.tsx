@@ -169,8 +169,9 @@ function VoiceParticipantRow({ m, anim }: { m: Member; anim?: string }) {
         <div className="vc-id">
           <div className="nm" title={m.displayName}>{m.displayName}{isLocal && !connecting ? ' (ты)' : ''}</div>
           {connecting ? <span className="vc-connecting">подключение…</span> : null}
-          {pr?.game ? <span className="pi-game vc" data-tip={'Играет в ' + pr.game.name}>{pr.game.icon ? <img src={`data:image/png;base64,${pr.game.icon}`} alt="" /> : <span className="gpad">🎮</span>}<span className="pg-nm">{pr.game.name}</span></span> : null}
         </div>
+        {/* Правый статус-блок: фикс-колонки. Слот-A (стример→«смотреть» / игрок→иконка игры) стоит слева от
+            зарезервированных mic(visibility:hidden) и chev → все иконки одного типа в одной вертикали, не пляшут по нику. */}
         {remote && streaming ? (
           <button className={'watchbtn' + (watching ? ' on' : '')} disabled={pending}
             aria-label={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}
@@ -178,11 +179,13 @@ function VoiceParticipantRow({ m, anim }: { m: Member; anim?: string }) {
             onClick={(e) => { e.stopPropagation(); watching ? E.closeWatch(m.username) : E.watch(m.username); }}>
             {pending ? <span className="spin" style={{ margin: 0, width: 13, height: 13 }} /> : <Icon name={watching ? 'eye-off' : 'eye'} />}
           </button>
+        ) : pr?.game ? (
+          <span className="vcg" data-tip={'Играет в ' + pr.game.name}>{pr.game.icon ? <img src={`data:image/png;base64,${pr.game.icon}`} alt="" /> : <span className="gpad">🎮</span>}</span>
         ) : null}
         {connecting
           ? <span className="spin" style={{ margin: 0, width: 14, height: 14 }} aria-label="Подключение" />
           : <div className={'micst' + (pr?.micMuted ? ' off' : '')} aria-label={pr?.micMuted ? (pr?.deafened ? 'Оглох' : 'Микрофон выключен') : undefined}><Icon name={pr?.deafened ? 'head-off' : 'mic-off'} /></div>}
-        {remote ? <div className="chev" aria-hidden="true"><Icon name="chevron" sm /></div> : null}
+        {remote ? <div className="chev" aria-hidden="true"><Icon name="chevron" sm /></div> : <div className="chev chev-pad" aria-hidden="true" />}
       </div>
       {remote ? (
         <div className="exp" id={rowId}>
