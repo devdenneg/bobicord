@@ -681,6 +681,7 @@ function Chat() {
   const [pill, setPill] = useState(0);            // счётчик непрочитанных (пока не внизу)
   const [atBottom, setAtBottom] = useState(true);
   const atBottomRef = useRef(true);
+  const [dividerFade, setDividerFade] = useState(false); // дивайдер «Новые сообщения» гаснет, когда юзер увидел границу
   const [focusTick, setFocusTick] = useState(0); // тикает на focus/blur/visibility — «увидел глазами» зависит от фокуса окна
   const [firstItemIndex, setFirstItemIndex] = useState(VIRT_BASE_INDEX); // якорь для prepend
   const [olderBusy, setOlderBusy] = useState(false); // идёт догрузка старых
@@ -713,8 +714,14 @@ function Chat() {
     prevLastId.current = null; prevTrim.current = 0; lastAckedRef.current = null; loadingOlder.current = false; setOlderBusy(false);
     // не даём startReached стрельнуть догрузкой прямо на маунте (пока идёт scroll-to-bottom и оседание)
     olderReady.current = false;
+    setDividerFade(false);
     const t = window.setTimeout(() => { olderReady.current = true; }, 700);
-    return () => clearTimeout(t);
+    // низ «оседает» уже ПОСЛЕ маунта (высоты картинок/эмодзи приходят позже) → если непрочитанного нет,
+    // добиваем скролл к последнему несколько раз, пока не уплыли от низа. Гард atBottomRef — не дёргаем,
+    // если юзер успел проскроллить вверх.
+    const settle: number[] = [];
+    if (unreadHere === 0) for (const d of [90, 320, 750]) settle.push(window.setTimeout(() => { if (atBottomRef.current) virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end' }); }, d));
+    return () => { clearTimeout(t); settle.forEach((s) => clearTimeout(s)); };
   }, [activeId]);
 
   // «Увидел своими глазами» = чат этого сервера открыт, проскроллен ВНИЗ И окно В ФОКУСЕ/видимо.
@@ -748,6 +755,13 @@ function Chat() {
     prevLastId.current = last;
   }, [messages, activeId, bumpUnreadStore]);
   useEffect(() => { if (atBottom) setPill(0); }, [atBottom]);
+  // Дивайдер «Новые сообщения» не висит вечно: как юзер добрался до низа и увидел границу (окно видимо),
+  // через ~4.5с плавно гасим его (CSS-transition). Сброс — в entry-эффекте при смене сервера.
+  useEffect(() => {
+    if (dividerFade || !atBottom || document.visibilityState !== 'visible') return;
+    const t = window.setTimeout(() => setDividerFade(true), 4500);
+    return () => clearTimeout(t);
+  }, [atBottom, dividerFade, focusTick]);
   // Внизу чата + окно В ФОКУСЕ/видимо → «прочитать всё» (реально увидел). Не в фокусе — НЕ читаем:
   // непрочитанное копится, пока не вернёшься в окно (focusTick пере-триггерит). Живые сообщения не имеют
   // серверного sid (узнаются лишь через refetch) → шлём all:true, сервер выставит last_read=MAX id.
@@ -1031,7 +1045,7 @@ function Chat() {
           className="virt-msgs"
           data={messages}
           firstItemIndex={firstItemIndex}
-          initialTopMostItemIndex={firstUnread >= 0 ? { index: firstUnread, align: 'start' } : messages.length - 1}
+          initialTopMostItemIndex={firstUnread >= 0 ? { index: firstUnread, align: 'start' } : { index: Math.max(0, messages.length - 1), align: 'end' }}
           alignToBottom
           startReached={loadOlder}
           followOutput={(bottom) => (bottom ? 'auto' : false)}
@@ -1042,7 +1056,7 @@ function Chat() {
           context={{ busy: olderBusy, hasMore: eng.chatHasMore }}
           components={{ Header: ChatOlderHeader, Footer: ChatFooter }}
           itemContent={(_, m) => (m.id === firstUnreadId
-            ? <div className="msg-newwrap"><div className="msg-newdiv"><span>Новые сообщения</span></div>{renderMessage(m)}</div>
+            ? <div className="msg-newwrap"><div className={'msg-newdiv' + (dividerFade ? ' faded' : '')}><span>Новые сообщения</span></div>{renderMessage(m)}</div>
             : renderMessage(m))}
         />
       )}

@@ -182,17 +182,23 @@
   .home-sec{font-size:12px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--muted);margin:0 0 12px}
   /* bento: активные (live/voice) карточки span-2, dense затыкает дыры → взвешенная сетка, не однообразная */
   .srv-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(288px,100%),1fr));gap:14px;grid-auto-flow:dense}
-  .srv-card{position:relative;overflow:hidden;isolation:isolate;background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-md);padding:16px;text-align:left;box-shadow:var(--sh-1);display:flex;flex-direction:column;gap:10px;align-items:stretch;transition:background var(--tr),border-color var(--tr),transform var(--tr),box-shadow var(--tr)}
+  /* overflow:visible — иначе баннер-обложка клипал бы hover-тултип «кто в сети» (.sc-tip всплывает ВВЕРХ за край карточки). Клип обложки — на самом .sc-cover ниже. */
+  .srv-card{position:relative;overflow:visible;isolation:isolate;background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-md);padding:16px;text-align:left;box-shadow:var(--sh-1);display:flex;flex-direction:column;gap:10px;align-items:stretch;transition:background var(--tr),border-color var(--tr),transform var(--tr),box-shadow var(--tr)}
   .srv-card > *{position:relative;z-index:1}
   .srv-card > .sc-cover{z-index:0}
   /* обложка = ЯРКИЙ баннер вверху карточки, мягко тает в фон (mask); контент читается поверх (скрим+тень) */
-  .sc-cover{position:absolute;inset:0 0 auto 0;height:104px;pointer-events:none;background-position:center;background-size:cover;filter:blur(18px) saturate(1.4) brightness(.8);opacity:.9;transform:scale(1.4);transform-origin:50% 25%;-webkit-mask-image:linear-gradient(180deg,#000 42%,transparent);mask-image:linear-gradient(180deg,#000 42%,transparent);transition:opacity .35s ease,filter .35s ease}
+  /* .sc-cover — клип-контейнер (overflow:hidden, свой radius, БЕЗ transform). scale/blur/ken-burns
+     на ::before → баннер не выпирает за карточку, а карте можно overflow:visible (тултип не режется). */
+  .sc-cover{position:absolute;inset:0 0 auto 0;height:104px;overflow:hidden;border-radius:var(--r-md) var(--r-md) 0 0;pointer-events:none;opacity:.9;-webkit-mask-image:linear-gradient(180deg,#000 42%,transparent);mask-image:linear-gradient(180deg,#000 42%,transparent);transition:opacity .35s ease}
+  .sc-cover::before{content:'';position:absolute;inset:0;background-image:var(--cover);background-position:center;background-size:cover;filter:blur(18px) saturate(1.4) brightness(.8);transform:scale(1.4);transform-origin:50% 25%;transition:filter .35s ease}
   .sc-cover::after{content:'';position:absolute;inset:0;background:linear-gradient(180deg,rgba(0,0,0,.42),rgba(0,0,0,.12) 60%,transparent)}
-  .srv-card.has-cover .sc-cover{animation:scKen 22s ease-in-out infinite alternate}
-  .srv-card:not(.has-cover) .sc-cover{background:linear-gradient(135deg,color-mix(in srgb,var(--tint) 82%,transparent),color-mix(in srgb,var(--tint) 20%,transparent));filter:saturate(1.3);opacity:.85}
+  .srv-card.has-cover .sc-cover::before{animation:scKen 22s ease-in-out infinite alternate}
+  .srv-card:not(.has-cover) .sc-cover{opacity:.85}
+  .srv-card:not(.has-cover) .sc-cover::before{background:linear-gradient(135deg,color-mix(in srgb,var(--tint) 82%,transparent),color-mix(in srgb,var(--tint) 20%,transparent));filter:saturate(1.3);transform:none}
   .srv-card.has-cover .sc-nm{text-shadow:0 1px 4px rgba(0,0,0,.6)}
   .srv-card.has-cover .sc-sub{text-shadow:0 1px 3px rgba(0,0,0,.5)}
-  .srv-card:hover .sc-cover{opacity:1;filter:blur(16px) saturate(1.5) brightness(.9)}
+  .srv-card:hover .sc-cover{opacity:1}
+  .srv-card:hover .sc-cover::before{filter:blur(16px) saturate(1.5) brightness(.9)}
   @keyframes scKen{0%{transform:scale(1.4) translate(-2%,0)}100%{transform:scale(1.52) translate(2%,-2%)}}
   /* ховер: с обложкой — нейтральный подъём (цвет уже даёт баннер, не мешаем хеш-цветом --tint) */
   .srv-card:hover{background:var(--panel2);border-color:color-mix(in srgb,var(--accent) 60%,var(--line-2));transform:translateY(-3px);box-shadow:0 14px 30px -16px rgba(0,0,0,.55),var(--sh-2)}
@@ -256,17 +262,22 @@
 
   /* S1 живой эфир */
   .live-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
-  .live-card{position:relative;overflow:hidden;isolation:isolate;background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-lg);padding:15px 17px;box-shadow:var(--sh-2),var(--hair);display:flex;flex-direction:column;gap:13px;min-height:118px;transition:transform .3s cubic-bezier(.2,.7,.3,1),box-shadow .35s ease,border-color .35s ease}
+  .live-card{position:relative;cursor:pointer;overflow:hidden;isolation:isolate;background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-lg);padding:15px 17px;box-shadow:var(--sh-2),var(--hair);display:flex;flex-direction:column;gap:13px;min-height:118px;transition:transform .3s cubic-bezier(.2,.7,.3,1),box-shadow .35s ease,border-color .35s ease}
   .live-card > *{position:relative;z-index:1}
   /* аврора-фон: мягкие цветные пятна медленно дрейфуют — карточка «дышит» и зовёт зайти */
   .live-card::before{content:'';position:absolute;inset:-45%;z-index:0;pointer-events:none;opacity:.5;filter:blur(16px);background:radial-gradient(38% 46% at 22% 26%,color-mix(in srgb,var(--accent) 60%,transparent),transparent 70%),radial-gradient(34% 42% at 82% 24%,color-mix(in srgb,var(--accent-txt) 45%,transparent),transparent 70%),radial-gradient(48% 54% at 60% 100%,color-mix(in srgb,var(--accent) 38%,transparent),transparent 72%);animation:lcAurora 15s ease-in-out infinite alternate}
   /* глянцевый блик-свип на ховере */
   .live-card::after{content:'';position:absolute;inset:0;z-index:2;pointer-events:none;border-radius:inherit;opacity:0;transform:translateX(-120%);background:linear-gradient(115deg,transparent 32%,rgba(255,255,255,.10) 48%,rgba(255,255,255,.02) 55%,transparent 70%)}
   .live-card:hover{transform:translateY(-3px);border-color:color-mix(in srgb,var(--accent) 55%,var(--line-2))}
-  .live-card:hover::after{opacity:1;animation:lcSweep 1.05s ease}
+  .live-card:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  /* блик-свип на ховере — только у voice-карточки (у стрима свой непрерывный «вещательный» перелив ниже) */
+  .live-card.voice:hover::after{opacity:1;animation:lcSweep 1.05s ease}
   /* STREAM: красная аврора + дыхание-свечение (сильнее зовёт) */
   .live-card.stream{border-color:color-mix(in srgb,var(--live) 38%,var(--line-2));animation:lcBreath 3.6s ease-in-out infinite}
   .live-card.stream::before{opacity:.62;background:radial-gradient(40% 48% at 20% 24%,color-mix(in srgb,var(--live) 62%,transparent),transparent 70%),radial-gradient(34% 44% at 84% 20%,color-mix(in srgb,#ff8aa0 52%,transparent),transparent 70%),radial-gradient(52% 56% at 62% 102%,color-mix(in srgb,var(--accent) 42%,transparent),transparent 72%)}
+  /* «идёт вещание»: непрерывный диагональный блик-перелив по стрим-карточке (сигнал/трансляция) */
+  .live-card.stream::after{opacity:.5;background:linear-gradient(115deg,transparent 28%,rgba(255,255,255,.13) 47%,color-mix(in srgb,var(--live) 24%,transparent) 53%,transparent 72%);animation:lcFlow 4.5s linear infinite}
+  @keyframes lcFlow{0%{transform:translateX(-130%)}100%{transform:translateX(130%)}}
   .live-card.stream:hover{border-color:color-mix(in srgb,var(--live) 65%,transparent)}
   /* VOICE-only: зелёная аврора, спокойнее */
   .live-card.voice::before{opacity:.46;background:radial-gradient(38% 46% at 22% 28%,color-mix(in srgb,var(--green) 52%,transparent),transparent 70%),radial-gradient(40% 48% at 80% 80%,color-mix(in srgb,var(--accent) 40%,transparent),transparent 72%)}
@@ -320,7 +331,7 @@
   /* «Играют сейчас» — кросс-серверные карточки игр (иконка + кластер игроков + счётчик) */
   .games-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));gap:12px}
   .game-card{display:flex;align-items:center;gap:12px;background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-md);padding:12px 14px;box-shadow:var(--sh-1);min-width:0;transition:border-color var(--tr),transform var(--tr)}
-  .game-card:hover{border-color:var(--accent);transform:translateY(-2px)}
+  .game-card:hover{background:var(--panel2)}  /* инфо-карточка, не кликается — только мягкая подсветка, без подъёма/акцент-рамки */
   .gc-ic{width:46px;height:46px;border-radius:12px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;overflow:hidden;background:var(--panel2);box-shadow:inset 0 0 0 1px rgba(255,255,255,.05)}
   .gc-ic img{width:100%;height:100%;object-fit:cover}
   .gc-ic .gc-pad{font-size:22px}
@@ -623,7 +634,8 @@
   @keyframes sbIn{from{opacity:0;transform:translateY(10px) scale(.8)}to{opacity:1;transform:none}}
   /* дивайдер «Новые сообщения» перед первым непрочитанным */
   .msg-newwrap{display:flex;flex-direction:column}
-  .msg-newdiv{display:flex;align-items:center;gap:10px;margin:8px 0 4px;color:var(--red,#f23f43);font-size:10.5px;font-weight:800;text-transform:uppercase;letter-spacing:.6px}
+  .msg-newdiv{display:flex;align-items:center;gap:10px;margin:8px 0 4px;color:var(--red,#f23f43);font-size:10.5px;font-weight:800;text-transform:uppercase;letter-spacing:.6px;max-height:24px;overflow:hidden;transition:opacity .5s ease,max-height .5s ease,margin .5s ease}
+  .msg-newdiv.faded{opacity:0;max-height:0;margin:0}  /* граница «увидена» → плавно гаснет и схлопывается */
   .msg-newdiv::before,.msg-newdiv::after{content:'';flex:1;height:1px;background:color-mix(in srgb,var(--red,#f23f43) 45%,transparent)}
   .msg-newdiv span{flex:0 0 auto}
   .chat-in{display:flex;gap:8px;padding:12px;border-top:1px solid var(--line-2)}

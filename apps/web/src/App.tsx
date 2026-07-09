@@ -126,7 +126,9 @@ function LiveCard({ item, onOpen }: { item: LiveItem; onOpen: () => void }) {
   const active = [...item.streamers, ...item.voice]; // все активные — для кластера лиц
   const lead = item.streamers[0];                    // ведущий стример (если стримят несколько — «+N»)
   return (
-    <div className={'live-card' + (hasStream ? ' stream' : ' voice')}>
+    <div className={'live-card' + (hasStream ? ' stream' : ' voice')}
+      role="button" tabIndex={0} onClick={onOpen}
+      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen(); } }}>
       <div className="lc-top">
         <span className="lc-srvic" style={{ background: faceBg(s.iconUrl, s.name, s.iconColor) }}><Face url={s.iconUrl} name={s.name} color={s.iconColor} /></span>
         <span className="lc-srv">{s.name}</span>
@@ -143,7 +145,7 @@ function LiveCard({ item, onOpen }: { item: LiveItem; onOpen: () => void }) {
       ) : null}
       <div className="lc-foot">
         {active.length ? <Cluster members={active} cap={6} /> : <span />}
-        <button className="cta" onClick={onOpen}>{hasStream ? 'Смотреть' : 'Зайти'}</button>
+        <button className="cta" onClick={(e) => { e.stopPropagation(); onOpen(); }}>{hasStream ? 'Смотреть' : 'Зайти'}</button>
       </div>
     </div>
   );
@@ -157,7 +159,7 @@ function ServerCard({ s, unread, connected, onOpen }: { s: ServerSummary; unread
   const tint = avColor(s.name, s.iconColor);                     // цвет-подложка (фолбэк без обложки + glow)
   return (
     <button className={'srv-card' + (isLive ? ' is-live' : '') + (connected ? ' is-connected' : '') + (coverUrl ? ' has-cover' : '')} onClick={onOpen} style={{ ['--tint' as any]: tint }}>
-      <span className="sc-cover" aria-hidden="true" style={coverUrl ? { backgroundImage: `url("${coverUrl}")` } : undefined} />
+      <span className="sc-cover" aria-hidden="true" style={coverUrl ? { ['--cover' as any]: `url("${coverUrl}")` } : undefined} />
       <div className="sc-h">
         <div className="sc-ic" style={{ background: faceBg(s.iconUrl, s.name, s.iconColor), overflow: 'hidden' }}><Face url={s.iconUrl} name={s.name} color={s.iconColor} /></div>
         <div style={{ minWidth: 0, flex: 1 }}>
