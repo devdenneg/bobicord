@@ -691,12 +691,19 @@ export class Engine {
   // строим цепочку: устройство -> analyser(VAD) + gain -> published track
   private async startMic() {
     if (!this.voiceRoom) return;
-    this.micRaw = await navigator.mediaDevices.getUserMedia({ audio: this.micCapture() });
+    // Контекст ПУБЛИКАЦИИ создаём и резюмим ДО getUserMedia — пока жива user-activation от клика «войти
+    // в голосовой». Раньше он рождался ПОСЛЕ gUM: на ПЕРВОМ входе промпт разрешения съедал активацию →
+    // контекст 'suspended', а suspended MediaStreamDestination выдаёт ТИШИНУ (пиры не слышат до F5 —
+    // после перезахода разрешение уже есть, промпта нет, активация клика доживает). Уже РАБОТАЮЩИЙ
+    // контекст промпт не усыпляет. resume + gesture-unlock/watchdog (ensureVoiceAudioRunning) — подстраховка.
     this.micActx = new AudioContext();
-    // Дожидаемся resume: getUserMedia выше (+ промпт разрешения) РВЁТ user-activation → этот
-    // контекст ПУБЛИКАЦИИ рождается 'suspended', а suspended MediaStreamDestination выдаёт ТИШИНУ
-    // (пиры не слышат, хотя зелёная обводка от ДРУГОГО контекста spCtx рисуется). См. ensureVoiceAudioRunning.
     try { await this.micActx.resume?.(); } catch { /**/ }
+    try {
+      this.micRaw = await navigator.mediaDevices.getUserMedia({ audio: this.micCapture() });
+    } catch (e) {
+      try { this.micActx.close(); } catch { /**/ } this.micActx = null; // отказ в доступе — не течём контекстом
+      throw e;
+    }
     const src = this.micActx.createMediaStreamSource(this.micRaw);
     this.micGain = this.micActx.createGain();
     src.connect(this.micGain);
