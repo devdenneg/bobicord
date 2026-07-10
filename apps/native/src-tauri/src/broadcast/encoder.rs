@@ -15,6 +15,13 @@ use windows::Win32::System::Variant::VARIANT;
 
 use super::capture::Nv12Frame;
 
+/// Период принудительного IDR, секунды. Страховка от потерянного keyframe: основной путь
+/// восстановления — PLI от зрителя (peer.rs форсит IDR), но если PLI потерялся, без
+/// периодического GOP зритель фризит навсегда. 4с: при 4.5 Мбит IDR ~200-300 КБ, редкий
+/// спайк терпим. Чаще (1-2с) — залпы по ~170 пакетов подряд раздувают jitter у зрителя и
+/// дают фризы 200-600 мс БЕЗ единой потери пакета (ловилось живьём, диаг 2026-07-10).
+const GOP_SECONDS: u32 = 4;
+
 pub struct EncodedFrame {
     pub data: Vec<u8>,
     pub is_keyframe: bool,
@@ -67,6 +74,14 @@ impl H264Encoder {
             set_attr_ratio(&output_type, &MF_MT_FRAME_RATE, fps, 1).map_err(|e| e.to_string())?;
             set_attr_ratio(&output_type, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1).map_err(|e| e.to_string())?;
             output_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32).map_err(|e| e.to_string())?;
+            // GOP задаём АТРИБУТОМ ВЫХОДНОГО ТИПА, до SetOutputType. Аппаратные MFT читают
+            // конфигурацию в момент SetOutputType; `CODECAPI_AVEncMPVGOPSize`, выставленный
+            // ПОСЛЕ (см. ниже), они молча игнорируют — энкодер оставался на дефолтном GOP=fps,
+            // то есть выдавал IDR раз в секунду вместо раза в 4с (подтверждено `IDR +2` за
+            // 2с-окно при `PLI +0` в net-логе вещателя).
+            output_type
+                .SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, fps.saturating_mul(GOP_SECONDS).max(1))
+                .map_err(|e| e.to_string())?;
             transform.SetOutputType(0, &output_type, 0).map_err(|e| format!("SetOutputType: {e}"))?;
 
             let input_type = MFCreateMediaType().map_err(|e| e.to_string())?;
@@ -93,13 +108,10 @@ impl H264Encoder {
                 // спайки, пробивающие слабый линк зрителя). Часть MFT (NVENC/AMF/QSV) свойство
                 // игнорирует или не поддерживает — не критично, полагаемся на CBR-контроль (let _ =).
                 let _ = api.SetValue(&CODECAPI_AVEncCommonBufferSize, &VARIANT::from(bitrate_bps));
-                // Периодический IDR (GOP) как страховка от потери keyframe: основной путь
-                // восстановления — PLI от зрителя (peer.rs читает RTCP и форсит IDR), но если
-                // PLI/force потерялся, без периодического GOP зритель фризит до следующего
-                // события навсегда. GOP в кадрах = fps*4 (~4с): при 6 Мбит IDR ~100-300КБ,
-                // оверхед незаметный, максимум 4с фриза. 2с слишком часто для CBR (спайки).
-                // Часть MFT игнорирует свойство — тогда полагаемся только на PLI (let _ =).
-                const GOP_SECONDS: u32 = 4;
+                // Дубль GOP через ICodecAPI. Основной путь — MF_MT_MAX_KEYFRAME_SPACING на
+                // выходном типе (выше): здесь мы уже ПОСЛЕ SetOutputType, и аппаратные MFT это
+                // значение игнорируют. Оставлено для софтверных MFT, которые читают ICodecAPI
+                // в рантайме; вреда нет, значение то же (let _ = — свойство опционально).
                 let _ = api.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(fps.saturating_mul(GOP_SECONDS).max(1)));
             }
 
