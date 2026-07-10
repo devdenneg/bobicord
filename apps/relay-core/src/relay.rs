@@ -45,30 +45,44 @@ use crate::link::{now_ms, parse_ice_server, read_link_stats, H264_FMTP};
 use crate::signaling::{self, JoinParams, TreeCmd, TreeEvent};
 use crate::transcode::{self, Feed, Transcode};
 
-/// Здоровье ВХОДЯЩЕГО потока: разрывы в RTP-нумерации и отказы фанаута детям.
+/// Глубина очереди «чтение -> фанаут». Развязывает приём от отдачи: пока один зритель
+/// захлёбывается, чтение от родителя продолжается. Переполнение = осознанный дроп, а не
+/// остановка ingest (разбор прода: 4 зрителя × 4.7 Мбит уперлись в 15-мегабитный аплинк
+/// VPS, `write_rtp` встал в бэкпрешер, цикл чтения замер — и разрывы RTP на входе
+/// выглядели как «потери сети», хотя пакеты терялись внутри нас).
+/// 256 пакетов ≈ 0.35 МБ ≈ 18 кадров при 4.5 Мбит/30fps — достаточно, чтобы пережить
+/// микро-затык, и мало, чтобы не копить задержку (инвариант «видео < 2с»).
+const FANOUT_QUEUE_VIDEO: usize = 256;
+/// Аудио редкое (50 пакетов/с) — та же глубина дала бы 5 секунд буфера.
+const FANOUT_QUEUE_AUDIO: usize = 100;
+
+/// Здоровье ВХОДЯЩЕГО потока и очереди фанаута.
 ///
-/// Зачем. Когда зрители жалуются на фризы, все косвенные метрики (loss из RTCP, PLI,
-/// фризы декодера) отвечают лишь «где-то теряется». Разрыв `sequence_number` на ВХОДЕ
-/// relay-узла отвечает однозначно: пропуски есть — теряет линк от родителя (для vrelay
-/// это аплинк вещателя); пропусков нет, а зрители фризят — виноват этот узел или линк
-/// вниз. Стоимость — одно сравнение на пакет.
+/// Разрыв `sequence_number` на ВХОДЕ relay-узла отвечает на вопрос, который косвенные
+/// метрики (RTCP loss, PLI, freezeCount) решить не могут: пропуски есть — теряет линк
+/// от родителя; пропусков нет, а зрители фризят — виноват этот узел или линк вниз.
+///
+/// `fanout_drops` считается ОТДЕЛЬНО от разрывов: это наши собственные потери на
+/// переполнении очереди (аплинк узла не тянет), и путать их с сетевыми — значит искать
+/// проблему не там. Оба счётчика делит с writer-таском через Arc.
 struct IngestMonitor {
     label: String,
     last_seq: Option<u16>,
     packets: u64,
-    lost: u64,
+    gaps: u64,
     reordered: u64,
     bytes: u64,
-    write_errs: u64,
+    fanout_drops: Arc<AtomicU64>,
+    write_errs: Arc<AtomicU64>,
     window_start: Instant,
     /// Тихий поток надо иногда подтверждать: иначе «нет строк» неотличимо от «узел умер».
     last_baseline: Instant,
 }
 
 impl IngestMonitor {
-    fn new(label: String) -> Self {
+    fn new(label: String, fanout_drops: Arc<AtomicU64>, write_errs: Arc<AtomicU64>) -> Self {
         let now = Instant::now();
-        Self { label, last_seq: None, packets: 0, lost: 0, reordered: 0, bytes: 0, write_errs: 0, window_start: now, last_baseline: now }
+        Self { label, last_seq: None, packets: 0, gaps: 0, reordered: 0, bytes: 0, fanout_drops, write_errs, window_start: now, last_baseline: now }
     }
 
     fn on_packet(&mut self, seq: u16, len: usize) {
@@ -80,9 +94,9 @@ impl IngestMonitor {
             match d {
                 0 => {}                                  // дубликат
                 1 => {}                                  // всё на месте
-                // Разрыв вперёд = потерянные пакеты. Половина пространства номеров отделяет
-                // «потеря» от «пришёл старый пакет» (переупорядочивание сети).
-                _ if d < 0x8000 => self.lost += (d - 1) as u64,
+                // Разрыв вперёд = недошедшие пакеты. Половина пространства номеров отделяет
+                // «пропуск» от «пришёл старый пакет» (переупорядочивание сети).
+                _ if d < 0x8000 => self.gaps += (d - 1) as u64,
                 _ => { self.reordered += 1; return; }     // опоздавший — last_seq не двигаем
             }
         }
@@ -97,18 +111,20 @@ impl IngestMonitor {
         const BASELINE: Duration = Duration::from_secs(30);
         if self.window_start.elapsed() < WINDOW { return; }
         let secs = self.window_start.elapsed().as_secs_f64().max(0.001);
-        let noisy = self.lost > 0 || self.write_errs > 0;
+        let drops = self.fanout_drops.swap(0, Ordering::Relaxed);
+        let errs = self.write_errs.swap(0, Ordering::Relaxed);
+        let noisy = self.gaps > 0 || drops > 0 || errs > 0;
         if noisy || self.last_baseline.elapsed() >= BASELINE {
             let kbit = (self.bytes as f64 * 8.0 / 1000.0) / secs;
-            let total = self.packets + self.lost;
-            let loss_pct = if total > 0 { self.lost as f64 * 100.0 / total as f64 } else { 0.0 };
+            let total = self.packets + self.gaps;
+            let gap_pct = if total > 0 { self.gaps as f64 * 100.0 / total as f64 } else { 0.0 };
             log::info!(
-                "ingest {}: пакетов {} | потеряно {} ({loss_pct:.2}%) | переупорядочено {} | {kbit:.0} кбит/с | ошибок отдачи детям {}",
-                self.label, self.packets, self.lost, self.reordered, self.write_errs,
+                "ingest {}: пакетов {} | разрывов RTP {} ({gap_pct:.2}%) | переупорядочено {} | {kbit:.0} кбит/с | фанаут: дропов {drops}, ошибок {errs}",
+                self.label, self.packets, self.gaps, self.reordered,
             );
             self.last_baseline = Instant::now();
         }
-        self.packets = 0; self.lost = 0; self.reordered = 0; self.bytes = 0; self.write_errs = 0;
+        self.packets = 0; self.gaps = 0; self.reordered = 0; self.bytes = 0;
         self.window_start = Instant::now();
     }
 }
@@ -369,24 +385,50 @@ impl RelayManager {
                 let is_video = track.kind() == RTPCodecType::Video;
                 tokio::spawn(async move {
                     let kind = if is_video { "video" } else { "audio" };
-                    let mut mon = IngestMonitor::new(format!("{ingest_sid} {kind} <- {ingest_parent}"));
+                    let fanout_drops = Arc::new(AtomicU64::new(0));
+                    let write_errs = Arc::new(AtomicU64::new(0));
+                    let mut mon = IngestMonitor::new(
+                        format!("{ingest_sid} {kind} <- {ingest_parent}"),
+                        fanout_drops.clone(),
+                        write_errs.clone(),
+                    );
+
+                    // Отдача детям — в ОТДЕЛЬНОМ таске. `write_rtp` пишет каждому ребёнку по
+                    // очереди и ждёт; при забитом аплинке узла он упирается в бэкпрешер сокета.
+                    // Раньше это останавливало и чтение от родителя: внутренние буферы webrtc-rs
+                    // переполнялись, и разрывы RTP на входе списывались на «сеть». Теперь затык
+                    // отдачи стоит нам дропов в СВОЕЙ очереди — они видны отдельной цифрой.
+                    let cap = if is_video { FANOUT_QUEUE_VIDEO } else { FANOUT_QUEUE_AUDIO };
+                    let (tx, mut rx) = tokio::sync::mpsc::channel::<webrtc::rtp::packet::Packet>(cap);
+                    let werrs = write_errs.clone();
+                    tokio::spawn(async move {
+                        while let Some(pkt) = rx.recv().await {
+                            let res = if is_video { video_local.write_rtp(&pkt).await } else { audio_local.write_rtp(&pkt).await };
+                            if let Err(e) = res {
+                                // ErrClosedPipe = ни одного связанного sender (нет детей/webview) — не ошибка
+                                if webrtc::Error::ErrClosedPipe.to_string() != e.to_string() {
+                                    // Считаем, а не пишем строку на пакет: 30 кадров/с с ошибкой
+                                    // залили бы лог мгновенно. Сводка — в IngestMonitor::tick.
+                                    werrs.fetch_add(1, Ordering::Relaxed);
+                                    log::debug!("relay: write_rtp: {e}");
+                                }
+                            }
+                        }
+                    });
+
                     loop {
                         match track.read_rtp().await {
                             Ok((packet, _)) => {
                                 mon.on_packet(packet.header.sequence_number, packet.payload.len());
-                                let res = if is_video { video_local.write_rtp(&packet).await } else { audio_local.write_rtp(&packet).await };
-                                if let Err(e) = res {
-                                    // ErrClosedPipe = ни одного связанного sender (нет детей/webview) — не ошибка
-                                    if webrtc::Error::ErrClosedPipe.to_string() != e.to_string() {
-                                        // Считаем, а не пишем строку на пакет: отдача 30 кадров/с
-                                        // с ошибкой залила бы лог мгновенно. Сводка — в tick().
-                                        mon.write_errs += 1;
-                                        log::debug!("relay: write_rtp: {e}");
-                                    }
-                                }
-                                // Д2: побочная ветка транскода — не мешает passthrough выше.
+                                // Д2: побочная ветка транскода — отдельный неблокирующий канал,
+                                // держим её ДО фанаута, чтобы затык отдачи не резал рендишны.
                                 if is_video && feed_count.load(Ordering::Relaxed) > 0 {
                                     for f in video_feeds.lock().unwrap().values() { f.send_video(&packet); }
+                                }
+                                // Очередь полна — роняем пакет, но НЕ чтение. Зритель добьёт
+                                // потерю через PLI; остановка ingest ударила бы по всем сразу.
+                                if tx.try_send(packet).is_err() {
+                                    fanout_drops.fetch_add(1, Ordering::Relaxed);
                                 }
                                 mon.tick();
                             }
@@ -876,11 +918,15 @@ pub fn start_rendition_root(cfg: RelayConfig, video: Arc<TrackLocalStaticRTP>, a
 #[cfg(test)]
 mod tests {
     use super::IngestMonitor;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
 
+    /// Возвращает (принято, разрывов, переупорядочено). Счётчики фанаута тесту не нужны —
+    /// их пишет writer-таск, здесь проверяется только арифметика номеров.
     fn feed(seqs: &[u16]) -> (u64, u64, u64) {
-        let mut m = IngestMonitor::new("test".into());
+        let mut m = IngestMonitor::new("test".into(), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         for &s in seqs { m.on_packet(s, 100); }
-        (m.packets, m.lost, m.reordered)
+        (m.packets, m.gaps, m.reordered)
     }
 
     #[test]

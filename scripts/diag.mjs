@@ -142,6 +142,7 @@ function upsert(map, k) {
 function parseViewer(session) {
   const ticks = new Map();
   let prev = null;
+  const first = (session.samples || [])[0] || null;
   for (const s of session.samples || []) {
     const b = bucket(s.t);
     if (prev) {
@@ -158,7 +159,7 @@ function parseViewer(session) {
     }
     prev = s;
   }
-  return { ticks, last: prev };
+  return { ticks, first, last: prev };
 }
 
 /* ---------------- сводка ---------------- */
@@ -222,32 +223,58 @@ function cmdReport(files) {
     console.log('');
   }
 
-  // Итоги по зрителям: фризы — это и есть жалоба.
+  // Итоги по зрителям: фризы — это и есть жалоба. Потери считаем В ДОЛЯХ: абсолютное
+  // число пакетов ничего не говорит без знания, сколько их пришло.
+  let worstViewerLoss = 0;
   for (const v of vw) {
     let freezes = 0, freezeMs = 0, lost = 0, pli = 0;
     for (const [, x] of v.ticks) { freezes += x.v.freezes; freezeMs += x.v.freezeMs; lost += x.v.lost; pli += x.v.pliSent; }
-    console.log(`зритель ${v.name} (${v.client}): фризов ${freezes}, суммарно ${(freezeMs / 1000).toFixed(1)}с, потеряно пакетов ${lost}, отправлено PLI ${pli}`);
+    const a = v.first, z = v.last;
+    const recv = a && z ? (z.packetsReceived ?? 0) - (a.packetsReceived ?? 0) : 0;
+    const lossPct = lost + recv > 0 ? (lost * 100) / (lost + recv) : 0;
+    const dur = a && z ? (z.t - a.t) / 1000 : 0;
+    const fps = a && z && dur > 0 ? ((z.framesDecoded ?? 0) - (a.framesDecoded ?? 0)) / dur : 0;
+    worstViewerLoss = Math.max(worstViewerLoss, lossPct);
+    console.log(
+      `зритель ${v.name} (${v.client}): фризов ${freezes} / ${(freezeMs / 1000).toFixed(0)}с, потери ${lossPct.toFixed(1)}% (${lost} пакетов), декодировано ${fps.toFixed(1)} fps, PLI ${pli}`,
+    );
   }
 
-  // Сводка вещателя.
-  let drops = 0, pli = 0, idr = 0, cbMax = 0, maxLoss = 0;
+  // Сводка вещателя. cbMax сравниваем с БЮДЖЕТОМ КАДРА (1000/fps), а не с константой.
+  let drops = 0, pli = 0, idr = 0, cbMax = 0, maxLoss = 0, dropWindows = 0, targetFps = 30;
   for (const [, x] of bc.ticks) {
     drops += x.timing?.drops ?? 0;
+    if ((x.timing?.drops ?? 0) > 0) dropWindows++;
     pli += x.net?.pli ?? 0;
     idr += x.net?.idr ?? 0;
     cbMax = Math.max(cbMax, x.timing?.cbMax ?? 0);
     for (const l of x.net?.links ?? []) maxLoss = Math.max(maxLoss, l.loss);
   }
+  if (broadcasters[0]?.samples?.length) targetFps = broadcasters[0].samples[0].targetFps || 30;
+  const windows = bc.ticks.size || 1;
+  const budgetMs = 1000 / targetFps;
+  const idrRate = (idr / windows) / (BUCKET_MS / 1000); // IDR в секунду
   if (bc.ticks.size) {
-    console.log(`\nвещатель: дропов захвата ${drops}, PLI получено ${pli}, IDR отдано ${idr}, cb max ${cbMax.toFixed(1)}мс, худший loss ${maxLoss.toFixed(1)}%`);
+    console.log(
+      `\nвещатель: дропов захвата ${drops} (в ${dropWindows} окнах из ${windows}), cb max ${cbMax.toFixed(1)}мс при бюджете ${budgetMs.toFixed(1)}мс,` +
+      ` PLI получено ${pli}, IDR отдано ${idr} (${idrRate.toFixed(2)}/с), худший loss линка ${maxLoss.toFixed(1)}%`,
+    );
   }
 
-  // Вердикт — та самая развилка, ради которой всё затевалось.
+  // Вердикт. Пороговые доли, не абсолюты: 55 дропов за 10 минут — шум инициализации,
+  // а не перегрузка, и раньше этот вердикт ошибочно винил захват.
   const anyFreeze = vw.some((v) => [...v.ticks.values()].some((x) => x.v.freezes > 0));
   if (anyFreeze) {
-    if (drops > 0 || cbMax > 30) console.log('\n=> Вещатель не успевал (дропы захвата / долгий колбэк). Смотри CPU-путь: capture.rs.');
-    else if (maxLoss > 0 || pli > 0) console.log('\n=> Захват чист, но линк сыпется (loss/PLI). Проблема ПОСЛЕ энкодера: аплинк к vrelay, coturn, сервер.');
-    else console.log('\n=> Захват чист и линк к прямым детям чист, а зрители фризят. Значит участок ниже: сервер (vrelay) или линк зрителя. Смотри WARN/ERROR ниже.');
+    const captureBad = dropWindows / windows > 0.1 || cbMax > budgetMs;
+    if (captureBad) console.log('\n=> Вещатель не успевал (дропы в >10% окон / колбэк длиннее бюджета кадра). Смотри CPU-путь: capture.rs.');
+    else if (maxLoss > 2) console.log('\n=> Захват чист, сыпется линк вещатель->прямой ребёнок. Смотри аплинк вещателя, coturn.');
+    else if (worstViewerLoss > 2) console.log('\n=> Захват и аплинк вещателя чисты, а зрители теряют пакеты. Виноват узел ниже (vrelay) или линк зрителя.\n   Дальше: docker compose logs vrelay | grep ingest   и   logs token | grep health');
+    else console.log('\n=> Ни захват, ни линки не объясняют фризы. Смотри WARN/ERROR ниже.');
+    // IDR-шторм усиливает любую потерю: каждый keyframe — крупный бурст.
+    if (idrRate > 0.5) {
+      console.log(`   ВНИМАНИЕ: IDR ${idrRate.toFixed(2)}/с — это шторм. Зрители теряют пакеты -> шлют PLI -> корень форсит IDR ->`);
+      console.log('   бурст пробивает линк -> снова потери. Ожидаемая частота при GOP=4с — 0.25/с.');
+    }
   }
 
   if (bc.events.length) {

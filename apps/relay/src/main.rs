@@ -42,7 +42,7 @@ impl Cfg {
         let max_children: u32 = std::env::var("VRELAY_MAX_CHILDREN").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
         let idle_sec: u64 = std::env::var("VRELAY_IDLE_SEC").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
         let max_streams: usize = std::env::var("VRELAY_MAX_STREAMS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
-        let out_mbps: u32 = std::env::var("VRELAY_OUT_MBPS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
+        let out_mbps: u32 = std::env::var("VRELAY_OUT_MBPS").ok().and_then(|v| v.parse().ok()).unwrap_or(15); // замер прода: устойчивая отдача 14-20 Мбит/с (см. docker-compose.yml)
         Ok(Self {
             session_secret,
             ws_url,

@@ -226,14 +226,20 @@ export function BroadcastModal() {
   async function start() {
     setBusy(true); setErr('');
     try {
-      // Д5: в пресет-режиме параметры кодирования берём из таблицы пресетов (CBR, autoBitrate off);
-      // в ручном режиме — из слайдеров (текущее поведение). chosenPreset уже посчитан по 0.75×BWE.
+      // Д5: в пресет-режиме параметры кодирования берём из таблицы пресетов; в ручном —
+      // из слайдеров. chosenPreset уже посчитан по 0.75×BWE.
       const preset = cfg.presetMode !== 'manual' ? chosenPreset : null;
       const w = preset ? preset.width : RES_MAP[cfg.resolution].w;
       const h = preset ? preset.height : RES_MAP[cfg.resolution].h;
       const fps = preset ? preset.fps : cfg.fps;
       const bitrateBps = (preset ? preset.bitrateKbps : cfg.bitrateKbps) * 1000;
-      const autoBitrate = preset ? false : cfg.autoBitrate; // пресет = фиксированный CBR
+      // Пресет тоже адаптируется по битрейту. Раньше здесь стоял false («пресет = фиксированный
+      // CBR») — и сервер не слал set-bitrate ВООБЩЕ: разбор реального стрима показал 4.5 Мбит/с
+      // ровной полкой сквозь окна с 46% потерь, потому что отступать было нечем (серверные
+      // рендишны, которые должны были адаптировать зрителей, требуют VRELAY_MAX_TRANSCODES>0).
+      // Битрейт пресета становится ПОТОЛКОМ ABR. Лестница fps/разрешения остаётся выключенной:
+      // натив включает её только при `manual && auto` (lib.rs), а мы в пресете.
+      const autoBitrate = preset ? true : cfg.autoBitrate;
       const source = buildSource(cfg);
       const audioTargetPid = deriveAudioPid(cfg, windows);
       // Трансляция идёт на ГОЛОСОВОЙ сервер (voiceServerId), а не на смотримый: вещать можно только
