@@ -674,7 +674,7 @@ export class Engine {
   private async pollPing() {
     // Watchdog: контекст публикации мика мог родиться/остаться 'suspended' (getUserMedia-промпт съел
     // user-activation) → пиры не слышат, хотя локально «всё работает». Держим его running, пока в войсе.
-    if (this.inVoice && this.micActx && this.micActx.state !== 'running') this.ensureVoiceAudioRunning();
+    if (this.inVoice && ((this.micActx && this.micActx.state !== 'running') || (this.spCtx && this.spCtx.state !== 'running'))) this.ensureVoiceAudioRunning();
     if (this.inVoice) void this.checkMicAlive(true); // мобилка: пере-снять мик, если источник умер на бэкграунде
     const track = this.voiceRoom?.localParticipant.getTrackPublication(Track.Source.Microphone)?.track;
     if (!track) return;
@@ -728,6 +728,13 @@ export class Engine {
     // контекст промпт не усыпляет. resume + gesture-unlock/watchdog (ensureVoiceAudioRunning) — подстраховка.
     this.micActx = new AudioContext();
     try { await this.micActx.resume?.(); } catch { /**/ }
+    // spCtx (контекст VAD-анализатора) резюмим тем же до-промптовым окном активации, что и micActx. Гейт
+    // «активации голосом» ставит vadOpen ИМЕННО из анализатора на spCtx (attachAnalyser/spLoop). Рождённый
+    // 'suspended' ПОСЛЕ gUM-промпта (attachAnalyser зовётся в конце startMic, уже без активации) → анализатор
+    // отдаёт константу → vadOpen залипает false → applyGate держит gain=0 → мик-трек ЖИВОЙ, но пиры слышат
+    // ТИШИНУ (чинит только F5). Watchdog его не спасал: гейтится по micActx, а тот теперь заранее running.
+    this.spCtx = this.spCtx || new AudioContext();
+    try { await this.spCtx.resume?.(); } catch { /**/ }
     try {
       this.micRaw = await navigator.mediaDevices.getUserMedia({ audio: this.micCapture() });
     } catch (e) {
@@ -782,8 +789,11 @@ export class Engine {
   private ensureVoiceAudioRunning() {
     const resume = () => { this.micActx?.resume?.().catch(() => {}); this.spCtx?.resume?.().catch(() => {}); };
     resume();
-    if (this.audioUnlock || !this.micActx || this.micActx.state === 'running') return;
-    const unlock = () => { resume(); if (!this.micActx || this.micActx.state === 'running') this.clearAudioUnlock(); };
+    // ОБА контекста должны быть running: micActx = публикуемый звук, spCtx = VAD-гейт (без него gain залипает 0).
+    // Раньше гейт стоял только на micActx → после его пред-резюма gesture-unlock не ставился, а spCtx оставался спящим.
+    const running = () => (!this.micActx || this.micActx.state === 'running') && (!this.spCtx || this.spCtx.state === 'running');
+    if (this.audioUnlock || running()) return;
+    const unlock = () => { resume(); if (running()) this.clearAudioUnlock(); };
     this.audioUnlock = () => {
       document.removeEventListener('pointerdown', unlock, true);
       document.removeEventListener('keydown', unlock, true);
