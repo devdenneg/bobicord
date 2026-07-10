@@ -17,6 +17,11 @@ const NATIVE_CAPACITY = 4;    // дефолт для нативного relay-у
 const BROWSER_CAPACITY = 0;   // дефолт для браузера: лист (пока treeVideo не пришлёт maxChildren>0)
 const MAX_CHILDREN_CAP = 10;  // жёсткий потолок на объявленную ёмкость (защита от абьюза; = максимум слайдера в UI)
 const REPARENT_COOLDOWN_MS = 10_000; // гистерезис авто-миграции — не мигрировать чаще
+// Карантин отбракованного родителя (frameDropReparent). Cooldown узла тут НЕ спасает: он
+// запрещает двигать узел часто, но не мешает через 10с вернуть его ТУДА ЖЕ — а корень со
+// свободными слотами всегда «лучший» по scoreParent (глубина 0). Отсюда орбита
+// корень<->vrelay. TTL заметно больше cooldown, чтобы линк успел реально измениться.
+const BAD_PARENT_TTL_MS = 120_000;
 
 // Э8 ABR: сервер держит целевой битрейт дерева и шлёт его корню (set-bitrate). Управление —
 // loss/RTT-based AIMD по худшему линку дерева (истинный GCC-BWE в webrtc-rs незрел). Единый
@@ -419,16 +424,35 @@ class TreeManager {
     banned.add(forNode.id);
     if (excludeParentId) banned.add(excludeParentId);
     const height = this.subtreeHeight(t, forNode.id);
-    let best = null, bestScore = Infinity;
-    for (const cand of t.nodes.values()) {
-      if (banned.has(cand.id)) continue;
-      if (cand.children.length >= this.capacityOf(cand)) continue;
-      if (cand.depth + 1 + height > MAX_DEPTH) continue;
-      if (!this.attachedToRoot(t, cand)) continue; // сирота/повисшая цепочка — не родитель
-      const s = this.scoreParent(cand, !!t.serverFirst);
-      if (s < bestScore) { bestScore = s; best = cand; }
+    // Родители, за которых узел уже отбраковали (frameDropReparent) — карантин BAD_PARENT_TTL_MS.
+    // Без него: увели с плохого родителя -> потери исчезли -> клиент/ABR просит best-peer ->
+    // scoreParent снова видит корень (глубина 0, слоты свободны) -> вернул -> потери -> увели.
+    // Наблюдалось живьём: зритель летал корень<->vrelay, 7 watch-сессий за 2 минуты.
+    const now = Date.now();
+    const quarantined = (id) => {
+      const until = forNode.badParents && forNode.badParents.get(id);
+      return !!until && now < until;
+    };
+    // Смягчение карантина — ТОЛЬКО для сироты (родителя нет вовсе): лучше плохой родитель,
+    // чем чёрный экран. Для добровольной миграции второй проход недопустим: pickParent уже
+    // исключил текущего родителя, и «запасным» оказался бы как раз забракованный — то есть
+    // орбита восстановилась бы. Узел с живым родителем при пустом выборе получит no-candidate
+    // и reattach к тому же родителю (ICE-restart), что и правильно.
+    const passes = forNode.parent ? [true] : [true, false];
+    for (const honorQuarantine of passes) {
+      let best = null, bestScore = Infinity;
+      for (const cand of t.nodes.values()) {
+        if (banned.has(cand.id)) continue;
+        if (honorQuarantine && quarantined(cand.id)) continue;
+        if (cand.children.length >= this.capacityOf(cand)) continue;
+        if (cand.depth + 1 + height > MAX_DEPTH) continue;
+        if (!this.attachedToRoot(t, cand)) continue; // сирота/повисшая цепочка — не родитель
+        const s = this.scoreParent(cand, !!t.serverFirst);
+        if (s < bestScore) { bestScore = s; best = cand; }
+      }
+      if (best) return best;
     }
-    return best;
+    return null;
   }
 
   join(streamId, node) {
@@ -980,7 +1004,9 @@ function attachTreeServer(httpServer, opts) {
       send(child.id, { t: 'assign-parent', streamId: baseSid, parentId: child.parent });
       if (child.parent) send(child.parent, { t: 'assign-child', streamId: baseSid, childId: child.id });
     });
-    p.parent = null; p.children = []; p.depth = 0; p.reparentCooldownUntil = 0;
+    // badParents тоже сбрасываем: дерево обрушилось, вещатель ушёл — карантин по старым
+    // peer-id бессмыслен, а новый корень получит новый id и под запрет не попадёт в любом случае.
+    p.parent = null; p.children = []; p.depth = 0; p.reparentCooldownUntil = 0; p.badParents = null;
     p.rendition = target; p.treeKey = newKey; p.qualityPinned = !!opts.pinned;
     const { parent } = mgr.join(newKey, p);
     if (parent) {
@@ -1168,7 +1194,13 @@ function attachTreeServer(httpServer, opts) {
         continue;
       }
       target.dropBadTicks = 0;
-      tlog(`[frame-drops] reparent ${target.id} (${target.identity}) в [${key}]: ${res.oldParentId || '-'} -> ${res.newParentId} (loss=${((target.linkLoss || 0) * 100).toFixed(1)}% dropPct=${(target.framesDroppedPct || 0).toFixed(1)})`);
+      // Карантин: этот родитель только что рвал картинку — best-peer не вернёт узел туда,
+      // пока TTL не истечёт (иначе орбита корень<->vrelay, см. BAD_PARENT_TTL_MS).
+      if (res.oldParentId) {
+        if (!target.badParents) target.badParents = new Map();
+        target.badParents.set(res.oldParentId, now + BAD_PARENT_TTL_MS);
+      }
+      tlog(`[frame-drops] reparent ${target.id} (${target.identity}) в [${key}]: ${res.oldParentId || '-'} -> ${res.newParentId} (loss=${((target.linkLoss || 0) * 100).toFixed(1)}% dropPct=${(target.framesDroppedPct || 0).toFixed(1)}, карантин родителя ${Math.round(BAD_PARENT_TTL_MS / 1000)}с)`);
       applyReparent(key, target.id, res);
       moved++;
     }
