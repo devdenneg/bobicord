@@ -23,6 +23,7 @@ export function MusicPlayer({ enabled }: { enabled: boolean }) {
   const [addUrl, setAddUrl] = useState('');
   const [adding, setAdding] = useState(false); // идёт запрос названия трека — блокируем повторное добавление
   const [err, setErr] = useState('');
+  const [playErr, setPlayErr] = useState(''); // трек не воспроизводится у ТЕБЯ (регион/встраивание/удалён) — onError YT
   const [needGesture, setNeedGesture] = useState(false);
   const [pos, setPos] = useState(0);
   const [dur, setDur] = useState(0);
@@ -84,7 +85,17 @@ export function MusicPlayer({ enabled }: { enabled: boolean }) {
           onStateChange: (e: any) => {
             if (e.data === YT.PlayerState.ENDED) useMusic.getState().onEnded();
             // Звук реально пошёл (не форс-мьют) → жест получен, плашку прячем навсегда.
-            if (e.data === YT.PlayerState.PLAYING) { const pl = playerRef.current; if (pl && !pl.isMuted?.()) { hasPlayedRef.current = true; setNeedGesture(false); } }
+            if (e.data === YT.PlayerState.PLAYING) { const pl = playerRef.current; if (pl && !pl.isMuted?.()) { hasPlayedRef.current = true; setNeedGesture(false); } setPlayErr(''); }
+          },
+          // Ролик не воспроизводится У ЭТОГО юзера (у других может играть): 2 — плохой id, 5 — HTML5-сбой (транзиент,
+          // повтор), 100 — удалён/приватный, 101/150 — встраивание запрещено владельцем или регион-блок. Показываем
+          // причину + даём «Пропустить» (шлёт next() всем). Молча стоящий плеер (стор думает «играет») так объясняется.
+          onError: (e: any) => {
+            const code = e?.data;
+            if (code === 5) { try { playerRef.current?.playVideo?.(); } catch { /**/ } return; }
+            setPlayErr(code === 100 ? 'Трек удалён или приватный'
+              : (code === 101 || code === 150) ? 'Трек недоступен у тебя (запрет встраивания или регион)'
+              : 'Не удалось воспроизвести трек');
           },
         },
       });
@@ -95,6 +106,7 @@ export function MusicPlayer({ enabled }: { enabled: boolean }) {
   const cur = m.current();
   const curId = cur?.id || '';
   useEffect(() => { sync(); }, [curId, m.seekTick, m.playing]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { setPlayErr(''); }, [curId]); // сменился трек — гасим прошлую ошибку воспроизведения
 
   // прогресс-тик + дрейф-коррекция
   useEffect(() => {
@@ -142,6 +154,8 @@ export function MusicPlayer({ enabled }: { enabled: boolean }) {
       </div>
 
       {needGesture ? <button className="mus-gesture" onClick={gesture}>▶ Включить звук (браузер требует нажатие)</button> : null}
+
+      {playErr ? <div className="mus-note"><Icon name="warn" sm /><span>{playErr}</span><button onClick={() => useMusic.getState().next()}>Пропустить</button></div> : null}
 
       <div className="mus-panel-wrap">
         <div className="mus-panel"><div className="mus-panel-in">
