@@ -36,6 +36,10 @@ services:
       - TURN_SECRET=${TURN_SECRET}
       - TURN_URLS=${TURN_URLS}
       - TURN_TTL_SEC=${TURN_TTL_SEC:-600}
+      # Свой STUN — тот же coturn (Binding-запросы не требуют авторизации). Пусто = дефолт
+      # tree.js (гугловский). Держим Google вторым в списке: coturn лёг, а vrelay жив —
+      # srflx-кандидат всё равно добывается.
+      - STUN_URLS=${STUN_URLS:-}
       # Roadmap-flow-стриминга Д8: server-first (стример → сервер → зрители) — ДЕФОЛТ on.
       # Дефолт в коде (tree.js: TREE_SERVER_FIRST !== '0'); откат на legacy = выставить 0.
       # Действует только для стримов с serverIngest (нативный клиент); старые бандлы — legacy.
@@ -47,8 +51,14 @@ services:
 
   # STUN/TURN для P2P relay-дерева (Evolution-TZ Э3). host-сеть — coturn сам слушает
   # 3478 (STUN/TURN) + min-port..max-port (relay). Секрет — только через env (CLAUDE.md).
+  #
+  # ВЫНЕСЕН на отдельный VPS вместе с vrelay (deploy/vrelay-remote/): relay-хоп обязан стоять
+  # рядом с медиаузлом, иначе зритель за симметричным NAT идёт `зритель → этот coturn → vrelay`
+  # через машину, от которой мы уехали. Профиль неактивен по умолчанию, поэтому `up -d` его не
+  # поднимает. Откат: COMPOSE_PROFILES=local-media в .env (+ погасить удалённый стек).
   coturn:
     image: coturn/coturn:latest
+    profiles: ["local-media"]
     network_mode: host
     restart: unless-stopped
     logging: *logging
@@ -71,8 +81,16 @@ services:
   # relay-пиров (или зритель явно выбрал «через сервер»), и passthrough-ретранслирует RTP.
   # host-сеть: WebRTC UDP напрямую с публичного IP (TURN/srflx не нужны); сигналинг — на
   # локальный token-сервис, TLS не нужен.
+  #
+  # ВЫНЕСЕН на отдельный VPS (deploy/vrelay-remote/): там свободно ядро под ffmpeg-транскод,
+  # которого здесь не было (1 vCPU на livekit/coturn/token/caddy). Удалённый агент коннектится
+  # сюда исходящим WS на wss://<домен>/tree — он WS-клиент, портов не слушает. Профиль
+  # неактивен по умолчанию, поэтому `up -d` его не поднимает; блок оставлен для отката
+  # (COMPOSE_PROFILES=local-media в .env). Двух агентов одновременно быть не должно:
+  # findVrelayAgent() в tree.js возьмёт того, кто подключился раньше.
   vrelay:
     image: ghcr.io/devdenneg/bobicord-vrelay:latest
+    profiles: ["local-media"]
     pull_policy: always
     network_mode: host
     restart: unless-stopped

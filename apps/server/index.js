@@ -44,6 +44,11 @@ const WS_URL = process.env.LK_WS_URL || 'wss://138-16-170-21.sslip.io';
 const TURN_SECRET = process.env.TURN_SECRET || '';
 const TURN_URLS = (process.env.TURN_URLS || '').split(',').map((s) => s.trim()).filter(Boolean);
 const TURN_TTL_SEC = parseInt(process.env.TURN_TTL_SEC || '600', 10);
+// STUN. Свой = тот же coturn: Binding-запросы авторизации не требуют (use-auth-secret гейтит
+// только TURN-аллокации). Google держим последним в списке — если coturn лёг, а vrelay жив,
+// srflx-кандидат всё равно добывается и стрим не умирает.
+const STUN_URLS = (process.env.STUN_URLS || 'stun:stun.l.google.com:19302')
+  .split(',').map((s) => s.trim()).filter(Boolean);
 const DATA_DIR = '/app/data';
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 // сюда CI (build-windows.yml) заливает установщик натива + latest.json (updater-манифест)
@@ -1198,6 +1203,7 @@ const server = http.createServer(app);
 const treeSrv = attachTreeServer(server, {
   sessionSecret: SESSION_SECRET,
   path: '/tree',
+  stunServers: STUN_URLS.map((urls) => ({ urls })),
   turnSecret: TURN_SECRET,
   turnUrls: TURN_URLS,
   turnTtlSec: TURN_TTL_SEC,

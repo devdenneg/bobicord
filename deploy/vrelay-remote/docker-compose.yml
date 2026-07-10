@@ -1,0 +1,76 @@
+# Медиа-стек RelayApp на отдельном VPS: vrelay (медиаузел + ffmpeg-транскод) и coturn
+# (STUN/TURN дерева). Ставится в /opt/vrelay, поднимается вручную:  docker compose up -d
+#
+# Этот файл НЕ участвует в .github/workflows/deploy.yml (там триггер на docker-compose.yml
+# в корне, точным путём) — прод-деплой его не трогает и не деплоит сюда.
+#
+# Оба сервиса на host-сети: vrelay раздаёт RTP напрямую с публичного IP (предпочитает
+# host-кандидат), coturn слушает 3478 + relay-диапазон. Caddy/TLS здесь не нужны: браузер к
+# этому хосту по HTTP/WS не обращается, а vrelay — WS-КЛИЕНТ, он сам коннектится к
+# tree-сигналингу на проде и портов не слушает.
+#
+# Порты, которые должны быть открыты снаружи (ufw / DigitalOcean Cloud Firewall):
+#   UDP 1024-65535   — vrelay: relay-core не задаёт SettingEngine-диапазон, webrtc-rs берёт
+#                      эфемерные высокие порты. Без этого ICE не сойдётся.
+#   UDP+TCP 3478     — coturn, STUN/TURN.
+#   UDP 49160-49200  — coturn, relay-диапазон (turnserver.conf min-port/max-port).
+
+services:
+  vrelay:
+    image: ghcr.io/devdenneg/bobicord-vrelay:latest
+    pull_policy: always
+    network_mode: host
+    restart: unless-stopped
+    # Медиаузел: сюда пишутся строки `ingest ...` (разрывы RTP, отдача детям) — самый
+    # многословный сервис и самый нужный при разборе фризов. Отдаём ему больше истории.
+    logging:
+      driver: json-file
+      options:
+        max-size: "200m"
+        max-file: "3"
+    environment:
+      # Тот же секрет, что у token на проде: агент минтит им session-JWT с uid virtual-relay,
+      # tree.js проверяет его на upgrade. Хранить в .env с chmod 600.
+      - SESSION_SECRET=${SESSION_SECRET}
+      # Публичный /tree прод-Caddy. wss поддержан (tokio-tungstenite, rustls-tls-webpki-roots).
+      - TREE_WS_URL=${TREE_WS_URL:-wss://reelay.online/tree}
+      # Прямых детей у медиаузла. Формула: (замеренная_отдача_Мбит × 0.7) / битрейт_стрима_Мбит.
+      - VRELAY_MAX_CHILDREN=${VRELAY_MAX_CHILDREN:-4}
+      # Исходящая полоса узла (Мбит/с) — идёт в скоринг best-peer и в бюджет битрейта дерева
+      # (tree.js serverBudget = out × 0.7 / детей). ЗАМЕРЕННАЯ устойчивая отдача, не тарифная:
+      # завышение = ядро дропает исходящие UDP, RTT зрителей уходит в секунды, фризы у ВСЕХ.
+      - VRELAY_OUT_MBPS=${VRELAY_OUT_MBPS:-15}
+      # Одновременных ffmpeg-транскодов. 1 = зрителю доступна лестница рендишнов (720/480/360);
+      # 0 = только source, меню качества пустое. Один 720p30-рендишн ≈ одно ядро; на 1 vCPU
+      # больше единицы не ставить. Второй запрос получит 'rendition-unavailable' и останется
+      # на source — это штатное поведение капа, не ошибка.
+      - VRELAY_MAX_TRANSCODES=${VRELAY_MAX_TRANSCODES:-1}
+      - VRELAY_IDLE_SEC=${VRELAY_IDLE_SEC:-60}
+      - VRELAY_MAX_STREAMS=${VRELAY_MAX_STREAMS:-8}
+      - RUST_LOG=${RUST_LOG:-info}
+
+  coturn:
+    image: coturn/coturn:latest
+    network_mode: host
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "2"
+    volumes:
+      - ./turnserver.conf:/etc/turnserver.conf:ro
+    environment:
+      # Тот же секрет, что у token на проде: он выдаёт временные креды (turnCreds.js), coturn
+      # их валидирует. Разъедутся — TURN начнёт отвечать 401 на каждую аллокацию.
+      - TURN_SECRET=${TURN_SECRET}
+      - TURN_REALM=${TURN_REALM:-relayapp.local}
+      # Нужен ТОЛЬКО если coturn за NAT (приватный адрес на интерфейсе). На DO публичный IPv4
+      # висит прямо на eth0 — оставляем пустым. Пусто = флаг не добавляется (на пустом падает).
+      - TURN_EXTERNAL_IP=${TURN_EXTERNAL_IP:-}
+      # ОБЯЗАТЕЛЬНО на этом хосте: кроме публичного адреса на eth0 есть 10.19.0.5, на eth1 —
+      # 10.114.0.2 (VPC), плюс docker0 172.17.0.1. Без привязки coturn раздаст relay-кандидаты
+      # с приватных адресов, и зритель зря сожжёт на них ICE-таймауты.
+      - TURN_LISTEN_IP=${TURN_LISTEN_IP}
+    # ${VAR:+...} подставляет флаг ТОЛЬКО если переменная непуста (иначе строки нет вовсе).
+    command: ["sh", "-c", "turnserver -c /etc/turnserver.conf --static-auth-secret=$${TURN_SECRET} --realm=$${TURN_REALM} $${TURN_EXTERNAL_IP:+--external-ip=$${TURN_EXTERNAL_IP}} $${TURN_LISTEN_IP:+--listening-ip=$${TURN_LISTEN_IP} --relay-ip=$${TURN_LISTEN_IP}}"]

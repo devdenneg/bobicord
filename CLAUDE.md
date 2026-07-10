@@ -26,6 +26,7 @@
 - `apps/web/src/store.ts`, `components/ServerView.tsx` — UI/состояние.
 - `apps/server/index.js` — Express + SQLite + выдача LiveKit-токенов. Сюда добавляется ws-сигналинг дерева + менеджер.
 - `docker-compose.yml`, Caddy, `.github/workflows/deploy.yml` — деплой. Сюда добавляются сервисы дерева/coturn.
+- `deploy/vrelay-remote/` — медиа-стек (vrelay + coturn) на ОТДЕЛЬНОМ VPS, ставится руками в `/opt/vrelay`. `deploy.yml` его не катает (триггер — `docker-compose.yml` точным путём).
 
 ## Как работать
 
@@ -108,6 +109,11 @@
 - **`request-keyframe` из рендишн-контекста легитимен ТОЛЬКО из `ensureRendition`** (ffmpeg без IDR не декодирует старт). PLI из рендишн-дерева НЕ уходит нативному вещателю (`onRequestKeyframe` шлёт корню ЭТОГО дерева — для рендишна это ffmpeg с фиксированным GOP) — нет IDR-шторма через деревья.
 - **coturn `external-ip`** — не хардкод: флаг `--external-ip=$TURN_EXTERNAL_IP` из docker-compose (`${VAR:+...}` — пусто → флага нет, coturn не падает). Прод обязан задать `TURN_EXTERNAL_IP` в `.env`.
 - **`dev-rendition` DEV-триггер удалён в Д8** (Д4 сделал настоящий реестр рендишнов).
+- **Медиа-стек вынесен на отдельный VPS** (`deploy/vrelay-remote/`), в корневом compose `vrelay` и `coturn` живут под профилем `local-media` и по умолчанию НЕ поднимаются. Откат — `COMPOSE_PROFILES=local-media` в прод-`.env`. Почему так: **vrelay — WS-КЛИЕНТ, не сервер** (`main.rs:41` читает `TREE_WS_URL`, коннектится исходящим, портов не слушает), значит на удалённом хосте не нужны ни Caddy, ни TLS; `tokio-tungstenite` собран с `rustls-tls-webpki-roots`, поэтому `wss://` работает из коробки. **coturn обязан ехать вместе с vrelay**: единственный его потребитель — дерево (`iceServersFor` зовётся только из `welcome`), LiveKit к нему не обращается (свой ICE, `7881/7882`); оставить его на проде = зритель за симметричным NAT идёт `зритель → прод-coturn → vrelay`, лишний хоп через машину, от которой уехали.
+- **Двух vrelay-агентов одновременно быть не должно.** `findVrelayAgent()` берёт ПЕРВОГО `isVrelayAgent` из `peers` (порядок вставки Map) — при двух подключённых выиграет тот, кто пришёл раньше. Env-переключателя нет; «активен тот, чей контейнер запущен».
+- **Свой STUN** — тот же coturn: Binding-запросы авторизации не требуют (`use-auth-secret` гейтит только TURN-аллокации). `tree.js` давно принимал opt `stunServers`, но `index.js` его не передавал — теперь читает `STUN_URLS` (свой первым, Google последним: coturn лёг, а vrelay жив → srflx всё равно добывается). В копии `turnserver.conf` для удалённого хоста снят `verbose` — иначе каждый Binding пишет строку, и 100 МБ json-file выкручиваются за дни.
+- **`natDetect.ts` требует ДВА НЕЗАВИСИМЫХ STUN-сервера** (сравнивает srflx-порт, чтобы поймать симметричный NAT). Подставить туда один свой IP дважды нельзя — порты совпадут всегда, детект начнёт врать.
+- **`TURN_LISTEN_IP` на облачном хосте обязателен.** У DO-дроплета кроме публичного IPv4 на `eth0` висит ещё `10.19.0.5`, на `eth1` — VPC `10.114.0.2`, плюс `docker0`. Без привязки coturn раздаёт relay-кандидаты с приватных адресов, и зритель жжёт на них ICE-таймауты.
 
 ## Игровой статус (натив, Discord-стиль)
 
@@ -159,3 +165,6 @@
 - **RTK-хук ломает `git commit -m @'...'`** (добавляет литерал `@`) — коммить через `git commit -F - <<'MSG'` heredoc.
 - **Rust компилится локально** (`cargo check`/`cargo test --lib` в `apps/native/src-tauri`, toolchain стоит) — прежняя запись «нет toolchain» устарела. Сигнатуры Win32 всё равно быстрее сверять по vendored-исходникам (`~/.cargo/registry/src/*/windows-<ver>/src/Windows/Win32/...`), чем гадать; ACL-права Tauri — по `node_modules/@tauri-apps/api/*.d.ts` (неверное имя = ФЕЙЛ сборки). PROPERTYKEY — в `Foundation`, не PropertiesSystem. Cargo.lock в репозитории отстаёт от `Cargo.toml` — CI синкает его через `cargo fetch` (build-windows.yml), локальный `cargo check` тоже его дописывает.
 - **Деплой**: push с правками `apps/web/**`/`apps/server/**` триггерит `deploy.yml` → пересоздание контейнеров РВЁТ живые relay-деревья (стримы падают). Натив (`capabilities/*.json`, `src/**`) → `build-windows.yml`, грузит бандл + capabilities вшиты в бинарь (веб-деплою не подчиняется).
+- **`docker compose restart <сервис>` падает, если сервис вне активного профиля** — и валит весь деплой (`set -e`). Поэтому прежний `restart coturn` из `deploy.yml` снят вместе с уходом coturn под `local-media`. При этом `up -d` профиль-выключенные сервисы НЕ останавливает: уже запущенный контейнер продолжает жить, гасить руками.
+- **Переливка `.env` через Windows-шелл приклеивает `\r`.** `SESSION_SECRET` длиной 65 вместо 64 = подпись JWT не сойдётся с прод-овой, агент получит отказ на `/tree`. Проверять `awk -F= '{print $1, length($2)}'`, чистить `sed -i 's/\r$//'`.
+- **На чистом Ubuntu-дроплете `docker compose` может отсутствовать** (пакет `docker.io` ставит только CLI+демон): `docker: unknown command: docker compose`. Ставится `apt-get install -y docker-compose-v2`.

@@ -115,8 +115,7 @@ jobs:
             cd /opt/voice
             docker compose pull
             docker compose up -d
-            # turnserver.conf — bind-mount: compose не видит его изменений и не пересоздаёт
-            # coturn, если сама сервис-секция не менялась. Рестартим явно (~1с простоя TURN;
-            # деплой всё равно рвёт деревья пересозданием token).
-            docker compose restart coturn
+            # coturn и vrelay здесь больше не поднимаются: они под профилем local-media и живут
+            # на отдельном VPS (deploy/vrelay-remote/). Прежний `docker compose restart coturn`
+            # снят — на сервисе вне активного профиля он падает и валит весь деплой.
             docker image prune -f
