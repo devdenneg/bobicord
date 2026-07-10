@@ -31,6 +31,7 @@ export interface Snapshot {
   myVoiceChannel: string | null;              // id голосового канала, в котором я сейчас (null = не в голосовом)
   voiceServerId: string | null;               // сервер, на котором я в голосовом (для персистентного VoiceDock + гарда auto-leave); null = не в голосе
   voiceChannels: Record<string, string>;      // username -> channelId (кто в каком голосовом канале)
+  channelActiveSince: Record<string, number>; // channelId -> epoch ms первого захода в ПУСТОЙ канал (таймер в списке каналов, как в Discord)
   deafened: boolean;
   localMicMuted: boolean;
   pttDown: boolean;
@@ -97,6 +98,7 @@ export class Engine {
   private voiceConnecting = false; // оптимистично зашли в канал, но mic ещё публикуется
   private lastVclaim = 0; // когда мы сами заявили голос (для tie-break гонки claim'ов между своими сессиями)
   private currentVc: string | null = null; // id голосового канала, в котором я сейчас (несколько каналов на сервер)
+  private myVcAt: number | null = null;    // epoch ms момента, когда занятость МОЕГО канала началась (унаследован от тех, кто уже там был, либо now() если я первый)
   private myChannelPeers = new Set<string>(); // кто в моём голосовом канале (диф → entry/exit при входе/выходе/смене канала)
   private roomReady = false; // true только после успешного await r.connect() (не просто наличие объекта Room)
   private reconnecting = false;
@@ -264,6 +266,7 @@ export class Engine {
     // прилетел живой TrackPublished). Серверный хинт /presence — fallback, когда пир не виден
     // локально или атрибут ещё в полёте.
     const voiceChannels: Record<string, string> = {};
+    const channelActiveSince: Record<string, number> = {};
     for (const m of this.members) {
       const p = this.partOf(m.username);
       const online = !!p || this.onlineHint.has(m.username);
@@ -274,7 +277,11 @@ export class Engine {
       } else {
         vc = this.voiceHint[m.username] || '';                               // пир не виден локально → серверный хинт
       }
-      if (vc) voiceChannels[m.username] = vc;
+      if (vc) {
+        voiceChannels[m.username] = vc;
+        const at = m.username === this.me.username ? this.myVcAt : Number((p as any)?.attributes?.vcAt) || null;
+        if (at && (!(vc in channelActiveSince) || at < channelActiveSince[vc])) channelActiveSince[vc] = at;
+      }
       const inV = !!vc || this.isInVoice(m.username);
       const mp = p ? p.getTrackPublication(Track.Source.Microphone) : undefined;
       // «оглох» (deafen) транслируется пирам participant-атрибутом deaf (как vc для голосового
@@ -304,7 +311,7 @@ export class Engine {
     return {
       connected: !!this.viewRoom, roomReady: this.roomReady, reconnecting: this.reconnecting,
       voiceQuality: this.inVoice ? this.connQuality : 'unknown', voicePing: this.inVoice ? this.pingMs : null,
-      inVoice: this.inVoice, voiceConnecting: this.inVoice && this.voiceConnecting, myVoiceChannel: this.currentVc, voiceServerId: this.voiceServerId, voiceChannels, deafened: this.deafened,
+      inVoice: this.inVoice, voiceConnecting: this.inVoice && this.voiceConnecting, myVoiceChannel: this.currentVc, voiceServerId: this.voiceServerId, voiceChannels, channelActiveSince, deafened: this.deafened,
       localMicMuted: this.localMicMuted(), pttDown: this.pttDown,
       presence, speaking, streams, watching, pending, watchers, messages: this.messages, chatHasMore: this.chatMore, chatTrimmed: this.trimmedFront,
       typing: [...this.typingUsers].filter(([n, exp]) => exp > Date.now() && n !== this.me.displayName).map(([n]) => n),
@@ -338,7 +345,8 @@ export class Engine {
         // voiceRoom-реконнект: заново заявляем vc/deaf + reconcile + vclaim (иначе на пару секунд пропадёт
         // звук/состав, и одна-голосовая могла разъехаться, пока мы лежали).
         if (r === this.voiceRoom && this.inVoice && this.currentVc) {
-          this.voiceRoom?.localParticipant.setAttributes({ vc: this.currentVc, deaf: this.deafened ? '1' : '' }).catch(() => {});
+          if (!this.myVcAt) this.myVcAt = this.channelStartFor(this.currentVc);
+          this.voiceRoom?.localParticipant.setAttributes({ vc: this.currentVc, deaf: this.deafened ? '1' : '', vcAt: String(this.myVcAt) }).catch(() => {});
           this.reconcileAllAudio();
           this.lastVclaim = Date.now();
           this.dataSend({ t: 'vclaim', uid: this.me.id, session: this.sessionId() });
@@ -485,6 +493,21 @@ export class Engine {
     const vc = (p as any)?.attributes?.vc;
     return vc || null;
   }
+  // Момент начала занятости канала channelId — унаследован от уже сидящих там (мин. их vcAt), либо
+  // now(), если я в него первый. Так «время звонка» переживает перестановки участников (не сбрасывается,
+  // пока канал не опустеет целиком) и одинаково для всех, кто его позже увидит — каждый вошедший копирует
+  // ЧУЖОЙ vcAt, а не пишет свой момент входа.
+  private channelStartFor(channelId: string): number {
+    if (!this.voiceRoom) return Date.now();
+    let min = Infinity;
+    this.voiceRoom.remoteParticipants.forEach((p) => {
+      const a = (p as any).attributes || {};
+      if (a.vc !== channelId) return;
+      const t = Number(a.vcAt);
+      if (t > 0 && t < min) min = t;
+    });
+    return Number.isFinite(min) ? min : Date.now();
+  }
   // подписка на микрофон пира только когда я в голосовом и мы в ОДНОМ канале (изоляция звука по каналам)
   private reconcilePeerAudio(p: Participant) {
     if (!this.voiceRoom || p === this.voiceRoom.localParticipant) return;
@@ -532,15 +555,17 @@ export class Engine {
     if (this.voiceRoom && this.inVoice) {
       const wantDeaf = this.deafened ? '1' : '';
       const a = this.voiceRoom.localParticipant.attributes || {};
-      if ((a.vc || '') !== (this.currentVc || '') || (a.deaf || '') !== wantDeaf)
-        this.voiceRoom.localParticipant.setAttributes({ vc: this.currentVc || '', deaf: wantDeaf }).catch(() => {});
+      if ((a.vc || '') !== (this.currentVc || '') || (a.deaf || '') !== wantDeaf) {
+        if (this.currentVc && !this.myVcAt) this.myVcAt = this.channelStartFor(this.currentVc); // не долетел исходный setAttributes — досчитываем сейчас
+        this.voiceRoom.localParticipant.setAttributes({ vc: this.currentVc || '', deaf: wantDeaf, vcAt: this.currentVc ? String(this.myVcAt) : '' }).catch(() => {});
+      }
     }
     // viewRoom, ЕСЛИ она НЕ голосовая (смотрю сервер, где не в войсе): моего голоса тут нет → vc/deaf ''
     // (иначе после leaveVoice/браузинга «залипну» в канале у других на этом сервере — vc:'' мог не долететь).
     if (this.viewRoom && this.viewRoom !== this.voiceRoom) {
       const a = this.viewRoom.localParticipant.attributes || {};
       if ((a.vc || '') !== '' || (a.deaf || '') !== '')
-        this.viewRoom.localParticipant.setAttributes({ vc: '', deaf: '' }).catch(() => {});
+        this.viewRoom.localParticipant.setAttributes({ vc: '', deaf: '', vcAt: '' }).catch(() => {});
     }
   }
   private isStreaming(username: string): boolean {
@@ -606,11 +631,12 @@ export class Engine {
       }
     }
     if (!this.voiceRoom) { this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.voiceServerId = null; this.emit(); return; }
-    try { await this.voiceRoom.localParticipant.setAttributes({ vc: channelId }); } catch { /**/ }
+    this.myVcAt = this.channelStartFor(channelId);
+    try { await this.voiceRoom.localParticipant.setAttributes({ vc: channelId, vcAt: String(this.myVcAt) }); } catch { /**/ }
     try { await this.startMic(); }
     catch {
-      this.inVoice = false; this.currentVc = null; this.voiceConnecting = false;
-      try { await this.voiceRoom.localParticipant.setAttributes({ vc: '' }); } catch { /**/ }
+      this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.myVcAt = null;
+      try { await this.voiceRoom.localParticipant.setAttributes({ vc: '', vcAt: '' }); } catch { /**/ }
       this.voiceRoom = null; this.voiceServerId = null;
       this.hooks.toast('Нет доступа к микрофону', 'err'); this.emit(); return;
     }
@@ -627,7 +653,8 @@ export class Engine {
   async switchVoice(channelId: string) {
     if (!this.voiceRoom || !this.inVoice || this.currentVc === channelId) return;
     this.currentVc = channelId;
-    try { await this.voiceRoom.localParticipant.setAttributes({ vc: channelId }); } catch { /**/ }
+    this.myVcAt = this.channelStartFor(channelId);
+    try { await this.voiceRoom.localParticipant.setAttributes({ vc: channelId, vcAt: String(this.myVcAt) }); } catch { /**/ }
     this.reconcileAllAudio();
     this.reconcileChannelSounds(true); // пере-сеем состав НОВОГО канала БЕЗ звука (мне не нужен бурст entry; другие услышат МЕНЯ через смену vc-атрибута)
     playSound('entry');
@@ -637,7 +664,7 @@ export class Engine {
     if (!this.voiceRoom || !this.inVoice) return;
     const vr = this.voiceRoom; // фиксируем: ниже обнулим указатель (и, возможно, порвём комнату)
     // оптимистично: сразу убираем себя из канала (UI не ждёт async-очистку mic/треков)
-    this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.deafened = false; this.manualMute = false; this.pttDown = false;
+    this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.deafened = false; this.manualMute = false; this.pttDown = false; this.myVcAt = null;
     this.myChannelPeers.clear(); // вышел — состав моего канала сброшен (другие услышат мой выход по unpub мика / vc'')
     playSound('exit'); // сам вышедший тоже слышит выход (остальные в канале — через onRemoteUnpub)
     this.emit();
@@ -649,7 +676,7 @@ export class Engine {
     // Сносим мик-аудиоэлементы сразу (origin=voice), не ждём async onUnsub. Стрим-аудио (origin=view)
     // НЕ трогаем — стрим смотрится и без голосового (и может жить в ДРУГОЙ, смотримой комнате).
     document.querySelectorAll('#audioSink audio[data-origin="voice"]').forEach((a) => a.remove());
-    try { await vr.localParticipant.setAttributes({ vc: '', deaf: '' }); } catch { /**/ }
+    try { await vr.localParticipant.setAttributes({ vc: '', deaf: '', vcAt: '' }); } catch { /**/ }
     // голосовая комната была voice-only (я смотрю ДРУГОЙ сервер) → рвём её; если это смотримая — оставляем как viewRoom
     if (vr !== this.viewRoom) { try { vr.disconnect(); } catch { /**/ } }
     this.voiceRoom = null; this.voiceServerId = null;

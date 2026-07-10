@@ -4,7 +4,7 @@ import type { Snapshot } from './engine';
 
 const EMPTY: Snapshot = {
   connected: false, roomReady: false, reconnecting: false, voiceQuality: 'unknown', voicePing: null, inVoice: false, voiceConnecting: false, myVoiceChannel: null, voiceServerId: null, voiceChannels: {}, deafened: false, localMicMuted: true, pttDown: false,
-  presence: {}, speaking: {}, streams: [], watching: {}, pending: {}, watchers: {}, messages: [], chatHasMore: false, chatTrimmed: 0, typing: [],
+  presence: {}, speaking: {}, streams: [], watching: {}, pending: {}, watchers: {}, messages: [], chatHasMore: false, chatTrimmed: 0, typing: [], channelActiveSince: {},
 };
 
 export function useEngine(): Snapshot {

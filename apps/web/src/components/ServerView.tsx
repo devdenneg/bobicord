@@ -230,14 +230,33 @@ function VoiceChannels() {
       </div>
       {channels.map((c) => (
         <VoiceChannelItem key={c.id} channel={c} canManage={canManage} canDelete={canManage && channels.length > 1} mine={onVoiceServer && myVc === c.id}
-          membersInChannel={members.filter((m) => eng.voiceChannels[m.username] === c.id)} />
+          membersInChannel={members.filter((m) => eng.voiceChannels[m.username] === c.id)} activeSince={eng.channelActiveSince[c.id]} />
       ))}
       {canManage && channels.length > 0 && channels.length < 5 ? <CreateChannelRow /> : null}
     </div>
   );
 }
 
-function VoiceChannelItem({ channel, membersInChannel, canManage, canDelete, mine }: { channel: { id: string; name: string }; membersInChannel: Member[]; canManage: boolean; canDelete: boolean; mine: boolean }) {
+// Таймер занятости канала (как в Discord): идёт с момента первого захода в ПУСТОЙ канал, не сбрасывается
+// при перестановках участников, гаснет только когда канал полностью опустеет (activeSince пропадает).
+// Пишем в DOM напрямую через ref (не setState) — тикает раз в секунду, лишний ре-рендер тут не нужен.
+function VoiceChannelTimer({ since }: { since: number }) {
+  const ref = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    const fmt = () => {
+      const s = Math.max(0, Math.floor((Date.now() - since) / 1000));
+      const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+      const txt = h > 0 ? `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}` : `${m}:${String(sec).padStart(2, '0')}`;
+      if (ref.current) ref.current.textContent = txt;
+    };
+    fmt();
+    const id = window.setInterval(fmt, 1000);
+    return () => window.clearInterval(id);
+  }, [since]);
+  return <span className="vchan-timer" ref={ref} />;
+}
+
+function VoiceChannelItem({ channel, membersInChannel, canManage, canDelete, mine, activeSince }: { channel: { id: string; name: string }; membersInChannel: Member[]; canManage: boolean; canDelete: boolean; mine: boolean; activeSince?: number }) {
   const E = getEngine()!;
   const renameChannel = useStore((s) => s.renameChannel);
   const deleteChannel = useStore((s) => s.deleteChannel);
@@ -265,6 +284,7 @@ function VoiceChannelItem({ channel, membersInChannel, canManage, canDelete, min
         ) : (
           <span className="vchan-nm" title={channel.name}>{channel.name}</span>
         )}
+        {!editing && activeSince ? <VoiceChannelTimer since={activeSince} /> : null}
         {!editing && membersInChannel.length ? <span className="vchan-n">{membersInChannel.length}</span> : null}
         {canManage && !editing ? (
           <span className="vchan-actions" onClick={(e) => e.stopPropagation()}>
