@@ -144,6 +144,11 @@ const RENDITION_TICK_MS = Number(process.env.TREE_RENDITION_TICK_MS) || 5_000;
 // роадмапа 15-30с.
 const ABR_GOOD_TICKS = 5;             // подряд «хороших» тиков до подъёма (спад — ABR_BAD_TICKS=2)
 const ABR_VIEWER_COOLDOWN_MS = 20_000; // гистерезис между переключениями качества одного зрителя
+// Д4: ОТДЕЛЬНЫЙ (низкий) порог потерь для ПОНИЖЕНИЯ рендишна пер-зрительским ABR. Source-ABR
+// (abrTick) остаётся на ABR_LOSS_HI=0.10 — резать битрейт source ВСЕМ из-за одного слабого нельзя.
+// А понизить рендишн ОДНОГО зрителя (транскод, остальных не трогает) можно раньше: волнами 5-8%
+// потерь source-ABR не ловил, зритель фризил на 6 Мбит. Env-оверрайд TREE_ABR_DOWN_LOSS = откат.
+const ABR_RENDITION_DOWN_LOSS = Number(process.env.TREE_ABR_DOWN_LOSS) || 0.04;
 
 // Roadmap-flow-стриминга Д7: серверная отбраковка плохого родителя для НАТИВНОГО зрителя.
 // Браузер судит сам по своему upstream-PC (treeVideo.ts dropDetector); у натива webview-PC —
@@ -923,6 +928,17 @@ function attachTreeServer(httpServer, opts) {
   // source (ffmpeg без IDR не начнёт декодировать — ЕДИНСТВЕННЫЙ легитимный keyframe-запрос
   // из рендишн-контекста). Реестр живёт на source-дереве (оно «владеет» стримом). true =
   // рендишн есть/поднимается; false = недоступен (нет source / апскейл / нет агента).
+  // Д4: занятые транскод-слоты агента (live/starting по ВСЕМ source-деревьям). Агент считает свои
+  // ffmpeg через CAS ACTIVE, но отказывает уже ПОСЛЕ переезда зрителя → сирота + rendition-unavailable
+  // (+ клиентский пин к source). Считаем на сервере и не стартуем сверх капа — авто-ход тихо отклонится.
+  function activeTranscodeCount() {
+    let n = 0;
+    for (const [key, t] of mgr.trees) {
+      if (parseTreeKey(key).rendition !== DEFAULT_RENDITION || !t.renditions) continue;
+      for (const e of t.renditions.values()) if (e.state !== RS_STOPPING) n++;
+    }
+    return n;
+  }
   function ensureRendition(baseSid, rendition, preset) {
     const srcTree = mgr.trees.get(treeKey(baseSid, DEFAULT_RENDITION));
     if (!srcTree || !srcTree.broadcasterId) return false;
@@ -938,6 +954,13 @@ function attachTreeServer(httpServer, opts) {
     // его vrelay-rendition-start (он всё равно ответит failed), не переводим зрителя между
     // деревьями. Второй эшелон: даже если клиент запросил рендишн по устаревшему меню.
     if (!(agent.vrelayMaxTranscodes > 0)) { tlog(`[rendition] ${baseSid}::${rendition} нужен, но агент без транскод-ёмкости (maxTranscodes=0)`); return false; }
+    // Гейт по капу: НЕ стартуем новый транскод сверх агент-ёмкости (реюз живого рунга — выше, до сюда
+    // не доходит). Иначе агент оверсабскрайбится, откажет постфактум → сирота/пин. Тихий отказ = зритель
+    // остаётся на текущем рунге (moveNodeToRendition notify:false).
+    if (activeTranscodeCount() >= agent.vrelayMaxTranscodes) {
+      tlog(`[rendition] ${baseSid}::${rendition} отложен — все ${agent.vrelayMaxTranscodes} транскод-слот(а) заняты`);
+      return false;
+    }
     const presetBitrate = preset || RENDITION_BITRATE[rendition] || 0;
     srcTree.renditions.set(rendition, { state: RS_STARTING, lastConsumerAt: now, presetBitrate });
     const bc = srcTree.nodes.get(srcTree.broadcasterId);
@@ -1017,6 +1040,16 @@ function attachTreeServer(httpServer, opts) {
     }
     tlog(`[quality] ${p.identity} ${oldKey} -> ${newKey} (${opts.pinned ? 'pinned' : 'auto'})`);
     broadcastTreeInfo(oldKey); broadcastTopology(oldKey); settleOrphans(oldKey);
+    // Освобождаем транскод-слот СРАЗУ, как покинутый рендишн опустел — иначе idle-свип держит ffmpeg
+    // ещё RENDITION_IDLE_MS, слот занят, и следующий шаг понижения (при малом капе) не пройдёт гейт.
+    // Только не-source и только при 0 потребителей (детей не бросаем).
+    const oldRend = parseTreeKey(oldKey).rendition;
+    if (oldRend !== DEFAULT_RENDITION) {
+      const ot = mgr.trees.get(oldKey);
+      let consumers = 0;
+      if (ot) for (const n of ot.nodes.values()) if (n.id !== ot.broadcasterId) consumers++;
+      if (!consumers) teardownRendition(baseSid, oldRend, 'vacated');
+    }
     broadcastTreeInfo(newKey); broadcastTopology(newKey); settleOrphans(newKey);
     if (target !== DEFAULT_RENDITION && srcTree.renditions) { const e = srcTree.renditions.get(target); if (e) e.lastConsumerAt = Date.now(); }
     return true;
@@ -1074,7 +1107,9 @@ function attachTreeServer(httpServer, opts) {
         if (!serverParent) continue; // под живым пиром качество структурно, менять нечего
         if (!node.statsAt || now - node.statsAt > STATS_TTL_MS) { node.abrBad = 0; node.abrGood = 0; continue; }
         const loss = node.linkLoss || 0, rtt = node.linkRtt || 0;
-        const bad = loss > ABR_LOSS_HI || rtt > ABR_RTT_HI;
+        // Понижение — по НИЗКОМУ порогу (пер-зритель, не бьёт остальных). Подъём (good) остаётся
+        // на ABR_LOSS_LO=0.02 → нейтральная зона 0.02–0.04 гасит болтанку понижение↔подъём.
+        const bad = loss > ABR_RENDITION_DOWN_LOSS || rtt > ABR_RTT_HI;
         const good = loss < ABR_LOSS_LO && rtt < ABR_RTT_LO;
         if (bad) { node.abrBad = (node.abrBad || 0) + 1; node.abrGood = 0; }
         else if (good) { node.abrGood = (node.abrGood || 0) + 1; node.abrBad = 0; }
