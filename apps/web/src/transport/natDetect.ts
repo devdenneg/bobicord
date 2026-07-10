@@ -29,29 +29,52 @@ export function stunUrlsByHost(iceServers: RTCIceServer[]): string[] {
 export async function detectSymmetricNat(stunUrls: string[] = FALLBACK_STUN): Promise<boolean> {
   if (stunUrls.length < 2) return false;
   try {
-    const ports = await Promise.all(stunUrls.slice(0, 2).map(srflxPort));
-    if (ports.some((p) => p == null)) return false; // неопределённо — не помечаем ложно
-    return ports[0] !== ports[1];
+    return await probeSameSocket(stunUrls.slice(0, 2));
   } catch { return false; }
 }
 
-function srflxPort(stunUrl: string): Promise<number | null> {
+/**
+ * ОДИН RTCPeerConnection с обоими STUN-серверами. Это принципиально: ICE-агент опрашивает их
+ * с одного и того же локального сокета (общий `relatedPort` = base), поэтому разные внешние
+ * порты означают именно симметричность.
+ *
+ * Раньше здесь было два независимых PC — по одному на сервер. У каждого свой локальный порт, а
+ * ЛЮБОЙ NAT отображает разные локальные порты на разные внешние. Проба возвращала true почти
+ * для каждого браузера за NAT (ловилось живьём: symNat=true у всех веб-зрителей подряд).
+ *
+ * Браузер схлопывает одинаковые srflx-кандидаты (совпали ip+port+type), поэтому при конусном
+ * NAT придёт ОДИН кандидат на оба сервера, а при симметричном — два с разными портами.
+ */
+function probeSameSocket(stunUrls: string[]): Promise<boolean> {
   return new Promise((resolve) => {
     let pc: RTCPeerConnection;
-    try { pc = new RTCPeerConnection({ iceServers: [{ urls: stunUrl }] }); } catch { resolve(null); return; }
+    try { pc = new RTCPeerConnection({ iceServers: stunUrls.map((urls) => ({ urls })) }); }
+    catch { resolve(false); return; }
+
+    // base-порт -> внешние порты, которые увидели разные серверы.
+    const byBase = new Map<number, Set<number>>();
     let done = false;
-    const finish = (port: number | null) => {
+    const finish = () => {
       if (done) return;
       done = true;
       try { pc.close(); } catch { /**/ }
-      resolve(port);
+      // Симметричный = хотя бы один base отобразился в ДВА разных внешних порта.
+      for (const ports of byBase.values()) if (ports.size >= 2) { resolve(true); return; }
+      resolve(false); // один srflx (конусный) либо ни одного (неопределённо) — не помечаем ложно
     };
+
     pc.onicecandidate = (e) => {
-      if (!e.candidate) { finish(null); return; }
-      if (e.candidate.type === 'srflx' && e.candidate.port != null) finish(e.candidate.port);
+      if (!e.candidate) { finish(); return; } // end-of-candidates: гатеринг завершён
+      const c = e.candidate;
+      if (c.type !== 'srflx' || c.port == null) return;
+      const base = c.relatedPort ?? -1; // нет relatedPort — валим всё в одну корзину
+      let set = byBase.get(base);
+      if (!set) { set = new Set(); byBase.set(base, set); }
+      set.add(c.port);
+      if (set.size >= 2) finish(); // ответ уже известен, ждать остальные кандидаты незачем
     };
     pc.createDataChannel('nat-probe');
-    pc.createOffer().then((o) => pc.setLocalDescription(o)).catch(() => finish(null));
-    setTimeout(() => finish(null), 2500);
+    pc.createOffer().then((o) => pc.setLocalDescription(o)).catch(() => finish());
+    setTimeout(finish, 3000); // гатеринг двух серверов, с запасом к прежним 2.5с
   });
 }
