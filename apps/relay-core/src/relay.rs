@@ -22,7 +22,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Notify};
-use webrtc::api::interceptor_registry::register_default_interceptors;
+use webrtc::api::interceptor_registry::{configure_rtcp_reports, configure_twcc_receiver_only};
+use webrtc::interceptor::nack::generator::Generator;
+use webrtc::interceptor::nack::responder::Responder;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
 use webrtc::api::{APIBuilder, API};
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
@@ -36,7 +38,7 @@ use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType};
 use webrtc::rtp_transceiver::rtp_receiver::RTCRtpReceiver;
-use webrtc::rtp_transceiver::RTCRtpTransceiver;
+use webrtc::rtp_transceiver::{RTCPFeedback, RTCRtpTransceiver};
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 use webrtc::track::track_local::{TrackLocal, TrackLocalWriter};
 use webrtc::track::track_remote::TrackRemote;
@@ -94,6 +96,13 @@ struct IngestMonitor {
 /// 250мс покрывают одиночный NACK-цикл: keyframe просим, только когда NACK реально провалился.
 /// Выше не задираем — при потерянном ретрансмите это лишь удлиняет фриз.
 const GAP_HEAL_GRACE: Duration = Duration::from_millis(250);
+/// Интервал nack::Generator (детект пропуска seq → отправка NACK). Дефолт webrtc-rs = 100мс —
+/// на лоссовом леге первый NACK ждёт до 100мс, ретрансмит опаздывает за приёмный буфер зрителя.
+/// 50мс вдвое режет worst-case латентность первого NACK (важнее всего на двойной потере, где
+/// нужен 2-й цикл). Ниже ~30мс не опускаем — учащение re-NACK добавляет RTCP на забитый аплинк.
+/// Требует РУЧНОЙ сборки Registry (register_default_interceptors интервал не параметризует) —
+/// поэтому nack-фидбэк на H.264 задаётся ЯВНО (иначе Generator/Responder не активируются).
+const NACK_GENERATOR_INTERVAL: Duration = Duration::from_millis(50);
 /// Пейсер фанаута (см. writer-таск в on_parent_offer): бюджет байт на окно. 12500Б / 5мс =
 /// 20 Мбит/с. Это ПОТОЛОК на один поток — не «×битрейт»: source-passthrough бывает 6 Мбит CBR
 /// с VBR-пиками, порезать их нельзя (fanout_drops), а истинный микробёрст (keyframe пачкой на
@@ -311,7 +320,12 @@ impl RelayManager {
                     clock_rate: 90000,
                     channels: 0,
                     sdp_fmtp_line: H264_FMTP.to_owned(),
-                    rtcp_feedback: vec![],
+                    // ЯВНО (не через configure_nack): собираем Registry вручную ради быстрого
+                    // Generator-тика, поэтому авто-дописывание nack отключено — задаём тут.
+                    rtcp_feedback: vec![
+                        RTCPFeedback { typ: "nack".to_owned(), parameter: String::new() },
+                        RTCPFeedback { typ: "nack".to_owned(), parameter: "pli".to_owned() },
+                    ],
                 },
                 payload_type: 102,
                 ..Default::default()
@@ -333,7 +347,16 @@ impl RelayManager {
             RTPCodecType::Audio,
         ).map_err(|e| e.to_string())?;
 
-        let registry = register_default_interceptors(Registry::new(), &mut m).map_err(|e| e.to_string())?;
+        // Ручная сборка Registry = дефолтные интерсепторы, НО с ускоренным nack::Generator.
+        // Повторяет register_default_interceptors → configure_nack (nack Responder+Generator) +
+        // configure_rtcp_reports (RR/SR) + configure_twcc_receiver_only (TWCC recv), НЕ теряя
+        // ничего. Отличие одно: Generator.with_interval(NACK_GENERATOR_INTERVAL) вместо 100мс.
+        // nack-фидбэк на кодек здесь НЕ дописывается (нет configure_nack) — он задан ЯВНО выше.
+        let mut registry = Registry::new();
+        registry.add(Box::new(Responder::builder()));
+        registry.add(Box::new(Generator::builder().with_interval(NACK_GENERATOR_INTERVAL)));
+        registry = configure_rtcp_reports(registry);
+        let registry = configure_twcc_receiver_only(registry, &mut m).map_err(|e| e.to_string())?;
         let api = APIBuilder::new().with_media_engine(m).with_interceptor_registry(registry).build();
 
         let (video_track, audio_track) = match injected {
