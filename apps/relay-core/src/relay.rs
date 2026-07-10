@@ -77,12 +77,31 @@ struct IngestMonitor {
     window_start: Instant,
     /// Тихий поток надо иногда подтверждать: иначе «нет строк» неотличимо от «узел умер».
     last_baseline: Instant,
+    /// GapHealer: недошедшие seq, которые ещё может закрыть ретрансмит (NACK). Разбор прода
+    /// (diag penis14, 2026-07-10): потеря 2-4 пакетов у зрителя лечилась ТОЛЬКО плановым IDR —
+    /// фриз ровно в GOP (~2.2с) на каждую микропотерю; NACK-цепочка через 3 хопа дыру не
+    /// закрывала, а PLI Chrome шлёт слишком поздно (его таймер длиннее GOP). Даём ретрансмиту
+    /// GAP_HEAL_GRACE, после — просим IDR у корня (см. take_unhealed / RequestKeyframe в цикле).
+    missing: std::collections::HashSet<u16>,
+    /// Момент появления самой старой незалеченной дыры.
+    oldest_missing_at: Option<Instant>,
 }
+
+/// Сколько ждём, что дыру закроет ретрансмит, прежде чем просить keyframe. Порядок — RTT
+/// хопа + запас; больше — зря тянем фриз, меньше — шлём IDR на дыры, которые NACK бы закрыл.
+const GAP_HEAL_GRACE: Duration = Duration::from_millis(150);
+/// Разрыв шире этого — не «потерялась пара пакетов», а обрыв/скачок (reparent, пауза
+/// источника): не раздуваем missing-set, сразу считаем незалеченным маркером.
+const GAP_TRACK_MAX: u16 = 128;
 
 impl IngestMonitor {
     fn new(label: String, fanout_drops: Arc<AtomicU64>, write_errs: Arc<AtomicU64>) -> Self {
         let now = Instant::now();
-        Self { label, last_seq: None, packets: 0, gaps: 0, reordered: 0, bytes: 0, fanout_drops, write_errs, window_start: now, last_baseline: now }
+        Self {
+            label, last_seq: None, packets: 0, gaps: 0, reordered: 0, bytes: 0,
+            fanout_drops, write_errs, window_start: now, last_baseline: now,
+            missing: std::collections::HashSet::new(), oldest_missing_at: None,
+        }
     }
 
     fn on_packet(&mut self, seq: u16, len: usize) {
@@ -96,11 +115,41 @@ impl IngestMonitor {
                 1 => {}                                  // всё на месте
                 // Разрыв вперёд = недошедшие пакеты. Половина пространства номеров отделяет
                 // «пропуск» от «пришёл старый пакет» (переупорядочивание сети).
-                _ if d < 0x8000 => self.gaps += (d - 1) as u64,
-                _ => { self.reordered += 1; return; }     // опоздавший — last_seq не двигаем
+                _ if d < 0x8000 => {
+                    self.gaps += (d - 1) as u64;
+                    // Регистрируем дыру для GapHealer. Широкий разрыв — одним маркером.
+                    if d <= GAP_TRACK_MAX {
+                        let mut s = prev.wrapping_add(1);
+                        while s != seq { self.missing.insert(s); s = s.wrapping_add(1); }
+                    } else {
+                        self.missing.insert(prev.wrapping_add(1));
+                    }
+                    if self.oldest_missing_at.is_none() { self.oldest_missing_at = Some(Instant::now()); }
+                }
+                _ => {
+                    // Опоздавший (ретрансмит/reorder) — возможно, закрыл дыру. last_seq не двигаем.
+                    self.reordered += 1;
+                    self.missing.remove(&seq);
+                    if self.missing.is_empty() { self.oldest_missing_at = None; }
+                    return;
+                }
             }
         }
         self.last_seq = Some(seq);
+    }
+
+    /// true — есть дыра старше grace, которую ретрансмит так и не закрыл (пора просить IDR
+    /// у корня, иначе декодеры зрителей молчат до планового GOP). Сбрасывает состояние:
+    /// один запрос на дыру; новые потери взводят заново.
+    fn take_unhealed(&mut self, grace: Duration) -> bool {
+        match self.oldest_missing_at {
+            Some(t) if t.elapsed() >= grace => {
+                self.missing.clear();
+                self.oldest_missing_at = None;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Окно 2с — как stats-тик вещателя и зрителя, чтобы `scripts/diag.mjs` сводил их
@@ -374,6 +423,10 @@ impl RelayManager {
         let feed_count = self.feed_count.clone();
         let ingest_sid = self.stream_id.clone();
         let ingest_parent = from.clone();
+        // GapHealer: незалеченная дыра на входе → request-keyframe корню (rate-limit общий
+        // с PLI-путём детей — last_kf_ms).
+        let kf_tx = self.cmd_tx.clone();
+        let kf_last = self.last_kf_ms.clone();
         pc.on_track(Box::new(move |track: Arc<TrackRemote>, _r: Arc<RTCRtpReceiver>, _t: Arc<RTCRtpTransceiver>| {
             let video_local = video_local.clone();
             let audio_local = audio_local.clone();
@@ -381,6 +434,8 @@ impl RelayManager {
             let feed_count = feed_count.clone();
             let ingest_sid = ingest_sid.clone();
             let ingest_parent = ingest_parent.clone();
+            let kf_tx = kf_tx.clone();
+            let kf_last = kf_last.clone();
             Box::pin(async move {
                 let is_video = track.kind() == RTPCodecType::Video;
                 tokio::spawn(async move {
@@ -429,6 +484,18 @@ impl RelayManager {
                                 // потерю через PLI; остановка ingest ударила бы по всем сразу.
                                 if tx.try_send(packet).is_err() {
                                     fanout_drops.fetch_add(1, Ordering::Relaxed);
+                                }
+                                // GapHealer: дыра в видео не закрылась ретрансмитом за grace →
+                                // просим IDR у корня немедленно. Без этого зрители ждали плановый
+                                // GOP (~2с фриза на каждую микропотерю). Rate-limit 1с — общий
+                                // с PLI-путём (last_kf_ms); сервер и вещатель режут шторм сами.
+                                if is_video && mon.take_unhealed(GAP_HEAL_GRACE) {
+                                    let now = now_ms();
+                                    if now.saturating_sub(kf_last.load(Ordering::Relaxed)) >= 1000 {
+                                        kf_last.store(now, Ordering::Relaxed);
+                                        let _ = kf_tx.send(TreeCmd::RequestKeyframe);
+                                        log::info!("ingest {ingest_sid} video: незалеченная потеря (>{}мс) — запросил keyframe у корня", GAP_HEAL_GRACE.as_millis());
+                                    }
                                 }
                                 mon.tick();
                             }
@@ -920,6 +987,7 @@ mod tests {
     use super::IngestMonitor;
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
+    use std::time::Duration;
 
     /// Возвращает (принято, разрывов, переупорядочено). Счётчики фанаута тесту не нужны —
     /// их пишет writer-таск, здесь проверяется только арифметика номеров.
@@ -969,5 +1037,73 @@ mod tests {
     fn duplicate_ignored() {
         let (_, lost, re) = feed(&[10, 10, 11]);
         assert_eq!((lost, re), (0, 0));
+    }
+
+    // ---- GapHealer (незалеченная дыра → запрос keyframe) ----
+
+    fn mon() -> IngestMonitor {
+        IngestMonitor::new("test".into(), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Дыра, которую никто не закрыл, по истечении grace отдаёт true ровно один раз.
+    #[test]
+    fn unhealed_gap_fires_once() {
+        let mut m = mon();
+        m.on_packet(10, 100);
+        m.on_packet(13, 100); // потеряны 11, 12
+        assert!(m.take_unhealed(Duration::ZERO));
+        assert!(!m.take_unhealed(Duration::ZERO)); // состояние сброшено — второй раз не стреляем
+    }
+
+    /// Ретрансмит закрыл ВСЕ недостающие → просить keyframe не надо.
+    #[test]
+    fn healed_gap_does_not_fire() {
+        let mut m = mon();
+        m.on_packet(10, 100);
+        m.on_packet(13, 100); // дыра 11,12
+        m.on_packet(11, 100); // ретрансмиты пришли (reorder-ветка)
+        m.on_packet(12, 100);
+        assert!(!m.take_unhealed(Duration::ZERO));
+    }
+
+    /// Закрыта только часть дыры — оставшаяся всё равно требует keyframe.
+    #[test]
+    fn partially_healed_gap_fires() {
+        let mut m = mon();
+        m.on_packet(10, 100);
+        m.on_packet(13, 100);
+        m.on_packet(11, 100); // 12 так и не пришёл
+        assert!(m.take_unhealed(Duration::ZERO));
+    }
+
+    /// Grace ещё не истёк — не стреляем (даём NACK шанс).
+    #[test]
+    fn within_grace_does_not_fire() {
+        let mut m = mon();
+        m.on_packet(10, 100);
+        m.on_packet(13, 100);
+        assert!(!m.take_unhealed(Duration::from_secs(60)));
+    }
+
+    /// Широкий разрыв (обрыв/reparent) не раздувает missing-set, но считается дырой.
+    #[test]
+    fn huge_gap_capped_but_fires() {
+        let mut m = mon();
+        m.on_packet(10, 100);
+        m.on_packet(10u16.wrapping_add(1000), 100);
+        assert!(m.missing.len() <= 1);
+        assert!(m.take_unhealed(Duration::ZERO));
+    }
+
+    /// Дыра через разворот номеров закрывается ретрансмитами корректно.
+    #[test]
+    fn heal_across_wraparound() {
+        let mut m = mon();
+        m.on_packet(65534, 100);
+        m.on_packet(2, 100);  // дыра 65535, 0, 1
+        m.on_packet(65535, 100);
+        m.on_packet(0, 100);
+        m.on_packet(1, 100);
+        assert!(!m.take_unhealed(Duration::ZERO));
     }
 }
