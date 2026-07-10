@@ -90,6 +90,10 @@ struct IngestMonitor {
 /// Сколько ждём, что дыру закроет ретрансмит, прежде чем просить keyframe. Порядок — RTT
 /// хопа + запас; больше — зря тянем фриз, меньше — шлём IDR на дыры, которые NACK бы закрыл.
 const GAP_HEAL_GRACE: Duration = Duration::from_millis(150);
+/// Пейсер фанаута (см. writer-таск в on_parent_offer): бюджет байт на окно. 7500Б / 5мс =
+/// 12 Мбит/с — в 3-4 раза выше битрейта стрима, душит ТОЛЬКО микробёрсты (keyframe-пачки).
+const PACE_WINDOW: Duration = Duration::from_millis(5);
+const PACE_BYTES_PER_WINDOW: usize = 7_500;
 /// Разрыв шире этого — не «потерялась пара пакетов», а обрыв/скачок (reparent, пауза
 /// источника): не раздуваем missing-set, сразу считаем незалеченным маркером.
 const GAP_TRACK_MAX: u16 = 128;
@@ -457,7 +461,25 @@ impl RelayManager {
                     let (tx, mut rx) = tokio::sync::mpsc::channel::<webrtc::rtp::packet::Packet>(cap);
                     let werrs = write_errs.clone();
                     tokio::spawn(async move {
+                        // Пейсер фанаута. В webrtc-rs НЕТ paced sender'а (в отличие от libwebrtc):
+                        // keyframe приходит от родителя пачкой 50-80 пакетов и write_rtp выплюнул бы
+                        // её на line-rate порта (2Gbit = микробёрст ~0.3мс) — хвост пачки выбивает
+                        // буферы последней мили зрителя, потери ложатся РОВНО на keyframe'ы →
+                        // фриз → PLI/GapHealer → новый IDR → шторм сам себя кормит (разбор
+                        // penis14 2026-07-10: потери волнами на обеих ногах при чистом ICMP).
+                        // Бюджет байт на окно 5мс (~12 Мбит/с, 3-4× битрейта стрима): гасит только
+                        // микробёрсты; keyframe 60КБ размазывается на ~40мс — незаметно (<2с бюджет).
+                        let mut win_start = Instant::now();
+                        let mut win_bytes: usize = 0;
                         while let Some(pkt) = rx.recv().await {
+                            let size = pkt.payload.len() + 12; // RTP-заголовок
+                            if win_bytes + size > PACE_BYTES_PER_WINDOW {
+                                let el = win_start.elapsed();
+                                if el < PACE_WINDOW { tokio::time::sleep(PACE_WINDOW - el).await; }
+                                win_start = Instant::now();
+                                win_bytes = 0;
+                            }
+                            win_bytes += size;
                             let res = if is_video { video_local.write_rtp(&pkt).await } else { audio_local.write_rtp(&pkt).await };
                             if let Err(e) = res {
                                 // ErrClosedPipe = ни одного связанного sender (нет детей/webview) — не ошибка
