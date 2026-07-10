@@ -76,6 +76,20 @@ function treeWsUrl(): string {
   return base + (base.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
 }
 
+// Приёмный буфер зрителя ~350мс (дефолт Chrome ~50мс). Разбор diag penis14 (2026-07-10, вечер):
+// потери на линках приходят БЁРСТАМИ и в основном ДОБИРАЮТСЯ с опозданием (ретрансмит/reorder,
+// «переупорядочено» ≈ «разрывам» в IngestMonitor) — но для 50мс-буфера опоздавший пакет уже мёртв,
+// декодер фризит до keyframe (~1с, rate-limit request-keyframe). 350мс впитывают бёрст целиком:
+// большинство фризов исчезает, цена — +0.35с задержки (бюджет инварианта — «видео < 2с»).
+// Ставим на ОБА приёмника (audio+video): буфер только у видео развёл бы губы со звуком.
+const JITTER_TARGET_MS = 350;
+function bufferReceiver(r: RTCRtpReceiver | null | undefined) {
+  if (!r) return;
+  const rr = r as any;
+  try { rr.jitterBufferTarget = JITTER_TARGET_MS; } catch { /**/ }        // стандарт (мс)
+  try { rr.playoutDelayHint = JITTER_TARGET_MS / 1000; } catch { /**/ }   // legacy-имя Chrome (сек)
+}
+
 // Форс H.264 (инвариант 4) на видео-трансивере PC при приёме от родителя (receiver.track video).
 function preferH264(pc: RTCPeerConnection) {
   const caps = (window as any).RTCRtpReceiver?.getCapabilities?.('video');
@@ -543,6 +557,7 @@ export class TreeVideoTransport implements VideoTransport {
       }
     };
     pc.ontrack = (e) => {
+      bufferReceiver(e.receiver);
       if (e.track.kind !== 'video') return;
       const handle = new MediaStreamVideoHandle(e.streams[0] || new MediaStream([e.track]));
       this.addVideo(streamId, handle, streamId, false);
@@ -620,6 +635,7 @@ export class TreeVideoTransport implements VideoTransport {
     st.pc = pc;
     pc.onicecandidate = (e) => { if (e.candidate) nativeWatchIce(e.candidate).catch(() => {}); };
     pc.ontrack = (e) => {
+      bufferReceiver(e.receiver);
       if (e.track.kind !== 'video') return;
       const handle = new MediaStreamVideoHandle(e.streams[0] || new MediaStream([e.track]));
       this.addVideo(streamId, handle, streamId, false);
