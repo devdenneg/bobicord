@@ -3,7 +3,7 @@ import type { VideoTransport, TreeInfo, RtpStats, TreeTopology } from './videoTr
 import { MediaStreamVideoHandle } from './videoTransport';
 import type { StreamInfo } from '../engine';
 import { getToken } from '../api';
-import { detectSymmetricNat } from './natDetect';
+import { detectSymmetricNat, stunUrlsByHost } from './natDetect';
 import {
   isTauri, startNativeWatch, stopNativeWatch, nativeWatchAnswer, nativeWatchIce, nativeWatchReparent,
   onNativeWatchOffer, onNativeWatchIce, onNativeTopology, onNativeWatchEnded,
@@ -199,6 +199,12 @@ export class TreeVideoTransport implements VideoTransport {
       let msg: any; try { msg = JSON.parse(ev.data); } catch { return; }
       if (msg.t === 'welcome') {
         if (Array.isArray(msg.iceServers) && msg.iceServers.length) this.iceServers = msg.iceServers;
+        // Перезапускаем NAT-пробу на STUN-серверах, которые прислал сервер: там наш coturn
+        // и Google — два РАЗНЫХ хоста, а значит два разных адресата, как и требует детект.
+        // Проба из attach() стартовала до welcome на фолбэк-списке; welcome обычно успевает
+        // раньше первого watch (join шлётся уже после него), так что гонки за natProbe нет.
+        const stun = stunUrlsByHost(this.iceServers);
+        if (stun.length >= 2) this.natProbe = detectSymmetricNat(stun);
       } else if (msg.t === 'stream-live') {
         announced.add(msg.identity);
         const fresh = !this.liveStreams.has(msg.identity);

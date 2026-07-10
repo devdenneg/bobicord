@@ -578,7 +578,13 @@ async fn run_signaling_loop(
                     Some(TreeEvent::Ice { from, candidate }) => mgr.on_ice(from, candidate).await,
                     Some(TreeEvent::DropPeer { peer_id }) => mgr.on_drop_peer(peer_id).await,
                     // Э8: relay-узел ниже по дереву просит IDR для нового зрителя — форсим.
-                    Some(TreeEvent::RequestKeyframe) => force_keyframe.store(true, Ordering::Relaxed),
+                    // Считаем в pli_count: запрос пришёл СИГНАЛИНГОМ, а не RTCP, и peer.rs его
+                    // не увидит. Без этого `net: ... PLI +0` читалось как «IDR никто не просил»,
+                    // хотя зрители из глубины дерева могли слать их пачками через vrelay.
+                    Some(TreeEvent::RequestKeyframe) => {
+                        stats.pli_count.fetch_add(1, Ordering::Relaxed);
+                        force_keyframe.store(true, Ordering::Relaxed);
+                    }
                     // Э8 ABR: сервер прислал целевой битрейт под худший линк дерева. Clamp
                     // в [FLOOR, потолок] — сервер уже клампит, но не доверяем сети вслепую.
                     Some(TreeEvent::SetBitrate { bps }) => {
