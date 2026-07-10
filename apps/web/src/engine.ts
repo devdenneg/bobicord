@@ -336,7 +336,12 @@ export class Engine {
     r.on(RoomEvent.TrackSubscribed, (track, pub, p) => this.onSub(track, pub, p, r))
       .on(RoomEvent.TrackUnsubscribed, (track, pub, p) => this.onUnsub(track, pub, p, r))
       .on(RoomEvent.ParticipantConnected, (p) => { if (r === this.viewRoom) { const u = baseUid(p.identity); if (u !== this.me.username && !this.hasOtherSession(u, p.identity)) this.hooks.toast((p.name || u) + ' в сети', 'ok'); this.hooks.peerJoined(u); } this.emit(); })
-      .on(RoomEvent.ParticipantDisconnected, (p) => { if (r === this.viewRoom) { const u = baseUid(p.identity); if (!this.hasOtherSession(u, p.identity)) this.cleanupPeer(u); } if (r === this.voiceRoom) this.reconcileChannelSounds(); this.emit(); })
+      // u !== this.me.username — иначе отключение СВОЕЙ же зомби-сессии (неудачный первый коннект,
+      // сеть/деплой) чистит АНАЛИЗАТОР ТЕКУЩЕЙ живой сессии (detachAnalyser(me) внутри cleanupPeer):
+      // полоска чувствительности замирает, гейт «активация голосом» может замереть закрытым — мик
+      // «пропадает» без видимой причины, лечится только перезаходом в канал. См. ParticipantConnected
+      // строкой выше — та же защита у него уже была, тут её не хватало.
+      .on(RoomEvent.ParticipantDisconnected, (p) => { if (r === this.viewRoom) { const u = baseUid(p.identity); if (u !== this.me.username && !this.hasOtherSession(u, p.identity)) this.cleanupPeer(u); } if (r === this.voiceRoom) this.reconcileChannelSounds(); this.emit(); })
       // звук мута слышен только самому мутящемуся — играем при локальном событии МОЕГО голосового трека
       .on(RoomEvent.TrackMuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.voiceRoom?.localParticipant && !this.deafToggling) playSound('mute'); this.emit(); })
       .on(RoomEvent.Reconnecting, () => { this.reconnecting = true; this.hooks.toast('Связь потеряна — переподключаюсь…', 'warn'); this.emit(); })
