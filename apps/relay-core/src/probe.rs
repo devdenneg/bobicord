@@ -4,10 +4,12 @@
 // мы — PC-answerer, принимаем трек и ДРОПАЕМ (никуда не пишем, не транскодируем). Короткоживущая
 // сессия с таймаутом (не висеть, если вещатель отвалился). Отдельно от ingest/рендишн-сессий.
 //
-// ВАЖНО: в отличие от passthrough-relay (relay.rs, `rtcp_feedback: vec![]`), probe заводит
-// ОТДЕЛЬНЫЙ MediaEngine с register_default_codecs — с transport-cc/nack/pli. Send-side GCC-BWE
-// вещателя требует transport-wide feedback ОТ приёмника; без него availableOutgoingBitrate не
-// разгоняется (документированный риск роадмапа) — тут даём полный набор фидбэка.
+// ВАЖНО: probe отличается от passthrough-relay ТОЛЬКО наличием transport-cc, НЕ nack.
+// nack/pli на видео есть и у relay/peer: `rtcp_feedback: vec![]` в register_codec — no-op,
+// его перетирает `register_default_interceptors` → `configure_nack`, дописывая nack ретроактивно
+// (проверено по webrtc 0.17.1). Здесь же register_default_CODECS даёт ДОБАВОЧНО transport-cc:
+// send-side GCC-BWE вещателя требует transport-wide feedback ОТ приёмника; без него
+// availableOutgoingBitrate не разгоняется (документированный риск роадмапа).
 
 use std::sync::Arc;
 use std::time::Duration;
