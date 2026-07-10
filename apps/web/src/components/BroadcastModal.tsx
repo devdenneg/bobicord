@@ -7,26 +7,25 @@ import { Backdrop } from './Backdrop';
 import { listMonitors, listWindows, startNativeBroadcast, setNativeBroadcastSource, stopNativeBroadcast, onBroadcastStats } from '../native';
 import { startBroadcasterSession, endAnyBroadcasterSession } from '../diag';
 import type { MonitorInfo, WindowInfo, BroadcastStats, CaptureSource } from '../native';
-import { pickPreset, type PresetMode } from '../presets';
+import { pickPreset, PRESETS } from '../presets';
 import { measureUpload, getCachedProbe, clearCachedProbe, type ProbeResult } from '../transport/probe';
 
-type Resolution = '1080' | '720' | '480' | 'source';
-const RES_MAP: Record<Resolution, { w: number; h: number; label: string }> = {
-  '1080': { w: 1920, h: 1080, label: '1080p' },
-  '720': { w: 1280, h: 720, label: '720p' },
-  '480': { w: 854, h: 480, label: '480p' },
-  source: { w: 3840, h: 2160, label: 'Как в источнике' },
+// Дискорд-стиль: маленький выбор качества, битрейт ВСЕГДА авто (сервер-ABR адаптирует под сеть,
+// слабых зрителей жмут серверные рендишны). Ручной битрейт-слайдер убран — им легко убить стрим
+// (наблюдалось: 10 Мбит на 1080p60 → фризы у всех). 'auto' подбирает пресет по замеру аплинка.
+type StreamQuality = 'auto' | '1080p60' | '720p60';
+// Фикс-пресеты (потолок; autoBitrate снижает под сеть). Значения совпадают с presets.ts/tree.js.
+const QUALITY_FIXED: Record<Exclude<StreamQuality, 'auto'>, { w: number; h: number; fps: 30 | 60; bitrateKbps: number; label: string }> = {
+  '1080p60': { w: 1920, h: 1080, fps: 60, bitrateKbps: 6000, label: '1080p60' },
+  '720p60': { w: 1280, h: 720, fps: 60, bitrateKbps: 4500, label: '720p60' },
 };
 
 interface SavedConfig {
   sourceKind: 'monitor' | 'window';
   monitorIndex: number;
   windowHwnd: number | null;
-  resolution: Resolution;
-  fps: 30 | 60;
-  bitrateKbps: number;
-  /** Э8 ABR: авто-адаптация битрейта под сеть дерева. bitrateKbps при этом — потолок. */
-  autoBitrate: boolean;
+  /** Дискорд-стиль выбор качества. 'auto' — пресет по замеру аплинка; фикс — потолок под auto-битрейт. */
+  quality: StreamQuality;
   /** auto — звук следует за источником: окно → его процесс (INCLUDE, надёжно против
    *  эха голоса войса), монитор → всё кроме RelayApp (EXCLUDE себя). Ничего выбирать руками.
    *  exclude/include — ручной override под «Дополнительно» (см. CLAUDE.md инвариант 6, audio.rs). */
@@ -37,33 +36,21 @@ interface SavedConfig {
   /** Д8: opt-in прямых подключений к стримеру. Выкл (дефолт) — server-first: единственный
    *  слот корня отдан vrelay (maxChildren=1). Вкл — maxChildren = 1 (vrelay) + maxDirectChildren. */
   allowDirectPeers: boolean;
-  /** Д5: режим пресета. 'smooth'/'quality' — из развилки после замера (CBR-пресет по таблице);
-   *  'manual' — ручные слайдеры (текущее поведение). Определяет, чем стартует трансляция. */
-  presetMode: PresetMode | 'manual';
 }
 // audioMode дефолтом 'auto': звук выбирается сам по источнику (окно → PID окна, монитор →
 // EXCLUDE себя), пользователю не нужно вручную указывать процесс. Ручной выбор остаётся
 // под «Дополнительно» на случай, когда нужен звук строго одного приложения.
-const DEF_CONFIG: SavedConfig = { sourceKind: 'monitor', monitorIndex: 0, windowHwnd: null, resolution: '1080', fps: 30, bitrateKbps: 6000, autoBitrate: false, audioMode: 'auto', audioPid: null, maxDirectChildren: 2, allowDirectPeers: false, presetMode: 'smooth' };
-// Диапазоны слайдеров. Сохранённый в localStorage конфиг мог содержать старые
-// пресеты (bitrateMbps 3/6/10, ранее 15/20; 1 прямое подключение) — мигрируем и
-// клампим, иначе на бэкенд уходит невалидное значение.
-const BITRATE_MIN_KBPS = 3000, BITRATE_MAX_KBPS = 10_000, BITRATE_STEP_KBPS = 1000;
+const DEF_CONFIG: SavedConfig = { sourceKind: 'monitor', monitorIndex: 0, windowHwnd: null, quality: 'auto', audioMode: 'auto', audioPid: null, maxDirectChildren: 2, allowDirectPeers: false };
 const DIRECT_MIN = 1, DIRECT_MAX = 10;
 function loadConfig(): SavedConfig {
   try {
     const raw = JSON.parse(localStorage.getItem('bcastConfig') || '{}');
-    const savedMode = raw.presetMode;
-    if (typeof raw.bitrateKbps !== 'number' && typeof raw.bitrateMbps === 'number') raw.bitrateKbps = raw.bitrateMbps * 1000;
-    delete raw.bitrateMbps;
     const c: SavedConfig = { ...DEF_CONFIG, ...raw };
-    c.bitrateKbps = Math.min(BITRATE_MAX_KBPS, Math.max(BITRATE_MIN_KBPS, Math.round(c.bitrateKbps / BITRATE_STEP_KBPS) * BITRATE_STEP_KBPS));
+    // Миграция со старой схемы (presetMode/resolution/fps/bitrate/autoBitrate) — всё это заменено
+    // одним `quality`. Старый конфиг → 'auto' (как у нового юзера), если валидного quality нет.
+    if (c.quality !== 'auto' && c.quality !== '1080p60' && c.quality !== '720p60') c.quality = 'auto';
     c.maxDirectChildren = Math.min(DIRECT_MAX, Math.max(DIRECT_MIN, Math.round(c.maxDirectChildren)));
     c.allowDirectPeers = !!c.allowDirectPeers;
-    // Конфиг, сохранённый до Д5, не имеет presetMode — открываем на «Авто» (DEF_CONFIG),
-    // как и у нового пользователя. Явно выбранный режим (в т.ч. 'manual') восстанавливается.
-    if (savedMode === 'smooth' || savedMode === 'quality' || savedMode === 'manual') c.presetMode = savedMode;
-    else c.presetMode = DEF_CONFIG.presetMode;
     return c;
   } catch { return DEF_CONFIG; }
 }
@@ -150,29 +137,27 @@ export function BroadcastModal() {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const [stats, setStats] = useState<BroadcastStats | null>(null);
-  // Д5: замер upload (probe). Кэш переживает открытия модалки (TTL сутки).
+  // Замер upload (probe) — нужен для 'auto' (пресет по 0.75×BWE). Кэш переживает открытия (TTL сутки).
   const [probe, setProbe] = useState<ProbeResult | null>(() => getCachedProbe());
   const [measuring, setMeasuring] = useState(false);
   const [measurePhase, setMeasurePhase] = useState('');
 
-  // Полезный битрейт = 75% от измеренного BWE; пресет из развилки под него.
   const usefulKbps = probe ? Math.round(probe.bweKbps * 0.75) : null;
-  const chosenPreset = (cfg.presetMode !== 'manual' && usefulKbps != null)
-    ? pickPreset(usefulKbps, cfg.presetMode as PresetMode)
-    : null;
+  // Итоговые параметры кодирования по выбранному качеству. 'auto' → пресет по замеру (без замера —
+  // самый нижний, floor). Фикс — из таблицы. Битрейт ВЕЗДЕ становится потолком auto-адаптации.
+  function resolveEncode() {
+    if (cfg.quality === 'auto') {
+      const p = (usefulKbps != null ? pickPreset(usefulKbps, 'smooth') : null) || PRESETS[PRESETS.length - 1];
+      return { w: p.width, h: p.height, fps: p.fps, bitrateKbps: p.bitrateKbps, label: p.label };
+    }
+    return QUALITY_FIXED[cfg.quality];
+  }
+  const enc = resolveEncode();
+  const summary = cfg.quality === 'auto' && usefulKbps == null && measuring
+    ? 'Будет: подберу после замера скорости · битрейт авто'
+    : `Будет: ${enc.label} · битрейт авто (сервер подстроит под сеть)`;
 
-  // Явные вкладки режима вещания. Активный таб выводится из presetMode (единый источник
-  // истины) — отдельного поля состояния нет. Переключение таба меняет presetMode.
-  const tab: 'auto' | 'manual' = cfg.presetMode === 'manual' ? 'manual' : 'auto';
-  const selectAuto = () => setCfg((c) => ({ ...c, presetMode: c.presetMode === 'manual' ? 'smooth' : c.presetMode }));
-  const selectManual = () => setCfg((c) => ({ ...c, presetMode: 'manual' }));
-  // Явная итоговая строка «что применится» для каждого таба.
-  const autoSummary = chosenPreset
-    ? `Будет: ${chosenPreset.label}, ${(chosenPreset.bitrateKbps / 1000).toFixed(1)} Мбит/с CBR`
-    : measuring ? 'Будет: определю после замера скорости' : 'Будет: нужен замер скорости';
-  const manualSummary = `Будет: ${RES_MAP[cfg.resolution].label}, ${cfg.fps} fps, ${cfg.bitrateKbps / 1000} Мбит/с${cfg.autoBitrate ? ' (макс., авто-адаптация)' : ' CBR'}`;
-
-  // Замер upload: спиннер 3-5с, затем развилка. useCache=false — принудительный ре-замер.
+  // Замер upload: спиннер 3-5с. useCache=false — принудительный ре-замер.
   async function runMeasure(useCache = true) {
     if (useCache) { const c = getCachedProbe(); if (c) { setProbe(c); return; } }
     setMeasuring(true); setMeasurePhase(''); setErr('');
@@ -190,7 +175,7 @@ export function BroadcastModal() {
     listWindows().then(setWindows).catch(() => {});
   }, [live]);
 
-  // Д5: дефолтный flow — авто-замер upload при открытии формы старта (если нет свежего кэша).
+  // Авто-замер upload при открытии формы старта (если нет свежего кэша) — нужен режиму «Авто».
   useEffect(() => {
     if (live) return;
     if (!getCachedProbe()) runMeasure(false);
@@ -226,20 +211,11 @@ export function BroadcastModal() {
   async function start() {
     setBusy(true); setErr('');
     try {
-      // Д5: в пресет-режиме параметры кодирования берём из таблицы пресетов; в ручном —
-      // из слайдеров. chosenPreset уже посчитан по 0.75×BWE.
-      const preset = cfg.presetMode !== 'manual' ? chosenPreset : null;
-      const w = preset ? preset.width : RES_MAP[cfg.resolution].w;
-      const h = preset ? preset.height : RES_MAP[cfg.resolution].h;
-      const fps = preset ? preset.fps : cfg.fps;
-      const bitrateBps = (preset ? preset.bitrateKbps : cfg.bitrateKbps) * 1000;
-      // Пресет тоже адаптируется по битрейту. Раньше здесь стоял false («пресет = фиксированный
-      // CBR») — и сервер не слал set-bitrate ВООБЩЕ: разбор реального стрима показал 4.5 Мбит/с
-      // ровной полкой сквозь окна с 46% потерь, потому что отступать было нечем (серверные
-      // рендишны, которые должны были адаптировать зрителей, требуют VRELAY_MAX_TRANSCODES>0).
-      // Битрейт пресета становится ПОТОЛКОМ ABR. Лестница fps/разрешения остаётся выключенной:
-      // натив включает её только при `manual && auto` (lib.rs), а мы в пресете.
-      const autoBitrate = preset ? true : cfg.autoBitrate;
+      const e = resolveEncode();
+      const bitrateBps = e.bitrateKbps * 1000;
+      // Битрейт ВСЕГДА адаптивный (потолок = e.bitrateKbps). presetMode !== 'manual' держит
+      // клиентскую лестницу fps/разрешения ВЫКЛ (адаптация зрителей — через серверные рендишны, Д4);
+      // сервер шлёт set-bitrate, вещатель снижает под худший линк. Ручного CBR больше нет.
       const source = buildSource(cfg);
       const audioTargetPid = deriveAudioPid(cfg, windows);
       // Трансляция идёт на ГОЛОСОВОЙ сервер (voiceServerId), а не на смотримый: вещать можно только
@@ -248,11 +224,9 @@ export function BroadcastModal() {
       const bcSrv = eng.voiceServerId || active.id;
       // Д8: server-first — единственный слот корня отдан vrelay (maxChildren=1). Opt-in
       // «прямые подключения» открывает N слотов вещателя: maxChildren = 1 (vrelay) + N.
-      // Натив клампит max_children в [1..10], сервер — в [0..MAX_CHILDREN_CAP].
       const directSlots = cfg.allowDirectPeers ? 1 + cfg.maxDirectChildren : 1;
-      await startNativeBroadcast(me.username, me.username, bcSrv, { source, maxWidth: w, maxHeight: h, fps, bitrateBps, autoBitrate, audioTargetPid, maxDirectChildren: directSlots, presetMode: preset ? cfg.presetMode : 'manual' });
-      // streamId вещателя == me.username (см. вызов выше). Сессия закроется в любой из
-      // трёх точек стопа (кнопка / store.endBroadcast / relay-broadcast-stopped).
+      await startNativeBroadcast(me.username, me.username, bcSrv, { source, maxWidth: e.w, maxHeight: e.h, fps: e.fps, bitrateBps, autoBitrate: true, audioTargetPid, maxDirectChildren: directSlots, presetMode: 'smooth' });
+      // streamId вещателя == me.username. Сессия закроется в любой из трёх точек стопа.
       startBroadcasterSession(me.username);
       saveConfig(cfg);
       useStore.getState().setBroadcastLive(true);
@@ -331,95 +305,44 @@ export function BroadcastModal() {
     <h2><Icon name="screen" />Трансляция экрана</h2>
     {sourceFields}
 
-    {/* Roadmap-flow-стриминга Д8: opt-in прямых подключений — про ТОПОЛОГИЮ, а не про качество,
-        поэтому вне табов авто/ручной (применяется в обоих режимах). Дефолт — «через сервер»
-        (server-first: единственный слот корня под vrelay). Вкл — вещатель открывает N прямых слотов. */}
-    <div className="fld"><label>Прямые подключения к тебе</label>
+    {/* Дискорд-стиль: маленький выбор качества. Битрейт всегда авто (сервер адаптирует), слайдера нет. */}
+    <div className="fld"><label>Качество</label>
       <div className="seg">
-        <button className={!cfg.allowDirectPeers ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, allowDirectPeers: false }))}>Только через сервер</button>
-        <button className={cfg.allowDirectPeers ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, allowDirectPeers: true }))}>Разрешить ({cfg.maxDirectChildren} слот.)</button>
+        <button className={cfg.quality === 'auto' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, quality: 'auto' }))}>Авто</button>
+        <button className={cfg.quality === '1080p60' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, quality: '1080p60' }))}>1080p60</button>
+        <button className={cfg.quality === '720p60' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, quality: '720p60' }))}>720p60</button>
       </div>
-      <p className="msub" style={{ margin: '8px 0 0' }}>{cfg.allowDirectPeers
-        ? `Зрители могут брать поток напрямую с тебя (до ${cfg.maxDirectChildren} прямых слотов). Остальные — через сервер.`
-        : 'Все зрители получают поток через сервер (меньше нагрузки на твою отдачу, стабильнее). Прямые подключения выключены.'}</p>
-      {cfg.allowDirectPeers && <div style={{ marginTop: 8 }}>
-        <label className="msub">Прямых слотов: {cfg.maxDirectChildren}</label>
-        <input type="range" min={DIRECT_MIN} max={DIRECT_MAX} step={1} value={cfg.maxDirectChildren} onChange={(e) => setCfg((c) => ({ ...c, maxDirectChildren: +e.target.value }))} />
+      <p className="msub" style={{ margin: '8px 0 0' }}>{cfg.quality === 'auto'
+        ? 'Авто (рекомендуется): подбираем разрешение под твою скорость, битрейт держит сервер.'
+        : 'Битрейт подстраивается автоматически; слабым зрителям сервер отдаёт качество пониже.'}</p>
+      {cfg.quality === 'auto' && <div style={{ marginTop: 6 }}>
+        {measuring
+          ? <span className="msub">Замеряю скорость сети… (3–5 с){measurePhase ? ` · ${measurePhase}` : ''}</span>
+          : probe
+            ? <span className="msub">
+                ~{(probe.bweKbps / 1000).toFixed(1)} Мбит/с отдача{probe.symmetricNat ? ' · ⚠ симметричный NAT' : ''}
+                {' '}<button className="linklike" style={{ background: 'none', border: 'none', color: 'var(--accent, #5865f2)', cursor: 'pointer', padding: 0 }} onClick={remeasure}>повторить замер</button>
+              </span>
+            : <button className="ghost" style={{ margin: 0 }} onClick={() => runMeasure(false)}>Замерить скорость</button>}
       </div>}
     </div>
+    <div style={{ marginTop: 10, padding: '8px 10px', borderRadius: 8, background: 'var(--accent-soft, rgba(88,101,242,.18))', fontSize: 13, fontWeight: 600 }}>{summary}</div>
 
-    {/* Roadmap-flow-стриминга Д5: явные взаимоисключающие вкладки — Авто (замер→развилка→пресет)
-        и Ручной (слайдеры). Активный таб = presetMode; применяется ТОЛЬКО он (см. start()). */}
-    <div className="fld"><label>Настройки вещания</label>
-      <div className="seg">
-        <button className={tab === 'auto' ? 'active' : ''} onClick={selectAuto}>Авто</button>
-        <button className={tab === 'manual' ? 'active' : ''} onClick={selectManual}>Ручной</button>
-      </div>
-    </div>
-
-    {tab === 'auto' ? <>
-      <div className="fld"><label>Скорость отдачи</label>
-        {measuring
-          ? <p className="msub" style={{ margin: 0 }}>Замеряю скорость сети… (3–5 с){measurePhase ? ` · ${measurePhase}` : ''}</p>
-          : probe
-            ? <p className="msub" style={{ margin: 0 }}>
-                ~{(probe.bweKbps / 1000).toFixed(1)} Мбит/с{probe.method === 'datachannel' ? ' (прибл.)' : ''}
-                {probe.symmetricNat ? ' · ⚠ симметричный NAT (возможно занижено)' : ''}
-                {usefulKbps != null ? ` · полезно ${(usefulKbps / 1000).toFixed(1)} Мбит/с` : ''}
-                {' '}<button className="linklike" style={{ background: 'none', border: 'none', color: 'var(--accent, #5865f2)', cursor: 'pointer', padding: 0 }} onClick={remeasure}>повторить замер</button>
-              </p>
-            : <button className="ghost" style={{ margin: 0 }} onClick={() => runMeasure(false)}>Замерить скорость</button>}
-      </div>
-      <div className="fld"><label>Режим</label>
-        <div className="seg">
-          <button className={cfg.presetMode === 'smooth' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, presetMode: 'smooth' }))}>Плавность</button>
-          <button className={cfg.presetMode === 'quality' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, presetMode: 'quality' }))}>Качество</button>
-        </div>
-        <p className="msub" style={{ margin: '8px 0 0' }}>{cfg.presetMode === 'quality'
-          ? 'Качество: 30 fps, максимальное разрешение под скорость.'
-          : 'Плавность: 60 fps, разрешение подстраивается под скорость.'}</p>
-      </div>
-      <div style={{ marginTop: 10, padding: '8px 10px', borderRadius: 8, background: 'var(--accent-soft, rgba(88,101,242,.18))', fontSize: 13, fontWeight: 600 }}>{autoSummary}</div>
-    </> : <>
-      <div className="fld"><label>Разрешение</label>
-        <select value={cfg.resolution} onChange={(e) => setCfg((c) => ({ ...c, resolution: e.target.value as Resolution }))}>
-          {(Object.keys(RES_MAP) as Resolution[]).map((k) => <option key={k} value={k}>{RES_MAP[k].label}</option>)}
-        </select>
-      </div>
-      <div className="fld"><label>FPS</label>
-        <div className="seg">
-          <button className={cfg.fps === 30 ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, fps: 30 }))}>30</button>
-          <button className={cfg.fps === 60 ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, fps: 60 }))}>60</button>
-        </div>
-      </div>
-      <div className="fld"><label>{cfg.autoBitrate ? 'Битрейт (макс.)' : 'Битрейт'}: {cfg.bitrateKbps / 1000} Мбит/с</label>
-        <input type="range" min={BITRATE_MIN_KBPS} max={BITRATE_MAX_KBPS} step={BITRATE_STEP_KBPS} value={cfg.bitrateKbps} onChange={(e) => setCfg((c) => ({ ...c, bitrateKbps: +e.target.value }))} />
-      </div>
-      <div className="fld"><label>Автобитрейт</label>
-        <div className="seg">
-          <button className={cfg.autoBitrate ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, autoBitrate: true }))}>Авто</button>
-          <button className={!cfg.autoBitrate ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, autoBitrate: false }))}>Фиксированный</button>
-        </div>
-        <p className="msub" style={{ margin: '8px 0 0' }}>{cfg.autoBitrate
-          ? 'Битрейт снижается автоматически под худший линк дерева (и восстанавливается). Значение выше — потолок.'
-          : 'Битрейт фиксирован. При плохой сети у зрителей возможны потери/буферизация.'}</p>
-      </div>
-      <div style={{ marginTop: 10, padding: '8px 10px', borderRadius: 8, background: 'var(--accent-soft, rgba(88,101,242,.18))', fontSize: 13, fontWeight: 600 }}>{manualSummary}</div>
-    </>}
     <div className="fld"><label>Звук</label>
-      <div className="seg">
-        <button className={cfg.audioMode === 'auto' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, audioMode: 'auto' }))}>Авто (по источнику)</button>
-      </div>
-      <p className="msub" style={{ margin: '8px 0 0' }}>{cfg.audioMode === 'auto'
+      <p className="msub" style={{ margin: 0 }}>{cfg.audioMode === 'auto'
         ? (cfg.sourceKind === 'window'
-            ? 'Звук берётся из процесса захватываемого окна — голос войса в стрим не попадёт.'
-            : 'Захват экрана: в стрим уходит звук всех приложений/игр, кроме самого RelayApp (голос войса не попадёт).')
+            ? 'Авто: звук процесса захватываемого окна — голос войса в стрим не попадёт.'
+            : 'Авто: звук всех приложений/игр, кроме самого RelayApp (голос войса не попадёт).')
         : cfg.audioMode === 'include'
             ? 'Ручной режим: только звук выбранного процесса.'
             : 'Ручной режим: весь звук, кроме RelayApp.'}</p>
-      <details style={{ marginTop: 8 }}>
-        <summary style={{ cursor: 'pointer' }} className="msub">Дополнительно</summary>
-        <div style={{ marginTop: 8 }}>
+    </div>
+
+    {/* Дополнительно: звук вручную + прямые подключения (топология). Спрятано ради простоты. */}
+    <details style={{ marginTop: 6 }}>
+      <summary style={{ cursor: 'pointer' }} className="msub">Дополнительно</summary>
+      <div style={{ marginTop: 10 }}>
+        <div className="fld"><label>Источник звука</label>
           <div className="seg">
             <button className={cfg.audioMode === 'auto' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, audioMode: 'auto' }))}>Авто</button>
             <button className={cfg.audioMode === 'exclude' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, audioMode: 'exclude' }))}>Всё, кроме RelayApp</button>
@@ -431,8 +354,22 @@ export function BroadcastModal() {
           </select>}
           <p className="msub" style={{ margin: '8px 0 0' }}>⚠ «Всё кроме RelayApp» на части ПК всё равно пропускает голос войса в запись (ограничение WebView2). Надёжно — «Только процесс» или «Авто» при захвате окна.</p>
         </div>
-      </details>
-    </div>
+        <div className="fld"><label>Прямые подключения к тебе</label>
+          <div className="seg">
+            <button className={!cfg.allowDirectPeers ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, allowDirectPeers: false }))}>Только через сервер</button>
+            <button className={cfg.allowDirectPeers ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, allowDirectPeers: true }))}>Разрешить ({cfg.maxDirectChildren} слот.)</button>
+          </div>
+          <p className="msub" style={{ margin: '8px 0 0' }}>{cfg.allowDirectPeers
+            ? `Зрители могут брать поток напрямую с тебя (до ${cfg.maxDirectChildren} прямых слотов). Остальные — через сервер.`
+            : 'Все зрители получают поток через сервер (меньше нагрузки на твою отдачу, стабильнее).'}</p>
+          {cfg.allowDirectPeers && <div style={{ marginTop: 8 }}>
+            <label className="msub">Прямых слотов: {cfg.maxDirectChildren}</label>
+            <input type="range" min={DIRECT_MIN} max={DIRECT_MAX} step={1} value={cfg.maxDirectChildren} onChange={(e) => setCfg((c) => ({ ...c, maxDirectChildren: +e.target.value }))} />
+          </div>}
+        </div>
+      </div>
+    </details>
+
     <div className="rowbtns">
       <button className="ghost" style={{ margin: 0 }} onClick={close}>Отмена</button>
       <button className="primary" style={{ margin: 0 }} disabled={busy || (cfg.sourceKind === 'window' && cfg.windowHwnd == null) || (cfg.audioMode === 'include' && cfg.audioPid == null)} onClick={start}>Начать трансляцию</button>
