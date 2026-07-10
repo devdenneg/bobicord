@@ -103,14 +103,6 @@ const GAP_HEAL_GRACE: Duration = Duration::from_millis(250);
 /// Требует РУЧНОЙ сборки Registry (register_default_interceptors интервал не параметризует) —
 /// поэтому nack-фидбэк на H.264 задаётся ЯВНО (иначе Generator/Responder не активируются).
 const NACK_GENERATOR_INTERVAL: Duration = Duration::from_millis(50);
-/// Пейсер фанаута (см. writer-таск в on_parent_offer): бюджет байт на окно. 12500Б / 5мс =
-/// 20 Мбит/с. Это ПОТОЛОК на один поток — не «×битрейт»: source-passthrough бывает 6 Мбит CBR
-/// с VBR-пиками, порезать их нельзя (fanout_drops), а истинный микробёрст (keyframe пачкой на
-/// line-rate порта = сотни Мбит мгновенно) он всё равно размазывает. Бюджет считается по байтам
-/// ОДНОГО write_rtp, хотя тот фанаутит N детям — так и надо: цель пейсера — временнОе разнесение
-/// пакетов (одинаковое всем детям), а не кап агрегатной полосы.
-const PACE_WINDOW: Duration = Duration::from_millis(5);
-const PACE_BYTES_PER_WINDOW: usize = 12_500;
 /// Разрыв шире этого — не «потерялась пара пакетов», а обрыв/скачок (reparent, пауза
 /// источника): не раздуваем missing-set, сразу считаем незалеченным маркером.
 const GAP_TRACK_MAX: u16 = 128;
@@ -492,25 +484,12 @@ impl RelayManager {
                     let (tx, mut rx) = tokio::sync::mpsc::channel::<webrtc::rtp::packet::Packet>(cap);
                     let werrs = write_errs.clone();
                     tokio::spawn(async move {
-                        // Пейсер фанаута. В webrtc-rs НЕТ paced sender'а (в отличие от libwebrtc):
-                        // keyframe приходит от родителя пачкой 50-80 пакетов и write_rtp выплюнул бы
-                        // её на line-rate порта (2Gbit = микробёрст ~0.3мс) — хвост пачки выбивает
-                        // буферы последней мили зрителя, потери ложатся РОВНО на keyframe'ы →
-                        // фриз → PLI/GapHealer → новый IDR → шторм сам себя кормит (разбор
-                        // penis14 2026-07-10: потери волнами на обеих ногах при чистом ICMP).
-                        // Бюджет байт на окно 5мс (~12 Мбит/с, 3-4× битрейта стрима): гасит только
-                        // микробёрсты; keyframe 60КБ размазывается на ~40мс — незаметно (<2с бюджет).
-                        let mut win_start = Instant::now();
-                        let mut win_bytes: usize = 0;
+                        // Пейсер фанаута УБРАН: на 1080p60 @10-12 Мбит keyframe ~500КБ не влезал в бюджет
+                        // окна, очередь (256) переполнялась → сервер САМ ронял пакеты (фанаут: дропов 1271,
+                        // penis14 2026-07-10) → потери всем зрителям. Форензика (lostPerGap≈1) показала, что
+                        // реальные потери НЕ бёрстовые, и сглаживать нечего. Пишем сразу; бэкпрешер сокета
+                        // отрабатывает try_send-очередь (её смысл — не тормозить чтение от родителя).
                         while let Some(pkt) = rx.recv().await {
-                            let size = pkt.payload.len() + 12; // RTP-заголовок
-                            if win_bytes + size > PACE_BYTES_PER_WINDOW {
-                                let el = win_start.elapsed();
-                                if el < PACE_WINDOW { tokio::time::sleep(PACE_WINDOW - el).await; }
-                                win_start = Instant::now();
-                                win_bytes = 0;
-                            }
-                            win_bytes += size;
                             let res = if is_video { video_local.write_rtp(&pkt).await } else { audio_local.write_rtp(&pkt).await };
                             if let Err(e) = res {
                                 // ErrClosedPipe = ни одного связанного sender (нет детей/webview) — не ошибка
