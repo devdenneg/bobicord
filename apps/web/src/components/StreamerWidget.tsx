@@ -9,7 +9,7 @@ import { Icon } from '../Icon';
 import { avColor, initial } from '../util';
 import { resolveUploadUrl } from '../api';
 import {
-  isTauri, onBroadcastStats, stopNativeBroadcast, setNativeBroadcastSource,
+  isTauri, onBroadcastStats, onBroadcastPreview, setPreviewInterval, stopNativeBroadcast, setNativeBroadcastSource,
   listMonitors, listWindows,
 } from '../native';
 import type { BroadcastStats, MonitorInfo, WindowInfo } from '../native';
@@ -24,6 +24,7 @@ export function StreamerWidget() {
   const me = useStore((s) => s.me);
   const eng = useEngine();
   const [stats, setStats] = useState<BroadcastStats | null>(null);
+  const [png, setPng] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(false);
   const [showAll, setShowAll] = useState(false);
   const [srcOpen, setSrcOpen] = useState(false);
@@ -40,6 +41,23 @@ export function StreamerWidget() {
     onBroadcastStats(setStats).then((u) => (un = u));
     return () => un?.();
   }, [live]);
+
+  // Превью-тумбнейл кадра (натив). Приходит по relay-broadcast-preview с интервалом,
+  // которым мы же управляем (setPreviewInterval) ниже.
+  useEffect(() => {
+    if (!isTauri || !live) { setPng(null); return; }
+    let un: (() => void) | undefined;
+    onBroadcastPreview((p) => setPng(p.png)).then((u) => (un = u));
+    return () => un?.();
+  }, [live]);
+
+  // Каденс превью: развёрнут → 3с, свёрнут → 0 (не гнать тумбнейл зря). Hover меняет на 1с
+  // (обработчики на <img>). Размонтирование виджета (стоп трансляции) → 0.
+  useEffect(() => {
+    if (!isTauri || !live) return;
+    setPreviewInterval(collapsed ? 0 : 3000);
+  }, [live, collapsed]);
+  useEffect(() => () => { if (isTauri) setPreviewInterval(0); }, []);
 
   // Списки источников для быстрой смены — грузим при открытии дропдауна (и на mount).
   useEffect(() => {
@@ -110,6 +128,12 @@ export function StreamerWidget() {
         <div className="sw-htxt"><b>Трансляция идёт</b><span title={stats?.source || ''}>{stats?.source || 'подготовка…'}</span></div>
         <button className="sw-mini" onClick={() => setCollapsed(true)} data-tip="Свернуть виджет"><Icon name="chevron" sm /></button>
       </div>
+
+      {/* Превью-тумбнейл кадра (натив). Hover учащает эмит до 1с, уход — обратно 3с. */}
+      {png ? (
+        <img className="sw-thumb" src={`data:image/png;base64,${png}`} alt="Превью трансляции"
+          onMouseEnter={() => setPreviewInterval(1000)} onMouseLeave={() => setPreviewInterval(3000)} />
+      ) : null}
 
       {/* Зрители: стек аватарок + счётчик + тултип со списком (как оверлей .watchers на тайле). */}
       <div className="sw-watchers">

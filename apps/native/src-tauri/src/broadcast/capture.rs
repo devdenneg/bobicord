@@ -200,6 +200,18 @@ pub struct QualityTargets {
     /// Целевой FPS — для программного пейсинга в on_frame_arrived (WGC отдаёт
     /// коарс-поток чуть выше цели, точный каденс держим здесь). См. spawn_capture.
     pub fps: Arc<AtomicU32>,
+    /// CPU-кап fps (u32::MAX = не сработал). ОТДЕЛЬНОЕ поле, не через QualityLadder:
+    /// лестница выключена в пресет/server-first режимах (ladder_enabled), а CPU-перегруз
+    /// случается именно там. Пишет один раз stats-тик (latch 60→30 до конца сессии,
+    /// см. mod.rs), читатели берут eff_fps() = min(fps, cap).
+    pub cpu_fps_cap: Arc<AtomicU32>,
+}
+
+impl QualityTargets {
+    /// Эффективный целевой fps: цель лестницы/пользователя, поджатая CPU-капом.
+    pub fn eff_fps(&self) -> u32 {
+        self.fps.load(Ordering::Relaxed).min(self.cpu_fps_cap.load(Ordering::Relaxed)).max(1)
+    }
 }
 
 /// Оборотный пул NV12-буферов. Раньше на каждый принятый кадр делался
@@ -230,12 +242,31 @@ impl BufferPool {
     }
 }
 
+/// Маленький RGBA-тумбнейл кадра для виджета вещателя (StreamerWidget). Считается дешёвым
+/// strided-downscale'ом прямо в WGC-колбэке (~160px, микросекунды), но PNG-энкод/emit —
+/// вне колбэка (отдельный low-prio поток в mod.rs), иначе долгий колбэк тормозит сессию.
+pub struct PreviewFrame {
+    pub data: Vec<u8>, // RGBA8, width*height*4
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Отвод превью из capture-сессии: интервал (мс, 0 = выключено) + канал в PNG-воркер.
+/// Интервал живёт в CaptureSupervisor (общий для всех сессий, переживает смену источника),
+/// пишется командой set_preview_interval; канал bounded(1) — переполнение роняет кадр.
+#[derive(Clone)]
+pub struct PreviewTap {
+    pub interval_ms: Arc<AtomicU32>,
+    pub tx: Sender<PreviewFrame>,
+}
+
 pub struct CaptureFlags {
     pub tx: Sender<Nv12Frame>,
     pub stop: Arc<AtomicBool>,
     pub targets: QualityTargets,
     pub stats: StatsHandle,
     pub pool: BufferPool,
+    pub preview: PreviewTap,
 }
 
 pub struct ScreenCapture {
@@ -268,6 +299,10 @@ pub struct ScreenCapture {
     /// Сырые вызовы on_frame_arrived (до гейта) за окно = темп отдачи WGC (`raw` в
     /// логе). Отделяет «источник мало презентит» от «гейт режет» при разборе fps.
     raw_window_count: u32,
+    /// Отвод превью-тумбнейла (виджет вещателя) + момент последнего снятого превью
+    /// (гейт по preview.interval_ms).
+    preview: PreviewTap,
+    last_preview: Instant,
 }
 
 impl ScreenCapture {
@@ -297,7 +332,7 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
         // приезжает на том же потоке, что и Capture::start (см. spawn_session, там же
         // основная регистрация). Дублируем на всякий случай: ensure идемпотентен.
         ensure_thread_mmcss(MmTask::Games);
-        let cur_fps = ctx.flags.targets.fps.load(Ordering::Relaxed).max(1);
+        let cur_fps = ctx.flags.targets.eff_fps();
         Ok(Self {
             tx: ctx.flags.tx,
             stop: ctx.flags.stop,
@@ -313,6 +348,8 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
             row_lut: Vec::new(),
             lut_key: (0, 0, 0, 0),
             raw_window_count: 0,
+            preview: ctx.flags.preview,
+            last_preview: Instant::now(),
         })
     }
 
@@ -329,9 +366,9 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
         // Диагностика: сырые вызовы (до гейта) = темп отдачи WGC.
         self.raw_window_count += 1;
 
-        // ABR-лестница (Э8): цель fps могла смениться на лету — пересобираем период
-        // пейсинга и ресинхронизируем дедлайн под новый темп.
-        let fps_now = self.targets.fps.load(Ordering::Relaxed).max(1);
+        // ABR-лестница (Э8) или CPU-кап: цель fps могла смениться на лету — пересобираем
+        // период пейсинга и ресинхронизируем дедлайн под новый темп.
+        let fps_now = self.targets.eff_fps();
         if fps_now != self.cur_fps {
             self.cur_fps = fps_now;
             self.target_period = Duration::from_secs_f64(1.0 / fps_now as f64);
@@ -371,6 +408,35 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
         let row_pitch = buf.row_pitch();
         let raw = buf.as_raw_buffer();
         let readback_ns = rb_start.elapsed().as_nanos() as u64;
+
+        // Превью-тумбнейл для виджета вещателя: дешёвый strided BGRA->RGBA downscale (~160px
+        // по ширине) под гейтом интервала, отвод в отдельный low-prio канал. PNG-энкод/base64/
+        // emit — НЕ здесь (mod.rs preview-поток), иначе долгий колбэк тормозит саму WGC-сессию.
+        // Отклонение от спеки (одобрено): превью-dims свои (160px), не dims NV12-выхода, поэтому
+        // col_lut/row_lut (заскоуплены на out_w/out_h) не подходят — семпл считаем inline
+        // (~14k пикселей, микросекунды). Снимаем только с ПРИНЯТЫХ кадров (после гейта пейсинга).
+        let iv = self.preview.interval_ms.load(Ordering::Relaxed);
+        if iv > 0 && src_w > 0 && src_h > 0 && self.last_preview.elapsed() >= Duration::from_millis(iv as u64) {
+            self.last_preview = now;
+            let pw = 160u32.min(src_w).max(2) & !1;
+            let ph = (((pw as u64 * src_h as u64) / src_w as u64) as u32).max(2) & !1;
+            let pitch = row_pitch as usize;
+            let mut rgba = vec![0u8; (pw * ph * 4) as usize];
+            for y in 0..ph as usize {
+                let sy = (y as u64 * src_h as u64 / ph as u64) as usize;
+                let base = sy * pitch;
+                for x in 0..pw as usize {
+                    let sx = (x as u64 * src_w as u64 / pw as u64) as usize;
+                    let o = base + sx * 4;
+                    let d = (y * pw as usize + x) * 4;
+                    rgba[d] = raw[o + 2]; // R
+                    rgba[d + 1] = raw[o + 1]; // G
+                    rgba[d + 2] = raw[o]; // B
+                    rgba[d + 3] = 255; // A
+                }
+            }
+            let _ = self.preview.tx.try_send(PreviewFrame { data: rgba, width: pw, height: ph });
+        }
 
         // ABR-лестница: максимумы разрешения тоже живые — их смена даст новый out_w/out_h,
         // LUT пересоберутся сами (ensure_luts), буфер возьмётся новой длины, энкодер увидит
@@ -711,6 +777,7 @@ fn spawn_session(
     user_fps: u32,
     stats: StatsHandle,
     shutdown_tx: tokio::sync::mpsc::UnboundedSender<Option<String>>,
+    preview: PreviewTap,
 ) -> (std::thread::JoinHandle<()>, Arc<AtomicBool>) {
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
@@ -779,6 +846,7 @@ fn spawn_session(
                 targets: targets.clone(),
                 stats: stats.clone(),
                 pool: pool.clone(),
+                preview: preview.clone(),
             };
             let result = match source {
                 CaptureSource::Monitor { index } => Monitor::from_index(index)
@@ -850,6 +918,10 @@ pub struct CaptureSupervisor {
     stats: StatsHandle,
     shutdown_tx: tokio::sync::mpsc::UnboundedSender<Option<String>>,
     cur: Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)>,
+    /// Интервал превью (мс, 0 = выкл) — общий для всех сессий, пишется set_preview_interval.
+    preview_interval: Arc<AtomicU32>,
+    /// Sender превью-канала — клонируется в каждую сессию (rx отдан PNG-воркеру в mod.rs).
+    preview_tx: Sender<PreviewFrame>,
 }
 
 impl CaptureSupervisor {
@@ -864,25 +936,34 @@ impl CaptureSupervisor {
         target_fps: u32,
         stats: StatsHandle,
         shutdown_tx: tokio::sync::mpsc::UnboundedSender<Option<String>>,
-    ) -> (Self, crossbeam_channel::Receiver<Nv12Frame>, BufferPool) {
+    ) -> (Self, crossbeam_channel::Receiver<Nv12Frame>, BufferPool, Receiver<PreviewFrame>) {
         let (tx, rx) = crossbeam_channel::bounded(2);
         // 4 буфера: 2 могут стоять в очереди кадров, 1 в работе у энкодера, 1 у захвата.
         let (pool_tx, pool_rx) = crossbeam_channel::bounded(4);
         let pool = BufferPool { tx: pool_tx, rx: pool_rx };
+        // Превью: bounded(1) — держим только самый свежий тумбнейл, переполнение роняем.
+        let (preview_tx, preview_rx) = crossbeam_channel::bounded(1);
         let targets = QualityTargets {
             max_width: Arc::new(AtomicU32::new(max_width)),
             max_height: Arc::new(AtomicU32::new(max_height)),
             fps: Arc::new(AtomicU32::new(target_fps)),
+            cpu_fps_cap: Arc::new(AtomicU32::new(u32::MAX)),
         };
         (
-            Self { tx, pool: pool.clone(), targets, user_fps: target_fps, stats, shutdown_tx, cur: None },
+            Self { tx, pool: pool.clone(), targets, user_fps: target_fps, stats, shutdown_tx, cur: None,
+                   preview_interval: Arc::new(AtomicU32::new(0)), preview_tx },
             rx,
             pool,
+            preview_rx,
         )
     }
 
     /// Живые цели качества — для ABR-лестницы (mod.rs пишет сюда при set-bitrate).
     pub fn targets(&self) -> QualityTargets { self.targets.clone() }
+
+    /// Общий atomic интервала превью (мс) — mod.rs отдаёт его в BroadcastHandle,
+    /// команда set_preview_interval пишет в него; capture-сессии читают на кадре.
+    pub fn preview_interval(&self) -> Arc<AtomicU32> { self.preview_interval.clone() }
 
     /// Запускает сессию для источника. Ошибка валидации возвращается синхронно
     /// (текущая сессия, если была, не трогается — вызывать после stop_current).
@@ -896,6 +977,7 @@ impl CaptureSupervisor {
             self.user_fps,
             self.stats.clone(),
             self.shutdown_tx.clone(),
+            PreviewTap { interval_ms: self.preview_interval.clone(), tx: self.preview_tx.clone() },
         );
         self.cur = Some(session);
         Ok(())

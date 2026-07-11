@@ -48,7 +48,7 @@ pub fn window_icon_png_base64(hwnd: isize, pid: u32) -> Option<String> {
         if generic_exe_icon_rgba().map_or(false, |g| *g == rgba) {
             return None;
         }
-        encode_png(&rgba).map(|bytes| STANDARD.encode(bytes))
+        encode_png(&rgba, ICON_SZ as u32, ICON_SZ as u32).map(|bytes| STANDARD.encode(bytes))
     }
 }
 
@@ -200,10 +200,12 @@ unsafe fn hicon_to_rgba(hicon: HICON) -> Option<Vec<u8>> {
     out
 }
 
-fn encode_png(rgba: &[u8]) -> Option<Vec<u8>> {
+/// RGBA-байты (w*h*4) -> PNG. Общий для иконок (32x32) и превью-тумбнейла вещателя
+/// (произвольный размер, см. broadcast/mod.rs preview-поток).
+pub fn encode_png(rgba: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
     {
-        let mut encoder = png::Encoder::new(&mut buf, ICON_SZ as u32, ICON_SZ as u32);
+        let mut encoder = png::Encoder::new(&mut buf, w, h);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().ok()?;

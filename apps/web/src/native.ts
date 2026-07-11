@@ -78,12 +78,31 @@ export interface BroadcastStats {
   bitrateTargetBps: number;
   bitrateActualBps: number;
   children: number;
+  /** CPU-latch: fps поджат до 30 из-за перегруза захвата (бейдж «(CPU)» в статах). */
+  cpuCapped: boolean;
 }
 
 export async function onBroadcastStats(cb: (stats: BroadcastStats) => void): Promise<() => void> {
   const { listen } = await import('@tauri-apps/api/event');
   const unlisten = await listen<BroadcastStats>('relay-broadcast-stats', (e) => cb(e.payload));
   return unlisten;
+}
+
+/** Превью-тумбнейл кадра вещателя (виджет). `png` — base64 без data-URI-префикса. */
+export interface BroadcastPreview { streamId: string; w: number; h: number; png: string }
+
+export async function onBroadcastPreview(cb: (p: BroadcastPreview) => void): Promise<() => void> {
+  const { listen } = await import('@tauri-apps/api/event');
+  const unlisten = await listen<BroadcastPreview>('relay-broadcast-preview', (e) => cb(e.payload));
+  return unlisten;
+}
+
+/** Интервал эмита превью-тумбнейла (мс, 0 = выкл). Виджет: 3000 (развёрнут), 1000 (hover),
+ *  0 (свёрнут/размонтирован). No-op в браузере / если не вещаем. */
+export async function setPreviewInterval(ms: number): Promise<void> {
+  if (!isTauri) return;
+  const { invoke } = await import('@tauri-apps/api/core');
+  await invoke('set_preview_interval', { ms });
 }
 
 export interface BroadcastStopInfo {

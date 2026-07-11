@@ -141,10 +141,19 @@ pub struct BroadcastHandle {
     /// успевал кликнуть "начать трансляцию" раньше, чем стейт реально очистится,
     /// и получал спурьезный "уже вещаем" (отсюда "нужно стартануть раз 5").
     alive: Arc<AtomicBool>,
+    /// Интервал превью-тумбнейла (мс, 0 = выкл) — общий с capture-сессиями; пишется
+    /// командой set_preview_interval (виджет вещателя запрашивает чаще при hover).
+    preview_interval: Arc<AtomicU32>,
+    /// Стоп для preview-PNG-потока (он в `threads`; recv_timeout выходит по флагу ≤500мс).
+    preview_stop: Arc<AtomicBool>,
 }
 
 impl BroadcastHandle {
     pub fn is_alive(&self) -> bool { self.alive.load(Ordering::Relaxed) }
+
+    /// Интервал превью-тумбнейла (мс, 0 = выкл). Пишет команда set_preview_interval:
+    /// виджет ставит 3000 (развёрнут), 1000 (hover), 0 (свёрнут/размонтирован).
+    pub fn set_preview_interval(&self, ms: u32) { self.preview_interval.store(ms, Ordering::Relaxed); }
 
     /// Смена источника видео (и звука) на лету без пересоздания дерева/треков (Э5.3).
     /// Валидация нового источника — синхронно внутри `switch`; при ошибке текущая
@@ -172,6 +181,7 @@ impl BroadcastHandle {
             let _ = tokio::task::spawn_blocking(move || a.lock().unwrap().stop()).await;
         }
         self.enc_stop.store(true, Ordering::Relaxed);
+        self.preview_stop.store(true, Ordering::Relaxed); // preview-поток выйдет из recv_timeout
         let _ = self.shutdown_tx.send(None); // штатный стоп по кнопке — без причины
         for t in self.threads.drain(..) {
             let _ = tokio::task::spawn_blocking(move || t.join()).await;
@@ -284,7 +294,10 @@ pub async fn start(
     // (монитор/окно) на лету — энкодер и WebRTC-треки этого не замечают (Э5.3).
     // buf_pool — оборотный пул NV12-буферов: захват берёт, энкодер возвращает после
     // encode(). Без него на каждый кадр аллоцировалось ~3 МБ (1080p) прямо в колбэке WGC.
-    let (mut cap_sup, cap_rx, buf_pool) = capture::CaptureSupervisor::new(max_width, max_height, fps, stats.clone(), shutdown_tx.clone());
+    let (mut cap_sup, cap_rx, buf_pool, preview_rx) = capture::CaptureSupervisor::new(max_width, max_height, fps, stats.clone(), shutdown_tx.clone());
+    // Интервал превью общий с capture-сессиями (переживает смену источника) — отдаём его
+    // в BroadcastHandle, команда set_preview_interval пишет в него.
+    let preview_interval = cap_sup.preview_interval();
     // Живые цели качества (ABR-лестница): пишет сигналинг-цикл, читают capture (на кадре)
     // и энкодер-поток (смена fps => пересоздание MFT с корректным rate-control).
     let quality_targets = cap_sup.targets();
@@ -333,7 +346,8 @@ pub async fn start(
     let stats_enc = stats.clone();
     let shutdown_tx_enc = shutdown_tx.clone();
     let target_bitrate_enc = target_bitrate.clone();
-    let eff_fps_enc = quality_targets.fps.clone();
+    // Клоним весь QualityTargets (не только fps): эффективный fps = min(цель, cpu_fps_cap).
+    let targets_enc = quality_targets.clone();
 
     let encoder_thread = std::thread::spawn(move || {
         // Тот же класс MMCSS, что и у захвата: под фуллскрин-игрой этот поток должен
@@ -385,13 +399,13 @@ pub async fn start(
                     break;
                 }
             };
-            let cur_fps = eff_fps_enc.load(Ordering::Relaxed).max(1);
+            let cur_fps = targets_enc.eff_fps();
             let frame_dur = Duration::from_secs_f64(1.0 / cur_fps as f64);
-            // ABR-лестница сменила целевой fps — пересоздаём MFT (см. комментарий у enc).
-            // Без дебаунса: ступени лестницы редкие (гистерезис в QualityLadder), в отличие
-            // от живого ресайза окна ниже.
+            // ABR-лестница или CPU-кап сменили целевой fps — пересоздаём MFT (см. комментарий
+            // у enc). Без дебаунса: обе смены редкие (гистерезис лестницы; CPU-кап — latch,
+            // один раз за сессию), в отличие от живого ресайза окна ниже.
             if matches!(&enc, Some((_, _, _, efps)) if *efps != cur_fps) {
-                log::info!("encoder: ladder fps -> {cur_fps}, переинициализация MFT");
+                log::info!("encoder: цель fps -> {cur_fps}, переинициализация MFT");
                 enc = None;
                 pending_resize = None;
             }
@@ -458,7 +472,10 @@ pub async fn start(
                     for c in chunks {
                         stats_enc.encoded_frames.fetch_add(1, Ordering::Relaxed);
                         stats_enc.encoded_bytes.fetch_add(c.data.len() as u64, Ordering::Relaxed);
-                        if c.is_keyframe { stats_enc.keyframes.fetch_add(1, Ordering::Relaxed); }
+                        if c.is_keyframe {
+                            stats_enc.keyframes.fetch_add(1, Ordering::Relaxed);
+                            if c.forced { stats_enc.keyframes_forced.fetch_add(1, Ordering::Relaxed); }
+                        }
                         let sample = Sample { data: Bytes::from(c.data), duration: real_dur, ..Default::default() };
                         let track = video_track.clone();
                         let w_start = Instant::now();
@@ -501,6 +518,37 @@ pub async fn start(
     audio_sup.start(audio_source);
     let audio_sup = Arc::new(std::sync::Mutex::new(audio_sup));
 
+    // Превью-тумбнейл: отдельный low-prio поток (БЕЗ MMCSS — намеренно уступает захвату/
+    // энкодеру) кодирует PNG+base64 из RGBA-кадра и эмитит relay-broadcast-preview. Дешёвый
+    // тап кадра (downscale) — в capture-колбэке под гейтом интервала; тяжёлый PNG — здесь,
+    // не на потоке WGC-колбэка (инвариант: долгий колбэк тормозит саму WGC-сессию). Блокируется
+    // на recv_timeout(500мс) — просыпается лишь на реальном превью (раз в 1-3с), CPU ~0.
+    let preview_stop = Arc::new(AtomicBool::new(false));
+    let preview_stop2 = preview_stop.clone();
+    let app_prev = app.clone();
+    let sid_prev = stream_id.clone();
+    let preview_thread = std::thread::spawn(move || {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        loop {
+            match preview_rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(pf) => {
+                    if let Some(png) = icon::encode_png(&pf.data, pf.width, pf.height) {
+                        if let Some(app) = &app_prev {
+                            let _ = app.emit("relay-broadcast-preview", &PreviewPayload {
+                                stream_id: sid_prev.clone(), w: pf.width, h: pf.height, png: STANDARD.encode(png),
+                            });
+                        }
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if preview_stop2.load(Ordering::Relaxed) { break; }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        log::info!("preview thread stopped");
+    });
+
     let alive = Arc::new(AtomicBool::new(true));
     let alive_loop = alive.clone();
     let meta = DebugMeta { stream_id, source_label: source_label.clone(), target_bitrate_bps: bitrate_bps };
@@ -510,12 +558,14 @@ pub async fn start(
     Ok(BroadcastHandle {
         enc_stop,
         shutdown_tx,
-        threads: vec![encoder_thread],
+        threads: vec![encoder_thread, preview_thread],
         cap_sup,
         audio_sup,
         force_keyframe,
         source_label,
         alive,
+        preview_interval,
+        preview_stop,
     })
 }
 
@@ -523,6 +573,17 @@ struct DebugMeta {
     stream_id: String,
     source_label: Arc<std::sync::Mutex<String>>,
     target_bitrate_bps: u32,
+}
+
+/// Превью-тумбнейл кадра для виджета вещателя — эмитится Tauri-событием
+/// `relay-broadcast-preview`. `png` — base64 без data-URI-префикса (как appIcon).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewPayload {
+    stream_id: String,
+    w: u32,
+    h: u32,
+    png: String,
 }
 
 /// Снимок для дебаг-панели во фронтенде (Э5.1) — эмитится Tauri-событием
@@ -541,6 +602,8 @@ struct DebugSnapshot {
     bitrate_target_bps: u32,
     bitrate_actual_bps: f64,
     children: usize,
+    /// CPU-latch сработал: fps поджат до 30 из-за перегруза захвата (бейдж «(CPU)» в UI).
+    cpu_capped: bool,
 }
 
 async fn run_signaling_loop(
@@ -563,6 +626,12 @@ async fn run_signaling_loop(
     // его не было вовсе — по файлу нельзя было сказать, ронял ли захват кадры. Дельта
     // за окно попадает в строку `timing:` рядом с секциями, которые её объясняют.
     let mut prev_drops = 0u64;
+    // CPU-latch (диаг 2026-07-10): 60fps-захват на слабом ПК не успевает (cb 72мс при
+    // бюджете 16.7мс) — фризы у ВСЕХ зрителей. 3 плохих тика (6с) подряд → fps кап 30.
+    // Без возврата вверх: по метрикам «появился запас» неотличим от «нагрузка та же»
+    // (после капа cb и дропы падают сами собой), а проба вверх = реинит MFT + IDR-спайк
+    // + болтанка. Latch до конца сессии.
+    let mut cpu_over_ticks = 0u32;
     // Причина самостоятельной остановки — раньше фронт узнавал только "трансляция
     // умерла", без "почему", и молча откатывался в форму настроек (см. StopInfo ниже).
     // Присваивается только на выходных ветках (break), поэтому без инициализатора —
@@ -630,15 +699,16 @@ async fn run_signaling_loop(
                     source: meta.source_label.lock().unwrap().clone(),
                     width: stats.out_width.load(Ordering::Relaxed),
                     height: stats.out_height.load(Ordering::Relaxed),
-                    // Живая цель (ABR-лестница), не пользовательский максимум — чтобы
-                    // дебаг-панель показывала фактический режим (напр. 30 при цели 60).
-                    target_fps: ladder.targets.fps.load(Ordering::Relaxed),
+                    // Живая цель (ABR-лестница + CPU-кап), не пользовательский максимум —
+                    // чтобы дебаг-панель показывала фактический режим (напр. 30 при цели 60).
+                    target_fps: ladder.targets.eff_fps(),
                     capture_fps: (cap - prev_cap) as f64 / dt,
                     encoder_fps: (enc - prev_enc) as f64 / dt,
                     dropped_frames: stats.capture_drops.load(Ordering::Relaxed),
                     bitrate_target_bps: target_bitrate.load(Ordering::Relaxed),
                     bitrate_actual_bps: (bytes - prev_bytes) as f64 * 8.0 / dt,
                     children: mgr.child_count(),
+                    cpu_capped: ladder.targets.cpu_fps_cap.load(Ordering::Relaxed) != u32::MAX,
                 };
                 prev_at = now; prev_cap = cap; prev_enc = enc; prev_bytes = bytes;
                 if let Some(app) = &app { let _ = app.emit("relay-broadcast-stats", &snapshot); }
@@ -664,6 +734,26 @@ async fn run_signaling_loop(
                     );
                 }
 
+                // CPU-latch: захват не успевает на 60fps → кап 30 до конца сессии (см. cpu_over_ticks).
+                // Гейт cb_n > 0 отсекает альт-таб/паузу источника (кадров нет → util 0, дропов нет —
+                // условия молчат сами, но и мусорного «хорошего» тика в счётчик не даём).
+                let eff_fps = ladder.targets.eff_fps();
+                if eff_fps > 30 && cb_n > 0 {
+                    // Доля wall-clock, съеденная WGC-колбэком (readback+convert): cb_avg[мс]×cb_n
+                    // восстанавливает сумму за окно, dt×1000 — само окно.
+                    let util = cb_avg * cb_n as f64 / (dt * 1000.0);
+                    let drops_bad = drops_delta as f64 > 0.10 * eff_fps as f64 * dt;
+                    if util > 0.85 || drops_bad {
+                        cpu_over_ticks += 1;
+                        if cpu_over_ticks >= 3 {
+                            ladder.targets.cpu_fps_cap.store(30, Ordering::Relaxed);
+                            log::warn!("cpu: захват не успевает (util {util:.2}, drops +{drops_delta}) — fps кап {eff_fps}→30 до конца сессии");
+                        }
+                    } else {
+                        cpu_over_ticks = 0;
+                    }
+                }
+
                 mgr.sweep_dead().await; // трупы child-PC (после реджойна drop-peer не придёт)
                 // Э8 ABR: реальные loss/rtt по каждому детскому линку (RTCP RR через get_stats) —
                 // сервер агрегирует worst-link по дереву и решает целевой битрейт. Раньше слали нули.
@@ -678,6 +768,7 @@ async fn run_signaling_loop(
                 // «вещатель не успевает» было нечем.
                 let pli = stats.pli_count.swap(0, Ordering::Relaxed);
                 let keyframes = stats.keyframes.swap(0, Ordering::Relaxed);
+                let kf_forced = stats.keyframes_forced.swap(0, Ordering::Relaxed);
                 let links_str = if links.is_empty() {
                     "нет RR".to_string()
                 } else {
@@ -686,8 +777,10 @@ async fn run_signaling_loop(
                         .collect::<Vec<_>>()
                         .join(", ")
                 };
+                // IDR: всего и (форс) — периодика = keyframes - kf_forced. PLI≈0 при keyframes≈1/с
+                // и форс≈0 = энкодер печёт IDR сам (дефолтный GOP=fps), а не петля PLI.
                 log::info!(
-                    "net: детей {} | {links_str} | битрейт {:.1}/{:.1} Мбит (факт/цель) | PLI +{pli} | IDR +{keyframes}",
+                    "net: детей {} | {links_str} | битрейт {:.1}/{:.1} Мбит (факт/цель) | PLI +{pli} | IDR +{keyframes} (форс +{kf_forced})",
                     snapshot.children,
                     snapshot.bitrate_actual_bps / 1e6,
                     cur_target as f64 / 1e6,

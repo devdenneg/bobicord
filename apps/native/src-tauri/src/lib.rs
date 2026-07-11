@@ -308,6 +308,15 @@ async fn stop_broadcast(state: tauri::State<'_, BroadcastState>) -> Result<(), S
   Ok(())
 }
 
+// Интервал превью-тумбнейла (мс, 0 = выкл) для виджета вещателя. Пишет в общий atomic
+// (capture-сессии читают на кадре). No-op, если не вещаем. Виджет: 3000 (развёрнут),
+// 1000 (hover), 0 (свёрнут/размонтирован) — тумбнейл не считается зря.
+#[tauri::command]
+async fn set_preview_interval(state: tauri::State<'_, BroadcastState>, ms: u32) -> Result<(), String> {
+  if let Some(h) = state.0.lock().await.as_ref() { h.set_preview_interval(ms); }
+  Ok(())
+}
+
 // Журнал "Загрузки": открыть/показать в папке/проверить наличие ранее сохранённого вложения.
 // Через explorer.exe (не Win32 ShellExecuteW/tauri-plugin-shell) — без новых зависимостей и
 // без ACL-прав (std::process::Command не гейтится capabilities). explorer.exe <path> открывает
@@ -367,7 +376,7 @@ pub fn run() {
       std::thread::spawn(branding::fix_shortcuts);
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![ping, list_monitors, list_windows, detect_game, foreground_fullscreen, set_detectable_games, start_broadcast, set_broadcast_source, stop_broadcast, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys, open_file, reveal_in_folder, paths_exist, diag::diag_take_log])
+    .invoke_handler(tauri::generate_handler![ping, list_monitors, list_windows, detect_game, foreground_fullscreen, set_detectable_games, start_broadcast, set_broadcast_source, stop_broadcast, set_preview_interval, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys, open_file, reveal_in_folder, paths_exist, diag::diag_take_log])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }
