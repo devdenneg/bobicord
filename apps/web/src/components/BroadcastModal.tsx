@@ -246,7 +246,7 @@ export function BroadcastModal() {
 
     {/* Дискорд-стиль: маленький выбор качества. Битрейт всегда авто (сервер адаптирует), слайдера нет. */}
     <div className="fld"><label>Качество</label>
-      <div className="seg">
+      <div className="seg seg-quality">
         <button className={cfg.quality === 'auto' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, quality: 'auto' }))}>Авто</button>
         {FIXED_LABELS.map((l) => (
           <button key={l} className={cfg.quality === l ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, quality: l }))}>{l}</button>

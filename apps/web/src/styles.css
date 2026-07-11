@@ -778,16 +778,18 @@
   .vd-devitem{display:block;width:100%;text-align:left;padding:7px 9px;border-radius:7px;background:none;color:var(--txt);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .vd-devitem:hover{background:var(--panel3)}
   .vd-devitem.on{color:var(--green);background:rgba(35,165,89,.12)}
-  /* Виджет вещателя (StreamerWidget): плашка НАД голосовым доком, согласована с .vd-inline/.vd-panel */
-  .sw{flex:0 0 auto;background:var(--bg2);border-top:1px solid var(--line-2);padding:9px;display:flex;flex-direction:column;gap:8px;min-width:0}
-  .sw-collapsed{padding:6px 9px}
+  /* Виджет вещателя (StreamerWidget): ОТДЕЛЬНАЯ карточка над голосовым доком (не сливается с ним) —
+     свой отступ, рамка кругом, скругление и тень; зазор показывает фон #channels под карточкой. */
+  .sw{flex:0 0 auto;margin:8px 8px 0;background:var(--bg2);border:1px solid var(--line-2);border-radius:12px;box-shadow:var(--sh-2);padding:10px;display:flex;flex-direction:column;gap:8px;min-width:0}
+  .sw-collapsed{padding:7px 9px}
   .sw-cbar{display:flex;align-items:center;gap:8px;width:100%;padding:5px 7px;border-radius:9px;background:var(--panel3);color:var(--txt);box-shadow:var(--sh-1),inset 0 0 0 1px rgba(255,255,255,.05);cursor:pointer;text-align:left}
   .sw-cbar:hover{background:var(--panel4);color:var(--txt-h)}
   .sw-ctitle{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:600}
   .sw-wcount{display:inline-flex;align-items:center;gap:3px;font-size:11.5px;font-weight:600;color:var(--muted)}
   .sw-wcount .ic{font-size:13px}
-  .sw-head{display:flex;align-items:center;gap:9px}
-  .sw-live{width:28px;height:28px;flex:0 0 auto;border-radius:8px;display:flex;align-items:center;justify-content:center;background:var(--red-fill);color:#fff;box-shadow:0 0 0 1px rgba(242,63,67,.4),0 0 10px rgba(242,63,67,.35)}
+  .sw-head{display:flex;align-items:center;gap:8px}
+  .sw-live{width:22px;height:22px;flex:0 0 auto;border-radius:7px;display:flex;align-items:center;justify-content:center;background:var(--red-fill);color:#fff;box-shadow:0 0 0 1px rgba(242,63,67,.4),0 0 8px rgba(242,63,67,.3)}
+  .sw-live .ic{font-size:13px}
   .sw-htxt{min-width:0;flex:1}
   .sw-htxt b{display:block;font-size:12px;font-weight:700;color:var(--txt-h);line-height:1.3}
   .sw-htxt span{display:block;font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -972,6 +974,9 @@
   .kbd{display:inline-block;background:var(--panel3);border:1px solid var(--line);border-bottom-width:2px;border-radius:6px;padding:1px 7px;font-size:12px;font-weight:600}
   .seg{display:flex;gap:4px;background:var(--panel2);padding:4px;border-radius:var(--r-sm)}
   .seg button{flex:1;background:transparent;color:var(--muted);padding:8px;font-size:13.5px}.seg button.active{background:var(--accent);color:#fff}
+  /* Выбор качества: много кнопок (Авто + 1440/1080/720 × 60/30) — не влезают в один ряд .seg.
+     Свой грид с авто-переносом: колонка минимум 66px (лейбл «1440p60» не клипается), заполняет ширину. */
+  .seg-quality{display:grid;grid-template-columns:repeat(auto-fit,minmax(66px,1fr))}
   .theme-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
   .theme-op{display:flex;align-items:center;gap:10px;padding:9px 11px;background:var(--panel2);border:1.5px solid var(--line-2);border-radius:var(--r-sm);color:var(--txt);text-align:left}
   .theme-op:hover{background:var(--panel3)}
