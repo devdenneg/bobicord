@@ -113,6 +113,8 @@ const RENDITION_BITRATE = { 1080: 4_500_000, 720: 3_000_000, 480: 1_500_000, 360
 // apps/web/src/presets.ts (PRESETS) — источник истины ТАМ; здесь КОПИЯ для валидации
 // битрейтов рендишнов. При ЛЮБОМ изменении значений синхронизируй ОБЕ копии.
 const PRESET_TABLE = [
+  { width: 2560, height: 1440, fps: 60, bitrateKbps: 11000 }, // 2K (1440p) — source-passthrough,
+  { width: 2560, height: 1440, fps: 30, bitrateKbps: 8000 },  // рендишна 1440 нет (max рендишн 1080)
   { width: 1920, height: 1080, fps: 60, bitrateKbps: 6000 },
   { width: 1280, height: 720,  fps: 60, bitrateKbps: 4500 },
   { width: 1920, height: 1080, fps: 30, bitrateKbps: 4500 },

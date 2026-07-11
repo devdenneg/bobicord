@@ -9,7 +9,7 @@ import { PRESETS } from './presets';
 // (наблюдалось: 10 Мбит на 1080p60 → фризы у всех). 'auto' подбирает пресет по замеру аплинка.
 // 30fps-пресеты добавлены после диага 2026-07-10: CPU-путь захвата на 60fps (бюджет кадра
 // 16.7мс) не успевал у части вещателей (cb до 72мс) — фризы у всех зрителей.
-export const FIXED_LABELS = ['1080p60', '720p60', '1080p30', '720p30'] as const;
+export const FIXED_LABELS = ['1440p60', '1440p30', '1080p60', '720p60', '1080p30', '720p30'] as const;
 export type FixedQuality = (typeof FIXED_LABELS)[number];
 export type StreamQuality = 'auto' | FixedQuality;
 // Фикс-пресеты (потолок; autoBitrate снижает под сеть) — значения из PRESETS, не дублируем.

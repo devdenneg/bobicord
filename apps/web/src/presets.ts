@@ -25,6 +25,8 @@ export interface Preset {
 // молча падал на 30fps-лестницу и совпадал с «Качеством» (наблюдалось живьём при
 // useful=4000: оба режима давали 720p30). 60 fps стоит ~1.6× от 30 fps той же высоты.
 export const PRESETS: Preset[] = [
+  { width: 2560, height: 1440, fps: 60, bitrateKbps: 11000, label: '1440p60' },
+  { width: 2560, height: 1440, fps: 30, bitrateKbps: 8000,  label: '1440p30' },
   { width: 1920, height: 1080, fps: 60, bitrateKbps: 6000, label: '1080p60' },
   { width: 1280, height: 720,  fps: 60, bitrateKbps: 4500, label: '720p60' },
   { width: 1920, height: 1080, fps: 30, bitrateKbps: 4500, label: '1080p30' },
