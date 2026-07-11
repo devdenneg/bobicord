@@ -39,4 +39,5 @@ Thumbs.db
 .mcp.json
 
 # скачанные диаг-сессии стримов (scripts/diag.mjs pull) — в них IP участников
-.diag/
+.diag*/
+
