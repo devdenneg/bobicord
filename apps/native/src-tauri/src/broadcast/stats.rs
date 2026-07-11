@@ -39,6 +39,11 @@ pub struct SharedStats {
     /// Сколько IDR реально ушло в трек за окно (по MFSampleExtension_CleanPoint).
     /// Частые IDR без смены разрешения = мы отвечаем на PLI, т.е. пакеты теряются.
     pub keyframes: AtomicU64,
+    /// Из них ФОРСИРОВАННЫХ (по флагу force_keyframe: PLI/tree-сигналинг/реинит MFT).
+    /// Разность keyframes - keyframes_forced = ПЕРИОДИЧЕСКИЕ IDR (плановый GOP). Разделяет
+    /// «шторм от петли PLI» и «энкодер печёт IDR сам» (дефолтный GOP=fps — диаг 2026-07-10):
+    /// при PLI≈0, но keyframes≈1/с и keyframes_forced≈0 виноват GOP энкодера, не сеть.
+    pub keyframes_forced: AtomicU64,
 }
 
 impl SharedStats {

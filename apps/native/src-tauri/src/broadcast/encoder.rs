@@ -25,6 +25,9 @@ const GOP_SECONDS: u32 = 4;
 pub struct EncodedFrame {
     pub data: Vec<u8>,
     pub is_keyframe: bool,
+    /// IDR по нашему запросу (force_keyframe: PLI/tree-сигналинг/реинит MFT), а не плановый GOP.
+    /// Диаг: разделяет шторм от петли PLI и энкодер, печущий IDR сам (дефолтный GOP=fps).
+    pub forced: bool,
 }
 
 pub struct H264Encoder {
@@ -38,6 +41,10 @@ pub struct H264Encoder {
     output_provides_samples: bool,
     output_sample_size: u32,
     force_keyframe: Arc<AtomicBool>,
+    /// Форс запрошен, но IDR ещё не вышел (async MFT кодирует с задержкой конвейера) —
+    /// снимается на первом же вышедшем keyframe, помечая его forced. Так форс-IDR
+    /// атрибутируется точно, даже когда выходит через кадр-два после запроса.
+    pending_forced: bool,
     /// Текущий целевой средний битрейт — чтобы `set_bitrate` пропускал no-op (ABR шлёт
     /// цель каждый тик, но реально меняется она редко). Меняется на лету через ICodecAPI
     /// без пересоздания MFT.
@@ -83,6 +90,22 @@ impl H264Encoder {
                 .SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, fps.saturating_mul(GOP_SECONDS).max(1))
                 .map_err(|e| e.to_string())?;
             transform.SetOutputType(0, &output_type, 0).map_err(|e| format!("SetOutputType: {e}"))?;
+
+            // Contingency-улика (диаг 2026-07-10): читаем фактический spacing из ПРИНЯТОГО
+            // выходного типа. Если MFT проигнорировал атрибут (want != got), IDR останется
+            // ~1/с при PLI≈0 — строка сразу укажет на MFT-игнор, без сведения диага.
+            let want_spacing = fps.saturating_mul(GOP_SECONDS).max(1);
+            match transform.GetOutputCurrentType(0) {
+                Ok(cur) => {
+                    let got = cur.GetUINT32(&MF_MT_MAX_KEYFRAME_SPACING).unwrap_or(0);
+                    if got == want_spacing {
+                        log::info!("encoder: keyframe-spacing принят: {got} кадров (GOP {GOP_SECONDS}с @ {fps}fps)");
+                    } else {
+                        log::warn!("encoder: keyframe-spacing НЕ принят: факт {got}, запрошен {want_spacing} — MFT может гнать IDR=GOP=fps (шторм)");
+                    }
+                }
+                Err(e) => log::warn!("encoder: GetOutputCurrentType для проверки spacing: {e}"),
+            }
 
             let input_type = MFCreateMediaType().map_err(|e| e.to_string())?;
             input_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).map_err(|e| e.to_string())?;
@@ -132,6 +155,7 @@ impl H264Encoder {
                 output_provides_samples: provides,
                 output_sample_size: stream_info.cbSize,
                 force_keyframe,
+                pending_forced: false,
                 current_bitrate: bitrate_bps,
             })
         }
@@ -158,6 +182,7 @@ impl H264Encoder {
                 if let Some(api) = &self.codec_api {
                     let _ = api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(true));
                 }
+                self.pending_forced = true; // следующий вышедший IDR — форсированный
             }
 
             let mut out = Vec::new();
@@ -292,7 +317,11 @@ impl H264Encoder {
                             let data = std::slice::from_raw_parts(ptr, len as usize).to_vec();
                             let _ = contig.Unlock();
                             let is_key = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0;
-                            out.push(EncodedFrame { data, is_keyframe: is_key });
+                            // Форс-запрос ловит первый вышедший IDR; периодические GOP-IDR идут
+                            // с pending_forced=false.
+                            let forced = is_key && self.pending_forced;
+                            if forced { self.pending_forced = false; }
+                            out.push(EncodedFrame { data, is_keyframe: is_key, forced });
                         }
                     }
                 }

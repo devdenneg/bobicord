@@ -91,8 +91,9 @@ const LINE_RE = /^(\d{10,})\s+\[(\w+)\]\[([^\]]+)\]\s+(.*)$/;
 
 // timing: cb 3.7/7.3 мс (avg/max) = readback 0.8 + convert 2.9 | encode 1.0/1.7 | write 0.5 | drops +0 (всего 0)
 const TIMING_RE = /timing: cb ([\d.]+)\/([\d.]+).*?readback ([\d.]+) \+ convert ([\d.]+).*?encode ([\d.]+)\/([\d.]+).*?write ([\d.]+).*?drops \+(\d+)/;
-// net: детей 1 | <id> loss=0.0% rtt=12мс | битрейт 5.8/6.0 Мбит (факт/цель) | PLI +0 | IDR +0
-const NET_RE = /net: детей (\d+) \| (.*?) \| битрейт ([\d.]+)\/([\d.]+).*?PLI \+(\d+) \| IDR \+(\d+)/;
+// net: детей 1 | <id> loss=0.0% rtt=12мс | битрейт 5.8/6.0 Мбит (факт/цель) | PLI +0 | IDR +0 (форс +0)
+// «(форс +N)» опционально (старые бинари без него) — не якорим, чтобы парсились оба формата.
+const NET_RE = /net: детей (\d+) \| (.*?) \| битрейт ([\d.]+)\/([\d.]+).*?PLI \+(\d+) \| IDR \+(\d+)(?: \(форс \+(\d+)\))?/;
 const LINK_RE = /(\S+) loss=([\d.]+)% rtt=(\d+)/g;
 
 function parseBroadcaster(session) {
@@ -117,7 +118,7 @@ function parseBroadcaster(session) {
     const nm = NET_RE.exec(msg);
     if (nm) {
       const links = [...nm[2].matchAll(LINK_RE)].map((l) => ({ id: l[1], loss: +l[2], rtt: +l[3] }));
-      upsert(ticks, b).net = { children: +nm[1], links, actualMbit: +nm[3], targetMbit: +nm[4], pli: +nm[5], idr: +nm[6] };
+      upsert(ticks, b).net = { children: +nm[1], links, actualMbit: +nm[3], targetMbit: +nm[4], pli: +nm[5], idr: +nm[6], idrForced: nm[7] != null ? +nm[7] : null };
       continue;
     }
     // Всё остальное на INFO — это capture/encoder fps и служебные строки; в сводке
@@ -241,12 +242,13 @@ function cmdReport(files) {
   }
 
   // Сводка вещателя. cbMax сравниваем с БЮДЖЕТОМ КАДРА (1000/fps), а не с константой.
-  let drops = 0, pli = 0, idr = 0, cbMax = 0, maxLoss = 0, dropWindows = 0, targetFps = 30;
+  let drops = 0, pli = 0, idr = 0, idrForced = 0, idrForcedKnown = false, cbMax = 0, maxLoss = 0, dropWindows = 0, targetFps = 30;
   for (const [, x] of bc.ticks) {
     drops += x.timing?.drops ?? 0;
     if ((x.timing?.drops ?? 0) > 0) dropWindows++;
     pli += x.net?.pli ?? 0;
     idr += x.net?.idr ?? 0;
+    if (x.net?.idrForced != null) { idrForced += x.net.idrForced; idrForcedKnown = true; }
     cbMax = Math.max(cbMax, x.timing?.cbMax ?? 0);
     for (const l of x.net?.links ?? []) maxLoss = Math.max(maxLoss, l.loss);
   }
@@ -270,10 +272,18 @@ function cmdReport(files) {
     else if (maxLoss > 2) console.log('\n=> Захват чист, сыпется линк вещатель->прямой ребёнок. Смотри аплинк вещателя, coturn.');
     else if (worstViewerLoss > 2) console.log('\n=> Захват и аплинк вещателя чисты, а зрители теряют пакеты. Виноват узел ниже (vrelay) или линк зрителя.\n   Дальше: docker compose logs vrelay | grep ingest   и   logs token | grep health');
     else console.log('\n=> Ни захват, ни линки не объясняют фризы. Смотри WARN/ERROR ниже.');
-    // IDR-шторм усиливает любую потерю: каждый keyframe — крупный бурст.
+    // IDR-шторм усиливает любую потерю: каждый keyframe — крупный бурст. С форс/периодика
+    // (новые бинари) различаем источник: форс≈0 при шторме = энкодер печёт IDR сам (GOP=fps),
+    // а не петля PLI — это разные фиксы (GOP-атрибут MFT vs rate-limit форса).
     if (idrRate > 0.5) {
-      console.log(`   ВНИМАНИЕ: IDR ${idrRate.toFixed(2)}/с — это шторм. Зрители теряют пакеты -> шлют PLI -> корень форсит IDR ->`);
-      console.log('   бурст пробивает линк -> снова потери. Ожидаемая частота при GOP=4с — 0.25/с.');
+      console.log(`   ВНИМАНИЕ: IDR ${idrRate.toFixed(2)}/с — это шторм. Ожидаемая частота при GOP=4с — 0.25/с.`);
+      if (idrForcedKnown && idr > 0) {
+        const forcedPct = idrForced / idr;
+        if (forcedPct < 0.2) console.log(`   форс всего ${idrForced}/${idr} (${(forcedPct * 100).toFixed(0)}%) — IDR печёт САМ ЭНКОДЕР (дефолтный GOP=fps), не петля PLI. Фикс: GOP-атрибут MFT (encoder.rs).`);
+        else console.log(`   форс ${idrForced}/${idr} (${(forcedPct * 100).toFixed(0)}%) — петля PLI: зрители теряют -> PLI -> корень форсит IDR -> бурст пробивает линк -> снова потери.`);
+      } else {
+        console.log('   (форс/периодика неизвестна — старый бинарь; обнови для разбивки источника шторма) петля PLI ИЛИ GOP энкодера.');
+      }
     }
   }
 
