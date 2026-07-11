@@ -76,6 +76,11 @@ struct IngestMonitor {
     bytes: u64,
     fanout_drops: Arc<AtomicU64>,
     write_errs: Arc<AtomicU64>,
+    /// ErrClosedPipe у write_rtp: ни одного привязанного sender'а. Легитимен у стрима без
+    /// зрителей (каждый пакет), поэтому НЕ входит в noisy-гейт — но печатается: ненулевой
+    /// closed_pipe при живых детях = «доставка вниз молча умерла», класс багов, который
+    /// прежнее молчаливое глотание делал невидимым («ошибок 0» врало).
+    closed_pipe: Arc<AtomicU64>,
     window_start: Instant,
     /// Тихий поток надо иногда подтверждать: иначе «нет строк» неотличимо от «узел умер».
     last_baseline: Instant,
@@ -108,11 +113,11 @@ const NACK_GENERATOR_INTERVAL: Duration = Duration::from_millis(50);
 const GAP_TRACK_MAX: u16 = 128;
 
 impl IngestMonitor {
-    fn new(label: String, fanout_drops: Arc<AtomicU64>, write_errs: Arc<AtomicU64>) -> Self {
+    fn new(label: String, fanout_drops: Arc<AtomicU64>, write_errs: Arc<AtomicU64>, closed_pipe: Arc<AtomicU64>) -> Self {
         let now = Instant::now();
         Self {
             label, last_seq: None, packets: 0, gaps: 0, reordered: 0, bytes: 0,
-            fanout_drops, write_errs, window_start: now, last_baseline: now,
+            fanout_drops, write_errs, closed_pipe, window_start: now, last_baseline: now,
             missing: std::collections::HashSet::new(), oldest_missing_at: None,
         }
     }
@@ -175,19 +180,71 @@ impl IngestMonitor {
         let secs = self.window_start.elapsed().as_secs_f64().max(0.001);
         let drops = self.fanout_drops.swap(0, Ordering::Relaxed);
         let errs = self.write_errs.swap(0, Ordering::Relaxed);
+        let cp = self.closed_pipe.swap(0, Ordering::Relaxed);
         let noisy = self.gaps > 0 || drops > 0 || errs > 0;
         if noisy || self.last_baseline.elapsed() >= BASELINE {
             let kbit = (self.bytes as f64 * 8.0 / 1000.0) / secs;
             let total = self.packets + self.gaps;
             let gap_pct = if total > 0 { self.gaps as f64 * 100.0 / total as f64 } else { 0.0 };
             log::info!(
-                "ingest {}: пакетов {} | разрывов RTP {} ({gap_pct:.2}%) | переупорядочено {} | {kbit:.0} кбит/с | фанаут: дропов {drops}, ошибок {errs}",
+                "ingest {}: пакетов {} | разрывов RTP {} ({gap_pct:.2}%) | переупорядочено {} | {kbit:.0} кбит/с | фанаут: дропов {drops}, ошибок {errs}, closed_pipe {cp}",
                 self.label, self.packets, self.gaps, self.reordered,
             );
             self.last_baseline = Instant::now();
         }
         self.packets = 0; self.gaps = 0; self.reordered = 0; self.bytes = 0;
         self.window_start = Instant::now();
+    }
+}
+
+/// Непрерывность RTP через смены upstream (reparent). Downstream-PC (дети + webview)
+/// привязаны к ОДНОМУ TrackLocalStaticRTP на всю жизнь сессии, а `write_rtp` переписывает
+/// per-binding только SSRC/payload_type — sequence/timestamp уходят как есть. Новый upstream
+/// начинает со СЛУЧАЙНОЙ базы: скачок seq ломает SRTP ROC/replay-окно получателя, и все
+/// последующие пакеты молча выбрасываются навсегда (подпись бага: у webview-зрителя после
+/// reparent `packetsReceived` замирает, лечил только ручной re-watch — diag 2026-07-10/11).
+/// Лечим переписыванием seq/ts каждого upstream («эпохи») в единую непрерывную нумерацию.
+struct RtpContinuity {
+    primed: bool,
+    /// Последний ОТПРАВЛЕННЫЙ (уже переписанный) seq; двигается только вперёд.
+    last_seq: u16,
+    /// Последний отправленный timestamp; только вперёд.
+    last_ts: u32,
+    /// Wall-clock последнего пакета (мс) — оценка ts-скачка при старте новой эпохи.
+    last_wall_ms: u64,
+}
+
+/// Оффсеты одной эпохи (одного upstream): out = in.wrapping_add(off). Считаются один раз
+/// по первому пакету эпохи и дальше применяются ко всем — внутриэпоховый порядок/дыры
+/// (NACK, reorder) сохраняются как есть.
+#[derive(Clone, Copy)]
+struct EpochOffsets { seq_off: u16, ts_off: u32 }
+
+impl RtpContinuity {
+    fn new() -> Self { Self { primed: false, last_seq: 0, last_ts: 0, last_wall_ms: 0 } }
+
+    /// Оффсеты новой эпохи по её первому пакету. seq продолжается строго с last_seq+1;
+    /// ts прыгает на wall-clock разрыв (кламп [min_gap_ticks, 10с]) — нулевой шаг ts между
+    /// кадрами ломает джиттер-буфер, а безграничный тащит PTS в будущее.
+    fn begin_epoch(&self, first_seq: u16, first_ts: u32, now_ms: u64, ticks_per_ms: u32, min_gap_ticks: u32) -> EpochOffsets {
+        if !self.primed { return EpochOffsets { seq_off: 0, ts_off: 0 }; }
+        let gap_ms = now_ms.saturating_sub(self.last_wall_ms).min(10_000) as u32;
+        let gap_ticks = gap_ms.saturating_mul(ticks_per_ms).max(min_gap_ticks);
+        EpochOffsets {
+            seq_off: self.last_seq.wrapping_add(1).wrapping_sub(first_seq),
+            ts_off: self.last_ts.wrapping_add(gap_ticks).wrapping_sub(first_ts),
+        }
+    }
+
+    /// Продвижение forward-only (wrapping-сравнение, порог полупространства): опоздавший
+    /// ретрансмит или хвост старой эпохи из дренажа фанаута не откатывают базу назад.
+    fn advance(&mut self, out_seq: u16, out_ts: u32, now_ms: u64) {
+        let d = out_seq.wrapping_sub(self.last_seq);
+        if !self.primed || (d != 0 && d < 0x8000) { self.last_seq = out_seq; }
+        let dt = out_ts.wrapping_sub(self.last_ts);
+        if !self.primed || (dt != 0 && dt < 0x8000_0000) { self.last_ts = out_ts; }
+        self.primed = true;
+        self.last_wall_ms = now_ms;
     }
 }
 
@@ -293,6 +350,9 @@ struct RelayManager {
     video_feeds: Arc<Mutex<HashMap<String, Arc<Feed>>>>,
     /// Быстрый гейт для горячего пути on_track: 0 = ни одного рендишна, лок не берём.
     feed_count: Arc<AtomicUsize>,
+    /// Непрерывность seq/ts через reparent'ы (см. RtpContinuity) — живёт поверх upstream'ов.
+    video_cont: Arc<Mutex<RtpContinuity>>,
+    audio_cont: Arc<Mutex<RtpContinuity>>,
 }
 
 // Кодировка upstream_state.
@@ -385,6 +445,8 @@ impl RelayManager {
             renditions: HashMap::new(),
             video_feeds: Arc::new(Mutex::new(HashMap::new())),
             feed_count: Arc::new(AtomicUsize::new(0)),
+            video_cont: Arc::new(Mutex::new(RtpContinuity::new())),
+            audio_cont: Arc::new(Mutex::new(RtpContinuity::new())),
         })
     }
 
@@ -454,6 +516,8 @@ impl RelayManager {
         // с PLI-путём детей — last_kf_ms).
         let kf_tx = self.cmd_tx.clone();
         let kf_last = self.last_kf_ms.clone();
+        let video_cont = self.video_cont.clone();
+        let audio_cont = self.audio_cont.clone();
         pc.on_track(Box::new(move |track: Arc<TrackRemote>, _r: Arc<RTCRtpReceiver>, _t: Arc<RTCRtpTransceiver>| {
             let video_local = video_local.clone();
             let audio_local = audio_local.clone();
@@ -463,17 +527,28 @@ impl RelayManager {
             let ingest_parent = ingest_parent.clone();
             let kf_tx = kf_tx.clone();
             let kf_last = kf_last.clone();
+            let video_cont = video_cont.clone();
+            let audio_cont = audio_cont.clone();
             Box::pin(async move {
                 let is_video = track.kind() == RTPCodecType::Video;
                 tokio::spawn(async move {
                     let kind = if is_video { "video" } else { "audio" };
                     let fanout_drops = Arc::new(AtomicU64::new(0));
                     let write_errs = Arc::new(AtomicU64::new(0));
+                    let closed_pipe = Arc::new(AtomicU64::new(0));
                     let mut mon = IngestMonitor::new(
                         format!("{ingest_sid} {kind} <- {ingest_parent}"),
                         fanout_drops.clone(),
                         write_errs.clone(),
+                        closed_pipe.clone(),
                     );
+                    // Continuity-rewrite: этот таск = один upstream = одна «эпоха». Оффсеты
+                    // считаются по первому пакету и продолжают нумерацию прежних эпох —
+                    // downstream не видит reparent (см. RtpContinuity). 90/48 тик/мс = clock
+                    // rate 90кГц (H.264) / 48кГц (Opus); min-gap = 1 кадр @30fps / 20мс Opus.
+                    let cont = if is_video { video_cont } else { audio_cont };
+                    let (ticks_per_ms, min_gap_ticks) = if is_video { (90u32, 3000u32) } else { (48u32, 960u32) };
+                    let mut epoch: Option<EpochOffsets> = None;
 
                     // Отдача детям — в ОТДЕЛЬНОМ таске. `write_rtp` пишет каждому ребёнку по
                     // очереди и ждёт; при забитом аплинке узла он упирается в бэкпрешер сокета.
@@ -483,6 +558,7 @@ impl RelayManager {
                     let cap = if is_video { FANOUT_QUEUE_VIDEO } else { FANOUT_QUEUE_AUDIO };
                     let (tx, mut rx) = tokio::sync::mpsc::channel::<webrtc::rtp::packet::Packet>(cap);
                     let werrs = write_errs.clone();
+                    let cpipe = closed_pipe.clone();
                     tokio::spawn(async move {
                         // Пейсер фанаута УБРАН: на 1080p60 @10-12 Мбит keyframe ~500КБ не влезал в бюджет
                         // окна, очередь (256) переполнялась → сервер САМ ронял пакеты (фанаут: дропов 1271,
@@ -492,8 +568,12 @@ impl RelayManager {
                         while let Some(pkt) = rx.recv().await {
                             let res = if is_video { video_local.write_rtp(&pkt).await } else { audio_local.write_rtp(&pkt).await };
                             if let Err(e) = res {
-                                // ErrClosedPipe = ни одного связанного sender (нет детей/webview) — не ошибка
-                                if webrtc::Error::ErrClosedPipe.to_string() != e.to_string() {
+                                if webrtc::Error::ErrClosedPipe.to_string() == e.to_string() {
+                                    // Ни одного привязанного sender'а (нет детей/webview). Легитимен
+                                    // у стрима без зрителей, но раньше глотался МОЛЧА — «ошибок 0»
+                                    // врало, когда доставка вниз умирала. Отдельный видимый счётчик.
+                                    cpipe.fetch_add(1, Ordering::Relaxed);
+                                } else {
                                     // Считаем, а не пишем строку на пакет: 30 кадров/с с ошибкой
                                     // залили бы лог мгновенно. Сводка — в IngestMonitor::tick.
                                     werrs.fetch_add(1, Ordering::Relaxed);
@@ -505,10 +585,20 @@ impl RelayManager {
 
                     loop {
                         match track.read_rtp().await {
-                            Ok((packet, _)) => {
+                            Ok((mut packet, _)) => {
+                                // Монитор видит СЫРЫЕ входные seq (диагностика линка от родителя),
+                                // rewrite — после него.
                                 mon.on_packet(packet.header.sequence_number, packet.payload.len());
+                                let now = now_ms();
+                                let off = *epoch.get_or_insert_with(|| cont.lock().unwrap().begin_epoch(
+                                    packet.header.sequence_number, packet.header.timestamp, now, ticks_per_ms, min_gap_ticks,
+                                ));
+                                packet.header.sequence_number = packet.header.sequence_number.wrapping_add(off.seq_off);
+                                packet.header.timestamp = packet.header.timestamp.wrapping_add(off.ts_off);
+                                cont.lock().unwrap().advance(packet.header.sequence_number, packet.header.timestamp, now);
                                 // Д2: побочная ветка транскода — отдельный неблокирующий канал,
                                 // держим её ДО фанаута, чтобы затык отдачи не резал рендишны.
+                                // Бонус continuity: RTP-демуксер ffmpeg тоже видит непрерывный поток.
                                 if is_video && feed_count.load(Ordering::Relaxed) > 0 {
                                     for f in video_feeds.lock().unwrap().values() { f.send_video(&packet); }
                                 }
@@ -1016,7 +1106,7 @@ pub fn start_rendition_root(cfg: RelayConfig, video: Arc<TrackLocalStaticRTP>, a
 
 #[cfg(test)]
 mod tests {
-    use super::IngestMonitor;
+    use super::{IngestMonitor, RtpContinuity};
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1024,7 +1114,7 @@ mod tests {
     /// Возвращает (принято, разрывов, переупорядочено). Счётчики фанаута тесту не нужны —
     /// их пишет writer-таск, здесь проверяется только арифметика номеров.
     fn feed(seqs: &[u16]) -> (u64, u64, u64) {
-        let mut m = IngestMonitor::new("test".into(), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let mut m = IngestMonitor::new("test".into(), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         for &s in seqs { m.on_packet(s, 100); }
         (m.packets, m.gaps, m.reordered)
     }
@@ -1074,7 +1164,7 @@ mod tests {
     // ---- GapHealer (незалеченная дыра → запрос keyframe) ----
 
     fn mon() -> IngestMonitor {
-        IngestMonitor::new("test".into(), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+        IngestMonitor::new("test".into(), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
     }
 
     /// Дыра, которую никто не закрыл, по истечении grace отдаёт true ровно один раз.
@@ -1137,5 +1227,97 @@ mod tests {
         m.on_packet(0, 100);
         m.on_packet(1, 100);
         assert!(!m.take_unhealed(Duration::ZERO));
+    }
+
+    // ---- RtpContinuity (непрерывность seq/ts через reparent) ----
+
+    const V_TPM: u32 = 90;      // видео: 90кГц = 90 тик/мс
+    const V_MIN: u32 = 3000;    // 1 кадр @30fps
+
+    /// Прогоняет пакет эпохи через оффсеты и продвигает базу; возвращает (out_seq, out_ts).
+    fn pass(c: &mut RtpContinuity, off: super::EpochOffsets, seq: u16, ts: u32, now: u64) -> (u16, u32) {
+        let (os, ot) = (seq.wrapping_add(off.seq_off), ts.wrapping_add(off.ts_off));
+        c.advance(os, ot, now);
+        (os, ot)
+    }
+
+    /// Первая эпоха — passthrough (нечего продолжать).
+    #[test]
+    fn continuity_first_epoch_passthrough() {
+        let c = RtpContinuity::new();
+        let off = c.begin_epoch(500, 100_000, 1000, V_TPM, V_MIN);
+        assert_eq!((off.seq_off, off.ts_off), (0, 0));
+    }
+
+    /// Новая эпоха продолжает нумерацию: следующий out_seq = last_seq+1, ts прыгает
+    /// на wall-clock разрыв.
+    #[test]
+    fn continuity_new_epoch_continues() {
+        let mut c = RtpContinuity::new();
+        let off1 = c.begin_epoch(100, 9000, 1000, V_TPM, V_MIN);
+        pass(&mut c, off1, 100, 9000, 1000);
+        pass(&mut c, off1, 101, 9000, 1000);
+        // reparent через 100мс, новый upstream начинает с seq=40000, ts=777
+        let off2 = c.begin_epoch(40000, 777, 1100, V_TPM, V_MIN);
+        let (s, t) = pass(&mut c, off2, 40000, 777, 1100);
+        assert_eq!(s, 102);                    // 101 + 1
+        assert_eq!(t, 9000 + 100 * V_TPM as u32); // +100мс в тиках
+    }
+
+    /// Граница rollover: last_seq=65534 → новая эпоха продолжает 65535, 0, 1.
+    #[test]
+    fn continuity_across_rollover() {
+        let mut c = RtpContinuity::new();
+        let off1 = c.begin_epoch(65534, 0, 0, V_TPM, V_MIN);
+        pass(&mut c, off1, 65534, 0, 0);
+        let off2 = c.begin_epoch(10, 500, 50, V_TPM, V_MIN);
+        assert_eq!(pass(&mut c, off2, 10, 500, 50).0, 65535);
+        assert_eq!(pass(&mut c, off2, 11, 500, 50).0, 0);
+        assert_eq!(pass(&mut c, off2, 12, 500, 50).0, 1);
+    }
+
+    /// Опоздавший ретрансмит (out_seq назад) не откатывает базу — следующая эпоха
+    /// продолжает от максимума, не от ретрансмита.
+    #[test]
+    fn continuity_retransmit_does_not_rollback() {
+        let mut c = RtpContinuity::new();
+        let off = c.begin_epoch(100, 0, 0, V_TPM, V_MIN);
+        pass(&mut c, off, 100, 0, 0);
+        pass(&mut c, off, 105, 4500, 0);
+        pass(&mut c, off, 102, 1500, 0); // ретрансмит дыры
+        let off2 = c.begin_epoch(7, 0, 100, V_TPM, V_MIN);
+        assert_eq!(pass(&mut c, off2, 7, 0, 100).0, 106); // от 105, не от 102
+    }
+
+    /// Кламп ts-скачка: мгновенный reparent (0мс) всё равно даёт минимум 1 кадр,
+    /// многочасовой обрыв — не больше 10с.
+    #[test]
+    fn continuity_ts_gap_clamped() {
+        let mut c = RtpContinuity::new();
+        let off1 = c.begin_epoch(1, 1000, 5000, V_TPM, V_MIN);
+        pass(&mut c, off1, 1, 1000, 5000);
+        // та же миллисекунда — минимум min_gap_ticks
+        let off2 = c.begin_epoch(50, 0, 5000, V_TPM, V_MIN);
+        assert_eq!(pass(&mut c, off2, 50, 0, 5000).1, 1000 + V_MIN);
+        // «час спустя» — кап 10с
+        let off3 = c.begin_epoch(90, 0, 5000 + 3_600_000, V_TPM, V_MIN);
+        assert_eq!(pass(&mut c, off3, 90, 0, 5000 + 3_600_000).1, 1000 + V_MIN + 10_000 * V_TPM as u32);
+    }
+
+    /// Три эпохи подряд: нумерация монотонна без дыр на стыках.
+    #[test]
+    fn continuity_three_epochs_monotonic() {
+        let mut c = RtpContinuity::new();
+        let mut now = 0u64;
+        let mut last = None::<u16>;
+        for (base_seq, base_ts) in [(100u16, 0u32), (60000, 1_000_000), (5, 42)] {
+            let off = c.begin_epoch(base_seq, base_ts, now, V_TPM, V_MIN);
+            for i in 0..5u16 {
+                let (s, _) = pass(&mut c, off, base_seq.wrapping_add(i), base_ts, now);
+                if let Some(p) = last { assert_eq!(s, p.wrapping_add(1), "дыра на стыке эпох"); }
+                last = Some(s);
+            }
+            now += 200;
+        }
     }
 }
