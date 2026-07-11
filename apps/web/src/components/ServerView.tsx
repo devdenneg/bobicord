@@ -9,6 +9,7 @@ import { avColor, initial, prefersReducedMotion, downscaleImage } from '../util'
 import { emoteMap, emoteUrl } from '../emotes';
 import { EmotePicker } from './EmotePicker';
 import { VoiceDock } from './VoiceDock';
+import { StreamerWidget } from './StreamerWidget';
 import { getSettings, setSettings } from '../settings';
 import { playSound } from '../sounds';
 import { applyNativeUpdate } from '../nativeUpdate';
@@ -1534,6 +1535,7 @@ function Channels() {
         <span className="chn">{active.name}</span><Icon name="info" sm />
       </div>
       <div className="ch-body"><VoiceChannels /></div>
+      <StreamerWidget />
       <VoiceDock variant="inline" />
       <div className="user-panel">
         <div className="up-i" onClick={() => setModal('profile')}><b>{me.displayName}</b><span>В сети</span></div>

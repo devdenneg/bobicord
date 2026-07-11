@@ -6,73 +6,10 @@ import { Icon } from '../Icon';
 import { Backdrop } from './Backdrop';
 import { listMonitors, listWindows, startNativeBroadcast, setNativeBroadcastSource, stopNativeBroadcast, onBroadcastStats } from '../native';
 import { startBroadcasterSession, endAnyBroadcasterSession } from '../diag';
-import type { MonitorInfo, WindowInfo, BroadcastStats, CaptureSource } from '../native';
+import type { MonitorInfo, WindowInfo, BroadcastStats } from '../native';
 import { pickPreset, PRESETS } from '../presets';
 import { measureUpload, getCachedProbe, clearCachedProbe, type ProbeResult } from '../transport/probe';
-
-// Дискорд-стиль: маленький выбор качества, битрейт ВСЕГДА авто (сервер-ABR адаптирует под сеть,
-// слабых зрителей жмут серверные рендишны). Ручной битрейт-слайдер убран — им легко убить стрим
-// (наблюдалось: 10 Мбит на 1080p60 → фризы у всех). 'auto' подбирает пресет по замеру аплинка.
-type StreamQuality = 'auto' | '1080p60' | '720p60';
-// Фикс-пресеты (потолок; autoBitrate снижает под сеть). Значения совпадают с presets.ts/tree.js.
-const QUALITY_FIXED: Record<Exclude<StreamQuality, 'auto'>, { w: number; h: number; fps: 30 | 60; bitrateKbps: number; label: string }> = {
-  '1080p60': { w: 1920, h: 1080, fps: 60, bitrateKbps: 6000, label: '1080p60' },
-  '720p60': { w: 1280, h: 720, fps: 60, bitrateKbps: 4500, label: '720p60' },
-};
-
-interface SavedConfig {
-  sourceKind: 'monitor' | 'window';
-  monitorIndex: number;
-  windowHwnd: number | null;
-  /** Дискорд-стиль выбор качества. 'auto' — пресет по замеру аплинка; фикс — потолок под auto-битрейт. */
-  quality: StreamQuality;
-  /** auto — звук следует за источником: окно → его процесс (INCLUDE, надёжно против
-   *  эха голоса войса), монитор → всё кроме RelayApp (EXCLUDE себя). Ничего выбирать руками.
-   *  exclude/include — ручной override под «Дополнительно» (см. CLAUDE.md инвариант 6, audio.rs). */
-  audioMode: 'auto' | 'exclude' | 'include';
-  audioPid: number | null;
-  /** Э8: лимит прямых зрителей корня; остальные уходят глубже через relay-узлы. */
-  maxDirectChildren: number;
-  /** Д8: opt-in прямых подключений к стримеру. Выкл (дефолт) — server-first: единственный
-   *  слот корня отдан vrelay (maxChildren=1). Вкл — maxChildren = 1 (vrelay) + maxDirectChildren. */
-  allowDirectPeers: boolean;
-}
-// audioMode дефолтом 'auto': звук выбирается сам по источнику (окно → PID окна, монитор →
-// EXCLUDE себя), пользователю не нужно вручную указывать процесс. Ручной выбор остаётся
-// под «Дополнительно» на случай, когда нужен звук строго одного приложения.
-const DEF_CONFIG: SavedConfig = { sourceKind: 'monitor', monitorIndex: 0, windowHwnd: null, quality: 'auto', audioMode: 'auto', audioPid: null, maxDirectChildren: 2, allowDirectPeers: false };
-const DIRECT_MIN = 1, DIRECT_MAX = 10;
-function loadConfig(): SavedConfig {
-  try {
-    const raw = JSON.parse(localStorage.getItem('bcastConfig') || '{}');
-    const c: SavedConfig = { ...DEF_CONFIG, ...raw };
-    // Миграция со старой схемы (presetMode/resolution/fps/bitrate/autoBitrate) — всё это заменено
-    // одним `quality`. Старый конфиг → 'auto' (как у нового юзера), если валидного quality нет.
-    if (c.quality !== 'auto' && c.quality !== '1080p60' && c.quality !== '720p60') c.quality = 'auto';
-    c.maxDirectChildren = Math.min(DIRECT_MAX, Math.max(DIRECT_MIN, Math.round(c.maxDirectChildren)));
-    c.allowDirectPeers = !!c.allowDirectPeers;
-    return c;
-  } catch { return DEF_CONFIG; }
-}
-function saveConfig(c: SavedConfig) { localStorage.setItem('bcastConfig', JSON.stringify(c)); }
-
-// Источник видео из текущего конфига (окно, если выбрано валидное; иначе монитор).
-function buildSource(cfg: SavedConfig): CaptureSource {
-  return cfg.sourceKind === 'window' && cfg.windowHwnd != null
-    ? { kind: 'window', hwnd: cfg.windowHwnd }
-    : { kind: 'monitor', index: cfg.monitorIndex };
-}
-
-// PID для WASAPI INCLUDE, либо undefined = EXCLUDE-режим. auto: окно → PID окна,
-// монитор → EXCLUDE себя. Ручные режимы — как выбрано.
-function deriveAudioPid(cfg: SavedConfig, windows: WindowInfo[]): number | undefined {
-  if (cfg.audioMode === 'include') return cfg.audioPid ?? undefined;
-  if (cfg.audioMode === 'exclude') return undefined;
-  // auto:
-  if (cfg.sourceKind === 'window' && cfg.windowHwnd != null)
-    return windows.find((x) => x.hwnd === cfg.windowHwnd)?.pid;
-  return undefined; // монитор в auto = EXCLUDE себя
-}
+import { FIXED_LABELS, QUALITY_FIXED, DIRECT_MIN, DIRECT_MAX, loadConfig, saveConfig, buildSource, deriveAudioPid, type SavedConfig } from '../broadcastSource';
 
 /** base64 PNG иконки окна в data-URI (без префикса приходит из Rust) или null. */
 function iconSrc(icon: string | null | undefined): string | null {
@@ -147,7 +84,9 @@ export function BroadcastModal() {
   // самый нижний, floor). Фикс — из таблицы. Битрейт ВЕЗДЕ становится потолком auto-адаптации.
   function resolveEncode() {
     if (cfg.quality === 'auto') {
-      const p = (usefulKbps != null ? pickPreset(usefulKbps, 'smooth') : null) || PRESETS[PRESETS.length - 1];
+      // 'quality' = 30fps-лестница. Дефолт «Авто» больше не предлагает 60fps: диаг 2026-07-10 —
+      // CPU-путь захвата на 60fps не успевал (фризы всем зрителям); 60fps — явный выбор.
+      const p = (usefulKbps != null ? pickPreset(usefulKbps, 'quality') : null) || PRESETS[PRESETS.length - 1];
       return { w: p.width, h: p.height, fps: p.fps, bitrateKbps: p.bitrateKbps, label: p.label };
     }
     return QUALITY_FIXED[cfg.quality];
@@ -280,7 +219,7 @@ export function BroadcastModal() {
         <div><span>Источник</span><b title={stats.source}>{stats.source}</b></div>
         <div><span>Разрешение</span><b>{stats.width}×{stats.height}</b></div>
         <div><span>Захват</span><b>{stats.captureFps.toFixed(1)} fps</b></div>
-        <div><span>Кодер</span><b>{stats.encoderFps.toFixed(1)} / {stats.targetFps} fps</b></div>
+        <div><span>Кодер</span><b>{stats.encoderFps.toFixed(1)} / {stats.targetFps} fps{stats.cpuCapped ? ' (CPU)' : ''}</b></div>
         <div><span>Битрейт</span><b>{(stats.bitrateActualBps / 1_000_000).toFixed(2)} / {(stats.bitrateTargetBps / 1_000_000).toFixed(1)} Мбит/с</b></div>
         <div><span>Потеряно кадров</span><b>{stats.droppedFrames}</b></div>
         <div><span>Детей в дереве</span><b>{stats.children}</b></div>
@@ -309,8 +248,9 @@ export function BroadcastModal() {
     <div className="fld"><label>Качество</label>
       <div className="seg">
         <button className={cfg.quality === 'auto' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, quality: 'auto' }))}>Авто</button>
-        <button className={cfg.quality === '1080p60' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, quality: '1080p60' }))}>1080p60</button>
-        <button className={cfg.quality === '720p60' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, quality: '720p60' }))}>720p60</button>
+        {FIXED_LABELS.map((l) => (
+          <button key={l} className={cfg.quality === l ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, quality: l }))}>{l}</button>
+        ))}
       </div>
       <p className="msub" style={{ margin: '8px 0 0' }}>{cfg.quality === 'auto'
         ? 'Авто (рекомендуется): подбираем разрешение под твою скорость, битрейт держит сервер.'
