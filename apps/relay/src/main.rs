@@ -301,6 +301,63 @@ async fn rendition_stop(streams: &Streams, renditions: &Renditions, stream_id: &
     log::info!("rendition {key}: остановлен (dev)");
 }
 
+/// Парсит /proc/net/snmp — пару строк `Udp: <заголовки>` / `Udp: <значения>` — и достаёт
+/// счётчик по имени столбца. Формат: две строки с префиксом `Udp:`, первая — имена, вторая —
+/// числа в том же порядке. None, если столбца нет или файл иной формы. Ungated (тест идёт и
+/// на dev-Windows); используется только linux-монитором ниже.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_udp_snmp(contents: &str, field: &str) -> Option<u64> {
+    let mut header: Option<Vec<&str>> = None;
+    for line in contents.lines() {
+        let Some(rest) = line.strip_prefix("Udp:") else { continue };
+        let cols: Vec<&str> = rest.split_whitespace().collect();
+        match header.take() {
+            None => header = Some(cols), // первая Udp:-строка — имена столбцов
+            Some(names) => {
+                let idx = names.iter().position(|&n| n == field)?;
+                return cols.get(idx).and_then(|v| v.parse().ok());
+            }
+        }
+    }
+    None
+}
+
+/// Мониторит UdpRcvbufErrors/SndbufErrors хоста (диаг 2026-07-11: единственная улика серверных
+/// дропов входящего/исходящего UDP при переполнении сокет-буфера — транскод/фанаут душат CPU).
+/// vrelay в docker с network_mode: host → /proc/net/snmp = хостовые счётчики без доп. маунтов.
+/// Дельта > 0 → warn; baseline раз в 5 мин как признак жизни. Только Linux (прод-VPS).
+#[cfg(target_os = "linux")]
+fn spawn_udp_monitor() {
+    tokio::spawn(async move {
+        let mut prev_rcv: Option<u64> = None;
+        let mut prev_snd: Option<u64> = None;
+        let mut ticks = 0u64;
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            let Ok(snmp) = tokio::fs::read_to_string("/proc/net/snmp").await else { continue };
+            let rcv = parse_udp_snmp(&snmp, "RcvbufErrors");
+            let snd = parse_udp_snmp(&snmp, "SndbufErrors");
+            let d_rcv = match (prev_rcv, rcv) { (Some(p), Some(c)) => c.saturating_sub(p), _ => 0 };
+            let d_snd = match (prev_snd, snd) { (Some(p), Some(c)) => c.saturating_sub(p), _ => 0 };
+            prev_rcv = rcv.or(prev_rcv);
+            prev_snd = snd.or(prev_snd);
+            ticks += 1;
+            if d_rcv > 0 || d_snd > 0 {
+                log::warn!(
+                    "[host] UdpRcvbufErrors +{d_rcv} (всего {}), SndbufErrors +{d_snd} (всего {}) — ядро дропает UDP: транскод/фанаут душат CPU",
+                    rcv.unwrap_or(0), snd.unwrap_or(0),
+                );
+            } else if ticks % 30 == 0 { // раз в 5 мин
+                log::info!("[host] UDP-буферы чисты (Rcvbuf {}, Sndbuf {})", rcv.unwrap_or(0), snd.unwrap_or(0));
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_udp_monitor() {} // dev на Windows/macOS — /proc/net/snmp нет
+
 #[tokio::main]
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -310,6 +367,7 @@ async fn main() {
     };
     let streams: Streams = Arc::new(Mutex::new(HashMap::new()));
     let renditions: Renditions = Arc::new(Mutex::new(HashMap::new()));
+    spawn_udp_monitor();
 
     let mut backoff = 1u64;
     loop {
@@ -328,5 +386,39 @@ async fn main() {
             }
         }
         backoff = (backoff * 2).min(30);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_udp_snmp;
+
+    // Реальная форма /proc/net/snmp (усечённая): две Udp:-строки, имена и значения.
+    const SNMP: &str = "\
+Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti
+Udp: 123456 12 0 654321 66138 42 0 0
+UdpLite: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors
+UdpLite: 0 0 0 0 0 0 0";
+
+    #[test]
+    fn parses_rcvbuf_errors() {
+        assert_eq!(parse_udp_snmp(SNMP, "RcvbufErrors"), Some(66138));
+        assert_eq!(parse_udp_snmp(SNMP, "SndbufErrors"), Some(42));
+        assert_eq!(parse_udp_snmp(SNMP, "InErrors"), Some(0));
+    }
+
+    #[test]
+    fn missing_field_is_none() {
+        assert_eq!(parse_udp_snmp(SNMP, "NoSuchColumn"), None);
+        assert_eq!(parse_udp_snmp("", "RcvbufErrors"), None);
+        // Только заголовок без значений — тоже None (position найдена, но строки значений нет).
+        assert_eq!(parse_udp_snmp("Udp: RcvbufErrors\n", "RcvbufErrors"), None);
+    }
+
+    // UdpLite-строки не должны спутаться с Udp: (префикс strip точный, "Udp:" != "UdpLite:").
+    #[test]
+    fn udplite_not_confused() {
+        let only_lite = "UdpLite: RcvbufErrors\nUdpLite: 999";
+        assert_eq!(parse_udp_snmp(only_lite, "RcvbufErrors"), None);
     }
 }
