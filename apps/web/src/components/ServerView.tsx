@@ -1507,9 +1507,10 @@ function QualityMenu({ identity, onClose }: { identity: string; onClose: () => v
 function Stage({ minimized, setMin }: { minimized: boolean; setMin: (v: boolean) => void }) {
   const eng = useEngine();
   const streams = eng.streams;
-  const cls = 'n' + Math.min(streams.length, 2);
+  // Грид: 1 плитка — на всю; 2 — 1×2; 3-4 — 2×2; 5+ (свой стрим + 4 чужих) — 2×N с автопереносом.
+  const gridCls = streams.length >= 5 ? 'n4' : streams.length >= 3 ? 'n' + streams.length : streams.length === 2 ? 'n2' : '';
   const grid = (
-    <div id="grid" className={streams.length >= 2 ? 'n2' : ''} style={{ display: streams.length ? 'grid' : 'none' }}>
+    <div id="grid" className={gridCls} style={{ display: streams.length ? 'grid' : 'none' }}>
       {streams.map((s) => <StreamTile key={s.key} streamKey={s.key} identity={s.identity} isLocal={s.isLocal} appName={s.appName} appIcon={s.appIcon} />)}
     </div>
   );

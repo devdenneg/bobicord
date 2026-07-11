@@ -51,6 +51,7 @@ type EmoteListener = (streamerId: string, emoteId: string, by: string, x: number
 export type LevelListener = (level: number, open: boolean, threshold: number) => void;
 
 // шкала чувствительности ввода: rms(0..1) -> dB(-80..0) -> норм.уровень(0..1), сравнимый с порогом
+const WATCH_MAX = 4; // грид: сколько чужих стримов зритель смотрит разом (веб — tree-WS/PC на стрим, натив — Rust relay-слот на стрим)
 const MIN_DB = -50; // шкала подогнана под уже обработанный браузером сигнал (AGC/NS), а не под теоретический динамический диапазон
 function rmsToDb(rms: number): number { if (rms <= 0) return MIN_DB; return Math.max(MIN_DB, Math.min(0, 20 * Math.log10(rms))); }
 function dbToNorm(db: number): number { return Math.max(0, Math.min(1, (db - MIN_DB) / -MIN_DB)); }
@@ -1124,10 +1125,13 @@ export class Engine {
   // остаётся базовым identity; смена качества (Д4) = closeWatch()+watch(identity, q). transportFor
   // не меняется (пин по identity).
   watch(identity: string, quality: string = 'source') {
-    // Смотрим ТОЛЬКО ОДИН стрим одновременно: закрываем все прочие открытые/подключающиеся.
-    // Это и требование продукта, и защита: grid верстается лишь под 1-2 плитки, а каждый tree-watch
-    // держит свой PC/relay — множественный просмотр перегружал и путал teardown при остановке одного.
-    for (const other of [...this.watching]) if (other !== identity) this.closeWatch(other);
+    // Грид до WATCH_MAX стримов одновременно (веб: свой tree-WS/PC на стрим; натив: свой
+    // Rust relay-слот на стрим, WatchState = HashMap). Кап — единая точка для обоих клиентов
+    // (натив идёт сюда же через treeVideo.watch). Уже смотрим этот стрим → no-op (guard в транспорте).
+    if (!this.watching.has(identity) && this.watching.size >= WATCH_MAX) {
+      this.hooks.toast(`Максимум ${WATCH_MAX} трансляции одновременно — закрой одну`, 'warn');
+      return;
+    }
     // no `this.room` participant guard here: a tree broadcaster (Э2) is a native peer,
     // not a LiveKit room participant (voice and video are separate transports now) —
     // existence is the VideoTransport's job (it no-ops safely on an unknown identity).

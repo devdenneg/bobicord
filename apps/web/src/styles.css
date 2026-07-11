@@ -434,7 +434,12 @@
   /* stage (reused) */
   #stage{background:#090b0f;display:none;align-items:center;justify-content:center;min-height:0;padding:14px;position:relative}
   #content.split #stage{display:flex}
-  #grid{display:grid;gap:10px;width:100%;height:100%;grid-template-columns:1fr}#grid.n2{grid-template-columns:1fr 1fr}
+  #grid{display:grid;gap:10px;width:100%;height:100%;grid-template-columns:1fr;grid-auto-rows:1fr}
+  #grid.n2{grid-template-columns:1fr 1fr}
+  /* 3-4 плитки — сетка 2×2 (у трёх последняя занимает нижний ряд целиком); 5+ — 2 колонки с автопереносом рядов */
+  #grid.n3,#grid.n4{grid-template-columns:1fr 1fr}
+  #grid.n3 .vwrap:first-child{grid-column:1 / -1}
+  @media(max-width:640px){#grid.n2,#grid.n3,#grid.n4{grid-template-columns:1fr}#grid.n3 .vwrap:first-child{grid-column:auto}}
   .vwrap{position:relative;background:#000;border-radius:var(--r-md);overflow:hidden;display:flex;border:1px solid var(--line-2);transition:opacity .15s,transform .15s}
   .vwrap.leaving{opacity:0;transform:scale(.96)}
   .vwrap video{width:100%;height:100%;object-fit:contain;background:#000;opacity:0;transition:opacity .22s ease-out}

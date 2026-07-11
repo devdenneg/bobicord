@@ -5,6 +5,7 @@ mod branding;
 pub mod diag;
 mod hotkeys;
 
+use std::collections::HashMap;
 use tokio::sync::Mutex;
 
 #[tauri::command]
@@ -39,31 +40,6 @@ struct GameInfo { name: String, icon: Option<String> }
 // Имя — заголовок окна (у игр обычно человекочитаемый), фолбэк — имя exe. Иконка — PNG base64
 // (переиспользуем icon.rs, тот же путь, что для стрим-пикера). Только метаданные окна/exe: НЕ
 // читаем память игры и не инжектим → безопасно для анти-читов.
-// Блоклист для ЭВРИСТИКИ-ФОЛБЭКА (шаг 2 detect_game). Позитивный аллоулист (games.rs) первичен;
-// сюда падают только полноэкранные foreground-окна ВНЕ списка игр Windows, и тут отсекается всё, что
-// на весь экран, но игрой не является. Расширен медиаплеерами/конференциями/удалёнкой/обоями —
-// именно они дают полноэкранные ложняки, которые прежний узкий список пропускал.
-const GAME_BLOCK: &[&str] = &[
-  // наш апп / браузеры / IDE / лаунчеры / шелл
-  "relayapp", "explorer", "chrome", "firefox", "msedge", "brave", "opera", "vivaldi",
-  "yandex", "arc", "zen", "chromium", "librewolf", "waterfox", "thorium", "msedgewebview2",
-  "code", "devenv", "rider64", "idea64", "pycharm64", "sublime_text", "discord",
-  "steam", "steamwebhelper", "epicgameslauncher", "battlenet", "spotify", "telegram",
-  "whatsapp", "obs64", "obs", "notepad", "cmd", "powershell", "windowsterminal", "wt",
-  "taskmgr", "searchhost", "searchapp", "startmenuexperiencehost", "shellexperiencehost",
-  "applicationframehost", "textinputhost", "dwm", "sihost", "systemsettings", "lockapp",
-  // медиаплееры (полноэкранное видео ≠ игра)
-  "vlc", "mpc-hc64", "mpc-hc", "mpc-be64", "mpv", "potplayermini64", "potplayer",
-  "kodi", "plex", "plexmediaplayer", "jellyfinmediaplayer", "wmplayer", "smplayer",
-  // конференции / удалёнка / стриминг рабочего стола
-  "zoom", "ms-teams", "teams", "msteams", "webex", "skype", "mstsc", "parsecd", "parsec",
-  "moonlight", "anydesk", "teamviewer", "rustdesk", "sunshine",
-  // офис / просмотр документов
-  "powerpnt", "soffice", "sumatrapdf", "acrobat", "acrord32",
-  // обои / оверлеи
-  "wallpaper32", "wallpaper64", "wallpaperengine", "livelywpf", "lively",
-];
-
 fn game_info_from(hwnd: isize, title: &str, stem: &str, pid: u32) -> GameInfo {
   let t = title.trim();
   let name: String = if t.is_empty() {
@@ -79,12 +55,6 @@ fn game_info_from(hwnd: isize, title: &str, stem: &str, pid: u32) -> GameInfo {
 fn exe_stem(process: &str) -> String {
   let e = process.to_lowercase();
   e.strip_suffix(".exe").unwrap_or(e.as_str()).to_string()
-}
-
-// Фолбэк-эвристика: имя exe годится в «игру», если НЕ в блоклисте.
-fn allowed_game(process: &str) -> Option<String> {
-  let stem = exe_stem(process);
-  if stem.is_empty() || GAME_BLOCK.contains(&stem.as_str()) { None } else { Some(stem) }
 }
 
 // Веб фетчит /api/detectable-games (сервер дистиллирует список Discord) и передаёт сюда — главный
@@ -141,7 +111,10 @@ fn foreground_fullscreen() -> bool {
 }
 
 struct BroadcastState(Mutex<Option<broadcast::BroadcastHandle>>);
-struct WatchState(Mutex<Option<broadcast::relay::RelayHandle>>);
+// Грид: до WATCH_MAX (кап держит JS engine) одновременных watch-слотов, ключ — stream_id.
+// Раньше был один Option-слот (один просмотр за раз); теперь каждый стрим грида — свой RelayHandle,
+// а команды answer/ice/reparent маршрутизируются по stream_id (relay-core уже тегирует свои webview-события).
+struct WatchState(Mutex<HashMap<String, broadcast::relay::RelayHandle>>);
 
 #[tauri::command]
 async fn start_broadcast(
@@ -203,7 +176,7 @@ async fn start_broadcast(
 
 // Э8: нативный relay-viewer. Rust держит upstream к родителю в дереве, ретранслирует детям
 // (passthrough) и показывает поток в этом webview через IPC (события relay-watch-offer/-ice,
-// команды watch_answer/watch_ice). Один активный watch за раз (как и broadcast).
+// команды watch_answer/watch_ice). Грид: до WATCH_MAX watch-слотов разом (ключ stream_id, кап в JS engine).
 #[tauri::command]
 async fn start_watch(
   app: tauri::AppHandle,
@@ -217,9 +190,14 @@ async fn start_watch(
   pinned: Option<bool>,
   available_outgoing: Option<u32>,
 ) -> Result<(), String> {
-  let mut slot = state.0.lock().await;
-  if let Some(old) = slot.take() { old.stop(); }
-  diag::reset(); // см. start_broadcast
+  let key = stream_id.clone();
+  let mut slots = state.0.lock().await;
+  // Ре-watch того же стрима (смена качества/реконнект) — гасим прежний слот этого же ключа,
+  // ЧУЖИЕ слоты грида не трогаем.
+  if let Some(old) = slots.remove(&key) { old.stop(); }
+  // Буфер диага один на процесс — сбрасываем только на ПЕРВЫЙ watch грида, иначе открытие
+  // второй плитки затёрло бы лог первой (см. start_broadcast).
+  if slots.is_empty() { diag::reset(); }
   // UiSink: relay-ядро (relay-core) не знает про Tauri — события webview (relay-watch-offer/
   // -ice, relay-topology) уходят через колбэк-обёртку над app.emit.
   let ui: broadcast::relay::UiSink = {
@@ -243,33 +221,34 @@ async fn start_watch(
     idle_exit: None, // натив смотрит стрим сам — уходим только по Stop
     reconnect: true, // рестарт сервера (деплой) не рвёт просмотр
   });
-  *slot = Some(handle);
+  slots.insert(key, handle);
   Ok(())
 }
 
 #[tauri::command]
-async fn stop_watch(state: tauri::State<'_, WatchState>) -> Result<(), String> {
-  if let Some(h) = state.0.lock().await.take() { h.stop(); }
+async fn stop_watch(state: tauri::State<'_, WatchState>, stream_id: String) -> Result<(), String> {
+  if let Some(h) = state.0.lock().await.remove(&stream_id) { h.stop(); }
   Ok(())
 }
 
-// Ответ webview на локальный offer relay-показа (см. relay-watch-offer).
+// Ответ webview на локальный offer relay-показа (см. relay-watch-offer). Маршрут по stream_id —
+// у грида несколько активных relay-слотов, answer относится к конкретному.
 #[tauri::command]
-async fn watch_answer(state: tauri::State<'_, WatchState>, sdp: String) -> Result<(), String> {
-  if let Some(h) = state.0.lock().await.as_ref() { h.webview_answer(sdp); }
+async fn watch_answer(state: tauri::State<'_, WatchState>, stream_id: String, sdp: String) -> Result<(), String> {
+  if let Some(h) = state.0.lock().await.get(&stream_id) { h.webview_answer(sdp); }
   Ok(())
 }
 
 #[tauri::command]
-async fn watch_ice(state: tauri::State<'_, WatchState>, candidate: serde_json::Value) -> Result<(), String> {
-  if let Some(h) = state.0.lock().await.as_ref() { h.webview_ice(candidate); }
+async fn watch_ice(state: tauri::State<'_, WatchState>, stream_id: String, candidate: serde_json::Value) -> Result<(), String> {
+  if let Some(h) = state.0.lock().await.get(&stream_id) { h.webview_ice(candidate); }
   Ok(())
 }
 
 // Э8: ручной выбор пира зрителем из UI дерева (target=Some) или авто-миграция (target=None).
 #[tauri::command]
-async fn watch_reparent(state: tauri::State<'_, WatchState>, target: Option<String>) -> Result<(), String> {
-  if let Some(h) = state.0.lock().await.as_ref() { h.request_reparent(target); }
+async fn watch_reparent(state: tauri::State<'_, WatchState>, stream_id: String, target: Option<String>) -> Result<(), String> {
+  if let Some(h) = state.0.lock().await.get(&stream_id) { h.request_reparent(target); }
   Ok(())
 }
 
@@ -348,7 +327,7 @@ pub fn run() {
     .plugin(tauri_plugin_dialog::init())
     .plugin(tauri_plugin_fs::init())
     .manage(BroadcastState(Mutex::new(None)))
-    .manage(WatchState(Mutex::new(None)))
+    .manage(WatchState(Mutex::new(HashMap::new())))
     .setup(|app| {
       // Раньше висело за cfg!(debug_assertions) — в релизном билде (то, что реально
       // ставят и тестируют) log::info!/warn!/error! по всему broadcast:: были

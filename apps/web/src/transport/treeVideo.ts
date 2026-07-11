@@ -141,10 +141,9 @@ export class TreeVideoTransport implements VideoTransport {
   private topologyCbs = new Set<(streamId: string) => void>();
   private reparentDeniedCbs = new Set<(streamId: string, reason: string) => void>();
   private renditionUnavailableCbs = new Set<(streamId: string, rendition: string, reason: string) => void>();
+  // Грид: watch-слот на каждый стрим (Rust WatchState = HashMap по stream_id). stopNativeWatch(streamId)
+  // адресный — teardown одного стрима не трогает остальные плитки.
   private nativeWatches = new Map<string, NativeWatchState>();
-  // Rust держит ОДИН watch-слот, stopNativeWatch() ГЛОБАЛЕН. Трекаем, какой стрим реально в слоте —
-  // чтобы стоп/teardown ЧУЖОГО стрима не рубил активный просмотр (bug: «стоп одного стрима гасит другой»).
-  private currentNativeWatch: string | null = null;
 
   private streamStartCbs = new Set<(identity: string, silent: boolean) => void>();
   private streamStopCbs = new Set<(identity: string) => void>();
@@ -663,9 +662,8 @@ export class TreeVideoTransport implements VideoTransport {
       st.unlisten.push(await onNativeWatchEnded(endCb));
     } catch { /**/ }
     if (st.closed) { st.unlisten.forEach((u) => { try { u(); } catch { /**/ } }); return; }
-    // Rust держит ОДИН watch-слот (WatchState). Явно останавливаем прошлый ПЕРЕД стартом нового
-    // и ждём — иначе fire-and-forget stopNativeWatch предыдущего стрима мог прийти на Rust ПОСЛЕ
-    // start нового и снести уже его (гонка при переключении A→B). Первый watch: слот пуст, no-op.
+    // Грид: Rust держит watch-слот НА КАЖДЫЙ стрим (WatchState = HashMap по stream_id). Стартуем
+    // независимо — чужие слоги не трогаем, стоп идёт по этому же streamId (см. nativeUnwatch).
     // Roadmap-flow-стриминга Д6: реальный upload зрителя из Д5-probe-кэша (тот же механизм, что
     // мерил вещатель — webrtc-rs BWE незрел, Chromium GCC надёжнее). Есть свежий кэш → отдаём
     // серверу (он решит ёмкость: запас upload → ветвление 1→2). Нет кэша → фоновый замер прогреет
@@ -689,9 +687,7 @@ export class TreeVideoTransport implements VideoTransport {
       else if (!cached) void measureUpload().catch(() => {}); // прогрев кэша, fire-and-forget
     } catch { /**/ }
     try {
-      await stopNativeWatch().catch(() => {});
       await startNativeWatch(streamId, this.me, this.serverId, NATIVE_RELAY_CAPACITY, st.quality, st.pinned, availableOutgoing);
-      this.currentNativeWatch = streamId; // этот стрим теперь в Rust-слоте
     }
     catch { this.nativeUnwatch(streamId, st); }
   }
@@ -699,7 +695,7 @@ export class TreeVideoTransport implements VideoTransport {
     if (st.pc) { try { st.pc.close(); } catch { /**/ } }
     const pc = new RTCPeerConnection({ iceServers: this.iceServers.length ? this.iceServers : DEFAULT_ICE_SERVERS });
     st.pc = pc;
-    pc.onicecandidate = (e) => { if (e.candidate) nativeWatchIce(e.candidate).catch(() => {}); };
+    pc.onicecandidate = (e) => { if (e.candidate) nativeWatchIce(streamId, e.candidate).catch(() => {}); };
     pc.ontrack = (e) => {
       bufferReceiver(e.receiver);
       this.upsertTrack(streamId, e.track);
@@ -709,7 +705,7 @@ export class TreeVideoTransport implements VideoTransport {
       preferH264(pc);
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      await nativeWatchAnswer(pc.localDescription!.sdp);
+      await nativeWatchAnswer(streamId, pc.localDescription!.sdp);
     } catch { /**/ }
   }
   private nativeUnwatch(streamId: string, st: NativeWatchState, keepVideo = false) {
@@ -723,9 +719,8 @@ export class TreeVideoTransport implements VideoTransport {
     this.topologyByStream.delete(streamId);
     this.clearDropState(streamId);
     if (!keepVideo) this.dropVideo(streamId);
-    // ГЛОБАЛЬНЫЙ Rust-стоп — ТОЛЬКО если рубим стрим, реально сидящий в слоте. Иначе teardown чужого
-    // (по discovery stream-end / реконсиляру / гонке) сносил бы АКТИВНЫЙ просмотр другого стрима.
-    if (this.currentNativeWatch === streamId) { this.currentNativeWatch = null; stopNativeWatch().catch(() => {}); }
+    // Rust-стоп адресный (по stream_id) — гасит только слот ЭТОГО стрима, прочие плитки грида целы.
+    stopNativeWatch(streamId).catch(() => {});
   }
 
   /* ---------- topology / manual peer pick ---------- */
@@ -742,7 +737,7 @@ export class TreeVideoTransport implements VideoTransport {
   requestReparent(streamId: string, targetId: string | null, reason?: string) {
     // Натив: reason в IPC не пробрасывается (нативную отбраковку по дропам делает сервер —
     // frameDropReparent); тут только ручной/ICE-fail reparent через Rust.
-    if (this.nativeWatches.has(streamId)) { nativeWatchReparent(targetId).catch(() => {}); return; }
+    if (this.nativeWatches.has(streamId)) { nativeWatchReparent(streamId, targetId).catch(() => {}); return; }
     const st = this.watches.get(streamId);
     if (st) { try { st.ws.send(JSON.stringify({ t: 'request-reparent', streamId, targetParentId: targetId, reason })); } catch { /**/ } }
   }

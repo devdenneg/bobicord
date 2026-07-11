@@ -92,7 +92,7 @@
 
 - **Tree-liveness самолечится ре-`hello`** (15с): `liveStreams` мутируют только discovery-события → потерянный `stream-live` (полуоткрытый WS) висел до F5. onHello на сервере идемпотентен (переотдаёт бэклог), клиентский `fresh`-гард без дублей. LiveKit-стримы самолечатся 3с-таймером (живой опрос комнаты).
 - `openDiscovery` при throw конструктора WS планирует ретрай (раньше discovery умирал навсегда). 2с-реконсиляр НЕ сносит активные watch (окно 4с). Закрытие прежнего сокета + гард реконнекта (только текущий сокет).
-- **Rust держит ОДИН watch-слот** (`WatchState = Mutex<Option>`), `stopNativeWatch()` глобален → зритель смотрит max 1 стрим (`engine.watch` закрывает прочие). Иначе остановка одного рубила единственный слот.
+- **Грид до 4 стримов разом** (`WATCH_MAX` в engine.ts). Rust держит watch-слот НА КАЖДЫЙ стрим (`WatchState = Mutex<HashMap<streamId, RelayHandle>>`), `stopNativeWatch(streamId)`/`watch_answer`/`watch_ice`/`watch_reparent` адресные по streamId (relay-core уже тегирует webview-события `streamId`). Кап — единая точка `engine.watch` (reject+тост на 5-м), покрывает и веб (свой tree-WS/PC на стрим), и натив. Раньше был ОДИН слот (`Mutex<Option>`, `stopNativeWatch()` глобален), `engine.watch` закрывал прочие. Грид-верстка — `#grid.n3/.n4` (2×2) в styles.css, `Stage` выбирает класс по числу плиток.
 
 ## Server-first + серверный транскод (Roadmap-flow-стриминга, Д-серия)
 

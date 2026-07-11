@@ -164,23 +164,23 @@ export async function startNativeWatch(streamId: string, identity: string, serve
   // решает ёмкость (ветвление 1→2). 0 = не измерен, сервер даёт консервативную ёмкость 1.
   await invoke('start_watch', { streamId, wsUrl: treeWsUrl(), identity, serverId, maxChildren, quality, pinned, availableOutgoing });
 }
-export async function stopNativeWatch(): Promise<void> {
+export async function stopNativeWatch(streamId: string): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');
-  await invoke('stop_watch');
+  await invoke('stop_watch', { streamId });
 }
-/** Ответ webview на локальный offer relay-показа. */
-export async function nativeWatchAnswer(sdp: string): Promise<void> {
+/** Ответ webview на локальный offer relay-показа. streamId — какой слот грида (Rust держит HashMap). */
+export async function nativeWatchAnswer(streamId: string, sdp: string): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');
-  await invoke('watch_answer', { sdp });
+  await invoke('watch_answer', { streamId, sdp });
 }
-export async function nativeWatchIce(candidate: any): Promise<void> {
+export async function nativeWatchIce(streamId: string, candidate: any): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');
-  await invoke('watch_ice', { candidate });
+  await invoke('watch_ice', { streamId, candidate });
 }
 /** Ручной выбор пира (target) или авто-миграция (null). */
-export async function nativeWatchReparent(target: string | null): Promise<void> {
+export async function nativeWatchReparent(streamId: string, target: string | null): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');
-  await invoke('watch_reparent', { target });
+  await invoke('watch_reparent', { streamId, target });
 }
 
 export async function onNativeWatchOffer(cb: (streamId: string, sdp: string) => void): Promise<() => void> {
