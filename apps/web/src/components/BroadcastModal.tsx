@@ -7,7 +7,7 @@ import { Backdrop } from './Backdrop';
 import { listMonitors, listWindows, startNativeBroadcast, setNativeBroadcastSource, stopNativeBroadcast, onBroadcastStats } from '../native';
 import { startBroadcasterSession, endAnyBroadcasterSession } from '../diag';
 import type { MonitorInfo, WindowInfo, BroadcastStats } from '../native';
-import { pickPreset, PRESETS } from '../presets';
+import { pickPreset, PRESETS, widthCapForHeight } from '../presets';
 import { measureUpload, getCachedProbe, clearCachedProbe, type ProbeResult } from '../transport/probe';
 import { FIXED_LABELS, QUALITY_FIXED, DIRECT_MIN, DIRECT_MAX, loadConfig, saveConfig, buildSource, deriveAudioPid, type SavedConfig } from '../broadcastSource';
 
@@ -164,7 +164,9 @@ export function BroadcastModal() {
       // Д8: server-first — единственный слот корня отдан vrelay (maxChildren=1). Opt-in
       // «прямые подключения» открывает N слотов вещателя: maxChildren = 1 (vrelay) + N.
       const directSlots = cfg.allowDirectPeers ? 1 + cfg.maxDirectChildren : 1;
-      await startNativeBroadcast(me.username, me.username, bcSrv, { source, maxWidth: e.w, maxHeight: e.h, fps: e.fps, bitrateBps, autoBitrate: true, audioTargetPid, maxDirectChildren: directSlots, presetMode: 'smooth' });
+      // maxWidth — кап под 32:9 (widthCapForHeight), не 16:9-ширина пресета: иначе ultrawide
+      // резался по вертикали (21:9 → 2560×1070 вместо 3440×1440). Высота (e.h) остаётся целью.
+      await startNativeBroadcast(me.username, me.username, bcSrv, { source, maxWidth: widthCapForHeight(e.h), maxHeight: e.h, fps: e.fps, bitrateBps, autoBitrate: true, audioTargetPid, maxDirectChildren: directSlots, presetMode: 'smooth' });
       // streamId вещателя == me.username. Сессия закроется в любой из трёх точек стопа.
       startBroadcasterSession(me.username);
       saveConfig(cfg);
