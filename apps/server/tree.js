@@ -762,7 +762,12 @@ function attachTreeServer(httpServer, opts) {
   // в сервере A видел бы badge/мог смотреть стрим из сервера B, о котором вообще не должен
   // знать (streamId = identity вещателя, никак не привязан к серверу сам по себе).
   function broadcastToServer(serverId, obj) {
-    for (const [pid, p] of peers) if (p.serverId === serverId) send(pid, obj);
+    // Все вызовы — discovery-события (stream-live/stream-end) для бейджей/списка стримов.
+    // Шлём ТОЛЬКО discovery-сокетам (hello без join → treeKey=null). Узлы дерева (watch/relay,
+    // treeKey задан) конец СВОЕГО стрима получают адресно (per-peer stream-end/drop-peer в onLeave);
+    // без гарда `!treeKey` stream-end ЧУЖОГО стрима прилетал в их watch/relay-сокет и ронял активный
+    // просмотр (баг: «выключение одного стрима реконнектит другой» — broadcast бил по всем сокетам).
+    for (const [pid, p] of peers) if (p.serverId === serverId && !p.treeKey) send(pid, obj);
   }
 
   // ---------- Э9: виртуальный fallback-relay ----------

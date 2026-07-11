@@ -537,6 +537,10 @@ export class TreeVideoTransport implements VideoTransport {
         // Ремень-и-подтяжки: при обрушении дерева сервер шлёт stream-end и в watch-сокеты
         // (drop-peer выше ловит только глубину 1 — parentId зрителя глубже это id relay-узла,
         // не вещателя). onclose сделает полный teardown.
+        // ГАРД по streamId: тот же тип летит discovery-broadcast'ом по всему серверу (конец ЛЮБОГО
+        // стрима) — без сверки конец ЧУЖОГО стрима закрывал бы наш watch-сокет → авто-ре-watch
+        // (баг: «выключение одного стрима реконнектит другой»). Реагируем только на конец СВОЕГО.
+        if (msg.streamId && msg.streamId !== streamId) break;
         try { st.ws.close(); } catch { /**/ }
         break;
       }

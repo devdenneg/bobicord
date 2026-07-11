@@ -165,7 +165,7 @@ pub fn connect(ws_url: String, join: JoinParams, reconnect: bool) -> (mpsc::Unbo
                         match incoming {
                             Some(Ok(Message::Text(txt))) => {
                                 if let Ok(v) = serde_json::from_str::<Value>(&txt) {
-                                    if let Some(evt) = parse_event(&v) {
+                                    if let Some(evt) = parse_event(&v, &stream_id) {
                                         if evt_tx.send(evt).is_err() { terminal = true; break; }
                                     }
                                 }
@@ -228,7 +228,7 @@ pub fn connect(ws_url: String, join: JoinParams, reconnect: bool) -> (mpsc::Unbo
     (cmd_tx, evt_rx)
 }
 
-fn parse_event(v: &Value) -> Option<TreeEvent> {
+fn parse_event(v: &Value, stream_id: &str) -> Option<TreeEvent> {
     match v.get("t")?.as_str()? {
         "welcome" => Some(TreeEvent::Welcome {
             ice_servers: v.get("iceServers").and_then(|x| x.as_array()).cloned().unwrap_or_default(),
@@ -256,7 +256,14 @@ fn parse_event(v: &Value) -> Option<TreeEvent> {
         "set-bitrate" => Some(TreeEvent::SetBitrate { bps: v.get("bps")?.as_u64()? as u32 }),
         "tree-topology" => Some(TreeEvent::Topology { payload: v.clone() }),
         "vrelay-release" => Some(TreeEvent::Release),
-        "stream-end" => Some(TreeEvent::StreamEnd),
+        // Гвардим по streamId: сервер шлёт discovery stream-end broadcast'ом по ВСЕМУ серверу
+        // (broadcastToServer) — конец ЛЮБОГО стрима прилетал и в наш relay-сокет и рвал активный
+        // watch чужим streamId (баг: «выключение одного стрима реконнектит другой»). Реагируем
+        // только на конец СВОЕГО стрима; нет поля (старый сервер) — принимаем как раньше.
+        "stream-end" => match v.get("streamId").and_then(|x| x.as_str()) {
+            Some(sid) if sid != stream_id => None,
+            _ => Some(TreeEvent::StreamEnd),
+        },
         _ => None,
     }
 }
