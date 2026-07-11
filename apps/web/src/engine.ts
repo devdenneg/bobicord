@@ -236,6 +236,12 @@ export class Engine {
       this.treeT.setQuality?.(sid, 'source');
       this.emit();
     });
+    // Бесшовное переключение (смена качества/reparent/reconnect) не доехало за failsafe —
+    // плитка закрыта, чтобы не морозить последний кадр. Тост + рефреш стримов.
+    this.treeT.onSeamlessSwitchFailed?.((_sid) => {
+      this.hooks.toast('Не удалось переключить качество — стрим прервался', 'warn');
+      this.emit();
+    });
     this.snap = this.build();
   }
 

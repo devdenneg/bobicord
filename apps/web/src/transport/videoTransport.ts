@@ -106,6 +106,9 @@ export interface VideoTransport {
   getQualityMode?(streamId: string): string | null;
   /** Д4: рендишн недоступен (агент отказал/кап/апскейл) — reason для тоста + фолбэк на source. */
   onRenditionUnavailable?(cb: (streamId: string, rendition: string, reason: string) => void): () => void;
+  /** Бесшовное переключение (смена качества/reparent/reconnect) не доехало за failsafe-таймаут:
+   *  плитка закрыта, чтобы не морозить последний кадр навсегда. Reason для тоста. Только tree. */
+  onSeamlessSwitchFailed?(cb: (streamId: string) => void): () => void;
 
   /** Только TreeVideoTransport (Э2.1) — позиция в дереве и живая RTP-статистика
    *  для дебаг-панели зрителя. LiveKit-транспорт их не реализует (там SFU, нет дерева). */

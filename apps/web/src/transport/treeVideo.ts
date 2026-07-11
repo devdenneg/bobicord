@@ -9,6 +9,7 @@ import {
   onNativeWatchOffer, onNativeWatchIce, onNativeTopology, onNativeWatchEnded,
 } from '../native';
 import { DropWindow, shouldReparentOnDrops, DROP_COOLDOWN_MS } from './dropDetector';
+import { newStallState, shouldSelfHeal, STALL_COOLDOWN_MS, type StallState } from './stallDetector';
 import { startViewerSession, endViewerSession } from '../diag';
 
 // Ёмкость нативного relay (passthrough) — сколько зрителей он ретранслирует. Rust держит
@@ -113,6 +114,9 @@ export class TreeVideoTransport implements VideoTransport {
   // Д7: скользящее окно дропов + клиентский cooldown на стрим (ключ — базовый streamId).
   private dropWindows = new Map<string, DropWindow>();
   private dropCooldownUntil = new Map<string, number>();
+  // Self-heal (диаг фризов): framesDecoded замер при live-стриме → авто re-watch (см. stallDetector).
+  private stallStates = new Map<string, StallState>();
+  private healCooldownUntil = new Map<string, number>();
   /** Живые стримы гильдии + метаданные приложения из stream-live (иконка/имя — Э-icon). */
   private liveStreams = new Map<string, StreamMeta>();
   private watches = new Map<string, WatchState>();
@@ -120,6 +124,15 @@ export class TreeVideoTransport implements VideoTransport {
   private natProbe: Promise<boolean> = Promise.resolve(false);
 
   private videoTracks = new Map<string, MediaStreamVideoHandle>();
+  // Бесшовная смена качества/reparent/reconnect: контейнер-MediaStream на streamId живёт
+  // ПОВЕРХ PC. ontrack не создаёт новый handle, а подменяет треки ВНУТРИ контейнера
+  // (removeTrack старого kind + addTrack) — <video>.srcObject остаётся тем же объектом,
+  // плитка (StreamTile, эффект по streamKey) не размонтируется, фуллскрин живёт.
+  private containers = new Map<string, MediaStream>();
+  // Failsafe бесшовного переключения: трек не приехал за N с → честный delVideo + тост
+  // (иначе вечный замороженный кадр). Снимается приходом видео-трека (upsertTrack).
+  private videoFailsafe = new Map<string, number>();
+  private switchFailedCbs = new Set<(streamId: string) => void>();
   private streamInfoByKey = new Map<string, StreamInfo>();
   private treeInfoByStream = new Map<string, TreeInfo>();
   /** Прошлые кумулятивные jitterBufferDelay/Count по стриму — для дельты в getRtpStats. */
@@ -174,6 +187,9 @@ export class TreeVideoTransport implements VideoTransport {
     this.nativeWatches.clear();
     this.liveStreams.clear();
     this.videoTracks.clear();
+    this.containers.clear();
+    this.videoFailsafe.forEach((t) => clearTimeout(t));
+    this.videoFailsafe.clear();
     this.streamInfoByKey.clear();
     this.topologyByStream.clear();
   }
@@ -282,11 +298,15 @@ export class TreeVideoTransport implements VideoTransport {
     ws.onmessage = (ev) => this.onWatchMessage(streamId, st, ev);
     ws.onclose = () => {
       if (st.closed) return;
-      this.teardownWatch(streamId, st);
+      // Стрим ещё жив → бесшовный реконнект: плитку держим (keepVideo), взводим failsafe.
+      // Стрим кончился → полный снос (discovery уже снял liveStreams).
+      const live = !this.closed && this.liveStreams.has(streamId);
+      this.teardownWatch(streamId, st, live);
       // Ре-watch: сокет оборвался (сеть/рестарт/heartbeat-terminate), но стрим ещё жив —
       // переподключаемся. Дискавери-сокет снимет liveStreams при stream-end, тогда ретрай
       // сам заглохнет (guard). Не дублируем, если watch уже пересоздан.
-      if (!this.closed && this.liveStreams.has(streamId)) {
+      if (live) {
+        this.armVideoFailsafe(streamId, 15000); // реконнект (сеть) медленнее смены качества
         setTimeout(() => {
           if (!this.closed && !this.watches.has(streamId) && !this.nativeWatches.has(streamId) && this.liveStreams.has(streamId)) this.watch(streamId, st.quality, st.pinned);
         }, 3000);
@@ -307,9 +327,14 @@ export class TreeVideoTransport implements VideoTransport {
     try { st.ws.send(JSON.stringify({ t: 'join', streamId, quality: st.quality, pinned: st.pinned, role: 'viewer', native: false, maxChildren: st.maxChildren, identity: this.me, symmetricNat, serverId: this.serverId })); } catch { /**/ }
   }
 
-  unwatch(streamId: string) {
+  // opts.keepVideo — бесшовный режим (смена качества/self-heal/reconnect): watch сносится,
+  // но плитка живёт на последнем кадре (контейнер/handle не трогаем) до нового трека.
+  // Вызывающий обязан взвести armVideoFailsafe — иначе при провале переключения кадр
+  // замёрзнет навсегда.
+  unwatch(streamId: string, opts?: { keepVideo?: boolean }) {
+    const keep = !!opts?.keepVideo;
     const nst = this.nativeWatches.get(streamId);
-    if (nst) { this.nativeUnwatch(streamId, nst); return; }
+    if (nst) { this.nativeUnwatch(streamId, nst, keep); return; }
     const st = this.watches.get(streamId);
     if (!st) return;
     // Сессия закрывается ЗДЕСЬ, а не в teardownWatch: тот зовётся и при обрыве ws с
@@ -323,18 +348,25 @@ export class TreeVideoTransport implements VideoTransport {
     this.treeInfoByStream.delete(streamId);
     this.lastJb.delete(streamId);
     this.clearDropState(streamId);
-    this.delVideo(streamId);
+    if (!keep) this.dropVideo(streamId);
   }
-  private teardownWatch(streamId: string, st: WatchState) {
+  private teardownWatch(streamId: string, st: WatchState, keepVideo = false) {
     if (st.pc) { try { st.pc.close(); } catch { /**/ } st.pc = null; }
     this.watches.delete(streamId);
     this.treeInfoByStream.delete(streamId);
     this.lastJb.delete(streamId);
     this.clearDropState(streamId);
+    if (!keepVideo) this.dropVideo(streamId);
+  }
+  // Полный снос видео-стороны: плитка, контейнер, failsafe. Единственный путь удаления
+  // контейнера — иначе застрявший failsafe/повторный teardown работают по мусору.
+  private dropVideo(streamId: string) {
+    this.clearVideoFailsafe(streamId);
+    this.containers.delete(streamId);
     this.delVideo(streamId);
   }
   // Д7: чистим окно/cooldown детектора дропов (утечка таймеров/окон — известная категория багов тут).
-  private clearDropState(streamId: string) { this.dropWindows.delete(streamId); this.dropCooldownUntil.delete(streamId); }
+  private clearDropState(streamId: string) { this.dropWindows.delete(streamId); this.dropCooldownUntil.delete(streamId); this.stallStates.delete(streamId); this.healCooldownUntil.delete(streamId); }
 
   /** Последний известный tree-info (позиция в дереве) для смотрибельного стрима. */
   getTreeInfo(streamId: string): TreeInfo | null {
@@ -406,7 +438,8 @@ export class TreeVideoTransport implements VideoTransport {
       if (!win) { win = new DropWindow(); this.dropWindows.set(streamId, win); }
       // Скрытая вкладка легитимно дропает кадры — сбрасываем окно, чтобы не тащить фоновые дельты
       // в момент возврата в visible (роадмап: «при возврате в visible — сбросить окно»).
-      if (hidden) { win.reset(); continue; }
+      // И stall-прогресс двигаем вперёд: фоновый троттлинг декода — не заморозка.
+      if (hidden) { win.reset(); const ss = this.stallStates.get(streamId); if (ss) ss.lastProgressAt = now; continue; }
       let report: RTCStatsReport;
       try { report = await pc.getStats(); } catch { continue; }
       let sample: { framesDropped: number; framesDecoded: number; packetsLost: number } | null = null;
@@ -418,6 +451,24 @@ export class TreeVideoTransport implements VideoTransport {
       }
       if (!sample) continue;
       win.push({ t: now, ...sample });
+      // Self-heal: декодер заклинил (framesDecoded замер) при живом стриме → бесшовный re-watch.
+      // Проверяем ДО reparent-решения (у которого свои `continue`), иначе на «спокойных» тиках
+      // (нет дропов) self-heal никогда не дошёл бы. Гейт liveStreams — не хилим кончившийся стрим.
+      if (this.liveStreams.has(streamId)) {
+        let ss = this.stallStates.get(streamId);
+        if (!ss) { ss = newStallState(now); this.stallStates.set(streamId, ss); }
+        const healCd = this.healCooldownUntil.get(streamId) || 0;
+        if (shouldSelfHeal(ss, sample.framesDecoded, now, { hidden, cooldownUntil: healCd })) {
+          this.healCooldownUntil.set(streamId, now + STALL_COOLDOWN_MS);
+          const cur = this.watches.get(streamId) || this.nativeWatches.get(streamId);
+          const q = cur?.quality ?? 'source'; const p = cur?.pinned ?? false;
+          console.warn(`[tree] self-heal: framesDecoded замер — re-watch ${streamId}`);
+          this.unwatch(streamId, { keepVideo: true });
+          this.watch(streamId, q, p);
+          this.armVideoFailsafe(streamId);
+          continue; // PC этого стрима снесён — дальнейший reparent-путь не про него
+        }
+      }
       const cooldownUntil = this.dropCooldownUntil.get(streamId) || 0;
       if (!shouldReparentOnDrops({ deltas: win.deltas(), hidden, now, cooldownUntil })) continue;
       // Прямой ребёнок СЕРВЕРНОГО узла (vrelay/рендишн-корень): pickParent лучшего не найдёт
@@ -448,7 +499,11 @@ export class TreeVideoTransport implements VideoTransport {
         break;
       }
       case 'assign-parent': {
-        if (st.pc) { try { st.pc.close(); } catch { /**/ } st.pc = null; this.delVideo(streamId); }
+        // Reparent: старый upstream-PC закрываем, но плитку ДЕРЖИМ (контейнер живёт) — новый
+        // offer от нового родителя приведёт трек в тот же <video> (upsertTrack). Failsafe
+        // страхует, если новый родитель не подаёт трек. Раньше delVideo здесь ронял окно на
+        // каждый reparent (чёрный пропад, вылет из фуллскрина).
+        if (st.pc) { try { st.pc.close(); } catch { /**/ } st.pc = null; this.armVideoFailsafe(streamId); }
         st.parentId = msg.parentId || null;
         break;
       }
@@ -525,8 +580,12 @@ export class TreeVideoTransport implements VideoTransport {
     // сносился и поднимался заново, а у натива watch-слот один глобальный → стрим закрывался
     // (прод, 2026-07-09). Дерево не меняется — правим pin на месте.
     if (cur && cur.quality === quality) { cur.pinned = pinned; return; }
-    this.unwatch(streamId);
+    // Бесшовно: сносим watch, но контейнер/handle держим — <video> продолжает показывать
+    // последний кадр, пока новый трек не приедет в тот же srcObject. Failsafe снимет плитку,
+    // если трек так и не пришёл (рендишн не поднялся / оборвался).
+    this.unwatch(streamId, { keepVideo: true });
     this.watch(streamId, quality, pinned);
+    this.armVideoFailsafe(streamId);
   }
   // Текущий режим для подсветки пункта меню. pinned → рендишн; иначе 'auto' (сервер мог
   // авто-двигать между деревьями — в auto показываем «Авто», реальный рендишн прозрачен).
@@ -559,9 +618,8 @@ export class TreeVideoTransport implements VideoTransport {
     };
     pc.ontrack = (e) => {
       bufferReceiver(e.receiver);
-      if (e.track.kind !== 'video') return;
-      const handle = new MediaStreamVideoHandle(e.streams[0] || new MediaStream([e.track]));
-      this.addVideo(streamId, handle, streamId, false);
+      // Оба kind в контейнер: аудио стрима едет тем же <video> (см. upsertTrack).
+      this.upsertTrack(streamId, e.track);
     };
     try {
       await pc.setRemoteDescription({ type: 'offer', sdp });
@@ -586,7 +644,10 @@ export class TreeVideoTransport implements VideoTransport {
     // мёртвый локальный watch; если стрим по discovery ещё жив — тут же переустанавливаем (авто-recovery).
     const endCb = (sid: string) => {
       if (sid !== streamId || st.closed) return;
-      this.unwatch(streamId);
+      // Стрим по discovery ещё жив → бесшовно (плитку держим, тут же переустановим watch).
+      const live = !this.closed && this.liveStreams.has(streamId);
+      this.unwatch(streamId, { keepVideo: live });
+      if (live) this.armVideoFailsafe(streamId);
       setTimeout(() => {
         if (!this.closed && this.liveStreams.has(streamId) && !this.nativeWatches.has(streamId) && !this.watches.has(streamId)) this.watch(streamId, st.quality, st.pinned);
       }, 1500);
@@ -637,9 +698,7 @@ export class TreeVideoTransport implements VideoTransport {
     pc.onicecandidate = (e) => { if (e.candidate) nativeWatchIce(e.candidate).catch(() => {}); };
     pc.ontrack = (e) => {
       bufferReceiver(e.receiver);
-      if (e.track.kind !== 'video') return;
-      const handle = new MediaStreamVideoHandle(e.streams[0] || new MediaStream([e.track]));
-      this.addVideo(streamId, handle, streamId, false);
+      this.upsertTrack(streamId, e.track);
     };
     try {
       await pc.setRemoteDescription({ type: 'offer', sdp });
@@ -649,7 +708,7 @@ export class TreeVideoTransport implements VideoTransport {
       await nativeWatchAnswer(pc.localDescription!.sdp);
     } catch { /**/ }
   }
-  private nativeUnwatch(streamId: string, st: NativeWatchState) {
+  private nativeUnwatch(streamId: string, st: NativeWatchState, keepVideo = false) {
     endViewerSession(streamId);
     st.closed = true;
     st.unlisten.forEach((u) => { try { u(); } catch { /**/ } });
@@ -659,7 +718,7 @@ export class TreeVideoTransport implements VideoTransport {
     this.lastJb.delete(streamId);
     this.topologyByStream.delete(streamId);
     this.clearDropState(streamId);
-    this.delVideo(streamId);
+    if (!keepVideo) this.dropVideo(streamId);
     // ГЛОБАЛЬНЫЙ Rust-стоп — ТОЛЬКО если рубим стрим, реально сидящий в слоте. Иначе teardown чужого
     // (по discovery stream-end / реконсиляру / гонке) сносил бы АКТИВНЫЙ просмотр другого стрима.
     if (this.currentNativeWatch === streamId) { this.currentNativeWatch = null; stopNativeWatch().catch(() => {}); }
@@ -701,6 +760,35 @@ export class TreeVideoTransport implements VideoTransport {
     this.streamInfoByKey.set(key, { key, identity, isLocal, appName: meta?.appName, appIcon: meta?.appIcon });
     this.videoTrackCbs.forEach((cb) => cb(key, handle, identity, isLocal));
   }
+  /** ontrack обоих путей (браузер/натив): кладёт трек в контейнер стрима, подменяя прежний
+   *  того же kind. Handle создаётся ОДИН раз на контейнер — повторные треки (смена качества,
+   *  reparent, reconnect) переключаются внутри того же srcObject, плитка не пересоздаётся. */
+  private upsertTrack(streamId: string, track: MediaStreamTrack) {
+    let c = this.containers.get(streamId);
+    if (!c) { c = new MediaStream(); this.containers.set(streamId, c); }
+    for (const old of c.getTracks()) if (old.kind === track.kind && old !== track) c.removeTrack(old);
+    if (!c.getTracks().includes(track)) c.addTrack(track);
+    if (track.kind === 'video') this.clearVideoFailsafe(streamId);
+    if (!this.videoTracks.has(streamId)) this.addVideo(streamId, new MediaStreamVideoHandle(c), streamId, false);
+  }
+  /** Взвести failsafe бесшовного переключения: трек не пришёл за ms → снос плитки + тост
+   *  (иначе вечный замороженный кадр). Перевзводится на каждый вызов; снимает upsertTrack. */
+  private armVideoFailsafe(streamId: string, ms = 10_000) {
+    this.clearVideoFailsafe(streamId);
+    this.videoFailsafe.set(streamId, window.setTimeout(() => {
+      this.videoFailsafe.delete(streamId);
+      if (!this.videoTracks.has(streamId)) return; // плитки уже нет — нечего сносить
+      this.containers.delete(streamId);
+      this.delVideo(streamId);
+      this.switchFailedCbs.forEach((cb) => cb(streamId));
+    }, ms));
+  }
+  private clearVideoFailsafe(streamId: string) {
+    const t = this.videoFailsafe.get(streamId);
+    if (t != null) { clearTimeout(t); this.videoFailsafe.delete(streamId); }
+  }
+  /** Failsafe сработал: бесшовное переключение не доехало, плитка закрыта (для тоста). */
+  onSeamlessSwitchFailed(cb: (streamId: string) => void) { this.switchFailedCbs.add(cb); return () => { this.switchFailedCbs.delete(cb); }; }
   private delVideo(key: string) {
     if (!this.videoTracks.has(key)) return;
     this.videoTracks.delete(key);
