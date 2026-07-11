@@ -110,7 +110,7 @@ export function StreamerWidget() {
   // Свёрнутый вид — одна строка: иконка + счётчик зрителей + развернуть.
   if (collapsed) {
     return (
-      <div className="sw sw-collapsed">
+      <div className="strw sw-collapsed">
         <button className="sw-cbar" onClick={() => setCollapsed(false)} data-tip="Развернуть виджет трансляции">
           <span className="sw-live"><Icon name="screen" sm /></span>
           <span className="sw-ctitle">Трансляция</span>
@@ -122,7 +122,7 @@ export function StreamerWidget() {
   }
 
   return (
-    <div className="sw">
+    <div className="strw">
       <div className="sw-head">
         <span className="sw-live"><Icon name="screen" sm /></span>
         <div className="sw-htxt"><b>Трансляция идёт</b><span title={stats?.source || ''}>{stats?.source || 'подготовка…'}</span></div>

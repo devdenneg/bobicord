@@ -784,8 +784,10 @@
   .vd-devitem:hover{background:var(--panel3)}
   .vd-devitem.on{color:var(--green);background:rgba(35,165,89,.12)}
   /* Виджет вещателя (StreamerWidget): ОТДЕЛЬНАЯ карточка над голосовым доком (не сливается с ним) —
-     свой отступ, рамка кругом, скругление и тень; зазор показывает фон #channels под карточкой. */
-  .sw{flex:0 0 auto;margin:8px 8px 0;background:var(--bg2);border:1px solid var(--line-2);border-radius:12px;box-shadow:var(--sh-2);padding:10px;display:flex;flex-direction:column;gap:8px;min-width:0}
+     свой отступ, рамка кругом, скругление и тень; зазор показывает фон #channels под карточкой.
+     Класс .strw, НЕ .sw — .sw занят тумблером-переключателем (line 82: width:42px;height:24px),
+     коллизия схлопывала виджет в 24px и дети вываливались поверх голосового дока. */
+  .strw{flex:0 0 auto;margin:8px 8px 0;background:var(--bg2);border:1px solid var(--line-2);border-radius:12px;box-shadow:var(--sh-2);padding:10px;display:flex;flex-direction:column;gap:8px;min-width:0}
   .sw-collapsed{padding:7px 9px}
   .sw-cbar{display:flex;align-items:center;gap:8px;width:100%;padding:5px 7px;border-radius:9px;background:var(--panel3);color:var(--txt);box-shadow:var(--sh-1),inset 0 0 0 1px rgba(255,255,255,.05);cursor:pointer;text-align:left}
   .sw-cbar:hover{background:var(--panel4);color:var(--txt-h)}
