@@ -37,9 +37,12 @@ use crate::link::{now_ms, H264_FMTP};
 
 /// Payload type H.264 в дереве (согласован с relay.rs / peer.rs MediaEngine).
 const PT_H264: u8 = 102;
-/// Потолок глубины очереди меток кадров (per-frame латентность) — страховка от дрейфа,
-/// если энкодер дропнет/задублирует кадр и вход/выход разойдутся.
-const MARK_QUEUE_CAP: usize = 240;
+/// Потолок глубины очереди меток кадров (per-frame латентность). Вход и выход расходятся
+/// СИСТЕМАТИЧЕСКИ: fps=30-фильтр дропает кадры 60fps-исходника (метка на каждый входной
+/// кадр, поп — на каждый выходной), и при капе 240 очередь за ~8с доезжала до потолка,
+/// после чего EWMA-латентность мерила возраст 240-кадровой давности (секунды мусора).
+/// Кап 8 ограничивает смещение метрики ~130мс; сама метрика при дропе кадров — приближённая.
+const MARK_QUEUE_CAP: usize = 8;
 /// Максимум подряд-рестартов ffmpeg до капитуляции (сломанный бинарь/аргументы — не крутить вечно).
 const MAX_RESTARTS: u64 = 10;
 
@@ -368,10 +371,15 @@ async fn if_break_on_stop(stop: &Notify) {
 }
 
 /// Аргументы ffmpeg-энкодера рендишна. CBR+HRD (nal-hrd=cbr, minrate=maxrate=bufsize),
-/// scale без апскейла (min(iw,W)/min(ih,H)), GOP 60 (2с@30fps), без B-кадров, low-latency.
+/// без B-кадров, low-latency. Выход капнут 30fps: `fps=30` ПЕРВЫМ звеном -vf — дроп кадров
+/// ДО scale (минус ~половина CPU скейла+энкода на 60fps-исходнике; один 1080p-ffmpeg на
+/// 2 vCPU боксе ел ядро целиком и отставал, latency 1.3с — диаг 2026-07-11). Заодно `-g 60`
+/// становится честными 2с при ЛЮБОМ исходнике: fps в транскод не прокидывается, и на
+/// 60fps-входе GOP был 1с — IDR-шторм рендишна. fps=30 = честный CFR, консистентен с
+/// force-cfr=1. Scale без апскейла (min(iw,W)/min(ih,H)).
 fn ffmpeg_args(sdp_path: &str, w: u32, h: u32, bitrate: u32, out_port: u16) -> Vec<String> {
     let vf = format!(
-        "scale='min({w},iw)':'min({h},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2"
+        "fps=30,scale='min({w},iw)':'min({h},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2"
     );
     let bufsize = bitrate; // ~1× битрейт — минимальная HRD-задержка
     let x264 = "nal-hrd=cbr:force-cfr=1".to_string();
@@ -382,7 +390,7 @@ fn ffmpeg_args(sdp_path: &str, w: u32, h: u32, bitrate: u32, out_port: u16) -> V
         "-i".into(), sdp_path.into(),
         "-an".into(),
         "-c:v".into(), "libx264".into(),
-        "-preset".into(), "superfast".into(),
+        "-preset".into(), "ultrafast".into(),
         "-tune".into(), "zerolatency".into(),
         "-profile:v".into(), "baseline".into(),
         "-pix_fmt".into(), "yuv420p".into(),
