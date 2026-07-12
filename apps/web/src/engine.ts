@@ -34,6 +34,7 @@ export interface Snapshot {
   channelActiveSince: Record<string, number>; // channelId -> epoch ms первого захода в ПУСТОЙ канал (таймер в списке каналов, как в Discord)
   deafened: boolean;
   localMicMuted: boolean;
+  micUnavailable: boolean; // зашёл в голосовой без микрофона (нет доступа) — listen-only
   pttDown: boolean;
   presence: Record<string, PeerState>;
   speaking: Record<string, boolean>;
@@ -111,6 +112,7 @@ export class Engine {
   private pingMs: number | null = null;          // RTT до сервера, мс (опрос статистики в голосовом)
   private connTimer: number | null = null;       // таймер опроса пинга (только в голосовом)
   private deafened = localStorage.getItem('voiceDeaf') === '1'; // персист: пред-установка «оглох» до входа (Discord-стиль)
+  private noMic = false; // зашёл в голосовой без микрофона (нет доступа) — listen-only, НЕ персист
   private pttDown = false;
   private watchTimers = new Map<string, number>();
 
@@ -328,7 +330,7 @@ export class Engine {
       connected: !!this.viewRoom, roomReady: this.roomReady, reconnecting: this.reconnecting,
       voiceQuality: this.inVoice ? this.connQuality : 'unknown', voicePing: this.inVoice ? this.pingMs : null,
       inVoice: this.inVoice, voiceConnecting: this.inVoice && this.voiceConnecting, myVoiceChannel: this.currentVc, voiceServerId: this.voiceServerId, voiceChannels, channelActiveSince, deafened: this.deafened,
-      localMicMuted: this.localMicMuted(), pttDown: this.pttDown,
+      localMicMuted: this.localMicMuted(), micUnavailable: this.noMic, pttDown: this.pttDown,
       presence, speaking, streams, watching, pending, watchers, messages: this.messages, chatHasMore: this.chatMore, chatTrimmed: this.trimmedFront, chatPrepended: this.chatPrepended,
       typing: [...this.typingUsers].filter(([n, exp]) => exp > Date.now() && n !== this.me.displayName).map(([n]) => n),
     };
@@ -440,7 +442,7 @@ export class Engine {
     if (this.micRaw) { this.micRaw.getTracks().forEach((t) => t.stop()); this.micRaw = null; }
     if (this.micActx) { try { this.micActx.close(); } catch { /**/ } this.micActx = null; }
     this.micGain = null;
-    this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.roomReady = false; this.screenStream = null; // deafened/manualMute НЕ трогаем — персист-интент
+    this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.roomReady = false; this.screenStream = null; this.noMic = false; // deafened/manualMute НЕ трогаем — персист-интент
     // рвём ОБЕ комнаты (при расцепе разные; при shared — одна, Set схлопнёт дубль)
     new Set([this.viewRoom, this.voiceRoom].filter(Boolean)).forEach((rm) => { try { (rm as Room).disconnect(); } catch { /**/ } });
     this.viewRoom = null; this.voiceRoom = null; this.viewServerId = ''; this.voiceServerId = null; this.emit();
@@ -608,7 +610,7 @@ export class Engine {
     return this.watchT.get(identity) ?? (this.treeT.isRemoteBroadcasting(identity) ? this.treeT : this.liveKitT);
   }
   private nameOf(identity: string): string { const p = this.partOf(identity); return (p && p.name) || identity; }
-  private localMicMuted(): boolean { return this.manualMute; }
+  private localMicMuted(): boolean { return this.manualMute || this.noMic; } // noMic (зашёл без мика) = тоже «нет звука наружу»
   private micPub() { return this.voiceRoom && this.voiceRoom.localParticipant.getTrackPublication(Track.Source.Microphone); }
   // Ждём, пока комната реально ПОДКЛЮЧИТСЯ (roomReady). Нужно, когда после свитча серверов WebRTC-connect
   // ещё идёт в фоне: объект Room есть, но публиковать в него нельзя. Резолвит true при готовности, false —
@@ -658,12 +660,14 @@ export class Engine {
     this.myVcAt = this.channelStartFor(channelId);
     // deaf по пред-установке — сразу заявляем пирам (иначе зашёл «оглохшим», а бейджа deaf у них нет)
     try { await this.voiceRoom.localParticipant.setAttributes({ vc: channelId, vcAt: String(this.myVcAt), deaf: this.deafened ? '1' : '' }); } catch { /**/ }
+    // Микрофон недоступен (нет устройства/отказ в доступе) — НЕ отменяем вход: заходим слушателем
+    // (listen-only). В канале, слышим всех, но нас не слышно. Как в Discord. noMic сбросится при
+    // успешном захвате мика (повторный клик по кнопке мика зовёт reapplyMic/startMic).
+    this.noMic = false;
     try { await this.startMic(); }
     catch {
-      this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.myVcAt = null;
-      try { await this.voiceRoom.localParticipant.setAttributes({ vc: '', vcAt: '' }); } catch { /**/ }
-      this.voiceRoom = null; this.voiceServerId = null;
-      this.hooks.toast('Нет доступа к микрофону', 'err'); this.emit(); return;
+      this.noMic = true;
+      this.hooks.toast('Микрофон недоступен — ты в канале, но тебя не слышно', 'warn');
     }
     this.reconcileAllAudio(); // подписываемся на пиров этого же канала (bootstrap мик-подписок)
     this.reconcileChannelSounds(true); // сеем состав канала БЕЗ звука (не проигрываем entry по всем, кто уже там)
@@ -689,7 +693,7 @@ export class Engine {
     if (!this.voiceRoom || !this.inVoice) return;
     const vr = this.voiceRoom; // фиксируем: ниже обнулим указатель (и, возможно, порвём комнату)
     // оптимистично: сразу убираем себя из канала (UI не ждёт async-очистку mic/треков)
-    this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.pttDown = false; this.myVcAt = null; // deafened/manualMute НЕ сбрасываем — персист-интент до след. входа
+    this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.pttDown = false; this.myVcAt = null; this.noMic = false; // deafened/manualMute НЕ сбрасываем — персист-интент до след. входа
     this.myChannelPeers.clear(); // вышел — состав моего канала сброшен (другие услышат мой выход по unpub мика / vc'')
     playSound('exit'); // сам вышедший тоже слышит выход (остальные в канале — через onRemoteUnpub)
     this.emit();
@@ -1005,6 +1009,13 @@ export class Engine {
     this.emit();
   }
   async toggleMic() {
+    // Зашёл в голосовой БЕЗ мика → клик = попытка получить доступ (дал разрешение позже / воткнул микрофон).
+    if (this.inVoice && this.noMic) {
+      this.manualMute = false; // клик по мику = «хочу говорить»
+      try { await this.startMic(); this.noMic = false; this.saveVoicePrefs(); this.hooks.toast('Микрофон подключён'); }
+      catch { this.hooks.toast('Микрофон всё ещё недоступен', 'warn'); }
+      this.emit(); return;
+    }
     // Работает и ВНЕ голоса: пред-установка мута (Discord-стиль) — применится на входе (startMic мьютит
     // при manualMute). В голосе — сразу мьютим/размьючиваем трек. Всегда персистим.
     this.manualMute = !this.manualMute;

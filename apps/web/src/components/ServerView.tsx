@@ -8,7 +8,7 @@ import { Icon } from '../Icon';
 import { avColor, initial, prefersReducedMotion, downscaleImage } from '../util';
 import { emoteMap, emoteUrl } from '../emotes';
 import { EmotePicker } from './EmotePicker';
-import { VoiceDock } from './VoiceDock';
+import { VoiceDock, VoiceControls } from './VoiceDock';
 import { StreamerWidget } from './StreamerWidget';
 import { getSettings, setSettings } from '../settings';
 import { playSound } from '../sounds';
@@ -517,7 +517,7 @@ function Members() {
   return (
     <aside id="members">
       <div className="m-sec" style={{ borderBottom: '1px solid var(--line-2)', height: 50, display: 'flex', alignItems: 'center', gap: 6 }}>Участники · <span>{members.length}</span>
-        {active?.statsEnabled ? <button className="m-trophy" data-tip="Рейтинг и уровни" onClick={() => setModal('leaderboard')}><Icon name="trophy" sm /></button> : null}
+        {active?.statsEnabled ? <button className="m-trophy tip-b" data-tip="Рейтинг и уровни" onClick={() => setModal('leaderboard')}><Icon name="trophy" sm /></button> : null}
       </div>
       <div id="mlist">
         {online.length ? <div className="m-sec" style={{ padding: '10px 8px 4px' }}>В сети — {online.length}</div> : null}
@@ -1629,11 +1629,10 @@ function Channels() {
   const me = useStore((s) => s.me)!;
   const setModal = useStore((s) => s.setModal);
   const eng = useEngine();
-  const E = getEngine()!;
   const muted = eng.localMicMuted;
   const deaf = eng.deafened;
-  // статус: пред-установка мута/оглушения видна ещё ДО входа в канал (Discord-стиль)
-  const statusText = deaf ? 'Звук выключен' : muted ? 'Микрофон выключен' : 'В сети';
+  // статус под ником: пред-установка/состояние мика видны ещё ДО входа в канал (Discord-стиль)
+  const statusText = eng.micUnavailable ? 'Микрофон недоступен' : deaf ? 'Звук выключен' : muted ? 'Микрофон выключен' : 'В сети';
   return (
     <div id="channels">
       <div className="ch-header" role="button" tabIndex={0} data-tip="Меню сервера" onClick={() => setModal('srvmenu')}>
@@ -1642,12 +1641,11 @@ function Channels() {
       <div className="ch-body"><VoiceChannels /></div>
       <StreamerWidget />
       <VoiceDock variant="inline" />
-      {/* нижняя аккаунт-панель (всегда): мик/оглох работают и ВНЕ голоса — пред-установка входа, сохраняется всегда */}
+      {/* нижняя аккаунт-панель (всегда): полный ряд контролов (mic▾ / наушники▾ / трансляция / настройки).
+          Работают и ВНЕ голоса — выбор устройства + пред-установка мута/оглушения до входа (Discord-стиль). */}
       <div className="user-panel">
         <div className="up-i" onClick={() => setModal('profile')}><b>{me.displayName}</b><span>{statusText}</span></div>
-        <button className={'up-btn' + (muted ? ' act' : '')} aria-pressed={muted} data-tip={muted ? 'Включить микрофон' : 'Выключить микрофон'} onClick={() => E.toggleMic()}><Icon name={muted ? 'mic-off' : 'mic'} sm /></button>
-        <button className={'up-btn' + (deaf ? ' act' : '')} aria-pressed={deaf} data-tip={deaf ? 'Включить звук' : 'Заглушить звук'} onClick={() => E.toggleDeaf()}><Icon name={deaf ? 'head-off' : 'head'} sm /></button>
-        <button className="up-btn" data-tip="Настройки звука" onClick={() => setModal('settings')}><Icon name="gear" sm /></button>
+        <VoiceControls up />
       </div>
     </div>
   );

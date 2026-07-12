@@ -89,7 +89,7 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
 }
 
 // Ряд контролов: мик (+▾ вход), наушники/оглох (+▾ вывод), трансляция, настройки. up — меню вверх (для дока внизу).
-function VoiceControls({ up }: { up?: boolean }) {
+export function VoiceControls({ up }: { up?: boolean }) {
   const eng = useEngine();
   const E = getEngine()!;
   const mode = getSettings().mode;
@@ -113,7 +113,10 @@ function VoiceControls({ up }: { up?: boolean }) {
 }
 
 // Общая панель голоса (внутри колонки каналов на сервере И в плавающем углу на главной).
-function VoicePanel() {
+// controls — рисовать ли ряд контролов (mic/наушники/трансляция/настройки). В server-view (inline)
+// контролы живут в нижней аккаунт-панели (.user-panel), поэтому тут НЕ дублируем; на главной
+// (floating) аккаунт-панели нет — контролы нужны здесь.
+function VoicePanel({ controls }: { controls?: boolean }) {
   const eng = useEngine();
   const E = getEngine()!;
   const servers = useStore((s) => s.servers);
@@ -138,7 +141,7 @@ function VoicePanel() {
         <div className={'conn-ind q-' + q} data-tip={qTip} aria-label={'Качество связи: ' + qTip} tabIndex={0}><i /><i /><i /></div>
         <button className="vd-btn vd-leave" data-tip="Выйти из голосового" onClick={() => E.leaveVoice()}><Icon name="leave" sm /></button>
       </div>
-      <VoiceControls up />
+      {controls ? <VoiceControls up /> : null}
       <MusicPlayer enabled={!!srv?.musicEnabled} />
     </div>
   );
@@ -149,6 +152,8 @@ function VoicePanel() {
 export function VoiceDock({ variant }: { variant: 'inline' | 'floating' }) {
   const eng = useEngine();
   if (!eng.inVoice || !eng.voiceServerId) return null;
-  if (variant === 'inline') return <div className="vd-inline"><VoicePanel /></div>;
-  return <div id="voicedock"><VoicePanel /></div>;
+  // inline (server-view): контролы в нижней аккаунт-панели, тут только статус+выход+музыка.
+  // floating (главная): аккаунт-панели нет → контролы здесь.
+  if (variant === 'inline') return <div className="vd-inline"><VoicePanel controls={false} /></div>;
+  return <div id="voicedock"><VoicePanel controls /></div>;
 }
