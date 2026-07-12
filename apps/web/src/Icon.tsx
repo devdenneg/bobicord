@@ -48,6 +48,7 @@ import PlayArrowRounded from '@mui/icons-material/PlayArrowRounded';
 import PauseRounded from '@mui/icons-material/PauseRounded';
 import SkipPreviousRounded from '@mui/icons-material/SkipPreviousRounded';
 import SkipNextRounded from '@mui/icons-material/SkipNextRounded';
+import EmojiEventsRounded from '@mui/icons-material/EmojiEventsRounded';
 
 const MAP: Record<string, SvgIconComponent> = {
   play: PlayArrowRounded, pause: PauseRounded, 'skip-prev': SkipPreviousRounded, 'skip-next': SkipNextRounded,
@@ -69,6 +70,7 @@ const MAP: Record<string, SvgIconComponent> = {
   bell: NotificationsRounded, shield: ShieldRounded, badge: BadgeRounded,
   attach: AttachFileRounded, file: InsertDriveFileRounded,
   folder: FolderRounded, 'open-in': OpenInNewRounded,
+  trophy: EmojiEventsRounded,
 };
 
 export function Icon({ name, sm }: { name: string; sm?: boolean }) {

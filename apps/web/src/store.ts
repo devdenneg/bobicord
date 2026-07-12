@@ -35,7 +35,7 @@ interface AppState {
   nativeUpdate: { version: string; obj: any } | null;
   emoteSize: 'sm' | 'md' | 'lg';
   toasts: Toast[];
-  modal: null | 'create' | 'join' | 'profile' | 'srvmenu' | 'invite' | 'srvsettings' | 'settings' | 'broadcast' | 'switchServer' | 'downloads';
+  modal: null | 'create' | 'join' | 'profile' | 'srvmenu' | 'invite' | 'srvsettings' | 'settings' | 'broadcast' | 'switchServer' | 'downloads' | 'leaderboard';
   joinPrefill: string;
   broadcastLive: boolean;
   unread: Record<string, number>; // непрочитанные по серверам (бейдж в рейле/таскбаре)
@@ -193,10 +193,10 @@ export const useStore = create<AppState>((set, get) => ({
         saveTimer = window.setTimeout(() => { api.putSettings(a.id, vols).catch(() => {}); }, 800);
       },
       peerJoined: (id) => { if (!get().members.some((m) => m.username === id)) get().refreshMembers(); },
-      persistMessage: (text, em, image, reply, localId, key, files) => {
+      persistMessage: (text, em, image, reply, localId, key, files, kind, level) => {
         const a = get().active;
         if (!a) { engine?.markSendResult(localId, false); return; }
-        api.postMessage(a.id, text, em, image, reply, key, files)
+        api.postMessage(a.id, text, em, image, reply, key, files, kind, level)
           .then((r) => engine?.markSendResult(localId, true, r?.id))
           .catch(() => engine?.markSendResult(localId, false));
       },

@@ -9,6 +9,7 @@ const Database = require('better-sqlite3');
 const { AccessToken, RoomServiceClient } = require('livekit-server-sdk');
 const { WebSocketServer } = require('ws');
 const { attachTreeServer } = require('./tree');
+const stats = require('./stats'); // рейтинг + уровни (экспериментальная фича)
 
 const app = express();
 // Нативный (Tauri) клиент грузит локальный bundle — его origin (tauri://localhost)
@@ -186,7 +187,26 @@ for (const sql of [
   "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE servers ADD COLUMN music_enabled INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE messages ADD COLUMN edited INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE servers ADD COLUMN stats_enabled INTEGER NOT NULL DEFAULT 0", // рейтинг+уровни (эксперимент, off по умолчанию)
+  "ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT ''",           // '' обычное | 'levelup' карточка достижения
+  "ALTER TABLE messages ADD COLUMN meta TEXT NOT NULL DEFAULT ''",           // JSON доп-данных сообщения (для levelup: {level})
 ]) { try { db.exec(sql); } catch (e) { /* column already exists */ } }
+
+// Статистика участника на сервере (рейтинг/уровни). Копится СЕРВЕРОМ (сэмплер голоса/стрима +
+// событие сообщения) — клиенту не доверяем. xp/level — кэш, пересчитываются из счётчиков.
+try {
+  db.exec(`CREATE TABLE IF NOT EXISTS user_stats(
+    server_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    voice_sec INTEGER NOT NULL DEFAULT 0,
+    stream_sec INTEGER NOT NULL DEFAULT 0,
+    messages INTEGER NOT NULL DEFAULT 0,
+    xp INTEGER NOT NULL DEFAULT 0,
+    level INTEGER NOT NULL DEFAULT 0,
+    updated INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(server_id, user_id)
+  )`);
+} catch (e) {}
 
 // Бутстрап супер-админа: denis всегда админ (идемпотентно на каждом старте); остальным админку выдаёт админ из /admin.
 try { db.prepare("UPDATE users SET is_admin=1 WHERE username=?").run('denis'); } catch (e) {}
@@ -419,7 +439,51 @@ function serverName(sid) { const s = db.prepare('SELECT name FROM servers WHERE 
 
 const pubUser = u => ({ id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '', bio: u.bio, isAdmin: !!u.is_admin || u.username === BOOTSTRAP_ADMIN });
 const UPLOAD_RE = /^\/api\/uploads\/[a-zA-Z0-9._-]+$/; // локальный путь к загрузке
-const pubServer = s => ({ id: s.id, name: s.name, ownerId: s.owner_id, iconColor: s.icon_color, iconUrl: s.icon_url || '', description: s.description || '', musicEnabled: !!s.music_enabled });
+const pubServer = s => ({ id: s.id, name: s.name, ownerId: s.owner_id, iconColor: s.icon_color, iconUrl: s.icon_url || '', description: s.description || '', musicEnabled: !!s.music_enabled, statsEnabled: !!s.stats_enabled });
+
+/* ---------------- Рейтинг + уровни (экспериментальная фича) ---------------- */
+function statsEnabled(sid) { const s = db.prepare('SELECT stats_enabled FROM servers WHERE id=?').get(sid); return !!(s && s.stats_enabled); }
+function userIdByUsername(username) { const u = db.prepare('SELECT id FROM users WHERE username=?').get(username); return u ? u.id : null; }
+// Начислить статистику юзеру на сервере и пересчитать уровень. Возвращает пройденную веху (кратное 5)
+// либо 0. delta: {voice_sec?, stream_sec?, messages?}. Гейт statsEnabled — на вызывающей стороне.
+function creditStats(sid, uid, delta) {
+  const cur = db.prepare('SELECT voice_sec,stream_sec,messages,level FROM user_stats WHERE server_id=? AND user_id=?').get(sid, uid)
+    || { voice_sec: 0, stream_sec: 0, messages: 0, level: 0 };
+  const voice = cur.voice_sec + (delta.voice_sec || 0);
+  const stream = cur.stream_sec + (delta.stream_sec || 0);
+  const messages = cur.messages + (delta.messages || 0);
+  const xp = stats.computeXp({ voice_sec: voice, stream_sec: stream, messages });
+  const level = stats.levelFromXp(xp);
+  const now = Date.now();
+  db.prepare(`INSERT INTO user_stats(server_id,user_id,voice_sec,stream_sec,messages,xp,level,updated)
+    VALUES(?,?,?,?,?,?,?,?)
+    ON CONFLICT(server_id,user_id) DO UPDATE SET voice_sec=excluded.voice_sec,stream_sec=excluded.stream_sec,messages=excluded.messages,xp=excluded.xp,level=excluded.level,updated=excluded.updated`)
+    .run(sid, uid, voice, stream, messages, xp, level, now);
+  return stats.milestoneCrossed(cur.level || 0, level);
+}
+// Пройдена веха → пуш виновнику по notify-WS; его клиент раз рассылает красивую карточку в чат
+// (идемпотентно по client_key lvl:<sid>:<uid>:<level> — без дублей, оффлайн увидят из истории).
+function announceIfMilestone(sid, uid, milestone) {
+  if (milestone > 0) { try { notifyUser(uid, { t: 'levelup', serverId: sid, level: milestone }); } catch (e) {} }
+}
+// Сэмплер времени голоса/стрима: раз в 60с по каждому серверу с включённой фичей опрашиваем LiveKit+tree
+// (onlineDetailed — источник inVoice/streaming) и кредитим по 60с. Сервер-авторитетно, клиент не при делах.
+async function sampleServerStats(sid) {
+  let online;
+  try { online = await onlineDetailed(sid); } catch (e) { return; }
+  for (const o of online) {
+    const uid = userIdByUsername(o.username); if (!uid) continue;
+    const delta = {};
+    if (o.inVoice) delta.voice_sec = 60;
+    if (o.streaming) delta.stream_sec = 60;
+    if (!delta.voice_sec && !delta.stream_sec) continue;
+    try { announceIfMilestone(sid, uid, creditStats(sid, uid, delta)); } catch (e) {}
+  }
+}
+setInterval(() => {
+  let rows; try { rows = db.prepare('SELECT id FROM servers WHERE stats_enabled=1').all(); } catch (e) { return; }
+  for (const r of rows) sampleServerStats(r.id); // fire-and-forget, каждый сервер независимо
+}, 60000);
 function isMember(uid, sid) { return !!db.prepare('SELECT 1 FROM memberships WHERE user_id=? AND server_id=?').get(uid, sid); }
 function memberCount(sid) { return db.prepare('SELECT COUNT(*) c FROM memberships WHERE server_id=?').get(sid).c; }
 // Полный каскад-снос сервера (все связанные таблицы по server_id). Имена таблиц — литералы, не ввод.
@@ -910,8 +974,9 @@ app.patch('/api/servers/:id', requireAuth, (req, res) => {
   if (req.body.iconUrl != null) { const v = String(req.body.iconUrl); if (v === '' || UPLOAD_RE.test(v)) iu = v; else return res.status(400).json({ error: 'Неверная обложка' }); }
   if (name !== null && name.length < 2) return res.status(400).json({ error: 'Название минимум 2 символа' });
   const music = req.body.musicEnabled != null ? (req.body.musicEnabled ? 1 : 0) : null;
-  db.prepare('UPDATE servers SET name=COALESCE(?,name), description=COALESCE(?,description), icon_color=COALESCE(?,icon_color), icon_url=COALESCE(?,icon_url), music_enabled=COALESCE(?,music_enabled) WHERE id=?')
-    .run(name, desc, ic, iu, music, s.id);
+  const statsOn = req.body.statsEnabled != null ? (req.body.statsEnabled ? 1 : 0) : null;
+  db.prepare('UPDATE servers SET name=COALESCE(?,name), description=COALESCE(?,description), icon_color=COALESCE(?,icon_color), icon_url=COALESCE(?,icon_url), music_enabled=COALESCE(?,music_enabled), stats_enabled=COALESCE(?,stats_enabled) WHERE id=?')
+    .run(name, desc, ic, iu, music, statsOn, s.id);
   const ns = db.prepare('SELECT * FROM servers WHERE id=?').get(s.id);
   res.json({ server: { ...pubServer(ns), memberCount: memberCount(s.id) } });
 });
@@ -1081,6 +1146,32 @@ app.put('/api/servers/:id/settings', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
+/* ---------------- РЕЙТИНГ (leaderboard) ---------------- */
+app.get('/api/servers/:id/leaderboard', requireAuth, (req, res) => {
+  const sid = req.params.id;
+  if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
+  if (!statsEnabled(sid)) return res.json({ enabled: false });
+  const rows = db.prepare(`SELECT us.user_id, us.voice_sec, us.stream_sec, us.xp, us.level,
+      u.username, u.display_name, u.avatar_color, u.avatar_url
+    FROM user_stats us JOIN users u ON u.id=us.user_id WHERE us.server_id=?`).all(sid);
+  const base = r => ({ uid: r.user_id, username: r.username, displayName: r.display_name, avatarColor: r.avatar_color, avatarUrl: r.avatar_url || '', level: r.level });
+  const top = key => rows.filter(r => r[key] > 0).sort((a, b) => b[key] - a[key]).slice(0, 50).map(r => ({ ...base(r), value: r[key] }));
+  const overall = rows.filter(r => r.xp > 0).sort((a, b) => b.xp - a.xp).slice(0, 50).map(r => ({ ...base(r), value: r.xp }));
+  // ранг me по категории (1-based; 0 = не в рейтинге / нулевое значение)
+  const rankOf = key => { const s = rows.filter(r => r[key] > 0).sort((a, b) => b[key] - a[key]); const i = s.findIndex(r => r.user_id === req.user.id); return i < 0 ? 0 : i + 1; };
+  const me = rows.find(r => r.user_id === req.user.id) || { voice_sec: 0, stream_sec: 0, xp: 0 };
+  res.json({
+    enabled: true,
+    categories: { level: overall, voice: top('voice_sec'), stream: top('stream_sec') },
+    me: {
+      voiceSec: me.voice_sec, streamSec: me.stream_sec, xp: me.xp,
+      progress: stats.levelProgress(me.xp),
+      ranks: { level: rankOf('xp'), voice: rankOf('voice_sec'), stream: rankOf('stream_sec') },
+      total: rows.length,
+    },
+  });
+});
+
 /* ---------- CHAT HISTORY (persist 7 days) ---------- */
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 app.get('/api/servers/:id/messages', requireAuth, (req, res) => {
@@ -1091,8 +1182,8 @@ app.get('/api/servers/:id/messages', requireAuth, (req, res) => {
   const minTs = Date.now() - WEEK_MS;
   // берём limit+1, чтобы понять, есть ли ещё более старые сообщения (hasMore)
   const rows = before > 0
-    ? db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,edited FROM messages WHERE server_id=? AND created>? AND id<? ORDER BY id DESC LIMIT ?').all(sid, minTs, before, limit + 1)
-    : db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,edited FROM messages WHERE server_id=? AND created>? ORDER BY id DESC LIMIT ?').all(sid, minTs, limit + 1);
+    ? db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,edited,kind,meta FROM messages WHERE server_id=? AND created>? AND id<? ORDER BY id DESC LIMIT ?').all(sid, minTs, before, limit + 1)
+    : db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,edited,kind,meta FROM messages WHERE server_id=? AND created>? ORDER BY id DESC LIMIT ?').all(sid, minTs, limit + 1);
   const hasMore = rows.length > limit;
   const page = rows.slice(0, limit).reverse(); // ASC: старые → новые (как рисуем в чате)
   // Реакции по загруженным сообщениям: агрегируем в {id,name,count,mine} на сообщение.
@@ -1109,7 +1200,7 @@ app.get('/api/servers/:id/messages', requireAuth, (req, res) => {
   }
   res.json({
     hasMore,
-    messages: page.map(r => ({ id: r.id, uid: r.user_id, name: r.display_name, color: r.avatar_color, text: r.text, em: JSON.parse(r.emotes || '{}'), img: r.image || '', files: JSON.parse(r.attachments || '[]'), reply: r.reply_to ? JSON.parse(r.reply_to) : undefined, ts: r.created, edited: !!r.edited, reactions: reactByMsg.has(r.id) ? [...reactByMsg.get(r.id).values()] : undefined })),
+    messages: page.map(r => ({ id: r.id, uid: r.user_id, name: r.display_name, color: r.avatar_color, text: r.text, em: JSON.parse(r.emotes || '{}'), img: r.image || '', files: JSON.parse(r.attachments || '[]'), reply: r.reply_to ? JSON.parse(r.reply_to) : undefined, ts: r.created, edited: !!r.edited, reactions: reactByMsg.has(r.id) ? [...reactByMsg.get(r.id).values()] : undefined, kind: r.kind || undefined, level: r.kind === 'levelup' && r.meta ? (JSON.parse(r.meta).level || undefined) : undefined })),
   });
 });
 // вложения: до 5 на сообщение, url валиден для своего kind (картинки — /api/uploads/*, инлайн;
@@ -1152,11 +1243,19 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
   })();
   const now = Date.now();
   const clientKey = String(req.body.key || '').slice(0, 64);
+  // kind/meta: пока единственный спец-тип — 'levelup' (карточка достижения). Анти-спуф: принимаем ТОЛЬКО
+  // если фича включена И заявленный уровень ≤ реального уровня автора (сервер — источник истины).
+  let kind = '', meta = '';
+  if (String(req.body.kind || '') === 'levelup' && statsEnabled(sid)) {
+    const lvl = parseInt((req.body.meta && req.body.meta.level) != null ? req.body.meta.level : req.body.level, 10);
+    const real = (db.prepare('SELECT level FROM user_stats WHERE server_id=? AND user_id=?').get(sid, req.user.id) || {}).level || 0;
+    if (Number.isFinite(lvl) && lvl > 0 && real >= lvl) { kind = 'levelup'; meta = JSON.stringify({ level: lvl }); }
+  }
   // OR IGNORE: повторный POST с тем же (server_id,user_id,client_key) схлопывается (retry после
   // потери ответа). info.changes===0 → это дубль: не чистим/не пушим повторно, но отвечаем ok
   // (сообщение уже в БД — для клиента это успех).
-  const info = db.prepare('INSERT OR IGNORE INTO messages(server_id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,client_key) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
-    .run(sid, req.user.id, req.user.display_name, req.user.avatar_color, text, em, image, JSON.stringify(attachments), replyTo, now, clientKey);
+  const info = db.prepare('INSERT OR IGNORE INTO messages(server_id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,client_key,kind,meta) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run(sid, req.user.id, req.user.display_name, req.user.avatar_color, text, em, image, JSON.stringify(attachments), replyTo, now, clientKey, kind, meta);
   // Возвращаем DB-id сообщения → клиент усыновляет sid на оптимистичное сообщение СРАЗУ (без ожидания
   // refetch): иначе свежеотправленное без sid нельзя удалить/реагировать, а реплай на него не кликабелен.
   // На дубль-ретрае (changes===0) достаём уже существующий id по client_key.
@@ -1165,6 +1264,7 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
   res.json({ ok: true, id: msgId });
   if (info.changes === 0) return; // дубль — дальше (cleanup/push) не нужно
   db.prepare('DELETE FROM messages WHERE server_id=? AND created<?').run(sid, now - WEEK_MS);
+  // (сообщения в XP НЕ входят — рейтинг только по голосу+эфиру)
   // Уведомление упомянутым/адресату ответа. ДВА канала: (1) глобальный notify-WS — мгновенно тем,
   // кто онлайн в приложении (натив + веб), для ЛЮБОГО сервера, даже НЕ подключённого («куда зайти»);
   // (2) web-push — свёрнуто/закрыто. Дедуп с живым LiveKit-путём на клиенте (по connectedServerId).

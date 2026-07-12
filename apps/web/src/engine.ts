@@ -61,7 +61,7 @@ interface EngineHooks {
   toast: (text: string, kind?: 'ok' | 'warn' | 'err' | 'info') => void;
   saveSettings: (vols: { users: Record<string, number>; streams: Record<string, number> }) => void;
   peerJoined: (identity: string) => void;
-  persistMessage: (text: string, em: Record<string, string>, image: string | undefined, reply: ReplyRef | undefined, localId: number, key: string, files?: Attachment[]) => void;
+  persistMessage: (text: string, em: Record<string, string>, image: string | undefined, reply: ReplyRef | undefined, localId: number, key: string, files?: Attachment[], kind?: string, level?: number) => void;
   refetchChat?: () => void; // догрузить свежие сообщения (после реконнекта — заполнить пропуск)
   endBroadcast?: () => void; // остановить нативную трансляцию (Rust) при выходе из голосового — browser-share гасит stopShare
   reactMessage?: (serverId: string, sid: number, emoteId: string, emoteName: string, add: boolean) => void; // персист реакции
@@ -1335,11 +1335,11 @@ export class Engine {
     if (!reply) return false;
     return (!!reply.uid && reply.uid === this.me.id) || reply.author === this.me.displayName;
   }
-  private pushMsg(who: string | null, text: string, sys: boolean, color?: number, mineOverride?: boolean, img?: string, ts?: number, uid?: string, reply?: ReplyRef, files?: Attachment[], mkey?: string): number {
+  private pushMsg(who: string | null, text: string, sys: boolean, color?: number, mineOverride?: boolean, img?: string, ts?: number, uid?: string, reply?: ReplyRef, files?: Attachment[], mkey?: string, kind?: string, level?: number): number {
     const mine = mineOverride !== undefined ? mineOverride : (!sys && who === this.me.displayName);
     const mention = !sys && !mine && (this.textMentionsMe(text) || this.replyToMe(reply));
     const id = msgSeq++;
-    const next = [...this.messages, { id, uid, who, text, mine, sys, color, img, files, ts: ts ?? Date.now(), mention, reply, mkey }];
+    const next = [...this.messages, { id, uid, who, text, mine, sys, color, img, files, ts: ts ?? Date.now(), mention, reply, mkey, kind, level }];
     // кап на память сессии; срез идёт с НАЧАЛА, поэтому копим trimmedFront — компонент на столько же
     // поднимет firstItemIndex virtuoso, иначе якорь скролла рассинхронится и контент прыгнет.
     const CAP = 1000;
@@ -1391,7 +1391,7 @@ export class Engine {
         if (m.reactions && m.reactions.length) this.reactions.set(m.id, new Map(m.reactions.map((r) => [r.id, { name: r.name, count: r.count, mine: r.mine }])));
         else this.reactions.delete(m.id);
       }
-      return { id: msgSeq++, sid: m.id, uid: m.uid, who: m.name, text: m.text, mine: m.uid === this.me.id, sys: false, color: m.color, img: m.img, files: m.files, ts: m.ts, mention: m.uid !== this.me.id && (this.textMentionsMe(m.text) || this.replyToMe(m.reply)), reply: m.reply, edited: m.edited };
+      return { id: msgSeq++, sid: m.id, uid: m.uid, who: m.name, text: m.text, mine: m.uid === this.me.id, sys: false, color: m.color, img: m.img, files: m.files, ts: m.ts, mention: m.uid !== this.me.id && (this.textMentionsMe(m.text) || this.replyToMe(m.reply)), reply: m.reply, edited: m.edited, kind: m.kind, level: m.level };
     });
   }
   // начальная страница истории (последние N) — заменяет весь чат, ставит курсор на самое старое
@@ -1466,6 +1466,26 @@ export class Engine {
     const id = this.pushMsg(this.me.displayName, t, false, this.me.avatarColor, true, img, undefined, this.me.id, reply, files, key);
     this.pendingSend.set(id, { text: t, em, img, reply, key, files });
     this.hooks.persistMessage(t, em, img, reply, id, key, files);
+  }
+
+  // --- Рейтинг: анонс достижения уровня (веха ×5) ---
+  private announcedLevels = new Set<string>(); // сессионный дедуп (сервер тоже дедупит по client_key)
+  // Пришёл пуш levelup по notify-WS (см. notifyws.ts). Виновник — мы; объявляем ОДИН раз в чат этого
+  // сервера. Только если сейчас смотрим этот сервер (иначе комнаты нет — в чужой чат слать нельзя).
+  onLevelUp(serverId: string, level: number) {
+    if (!serverId || !Number.isFinite(level) || level <= 0) return;
+    if (this.viewServerId !== serverId) return;
+    this.announceLevelUp(level);
+  }
+  private announceLevelUp(level: number) {
+    const key = `lvl:${this.viewServerId}:${this.me.id}:${level}`;
+    if (this.announcedLevels.has(key)) return; // уже объявляли в этой сессии
+    this.announcedLevels.add(key);
+    const text = `🎉 ${this.me.displayName} — ${level} уровень!`; // нейтрально по роду; карточка рисует имя+уровень отдельно
+    // realtime-раздача в комнату (карточка kind='levelup') + локальный эхо + персист (оффлайн увидят из истории).
+    if (this.viewRoom) this.dataSend({ t: 'chat', name: this.me.displayName, text, color: this.me.avatarColor, uid: this.me.id, mkey: key, kind: 'levelup', level });
+    const id = this.pushMsg(this.me.displayName, text, false, this.me.avatarColor, true, undefined, undefined, this.me.id, undefined, undefined, key, 'levelup', level);
+    this.hooks.persistMessage(text, {}, undefined, undefined, id, key, undefined, 'levelup', level);
   }
   // --- реакции 7TV (по серверному sid) ---
   getReactions(sid?: number | null): Reaction[] {
@@ -1556,7 +1576,7 @@ export class Engine {
         const own = d.uid === this.me.id; // моё же сообщение с другой сессии — показываем как своё, без звука/меншена
         const repliedToMe = !own && this.replyToMe(d.reply);
         const mentioned = !own && (this.textMentionsMe(d.text) || repliedToMe);
-        this.pushMsg(d.name, d.text, false, d.color, own, d.img, undefined, d.uid, d.reply, d.files, d.mkey);
+        this.pushMsg(d.name, d.text, false, d.color, own, d.img, undefined, d.uid, d.reply, d.files, d.mkey, d.kind, d.level);
         if (!own && mentioned) { // тост+notify ТОЛЬКО когда тегнули/реплайнули; звук тега даёт само notify (Discord)
           this.hooks.toast(repliedToMe ? `${d.name} ответил тебе` : `${d.name} упомянул тебя`, 'info');
           const fallback = d.img ? '🖼 изображение' : (d.files && d.files.length ? '📎 вложение' : '');

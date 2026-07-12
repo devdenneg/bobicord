@@ -4,7 +4,7 @@
 // а натив web-push вообще не получает). Так «понимаешь, куда зайти».
 import { getToken, webOrigin } from './api';
 import { notify, type NotifKind } from './notify';
-import { useStore } from './store';
+import { useStore, getEngine } from './store';
 
 let ws: WebSocket | null = null;
 let reconnectTimer: number | null = null;
@@ -36,6 +36,8 @@ export function connectNotifyWs() {
     // кросс-девайс: прочитано на другом устройстве этого юзера → сбрасываем unread локально (и для
     // ПОДКЛЮЧЁННОГО сервера — тут дедуп по viewServerId НЕ применяем, чтение общее по БД).
     if (d.t === 'read') { if (d.serverId) useStore.getState().applyRemoteRead(d.serverId, d.lastRead || 0); return; }
+    // Достижение уровня (веха ×5): сервер пушит виновнику → его клиент раз объявляет карточку в чат.
+    if (d.t === 'levelup') { try { getEngine()?.onLevelUp(d.serverId, d.level); } catch { /**/ } return; }
     if (d.t !== 'notify') return;
     const st = useStore.getState();
     // текущий (подключённый) сервер обслуживает живой LiveKit-путь — тут не дублируем

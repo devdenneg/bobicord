@@ -92,8 +92,9 @@ export const api = {
     req<{ server: ServerSummary; invite: string; inviteExpires: number }>('POST', '/servers', { name }),
   getServer: (id: string) =>
     req<{ server: ServerDetail; members: Member[]; myRole: string; myPerms: number }>('GET', '/servers/' + id),
-  patchServer: (id: string, patch: { name?: string; description?: string; iconColor?: number; iconUrl?: string; musicEnabled?: boolean }) =>
+  patchServer: (id: string, patch: { name?: string; description?: string; iconColor?: number; iconUrl?: string; musicEnabled?: boolean; statsEnabled?: boolean }) =>
     req<{ server: ServerDetail }>('PATCH', '/servers/' + id, patch),
+  getLeaderboard: (id: string) => req<import('./types').Leaderboard>('GET', `/servers/${id}/leaderboard`),
   leaveServer: (id: string) => req<{ ok: boolean }>('POST', `/servers/${id}/leave`),
   kickMember: (id: string, userId: string) => req<{ ok: boolean }>('POST', `/servers/${id}/kick`, { userId }),
   deleteServer: (id: string) => req<{ ok: boolean }>('DELETE', '/servers/' + id),
@@ -130,7 +131,7 @@ export const api = {
     const q = qs.toString();
     return req<{ messages: HistoryMessage[]; hasMore: boolean }>('GET', `/servers/${id}/messages${q ? '?' + q : ''}`);
   },
-  postMessage: (id: string, text: string, em: Record<string, string>, image?: string, reply?: import('./types').ReplyRef, key?: string, files?: Attachment[]) => req<{ ok: boolean; id?: number }>('POST', `/servers/${id}/messages`, { text, em, image, reply, key, files }),
+  postMessage: (id: string, text: string, em: Record<string, string>, image?: string, reply?: import('./types').ReplyRef, key?: string, files?: Attachment[], kind?: string, level?: number) => req<{ ok: boolean; id?: number }>('POST', `/servers/${id}/messages`, { text, em, image, reply, key, files, kind, level }),
   reactMessage: (id: string, mid: number, emoteId: string, emoteName: string, add: boolean) => req<{ ok: boolean }>('POST', `/servers/${id}/messages/${mid}/react`, { emoteId, emoteName, add }),
   editMessage: (id: string, mid: number, text: string) => req<{ ok: boolean }>('PATCH', `/servers/${id}/messages/${mid}`, { text }),
   deleteMessage: (id: string, mid: number) => req<{ ok: boolean }>('DELETE', `/servers/${id}/messages/${mid}`),

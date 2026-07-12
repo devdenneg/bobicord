@@ -66,6 +66,7 @@ export interface ServerSummary {
   iconUrl?: string;
   description?: string;
   musicEnabled?: boolean; // совместное прослушивание YouTube включено на сервере (по умолчанию нет)
+  statsEnabled?: boolean; // рейтинг+уровни включены (эксперимент, по умолчанию нет)
   role: string;
   memberCount: number;
   online?: OnlineMember[];
@@ -93,6 +94,7 @@ export interface ServerDetail {
   iconUrl?: string;
   description?: string;
   musicEnabled?: boolean;
+  statsEnabled?: boolean;
   memberCount: number;
   myRole: string;
   myPerms?: number;
@@ -149,6 +151,8 @@ export interface ChatMessage {
   status?: 'failed'; // не удалось сохранить на сервере (показываем «не отправлено · повторить»)
   edited?: boolean; // сообщение было отредактировано (метка «(изменено)»)
   mkey?: string; // клиентский ключ сообщения — по нему ВСЕ клиенты усыновляют серверный sid (для реакций/edit на чужих live-сообщениях)
+  kind?: string; // '' обычное | 'levelup' карточка достижения уровня
+  level?: number; // для kind='levelup' — достигнутый уровень
 }
 
 export interface HistoryMessage {
@@ -164,6 +168,22 @@ export interface HistoryMessage {
   reply?: ReplyRef;
   edited?: boolean;
   reactions?: Reaction[]; // агрегат реакций из истории
+  kind?: string; // 'levelup' — карточка достижения
+  level?: number; // достигнутый уровень (для kind='levelup')
+}
+
+// Рейтинг сервера (экспериментальная фича, off по умолчанию). Категории: уровень (overall), голос, эфир.
+export interface LeaderRow { uid: string; username: string; displayName: string; avatarColor: number; avatarUrl?: string; level: number; value: number }
+export interface LeaderMe {
+  voiceSec: number; streamSec: number; xp: number;
+  progress: { level: number; xp: number; into: number; span: number; next: number };
+  ranks: { level: number; voice: number; stream: number };
+  total: number;
+}
+export interface Leaderboard {
+  enabled: boolean;
+  categories?: { level: LeaderRow[]; voice: LeaderRow[]; stream: LeaderRow[] };
+  me?: LeaderMe;
 }
 
 export interface Emote { id: string; name: string }

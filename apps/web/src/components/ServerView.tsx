@@ -470,6 +470,8 @@ function MemberRow({ m, anim }: { m: Member; anim?: string }) {
 function Members() {
   const eng = useEngine();
   const members = useStore((s) => s.members);
+  const active = useStore((s) => s.active);
+  const setModal = useStore((s) => s.setModal);
   const online = members.filter((m) => eng.presence[m.username]?.online);
   const offline = members.filter((m) => !eng.presence[m.username]?.online);
 
@@ -514,7 +516,9 @@ function Members() {
 
   return (
     <aside id="members">
-      <div className="m-sec" style={{ borderBottom: '1px solid var(--line-2)', height: 50, display: 'flex', alignItems: 'center' }}>Участники · <span>{members.length}</span></div>
+      <div className="m-sec" style={{ borderBottom: '1px solid var(--line-2)', height: 50, display: 'flex', alignItems: 'center', gap: 6 }}>Участники · <span>{members.length}</span>
+        {active?.statsEnabled ? <button className="m-trophy" data-tip="Рейтинг и уровни" onClick={() => setModal('leaderboard')}><Icon name="trophy" sm /></button> : null}
+      </div>
       <div id="mlist">
         {online.length ? <div className="m-sec" style={{ padding: '10px 8px 4px' }}>В сети — {online.length}</div> : null}
         {onlineRender.map((m) => <MemberRow m={m} anim={animOf(m, true)} key={m.username} />)}
@@ -1102,6 +1106,20 @@ function Chat() {
 
   // рендер одного сообщения (itemContent virtuoso). Чужие — слева с аватаром, свои — справа без.
   const renderMessage = (m: typeof messages[number]) => {
+    // Карточка достижения уровня (рейтинг-фича) — своя вёрстка, не обычный пузырь
+    if (m.kind === 'levelup') {
+      const lvAuthor = m.who ? byName.get(m.who) : undefined;
+      return (
+        <div className="virt-row">
+          <div className="lvlup-card">
+            <span className="lvlup-badge">{m.level ?? '?'}</span>
+            <Avatar name={m.who || ''} ci={m.color ?? 0} url={lvAuthor?.avatarUrl} size={30} />
+            <div className="lvlup-txt"><b>{m.who}</b><span>{m.level}-й уровень! 🎉</span></div>
+            <Icon name="trophy" />
+          </div>
+        </div>
+      );
+    }
     const cont = groupStart.get(m.id) === false; // продолжение группы того же автора
     const parts = m.sys ? null : renderRich(m.text, mentionNames);
     const emoCount = parts ? parts.filter((p) => typeof p === 'object' && 'emo' in p).length : 0;

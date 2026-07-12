@@ -1444,3 +1444,65 @@
 .mus-clear{width:100%;margin-top:8px;padding:7px;border-radius:8px;background:var(--panel2);color:var(--muted);font-size:11.5px}
 .mus-clear:hover{background:var(--panel3);color:var(--txt)}
 @media (prefers-reduced-motion:reduce){.mus-panel-wrap{transition:none}.mus-caret .ic{transition:none}}
+
+/* ---- Рейтинг / уровни (экспериментальная фича) ---- */
+.m-trophy{margin-left:auto;background:none;color:var(--muted);padding:5px;border-radius:7px;display:flex}
+.m-trophy:hover{background:var(--panel3);color:var(--yellow)}
+
+/* карточка достижения уровня в чате */
+.lvlup-card{margin:6px 16px;display:flex;align-items:center;gap:12px;padding:10px 14px;border-radius:12px;background:linear-gradient(100deg,color-mix(in srgb,var(--accent) 22%,transparent),color-mix(in srgb,var(--yellow) 14%,transparent));border:1px solid color-mix(in srgb,var(--accent) 40%,transparent)}
+.lvlup-badge{flex:0 0 auto;width:30px;height:30px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:14px;color:#fff;background:linear-gradient(160deg,var(--accent),color-mix(in srgb,var(--accent) 55%,#000))}
+.lvlup-txt{flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.2}
+.lvlup-txt b{font-size:13.5px;color:var(--txt-h);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lvlup-txt span{font-size:12px;color:var(--muted)}
+.lvlup-card .ic{color:var(--yellow);font-size:20px;flex:0 0 auto}
+
+/* модалка рейтинга */
+.box-lb{width:560px;max-width:94vw;padding:0}
+.lb{display:flex;flex-direction:column;max-height:82vh}
+.lb-head{display:flex;align-items:center;gap:8px;padding:16px 18px 12px;border-bottom:1px solid var(--line-2)}
+.lb-title{display:flex;align-items:center;gap:9px;font-weight:700;font-size:16px;color:var(--txt-h);flex:1;min-width:0}
+.lb-title .ic{color:var(--yellow);flex:0 0 auto}
+.lb-title>span:first-of-type{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lb-exp{flex:0 0 auto;font-size:9.5px;font-weight:800;letter-spacing:.4px;color:var(--accent);border:1px solid color-mix(in srgb,var(--accent) 45%,transparent);border-radius:5px;padding:1px 5px}
+.lb-empty{padding:32px 20px;text-align:center;color:var(--muted);font-size:13.5px;display:flex;flex-direction:column;align-items:center;gap:10px;line-height:1.5}
+
+.lb-me{display:flex;gap:14px;align-items:center;margin:14px 18px;padding:14px;border-radius:14px;background:var(--panel2);border:1px solid var(--line-2)}
+.lb-me-lvl{flex:0 0 auto;width:64px;height:64px;border-radius:16px;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff;background:linear-gradient(160deg,var(--accent),color-mix(in srgb,var(--accent) 50%,#000))}
+.lb-me-num{font-size:26px;font-weight:800;line-height:1}
+.lb-me-cap{font-size:9px;letter-spacing:.5px;text-transform:uppercase;opacity:.85;margin-top:2px}
+.lb-me-body{flex:1;min-width:0;display:flex;flex-direction:column;gap:7px}
+.lb-me-top{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.lb-me-xp{font-size:14px;font-weight:700;color:var(--txt-h)}
+.lb-me-next{font-size:11.5px;color:var(--muted)}
+.lb-bar{height:8px;border-radius:99px;background:var(--panel3);overflow:hidden}
+.lb-bar i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--accent),var(--yellow));transition:width .4s}
+.lb-me-ranks{display:flex;gap:7px;flex-wrap:wrap;margin-top:2px}
+.lb-chip{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--muted);background:var(--panel3);border-radius:99px;padding:3px 9px}
+.lb-chip .ic{font-size:14px}
+.lb-chip b{color:var(--txt-h);font-weight:700}
+.lb-chip i{font-style:normal;opacity:.8}
+
+.lb-tabs{display:flex;gap:6px;padding:0 18px;margin-bottom:4px}
+.lb-tab{flex:1;display:flex;align-items:center;justify-content:center;gap:6px;padding:9px;border-radius:9px;font-size:13px;font-weight:600;color:var(--muted);background:none}
+.lb-tab:hover{background:var(--panel2);color:var(--txt)}
+.lb-tab.on{background:var(--panel3);color:var(--txt-h)}
+.lb-tab .ic{font-size:16px}
+
+.lb-why{margin:4px 18px 8px;padding:8px 12px;border-radius:9px;background:color-mix(in srgb,var(--accent) 8%,transparent);border:1px solid color-mix(in srgb,var(--accent) 22%,transparent);font-size:12.5px;color:var(--txt);line-height:1.45}
+.lb-why b{color:var(--txt-h)}
+
+.lb-list{flex:1;overflow-y:auto;padding:2px 12px 6px;display:flex;flex-direction:column;gap:2px;min-height:80px}
+.lb-row{display:flex;align-items:center;gap:11px;padding:7px 8px;border-radius:10px}
+.lb-row:hover{background:var(--panel2)}
+.lb-row.mine{background:color-mix(in srgb,var(--accent) 12%,transparent);outline:1px solid color-mix(in srgb,var(--accent) 30%,transparent)}
+.lb-rank{flex:0 0 auto;width:26px;text-align:center}
+.lb-medal{font-size:18px}
+.lb-num{font-size:13px;font-weight:700;color:var(--muted)}
+.lb-av{border-radius:50%;overflow:hidden;display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff;flex:0 0 auto}
+.lb-av .avimg{width:100%;height:100%;object-fit:cover}
+.lb-who{flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.25}
+.lb-nm{font-size:13.5px;font-weight:600;color:var(--txt-h);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lb-lvl{font-size:11px;color:var(--muted)}
+.lb-val{flex:0 0 auto;font-size:13px;font-weight:700;color:var(--txt-h)}
+.lb-foot{padding:10px 18px 14px;font-size:11px;color:var(--muted);border-top:1px solid var(--line-2);line-height:1.5}
