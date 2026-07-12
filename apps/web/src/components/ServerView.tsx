@@ -710,6 +710,10 @@ function Chat() {
   const eng = useEngine();
   const E = getEngine()!;
   const [text, setText] = useState('');
+  // Черновики per-server: недописанное сообщение не теряется при переходе между серверами (localStorage).
+  const textRef = useRef(text); textRef.current = text;
+  const prevActive = useRef<string | undefined>(undefined);
+  const DRAFT_KEY = 'chatDraft:';
   const [lightbox, setLightbox] = useState<Attachment | null>(null);
   const [pickAnchor, setPickAnchor] = useState<DOMRect | null | undefined>(undefined);
   const emoBtnRef = useRef<HTMLButtonElement>(null);
@@ -727,6 +731,18 @@ function Chat() {
   const me = useStore((s) => s.me)!;
   const members = useStore((s) => s.members);
   const activeId = useStore((s) => s.active?.id);
+  // Черновики per-server: сохранить при уходе, восстановить при входе. (refs объявлены выше.)
+  useEffect(() => {
+    const prev = prevActive.current;
+    if (prev && prev !== activeId) {
+      if (textRef.current.trim()) localStorage.setItem(DRAFT_KEY + prev, textRef.current);
+      else localStorage.removeItem(DRAFT_KEY + prev);
+    }
+    prevActive.current = activeId;
+    setText((activeId && localStorage.getItem(DRAFT_KEY + activeId)) || '');
+    return () => { const a = prevActive.current; if (a) { if (textRef.current.trim()) localStorage.setItem(DRAFT_KEY + a, textRef.current); else localStorage.removeItem(DRAFT_KEY + a); } };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId]);
   const nativeUpdate = useStore((s) => s.nativeUpdate);
   const [updating, setUpdating] = useState(false);
   const messages = eng.messages;
@@ -992,6 +1008,7 @@ function Chat() {
     t.split(/\s+/).forEach((w) => { if (emoteMap.has(w)) em[w] = emoteMap.get(w)!; });
     E.sendChatWithEmotes(t, em, undefined, replyTo ? buildReplyRef(replyTo) : undefined, ready.length ? ready : undefined);
     setText(''); setReplyTo(null); setStaged([]);
+    if (activeId) localStorage.removeItem(DRAFT_KEY + activeId); // отправлено — черновик снят
     scrollToBottom(); // req: после отправки всегда показываем конец
   }
   // очередь на отправку: как только последнее вложение долилось (успешно или с ошибкой — send()
@@ -1059,6 +1076,7 @@ function Chat() {
 
   const mentionNames = (() => { const s = new Set<string>(); for (const mm of members) { s.add(mm.username.toLowerCase()); s.add(mm.displayName.toLowerCase()); } ['все', 'all', 'everyone'].forEach((w) => s.add(w)); return s; })();
   const byName = new Map(members.map((mm) => [mm.displayName, mm] as const));
+  const byUid = new Map(members.map((mm) => [mm.id, mm] as const)); // стабильный резолв автора реплая по user id (не по нику)
 
   // начало группы (Telegram-style): шапка/аватар только у первого сообщения серии одного автора.
   // Группа ограничена 10 сообщениями — после этого начинается заново даже у того же автора.
@@ -1086,7 +1104,7 @@ function Chat() {
     // цитата исходного сообщения (reply) — над автором, кликабельна если оригинал загружен
     let replyQuote: JSX.Element | null = null;
     if (m.reply) {
-      const rAuthor = byName.get(m.reply.author);
+      const rAuthor = (m.reply.uid && byUid.get(m.reply.uid)) || byName.get(m.reply.author);
       const rColor = (rAuthor && roleColorOf(rAuthor)) || avColor(m.reply.author, rAuthor?.avatarColor ?? 0);
       const jumpable = m.reply.sid != null;
       const rep = m.reply;
