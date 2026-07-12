@@ -46,7 +46,8 @@ function Avatar({ name, ci, url, size = 32, dot, live, liveApp }: { name: string
       {url ? <img className="avimg" src={resolveUploadUrl(url)} alt="" /> : initial(name)}
       {dot ? <span className={'sdot ' + dot} /> : null}
       {live ? <span className="av-live" title={liveApp?.appName ? `Стримит ${liveApp.appName}` : 'В эфире'}>LIVE</span> : null}
-      {live && liveApp?.appIcon ? <img src={`data:image/png;base64,${liveApp.appIcon}`} alt="" title={liveApp.appName ? `Стримит ${liveApp.appName}` : undefined} style={{ position: 'absolute', right: -3, bottom: -3, width: 14, height: 14, borderRadius: 3, border: '2px solid var(--bg-alt, #111)', objectFit: 'contain' }} /> : null}
+      {/* иконка игры — наверх-вправо: низ по центру занимает LIVE-бейдж (иначе наслаиваются) */}
+      {live && liveApp?.appIcon ? <img src={`data:image/png;base64,${liveApp.appIcon}`} alt="" title={liveApp.appName ? `Стримит ${liveApp.appName}` : undefined} style={{ position: 'absolute', right: -3, top: -3, width: 14, height: 14, borderRadius: 3, border: '2px solid var(--bg-alt, #111)', objectFit: 'contain' }} /> : null}
     </div>
   );
 }
