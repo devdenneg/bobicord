@@ -170,6 +170,9 @@ export const api = {
     const d = await req<{ items: Emote[] }>('GET', `/7tv/search?${qs}`);
     return d.items || [];
   },
+  // Резолв аудио-URL совместного прослушивания через медиа-релей (обход блокировки YouTube).
+  // Возвращает готовый URL для <audio> (аудио идёт браузер↔релей, мимо основного VPS). 503 = релей выкл.
+  musicResolve: (id: string) => req<{ url: string; title?: string; duration?: number }>('GET', `/music/resolve/${id}`),
 };
 
 /** Отправка на выгрузке страницы (`pagehide`): обычный fetch браузер убьёт вместе с

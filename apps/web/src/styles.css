@@ -1392,6 +1392,9 @@
 .mus-bar{display:flex;align-items:center;gap:8px;padding:7px 8px;min-width:0}
 .mus-thumb{width:64px;height:36px;flex:0 0 auto;border-radius:6px;overflow:hidden;background:#000;position:relative}
 .mus-thumb #yt-music-player,.mus-thumb iframe{position:absolute;top:0;left:0;width:256px;height:144px;transform:scale(.25);transform-origin:top left;pointer-events:none;border:0}
+/* аудио-режим (медиа-релей): вместо видео — иконка, центрированная на акцентном фоне */
+.mus-thumb-audio{display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,color-mix(in srgb,var(--accent) 55%,#000),#111)}
+.mus-thumb-audio svg{width:18px;height:18px;opacity:.9}
 .mus-meta{flex:1;min-width:0;cursor:pointer;overflow:hidden}
 .mus-title{font-size:12.5px;font-weight:600;color:var(--txt-h);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .mus-sub{font-size:10.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:1px}

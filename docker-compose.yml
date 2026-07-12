@@ -44,6 +44,11 @@ services:
       # Дефолт в коде (tree.js: TREE_SERVER_FIRST !== '0'); откат на legacy = выставить 0.
       # Действует только для стримов с serverIngest (нативный клиент); старые бандлы — legacy.
       - TREE_SERVER_FIRST=${TREE_SERVER_FIRST:-1}
+      # Медиа-релей YouTube (совместное прослушивание, обход блокировки). Сервер лишь подписывает
+      # HMAC-токен; аудио идёт браузер↔релей (deploy/media-relay), мимо этого VPS. Пусто = фича
+      # выключена (resolve → 503, плеер показывает «релей недоступен»). Значения — в .env на хосте.
+      - MEDIA_RELAY_URL=${MEDIA_RELAY_URL:-}
+      - MEDIA_RELAY_SECRET=${MEDIA_RELAY_SECRET:-}
     volumes:
       - ./data:/app/data
     ports:
