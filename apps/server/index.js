@@ -1157,7 +1157,12 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
   // (сообщение уже в БД — для клиента это успех).
   const info = db.prepare('INSERT OR IGNORE INTO messages(server_id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,client_key) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
     .run(sid, req.user.id, req.user.display_name, req.user.avatar_color, text, em, image, JSON.stringify(attachments), replyTo, now, clientKey);
-  res.json({ ok: true });
+  // Возвращаем DB-id сообщения → клиент усыновляет sid на оптимистичное сообщение СРАЗУ (без ожидания
+  // refetch): иначе свежеотправленное без sid нельзя удалить/реагировать, а реплай на него не кликабелен.
+  // На дубль-ретрае (changes===0) достаём уже существующий id по client_key.
+  const msgId = info.changes ? info.lastInsertRowid
+    : (clientKey ? (db.prepare('SELECT id FROM messages WHERE server_id=? AND user_id=? AND client_key=?').get(sid, req.user.id, clientKey) || {}).id : null);
+  res.json({ ok: true, id: msgId });
   if (info.changes === 0) return; // дубль — дальше (cleanup/push) не нужно
   db.prepare('DELETE FROM messages WHERE server_id=? AND created<?').run(sid, now - WEEK_MS);
   // Уведомление упомянутым/адресату ответа. ДВА канала: (1) глобальный notify-WS — мгновенно тем,

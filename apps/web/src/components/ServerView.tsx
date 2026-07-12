@@ -684,11 +684,12 @@ const VIRT_BASE_INDEX = 1_000_000;
 
 // Шапка списка чата: спиннер во время догрузки старых сообщений / метка начала истории.
 // Определена на уровне модуля (стабильная ссылка) — иначе virtuoso ремонтит её на каждый рендер.
+// Лоадер догрузки вынесен из хедера в absolute-оверлей (#chat) — иначе смена высоты хедера в потоке
+// списка дёргала якорь virtuoso (прыжок). Здесь остаётся только фикс-высокая метка «начало истории».
 function ChatOlderHeader({ context }: { context?: { busy?: boolean; hasMore?: boolean } }) {
   return (
     <div className="virt-head">
-      {context?.busy ? <span className="chat-load"><span className="spin" style={{ width: 14, height: 14, margin: 0 }} />Загрузка сообщений…</span>
-        : context && !context.hasMore ? <span className="virt-head-end">Начало истории</span> : null}
+      {context && !context.hasMore ? <span className="virt-head-end">Начало истории</span> : null}
     </div>
   );
 }
@@ -930,7 +931,7 @@ function Chat() {
   }, []);
   // переход к оригиналу по клику на цитату (если он сейчас загружен) + короткая подсветка
   const jumpToReply = useCallback((r: ReplyRef) => {
-    if (r.sid == null) return;
+    if (r.sid == null) { useStore.getState().toast('Оригинал ещё синхронизируется — секунду', 'warn'); return; }
     const idx = messages.findIndex((mm) => mm.sid === r.sid);
     // Оригинал вне загруженного окна — не молчим (был «мёртвый клик»): подсказываем прокрутить/догрузить.
     if (idx < 0) { useStore.getState().toast('Сообщение выше — прокрути вверх, чтобы догрузить', 'warn'); return; }
@@ -938,6 +939,12 @@ function Chat() {
     setFlashId(messages[idx].id);
   }, [messages]);
   useEffect(() => { if (flashId == null) return; const t = window.setTimeout(() => setFlashId(null), 1300); return () => clearTimeout(t); }, [flashId]);
+  // реакция + доскролл: пилюля растит высоту последнего сообщения — если я внизу, держим его в поле зрения
+  const reactTo = useCallback((sid: number, emote: { id: string; name: string }) => {
+    E.toggleReaction(sid, emote);
+    const last = messages.length ? messages[messages.length - 1] : null;
+    if (last && last.sid === sid && atBottomRef.current) requestAnimationFrame(() => virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end' }));
+  }, [E, messages]);
 
   async function runCommand(raw: string) {
     const active = useStore.getState().active;
@@ -1107,10 +1114,9 @@ function Chat() {
     if (m.reply) {
       const rAuthor = (m.reply.uid && byUid.get(m.reply.uid)) || byName.get(m.reply.author);
       const rColor = (rAuthor && roleColorOf(rAuthor)) || avColor(m.reply.author, rAuthor?.avatarColor ?? 0);
-      const jumpable = m.reply.sid != null;
       const rep = m.reply;
       replyQuote = (
-        <button className={'reply-quote' + (jumpable ? ' jumpable' : '')} disabled={!jumpable} onClick={jumpable ? () => jumpToReply(rep) : undefined}
+        <button className="reply-quote jumpable" onClick={() => jumpToReply(rep)}
           title={rep.author + ': ' + replySnippet(rep)}>
           <span className="rq-hook" style={{ borderColor: rColor }} />
           <Avatar name={rep.author} ci={rAuthor?.avatarColor ?? 0} url={rAuthor?.avatarUrl} size={16} />
@@ -1150,7 +1156,7 @@ function Chat() {
                 {m.status === 'failed' ? <div className="msg-failed"><Icon name="warn" sm />Не отправлено<button onClick={() => getEngine()?.retrySend(m.id)}>Повторить</button></div> : null}
                 {(() => { const reacts = m.sid != null ? E.getReactions(m.sid) : []; return reacts.length ? (
                   <div className="msg-reacts">
-                    {reacts.map((r) => <button key={r.id} className={'react-pill' + (r.mine ? ' mine' : '')} title={r.name} onClick={() => m.sid != null && E.toggleReaction(m.sid, { id: r.id, name: r.name })}><img src={emoteUrl(r.id)} alt={r.name} loading="lazy" /><b>{r.count}</b></button>)}
+                    {reacts.map((r) => <button key={r.id} className={'react-pill' + (r.mine ? ' mine' : '')} title={r.name} onClick={() => m.sid != null && reactTo(m.sid, { id: r.id, name: r.name })}><img src={emoteUrl(r.id)} alt={r.name} loading="lazy" /><b>{r.count}</b></button>)}
                     <button className="react-add" data-tip="Добавить реакцию" onClick={(e) => m.sid != null && setReactTarget({ sid: m.sid, anchor: e.currentTarget.getBoundingClientRect() })}><Icon name="react" sm /></button>
                   </div>
                 ) : null; })()}
@@ -1198,6 +1204,7 @@ function Chat() {
           }}
         />
       )}
+      {olderBusy ? <div className="chat-load-top"><span className="chat-load"><span className="spin" style={{ width: 14, height: 14, margin: 0 }} />Загрузка сообщений…</span></div> : null}
       {!atBottom ? <button id="scrollbtn" aria-label="Прокрутить вниз" data-tip="К последним" onClick={scrollToBottom}><Icon name="chevron" />{pill > 0 ? <span className="sb-badge">{pill > 99 ? '99+' : pill}</span> : null}</button> : null}
       {/* лейн печатающих зарезервирован всегда (min-height) — badge не наслаивается на последнее сообщение */}
       <div className="typing-ind" aria-live="polite">
@@ -1290,7 +1297,7 @@ function Chat() {
       {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} onClose={() => setPickAnchor(undefined)}
         onPick={(e: Emote) => { setText((t) => t + (t && !t.endsWith(' ') ? ' ' : '') + e.name + ' '); }} /> : null}
       {reactTarget ? <EmotePicker anchor={reactTarget.anchor} onClose={() => setReactTarget(null)}
-        onPick={(e: Emote) => { E.toggleReaction(reactTarget.sid, e); setReactTarget(null); }} /> : null}
+        onPick={(e: Emote) => { reactTo(reactTarget.sid, e); setReactTarget(null); }} /> : null}
       {lightbox ? <ImageLightbox attachment={lightbox} onClose={() => setLightbox(null)} /> : null}
     </div>
   );

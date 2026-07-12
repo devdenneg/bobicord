@@ -1341,9 +1341,15 @@ export class Engine {
     this.messages = this.messages.map((m) => (m.id === localId && m.status !== status ? (changed = true, { ...m, status }) : m));
     if (changed) this.emit();
   }
-  markSendResult(localId: number, ok: boolean) {
-    if (ok) { this.pendingSend.delete(localId); this.setMsgStatus(localId, undefined); }
-    else this.setMsgStatus(localId, 'failed');
+  markSendResult(localId: number, ok: boolean, sid?: number) {
+    if (ok) {
+      this.pendingSend.delete(localId);
+      // Усыновляем серверный sid на оптимистичное сообщение — сразу включает edit/delete/реакции и
+      // кликабельность реплая на него (иначе живут без sid до refetch).
+      let ch = false;
+      this.messages = this.messages.map((m) => (m.id === localId && m.sid == null && sid != null ? (ch = true, { ...m, sid, status: undefined }) : (m.id === localId && m.status ? (ch = true, { ...m, status: undefined }) : m)));
+      if (ch) this.emit(); else this.setMsgStatus(localId, undefined);
+    } else this.setMsgStatus(localId, 'failed');
   }
   retrySend(localId: number) {
     const p = this.pendingSend.get(localId); if (!p) return;

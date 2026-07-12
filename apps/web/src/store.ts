@@ -196,7 +196,7 @@ export const useStore = create<AppState>((set, get) => ({
         const a = get().active;
         if (!a) { engine?.markSendResult(localId, false); return; }
         api.postMessage(a.id, text, em, image, reply, key, files)
-          .then(() => engine?.markSendResult(localId, true))
+          .then((r) => engine?.markSendResult(localId, true, r?.id))
           .catch(() => engine?.markSendResult(localId, false));
       },
       refetchChat: () => { const a = get().active; if (!a) return; api.getMessages(a.id, undefined, 30).then((d) => engine?.mergeRecent(d.messages)).catch(() => {}); },

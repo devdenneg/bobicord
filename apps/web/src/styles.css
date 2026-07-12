@@ -446,16 +446,18 @@
   .vwrap video.ready{opacity:1}
   .vwrap .lbl{position:absolute;left:56px;bottom:10px;background:#000c;backdrop-filter:blur(8px);padding:4px 10px;border-radius:8px;font-size:12.5px;font-weight:500;z-index:2;transition:opacity var(--tr)}
   .vwrap:hover:not(.idle) .lbl,.vwrap:focus-within .lbl{opacity:0}
-  /* hover control bar */
-  .vbar{position:absolute;left:0;right:0;bottom:0;z-index:6;display:flex;align-items:center;gap:9px;padding:9px 12px 9px 56px;background:linear-gradient(0deg,#000e,#000a 55%,transparent);opacity:0;transform:translateY(10px);transition:opacity var(--tr),transform var(--tr);pointer-events:none}
-  .vwrap:hover:not(.idle) .vbar,.vwrap:focus-within .vbar{opacity:1;transform:none;pointer-events:auto}
-  @media (hover:none){.vbar{opacity:1;transform:none;pointer-events:auto}}
-  .vbar .vb-vol{width:104px;accent-color:var(--accent);cursor:pointer;height:5px}
-  .vbar .vb-pct{font-size:11.5px;color:#fff;min-width:34px;font-weight:600}
-  .vbar .vb-lbl{font-size:12.5px;color:#fff;font-weight:500}
-  .vbar .vb-sp{flex:1}
-  .vbar .vb-btn{width:34px;height:34px;flex:0 0 auto;border-radius:8px;background:#ffffff1a;color:#fff;display:flex;align-items:center;justify-content:center;padding:0;transition:background var(--tr)}
-  .vbar .vb-btn:hover{background:#ffffff33}
+  /* hover control bar — центрированная плавающая пилюля (Discord-стиль), всплывает по наведению */
+  .vbar{position:absolute;left:50%;bottom:14px;z-index:6;display:flex;align-items:center;gap:3px;padding:6px 8px;max-width:calc(100% - 24px);background:rgba(18,19,22,.72);backdrop-filter:blur(16px) saturate(1.4);-webkit-backdrop-filter:blur(16px) saturate(1.4);border:1px solid #ffffff20;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.5);opacity:0;transform:translate(-50%,10px) scale(.97);transform-origin:bottom center;transition:opacity .16s ease,transform .16s ease;pointer-events:none}
+  .vwrap:hover:not(.idle) .vbar,.vwrap:focus-within .vbar{opacity:1;transform:translate(-50%,0) scale(1);pointer-events:auto}
+  @media (hover:none){.vbar{opacity:1;transform:translate(-50%,0) scale(1);pointer-events:auto}}
+  .vbar .vb-vol{width:84px;accent-color:var(--accent);cursor:pointer;height:5px;margin:0 3px}
+  .vbar .vb-pct{font-size:11px;color:#fff;min-width:32px;font-weight:600;text-align:center;font-variant-numeric:tabular-nums}
+  .vbar .vb-lbl{font-size:12.5px;color:#fff;font-weight:500;padding:0 8px;white-space:nowrap}
+  .vbar .vb-sp{width:1px;align-self:stretch;margin:4px 4px;background:#ffffff22;flex:0 0 auto}
+  .vbar .vb-btn{width:34px;height:34px;flex:0 0 auto;border-radius:9px;background:transparent;color:#fff;display:flex;align-items:center;justify-content:center;padding:0;transition:background .1s,transform .1s}
+  .vbar .vb-btn:hover{background:#ffffff20}
+  .vbar .vb-btn:active{transform:scale(.92)}
+  .vbar .vb-btn.active{background:var(--accent);color:#fff}
   .vbar .vb-btn.danger:hover{background:var(--red-fill)}
   .vwrap .watchers{position:absolute;top:10px;left:10px;display:flex;align-items:center;background:#000b;backdrop-filter:blur(8px);padding:4px 11px 4px 8px;border-radius:9999px;font-size:12px;z-index:7;cursor:default}
   .vwrap .watchers .wa{width:22px;height:22px;border-radius:50%;overflow:hidden;font-size:10.5px;font-weight:700;color:#fff;display:flex;align-items:center;justify-content:center;border:2px solid #050505;margin-right:-7px}
@@ -546,7 +548,9 @@
   .virt-head{display:flex;align-items:center;justify-content:center;min-height:14px;padding:10px 0 6px}
   .virt-head-end{font-size:11px;color:var(--muted);opacity:.55}
   /* лоадер пагинации: пилюля со спиннером */
-  .chat-load{display:inline-flex;align-items:center;gap:8px;padding:5px 12px;background:var(--panel2);border:1px solid var(--line-2);border-radius:20px;font-size:12px;color:var(--muted);box-shadow:0 2px 8px rgba(0,0,0,.15)}
+  .chat-load{display:inline-flex;align-items:center;gap:8px;padding:5px 12px;background:var(--panel2);border:1px solid var(--line-2);border-radius:20px;font-size:12px;color:var(--muted);box-shadow:0 2px 8px rgba(0,0,0,.2)}
+  /* оверлей-лоадер догрузки (вне потока списка — не двигает якорь virtuoso) */
+  .chat-load-top{position:absolute;top:12px;left:0;right:0;display:flex;justify-content:center;z-index:8;pointer-events:none;animation:sbIn .16s ease-out}
   .chat-load .spin{border-color:color-mix(in srgb,var(--accent) 30%,transparent);border-top-color:var(--accent)}
   /* ---- скелетоны загрузки (плавный переход вместо блёклого спиннера / прыжков дозагрузки) ---- */
   @keyframes skShimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
