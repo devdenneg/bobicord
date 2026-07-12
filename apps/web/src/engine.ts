@@ -44,6 +44,7 @@ export interface Snapshot {
   messages: ChatMessage[];
   chatHasMore: boolean; // есть ли ещё более старые сообщения для догрузки вверх
   chatTrimmed: number; // накопленное число срезанных с начала сообщений (для коррекции якоря virtuoso)
+  chatPrepended: number; // накопленное число догруженных пагинацией старых сообщений (якорь virtuoso)
   typing: string[];
 }
 
@@ -144,6 +145,7 @@ export class Engine {
   private chatMore = false; // есть ли ещё более старые сообщения на сервере (пагинация вверх)
   private oldestSid: number | null = null; // DB-id самого старого загруженного сообщения = курсор для before
   private trimmedFront = 0; // сколько сообщений суммарно срезано с НАЧАЛА (для якоря virtuoso: срез спереди → firstItemIndex += N)
+  private chatPrepended = 0; // сколько старых сообщений догружено пагинацией (для якоря: prepend → firstItemIndex -= N). Меняется ВМЕСТЕ с messages (один emit) → нет прыжка.
   private typingUsers = new Map<string, number>(); // displayName -> expiry ts
   private lastTypingSent = 0;
 
@@ -326,7 +328,7 @@ export class Engine {
       voiceQuality: this.inVoice ? this.connQuality : 'unknown', voicePing: this.inVoice ? this.pingMs : null,
       inVoice: this.inVoice, voiceConnecting: this.inVoice && this.voiceConnecting, myVoiceChannel: this.currentVc, voiceServerId: this.voiceServerId, voiceChannels, channelActiveSince, deafened: this.deafened,
       localMicMuted: this.localMicMuted(), pttDown: this.pttDown,
-      presence, speaking, streams, watching, pending, watchers, messages: this.messages, chatHasMore: this.chatMore, chatTrimmed: this.trimmedFront,
+      presence, speaking, streams, watching, pending, watchers, messages: this.messages, chatHasMore: this.chatMore, chatTrimmed: this.trimmedFront, chatPrepended: this.chatPrepended,
       typing: [...this.typingUsers].filter(([n, exp]) => exp > Date.now() && n !== this.me.displayName).map(([n]) => n),
     };
   }
@@ -1369,7 +1371,7 @@ export class Engine {
     this.messages = this.mapHistory(list);
     this.chatMore = hasMore;
     this.oldestSid = list.length ? (list[0].id ?? null) : null; // list в ASC-порядке, [0] — самое старое
-    this.trimmedFront = 0; // новая история — счётчик среза сбрасывается (компонент тоже обнулит prevTrim)
+    this.trimmedFront = 0; this.chatPrepended = 0; // новая история — счётчики якоря virtuoso сбрасываются
     this.emit();
   }
   // догрузка пропущенного после реконнекта. Дедуп двойной:
@@ -1414,6 +1416,7 @@ export class Engine {
     if (list.length) {
       this.messages = [...this.mapHistory(list), ...this.messages];
       this.oldestSid = list[0].id ?? this.oldestSid;
+      this.chatPrepended += list.length; // якорь virtuoso сдвигается вместе с данными (один emit) — без прыжка
     }
     this.emit();
   }

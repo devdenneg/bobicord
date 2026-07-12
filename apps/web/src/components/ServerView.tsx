@@ -687,7 +687,7 @@ const VIRT_BASE_INDEX = 1_000_000;
 function ChatOlderHeader({ context }: { context?: { busy?: boolean; hasMore?: boolean } }) {
   return (
     <div className="virt-head">
-      {context?.busy ? <span className="spin" style={{ width: 16, height: 16, margin: 0 }} />
+      {context?.busy ? <span className="chat-load"><span className="spin" style={{ width: 14, height: 14, margin: 0 }} />Загрузка сообщений…</span>
         : context && !context.hasMore ? <span className="virt-head-end">Начало истории</span> : null}
     </div>
   );
@@ -792,12 +792,14 @@ function Chat() {
   const atBottomRef = useRef(true);
   const [dividerFade, setDividerFade] = useState(false); // дивайдер «Новые сообщения» гаснет, когда юзер увидел границу
   const [focusTick, setFocusTick] = useState(0); // тикает на focus/blur/visibility — «увидел глазами» зависит от фокуса окна
-  const [firstItemIndex, setFirstItemIndex] = useState(VIRT_BASE_INDEX); // якорь для prepend
+  // Якорь virtuoso DERIVED из engine-стейта (prepend/срез) — меняется ВМЕСТЕ с messages (один emit),
+  // поэтому Virtuoso всегда видит согласованные data+firstItemIndex → чат НЕ прыгает при пагинации.
+  // (Раньше был component-state + отдельные setFirstItemIndex → два источника, рассинхрон, прыжок.)
+  const firstItemIndex = VIRT_BASE_INDEX - eng.chatPrepended + eng.chatTrimmed;
   const [olderBusy, setOlderBusy] = useState(false); // идёт догрузка старых
   const loadingOlder = useRef(false);                // защита от повторного startReached
   const olderReady = useRef(false);                  // гейт: не грузить старое, пока вход не устаканился
   const prevLastId = useRef<number | null>(null);    // id последнего сообщения — детект append vs prepend
-  const prevTrim = useRef(0);                         // сколько среза уже учтено в firstItemIndex
   const lastAckedRef = useRef<number | null>(null);   // последний месседж (local id), для которого послан readAll — не спамим POST
   const lastTagAt = useRef(0);                         // троттл звука-пинга сообщений (не в фокусе) — не строчить пулемётом
   // автокомплит упоминаний (@ник)
@@ -813,7 +815,7 @@ function Chat() {
 
   // смена сервера: сброс состояния виртуального списка (Virtuoso ремонтится по key={activeId})
   useLayoutEffect(() => {
-    setFirstItemIndex(VIRT_BASE_INDEX);
+    // firstItemIndex теперь DERIVED (сбрасывается engine.loadHistory: chatPrepended/Trimmed=0) — руками не трогаем.
     // на входе: если есть непрочитанные — сеем счётчик jump-кнопки и стартуем НЕ внизу (позиция у
     // дивайдера, см. initialTopMostItemIndex), иначе внизу
     const unreadHere = unreadServer > 0 ? messages.filter((m) => m.sid != null && m.sid > baseline && !m.mine).length : 0;
@@ -821,7 +823,7 @@ function Chat() {
     // сброс стейджинга вложений при смене сервера — не тащим прикреплённые файлы между чатами
     setStaged((s) => { s.forEach((it) => it.previewUrl && URL.revokeObjectURL(it.previewUrl)); return []; });
     setSendQueued(false);
-    prevLastId.current = null; prevTrim.current = 0; lastAckedRef.current = null; loadingOlder.current = false; setOlderBusy(false);
+    prevLastId.current = null; lastAckedRef.current = null; loadingOlder.current = false; setOlderBusy(false);
     // не даём startReached стрельнуть догрузкой прямо на маунте (пока идёт scroll-to-bottom и оседание)
     olderReady.current = false;
     setDividerFade(false);
@@ -891,12 +893,6 @@ function Chat() {
     markReadStore(activeId, lastSid ?? (useStore.getState().lastRead[activeId] || 0), true);
   }, [atBottom, messages, activeId, markReadStore, focusTick]);
 
-  // срез сообщений с начала (кап памяти в engine) сдвигает данные вперёд — поднимаем firstItemIndex
-  // на столько же, иначе якорь virtuoso рассинхронится. useLayoutEffect — до отрисовки, без мелькания.
-  useLayoutEffect(() => {
-    const t = eng.chatTrimmed;
-    if (t !== prevTrim.current) { setFirstItemIndex((f) => f + (t - prevTrim.current)); prevTrim.current = t; }
-  }, [eng.chatTrimmed]);
 
   // догрузка более старых сообщений при скролле к верху (курсорная пагинация)
   const loadOlder = useCallback(async () => {
@@ -909,10 +905,9 @@ function Chat() {
       const h = await api.getMessages(reqId, cursor, 30);
       // за время запроса могли переключить сервер — не вклеиваем чужую страницу в чужой чат
       if (useStore.getState().active?.id !== reqId) return;
-      const count = h.messages.length;
-      // сначала сдвигаем базовый индекс, затем растим данные — оба апдейта в одном тике
-      // (React 18 батчит), virtuoso держит позицию скролла на прежнем сообщении.
-      if (count > 0) setFirstItemIndex((f) => f - count);
+      // prependHistory растит messages И chatPrepended в ОДНОМ emit → firstItemIndex (derived) сдвигается
+      // атомарно с данными, virtuoso держит позицию на прежнем сообщении (без прыжка). Отдельный
+      // setFirstItemIndex больше не нужен (был вторым источником и давал рассинхрон/прыжок).
       E.prependHistory(h.messages, h.hasMore);
     } catch { /**/ }
     finally { loadingOlder.current = false; setOlderBusy(false); }
