@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { searchEmotes, emoteUrlSm } from '../emotes';
+import { searchEmotes, emoteUrlSm, getRecentEmotes, pushRecentEmote } from '../emotes';
 import { useStore } from '../store';
 import type { Emote } from '../types';
 
@@ -9,6 +9,8 @@ export function EmotePicker({ anchor, onPick, onClose, sizePicker }: { anchor: D
   const emoteSize = useStore((s) => s.emoteSize);
   const setEmoteSize = useStore((s) => s.setEmoteSize);
   const [loaded, setLoaded] = useState(false);
+  const [recent, setRecent] = useState<Emote[]>(() => getRecentEmotes());
+  const pick = useCallback((e: Emote) => { pushRecentEmote(e); setRecent(getRecentEmotes()); onPick(e); }, [onPick]);
   const pageRef = useRef(0); const moreRef = useRef(true); const loadingRef = useRef(false);
   const boxRef = useRef<HTMLDivElement>(null);
   const gridRef = useRef<HTMLDivElement>(null);
@@ -62,9 +64,20 @@ export function EmotePicker({ anchor, onPick, onClose, sizePicker }: { anchor: D
         </div>
       ) : null}
       <div id="epickGrid" ref={gridRef} onScroll={(e) => { const g = e.currentTarget; if (g.scrollTop + g.clientHeight >= g.scrollHeight - 100) fetchPage(q, false); }}>
+        {!q.trim() && recent.length ? <>
+          <div className="epick-sec">Недавние</div>
+          <div className="epick-row">
+            {recent.map((e) => (
+              <button className="emobtn" key={'r' + e.id} title={e.name} onClick={() => pick(e)}>
+                <img src={emoteUrlSm(e.id)} alt={e.name} loading="lazy" decoding="async" />
+              </button>
+            ))}
+          </div>
+          <div className="epick-sec">{q.trim() ? 'Результаты' : 'Популярные'}</div>
+        </> : null}
         {items.length === 0 ? <div id="epickLoad">{loaded ? 'Ничего не найдено' : 'Загрузка...'}</div> :
           items.map((e) => (
-            <button className="emobtn" key={e.id} title={e.name} onClick={() => onPick(e)}>
+            <button className="emobtn" key={e.id} title={e.name} onClick={() => pick(e)}>
               <img src={emoteUrlSm(e.id)} alt={e.name} loading="lazy" decoding="async" />
             </button>
           ))}

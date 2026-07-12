@@ -1164,6 +1164,8 @@
   .emobtn:hover{background:var(--panel3)}.emobtn img{max-width:38px;max-height:38px}
   #epickHint{font-size:10px;color:var(--muted);text-align:center;padding:5px;border-top:1px solid var(--line-2);letter-spacing:.5px}
   #epickLoad{grid-column:1/-1;text-align:center;color:var(--muted);font-size:13px;padding:20px}
+  .epick-sec{grid-column:1/-1;font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);padding:6px 4px 2px}
+  .epick-row{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:4px;margin-bottom:2px}
 
   /* toasts — зарезервированный стек СНИЗУ-СЛЕВА (за рейлом), новый снизу, стек вверх, без наслоений.
      column-reverse: последний тост внизу у угла, старые уезжают вверх; контейнер не ловит клики,
