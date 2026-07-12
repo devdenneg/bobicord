@@ -597,6 +597,9 @@ export class Engine {
     }
     return this.liveKitT.isRemoteBroadcasting(username) || this.treeT.isRemoteBroadcasting(username);
   }
+  // Публичный предикат «X сейчас вещает» (авто-watch с главной): true ровно когда транспорт,
+  // который отдаёт этот стрим, уже объявлен в discovery — тогда watch() выберет ВЕРНЫЙ транспорт.
+  isStreamLive(username: string): boolean { return this.isStreaming(username); }
   // Один стрим — один транспорт (не dual-publish): смотрим, откуда реально вещает
   // identity, дерево или LiveKit-комната, и подключаемся тем же транспортом.
   // Для уже открытого watch приоритет у пина (watchT) — объявление могло уже пропасть.

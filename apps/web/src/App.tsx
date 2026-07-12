@@ -302,7 +302,8 @@ function Home() {
             а «никто не в эфире» ужимается в тонкую строку внизу (не доминирует экраном показывая ничего). */}
         {live.length ? <>
           <div className="home-sec hot">Сейчас в эфире</div>
-          <div className="live-grid">{live.map((it) => <LiveCard key={it.key} item={it} onOpen={() => openServer(it.server.id)} />)}</div>
+          {/* hasStream → CTA открывает сервер И сразу запускает просмотр ведущего стримера; voice-only → просто вход */}
+          <div className="live-grid">{live.map((it) => <LiveCard key={it.key} item={it} onOpen={() => openServer(it.server.id, it.streamers[0]?.username)} />)}</div>
         </> : null}
 
         {games.length ? <>

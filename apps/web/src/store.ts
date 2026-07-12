@@ -49,7 +49,8 @@ interface AppState {
   afterAuth: (user: User) => Promise<void>;
   loadMe: () => Promise<void>;
   logout: () => void;
-  openServer: (id: string) => Promise<void>;
+  openServer: (id: string, watchUser?: string) => Promise<void>; // watchUser — авто-запуск просмотра стримера после входа (CTA «Смотреть» с главной)
+  watchAfterEnter: (serverId: string, username: string) => void;
   connectServer: (id: string) => Promise<void>;       // фактический (ре)коннект к серверу
   showConnectedServer: (id: string) => Promise<void>; // показать уже подключённый сервер без реконнекта
   confirmSwitchServer: () => void;                     // подтверждение модалки переключения
@@ -285,12 +286,28 @@ export const useStore = create<AppState>((set, get) => ({
   // Точка входа по клику на сервер. Просмотр СВОБОДНЫЙ (голос не рвём, модалки переключения больше нет):
   // уже смотрю → no-op; смотримая комната уже на id (вернулся с главной) → мгновенный показ; иначе — вход
   // (connectServer сам решит: реюз живой голосовой комнаты или новый view-коннект).
-  openServer: async (id) => {
+  openServer: async (id, watchUser) => {
     const s = get();
     if (s.loadingServerId === id) return;                     // уже открываем этот сервер
-    if (s.view === 'server' && s.active?.id === id) return;    // уже смотрим его
-    if (s.viewServerId === id) { await get().showConnectedServer(id); return; } // смотримая комната уже на id
+    if (s.view === 'server' && s.active?.id === id) { if (watchUser) get().watchAfterEnter(id, watchUser); return; } // уже смотрим его
+    if (s.viewServerId === id) { await get().showConnectedServer(id); if (watchUser) get().watchAfterEnter(id, watchUser); return; } // смотримая комната уже на id
     await get().connectServer(id);
+    if (watchUser) get().watchAfterEnter(id, watchUser);
+  },
+
+  // Авто-просмотр после входа (CTA «Смотреть» с главной): ждём, пока discovery объявит стрим (тогда
+  // transportFor выберет верный транспорт), затем engine.watch. Гард по viewServerId — уход с сервера
+  // отменяет. Стрим не появился за окно → стример ушёл офлайн, тихий тост.
+  watchAfterEnter: (serverId, username) => {
+    if (username === get().me?.username) return; // ведущий стример — я сам: свой стрим не смотрим
+    const deadline = Date.now() + 12000;
+    const tick = () => {
+      if (get().viewServerId !== serverId || get().view !== 'server') return; // ушли — отмена
+      if (engine?.isStreamLive(username)) { engine.watch(username); return; }
+      if (Date.now() > deadline) { get().toast('Трансляция уже завершилась', 'info'); return; }
+      setTimeout(tick, 400);
+    };
+    tick();
   },
 
   // Показать сервер, к которому уже подключены (вернулись с главной) — мгновенно, без реконнекта.
