@@ -116,7 +116,11 @@ export interface ReplyRef {
   sid?: number;    // id строки в БД исходного — для перехода к оригиналу
   img?: boolean;   // в исходном была картинка (legacy-поле img ИЛИ files с kind:'image')
   hasFile?: boolean; // в исходном был файл-вложение (kind:'file')
+  thumb?: string;  // R3: URL превью-картинки оригинала (тумбнейл в цитате)
 }
+
+// Реакция 7TV на сообщение (агрегат): эмоут + счётчик + реагировал ли я.
+export interface Reaction { id: string; name: string; count: number; mine: boolean }
 
 // вложение к сообщению — картинка (инлайн-превью, /api/uploads/*) или произвольный файл
 // (форс-скачивание, /api/files/*). До 5 штук на сообщение (см. sanitizeAttachments на сервере).
@@ -143,6 +147,7 @@ export interface ChatMessage {
   mention?: boolean; // упоминает меня (@ник) ИЛИ ответ на моё сообщение
   reply?: ReplyRef; // это ответ на другое сообщение
   status?: 'failed'; // не удалось сохранить на сервере (показываем «не отправлено · повторить»)
+  edited?: boolean; // сообщение было отредактировано (метка «(изменено)»)
 }
 
 export interface HistoryMessage {
@@ -156,6 +161,8 @@ export interface HistoryMessage {
   files?: Attachment[];
   ts: number;
   reply?: ReplyRef;
+  edited?: boolean;
+  reactions?: Reaction[]; // агрегат реакций из истории
 }
 
 export interface Emote { id: string; name: string }

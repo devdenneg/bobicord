@@ -2,7 +2,7 @@ import {
   Room, RoomEvent, Track, LocalAudioTrack, AudioPresets, ConnectionQuality,
   type RemoteParticipant, type Participant, type TrackPublication, type RemoteTrack,
 } from 'livekit-client';
-import type { User, Member, ChatMessage, Emote, HistoryMessage, ReplyRef, Attachment } from './types';
+import type { User, Member, ChatMessage, Emote, HistoryMessage, ReplyRef, Attachment, Reaction } from './types';
 import { baseUid } from './util';
 import { notify } from './notify';
 import { api } from './api';
@@ -63,6 +63,9 @@ interface EngineHooks {
   persistMessage: (text: string, em: Record<string, string>, image: string | undefined, reply: ReplyRef | undefined, localId: number, key: string, files?: Attachment[]) => void;
   refetchChat?: () => void; // догрузить свежие сообщения (после реконнекта — заполнить пропуск)
   endBroadcast?: () => void; // остановить нативную трансляцию (Rust) при выходе из голосового — browser-share гасит stopShare
+  reactMessage?: (serverId: string, sid: number, emoteId: string, emoteName: string, add: boolean) => void; // персист реакции
+  editMessage?: (serverId: string, sid: number, text: string) => void;   // персист редактирования
+  deleteMessage?: (serverId: string, sid: number) => void;               // персист удаления
 }
 
 let msgSeq = 1;
@@ -135,6 +138,9 @@ export class Engine {
   private pendingWatch = new Set<string>();
   private streamWatchers = new Map<string, Map<string, { name: string; color: number; avatarUrl?: string; ts: number }>>();
   private messages: ChatMessage[] = [];
+  // Реакции 7TV по сообщению (ключ — серверный sid): emoteId -> {name, count, mine}. Источник правды —
+  // история (getReactions читает UI); realtime-события (t:'react') мутируют, refetch корректирует дрейф.
+  private reactions = new Map<number, Map<string, { name: string; count: number; mine: boolean }>>();
   private chatMore = false; // есть ли ещё более старые сообщения на сервере (пагинация вверх)
   private oldestSid: number | null = null; // DB-id самого старого загруженного сообщения = курсор для before
   private trimmedFront = 0; // сколько сообщений суммарно срезано с НАЧАЛА (для якоря virtuoso: срез спереди → firstItemIndex += N)
@@ -1349,11 +1355,17 @@ export class Engine {
   private mapHistory(list: HistoryMessage[]): ChatMessage[] {
     return list.map((m) => {
       if (m.em) for (const k in m.em) this.onEmoteResolve?.(k, m.em[k]);
-      return { id: msgSeq++, sid: m.id, uid: m.uid, who: m.name, text: m.text, mine: m.uid === this.me.id, sys: false, color: m.color, img: m.img, files: m.files, ts: m.ts, mention: m.uid !== this.me.id && (this.textMentionsMe(m.text) || this.replyToMe(m.reply)), reply: m.reply };
+      // реакции из истории — авторитетны (корректируют realtime-дрейф). Ключ — серверный id (sid).
+      if (m.id != null) {
+        if (m.reactions && m.reactions.length) this.reactions.set(m.id, new Map(m.reactions.map((r) => [r.id, { name: r.name, count: r.count, mine: r.mine }])));
+        else this.reactions.delete(m.id);
+      }
+      return { id: msgSeq++, sid: m.id, uid: m.uid, who: m.name, text: m.text, mine: m.uid === this.me.id, sys: false, color: m.color, img: m.img, files: m.files, ts: m.ts, mention: m.uid !== this.me.id && (this.textMentionsMe(m.text) || this.replyToMe(m.reply)), reply: m.reply, edited: m.edited };
     });
   }
   // начальная страница истории (последние N) — заменяет весь чат, ставит курсор на самое старое
   loadHistory(list: HistoryMessage[], hasMore = false) {
+    this.reactions.clear();
     this.messages = this.mapHistory(list);
     this.chatMore = hasMore;
     this.oldestSid = list.length ? (list[0].id ?? null) : null; // list в ASC-порядке, [0] — самое старое
@@ -1423,6 +1435,59 @@ export class Engine {
     this.pendingSend.set(id, { text: t, em, img, reply, key, files });
     this.hooks.persistMessage(t, em, img, reply, id, key, files);
   }
+  // --- реакции 7TV (по серверному sid) ---
+  getReactions(sid?: number | null): Reaction[] {
+    if (sid == null) return [];
+    const m = this.reactions.get(sid);
+    if (!m) return [];
+    return [...m.entries()].map(([id, v]) => ({ id, name: v.name, count: v.count, mine: v.mine })).filter((r) => r.count > 0);
+  }
+  toggleReaction(sid: number, emote: { id: string; name: string }) {
+    let m = this.reactions.get(sid); if (!m) { m = new Map(); this.reactions.set(sid, m); }
+    const cur = m.get(emote.id) || { name: emote.name, count: 0, mine: false };
+    const add = !cur.mine;
+    cur.mine = add; cur.count = Math.max(0, cur.count + (add ? 1 : -1)); cur.name = emote.name;
+    if (cur.count <= 0) m.delete(emote.id); else m.set(emote.id, cur);
+    this.emit();
+    this.dataSend({ t: 'react', sid, id: emote.id, name: emote.name, uid: this.me.id, add });
+    this.hooks.reactMessage?.(this.viewServerId, sid, emote.id, emote.name, add);
+  }
+  private applyReaction(d: any) {
+    const sid = d.sid; if (typeof sid !== 'number' || d.uid === this.me.id) return; // своё не дублируем (эха обычно нет)
+    let m = this.reactions.get(sid); if (!m) { m = new Map(); this.reactions.set(sid, m); }
+    const cur = m.get(d.id) || { name: String(d.name || ''), count: 0, mine: false };
+    cur.name = String(d.name || cur.name);
+    cur.count = Math.max(0, cur.count + (d.add ? 1 : -1));
+    if (cur.count <= 0 && !cur.mine) m.delete(d.id); else m.set(d.id, cur);
+    this.emit();
+  }
+  // --- edit / delete своего сообщения ---
+  editChat(sid: number, text: string) {
+    const t = text.trim(); if (!t) return;
+    this.messages = this.messages.map((m) => (m.sid === sid ? { ...m, text: t, edited: true } : m));
+    this.emit();
+    this.dataSend({ t: 'edit', sid, text: t });
+    this.hooks.editMessage?.(this.viewServerId, sid, t);
+  }
+  deleteChat(sid: number) {
+    this.messages = this.messages.filter((m) => m.sid !== sid);
+    this.reactions.delete(sid);
+    this.emit();
+    this.dataSend({ t: 'del', sid });
+    this.hooks.deleteMessage?.(this.viewServerId, sid);
+  }
+  private applyEdit(d: any) {
+    if (typeof d.sid !== 'number') return;
+    let ch = false;
+    this.messages = this.messages.map((m) => (m.sid === d.sid ? (ch = true, { ...m, text: String(d.text || ''), edited: true }) : m));
+    if (ch) this.emit();
+  }
+  private applyDelete(d: any) {
+    if (typeof d.sid !== 'number') return;
+    const before = this.messages.length;
+    this.messages = this.messages.filter((m) => m.sid !== d.sid);
+    if (this.messages.length !== before) { this.reactions.delete(d.sid); this.emit(); }
+  }
   sendTyping() {
     if (!this.viewRoom) return;
     const now = Date.now();
@@ -1466,10 +1531,13 @@ export class Engine {
           notify('mention', { title: d.name, body: String(d.text || '').slice(0, 140) || fallback, tag: 'mention:' + this.viewServerId });
         }
       }
-      else if (d.t === 'clear') { this.messages = []; this.emit(); this.sysMsg((d.by || 'Админ') + ' очистил чат'); }
+      else if (d.t === 'clear') { this.messages = []; this.reactions.clear(); this.emit(); this.sysMsg((d.by || 'Админ') + ' очистил чат'); }
       else if (d.t === 'emote') this.emoteListeners.forEach((f) => f(d.s, d.e, d.by, d.x, d.sz));
       else if (d.t === 'watch') { const m = this.wset(d.s); if (d.on) m.set(d.id, { name: d.n, color: d.c ?? 0, avatarUrl: d.a, ts: Date.now() }); else m.delete(d.id); this.emit(); }
       else if (d.t === 'typing') { if (d.name && d.name !== this.me.displayName) { this.typingUsers.set(d.name, Date.now() + 3500); this.emit(); setTimeout(() => this.pruneTyping(), 3600); } }
+      else if (d.t === 'react') this.applyReaction(d);
+      else if (d.t === 'edit') this.applyEdit(d);
+      else if (d.t === 'del') this.applyDelete(d);
     } catch { /**/ }
   };
   onEmoteResolve: ((name: string, id: string) => void) | null = null;
@@ -1478,7 +1546,7 @@ export class Engine {
   // reliable для состояния, которое нельзя терять: чат (сообщения), vclaim (одна голосовая на
   // аккаунт — потеря датаграммы оставила бы две сессии в войсе), clear (чистка чата).
   // vclaim принадлежит голосовой сессии → voiceRoom; чат/clear/typing/emote/watch — просматриваемому серверу → viewRoom
-  private dataSend(obj: any) { const room = (obj.t === 'vclaim' || obj.t === 'music') ? this.voiceRoom : this.viewRoom; if (!room) return; try { room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify(obj)), { reliable: obj.t === 'chat' || obj.t === 'vclaim' || obj.t === 'clear' || obj.t === 'music' }); } catch { /**/ } }
+  private dataSend(obj: any) { const room = (obj.t === 'vclaim' || obj.t === 'music') ? this.voiceRoom : this.viewRoom; if (!room) return; try { room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify(obj)), { reliable: obj.t === 'chat' || obj.t === 'vclaim' || obj.t === 'clear' || obj.t === 'music' || obj.t === 'react' || obj.t === 'edit' || obj.t === 'del' }); } catch { /**/ } }
 
   emoteImg(id: string) { return emoteUrl(id); }
 }

@@ -131,6 +131,9 @@ export const api = {
     return req<{ messages: HistoryMessage[]; hasMore: boolean }>('GET', `/servers/${id}/messages${q ? '?' + q : ''}`);
   },
   postMessage: (id: string, text: string, em: Record<string, string>, image?: string, reply?: import('./types').ReplyRef, key?: string, files?: Attachment[]) => req<{ ok: boolean }>('POST', `/servers/${id}/messages`, { text, em, image, reply, key, files }),
+  reactMessage: (id: string, mid: number, emoteId: string, emoteName: string, add: boolean) => req<{ ok: boolean }>('POST', `/servers/${id}/messages/${mid}/react`, { emoteId, emoteName, add }),
+  editMessage: (id: string, mid: number, text: string) => req<{ ok: boolean }>('PATCH', `/servers/${id}/messages/${mid}`, { text }),
+  deleteMessage: (id: string, mid: number) => req<{ ok: boolean }>('DELETE', `/servers/${id}/messages/${mid}`),
   // Web Push (фоновые уведомления PWA/браузера)
   pushVapid: () => req<{ enabled: boolean; key: string }>('GET', '/push/vapid'),
   pushSubscribe: (sub: unknown, prefs: { mention: boolean; stream: boolean }) => req<{ ok: boolean }>('POST', '/push/subscribe', { sub, prefs }),

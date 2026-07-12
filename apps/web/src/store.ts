@@ -200,6 +200,9 @@ export const useStore = create<AppState>((set, get) => ({
           .catch(() => engine?.markSendResult(localId, false));
       },
       refetchChat: () => { const a = get().active; if (!a) return; api.getMessages(a.id, undefined, 30).then((d) => engine?.mergeRecent(d.messages)).catch(() => {}); },
+      reactMessage: (serverId, sid, emoteId, emoteName, add) => { api.reactMessage(serverId, sid, emoteId, emoteName, add).catch(() => {}); },
+      editMessage: (serverId, sid, text) => { api.editMessage(serverId, sid, text).catch(() => {}); },
+      deleteMessage: (serverId, sid) => { api.deleteMessage(serverId, sid).catch(() => {}); },
       // выход из голосового → гасим нативную трансляцию (Rust-дерево) + сбрасываем флаг (browser-share гасит engine.stopShare)
       endBroadcast: () => { if (isTauri) stopNativeBroadcast().catch(() => {}).finally(() => endAnyBroadcasterSession()); get().setBroadcastLive(false); },
     });

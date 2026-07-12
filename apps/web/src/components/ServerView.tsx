@@ -748,6 +748,9 @@ function Chat() {
   const messages = eng.messages;
   const [replyTo, setReplyTo] = useState<ChatMessage | null>(null); // на какое сообщение отвечаем
   const [flashId, setFlashId] = useState<number | null>(null);      // подсветка оригинала при переходе по цитате
+  const [reactTarget, setReactTarget] = useState<{ sid: number; anchor: DOMRect } | null>(null); // 7TV-пикер для реакции
+  const [editing, setEditing] = useState<{ id: number; sid: number } | null>(null); // инлайн-редактирование
+  const [editText, setEditText] = useState('');
   const markReadStore = useStore((s) => s.markRead);
   const bumpUnreadStore = useStore((s) => s.bumpUnread);
   // базовая линия «прочитано до» (id) — замораживается при входе на сервер; дивайдер «новые» рисуется
@@ -916,11 +919,14 @@ function Chat() {
   }, [E, activeId]);
 
   // --- reply (ответ на сообщение) ---
-  const buildReplyRef = (m: ChatMessage): ReplyRef => ({
-    author: m.who || '', text: (m.text || '').slice(0, 160), uid: m.uid, sid: m.sid,
-    img: !!m.img || !!m.files?.some((f) => f.kind === 'image'),
-    hasFile: !!m.files?.some((f) => f.kind === 'file'),
-  });
+  const buildReplyRef = (m: ChatMessage): ReplyRef => {
+    const imgUrl = m.img || m.files?.find((f) => f.kind === 'image')?.url;
+    return {
+      author: m.who || '', text: (m.text || '').slice(0, 160), uid: m.uid, sid: m.sid,
+      img: !!imgUrl, hasFile: !!m.files?.some((f) => f.kind === 'file'),
+      thumb: imgUrl ? resolveUploadUrl(imgUrl) : undefined,
+    };
+  };
   // текстовый сниппет цитаты, когда исходное сообщение без текста (только вложения)
   const replySnippet = (r: ReplyRef): string => r.text || (r.img && r.hasFile ? '🖼📎 Вложения' : r.img ? '🖼 Изображение' : r.hasFile ? '📎 Файл' : '');
   const startReply = useCallback((m: ChatMessage) => {
@@ -1114,6 +1120,7 @@ function Chat() {
           <span className="rq-hook" style={{ borderColor: rColor }} />
           <Avatar name={rep.author} ci={rAuthor?.avatarColor ?? 0} url={rAuthor?.avatarUrl} size={16} />
           <span className="rq-author" style={{ color: rColor }}>{rep.author}</span>
+          {rep.thumb ? <img className="rq-thumb" src={rep.thumb} alt="" loading="lazy" /> : null}
           <span className="rq-text">{replySnippet(rep)}</span>
         </button>
       );
@@ -1131,18 +1138,34 @@ function Chat() {
             {!m.sys && !cont ? <div className="who" style={{ color: nameColor }}>{m.who}{aRoles.length ? <span className="who-roles">{aRoles.map((r) => <span key={r.id} className="who-role" style={{ background: (r.color || 'var(--panel3)') + '22', color: r.color || 'var(--muted)', borderColor: (r.color || 'var(--line-2)') + '55' }}>{r.name}</span>)}</span> : null}{m.ts ? <span className="mtime">{fmtTime(m.ts)}</span> : null}</div> : null}
             <div className="msg-main">
               <div className="msg-content">
-                {m.sys || m.text ? (
+                {editing?.id === m.id ? (
+                  <div className="msg-edit">
+                    <input autoFocus value={editText} onChange={(e) => setEditText(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); if (m.sid != null && editText.trim()) E.editChat(m.sid, editText); setEditing(null); } else if (e.key === 'Escape') { e.preventDefault(); setEditing(null); } }} />
+                    <div className="msg-edit-hint">Enter — сохранить · Esc — отмена</div>
+                  </div>
+                ) : m.sys || m.text ? (
                   <div className={'tx' + (big ? ' big' : '')}>
                     {m.sys ? m.text : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : 'link' in p ? <a key={i} className="msg-link" href={p.link} target="_blank" rel="noreferrer">{p.link}</a> : 'mention' in p ? <span key={i} className="mention-tag">{p.mention}</span> : <img key={i} className="emo" src={emoteUrl(p.emo)} alt={p.name} title={p.name} loading="lazy" decoding="async" />))}
+                    {m.edited && !m.sys ? <span className="medit" title="Изменено">(изменено)</span> : null}
                   </div>
                 ) : null}
                 {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox({ url: m.img!, name: m.img!.split('/').pop() || 'image', size: 0, mime: 'image/*', kind: 'image' })}><img className="msg-img" src={resolveUploadUrl(m.img)} alt="" loading="lazy" /></button> : null}
                 {m.files && m.files.length ? <MessageAttachments files={m.files} onImageClick={setLightbox} /> : null}
                 {m.status === 'failed' ? <div className="msg-failed"><Icon name="warn" sm />Не отправлено<button onClick={() => getEngine()?.retrySend(m.id)}>Повторить</button></div> : null}
+                {(() => { const reacts = m.sid != null ? E.getReactions(m.sid) : []; return reacts.length ? (
+                  <div className="msg-reacts">
+                    {reacts.map((r) => <button key={r.id} className={'react-pill' + (r.mine ? ' mine' : '')} title={r.name} onClick={() => m.sid != null && E.toggleReaction(m.sid, { id: r.id, name: r.name })}><img src={emoteUrl(r.id)} alt={r.name} loading="lazy" /><b>{r.count}</b></button>)}
+                    <button className="react-add" data-tip="Добавить реакцию" onClick={(e) => m.sid != null && setReactTarget({ sid: m.sid, anchor: e.currentTarget.getBoundingClientRect() })}><Icon name="react" sm /></button>
+                  </div>
+                ) : null; })()}
               </div>
-              {!m.sys ? <div className="msg-actions" onMouseDown={(e) => e.preventDefault()}>
+              {!m.sys && editing?.id !== m.id ? <div className="msg-actions" onMouseDown={(e) => e.preventDefault()}>
+                {m.sid != null ? <button className="msg-act" data-tip="Реакция" onClick={(e) => setReactTarget({ sid: m.sid!, anchor: e.currentTarget.getBoundingClientRect() })}><Icon name="react" sm /></button> : null}
                 <button className="msg-act" data-tip="Ответить" onClick={() => startReply(m)}><Icon name="reply" sm /></button>
                 {m.text ? <button className="msg-act" data-tip="Копировать текст" onClick={() => { navigator.clipboard?.writeText(m.text!).then(() => useStore.getState().toast('Скопировано', 'ok')).catch(() => {}); }}><Icon name="copy" sm /></button> : null}
+                {m.mine && m.text && m.sid != null ? <button className="msg-act" data-tip="Изменить" onClick={() => { setEditing({ id: m.id, sid: m.sid! }); setEditText(m.text); }}><Icon name="edit" sm /></button> : null}
+                {m.mine && m.sid != null ? <button className="msg-act danger" data-tip="Удалить" onClick={() => { if (window.confirm('Удалить сообщение?')) E.deleteChat(m.sid!); }}><Icon name="delete" sm /></button> : null}
               </div> : null}
             </div>
           </div>
@@ -1271,6 +1294,8 @@ function Chat() {
       </div>
       {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} onClose={() => setPickAnchor(undefined)}
         onPick={(e: Emote) => { setText((t) => t + (t && !t.endsWith(' ') ? ' ' : '') + e.name + ' '); }} /> : null}
+      {reactTarget ? <EmotePicker anchor={reactTarget.anchor} onClose={() => setReactTarget(null)}
+        onPick={(e: Emote) => { E.toggleReaction(reactTarget.sid, e); setReactTarget(null); }} /> : null}
       {lightbox ? <ImageLightbox attachment={lightbox} onClose={() => setLightbox(null)} /> : null}
     </div>
   );

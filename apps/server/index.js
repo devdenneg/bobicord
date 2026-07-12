@@ -185,6 +185,7 @@ for (const sql of [
   "ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
   "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE servers ADD COLUMN music_enabled INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE messages ADD COLUMN edited INTEGER NOT NULL DEFAULT 0",
 ]) { try { db.exec(sql); } catch (e) { /* column already exists */ } }
 
 // Бутстрап супер-админа: denis всегда админ (идемпотентно на каждом старте); остальным админку выдаёт админ из /admin.
@@ -196,6 +197,19 @@ try { db.prepare("UPDATE users SET is_admin=1 WHERE username=?").run('denis'); }
 try { db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_ckey ON messages(server_id, user_id, client_key) WHERE client_key <> ''"); } catch (e) {}
 // memberships PK = (user_id, server_id) → выборка по server_id (appOpenMembers, memberCount — часто в /me/presence) сканировала бы; индекс по server_id ускоряет.
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_mem_server ON memberships(server_id)"); } catch (e) {}
+// Реакции 7TV на сообщения: (сервер, сообщение, эмоут, юзер) — уникальны (один юзер = одна реакция этим эмоутом).
+try {
+  db.exec(`CREATE TABLE IF NOT EXISTS reactions(
+    server_id TEXT NOT NULL,
+    msg_id INTEGER NOT NULL,
+    emote_id TEXT NOT NULL,
+    emote_name TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    created INTEGER NOT NULL,
+    PRIMARY KEY(server_id, msg_id, emote_id, user_id)
+  )`);
+  db.exec("CREATE INDEX IF NOT EXISTS idx_react_msg ON reactions(server_id, msg_id)");
+} catch (e) {}
 
 /* one-time migration of legacy users.json -> users table */
 (function migrateLegacy() {
@@ -1077,13 +1091,25 @@ app.get('/api/servers/:id/messages', requireAuth, (req, res) => {
   const minTs = Date.now() - WEEK_MS;
   // берём limit+1, чтобы понять, есть ли ещё более старые сообщения (hasMore)
   const rows = before > 0
-    ? db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created FROM messages WHERE server_id=? AND created>? AND id<? ORDER BY id DESC LIMIT ?').all(sid, minTs, before, limit + 1)
-    : db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created FROM messages WHERE server_id=? AND created>? ORDER BY id DESC LIMIT ?').all(sid, minTs, limit + 1);
+    ? db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,edited FROM messages WHERE server_id=? AND created>? AND id<? ORDER BY id DESC LIMIT ?').all(sid, minTs, before, limit + 1)
+    : db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,edited FROM messages WHERE server_id=? AND created>? ORDER BY id DESC LIMIT ?').all(sid, minTs, limit + 1);
   const hasMore = rows.length > limit;
   const page = rows.slice(0, limit).reverse(); // ASC: старые → новые (как рисуем в чате)
+  // Реакции по загруженным сообщениям: агрегируем в {id,name,count,mine} на сообщение.
+  const reactByMsg = new Map();
+  const pageIds = page.map(r => r.id);
+  if (pageIds.length) {
+    const ph = pageIds.map(() => '?').join(',');
+    const rr = db.prepare(`SELECT msg_id, emote_id, emote_name, user_id FROM reactions WHERE server_id=? AND msg_id IN (${ph})`).all(sid, ...pageIds);
+    for (const x of rr) {
+      let em = reactByMsg.get(x.msg_id); if (!em) { em = new Map(); reactByMsg.set(x.msg_id, em); }
+      let e = em.get(x.emote_id); if (!e) { e = { id: x.emote_id, name: x.emote_name, count: 0, mine: false }; em.set(x.emote_id, e); }
+      e.count++; if (x.user_id === req.user.id) e.mine = true;
+    }
+  }
   res.json({
     hasMore,
-    messages: page.map(r => ({ id: r.id, uid: r.user_id, name: r.display_name, color: r.avatar_color, text: r.text, em: JSON.parse(r.emotes || '{}'), img: r.image || '', files: JSON.parse(r.attachments || '[]'), reply: r.reply_to ? JSON.parse(r.reply_to) : undefined, ts: r.created })),
+    messages: page.map(r => ({ id: r.id, uid: r.user_id, name: r.display_name, color: r.avatar_color, text: r.text, em: JSON.parse(r.emotes || '{}'), img: r.image || '', files: JSON.parse(r.attachments || '[]'), reply: r.reply_to ? JSON.parse(r.reply_to) : undefined, ts: r.created, edited: !!r.edited, reactions: reactByMsg.has(r.id) ? [...reactByMsg.get(r.id).values()] : undefined })),
   });
 });
 // вложения: до 5 на сообщение, url валиден для своего kind (картинки — /api/uploads/*, инлайн;
@@ -1121,7 +1147,8 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
     const clean = { author, text: String(rp.text || '').slice(0, 160), img: !!rp.img };
     if (rp.uid) clean.uid = String(rp.uid).slice(0, 64);
     if (Number.isFinite(rp.sid)) clean.sid = rp.sid;
-    return JSON.stringify(clean).slice(0, 500);
+    if (rp.thumb) clean.thumb = String(rp.thumb).slice(0, 300); // R3: превью картинки оригинала в цитате
+    return JSON.stringify(clean).slice(0, 600);
   })();
   const now = Date.now();
   const clientKey = String(req.body.key || '').slice(0, 64);
@@ -1152,6 +1179,45 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
       if (VAPID) pushToUsers('mention', targets, { kind: 'mention', title: req.user.display_name, body, serverId: sid, tag: 'mention:' + sid, url: '/?server=' + sid }).catch(() => {});
     } catch (e) { console.error('[notify] mention:', e && e.message); }
   })();
+});
+// Реакция 7TV на сообщение (тогл). Realtime-раздача — через data-канал клиента (как чат), сервер персистит.
+app.post('/api/servers/:id/messages/:mid/react', requireAuth, (req, res) => {
+  const sid = req.params.id;
+  if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
+  const mid = parseInt(req.params.mid, 10);
+  const emoteId = String(req.body.emoteId || '').slice(0, 64);
+  const emoteName = String(req.body.emoteName || '').slice(0, 64);
+  if (!mid || !emoteId || !emoteName) return res.status(400).json({ error: 'bad' });
+  const msg = db.prepare('SELECT id FROM messages WHERE id=? AND server_id=?').get(mid, sid);
+  if (!msg) return res.status(404).json({ error: 'no msg' });
+  if (req.body.add) db.prepare('INSERT OR IGNORE INTO reactions(server_id,msg_id,emote_id,emote_name,user_id,created) VALUES(?,?,?,?,?,?)').run(sid, mid, emoteId, emoteName, req.user.id, Date.now());
+  else db.prepare('DELETE FROM reactions WHERE server_id=? AND msg_id=? AND emote_id=? AND user_id=?').run(sid, mid, emoteId, req.user.id);
+  res.json({ ok: true });
+});
+// Редактирование СВОЕГО сообщения (флаг edited + новый текст). Realtime — через data-канал.
+app.patch('/api/servers/:id/messages/:mid', requireAuth, (req, res) => {
+  const sid = req.params.id;
+  const mid = parseInt(req.params.mid, 10);
+  const text = String(req.body.text || '').slice(0, 1000);
+  if (!mid || !text.trim()) return res.status(400).json({ error: 'пусто' });
+  const msg = db.prepare('SELECT user_id FROM messages WHERE id=? AND server_id=?').get(mid, sid);
+  if (!msg) return res.status(404).json({ error: 'no msg' });
+  if (msg.user_id !== req.user.id) return res.status(403).json({ error: 'не твоё' });
+  db.prepare('UPDATE messages SET text=?, edited=1 WHERE id=?').run(text, mid);
+  res.json({ ok: true });
+});
+// Удаление сообщения: автор ИЛИ владелец сервера. Сносим и его реакции.
+app.delete('/api/servers/:id/messages/:mid', requireAuth, (req, res) => {
+  const sid = req.params.id;
+  const mid = parseInt(req.params.mid, 10);
+  if (!mid) return res.status(400).json({ error: 'bad' });
+  const msg = db.prepare('SELECT user_id FROM messages WHERE id=? AND server_id=?').get(mid, sid);
+  if (!msg) return res.status(404).json({ error: 'no msg' });
+  const owner = (db.prepare('SELECT owner_id FROM servers WHERE id=?').get(sid) || {}).owner_id === req.user.id;
+  if (msg.user_id !== req.user.id && !owner) return res.status(403).json({ error: 'нельзя' });
+  db.prepare('DELETE FROM messages WHERE id=?').run(mid);
+  db.prepare('DELETE FROM reactions WHERE server_id=? AND msg_id=?').run(sid, mid);
+  res.json({ ok: true });
 });
 
 app.get('/healthz', (req, res) => res.send('ok'));
