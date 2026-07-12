@@ -1610,6 +1610,12 @@ function Channels() {
   const active = useStore((s) => s.active)!;
   const me = useStore((s) => s.me)!;
   const setModal = useStore((s) => s.setModal);
+  const eng = useEngine();
+  const E = getEngine()!;
+  const muted = eng.localMicMuted;
+  const deaf = eng.deafened;
+  // статус: пред-установка мута/оглушения видна ещё ДО входа в канал (Discord-стиль)
+  const statusText = deaf ? 'Звук выключен' : muted ? 'Микрофон выключен' : 'В сети';
   return (
     <div id="channels">
       <div className="ch-header" role="button" tabIndex={0} data-tip="Меню сервера" onClick={() => setModal('srvmenu')}>
@@ -1618,8 +1624,11 @@ function Channels() {
       <div className="ch-body"><VoiceChannels /></div>
       <StreamerWidget />
       <VoiceDock variant="inline" />
+      {/* нижняя аккаунт-панель (всегда): мик/оглох работают и ВНЕ голоса — пред-установка входа, сохраняется всегда */}
       <div className="user-panel">
-        <div className="up-i" onClick={() => setModal('profile')}><b>{me.displayName}</b><span>В сети</span></div>
+        <div className="up-i" onClick={() => setModal('profile')}><b>{me.displayName}</b><span>{statusText}</span></div>
+        <button className={'up-btn' + (muted ? ' act' : '')} aria-pressed={muted} data-tip={muted ? 'Включить микрофон' : 'Выключить микрофон'} onClick={() => E.toggleMic()}><Icon name={muted ? 'mic-off' : 'mic'} sm /></button>
+        <button className={'up-btn' + (deaf ? ' act' : '')} aria-pressed={deaf} data-tip={deaf ? 'Включить звук' : 'Заглушить звук'} onClick={() => E.toggleDeaf()}><Icon name={deaf ? 'head-off' : 'head'} sm /></button>
         <button className="up-btn" data-tip="Настройки звука" onClick={() => setModal('settings')}><Icon name="gear" sm /></button>
       </div>
     </div>

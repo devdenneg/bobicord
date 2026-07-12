@@ -110,7 +110,7 @@ export class Engine {
   private connQuality: VoiceQuality = 'unknown'; // качество связи (обновляется по событию LiveKit)
   private pingMs: number | null = null;          // RTT до сервера, мс (опрос статистики в голосовом)
   private connTimer: number | null = null;       // таймер опроса пинга (только в голосовом)
-  private deafened = false;
+  private deafened = localStorage.getItem('voiceDeaf') === '1'; // персист: пред-установка «оглох» до входа (Discord-стиль)
   private pttDown = false;
   private watchTimers = new Map<string, number>();
 
@@ -121,7 +121,8 @@ export class Engine {
   private micGain: GainNode | null = null;
   private micDenoise: RnnoiseWorkletNode | null = null;
   private micVadDest: MediaStreamAudioDestinationNode | null = null;
-  private manualMute = false;
+  private manualMute = localStorage.getItem('voiceMute') === '1'; // персист: пред-установка «мут мика» до входа (Discord-стиль)
+  private saveVoicePrefs() { try { localStorage.setItem('voiceMute', this.manualMute ? '1' : '0'); localStorage.setItem('voiceDeaf', this.deafened ? '1' : '0'); } catch { /**/ } }
   private deafToggling = false; // окно подавления mute/unmute-звука от track.mute()/unmute() при оглушении (deaf сам играет fullMute/unmute)
 
   // Оба транспорта живут одновременно (не выбор build-флагом): нативный вещатель
@@ -439,7 +440,7 @@ export class Engine {
     if (this.micRaw) { this.micRaw.getTracks().forEach((t) => t.stop()); this.micRaw = null; }
     if (this.micActx) { try { this.micActx.close(); } catch { /**/ } this.micActx = null; }
     this.micGain = null;
-    this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.roomReady = false; this.deafened = false; this.manualMute = false; this.screenStream = null;
+    this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.roomReady = false; this.screenStream = null; // deafened/manualMute НЕ трогаем — персист-интент
     // рвём ОБЕ комнаты (при расцепе разные; при shared — одна, Set схлопнёт дубль)
     new Set([this.viewRoom, this.voiceRoom].filter(Boolean)).forEach((rm) => { try { (rm as Room).disconnect(); } catch { /**/ } });
     this.viewRoom = null; this.voiceRoom = null; this.viewServerId = ''; this.voiceServerId = null; this.emit();
@@ -636,7 +637,7 @@ export class Engine {
     // в голосовом на ДРУГОМ сервере → покидаем его (Discord: молча переносим голос сюда)
     if (this.inVoice && this.voiceServerId !== targetServer) await this.leaveVoice();
     this.currentVc = channelId;
-    this.inVoice = true; this.manualMute = false; this.pttDown = false;
+    this.inVoice = true; this.pttDown = false; // manualMute НЕ сбрасываем — пред-установка мута применяется на входе
     this.voiceConnecting = true;
     this.voiceRoom = this.viewRoom;      // реюз коннекта смотримого сервера как голосового (без второго соединения)
     this.voiceServerId = targetServer;
@@ -655,7 +656,8 @@ export class Engine {
     }
     if (!this.voiceRoom) { this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.voiceServerId = null; this.emit(); return; }
     this.myVcAt = this.channelStartFor(channelId);
-    try { await this.voiceRoom.localParticipant.setAttributes({ vc: channelId, vcAt: String(this.myVcAt) }); } catch { /**/ }
+    // deaf по пред-установке — сразу заявляем пирам (иначе зашёл «оглохшим», а бейджа deaf у них нет)
+    try { await this.voiceRoom.localParticipant.setAttributes({ vc: channelId, vcAt: String(this.myVcAt), deaf: this.deafened ? '1' : '' }); } catch { /**/ }
     try { await this.startMic(); }
     catch {
       this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.myVcAt = null;
@@ -687,7 +689,7 @@ export class Engine {
     if (!this.voiceRoom || !this.inVoice) return;
     const vr = this.voiceRoom; // фиксируем: ниже обнулим указатель (и, возможно, порвём комнату)
     // оптимистично: сразу убираем себя из канала (UI не ждёт async-очистку mic/треков)
-    this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.deafened = false; this.manualMute = false; this.pttDown = false; this.myVcAt = null;
+    this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.pttDown = false; this.myVcAt = null; // deafened/manualMute НЕ сбрасываем — персист-интент до след. входа
     this.myChannelPeers.clear(); // вышел — состав моего канала сброшен (другие услышат мой выход по unpub мика / vc'')
     playSound('exit'); // сам вышедший тоже слышит выход (остальные в канале — через onRemoteUnpub)
     this.emit();
@@ -1003,35 +1005,44 @@ export class Engine {
     this.emit();
   }
   async toggleMic() {
-    if (!this.inVoice || !this.voiceRoom) return;
+    // Работает и ВНЕ голоса: пред-установка мута (Discord-стиль) — применится на входе (startMic мьютит
+    // при manualMute). В голосе — сразу мьютим/размьючиваем трек. Всегда персистим.
     this.manualMute = !this.manualMute;
-    const p = this.micPub();
-    // пока фулл-мут (deafened) активен, трек должен оставаться замьюченным на уровне LiveKit
-    // независимо от ручного тогла — иначе снятие ручного мута во время deafen паразитно
-    // размучивает трек (звук всё равно молчит через applyGate/gain=0, но у пиров и у себя
-    // пропадает бейдж мута, будто фулл-мута больше нет).
-    if (p && p.track) { (this.manualMute || this.deafened) ? p.track.mute() : p.track.unmute(); } // ручной мут виден другим
-    this.applyGate();
+    this.saveVoicePrefs();
+    if (this.inVoice && this.voiceRoom) {
+      const p = this.micPub();
+      // пока фулл-мут (deafened) активен, трек должен оставаться замьюченным на уровне LiveKit
+      // независимо от ручного тогла — иначе снятие ручного мута во время deafen паразитно
+      // размучивает трек (звук всё равно молчит через applyGate/gain=0, но у пиров и у себя
+      // пропадает бейдж мута, будто фулл-мута больше нет).
+      if (p && p.track) { (this.manualMute || this.deafened) ? p.track.mute() : p.track.unmute(); } // ручной мут виден другим
+      this.applyGate();
+    }
     this.emit();
   }
   toggleDeaf() {
-    if (!this.inVoice) return;
+    // Работает и ВНЕ голоса: пред-установка «оглох» — применится на входе (joinVoice ставит deaf-атрибут,
+    // reconcile не подпишется). Всегда персистим.
     this.deafened = !this.deafened;
-    // оглушение внутри мьютит/размьютит мик-трек → RoomEvent.TrackMuted/Unmuted. Глушим их
-    // паразитный mute/unmute-звук на ~250мс: свой звук (fullMute/unmute) играем явно ниже.
-    this.deafToggling = true;
-    window.setTimeout(() => { this.deafToggling = false; }, 250);
-    // транслируем пирам, чтобы у них статус-бейдж отличался от простого мута мика (см. build())
-    this.voiceRoom?.localParticipant.setAttributes({ deaf: this.deafened ? '1' : '' }).catch(() => {});
-    const p = this.micPub();
-    if (this.deafened) { if (p && p.track) p.track.mute(); }
-    else { if (p && p.track && !this.manualMute) p.track.unmute(); }
-    // deafen → отписка от всех миков (want=false при deafened), undeafen → переподписка. Отписка
-    // надёжнее глушения громкостью: нет трека = точно тишина, и размут пира не воскресит звук.
-    this.reconcileAllAudio();
-    this.applyGate();
+    this.saveVoicePrefs();
+    if (this.inVoice) {
+      // оглушение внутри мьютит/размьютит мик-трек → RoomEvent.TrackMuted/Unmuted. Глушим их
+      // паразитный mute/unmute-звук на ~250мс: свой звук (fullMute/unmute) играем явно ниже.
+      this.deafToggling = true;
+      window.setTimeout(() => { this.deafToggling = false; }, 250);
+      // транслируем пирам, чтобы у них статус-бейдж отличался от простого мута мика (см. build())
+      this.voiceRoom?.localParticipant.setAttributes({ deaf: this.deafened ? '1' : '' }).catch(() => {});
+      const p = this.micPub();
+      if (this.deafened) { if (p && p.track) p.track.mute(); }
+      else { if (p && p.track && !this.manualMute) p.track.unmute(); }
+      // deafen → отписка от всех миков (want=false при deafened), undeafen → переподписка. Отписка
+      // надёжнее глушения громкостью: нет трека = точно тишина, и размут пира не воскресит звук.
+      this.reconcileAllAudio();
+      this.applyGate();
+      this.applyAllVolumes();
+    }
+    // стрим-аудио (просмотр) глушим/восстанавливаем ВСЕГДА — просмотр не требует голоса, deafen вне канала тоже должен его глушить
     this.screenAudioEls.forEach((a) => (a.muted = this.deafened));
-    this.applyAllVolumes();
     playSound(this.deafened ? 'fullMute' : 'unmute'); // оглох → fullMute; вернул звук → unmute (только сам)
     this.hooks.toast(this.deafened ? 'Тебя не слышно и ты никого не слышишь' : 'Звук включён');
     this.emit();

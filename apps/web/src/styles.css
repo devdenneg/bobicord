@@ -406,6 +406,8 @@
   .user-panel .up-i span{font-size:11.5px;color:var(--muted)}
   .user-panel .up-btn{background:none;padding:7px;color:var(--muted);border-radius:7px;flex:0 0 auto}
   .user-panel .up-btn:hover{background:var(--panel3);color:var(--txt)}
+  .user-panel .up-btn.act{color:var(--red)}
+  .user-panel .up-btn.act:hover{background:color-mix(in srgb,var(--red) 16%,transparent);color:var(--red)}
   #main{display:flex;flex-direction:column;min-height:0;background:var(--bg2)}
   .srv-header{height:50px;flex:0 0 auto;border-bottom:1px solid var(--line-2);display:flex;align-items:center;gap:10px;padding:0 16px;box-shadow:var(--sh-1);position:relative;z-index:5}
   .srv-header .hn{font-weight:700;font-size:15.5px;color:var(--txt-h);display:flex;align-items:center;gap:8px;flex:1;min-width:0}
