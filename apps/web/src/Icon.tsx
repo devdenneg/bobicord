@@ -32,6 +32,8 @@ import CloseRounded from '@mui/icons-material/CloseRounded';
 import PaletteRounded from '@mui/icons-material/PaletteRounded';
 import DownloadRounded from '@mui/icons-material/DownloadRounded';
 import ReplyRounded from '@mui/icons-material/ReplyRounded';
+import ContentCopyRounded from '@mui/icons-material/ContentCopyRounded';
+import AddReactionRounded from '@mui/icons-material/AddReactionRounded';
 import DeleteRounded from '@mui/icons-material/DeleteRounded';
 import EditRounded from '@mui/icons-material/EditRounded';
 import KeyboardRounded from '@mui/icons-material/KeyboardRounded';
@@ -62,6 +64,7 @@ const MAP: Record<string, SvgIconComponent> = {
   'eye-off': VisibilityOffRounded, refresh: RefreshRounded,
   fullscreen: FullscreenRounded, pip: PictureInPictureAltRounded,
   palette: PaletteRounded, download: DownloadRounded, reply: ReplyRounded,
+  copy: ContentCopyRounded, react: AddReactionRounded,
   trash: DeleteRounded, edit: EditRounded, keyboard: KeyboardRounded,
   bell: NotificationsRounded, shield: ShieldRounded, badge: BadgeRounded,
   attach: AttachFileRounded, file: InsertDriveFileRounded,

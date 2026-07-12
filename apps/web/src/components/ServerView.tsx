@@ -746,6 +746,25 @@ function Chat() {
   const unreadServer = useStore((s) => s.unread[activeId || ''] || 0);
   const firstUnread = unreadServer > 0 ? messages.findIndex((m) => m.sid != null && m.sid > baseline && !m.mine) : -1;
   const firstUnreadId = firstUnread >= 0 ? messages[firstUnread].id : null;
+  // Разделители дней: id первого сообщения каждой календарной даты (сравниваем локальный день с предыдущим).
+  const dayFirst = useMemo(() => {
+    const s = new Map<number, number>(); // msg.id -> ts начала дня
+    let prevDay = '';
+    for (const m of messages) {
+      if (!m.ts) continue;
+      const d = new Date(m.ts); const key = d.getFullYear() + '-' + d.getMonth() + '-' + d.getDate();
+      if (key !== prevDay) { s.set(m.id, m.ts); prevDay = key; }
+    }
+    return s;
+  }, [messages]);
+  const fmtDay = (ts: number) => {
+    const d = new Date(ts), now = new Date();
+    const sameDay = (a: Date, b: Date) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+    const yest = new Date(now); yest.setDate(now.getDate() - 1);
+    if (sameDay(d, now)) return 'Сегодня';
+    if (sameDay(d, yest)) return 'Вчера';
+    return d.toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: d.getFullYear() !== now.getFullYear() ? 'numeric' : undefined });
+  };
 
   // --- виртуальный список чата (react-virtuoso) ---
   const virtuosoRef = useRef<VirtuosoHandle>(null);
@@ -1103,7 +1122,10 @@ function Chat() {
                 {m.files && m.files.length ? <MessageAttachments files={m.files} onImageClick={setLightbox} /> : null}
                 {m.status === 'failed' ? <div className="msg-failed"><Icon name="warn" sm />Не отправлено<button onClick={() => getEngine()?.retrySend(m.id)}>Повторить</button></div> : null}
               </div>
-              {!m.sys ? <button className="msg-reply-btn" data-tip="Ответить" onMouseDown={(e) => e.preventDefault()} onClick={() => startReply(m)}><Icon name="reply" sm /></button> : null}
+              {!m.sys ? <div className="msg-actions" onMouseDown={(e) => e.preventDefault()}>
+                <button className="msg-act" data-tip="Ответить" onClick={() => startReply(m)}><Icon name="reply" sm /></button>
+                {m.text ? <button className="msg-act" data-tip="Копировать текст" onClick={() => { navigator.clipboard?.writeText(m.text!).then(() => useStore.getState().toast('Скопировано', 'ok')).catch(() => {}); }}><Icon name="copy" sm /></button> : null}
+              </div> : null}
             </div>
           </div>
         </div>
@@ -1132,9 +1154,12 @@ function Chat() {
           computeItemKey={(_, m) => m.id}
           context={{ busy: olderBusy, hasMore: eng.chatHasMore }}
           components={{ Header: ChatOlderHeader, Footer: ChatFooter }}
-          itemContent={(_, m) => (m.id === firstUnreadId
-            ? <div className="msg-newwrap"><div className={'msg-newdiv' + (dividerFade ? ' faded' : '')}><span>Новые сообщения</span></div>{renderMessage(m)}</div>
-            : renderMessage(m))}
+          itemContent={(_, m) => {
+            const dayTs = dayFirst.get(m.id);
+            const dayDiv = dayTs != null ? <div className="msg-daydiv"><span>{fmtDay(dayTs)}</span></div> : null;
+            if (m.id === firstUnreadId) return <>{dayDiv}<div className="msg-newwrap"><div className={'msg-newdiv' + (dividerFade ? ' faded' : '')}><span>Новые сообщения</span></div>{renderMessage(m)}</div></>;
+            return dayDiv ? <>{dayDiv}{renderMessage(m)}</> : renderMessage(m);
+          }}
         />
       )}
       {!atBottom ? <button id="scrollbtn" aria-label="Прокрутить вниз" data-tip="К последним" onClick={scrollToBottom}><Icon name="chevron" />{pill > 0 ? <span className="sb-badge">{pill > 99 ? '99+' : pill}</span> : null}</button> : null}
