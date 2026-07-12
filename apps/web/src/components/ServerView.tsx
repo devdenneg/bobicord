@@ -1023,7 +1023,9 @@ function Chat() {
     E.sendChatWithEmotes(t, em, undefined, replyTo ? buildReplyRef(replyTo) : undefined, ready.length ? ready : undefined);
     setText(''); setReplyTo(null); setStaged([]);
     if (activeId) localStorage.removeItem(DRAFT_KEY + activeId); // отправлено — черновик снят
-    scrollToBottom(); // req: после отправки всегда показываем конец
+    // Скролл к низу после отправки делает followOutput (last.mine → 'auto') уже ПОСЛЕ аппенда.
+    // Синхронный scrollToBottom тут скроллил бы к СТАРОМУ последнему (оптимистичное сообщение
+    // ещё не в data Virtuoso) → визуальный прыжок мимо. setPill сбросит эффект atBottom.
   }
   // очередь на отправку: как только последнее вложение долилось (успешно или с ошибкой — send()
   // сам отфильтрует неудачные), стреляем реальной отправкой без повторного нажатия юзером.
@@ -1209,7 +1211,12 @@ function Chat() {
           initialTopMostItemIndex={firstUnread >= 0 ? { index: firstUnread, align: 'start' } : { index: Math.max(0, messages.length - 1), align: 'end' }}
           alignToBottom
           startReached={loadOlder}
-          followOutput={(bottom) => (bottom ? 'auto' : false)}
+          followOutput={(bottom) => {
+            // Своё или системное сообщение — ВСЕГДА прыгаем к низу (требование: видеть конец чата),
+            // даже если проскроллены вверх. Чужие — только если уже у низа (не дёргаем при чтении истории).
+            const last = messages.length ? messages[messages.length - 1] : null;
+            return last && (last.mine || last.sys) ? 'auto' : bottom ? 'auto' : false;
+          }}
           atBottomThreshold={120}
           atBottomStateChange={onAtBottom}
           increaseViewportBy={{ top: 600, bottom: 400 }}
