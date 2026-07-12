@@ -1321,11 +1321,11 @@ export class Engine {
     if (!reply) return false;
     return (!!reply.uid && reply.uid === this.me.id) || reply.author === this.me.displayName;
   }
-  private pushMsg(who: string | null, text: string, sys: boolean, color?: number, mineOverride?: boolean, img?: string, ts?: number, uid?: string, reply?: ReplyRef, files?: Attachment[]): number {
+  private pushMsg(who: string | null, text: string, sys: boolean, color?: number, mineOverride?: boolean, img?: string, ts?: number, uid?: string, reply?: ReplyRef, files?: Attachment[], mkey?: string): number {
     const mine = mineOverride !== undefined ? mineOverride : (!sys && who === this.me.displayName);
     const mention = !sys && !mine && (this.textMentionsMe(text) || this.replyToMe(reply));
     const id = msgSeq++;
-    const next = [...this.messages, { id, uid, who, text, mine, sys, color, img, files, ts: ts ?? Date.now(), mention, reply }];
+    const next = [...this.messages, { id, uid, who, text, mine, sys, color, img, files, ts: ts ?? Date.now(), mention, reply, mkey }];
     // кап на память сессии; срез идёт с НАЧАЛА, поэтому копим trimmedFront — компонент на столько же
     // поднимет firstItemIndex virtuoso, иначе якорь скролла рассинхронится и контент прыгнет.
     const CAP = 1000;
@@ -1343,13 +1343,22 @@ export class Engine {
   }
   markSendResult(localId: number, ok: boolean, sid?: number) {
     if (ok) {
+      const pend = this.pendingSend.get(localId);
       this.pendingSend.delete(localId);
       // Усыновляем серверный sid на оптимистичное сообщение — сразу включает edit/delete/реакции и
       // кликабельность реплая на него (иначе живут без sid до refetch).
       let ch = false;
       this.messages = this.messages.map((m) => (m.id === localId && m.sid == null && sid != null ? (ch = true, { ...m, sid, status: undefined }) : (m.id === localId && m.status ? (ch = true, { ...m, status: undefined }) : m)));
       if (ch) this.emit(); else this.setMsgStatus(localId, undefined);
+      // Раздаём серверный sid ВСЕМ по mkey — чтобы ДРУГИЕ могли реагировать/edit на этом сообщении (у них оно live, без sid).
+      if (sid != null && pend?.key && this.viewRoom) this.dataSend({ t: 'sid', mkey: pend.key, sid });
     } else this.setMsgStatus(localId, 'failed');
+  }
+  private applySidAdopt(d: any) {
+    if (typeof d.sid !== 'number' || !d.mkey) return;
+    let ch = false;
+    this.messages = this.messages.map((m) => (m.mkey === d.mkey && m.sid == null ? (ch = true, { ...m, sid: d.sid }) : m));
+    if (ch) this.emit();
   }
   retrySend(localId: number) {
     const p = this.pendingSend.get(localId); if (!p) return;
@@ -1436,11 +1445,11 @@ export class Engine {
   sendChatWithEmotes(text: string, em: Record<string, string>, img?: string, reply?: ReplyRef, files?: Attachment[]) {
     if (!text.trim() && !img && !(files && files.length)) return;
     const t = text.trim();
+    const key = newClientKey(); // общий ключ: dedup POST + mkey для усыновления sid всеми клиентами (реакции на чужих)
     // realtime-раздача только при поднятой комнате; локальный эхо + persist работают и без неё —
     // в окне фоновой докрутки connect (сразу после входа в сервер) сообщение не теряется, ложится в БД.
-    if (this.viewRoom) this.dataSend({ t: 'chat', name: this.me.displayName, text: t, em, color: this.me.avatarColor, img, files, uid: this.me.id, reply });
-    const id = this.pushMsg(this.me.displayName, t, false, this.me.avatarColor, true, img, undefined, this.me.id, reply, files);
-    const key = newClientKey();
+    if (this.viewRoom) this.dataSend({ t: 'chat', name: this.me.displayName, text: t, em, color: this.me.avatarColor, img, files, uid: this.me.id, reply, mkey: key });
+    const id = this.pushMsg(this.me.displayName, t, false, this.me.avatarColor, true, img, undefined, this.me.id, reply, files, key);
     this.pendingSend.set(id, { text: t, em, img, reply, key, files });
     this.hooks.persistMessage(t, em, img, reply, id, key, files);
   }
@@ -1533,7 +1542,7 @@ export class Engine {
         const own = d.uid === this.me.id; // моё же сообщение с другой сессии — показываем как своё, без звука/меншена
         const repliedToMe = !own && this.replyToMe(d.reply);
         const mentioned = !own && (this.textMentionsMe(d.text) || repliedToMe);
-        this.pushMsg(d.name, d.text, false, d.color, own, d.img, undefined, d.uid, d.reply, d.files);
+        this.pushMsg(d.name, d.text, false, d.color, own, d.img, undefined, d.uid, d.reply, d.files, d.mkey);
         if (!own && mentioned) { // тост+notify ТОЛЬКО когда тегнули/реплайнули; звук тега даёт само notify (Discord)
           this.hooks.toast(repliedToMe ? `${d.name} ответил тебе` : `${d.name} упомянул тебя`, 'info');
           const fallback = d.img ? '🖼 изображение' : (d.files && d.files.length ? '📎 вложение' : '');
@@ -1547,6 +1556,7 @@ export class Engine {
       else if (d.t === 'react') this.applyReaction(d);
       else if (d.t === 'edit') this.applyEdit(d);
       else if (d.t === 'del') this.applyDelete(d);
+      else if (d.t === 'sid') this.applySidAdopt(d);
     } catch { /**/ }
   };
   onEmoteResolve: ((name: string, id: string) => void) | null = null;
@@ -1555,7 +1565,7 @@ export class Engine {
   // reliable для состояния, которое нельзя терять: чат (сообщения), vclaim (одна голосовая на
   // аккаунт — потеря датаграммы оставила бы две сессии в войсе), clear (чистка чата).
   // vclaim принадлежит голосовой сессии → voiceRoom; чат/clear/typing/emote/watch — просматриваемому серверу → viewRoom
-  private dataSend(obj: any) { const room = (obj.t === 'vclaim' || obj.t === 'music') ? this.voiceRoom : this.viewRoom; if (!room) return; try { room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify(obj)), { reliable: obj.t === 'chat' || obj.t === 'vclaim' || obj.t === 'clear' || obj.t === 'music' || obj.t === 'react' || obj.t === 'edit' || obj.t === 'del' }); } catch { /**/ } }
+  private dataSend(obj: any) { const room = (obj.t === 'vclaim' || obj.t === 'music') ? this.voiceRoom : this.viewRoom; if (!room) return; try { room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify(obj)), { reliable: obj.t === 'chat' || obj.t === 'vclaim' || obj.t === 'clear' || obj.t === 'music' || obj.t === 'react' || obj.t === 'edit' || obj.t === 'del' || obj.t === 'sid' }); } catch { /**/ } }
 
   emoteImg(id: string) { return emoteUrl(id); }
 }
