@@ -505,15 +505,17 @@
   .msg-reply-btn .ic{font-size:16px}
   .virt-row:hover .msg-reply-btn{opacity:1}
   .msg-reply-btn:hover{background:var(--panel4);color:var(--accent-txt)}
-  /* цитата ответа: вертикальная цветная полоса + автор + сниппет, всегда слева-направо (и у своих) */
-  .reply-quote{display:flex;align-items:center;gap:7px;max-width:min(100%,340px);margin:0 0 4px;padding:3px 10px 3px 7px;background:var(--panel2);border-radius:7px;font-size:12.5px;line-height:1.3;text-align:left;overflow:hidden}
-  .reply-quote .rq-bar{flex:0 0 auto;align-self:stretch;width:3px;min-height:15px;border-radius:2px;background:var(--accent)}
-  .reply-quote .rq-author{font-weight:600;flex:0 1 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:48%}
-  .reply-quote .rq-text{color:var(--muted);flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .reply-quote.jumpable{cursor:pointer;transition:background .12s}
-  .reply-quote.jumpable:hover{background:var(--panel3)}
+  /* цитата ответа (Telegram/Discord-стиль): изогнутый hook + аватар автора + имя цветом роли + сниппет */
+  .reply-quote{display:flex;align-items:center;gap:6px;max-width:min(100%,440px);margin:0 0 3px;padding:1px 10px 1px 2px;background:transparent;border-radius:7px;font-size:12.5px;line-height:1.3;text-align:left;overflow:hidden;color:var(--muted)}
+  .reply-quote .rq-hook{flex:0 0 auto;width:22px;height:9px;margin:8px 1px 0 6px;border-left:2px solid;border-top:2px solid;border-top-left-radius:7px;opacity:.5}
+  .reply-quote .av{flex:0 0 auto}
+  .reply-quote .rq-author{font-weight:600;flex:0 0 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:42%}
+  .reply-quote .rq-text{color:var(--muted);flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.9}
+  .reply-quote.jumpable{cursor:pointer;transition:opacity .12s}
+  .reply-quote.jumpable:hover{opacity:1}
+  .reply-quote.jumpable:hover .rq-hook{opacity:.85}
   .reply-quote.jumpable:hover .rq-text{color:var(--txt)}
-  .msg.flash .tx{animation:msgFlash 1.3s ease-out}
+  .msg.flash .msg-content{animation:msgFlash 1.3s ease-out;border-radius:6px}
   @keyframes msgFlash{0%,55%{box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 45%,transparent)}100%{box-shadow:0 0 0 3px transparent}}
   .reply-bar{display:flex;align-items:center;gap:8px;margin:0 12px;padding:7px 12px;background:var(--panel2);border:1px solid var(--line-2);border-bottom:none;border-radius:10px 10px 0 0;font-size:13px;color:var(--muted);animation:sbIn .16s ease-out}
   .reply-bar>.ic{font-size:16px;color:var(--muted);flex:0 0 auto;transform:scaleX(-1)}

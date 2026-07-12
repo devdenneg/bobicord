@@ -737,7 +737,14 @@ function Chat() {
   // базовая линия «прочитано до» (id) — замораживается при входе на сервер; дивайдер «новые» рисуется
   // перед первым сообщением НОВЕЕ неё (чужим). При повторном входе lastRead уже сдвинут → дивайдера нет.
   const baseline = useMemo(() => useStore.getState().lastRead[activeId || ''] || 0, [activeId]);
-  const firstUnread = messages.findIndex((m) => m.sid != null && m.sid > baseline && !m.mine);
+  // Сервер (read_state) — источник правды по «есть ли непрочитанное». baseline (lastRead) может ОТСТАВАТЬ
+  // от него и давать ложный firstUnread у верха истории: (1) свежевступивший в сессии сервер —
+  // refreshServers/mergeUnread сеют unread, но НЕ lastRead → baseline=0 → sid>0 у первого чужого сообщения;
+  // (2) baseline — снимок useMemo по [activeId], не обновляется после долёта /me. Когда сервер говорит
+  // «0 непрочитанных» — дивайдера нет и вход СТРОГО в низ (иначе чат открывается у верха истории при
+  // отсутствии новых). При unread>0 позиционируем по baseline как раньше.
+  const unreadServer = useStore((s) => s.unread[activeId || ''] || 0);
+  const firstUnread = unreadServer > 0 ? messages.findIndex((m) => m.sid != null && m.sid > baseline && !m.mine) : -1;
   const firstUnreadId = firstUnread >= 0 ? messages[firstUnread].id : null;
 
   // --- виртуальный список чата (react-virtuoso) ---
@@ -771,7 +778,7 @@ function Chat() {
     setFirstItemIndex(VIRT_BASE_INDEX);
     // на входе: если есть непрочитанные — сеем счётчик jump-кнопки и стартуем НЕ внизу (позиция у
     // дивайдера, см. initialTopMostItemIndex), иначе внизу
-    const unreadHere = messages.filter((m) => m.sid != null && m.sid > baseline && !m.mine).length;
+    const unreadHere = unreadServer > 0 ? messages.filter((m) => m.sid != null && m.sid > baseline && !m.mine).length : 0;
     setPill(unreadHere); setAtBottom(unreadHere === 0); atBottomRef.current = unreadHere === 0; setReplyTo(null);
     // сброс стейджинга вложений при смене сервера — не тащим прикреплённые файлы между чатами
     setStaged((s) => { s.forEach((it) => it.previewUrl && URL.revokeObjectURL(it.previewUrl)); return []; });
@@ -889,7 +896,8 @@ function Chat() {
   const jumpToReply = useCallback((r: ReplyRef) => {
     if (r.sid == null) return;
     const idx = messages.findIndex((mm) => mm.sid === r.sid);
-    if (idx < 0) return;
+    // Оригинал вне загруженного окна — не молчим (был «мёртвый клик»): подсказываем прокрутить/догрузить.
+    if (idx < 0) { useStore.getState().toast('Сообщение выше — прокрути вверх, чтобы догрузить', 'warn'); return; }
     virtuosoRef.current?.scrollToIndex({ index: idx, align: 'center', behavior: 'smooth' });
     setFlashId(messages[idx].id);
   }, [messages]);
@@ -1066,7 +1074,8 @@ function Chat() {
       replyQuote = (
         <button className={'reply-quote' + (jumpable ? ' jumpable' : '')} disabled={!jumpable} onClick={jumpable ? () => jumpToReply(rep) : undefined}
           title={rep.author + ': ' + replySnippet(rep)}>
-          <span className="rq-bar" style={{ background: rColor }} />
+          <span className="rq-hook" style={{ borderColor: rColor }} />
+          <Avatar name={rep.author} ci={rAuthor?.avatarColor ?? 0} url={rAuthor?.avatarUrl} size={16} />
           <span className="rq-author" style={{ color: rColor }}>{rep.author}</span>
           <span className="rq-text">{replySnippet(rep)}</span>
         </button>
