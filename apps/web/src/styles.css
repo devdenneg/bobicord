@@ -934,7 +934,9 @@
   .pi.speaking .nm{color:var(--txt-h)}
   .pi.offline .av{filter:grayscale(.6);opacity:.5}
   .pi .av .sdot{position:absolute;right:-2px;bottom:-2px;width:12px;height:12px;border-radius:50%;border:2.5px solid var(--panel)}
-  .pi .av .sdot.voice,.pi .av .sdot.online{background:var(--green)}.pi .av .sdot.offline{background:#5a5f6a}.pi .av .sdot.away{background:var(--yellow)}
+  .pi .av .sdot.online{background:var(--green)}.pi .av .sdot.offline{background:#5a5f6a}.pi .av .sdot.away{background:var(--yellow)}
+  /* voice = зелёное кольцо (дырка в центре) — сразу отличает «в голосовом» от просто online (сплошной) */
+  .pi .av .sdot.voice{background:radial-gradient(circle at 50% 50%,var(--panel) 0 2.1px,var(--green) 2.6px 100%)}
   .pi .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;font-weight:500}
   .pi.offline .nm{color:var(--muted)}
   .pi .nm .rl{color:var(--yellow);font-size:11px;margin-left:5px}
@@ -947,6 +949,8 @@
   .pi-l1{display:flex;align-items:center;gap:8px;min-width:0}
   .pi-l2{display:flex;align-items:center;gap:6px;min-width:0;min-height:17px}
   .pi-l2 .pi-game.mem{flex:0 1 auto;max-width:62%}
+  /* нет ролей рядом → игре незачем ужиматься до 62%: даём всю строку (иначе имя игры режется зря) */
+  .pi-l2 .pi-game.mem:only-child{max-width:100%}
   .pi-ctl{flex:0 0 auto;display:flex;align-items:center;gap:2px}
   /* «играет в X»: в голосовом — только иконка (тултип), в участниках — иконка + название */
   .pi-game{flex:0 0 auto;display:inline-flex;align-items:center;gap:5px;min-width:0}
