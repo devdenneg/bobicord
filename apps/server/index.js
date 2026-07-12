@@ -60,10 +60,18 @@ const RELEASES_DIR = path.join(DATA_DIR, 'releases');
 const DIAG_DIR = path.join(DATA_DIR, 'diag');
 const DIAG_MAX_FILES = 400; // сессий на диске
 const DIAG_MAX_TOTAL_BYTES = 100 * 1024 * 1024;
+// 7TV-прокси: диск-кэш проксированных эмоутов (обход РКН-блокировки cdn.7tv.app/7tv.io у части
+// RU-провайдеров — домены режутся на уровне DNS/SNI/DPI, сам апп reelay.online доступен). Том общий
+// с БД/uploads/diag → кап обязателен (переполнение уронило бы всё, включая стриминг).
+const SEVENTV_DIR = path.join(DATA_DIR, '7tv');
+const SEVENTV_MAX_FILES = 20000;
+const SEVENTV_MAX_TOTAL_BYTES = 500 * 1024 * 1024; // ~500 МБ
+const SEVENTV_MAX_UPSTREAM = 2 * 1024 * 1024; // отсечка патологически крупной анимации (защита egress VPS)
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
 try { fs.mkdirSync(UPLOADS_DIR, { recursive: true }); } catch (e) {}
 try { fs.mkdirSync(RELEASES_DIR, { recursive: true }); } catch (e) {}
 try { fs.mkdirSync(DIAG_DIR, { recursive: true }); } catch (e) {}
+try { fs.mkdirSync(SEVENTV_DIR, { recursive: true }); } catch (e) {}
 
 /* ---------------- DB ---------------- */
 const db = new Database(path.join(DATA_DIR, 'voice.db'));
@@ -850,6 +858,143 @@ app.post('/api/upload', requireAuth, express.raw({ type: Object.keys(MIME_EXT), 
   try { fs.writeFileSync(path.join(UPLOADS_DIR, name), req.body); }
   catch (e) { return res.status(500).json({ error: 'Не удалось сохранить файл' }); }
   res.json({ url: '/api/uploads/' + name });
+});
+
+/* ---------------- 7TV PROXY (обход блокировки эмоутов у части RU-провайдеров) ----------------
+ * У части юзеров домены 7TV (7tv.app в реестре РКН с 11.10.2024 за ЛГБТ-эмоут) режутся на уровне
+ * DNS/SNI/DPI, причём 7tv.io (API) и cdn.7tv.app (картинки) — разные апексы/IP и блокируются
+ * независимо. reelay.online (как и 7TV) НЕ за Cloudflare → проксирование реально доезжает до юзера.
+ * Клиент по direct-first детектит блок и фолбэчит на эти роуты. Картинки — публично (тег <img> не
+ * шлёт Bearer) + диск-кэш; глобальный сет — публично + TTL/serve-stale; поиск — под auth.
+ * Роуты держим в index.js (Dockerfile COPY копирует только его — новый файл дал бы crash-loop). */
+
+// Кап каталога кэша: копия pruneDiag (плоские имена id_file.webp → эвикшн по mtime без рекурсии).
+function pruneSeventv() {
+  let files;
+  try {
+    files = fs.readdirSync(SEVENTV_DIR)
+      .filter((n) => n.endsWith('.webp'))
+      .map((n) => { const p = path.join(SEVENTV_DIR, n); const st = fs.statSync(p); return { p, size: st.size, mtime: st.mtimeMs }; })
+      .sort((a, b) => a.mtime - b.mtime); // старые первыми
+  } catch (e) { return; }
+  let total = files.reduce((s, f) => s + f.size, 0);
+  while (files.length && (files.length > SEVENTV_MAX_FILES || total > SEVENTV_MAX_TOTAL_BYTES)) {
+    const f = files.shift();
+    try { fs.unlinkSync(f.p); total -= f.size; } catch (e) { /* уже удалён */ }
+  }
+}
+
+// single-flight по ключу кэша: N зрителей одного эмоута → 1 запрос наружу (против thundering herd
+// при одновременной загрузке заблокированных клиентов). Плюс мягкий cap distinct-фетчей — бэкпрешур,
+// чтобы зависший upstream не копил сокеты в ТОМ ЖЕ процессе, что и tree-WS сигналинг дерева.
+const _7tvInflight = new Map();
+const SEVENTV_MAX_INFLIGHT = 48;
+async function fetchSeventvEmote(id, file, dest) {
+  const key = id + '_' + file;
+  const existing = _7tvInflight.get(key);
+  if (existing) return existing;
+  if (_7tvInflight.size >= SEVENTV_MAX_INFLIGHT) return null; // бэкпрешур
+  const p = (async () => {
+    // Хост ЗАХАРДКОЖЕН, id/file уже провалидированы — только конкатенация, никогда new URL(userInput).
+    // redirect:'follow' обязателен — легаси Mongo ObjectId (24 симв. из старых сообщений) отдаёт 308→ULID.
+    const r = await fetch(`https://cdn.7tv.app/emote/${id}/${file}`, { signal: AbortSignal.timeout(6000), redirect: 'follow' });
+    if (r.status !== 200) return null; // 404/редирект-петля/5xx — не кэшируем
+    if (!String(r.headers.get('content-type') || '').startsWith('image/')) return null; // HTML-заглушка провайдера с 200 → не отравляем immutable-кэш
+    const ab = await r.arrayBuffer();
+    if (ab.byteLength === 0 || ab.byteLength > SEVENTV_MAX_UPSTREAM) return null;
+    const buf = Buffer.from(ab);
+    // персист best-effort (клиент получит буфер в любом случае): атомарно tmp+rename — усечённый
+    // при обрыве не раздастся как immutable 30д.
+    try {
+      const tmp = dest + '.' + crypto.randomBytes(6).toString('hex') + '.tmp';
+      fs.writeFileSync(tmp, buf);
+      fs.renameSync(tmp, dest);
+      pruneSeventv();
+    } catch (e) { console.error('[7tv] cache write:', e && e.message); }
+    return buf;
+  })().catch((e) => { console.error('[7tv] upstream:', e && e.message); return null; }).finally(() => _7tvInflight.delete(key));
+  _7tvInflight.set(key, p);
+  return p;
+}
+
+// Картинки эмоутов. БЕЗ auth (<img> не шлёт токен). :file сужен до 1x/2x.webp (клиент просит только
+// их) — снимает разом Content-Type/nosniff/egress/коллизию рендишнов.
+app.get('/api/7tv/emote/:id/:file', async (req, res) => {
+  const id = String(req.params.id || '');
+  const file = String(req.params.file || '');
+  // Строгая валидация (анти-SSRF): без точек/слэшей/@/:/контрол-символов в id, фикс-набор файлов.
+  if (!id || id.length > 40 || /[^a-zA-Z0-9]/.test(id) || !/^[12]x\.webp$/.test(file)) return res.sendStatus(400);
+  const dest = path.resolve(SEVENTV_DIR, id + '_' + file);
+  if (dest !== path.join(SEVENTV_DIR, id + '_' + file)) return res.sendStatus(400); // пояс против traversal
+  try {
+    if (fs.existsSync(dest)) {
+      // заголовки задаём через опции sendFile — иначе send затрёт Cache-Control дефолтным max-age=0.
+      return res.sendFile(dest, { maxAge: '30d', immutable: true, headers: { 'Content-Type': 'image/webp', 'X-Content-Type-Options': 'nosniff' } }, (err) => { if (err && !res.headersSent) res.sendStatus(500); });
+    }
+    const buf = await fetchSeventvEmote(id, file, dest);
+    if (!buf) return res.sendStatus(502);
+    res.setHeader('Cache-Control', 'public, max-age=2592000, immutable');
+    res.setHeader('Content-Type', 'image/webp');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.end(buf);
+  } catch (e) {
+    console.error('[7tv] emote:', e && e.message);
+    if (!res.headersSent) res.sendStatus(502);
+  }
+});
+
+// Глобальный сет (name→id). Публичный намеренно: loadGlobalEmotes зовётся ДО логина. Абьюз
+// ограничен — это один кэш-блоб (апстрим дёргается максимум раз в TTL). Паттерн getDetectableGames:
+// TTL 1ч + диск-персист + serve-stale-on-error + single-flight.
+let _7tvGlobal = null, _7tvGlobalAt = 0, _7tvGlobalInflight = null;
+const _7TV_GLOBAL_FILE = path.join(SEVENTV_DIR, 'global.json');
+function getSeventvGlobal() {
+  const now = Date.now();
+  if (_7tvGlobal && now - _7tvGlobalAt < 3600 * 1000) return Promise.resolve(_7tvGlobal);
+  if (_7tvGlobalInflight) return _7tvGlobalInflight;
+  _7tvGlobalInflight = (async () => {
+    try {
+      const r = await fetch('https://7tv.io/v3/emote-sets/global', { signal: AbortSignal.timeout(10000) });
+      const d = await r.json();
+      if (d && Array.isArray(d.emotes)) {
+        _7tvGlobal = d; _7tvGlobalAt = now;
+        try { fs.writeFileSync(_7TV_GLOBAL_FILE, JSON.stringify(d)); } catch (e) {}
+        return d;
+      }
+      return _7tvGlobal; // мусорный ответ — держим прежнюю копию, если была
+    } catch (e) {
+      if (_7tvGlobal) return _7tvGlobal; // serve-stale из памяти
+      try { _7tvGlobal = JSON.parse(fs.readFileSync(_7TV_GLOBAL_FILE, 'utf8')); _7tvGlobalAt = now; return _7tvGlobal; } catch (e2) { return null; }
+    } finally { _7tvGlobalInflight = null; }
+  })();
+  return _7tvGlobalInflight;
+}
+app.get('/api/7tv/global', async (req, res) => {
+  try {
+    const d = await getSeventvGlobal();
+    if (!d) return res.sendStatus(502);
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.json(d);
+  } catch (e) { if (!res.headersSent) res.sendStatus(502); }
+});
+
+// Поиск эмоутов. Под auth (пикер открывается после логина). GQL-строка ЗАХАРДКОЖЕНА на сервере
+// (не форвардим клиентский body → нет инъекции); q/p валидируются и капаются.
+app.get('/api/7tv/search', requireAuth, async (req, res) => {
+  const q = String(req.query.q || '').trim().slice(0, 64);
+  const p = Math.min(20, Math.max(1, parseInt(req.query.p, 10) || 1));
+  try {
+    const body = {
+      query: 'query($q:String!,$p:Int){emotes(query:$q,page:$p,limit:100,sort:{value:"popularity",order:DESCENDING}){items{id name}}}',
+      variables: { q, p },
+    };
+    const r = await fetch('https://7tv.io/v3/gql', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(8000),
+    });
+    const d = await r.json();
+    const items = ((d.data && d.data.emotes && d.data.emotes.items) || []).map((e) => ({ id: e.id, name: e.name }));
+    res.json({ items });
+  } catch (e) { if (!res.headersSent) res.sendStatus(502); }
 });
 
 /* ---------------- FILE ATTACHMENTS (любые расширения, <=10MB) ----------------

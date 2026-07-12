@@ -6,7 +6,8 @@ import { api, resolveUploadUrl } from '../api';
 import { useEngine } from '../hooks';
 import { Icon } from '../Icon';
 import { avColor, initial, prefersReducedMotion, downscaleImage } from '../util';
-import { emoteMap, emoteUrl } from '../emotes';
+import { emoteMap } from '../emotes';
+import { EmoteImg } from './EmoteImg';
 import { EmotePicker } from './EmotePicker';
 import { VoiceDock, VoiceControls } from './VoiceDock';
 import { StreamerWidget } from './StreamerWidget';
@@ -1166,7 +1167,7 @@ function Chat() {
                   </div>
                 ) : m.sys || m.text ? (
                   <div className={'tx' + (big ? ' big' : '')}>
-                    {m.sys ? m.text : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : 'link' in p ? <a key={i} className="msg-link" href={p.link} target="_blank" rel="noreferrer">{p.link}</a> : 'mention' in p ? <span key={i} className="mention-tag">{p.mention}</span> : <img key={i} className="emo" src={emoteUrl(p.emo)} alt={p.name} title={p.name} loading="lazy" decoding="async" />))}
+                    {m.sys ? m.text : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : 'link' in p ? <a key={i} className="msg-link" href={p.link} target="_blank" rel="noreferrer">{p.link}</a> : 'mention' in p ? <span key={i} className="mention-tag">{p.mention}</span> : <EmoteImg key={i} className="emo" id={p.emo} alt={p.name} title={p.name} />))}
                     {m.edited && !m.sys ? <span className="medit" title="Изменено">(изменено)</span> : null}
                   </div>
                 ) : null}
@@ -1175,7 +1176,7 @@ function Chat() {
                 {m.status === 'failed' ? <div className="msg-failed"><Icon name="warn" sm />Не отправлено<button onClick={() => getEngine()?.retrySend(m.id)}>Повторить</button></div> : null}
                 {(() => { const reacts = m.sid != null ? E.getReactions(m.sid) : []; return reacts.length ? (
                   <div className="msg-reacts">
-                    {reacts.map((r) => <button key={r.id} className={'react-pill' + (r.mine ? ' mine' : '')} title={r.name} onClick={() => m.sid != null && reactTo(m.sid, { id: r.id, name: r.name })}><img src={emoteUrl(r.id)} alt={r.name} loading="lazy" /><b>{r.count}</b></button>)}
+                    {reacts.map((r) => <button key={r.id} className={'react-pill' + (r.mine ? ' mine' : '')} title={r.name} onClick={() => m.sid != null && reactTo(m.sid, { id: r.id, name: r.name })}><EmoteImg id={r.id} alt={r.name} /><b>{r.count}</b></button>)}
                     <button className="react-add" data-tip="Добавить реакцию" onClick={(e) => m.sid != null && setReactTarget({ sid: m.sid, anchor: e.currentTarget.getBoundingClientRect() })}><Icon name="react" sm /></button>
                   </div>
                 ) : null; })()}
@@ -1330,7 +1331,7 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
   const members = useStore((s) => s.members);
   const emoteSize = useStore((s) => s.emoteSize);
   const vidRef = useRef<HTMLVideoElement>(null);
-  const [floats, setFloats] = useState<{ id: number; url: string; by: string; x: number; size?: string }[]>([]);
+  const [floats, setFloats] = useState<{ id: number; emoteId: string; by: string; x: number; size?: string }[]>([]);
   const [stats, setStats] = useState('');
   const [statsOn, setStatsOn] = useState(true);
   const [wOpen, setWOpen] = useState(false); // тач: «кто смотрит» по тапу
@@ -1362,7 +1363,7 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
   useEffect(() => E.onEmote((sid, emoteId, by, x, size) => {
     if (sid !== identity) return;
     const id = floatSeq.current++;
-    setFloats((f) => [...f.slice(-23), { id, url: emoteUrl(emoteId), by, x, size }]);
+    setFloats((f) => [...f.slice(-23), { id, emoteId, by, x, size }]);
     setTimeout(() => setFloats((f) => f.filter((e) => e.id !== id)), 2800);
   }), [identity, E]);
 
@@ -1431,7 +1432,7 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
       <div className="emolayer">
         {floats.map((f) => (
           <div className={'floatEmo em-' + (f.size || 'md')} key={f.id} style={{ left: Math.max(2, Math.min(92, f.x * 100)) + '%' }}>
-            <img src={f.url} alt="" decoding="async" /><div className="ftag">{f.by}</div>
+            <EmoteImg id={f.emoteId} /><div className="ftag">{f.by}</div>
           </div>
         ))}
       </div>

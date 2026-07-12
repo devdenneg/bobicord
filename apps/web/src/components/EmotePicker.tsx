@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { searchEmotes, emoteUrlSm, getRecentEmotes, pushRecentEmote } from '../emotes';
+import { searchEmotes, getRecentEmotes, pushRecentEmote } from '../emotes';
+import { EmoteImg } from './EmoteImg';
 import { useStore } from '../store';
 import type { Emote } from '../types';
 
@@ -27,7 +28,14 @@ export function EmotePicker({ anchor, onPick, onClose, sizePicker }: { anchor: D
     if (reset) setLoaded(true);
   }, []);
 
-  useEffect(() => { moreRef.current = true; pageRef.current = 0; setItems([]); setLoaded(false); fetchPage(q, true); }, [q, fetchPage]);
+  // Дебаунс набора: не дёргаем 7tv.io/наш прокси на каждый символ (прокси концентрирует все
+  // запросы на один VPS-IP → общий rate-limit). Пустой q — сразу (популярные при открытии).
+  useEffect(() => {
+    moreRef.current = true; pageRef.current = 0; setItems([]); setLoaded(false);
+    if (!q.trim()) { fetchPage(q, true); return; }
+    const t = setTimeout(() => fetchPage(q, true), 250);
+    return () => clearTimeout(t);
+  }, [q, fetchPage]);
   useEffect(() => {
     const onDown = (e: MouseEvent) => {
       if (boxRef.current && !boxRef.current.contains(e.target as Node) && !(e.target as HTMLElement).closest('#emoBtn') && !(e.target as HTMLElement).closest('.spray')) onClose();
@@ -69,7 +77,7 @@ export function EmotePicker({ anchor, onPick, onClose, sizePicker }: { anchor: D
           <div className="epick-row">
             {recent.map((e) => (
               <button className="emobtn" key={'r' + e.id} title={e.name} onClick={() => pick(e)}>
-                <img src={emoteUrlSm(e.id)} alt={e.name} loading="lazy" decoding="async" />
+                <EmoteImg id={e.id} size="sm" alt={e.name} />
               </button>
             ))}
           </div>
@@ -78,7 +86,7 @@ export function EmotePicker({ anchor, onPick, onClose, sizePicker }: { anchor: D
         {items.length === 0 ? <div id="epickLoad">{loaded ? 'Ничего не найдено' : 'Загрузка...'}</div> :
           items.map((e) => (
             <button className="emobtn" key={e.id} title={e.name} onClick={() => pick(e)}>
-              <img src={emoteUrlSm(e.id)} alt={e.name} loading="lazy" decoding="async" />
+              <EmoteImg id={e.id} size="sm" alt={e.name} />
             </button>
           ))}
       </div>
