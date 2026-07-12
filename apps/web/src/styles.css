@@ -502,6 +502,8 @@
   .virt-row.cont{padding-top:2px}          /* продолжение группы того же автора — плотнее */
   .virt-row.cont-media{padding-top:10px}   /* продолжение с картинкой/файлом — больше воздуха, иначе превью сливаются в кашу */
   .virt-row .msg{animation:none}          /* иначе msgIn проигрывается на каждом въезде строки в вьюпорт */
+  /* Discord-ховер: подсвечиваем ВСЮ полосу сообщения — сразу видно, к какому относится action-bar */
+  .virt-row:hover{background:color-mix(in srgb,var(--txt) 5%,transparent)}
   /* ---- reply (ответы на сообщения) ---- */
   /* плавающий action-bar сообщения (Discord-стиль): пилюля в правом-верхнем углу, всплывает по hover */
   .msg-actions{position:absolute;top:-13px;right:8px;display:flex;gap:1px;padding:2px;background:var(--panel2);border:1px solid var(--line-2);border-radius:8px;box-shadow:0 4px 14px rgba(0,0,0,.32);opacity:0;transform:translateY(3px) scale(.96);transform-origin:top right;transition:opacity .12s ease,transform .12s ease;z-index:4;pointer-events:none}

@@ -1492,7 +1492,7 @@ function TreePeerPanel({ identity, onClose }: { identity: string; onClose: () =>
   })();
   return (
     <div className="treepanel" onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}
-      style={{ position: 'absolute', right: 8, bottom: 52, width: 280, maxHeight: 320, overflow: 'auto', background: 'rgba(20,22,28,.96)', border: '1px solid rgba(255,255,255,.1)', borderRadius: 10, padding: 10, zIndex: 5, color: '#fff', fontSize: 12 }}>
+      style={{ position: 'absolute', left: '50%', transform: 'translateX(-50%)', bottom: 62, width: 'min(280px, calc(100% - 24px))', maxHeight: 320, overflow: 'auto', background: 'rgba(20,22,28,.96)', backdropFilter: 'blur(16px)', WebkitBackdropFilter: 'blur(16px)', border: '1px solid rgba(255,255,255,.12)', borderRadius: 12, padding: 10, zIndex: 7, color: '#fff', fontSize: 12, boxShadow: '0 10px 30px rgba(0,0,0,.5)' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
         <b>Дерево трансляции</b>
         <button className="vb-btn" onClick={onClose}><Icon name="close" sm /></button>
@@ -1560,7 +1560,7 @@ function QualityMenu({ identity, onClose }: { identity: string; onClose: () => v
   const items = onlySource ? ['source'] : ['auto', ...renditions];
   return (
     <div className="qualpanel" onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}
-      style={{ position: 'absolute', right: 8, bottom: 52, width: 220, background: 'rgba(20,22,28,.96)', border: '1px solid rgba(255,255,255,.1)', borderRadius: 10, padding: 10, zIndex: 5, color: '#fff', fontSize: 12 }}>
+      style={{ position: 'absolute', left: '50%', transform: 'translateX(-50%)', bottom: 62, width: 'min(220px, calc(100% - 24px))', background: 'rgba(20,22,28,.96)', backdropFilter: 'blur(16px)', WebkitBackdropFilter: 'blur(16px)', border: '1px solid rgba(255,255,255,.12)', borderRadius: 12, padding: 10, zIndex: 7, color: '#fff', fontSize: 12, boxShadow: '0 10px 30px rgba(0,0,0,.5)' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
         <b>Качество</b>
         <button className="vb-btn" onClick={onClose}><Icon name="close" sm /></button>
