@@ -87,6 +87,15 @@ function mapQuality(q: ConnectionQuality): VoiceQuality {
     default: return 'unknown';
   }
 }
+// Худшее из двух оценок качества. Нужно, чтобы метка учитывала И потери (LiveKit connectionQuality),
+// И задержку (RTT): LiveKit-качество про потери/джиттер и НЕ видит латентности — при 447мс без потерь
+// показывало бы «отличное». unknown уступает любой определённой оценке.
+const VQ_RANK: Record<VoiceQuality, number> = { excellent: 0, good: 1, poor: 2, lost: 3, unknown: -1 };
+function worseVoiceQuality(a: VoiceQuality, b: VoiceQuality): VoiceQuality {
+  if (a === 'unknown') return b;
+  if (b === 'unknown') return a;
+  return VQ_RANK[a] >= VQ_RANK[b] ? a : b;
+}
 
 export class Engine {
   // Две комнаты (two-room-decouple S4): viewRoom — комната сервера, который смотрю; voiceRoom — комната
@@ -748,10 +757,15 @@ export class Engine {
       // ConnectionQualityChanged: оно приходит лишь при СМЕНЕ качества, поэтому при стабильной
       // связи с самого старта метка залипала на «соединение…» (unknown), хотя пинг уже шёл.
       const lp = this.voiceRoom?.localParticipant;
-      let cq = lp?.connectionQuality != null ? mapQuality(lp.connectionQuality) : 'unknown';
-      if (cq === 'unknown' && v != null) {
-        // LiveKit ещё не отдал качество, но RTT есть → связь жива. Выводим из пинга, чтобы не залипать.
-        const ms = v * 1000; cq = ms < 120 ? 'excellent' : ms < 250 ? 'good' : 'poor';
+      let cq: VoiceQuality = lp?.connectionQuality != null ? mapQuality(lp.connectionQuality) : 'unknown';
+      // Метка учитывает и потери (LiveKit), и ЗАДЕРЖКУ (RTT): берём худшее. Иначе при большом пинге
+      // без потерь показывалось «отличное» (LiveKit quality латентность не видит). Цель голоса ≤250мс.
+      // Заодно покрывает старый кейс «LiveKit ещё unknown, но RTT есть» (worse(unknown, pq) = pq).
+      // 'lost' (полный обрыв от LiveKit) пингом не перебиваем.
+      if (v != null && cq !== 'lost') {
+        const ms = v * 1000;
+        const pq: VoiceQuality = ms < 120 ? 'excellent' : ms < 250 ? 'good' : 'poor';
+        cq = worseVoiceQuality(cq, pq);
       }
       if (cq !== this.connQuality) { this.connQuality = cq; changed = true; }
       if (changed) this.emit();

@@ -401,9 +401,11 @@
   .ch-body{flex:1;overflow-y:auto;overflow-x:hidden;padding:10px 8px}
   .user-panel{flex:0 0 auto;background:var(--bg2);border-top:1px solid var(--line-2);display:flex;align-items:center;gap:8px;padding:8px 10px}
   .user-panel .up-av{width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;color:#fff;flex:0 0 auto;cursor:pointer;background-image:linear-gradient(160deg,rgba(255,255,255,.18),rgba(0,0,0,.14))}
-  .user-panel .up-i{flex:1;min-width:0;cursor:pointer}
+  .user-panel .up-i{flex:1;min-width:0;overflow:hidden;cursor:pointer}
   .user-panel .up-i b{display:block;font-size:13.5px;color:var(--txt-h);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .user-panel .up-i span{font-size:11.5px;color:var(--muted)}
+  /* статус («Микрофон выключен» и т.п.) — тоже в одну строку с усечением: без nowrap/overflow он
+     переносился и вылезал ИЗ .up-i под кнопки контролов при узкой колонке (баг верстки). */
+  .user-panel .up-i span{display:block;font-size:11.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .user-panel .up-btn{background:none;padding:7px;color:var(--muted);border-radius:7px;flex:0 0 auto}
   .user-panel .up-btn:hover{background:var(--panel3);color:var(--txt)}
   .user-panel .up-btn.act{color:var(--red)}
@@ -792,7 +794,7 @@
   .vd-txt{min-width:0}
   .vd-txt b{display:block;font-size:12px;font-weight:700;color:var(--green);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.3}
   .vd-txt span{display:block;font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .vd-controls{display:flex;align-items:center;justify-content:center;gap:8px}
+  .vd-controls{display:flex;align-items:center;justify-content:center;gap:8px;flex-shrink:0}
   .vd-btn{width:38px;height:38px;flex:0 0 auto;border-radius:10px;display:flex;align-items:center;justify-content:center;background:var(--panel3);color:var(--txt);padding:0;box-shadow:var(--sh-1),inset 0 0 0 1px rgba(255,255,255,.05);transition:background .16s,color .16s,transform .16s cubic-bezier(.34,1.4,.64,1),box-shadow .16s}
   .vd-btn:hover{background:var(--panel4);color:var(--txt-h);transform:translateY(-1px)}
   .vd-btn:active{transform:translateY(0) scale(.93)}
