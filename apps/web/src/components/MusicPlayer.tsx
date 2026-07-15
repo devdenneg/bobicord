@@ -1,146 +1,126 @@
 import { useEffect, useRef, useState } from 'react';
 import { useMusic } from '../music';
-import { loadYT } from '../youtube';
+import { api } from '../api';
 import { Icon } from '../Icon';
 
-// Мини-плеер совместного прослушивания (в VoiceDock, только если фича включена в настройках сервера и ты
-// в голосовом). YouTube IFrame играет текущий трек синхронно у всех (music-store через data-канал).
-// Громкость — ЛОКАЛЬНАЯ у каждого (localStorage 'musicVol'), дефолт 10%. Видео маленькое, но видимое (ToS).
-const YT_ELEM = 'yt-music-player';
+// Мини-плеер совместного прослушивания (в VoiceDock, если фича включена на сервере и ты в голосовом).
+// Аудио приходит через медиа-релей (deploy/media-relay) — обход блокировки YouTube: <audio> тянет поток
+// с релея (браузер↔релей напрямую, мимо основного VPS). Текущий трек синхронен у всех (music-store через
+// data-канал). Громкость — ЛОКАЛЬНАЯ у каждого (localStorage 'musicVol'), дефолт 10%.
 const fmt = (s: number) => { s = Math.max(0, Math.floor(s || 0)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
 const getVol = () => { const v = parseInt(localStorage.getItem('musicVol') || '10', 10); return isNaN(v) ? 10 : Math.max(0, Math.min(100, v)); };
-// Ползунок (0..100, «человеческий» %) → реальная громкость YT (0..100). Перцептивная кривая: слух ~логарифмический,
-// а музыкальные треки громкие → линейный setVolume(1) уже отчётливо слышно. Понижаем мастер (потолок 40) и
-// поджимаем низ (γ=1.4): 1% → ~0 (почти тишина), 10% (дефолт) → ~2 (тихий фон), 50% → ~15, 100% → 40 (потолок).
-const ytVol = (pct: number) => Math.round(40 * Math.pow(Math.max(0, Math.min(100, pct)) / 100, 1.4));
+// Ползунок (0..100 «человеческих» %) → <audio>.volume (0..1). Перцептивная кривая (слух ~логарифмический,
+// треки громкие): мастер-потолок 0.4 + γ=1.4. 1% → ~0 (тишина), 10% (дефолт) → ~0.016 (тихий фон), 100% → 0.4.
+const audioVol = (pct: number) => Math.pow(Math.max(0, Math.min(100, pct)) / 100, 1.4) * 0.4;
 
 export function MusicPlayer({ enabled }: { enabled: boolean }) {
   const m = useMusic();
-  const playerRef = useRef<any>(null);
-  const readyRef = useRef(false);
-  const hasPlayedRef = useRef(false); // хоть раз звук пошёл со звуком (autoplay-жест уже получен) → плашку больше не показываем
+  const audioRef = useRef<HTMLAudioElement>(null);
   const [open, setOpen] = useState(false);
   const [addUrl, setAddUrl] = useState('');
   const [adding, setAdding] = useState(false); // идёт запрос названия трека — блокируем повторное добавление
   const [err, setErr] = useState('');
-  const [playErr, setPlayErr] = useState(''); // трек не воспроизводится у ТЕБЯ (регион/встраивание/удалён) — onError YT
-  const [needGesture, setNeedGesture] = useState(false);
+  const [playErr, setPlayErr] = useState('');   // трек не воспроизводится у ТЕБЯ (релей/сеть)
+  const [needGesture, setNeedGesture] = useState(false); // браузер заблокировал автоплей со звуком
   const [pos, setPos] = useState(0);
   const [dur, setDur] = useState(0);
   const [vol, setVol] = useState(getVol);
   const volRef = useRef(vol);
+  const resolvedFor = useRef('');   // videoId, для которого сейчас выставлен src (защита от гонок резолва)
+  const [resolving, setResolving] = useState(false);
 
   const applyVol = (v: number) => {
     volRef.current = v; setVol(v); localStorage.setItem('musicVol', String(v));
-    try { const p = playerRef.current; if (p && readyRef.current) { p.setVolume(ytVol(v)); if (v > 0 && hasPlayedRef.current) p.unMute?.(); } } catch { /**/ }
+    const a = audioRef.current; if (a) a.volume = audioVol(v);
   };
-
-  // синхронизируем плеер с состоянием сессии (трек / позиция / пауза) + громкость
-  const sync = () => {
-    const p = playerRef.current; if (!p || !readyRef.current) return;
-    const st = useMusic.getState();
-    const c = st.current();
-    if (!c) { try { p.stopVideo?.(); } catch { /**/ } return; }
-    const posSec = st.currentPos();
-    try {
-      const loaded = p.getVideoData?.()?.video_id || '';
-      if (loaded !== c.id) p.loadVideoById({ videoId: c.id, startSeconds: posSec });
-      else { const d = Math.abs((p.getCurrentTime?.() || 0) - posSec); if (d > 1.5) p.seekTo(posSec, true); }
-      p.setVolume(ytVol(volRef.current));
-      if (hasPlayedRef.current) { if (volRef.current > 0) p.unMute?.(); } // звук уже разблокирован — держим unmute
-      else if (volRef.current > 0) p.unMute?.();                          // оптимистично пробуем со звуком (высокий MEI разрешит)
-      if (st.playing) p.playVideo?.(); else p.pauseVideo?.();
-    } catch { /**/ }
-    // autoplay-политика браузера. playVideo идёт в iframe через postMessage → теряет user-activation, поэтому
-    // старт СО ЗВУКОМ у большинства (низкий media-engagement) блокируется, а клик по «Включить звук» напрямую
-    // playVideo тоже не разблокирует. Решение: если через 2.5с звук не пошёл сам — крутим ВИДЕО ТИХО (muted-autoplay
-    // активацию не требует, всегда ок) и показываем плашку; она затем лишь снимет mute (unMute у уже играющего видео
-    // активацию НЕ требует). Проверка один раз и только пока звук ни разу не шёл — паузу/сик/смену трека не дёргает.
-    if (st.playing && !hasPlayedRef.current) {
-      window.setTimeout(() => {
-        try {
-          const pl = playerRef.current; if (!pl) return;
-          if (!useMusic.getState().playing || hasPlayedRef.current) return;
-          const state = pl.getPlayerState?.();
-          if (state === 1 && !pl.isMuted?.()) { hasPlayedRef.current = true; setNeedGesture(false); return; } // MEI разрешил звук сам
-          try { pl.mute?.(); pl.playVideo?.(); } catch { /**/ }  // заблокировано → гарантируем тихое проигрывание в синхроне
-          setNeedGesture(true);
-        } catch { /**/ }
-      }, 2500);
-    }
-  };
-
-  // создать IFrame-плеер один раз (только когда фича включена)
-  useEffect(() => {
-    if (!enabled) return;
-    let cancelled = false;
-    loadYT().then(() => {
-      if (cancelled || playerRef.current) return;
-      const YT = (window as any).YT;
-      playerRef.current = new YT.Player(YT_ELEM, {
-        width: '256', height: '144',
-        playerVars: { controls: 0, disablekb: 1, modestbranding: 1, rel: 0, playsinline: 1, iv_load_policy: 3 },
-        events: {
-          onReady: () => { readyRef.current = true; try { playerRef.current.setVolume(ytVol(volRef.current)); } catch { /**/ } sync(); },
-          onStateChange: (e: any) => {
-            if (e.data === YT.PlayerState.ENDED) useMusic.getState().onEnded();
-            // Звук реально пошёл (не форс-мьют) → жест получен, плашку прячем навсегда.
-            if (e.data === YT.PlayerState.PLAYING) { const pl = playerRef.current; if (pl && !pl.isMuted?.()) { hasPlayedRef.current = true; setNeedGesture(false); } setPlayErr(''); }
-          },
-          // Ролик не воспроизводится У ЭТОГО юзера (у других может играть): 2 — плохой id, 5 — HTML5-сбой (транзиент,
-          // повтор), 100 — удалён/приватный, 101/150 — встраивание запрещено владельцем или регион-блок. Показываем
-          // причину + даём «Пропустить» (шлёт next() всем). Молча стоящий плеер (стор думает «играет») так объясняется.
-          onError: (e: any) => {
-            const code = e?.data;
-            if (code === 5) { try { playerRef.current?.playVideo?.(); } catch { /**/ } return; }
-            setPlayErr(code === 100 ? 'Трек удалён или приватный'
-              : (code === 101 || code === 150) ? 'Трек недоступен у тебя (запрет встраивания или регион)'
-              : 'Не удалось воспроизвести трек');
-          },
-        },
-      });
-    });
-    return () => { cancelled = true; try { playerRef.current?.destroy?.(); } catch { /**/ } playerRef.current = null; readyRef.current = false; };
-  }, [enabled]);
+  // Пытаемся играть; браузер блокирует автоплей со звуком без жеста → показываем плашку.
+  const tryPlay = () => { const a = audioRef.current; if (!a) return; a.play().then(() => setNeedGesture(false)).catch(() => setNeedGesture(true)); };
 
   const cur = m.current();
   const curId = cur?.id || '';
-  useEffect(() => { sync(); }, [curId, m.seekTick, m.playing]); // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => { setPlayErr(''); }, [curId]); // сменился трек — гасим прошлую ошибку воспроизведения
 
-  // прогресс-тик + дрейф-коррекция
+  // Резолв аудио-URL при смене трека (через медиа-релей). src применяется здесь, позиция/старт — в
+  // onLoadedMetadata (currentTime до метаданных не выставить).
+  useEffect(() => {
+    if (!enabled) return;
+    const a = audioRef.current;
+    if (!curId) { resolvedFor.current = ''; if (a) { a.removeAttribute('src'); a.load(); } setDur(0); return; }
+    if (resolvedFor.current === curId) return;
+    let cancelled = false;
+    setResolving(true); setPlayErr('');
+    api.musicResolve(curId).then((d) => {
+      if (cancelled) return;
+      resolvedFor.current = curId;
+      if (d.duration) setDur(d.duration);
+      const el = audioRef.current; if (!el) return;
+      el.src = d.url; el.load(); // → onLoadedMetadata выставит позицию и запустит при playing
+    }).catch(() => { if (!cancelled) setPlayErr('Не удалось получить аудио (релей недоступен?)'); })
+      .finally(() => { if (!cancelled) setResolving(false); });
+    return () => { cancelled = true; };
+  }, [curId, enabled]);
+
+  // Синк play/pause/seek: состояние стора → <audio>. Ждём, пока src выставлен для текущего трека.
+  useEffect(() => {
+    const a = audioRef.current; if (!a || !enabled || resolving) return;
+    if (resolvedFor.current !== curId || !curId) return;
+    const st = useMusic.getState();
+    if (isFinite(a.duration) && a.duration > 0) {
+      const target = st.currentPos();
+      if (Math.abs(a.currentTime - target) > 1.5) { try { a.currentTime = target; } catch { /**/ } }
+    }
+    if (st.playing) tryPlay(); else a.pause();
+  }, [m.playing, m.seekTick, curId, enabled, resolving]);
+
+  // Прогресс-тик (позиция синхронна через стор) + дрейф-коррекция локального аудио.
   useEffect(() => {
     if (!enabled) return;
     const t = window.setInterval(() => {
       const st = useMusic.getState();
       setPos(st.currentPos());
-      const p = playerRef.current;
-      if (p && readyRef.current) { try { setDur(p.getDuration?.() || 0); if (st.playing) { const d = Math.abs((p.getCurrentTime?.() || 0) - st.currentPos()); if (d > 2) p.seekTo(st.currentPos(), true); } } catch { /**/ } }
+      const a = audioRef.current;
+      if (a && isFinite(a.duration) && a.duration > 0) {
+        setDur(a.duration);
+        if (st.playing) { const d = Math.abs(a.currentTime - st.currentPos()); if (d > 2) { try { a.currentTime = st.currentPos(); } catch { /**/ } } }
+      }
     }, 1000);
     return () => clearInterval(t);
   }, [enabled]);
 
   const onAdd = async () => {
-    if (adding || !addUrl.trim()) return; // не даём копить клики, пока грузится название текущего
+    if (adding || !addUrl.trim()) return; // не даём копить клики, пока грузится название
     setAdding(true);
     const e = await useMusic.getState().add(addUrl);
     setAdding(false);
     if (e) setErr(e); else { setErr(''); setAddUrl(''); }
   };
+  // Клик по плашке = user-activation → play() со звуком проходит.
   const gesture = () => {
-    // Видео к этому моменту уже крутится ТИХО (см. sync-фолбэк) → снятие mute активацию не требует и проходит.
-    // Прячем плашку не сразу, а по факту размьюта (isMuted=false) — иначе спрятали бы при неудаче.
-    try { const p = playerRef.current; if (p && readyRef.current) { p.unMute?.(); p.setVolume(ytVol(volRef.current)); p.seekTo(useMusic.getState().currentPos(), true); p.playVideo?.(); } } catch { /**/ }
-    const confirm = () => { try { const pl = playerRef.current; if (pl && !pl.isMuted?.()) { hasPlayedRef.current = true; setNeedGesture(false); } } catch { /**/ } };
-    window.setTimeout(confirm, 250); window.setTimeout(confirm, 800);
+    const a = audioRef.current; if (!a) return;
+    a.volume = audioVol(volRef.current);
+    try { a.currentTime = useMusic.getState().currentPos(); } catch { /**/ }
+    tryPlay();
   };
 
   if (!enabled) return null;
 
   return (
     <div className={'music' + (open ? ' open' : '')}>
+      <audio
+        ref={audioRef}
+        preload="auto"
+        onLoadedMetadata={() => {
+          const a = audioRef.current; if (!a) return;
+          a.volume = audioVol(volRef.current);
+          const st = useMusic.getState();
+          try { a.currentTime = st.currentPos(); } catch { /**/ }
+          if (st.playing) tryPlay();
+        }}
+        onEnded={() => useMusic.getState().onEnded()}
+        onPlaying={() => { setNeedGesture(false); setPlayErr(''); }}
+        onError={() => { if (resolvedFor.current === curId && curId) setPlayErr('Не удалось воспроизвести трек'); }}
+      />
       <div className="mus-bar">
-        <span className="mus-thumb"><div id={YT_ELEM} /></span>
+        <span className="mus-thumb mus-thumb-audio">{resolving ? <span className="mus-spin" /> : <Icon name="speaker" />}</span>
         <div className="mus-meta" onClick={() => setOpen((o) => !o)}>
           <div className="mus-title">{cur ? cur.title : 'Совместное прослушивание'}</div>
           <div className="mus-sub">{cur ? (m.playing ? '♪ играет' : 'пауза') + (cur.by ? ' · ' + cur.by : '') : 'вставь ссылку YouTube'}</div>

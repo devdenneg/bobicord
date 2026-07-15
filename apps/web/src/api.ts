@@ -1,4 +1,4 @@
-import type { User, ServerSummary, Member, ServerDetail, InvitePreview, HistoryMessage, Role, VoiceChannel, Attachment, AdminOverview } from './types';
+import type { User, ServerSummary, Member, ServerDetail, InvitePreview, HistoryMessage, Role, VoiceChannel, Attachment, AdminOverview, Emote } from './types';
 
 let token: string | null = localStorage.getItem('sess');
 export const getToken = () => token;
@@ -162,6 +162,17 @@ export const api = {
   // Диагностика стрима: клиент сдаёт сессию по её окончании (см. diag.ts). Тело крупнее
   // обычного (лог + семплы) — сервер парсит этот путь отдельным express.json({limit:'2mb'}).
   diagSession: (payload: unknown) => req<{ ok: boolean; name: string }>('POST', '/diag/session', payload),
+  // 7TV-прокси (обход блокировки 7tv.io у части провайдеров) — фолбэк, когда direct недоступен.
+  // req() даёт префикс API_BASE (натив → прод-хост, иначе относит.) + таймаут; search шлёт Authorization.
+  sevenGlobal: () => req<{ emotes?: { name: string; id: string }[] }>('GET', '/7tv/global'),
+  sevenSearch: async (q: string, p: number): Promise<Emote[]> => {
+    const qs = new URLSearchParams({ q, p: String(p) }).toString();
+    const d = await req<{ items: Emote[] }>('GET', `/7tv/search?${qs}`);
+    return d.items || [];
+  },
+  // Резолв аудио-URL совместного прослушивания через медиа-релей (обход блокировки YouTube).
+  // Возвращает готовый URL для <audio> (аудио идёт браузер↔релей, мимо основного VPS). 503 = релей выкл.
+  musicResolve: (id: string) => req<{ url: string; title?: string; duration?: number }>('GET', `/music/resolve/${id}`),
 };
 
 /** Отправка на выгрузке страницы (`pagehide`): обычный fetch браузер убьёт вместе с

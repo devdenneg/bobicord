@@ -5,6 +5,7 @@
 import { create } from 'zustand';
 import { getEngine, useStore } from './store';
 import { parseVideoId, fetchTitle } from './youtube';
+import { api } from './api';
 
 export interface MTrack { id: string; title: string; by: string }
 
@@ -90,7 +91,9 @@ export const useMusic = create<MusicState>((set, get) => {
     add: async (url) => {
       const id = parseVideoId(url);
       if (!id) return 'Не похоже на ссылку YouTube';
-      const title = await fetchTitle(id);
+      let title = await fetchTitle(id); // oembed (без релея; при неудаче вернёт сам id)
+      // youtube.com заблокирован у добавляющего → oembed отдал id → берём название с медиа-релея
+      if (title === id) { try { const d = await api.musicResolve(id); if (d.title) title = d.title; } catch { /* релей выкл/недоступен */ } }
       const s = get();
       const track: MTrack = { id, title, by: useStore.getState().me?.displayName || '' };
       const queue = [...s.queue, track];
