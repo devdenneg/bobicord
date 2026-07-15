@@ -29,6 +29,9 @@ interface AppState {
   // сервер, к которому реально подключены (комната/чат/голос). Переживает уход на главную —
   // соединение НЕ рвём, пока не переключишься на другой сервер или не выйдешь.
   viewServerId: string | null;
+  // Какой мобильный экран открыть после перехода с главной: голос, чат/эфир или люди.
+  // Это только UI-intent, на соединение и медиа-движок не влияет.
+  serverEntryTab: 'channels' | 'main' | 'members';
   pendingSwitchId: string | null; // цель для модалки подтверждения переключения сервера
   updateReady: boolean;
   // доступное обновление НАТИВА (Tauri updater); obj — Update из @tauri-apps/plugin-updater
@@ -49,7 +52,7 @@ interface AppState {
   afterAuth: (user: User) => Promise<void>;
   loadMe: () => Promise<void>;
   logout: () => void;
-  openServer: (id: string, watchUser?: string) => Promise<void>; // watchUser — авто-запуск просмотра стримера после входа (CTA «Смотреть» с главной)
+  openServer: (id: string, watchUser?: string, entryTab?: 'channels' | 'main' | 'members') => Promise<void>; // watchUser — авто-запуск просмотра стримера после входа (CTA «Смотреть» с главной)
   watchAfterEnter: (serverId: string, username: string) => void;
   connectServer: (id: string) => Promise<void>;       // фактический (ре)коннект к серверу
   showConnectedServer: (id: string) => Promise<void>; // показать уже подключённый сервер без реконнекта
@@ -165,7 +168,7 @@ let unreadTimer: number | null = null;
 let toastSeq = 1;
 
 export const useStore = create<AppState>((set, get) => ({
-  view: 'loading', me: null, servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, viewServerId: null, pendingSwitchId: null, updateReady: false, nativeUpdate: null, emoteSize: (localStorage.getItem('emoteSize') as 'sm' | 'md' | 'lg') || 'md', toasts: [], modal: null, joinPrefill: '', broadcastLive: false, unread: {}, lastRead: {},
+  view: 'loading', me: null, servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, viewServerId: null, serverEntryTab: 'channels', pendingSwitchId: null, updateReady: false, nativeUpdate: null, emoteSize: (localStorage.getItem('emoteSize') as 'sm' | 'md' | 'lg') || 'md', toasts: [], modal: null, joinPrefill: '', broadcastLive: false, unread: {}, lastRead: {},
 
   toast: (text, kind) => {
     const id = toastSeq++;
@@ -286,7 +289,9 @@ export const useStore = create<AppState>((set, get) => ({
   // Точка входа по клику на сервер. Просмотр СВОБОДНЫЙ (голос не рвём, модалки переключения больше нет):
   // уже смотрю → no-op; смотримая комната уже на id (вернулся с главной) → мгновенный показ; иначе — вход
   // (connectServer сам решит: реюз живой голосовой комнаты или новый view-коннект).
-  openServer: async (id, watchUser) => {
+  openServer: async (id, watchUser, entryTab) => {
+    // Стрим всегда открываем сразу на сцене; обычный вход — в голосе, если вызывающий не уточнил intent.
+    set({ serverEntryTab: entryTab || (watchUser ? 'main' : 'channels') });
     const s = get();
     if (s.loadingServerId === id) return;                     // уже открываем этот сервер
     if (s.view === 'server' && s.active?.id === id) { if (watchUser) get().watchAfterEnter(id, watchUser); return; } // уже смотрим его

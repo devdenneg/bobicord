@@ -11,9 +11,6 @@ import { checkNativeUpdate, startNativeUpdatePolling } from './nativeUpdate';
 import { applyStoredTheme } from './theme';
 
 applyStoredTheme(); // применить сохранённую тему до первого рендера
-// запрет pinch-zoom на iOS/iPadOS (viewport user-scalable=no там не всегда держит); события gesture* — только Safari-тач, десктоп не затрагивается
-document.addEventListener('gesturestart', (e) => e.preventDefault(), { passive: false });
-document.addEventListener('gesturechange', (e) => e.preventDefault(), { passive: false });
 loadGlobalEmotes();
 // SW для установки PWA. НЕ кэширует (кэш ранее ронял прод); старые кэши чистятся внутри sw.js.
 if ('serviceWorker' in navigator) {

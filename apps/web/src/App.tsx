@@ -37,13 +37,14 @@ function Rail() {
   // подсвечиваем сервер только когда реально смотрим его (на главной — home активна)
   const activeId = view === 'server' ? (active?.id || loadingServerId) : null;
   return (
-    <nav id="rail">
-      <button className={'railbtn tip-l' + (!activeId ? ' active' : '')} data-tip="Домой" onClick={goHome}><Icon name="home" /></button>
+    <nav id="rail" aria-label="Серверы и разделы">
+      <button className={'railbtn tip-l' + (view === 'home' ? ' active' : '')} aria-label="Домой" data-tip="Домой" onClick={goHome}><Icon name="home" /></button>
       <div className="rail-sep" />
       {servers.map((s) => {
         const un = activeId === s.id ? 0 : (unread[s.id] || 0); // активный не бейджим (читаем его)
         return (
         <button key={s.id} className={'railbtn tip-l' + (activeId === s.id ? ' active' : '') + (eng.voiceServerId === s.id && activeId !== s.id ? ' connected' : '') + (un ? ' unread' : '')}
+          aria-label={s.name + (eng.voiceServerId === s.id && activeId !== s.id ? ' — вы в голосовом канале' : '')}
           data-tip={eng.voiceServerId === s.id && activeId !== s.id ? s.name + ' · в голосе' : s.name}
           style={{ background: s.iconUrl ? '#0000' : avColor(s.name, s.iconColor) }} onClick={() => openServer(s.id)}>
           {s.iconUrl ? <img className="avimg" src={resolveUploadUrl(s.iconUrl)} alt="" /> : initial(s.name)}{(s.online || []).some((m) => m.inVoice) ? <span className="dot green" /> : null}
@@ -51,13 +52,13 @@ function Rail() {
         </button>
         );
       })}
-      <button className="railbtn rail-add tip-l" data-tip="Создать / войти" onClick={() => setModal('create')}><Icon name="plus" /></button>
+      <button className="railbtn rail-add tip-l" aria-label="Создать сервер или войти" data-tip="Создать / войти" onClick={() => setModal('create')}><Icon name="plus" /></button>
       <div className="rail-grow" />
-      {me.isAdmin ? <button className="railbtn rail-admin tip-l" data-tip="Админка" onClick={goAdmin}><Icon name="users" /></button> : null}
+      {me.isAdmin ? <button className="railbtn rail-admin tip-l" aria-label="Админка" data-tip="Админка" onClick={goAdmin}><Icon name="users" /></button> : null}
       {/* Настройки — глобально в рейле (доступны и на главной, не только внутри сервера) */}
-      <button className="railbtn rail-set tip-l" data-tip="Настройки" onClick={() => setModal('settings')}><Icon name="gear" /></button>
-      <button className="railbtn rail-dl tip-l" data-tip="Загрузки" onClick={() => setModal('downloads')}><Icon name="download" /></button>
-      <button className="railbtn rail-me tip-l" data-tip="Профиль" style={{ background: me.avatarUrl ? '#0000' : avColor(me.displayName, me.avatarColor) }} onClick={() => setModal('profile')}>{me.avatarUrl ? <img className="avimg" src={resolveUploadUrl(me.avatarUrl)} alt="" /> : initial(me.displayName)}</button>
+      <button className="railbtn rail-set tip-l" aria-label="Настройки" data-tip="Настройки" onClick={() => setModal('settings')}><Icon name="gear" /></button>
+      <button className="railbtn rail-dl tip-l" aria-label="Загрузки" data-tip="Загрузки" onClick={() => setModal('downloads')}><Icon name="download" /></button>
+      <button className="railbtn rail-me tip-l" aria-label="Профиль" data-tip="Профиль" style={{ background: me.avatarUrl ? '#0000' : avColor(me.displayName, me.avatarColor) }} onClick={() => setModal('profile')}>{me.avatarUrl ? <img className="avimg" src={resolveUploadUrl(me.avatarUrl)} alt="" /> : initial(me.displayName)}</button>
     </nav>
   );
 }
@@ -67,6 +68,11 @@ function Face({ url, name }: { url?: string; name: string; color: number }) {
   return url ? <img className="avimg" src={resolveUploadUrl(url)} alt="" /> : <>{initial(name)}</>;
 }
 const faceBg = (url: string | undefined, name: string, color: number) => (url ? '#0000' : avColor(name, color));
+const pluralRu = (n: number, one: string, few: string, many: string) => {
+  const mod100 = Math.abs(n) % 100;
+  const mod10 = mod100 % 10;
+  return mod100 > 10 && mod100 < 20 ? many : mod10 === 1 ? one : mod10 > 1 && mod10 < 5 ? few : many;
+};
 
 // ★ Сигнатурный примитив: перекрытые лица с кольцами-по-состоянию (стрим=красное, голос=зелёное) + «+N».
 // Отрисован ИДЕНТИЧНО везде, где есть присутствие (живые карточки, серверные карточки, эфир).
@@ -146,7 +152,7 @@ function LiveCard({ item, onOpen }: { item: LiveItem; onOpen: () => void }) {
       ) : null}
       <div className="lc-foot">
         {active.length ? <Cluster members={active} cap={6} /> : <span />}
-        <button className="cta" onClick={(e) => { e.stopPropagation(); onOpen(); }}>{hasStream ? 'Смотреть' : 'Зайти'}</button>
+        <span className="cta" aria-hidden="true">{hasStream ? 'Смотреть' : 'Зайти'}</span>
       </div>
     </div>
   );
@@ -159,13 +165,13 @@ function ServerCard({ s, unread, connected, onOpen }: { s: ServerSummary; unread
   const coverUrl = s.iconUrl ? resolveUploadUrl(s.iconUrl) : ''; // обложка сервера как фон-декор карточки
   const tint = avColor(s.name, s.iconColor);                     // цвет-подложка (фолбэк без обложки + glow)
   return (
-    <button className={'srv-card' + (isLive ? ' is-live' : '') + (connected ? ' is-connected' : '') + (coverUrl ? ' has-cover' : '')} onClick={onOpen} style={{ ['--tint' as any]: tint }}>
+    <button className={'srv-card' + (isLive ? ' is-live' : '') + (connected ? ' is-connected' : '') + (coverUrl ? ' has-cover' : '')} aria-label={`Открыть сервер ${s.name}`} onClick={onOpen} style={{ ['--tint' as any]: tint }}>
       <span className="sc-cover" aria-hidden="true" style={coverUrl ? { ['--cover' as any]: `url("${coverUrl}")` } : undefined} />
       <div className="sc-h">
         <div className="sc-ic" style={{ background: faceBg(s.iconUrl, s.name, s.iconColor), overflow: 'hidden' }}><Face url={s.iconUrl} name={s.name} color={s.iconColor} /></div>
         <div style={{ minWidth: 0, flex: 1 }}>
           <div className="sc-nm">{s.name}</div>
-          <div className="sc-sub">{s.memberCount} участник(ов){s.role === 'owner' ? ' · владелец' : ''}</div>
+          <div className="sc-sub">{s.memberCount} {pluralRu(s.memberCount, 'участник', 'участника', 'участников')}{s.role === 'owner' ? ' · владелец' : ''}</div>
         </div>
         <DominantBadge s={s} unread={unread} />
       </div>
@@ -220,8 +226,30 @@ function GamesNow({ games }: { games: GameGroup[] }) {
   );
 }
 
-function StatPill({ icon, n, label }: { icon?: 'green' | 'acc'; n: number; label: string }) {
-  return <span className="stat-pill">{icon ? <i className={'dot ' + (icon === 'green' ? 'green' : 'acc')} /> : null}<b>{n}</b> {label}</span>;
+function HomeSectionHeading({ eyebrow, title, detail, tone }: { eyebrow: string; title: string; detail?: string; tone?: 'live' | 'accent' }) {
+  return (
+    <div className={'home-section-head' + (tone ? ' ' + tone : '')}>
+      <div><span>{eyebrow}</span><h2>{title}</h2></div>
+      {detail ? <p>{detail}</p> : null}
+    </div>
+  );
+}
+
+function HomeMetric({ icon, value, label, tone }: { icon: string; value: number; label: string; tone?: 'live' | 'green' | 'accent' }) {
+  return (
+    <div className={'home-metric' + (tone ? ' ' + tone : '')}>
+      <span className="hm-icon"><Icon name={icon} sm /></span>
+      <span><b>{value}</b><small>{label}</small></span>
+    </div>
+  );
+}
+
+function dayGreeting() {
+  const hour = new Date().getHours();
+  if (hour < 6) return 'Доброй ночи';
+  if (hour < 12) return 'Доброе утро';
+  if (hour < 18) return 'Добрый день';
+  return 'Добрый вечер';
 }
 
 // Главная — «пультовая»: что происходит СЕЙЧАС во всех твоих мирах (эфир) + куда прыгнуть, а не список серверов.
@@ -233,6 +261,7 @@ function Home() {
   const openServer = useStore((s) => s.openServer);
   const setModal = useStore((s) => s.setModal);
   const refreshServers = useStore((s) => s.refreshServers);
+  const eng = useEngine();
   const [filter, setFilter] = useState<'all' | 'unread' | 'mine'>('all');
 
   // Поллинг присутствия главной (мы не в комнате): держим «эфир» свежим, пока вкладка видима; мгновенно
@@ -249,73 +278,138 @@ function Home() {
   const games = useMemo(() => deriveGames(servers), [servers]);
   const ranked = useMemo(() => rankServers(servers, unread), [servers, unread]);
   const shown = useMemo(() => ranked.filter((s) => filter === 'unread' ? (unread[s.id] || 0) > 0 : filter === 'mine' ? s.role === 'owner' : true), [ranked, filter, unread]);
-  const totalOnline = servers.reduce((n, s) => n + (s.onlineCount || 0), 0);
+  const onlineMembers = useMemo(() => {
+    const unique = new Map<string, OnlineMember>();
+    for (const server of servers) for (const member of server.online || []) {
+      const current = unique.get(member.username);
+      if (!current || (!current.streaming && member.streaming) || (!current.inVoice && member.inVoice)) unique.set(member.username, member);
+    }
+    return clusterOrder([...unique.values()]);
+  }, [servers]);
+  const totalOnline = onlineMembers.length || servers.reduce((n, s) => n + (s.onlineCount || 0), 0);
+  const totalStreaming = onlineMembers.filter((m) => m.streaming).length;
+  const totalInVoice = onlineMembers.filter((m) => m.inVoice).length;
   const totalUnread = servers.reduce((n, s) => n + (unread[s.id] || 0), 0);
   const firstName = me.displayName.split(' ')[0];
   const connectedServer = connectedId ? servers.find((s) => s.id === connectedId) : null;
+  const voiceServer = eng.voiceServerId ? servers.find((s) => s.id === eng.voiceServerId) : null;
   const waiting = ranked.filter((s) => (unread[s.id] || 0) > 0);
-
-  // Нет серверов — приветственный герой с двумя действиями (тот же .bigbtn).
-  if (!servers.length) {
-    return (
-      <section id="home">
-        <header className="home-hd">
-          <div className="home-brand"><LogoLoader size={40} speedMs={8000} /><span>Рилэй</span></div>
-          <div className="hd-actions"><button className="hd-me" onClick={() => setModal('profile')} style={{ background: faceBg(me.avatarUrl, me.displayName, me.avatarColor) }}><Face url={me.avatarUrl} name={me.displayName} color={me.avatarColor} /></button></div>
-        </header>
-        <div className="home-body home-welcome">
-          <div className="hw-inner">
-            <h1>Тут пока пусто</h1>
-            <p>Создай свой мир или зайди по приглашению.</p>
-            <div className="home-actions">
-              <button className="bigbtn" onClick={() => setModal('create')}><div className="bi g"><Icon name="plus" /></div><div><b>Создать сервер</b><span>Свой сервер для друзей</span></div></button>
-              <button className="bigbtn" onClick={() => setModal('join')}><div className="bi a"><Icon name="link" /></div><div><b>Присоединиться</b><span>По коду или ссылке-приглашению</span></div></button>
-            </div>
-          </div>
-        </div>
-      </section>
-    );
-  }
+  const heroServer = voiceServer || live[0]?.server || connectedServer || ranked[0] || null;
+  const heroLive = heroServer ? live.find((item) => item.server.id === heroServer.id) : undefined;
+  const heroMembers = heroServer?.online?.length ? heroServer.online : onlineMembers;
+  const heroWatchUser = heroLive?.streamers[0]?.username;
+  const heroIsCurrentVoice = Boolean(eng.inVoice && voiceServer?.id === heroServer?.id);
+  const heroIsLive = Boolean(heroLive?.streamers.length);
+  const heroIsVoice = heroIsCurrentVoice || Boolean(heroLive?.voice.length);
+  const heroIsOnline = heroIsVoice || Boolean(heroServer && ((heroServer.online?.length || heroServer.onlineCount || 0) > 0));
+  const primaryLabel = !heroServer ? 'Создать первый сервер'
+    : heroIsCurrentVoice ? 'Вернуться в голос'
+      : heroIsLive ? 'Смотреть эфир'
+        : connectedServer?.id === heroServer.id ? 'Продолжить разговор'
+          : heroLive?.voice.length ? 'Зайти к друзьям' : `Открыть ${heroServer.name}`;
+  const primaryHint = !heroServer ? 'Это займёт меньше минуты'
+    : heroIsCurrentVoice ? heroServer.name
+      : heroIsLive ? `${heroLive!.streamers[0].displayName} уже в эфире`
+        : heroLive?.voice.length ? `${heroLive.voice.length} в голосовом канале` : 'Перейти на сервер';
+  const heroKicker = heroIsCurrentVoice && voiceServer ? `Ты в голосе · ${voiceServer.name}`
+    : heroIsLive ? `${heroLive!.streamers.length} ${pluralRu(heroLive!.streamers.length, 'трансляция', 'трансляции', 'трансляций')} · ${heroServer!.name}`
+      : heroIsVoice ? `${heroLive?.voice.length || totalInVoice} ${pluralRu(heroLive?.voice.length || totalInVoice, 'человек', 'человека', 'человек')} в голосе`
+        : totalOnline ? `${totalOnline} онлайн на твоих серверах` : 'Твоя точка встречи';
+  const heroText = !servers.length ? 'Создай своё пространство, позови друзей и начинай созвон без лишних экранов.'
+    : heroIsCurrentVoice ? 'Разговор уже идёт — вернись в голосовой канал одним нажатием.'
+      : heroIsLive ? 'Самое живое уже собрано здесь — подключайся к трансляции в один клик.'
+        : heroIsVoice ? 'Друзья уже в голосе. Заходи в разговор без лишних экранов.'
+        : totalUnread ? 'Новые сообщения и твои серверы собраны в одном спокойном потоке.'
+          : 'Всё спокойно. Серверы, голос, чат и трансляции готовы, когда понадобятся.';
+  const gamePlayers = games.reduce((n, game) => n + game.players.length, 0);
+  const runPrimary = () => heroServer ? openServer(heroServer.id, heroWatchUser, heroWatchUser ? 'main' : 'channels') : setModal('create');
 
   return (
     <section id="home">
       <header className="home-hd">
         <div className="home-brand"><LogoLoader size={40} speedMs={8000} /><span>Рилэй</span></div>
-        <span className="hd-greet">Привет, {firstName}</span>
-        <div className="stat-strip">
-          <StatPill n={servers.length} label="серверов" />
-          <StatPill icon="green" n={totalOnline} label="в сети" />
-          {totalUnread ? <StatPill icon="acc" n={totalUnread} label="непрочитано" /> : null}
+        <div className="hd-context" aria-live="polite">
+          <i className={'dot ' + (totalOnline ? 'green' : '')} />
+          <span>{totalOnline ? `${totalOnline} онлайн` : 'готов к связи'}</span>
         </div>
         <div className="hd-actions">
-          <button className="hd-create" onClick={() => setModal('create')}><Icon name="plus" sm />Создать</button>
-          <button className="hd-join" onClick={() => setModal('join')}>Войти</button>
-          <button className="hd-me" onClick={() => setModal('profile')} style={{ background: faceBg(me.avatarUrl, me.displayName, me.avatarColor) }}><Face url={me.avatarUrl} name={me.displayName} color={me.avatarColor} /></button>
+          <button className="hd-create" aria-label="Создать сервер" onClick={() => setModal('create')}><Icon name="plus" sm /><span>Создать</span></button>
+          <button className="hd-join" aria-label="Войти по приглашению" onClick={() => setModal('join')}><Icon name="link" sm /><span>Войти</span></button>
+          <button className="hd-me" aria-label="Открыть профиль" onClick={() => setModal('profile')} style={{ background: faceBg(me.avatarUrl, me.displayName, me.avatarColor) }}><Face url={me.avatarUrl} name={me.displayName} color={me.avatarColor} /></button>
         </div>
       </header>
 
       <div className="home-body home-enter">
-        {/* акцентные баннеры: обновление (веб/натив) → промо десктоп-приложения (веб). null, если нечего показать */}
         <UpdateBanner />
         <DownloadCard />
-        {/* Приоритет ДИНАМИЧЕСКИЙ: эфир — герой ТОЛЬКО когда он есть. Пусто → ведут «Тебя ждут» и серверы,
-            а «никто не в эфире» ужимается в тонкую строку внизу (не доминирует экраном показывая ничего). */}
+
+        <section className={'home-hero' + (heroIsLive ? ' is-live' : heroIsVoice ? ' is-voice' : '')}>
+          <div className="hero-copy">
+            <div className="hero-kicker"><i className="hero-signal" />{heroKicker}</div>
+            <h1>{servers.length ? <>{dayGreeting()}, <em>{firstName}</em></> : <>Твой голос.<br /><em>Твои люди.</em></>}</h1>
+            <p>{heroText}</p>
+            <div className="hero-actions">
+              <button className="hero-primary" onClick={runPrimary}>
+                <span className="hero-action-icon"><Icon name={heroServer ? (heroLive?.streamers.length ? 'play' : 'speaker') : 'plus'} /></span>
+                <span><b>{primaryLabel}</b><small>{primaryHint}</small></span>
+                <Icon name="chevron" sm />
+              </button>
+              <button className="hero-secondary" onClick={() => setModal(heroServer ? 'create' : 'join')}>
+                <Icon name={heroServer ? 'plus' : 'link'} sm />{heroServer ? 'Новый сервер' : 'Войти по приглашению'}
+              </button>
+            </div>
+          </div>
+
+          <div className="hero-activity" role="status" aria-label={heroKicker}>
+            <div className="ha-glow" aria-hidden="true" />
+            <div className="ha-top"><span>ПРЯМО СЕЙЧАС</span><i className={heroIsLive ? 'live' : heroIsOnline ? 'online' : ''}>{heroIsLive ? 'LIVE' : heroIsOnline ? 'ONLINE' : 'READY'}</i></div>
+            {heroServer ? (
+              <div className="ha-server">
+                <span className="ha-server-icon" style={{ background: faceBg(heroServer.iconUrl, heroServer.name, heroServer.iconColor) }}><Face url={heroServer.iconUrl} name={heroServer.name} color={heroServer.iconColor} /></span>
+                <span><b>{heroServer.name}</b><small>{heroLive?.streamers.length ? 'Идёт трансляция' : heroLive?.voice.length ? 'Разговор уже начался' : connectedServer?.id === heroServer.id ? 'Можно быстро вернуться' : 'Готов к созвону'}</small></span>
+                {heroLive?.streamers.length ? <span className="ha-live"><i />LIVE</span> : null}
+              </div>
+            ) : (
+              <div className="ha-empty"><span><Icon name="speaker" /></span><b>Первый созвон начинается здесь</b><small>Сервер объединит голос, чат и трансляции.</small></div>
+            )}
+            <div className="ha-people">
+              {heroMembers.length ? <Cluster members={heroMembers} cap={7} /> : <div className="ha-orbit" aria-hidden="true"><i /><i /><i /></div>}
+              <span>{heroMembers.length ? `${Math.min(heroMembers.length, 7)} ${pluralRu(Math.min(heroMembers.length, 7), 'друг онлайн', 'друга рядом', 'друзей рядом')}` : 'Место уже готово'}</span>
+            </div>
+            <div className="home-metrics">
+              <HomeMetric icon="users" value={totalOnline} label="онлайн" tone="green" />
+              <HomeMetric icon="mic-sm" value={totalInVoice} label="в голосе" tone="accent" />
+              <HomeMetric icon="screen" value={totalStreaming} label="в эфире" tone="live" />
+            </div>
+          </div>
+        </section>
+
+        {!servers.length ? (
+          <>
+            <HomeSectionHeading eyebrow="Три шага" title="От тишины до разговора" detail="Без сложной настройки" />
+            <div className="onboarding-grid">
+              <article><span>01</span><Icon name="plus" /><div><b>Создай сервер</b><p>Одно пространство для своей компании.</p></div></article>
+              <article><span>02</span><Icon name="link" /><div><b>Позови друзей</b><p>Отправь им короткую ссылку.</p></div></article>
+              <article><span>03</span><Icon name="speaker" /><div><b>Начни созвон</b><p>Голос, чат и экран уже внутри.</p></div></article>
+            </div>
+          </>
+        ) : null}
+
         {live.length ? <>
-          <div className="home-sec hot">Сейчас в эфире</div>
-          {/* hasStream → CTA открывает сервер И сразу запускает просмотр ведущего стримера; voice-only → просто вход */}
+          <HomeSectionHeading eyebrow="Живое" title="Сейчас в эфире" detail={`${live.length} ${pluralRu(live.length, 'активный сервер', 'активных сервера', 'активных серверов')}`} tone="live" />
           <div className="live-grid">{live.map((it) => <LiveCard key={it.key} item={it} onOpen={() => openServer(it.server.id, it.streamers[0]?.username)} />)}</div>
         </> : null}
 
         {games.length ? <>
-          <div className="home-sec">Играют сейчас</div>
+          <HomeSectionHeading eyebrow="Активность" title="Играют сейчас" detail={`${gamePlayers} ${pluralRu(gamePlayers, 'игрок', 'игрока', 'игроков')}`} />
           <GamesNow games={games} />
         </> : null}
 
         {waiting.length ? <>
-          <div className="home-sec">Тебя ждут</div>
+          <HomeSectionHeading eyebrow="Непрочитанное" title="Тебя ждут" detail={`${totalUnread} ${pluralRu(totalUnread, 'новое сообщение', 'новых сообщения', 'новых сообщений')}`} tone="accent" />
           <div className="catchup">
             {waiting.map((s) => (
-              <button key={s.id} className="cu-chip" onClick={() => openServer(s.id)}>
+              <button key={s.id} className="cu-chip" onClick={() => openServer(s.id, undefined, 'main')}>
                 <span className="cu-ic" style={{ background: faceBg(s.iconUrl, s.name, s.iconColor) }}><Face url={s.iconUrl} name={s.name} color={s.iconColor} /></span>
                 <span className="cu-nm">{s.name}</span><b>{unread[s.id]}</b>
               </button>
@@ -323,19 +417,20 @@ function Home() {
           </div>
         </> : null}
 
-        <div className="home-sec">Твои серверы</div>
-        <div className="home-chips">
-          {(['all', 'unread', 'mine'] as const).map((f) => (
-            <button key={f} className={'chip' + (filter === f ? ' on' : '')} onClick={() => setFilter(f)}>{f === 'all' ? 'Все' : f === 'unread' ? 'Непрочитанное' : 'Мои'}</button>
-          ))}
-        </div>
-        <div className="srv-grid">
-          {shown.length ? shown.map((s) => <ServerCard key={s.id} s={s} unread={unread} connected={connectedId === s.id} onOpen={() => openServer(s.id)} />)
-            : <div className="sc-none" style={{ gridColumn: '1/-1', padding: 10 }}>Ничего не найдено по фильтру.</div>}
-        </div>
+        {servers.length ? <>
+          <HomeSectionHeading eyebrow="Пространства" title="Твои серверы" detail={`${shown.length} из ${servers.length}`} />
+          <div className="home-chips">
+            {(['all', 'unread', 'mine'] as const).map((f) => (
+              <button key={f} className={'chip' + (filter === f ? ' on' : '')} aria-pressed={filter === f} onClick={() => setFilter(f)}>{f === 'all' ? 'Все' : f === 'unread' ? 'Непрочитанное' : 'Мои'}</button>
+            ))}
+          </div>
+          <div className="srv-grid">
+            {shown.length ? shown.map((s) => <ServerCard key={s.id} s={s} unread={unread} connected={connectedId === s.id} onOpen={() => openServer(s.id)} />)
+              : <div className="sc-none" style={{ gridColumn: '1/-1', padding: 10 }}>Ничего не найдено по фильтру.</div>}
+          </div>
+        </> : null}
 
-        {/* нет эфира — тонкая строка-шёпот внизу, не большой пустой герой */}
-        {!live.length ? (
+        {servers.length && !live.length ? (
           <div className="live-quiet">
             <span className="lq-ic"><Icon name="screen" sm /></span>
             <span className="lq-tx">Сейчас никто не в эфире</span>
@@ -343,9 +438,8 @@ function Home() {
           </div>
         ) : null}
 
-        {/* дубль действий из хедера — крупными карточками в теле (быстрый доступ, не только мелкие кнопки сверху) */}
-        <div className="home-sec">Добавить сервер</div>
-        <div className="home-actions">
+        <HomeSectionHeading eyebrow="Быстрый старт" title={servers.length ? 'Собери своих' : 'Начни прямо сейчас'} detail="Все действия под рукой" />
+        <div className="home-actions quick-actions">
           <button className="bigbtn" onClick={() => setModal('create')}><div className="bi g"><Icon name="plus" /></div><div><b>Создать сервер</b><span>Свой сервер для друзей</span></div></button>
           <button className="bigbtn" onClick={() => setModal('join')}><div className="bi a"><Icon name="link" /></div><div><b>Присоединиться</b><span>По коду или ссылке-приглашению</span></div></button>
         </div>

@@ -49,6 +49,7 @@ import PauseRounded from '@mui/icons-material/PauseRounded';
 import SkipPreviousRounded from '@mui/icons-material/SkipPreviousRounded';
 import SkipNextRounded from '@mui/icons-material/SkipNextRounded';
 import EmojiEventsRounded from '@mui/icons-material/EmojiEventsRounded';
+import MoreHorizRounded from '@mui/icons-material/MoreHorizRounded';
 
 const MAP: Record<string, SvgIconComponent> = {
   play: PlayArrowRounded, pause: PauseRounded, 'skip-prev': SkipPreviousRounded, 'skip-next': SkipNextRounded,
@@ -66,7 +67,7 @@ const MAP: Record<string, SvgIconComponent> = {
   fullscreen: FullscreenRounded, pip: PictureInPictureAltRounded,
   palette: PaletteRounded, download: DownloadRounded, reply: ReplyRounded,
   copy: ContentCopyRounded, react: AddReactionRounded,
-  trash: DeleteRounded, edit: EditRounded, keyboard: KeyboardRounded,
+  trash: DeleteRounded, delete: DeleteRounded, edit: EditRounded, keyboard: KeyboardRounded, more: MoreHorizRounded,
   bell: NotificationsRounded, shield: ShieldRounded, badge: BadgeRounded,
   attach: AttachFileRounded, file: InsertDriveFileRounded,
   folder: FolderRounded, 'open-in': OpenInNewRounded,

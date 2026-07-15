@@ -24,7 +24,7 @@ function CreateModal() {
   async function create() {
     if (name.trim().length < 2) { setErr('Название минимум 2 символа'); return; }
     setBusy(true);
-    try { const d = await api.createServer(name.trim()); close(); await useStore.getState().loadMe(); await useStore.getState().connectServer(d.server.id); useStore.getState().toast('Сервер создан', 'ok'); }
+    try { const d = await api.createServer(name.trim()); close(); await useStore.getState().loadMe(); await useStore.getState().openServer(d.server.id, undefined, 'channels'); useStore.getState().toast('Сервер создан', 'ok'); }
     catch (e: any) { setErr(e.message); } finally { setBusy(false); }
   }
   return <Backdrop onClose={close} label="Создать сервер">
@@ -49,7 +49,7 @@ function JoinModal() {
   async function join() {
     const cc = extractCode(code); if (!cc) { setErr('Введи код'); return; }
     setBusy(true); setErr('');
-    try { const d = await api.joinInvite(cc); close(); await useStore.getState().loadMe(); await useStore.getState().connectServer(d.server.id); useStore.getState().toast('Ты на сервере «' + d.server.name + '»', 'ok'); }
+    try { const d = await api.joinInvite(cc); close(); await useStore.getState().loadMe(); await useStore.getState().openServer(d.server.id, undefined, 'channels'); useStore.getState().toast('Ты на сервере «' + d.server.name + '»', 'ok'); }
     catch (e: any) { setErr(e.message); } finally { setBusy(false); }
   }
   return <Backdrop onClose={close} label="Присоединиться">

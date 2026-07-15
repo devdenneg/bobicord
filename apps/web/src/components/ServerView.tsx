@@ -757,6 +757,17 @@ function Chat() {
   const [reactTarget, setReactTarget] = useState<{ sid: number; anchor: DOMRect } | null>(null); // 7TV-пикер для реакции
   const [editing, setEditing] = useState<{ id: number; sid: number } | null>(null); // инлайн-редактирование
   const [editText, setEditText] = useState('');
+  const [actionsFor, setActionsFor] = useState<number | null>(null); // touch: явное меню действий сообщения
+
+  useEffect(() => {
+    if (actionsFor == null) return;
+    const close = (e: PointerEvent) => {
+      const target = e.target as Element | null;
+      if (!target?.closest('.msg-actions,.msg-more')) setActionsFor(null);
+    };
+    document.addEventListener('pointerdown', close);
+    return () => document.removeEventListener('pointerdown', close);
+  }, [actionsFor]);
   const markReadStore = useStore((s) => s.markRead);
   const bumpUnreadStore = useStore((s) => s.bumpUnread);
   // базовая линия «прочитано до» (id) — замораживается при входе на сервер; дивайдер «новые» рисуется
@@ -1180,13 +1191,16 @@ function Chat() {
                   </div>
                 ) : null; })()}
               </div>
-              {!m.sys && editing?.id !== m.id ? <div className="msg-actions" onMouseDown={(e) => e.preventDefault()}>
-                {m.sid != null ? <button className="msg-act" data-tip="Реакция" onClick={(e) => setReactTarget({ sid: m.sid!, anchor: e.currentTarget.getBoundingClientRect() })}><Icon name="react" sm /></button> : null}
-                <button className="msg-act" data-tip="Ответить" onClick={() => startReply(m)}><Icon name="reply" sm /></button>
-                {m.text ? <button className="msg-act" data-tip="Копировать текст" onClick={() => { navigator.clipboard?.writeText(m.text!).then(() => useStore.getState().toast('Скопировано', 'ok')).catch(() => {}); }}><Icon name="copy" sm /></button> : null}
-                {m.mine && m.text && m.sid != null ? <button className="msg-act" data-tip="Изменить" onClick={() => { setEditing({ id: m.id, sid: m.sid! }); setEditText(m.text); }}><Icon name="edit" sm /></button> : null}
-                {m.mine && m.sid != null ? <button className="msg-act danger" data-tip="Удалить" onClick={() => { if (window.confirm('Удалить сообщение?')) E.deleteChat(m.sid!); }}><Icon name="delete" sm /></button> : null}
-              </div> : null}
+              {!m.sys && editing?.id !== m.id ? <>
+                <button className="msg-more" aria-label="Действия с сообщением" aria-expanded={actionsFor === m.id} aria-controls={`msg-actions-${m.id}`} onClick={(e) => { e.stopPropagation(); setActionsFor((id) => id === m.id ? null : m.id); }}><Icon name="more" sm /></button>
+                <div id={`msg-actions-${m.id}`} className={'msg-actions' + (actionsFor === m.id ? ' open' : '')} onMouseDown={(e) => e.preventDefault()}>
+                  {m.sid != null ? <button className="msg-act" aria-label="Добавить реакцию" data-tip="Реакция" onClick={(e) => { setReactTarget({ sid: m.sid!, anchor: e.currentTarget.getBoundingClientRect() }); setActionsFor(null); }}><Icon name="react" sm /></button> : null}
+                  <button className="msg-act" aria-label="Ответить" data-tip="Ответить" onClick={() => { startReply(m); setActionsFor(null); }}><Icon name="reply" sm /></button>
+                  {m.text ? <button className="msg-act" aria-label="Копировать текст" data-tip="Копировать текст" onClick={() => { navigator.clipboard?.writeText(m.text!).then(() => useStore.getState().toast('Скопировано', 'ok')).catch(() => {}); setActionsFor(null); }}><Icon name="copy" sm /></button> : null}
+                  {m.mine && m.text && m.sid != null ? <button className="msg-act" aria-label="Изменить сообщение" data-tip="Изменить" onClick={() => { setEditing({ id: m.id, sid: m.sid! }); setEditText(m.text); setActionsFor(null); }}><Icon name="edit" sm /></button> : null}
+                  {m.mine && m.sid != null ? <button className="msg-act danger" aria-label="Удалить сообщение" data-tip="Удалить" onClick={() => { setActionsFor(null); if (window.confirm('Удалить сообщение?')) E.deleteChat(m.sid!); }}><Icon name="delete" sm /></button> : null}
+                </div>
+              </> : null}
             </div>
           </div>
         </div>
@@ -1679,11 +1693,15 @@ function useResizable(key: string, def: number, min: number, max: number, edge: 
 export function ServerView() {
   const eng = useEngine();
   const setModal = useStore((s) => s.setModal);
+  const entryTab = useStore((s) => s.serverEntryTab);
   const [minimized, setMin] = useState(false);
-  const [mtab, setMtab] = useState<'channels' | 'main' | 'members'>('channels'); // мобилка: по умолчанию вкладка «Голос»
+  const [mtab, setMtab] = useState<'channels' | 'main' | 'members'>(() => entryTab);
   const hasStreams = eng.streams.length > 0;
   const split = hasStreams && !minimized;
   useEffect(() => { if (!hasStreams) setMin(false); }, [hasStreams]);
+  // CTA «Смотреть» с главной сначала подключает транспорт, затем добавляет stream в snapshot.
+  // На телефоне сразу показываем сцену, а не оставляем пользователя на вкладке «Голос».
+  useEffect(() => { if (hasStreams) setMtab('main'); }, [hasStreams]);
   const chan = useResizable('w:channels', 290, 270, 440, 'right');
   const mem = useResizable('w:members', 244, 216, 400, 'left');
   const chatW = useResizable('w:chat', 340, 260, 640, 'left');
@@ -1691,6 +1709,10 @@ export function ServerView() {
   useEffect(() => { localStorage.setItem('membersOpen', membersOpen ? '1' : '0'); }, [membersOpen]);
   const [showChat, setShowChat] = useState(false);
   useEffect(() => { if (!split) setShowChat(false); }, [split]);
+  // В split-режиме stage обязан сохранить рабочую ширину: правая панель чата и участники
+  // взаимоисключаются. Иначе сохранённые пользователем ширины могут полностью зажать видео.
+  const toggleSplitChat = () => setShowChat((open) => { const next = !open; if (next) setMembersOpen(false); return next; });
+  const toggleMembers = () => setMembersOpen((open) => { const next = !open; if (next) setShowChat(false); return next; });
   // трансляция открылась → сразу прячем участников (место под видео); закрылась → возвращаем, если прятали сами
   const prevSplit = useRef(false);
   const autoHidMembers = useRef(false);
@@ -1708,8 +1730,8 @@ export function ServerView() {
         <div id="main">
           <div className="srv-header">
             <div className="hn"><Icon name="hash" sm /><span>общий</span></div>
-            {split ? <button className={'hbtn' + (showChat ? ' on' : '')} data-tip={showChat ? 'Скрыть чат' : 'Показать чат'} onClick={() => setShowChat((v) => !v)}><Icon name="chat" sm /></button> : null}
-            <button className={'hbtn mob-hide' + (membersOpen ? ' on' : '')} data-tip={membersOpen ? 'Скрыть участников' : 'Показать участников'} onClick={() => setMembersOpen((v) => !v)}><Icon name="users" sm /></button>
+            {split ? <button className={'hbtn' + (showChat ? ' on' : '')} data-tip={showChat ? 'Скрыть чат' : 'Показать чат'} onClick={toggleSplitChat}><Icon name="chat" sm /></button> : null}
+            <button className={'hbtn mob-hide' + (membersOpen ? ' on' : '')} data-tip={membersOpen ? 'Скрыть участников' : 'Показать участников'} onClick={toggleMembers}><Icon name="users" sm /></button>
             <button className="hbtn" data-tip="Пригласить" onClick={() => setModal('invite')}><Icon name="link" sm /></button>
             <button className="hbtn mob-only" data-tip="Настройки" onClick={() => setModal('settings')}><Icon name="gear" sm /></button>
           </div>
@@ -1717,7 +1739,7 @@ export function ServerView() {
             <Stage minimized={minimized} setMin={setMin} />
             {split && showChat ? <div className="rz rz-chat" onMouseDown={chatW.onDown} title="Потяни — ширина чата" /> : null}
             <Chat />
-            {split ? <button className="mob-chat-toggle" onClick={() => setShowChat((v) => !v)}><Icon name={showChat ? 'screen' : 'chat'} sm />{showChat ? 'К трансляции' : 'Открыть чат'}</button> : null}
+            {split ? <button className="mob-chat-toggle" onClick={toggleSplitChat}><Icon name={showChat ? 'screen' : 'chat'} sm />{showChat ? 'К трансляции' : 'Открыть чат'}</button> : null}
           </div>
         </div>
         <Members />
@@ -1725,9 +1747,9 @@ export function ServerView() {
         {membersOpen ? <div className="rz rz-mem" onMouseDown={mem.onDown} title="Потяни, чтобы изменить ширину" /> : null}
       </section>
       <div id="mtabs">
-        <button className={mtab === 'channels' ? 'active' : ''} onClick={() => setMtab('channels')}><Icon name="speaker" />Голос</button>
-        <button className={mtab === 'main' ? 'active' : ''} onClick={() => setMtab('main')}><Icon name="chat" />Чат</button>
-        <button className={mtab === 'members' ? 'active' : ''} onClick={() => setMtab('members')}><Icon name="users" />Люди</button>
+        <button className={mtab === 'channels' ? 'active' : ''} aria-label="Голосовые каналы" onClick={() => setMtab('channels')}><Icon name="speaker" />Голос</button>
+        <button className={mtab === 'main' ? 'active' : ''} aria-label={hasStreams ? 'Трансляция и чат' : 'Чат'} onClick={() => setMtab('main')}><Icon name={hasStreams ? 'screen' : 'chat'} />{hasStreams ? 'Эфир' : 'Чат'}</button>
+        <button className={mtab === 'members' ? 'active' : ''} aria-label="Участники" onClick={() => setMtab('members')}><Icon name="users" />Люди</button>
       </div>
     </>
   );
