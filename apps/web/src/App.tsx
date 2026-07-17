@@ -345,7 +345,7 @@ function Home() {
 
         <section className={'home-hero' + (heroIsLive ? ' is-live' : heroIsVoice ? ' is-voice' : '')}>
           <div className="hero-copy">
-            <div className="hero-kicker"><i className="hero-signal" />{heroKicker}</div>
+            <div className="hero-kicker"><i className="hero-signal" /><span>{heroKicker}</span></div>
             <h1>{servers.length ? <>{dayGreeting()}, <em>{firstName}</em></> : <>Твой голос.<br /><em>Твои люди.</em></>}</h1>
             <p>{heroText}</p>
             <div className="hero-actions">

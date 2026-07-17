@@ -37,6 +37,28 @@ export function webOrigin(): string {
   return API_BASE || location.origin;
 }
 
+export interface VoiceLease {
+  sessionId: string;
+  serverId: string;
+  channelId: string;
+  epoch: number;
+  claimedAt: number;
+}
+export interface VoiceLeaseEvent {
+  ok?: boolean;
+  t: 'voice-lease';
+  reason: 'snapshot' | 'minted' | 'claimed' | 'idempotent' | 'released' | 'stale' | 'stale-ticket' | 'consumed' | 'ticket-required' | 'revoked' | 'request-aborted' | 'session-gone' | 'membership-revoked' | 'channel-deleted' | 'server-revoked' | 'server-deleted' | 'account-deleted';
+  lease: VoiceLease | null;
+  currentEpoch: number;
+  accepted?: boolean;
+  released?: boolean;
+}
+export interface VoiceIntentTicket extends VoiceLeaseEvent {
+  ticket: number;
+  clientIntent: number;
+  idempotent?: boolean;
+}
+
 async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = {};
   if (token) headers['Authorization'] = 'Bearer ' + token;
@@ -47,12 +69,15 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
   const timer = ctrl ? setTimeout(() => ctrl.abort(), 15000) : null;
   if (ctrl) opt.signal = ctrl.signal;
   let r: Response;
-  try { r = await fetch(API_BASE + '/api' + path, opt); }
-  catch (e) { throw new Error(ctrl?.signal.aborted ? 'Таймаут запроса' : (e instanceof Error ? e.message : 'Сеть недоступна')); }
-  finally { if (timer) clearTimeout(timer); }
   let d: any = {};
   let parsed = false;
-  try { d = await r.json(); parsed = true; } catch { /* ignore */ }
+  try {
+    r = await fetch(API_BASE + '/api' + path, opt);
+    try { d = await r.json(); parsed = true; }
+    catch (e) { if (ctrl?.signal.aborted) throw e; }
+  }
+  catch (e) { throw new Error(ctrl?.signal.aborted ? 'Таймаут запроса' : (e instanceof Error ? e.message : 'Сеть недоступна')); }
+  finally { if (timer !== null) clearTimeout(timer); }
   if (!r.ok) throw new Error(d?.error || 'Ошибка ' + r.status);
   // 200, но тело не JSON (напр. index.html при неверном API_BASE в нативе) — падаем
   // громко, а не отдаём {} наверх (иначе me/servers undefined → белый экран на home).
@@ -113,7 +138,14 @@ export const api = {
   renameChannel: (id: string, cid: string, name: string) => req<{ channels: VoiceChannel[] }>('PATCH', `/servers/${id}/channels/${cid}`, { name }),
   deleteChannel: (id: string, cid: string) => req<{ channels: VoiceChannel[] }>('DELETE', `/servers/${id}/channels/${cid}`),
   clearChat: (id: string) => req<{ ok: boolean }>('POST', `/servers/${id}/clear`),
-  serverToken: (id: string) => req<{ token: string; url: string; room: string }>('GET', `/servers/${id}/token`),
+  serverToken: (id: string) => req<{ token: string; url: string; room: string; sessionId: string }>('GET', `/servers/${id}/token`),
+  getVoiceLease: () => req<VoiceLeaseEvent>('GET', '/voice/lease'),
+  mintVoiceIntent: (sessionId: string, serverId: string, channelId: string, clientIntent: number) =>
+    req<VoiceIntentTicket>('POST', '/voice/lease/intent', { sessionId, serverId, channelId, clientIntent }),
+  claimVoiceLease: (sessionId: string, serverId: string, channelId: string, clientIntent: number, ticket: number) =>
+    req<VoiceLeaseEvent>('POST', '/voice/lease/claim', { sessionId, serverId, channelId, clientIntent, ticket }),
+  releaseVoiceLease: (sessionId: string, epoch: number) =>
+    req<VoiceLeaseEvent>('POST', '/voice/lease/release', { sessionId, epoch }),
   getSettings: (id: string) => req<{ data: any }>('GET', `/servers/${id}/settings`),
   putSettings: (id: string, data: any) => req<{ ok: boolean }>('PUT', `/servers/${id}/settings`, { data }),
   // аккаунтные настройки (хоткеи и т.п.) — следуют за юзером на любом устройстве, не за localStorage

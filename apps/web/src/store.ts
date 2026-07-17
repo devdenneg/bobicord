@@ -79,20 +79,25 @@ let memberTimer: number | null = null;
 // эпоху на старте и сверяют перед записью в стор/engine — иначе протухший хвост прошлого сервера
 // пишет своё состояние поверх текущего или рвёт живую комнату. goHome НЕ бампит (соединение живёт).
 let viewEpoch = 0;
+// Каждый новый presence-poll делает все более ранние ответы неактуальными. Одного viewEpoch
+// недостаточно: два запроса одного и того же сервера могут завершиться в обратном порядке.
+let memberPollRequestSeq = 0;
 
 // поллинг состава/пресенса активного сервера (5с). Работает только пока смотрим этот сервер.
 function startMemberPoll(id: string) {
   if (memberTimer) clearInterval(memberTimer);
+  memberPollRequestSeq++; // инвалидировать уже летящий poll, даже если сервер и epoch не сменились
   const epoch = viewEpoch;
   const poll = async () => {
     const st = useStore.getState();
     if (st.view !== 'server' || st.viewServerId !== id || viewEpoch !== epoch) return;
+    const requestSeq = ++memberPollRequestSeq;
     try {
       const [srv, prs] = await Promise.all([api.getServer(id), api.presence(id)]);
       // повторный гард ПОСЛЕ await: за время сети юзер мог переключить/покинуть сервер — иначе
       // протухший ответ пишет состав/пресенс чужого сервера в стор и engine (чинилось только 5с спустя)
       const st2 = useStore.getState();
-      if (st2.view !== 'server' || st2.viewServerId !== id || viewEpoch !== epoch) return;
+      if (st2.view !== 'server' || st2.viewServerId !== id || viewEpoch !== epoch || requestSeq !== memberPollRequestSeq) return;
       // Обновляем и СВОИ роль/права (myRole/myPerms), не только channels: раньше спред ...st2.active
       // сохранял старые myRole/myPerms → выданные владельцем роль/права не появлялись до F5/реконнекта
       // (getServer их отдаёт, но поллер выбрасывал). Плюс имя/роли сервера — на случай их правки.
@@ -189,11 +194,11 @@ export const useStore = create<AppState>((set, get) => ({
     flushPendingDiag().catch(() => {});
     engine = new Engine(user, {
       toast: (t, k) => get().toast(t, k),
-      saveSettings: (vols) => {
-        const a = get().active; if (!a) return;
-        localStorage.setItem('srvset:' + a.id, JSON.stringify(vols));
+      saveSettings: (serverId, vols) => {
+        if (!serverId) return;
+        localStorage.setItem('srvset:' + serverId, JSON.stringify(vols));
         if (saveTimer) clearTimeout(saveTimer);
-        saveTimer = window.setTimeout(() => { api.putSettings(a.id, vols).catch(() => {}); }, 800);
+        saveTimer = window.setTimeout(() => { api.putSettings(serverId, vols).catch(() => {}); }, 800);
       },
       peerJoined: (id) => { if (!get().members.some((m) => m.username === id)) get().refreshMembers(); },
       persistMessage: (text, em, image, reply, localId, key, files, kind, level) => {
@@ -203,12 +208,28 @@ export const useStore = create<AppState>((set, get) => ({
           .then((r) => engine?.markSendResult(localId, true, r?.id))
           .catch(() => engine?.markSendResult(localId, false));
       },
-      refetchChat: () => { const a = get().active; if (!a) return; api.getMessages(a.id, undefined, 30).then((d) => engine?.mergeRecent(d.messages)).catch(() => {}); },
-      reactMessage: (serverId, sid, emoteId, emoteName, add) => { api.reactMessage(serverId, sid, emoteId, emoteName, add).catch(() => {}); },
+      refetchChat: (sid) => {
+        const a = get().active; if (!a) return;
+        const id = a.id, epoch = viewEpoch, targetEngine = engine;
+        const exactCursor = sid != null && Number.isSafeInteger(sid) ? sid + 1 : undefined;
+        api.getMessages(id, exactCursor, exactCursor == null ? 30 : 1).then((d) => {
+          const current = get();
+          if (viewEpoch !== epoch || current.viewServerId !== id || current.active?.id !== id || engine !== targetEngine) return;
+          targetEngine?.mergeRecent(d.messages);
+        }).catch(() => {});
+      },
+      // Let the engine observe failures so it can roll optimistic state back.
+      reactMessage: (serverId, sid, emoteId, emoteName, add) => api.reactMessage(serverId, sid, emoteId, emoteName, add).then(() => undefined),
       editMessage: (serverId, sid, text) => { api.editMessage(serverId, sid, text).catch(() => {}); },
       deleteMessage: (serverId, sid) => { api.deleteMessage(serverId, sid).catch(() => {}); },
       // выход из голосового → гасим нативную трансляцию (Rust-дерево) + сбрасываем флаг (browser-share гасит engine.stopShare)
       endBroadcast: () => { if (isTauri) stopNativeBroadcast().catch(() => {}).finally(() => endAnyBroadcasterSession()); get().setBroadcastLive(false); },
+      connectionLost: (serverId, _voiceChannel, wasViewing) => {
+        // Terminal LiveKit disconnect уже не восстановится внутренним reconnect. Если это открытый
+        // сервер — получаем свежий token через штатный retry connectServer; голос не захватываем
+        // автоматически, чтобы старый ПК после offline не выбил активный телефон.
+        if (wasViewing && get().viewServerId === serverId && get().view === 'server') void get().connectServer(serverId);
+      },
     });
     engine.onEmoteResolve = (name, id) => emoteMap.set(name, id);
     set({ me: user });
@@ -257,8 +278,28 @@ export const useStore = create<AppState>((set, get) => ({
     set((s) => ({ unread: { ...s.unread, [serverId]: 0 }, lastRead: { ...s.lastRead, [serverId]: Math.max(s.lastRead[serverId] || 0, lastRead) } }));
     updateAppBadge();
   },
-  refreshMembers: async () => { const a = get().active; if (!a) return; try { const d = await api.getServer(a.id); set({ members: d.members }); engine?.setMembers(d.members); } catch { /**/ } },
-  refreshServer: async () => { const a = get().active; if (!a) return; try { const d = await api.getServer(a.id); set({ members: d.members, active: { ...d.server, myRole: d.myRole, myPerms: d.myPerms } }); engine?.setMembers(d.members); } catch { /**/ } },
+  refreshMembers: async () => {
+    const a = get().active; if (!a) return;
+    const id = a.id, epoch = viewEpoch, targetEngine = engine;
+    try {
+      const d = await api.getServer(id);
+      const current = get();
+      if (viewEpoch !== epoch || current.viewServerId !== id || current.active?.id !== id || engine !== targetEngine) return;
+      set({ members: d.members });
+      targetEngine?.setMembers(d.members);
+    } catch { /**/ }
+  },
+  refreshServer: async () => {
+    const a = get().active; if (!a) return;
+    const id = a.id, epoch = viewEpoch, targetEngine = engine;
+    try {
+      const d = await api.getServer(id);
+      const current = get();
+      if (viewEpoch !== epoch || current.viewServerId !== id || current.active?.id !== id || engine !== targetEngine) return;
+      set({ members: d.members, active: { ...d.server, myRole: d.myRole, myPerms: d.myPerms } });
+      targetEngine?.setMembers(d.members);
+    } catch { /**/ }
+  },
 
   createChannel: async (name) => {
     const a = get().active; if (!a) return;
@@ -341,7 +382,7 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       // сохранённые громкости из localStorage — синхронно, до сети (иначе слайдеры = 100%)
       const cache = JSON.parse(localStorage.getItem('srvset:' + id) || 'null');
-      if (cache) engine?.setVols(cache);
+      if (cache) engine?.setVols(id, cache);
       // КРИТИЧНОЕ для первой отрисовки — параллельно; тяжёлый WebRTC-connect уходит в фон (ниже).
       const [d, hist, settings, pres] = await Promise.all([
         api.getServer(id),
@@ -349,9 +390,9 @@ export const useStore = create<AppState>((set, get) => ({
         api.getSettings(id).catch(() => null),
         api.presence(id).catch(() => null),
       ]);
-      if (get().loadingServerId !== id) return; // юзер уже переключился
+      if (viewEpoch !== myEpoch || get().loadingServerId !== id) return; // юзер уже переключился/перезапустил этот же connect
       const active: ServerDetail = { ...d.server, myRole: d.myRole, myPerms: d.myPerms };
-      if (settings?.data && (settings.data.users || settings.data.streams)) engine?.setVols(settings.data);
+      if (settings?.data && (settings.data.users || settings.data.streams)) engine?.setVols(id, settings.data);
       engine?.setMembers(d.members);
       if (pres) { engine?.setOnlineHint(pres.online); engine?.setAwayHint(pres.away || []); engine?.setVoiceHint(pres.voice || {}); }
       engine?.loadHistory(hist.messages, hist.hasMore);
@@ -375,7 +416,7 @@ export const useStore = create<AppState>((set, get) => ({
           try {
             const tk = await api.serverToken(id);
             if (viewEpoch !== myEpoch) return;
-            await engine?.connect(tk.url, tk.token, id);
+            await engine?.connect(tk.url, tk.token, id, tk.sessionId);
             return; // успех
           } catch {
             if (viewEpoch !== myEpoch) return; // устарели во время попытки
@@ -390,7 +431,11 @@ export const useStore = create<AppState>((set, get) => ({
         }
       })();
       startMemberPoll(id);
-    } catch (e: any) { get().toast(e.message, 'err'); get().exitServer(); }
+    } catch (e: any) {
+      // Ошибка старого A-connect не имеет права закрыть уже открываемый B (или более свежий retry A).
+      if (viewEpoch !== myEpoch) return;
+      get().toast(e.message, 'err'); get().exitServer();
+    }
   },
 
   // Подтверждение модалки переключения: рвём текущее соединение и коннектимся к цели.

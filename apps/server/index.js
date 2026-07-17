@@ -9,6 +9,7 @@ const Database = require('better-sqlite3');
 const { AccessToken, RoomServiceClient } = require('livekit-server-sdk');
 const { WebSocketServer } = require('ws');
 const { attachTreeServer } = require('./tree');
+const { createVoiceLeaseStore, voiceLeaseEvent, selectVoiceState } = require('./voiceLease');
 const stats = require('./stats'); // рейтинг + уровни (экспериментальная фича)
 
 const app = express();
@@ -181,6 +182,7 @@ CREATE INDEX IF NOT EXISTS idx_inv_server ON invites(server_id);
 CREATE INDEX IF NOT EXISTS idx_roles_server ON roles(server_id);
 CREATE INDEX IF NOT EXISTS idx_mroles ON member_roles(server_id, user_id);
 `);
+const voiceLeases = createVoiceLeaseStore(db);
 
 /* add new columns to pre-existing DBs (idempotent — throws if column exists) */
 for (const sql of [
@@ -292,6 +294,16 @@ const rsc = new RoomServiceClient(WS_URL.replace('wss://', 'https://'), KEY, SEC
 // LiveKit identity = `username#<nonce>` (уникально на сессию — иначе второй девайс кикает первого).
 // Наружу (presence/voice) отдаём БАЗОВЫЙ username, дедуплицируя несколько сессий одного юзера.
 const baseIdentity = id => { const s = String(id || ''); const i = s.indexOf('#'); return i < 0 ? s : s.slice(0, i); };
+function voiceLeaseForUsername(username) {
+  const userId = userIdByUsername(username);
+  if (!userId) return { lease: null, currentEpoch: 0 };
+  const state = voiceLeases.read(userId), lease = state.lease;
+  if (lease && (!db.prepare('SELECT 1 FROM memberships WHERE user_id=? AND server_id=?').get(userId, lease.serverId)
+    || !db.prepare('SELECT 1 FROM voice_channels WHERE id=? AND server_id=?').get(lease.channelId, lease.serverId))) {
+    return { lease: null, currentEpoch: state.currentEpoch };
+  }
+  return state;
+}
 async function onlineIn(serverId) {
   try { const ps = await rsc.listParticipants('srv:' + serverId); return [...new Set(ps.map(p => baseIdentity(p.identity)))]; }
   catch (e) { return []; }
@@ -320,12 +332,13 @@ function appOpenMembers(serverId) {
 async function onlineDetailed(serverId) {
   try {
     const ps = await rsc.listParticipants('srv:' + serverId);
+    const { voice } = selectVoiceState(ps, baseIdentity, { serverId, leaseForUser: voiceLeaseForUsername });
     const byUser = new Map();
     for (const p of ps) {
       const u = baseIdentity(p.identity);
       const tracks = p.tracks || [];
       const streaming = tracks.some(t => t.source === 3);
-      const inVoice = tracks.some(t => t.source === 2) || !!(p.attributes && p.attributes.vc);
+      const inVoice = !!voice[u];
       // Игровой статус (натив-атрибуты game/gicon) — для блока «Играют сейчас» на главной (кросс-сервер).
       const game = p.attributes && p.attributes.game ? String(p.attributes.game).slice(0, 64) : '';
       const gicon = p.attributes && p.attributes.gicon ? String(p.attributes.gicon) : '';
@@ -357,8 +370,10 @@ async function onlineDetailed(serverId) {
 async function voiceStateIn(serverId) {
   try {
     const ps = await rsc.listParticipants('srv:' + serverId);
-    const online = new Set(), voice = {};
-    for (const p of ps) { const u = baseIdentity(p.identity); online.add(u); const vc = p.attributes && p.attributes.vc; if (vc) voice[u] = vc; }
+    const { online, voice } = selectVoiceState(ps, baseIdentity, {
+      serverId,
+      leaseForUser: voiceLeaseForUsername,
+    });
     const away = [];
     for (const [u, aw] of appOpenMembers(serverId)) { online.add(u); if (aw && !voice[u]) away.push(u); } // глобальный онлайн + away (idle, не в голосе)
     return { online: [...online], voice, away };
@@ -443,6 +458,9 @@ function notifyUser(userId, payload) {
   const data = JSON.stringify(payload);
   for (const ws of set) { if (ws.readyState === 1 /* OPEN */) { try { ws.send(data); } catch (e) { /**/ } } }
 }
+function notifyServerMembers(serverId, payload) {
+  for (const row of db.prepare('SELECT user_id FROM memberships WHERE server_id=?').all(serverId)) notifyUser(row.user_id, payload);
+}
 function serverName(sid) { const s = db.prepare('SELECT name FROM servers WHERE id=?').get(sid); return s ? s.name : 'Сервер'; }
 
 const pubUser = u => ({ id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '', bio: u.bio, isAdmin: !!u.is_admin || u.username === BOOTSTRAP_ADMIN });
@@ -496,14 +514,23 @@ function isMember(uid, sid) { return !!db.prepare('SELECT 1 FROM memberships WHE
 function memberCount(sid) { return db.prepare('SELECT COUNT(*) c FROM memberships WHERE server_id=?').get(sid).c; }
 // Полный каскад-снос сервера (все связанные таблицы по server_id). Имена таблиц — литералы, не ввод.
 function purgeServer(sid) {
+  invalidateVoiceLeasesForServer(sid, 'server-deleted');
+  evictRoomParticipants(sid);
   for (const t of ['memberships', 'invites', 'server_settings', 'roles', 'member_roles', 'messages', 'voice_channels', 'read_state']) db.prepare(`DELETE FROM ${t} WHERE server_id=?`).run(sid);
   db.prepare('DELETE FROM servers WHERE id=?').run(sid);
 }
 // Полный снос юзера: сначала его сервера-владения (иначе осиротеют), потом все его записи.
 function purgeUser(uid) {
+  const account = db.prepare('SELECT username FROM users WHERE id=?').get(uid);
+  const joinedServers = db.prepare('SELECT server_id FROM memberships WHERE user_id=?').all(uid).map(row => row.server_id);
+  invalidateVoiceLease(uid, () => true, 'account-deleted');
+  if (account) for (const serverId of joinedServers) evictUserFromRoom(serverId, account.username);
   for (const s of db.prepare('SELECT id FROM servers WHERE owner_id=?').all(uid)) purgeServer(s.id);
   for (const t of ['memberships', 'member_roles', 'server_settings', 'messages', 'read_state']) db.prepare(`DELETE FROM ${t} WHERE user_id=?`).run(uid);
   for (const t of ['user_settings', 'push_subs', 'push_prefs']) db.prepare(`DELETE FROM ${t} WHERE user_id=?`).run(uid);
+  db.prepare('DELETE FROM voice_session_intents WHERE user_id=?').run(uid);
+  db.prepare('DELETE FROM voice_user_intents WHERE user_id=?').run(uid);
+  db.prepare('DELETE FROM voice_leases WHERE user_id=?').run(uid);
   db.prepare('DELETE FROM users WHERE id=?').run(uid);
 }
 // Непрочитанные: чат-сообщения сервера НОВЕЕ last_read юзера и НЕ его собственные. Системных
@@ -549,6 +576,276 @@ function ensureDefaultChannel(sid) {
   const n = db.prepare('SELECT COUNT(*) c FROM voice_channels WHERE server_id=?').get(sid).c;
   if (n === 0) db.prepare('INSERT INTO voice_channels(id,server_id,name,position,created) VALUES(?,?,?,?,?)').run(newId('vc'), sid, 'Общий', 0, Date.now());
 }
+
+/* ---- authoritative voice ownership (one device/session per account) ---- */
+const VOICE_SESSION_RE = /^[A-Za-z0-9._:~-]{1,128}$/;
+const VOICE_RESOURCE_RE = /^[A-Za-z0-9_-]{1,96}$/;
+const voiceClaimQueues = new Map();
+const pendingVoiceEvictions = new Map();
+function leaseResponse(state, reason) {
+  return { ok: true, ...voiceLeaseEvent(state, reason) };
+}
+function serializeVoiceClaim(userId, task) {
+  const before = voiceClaimQueues.get(userId) || Promise.resolve();
+  const run = before.catch(() => {}).then(task);
+  const tracked = run.finally(() => { if (voiceClaimQueues.get(userId) === tracked) voiceClaimQueues.delete(userId); });
+  voiceClaimQueues.set(userId, tracked);
+  return tracked;
+}
+function invalidateVoiceLease(userId, predicate, reason = 'revoked') {
+  const state = voiceLeases.read(userId);
+  if (!state.lease || (predicate && !predicate(state.lease))) return state;
+  const released = voiceLeases.release(userId, state.lease.sessionId, state.lease.epoch);
+  if (released.released) notifyUser(userId, voiceLeaseEvent(released, reason));
+  return released;
+}
+function invalidateVoiceLeasesForServer(serverId, reason = 'server-revoked') {
+  const rows = db.prepare('SELECT user_id FROM voice_leases WHERE active=1 AND server_id=?').all(serverId);
+  for (const row of rows) invalidateVoiceLease(row.user_id, lease => lease.serverId === serverId, reason);
+}
+function invalidateVoiceLeasesForChannel(serverId, channelId, reason = 'channel-deleted') {
+  const rows = db.prepare('SELECT user_id FROM voice_leases WHERE active=1 AND server_id=? AND channel_id=?').all(serverId, channelId);
+  for (const row of rows) invalidateVoiceLease(row.user_id, lease => lease.serverId === serverId && lease.channelId === channelId, reason);
+}
+function evictRoomParticipants(serverId, username) {
+  const roomName = 'srv:' + serverId;
+  try {
+    void withTimeout(rsc.listParticipants(roomName), 2500, 'listParticipants')
+      .then(participants => Promise.allSettled(participants
+        .filter(p => !username || baseIdentity(p.identity) === username)
+        .map(p => withTimeout(rsc.removeParticipant(roomName, p.identity), 2500, 'removeParticipant'))))
+      .catch(() => {});
+  } catch (e) { /** room may already be gone */ }
+}
+function evictUserFromRoom(serverId, username) { evictRoomParticipants(serverId, username); }
+function evictLegacyVoiceChannelParticipants(serverId, channelId) {
+  const roomName = 'srv:' + serverId;
+  try {
+    void withTimeout(rsc.listParticipants(roomName), 2500, 'listParticipants').then(participants => {
+      for (const participant of participants) {
+        if (String((participant.attributes || {}).vc || '') !== channelId) continue;
+        // The channel no longer exists, so every exact occupant must go. Do
+        // not infer "modern" from account history: an old vc-only tab may
+        // belong to an account that used the lease protocol on another device.
+        void scheduleVoiceEviction(serverId, participant.identity).catch(() => {});
+      }
+    }).catch(() => {});
+  } catch (e) { /** room may already be gone */ }
+}
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(label + ' timeout')), ms); });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+function voiceEvictionKey(serverId, identity) { return serverId + '\n' + identity; }
+function voiceEvictionPending(serverId, identity) { return pendingVoiceEvictions.has(voiceEvictionKey(serverId, identity)); }
+function scheduleVoiceEviction(serverId, identity) {
+  const key = voiceEvictionKey(serverId, identity);
+  const existing = pendingVoiceEvictions.get(key);
+  if (existing) return existing;
+  let tracked;
+  tracked = Promise.resolve(rsc.removeParticipant('srv:' + serverId, identity))
+    .finally(() => { if (pendingVoiceEvictions.get(key) === tracked) pendingVoiceEvictions.delete(key); });
+  pendingVoiceEvictions.set(key, tracked);
+  return tracked;
+}
+async function revokeOlderVoiceParticipants(userId, username, keep, previousLease) {
+  if (previousLease && previousLease.sessionId === keep.sessionId) return;
+  const ownsKeep = () => {
+    const current = voiceLeases.read(userId).lease;
+    return !!current && current.sessionId === keep.sessionId && current.serverId === keep.serverId
+      && current.channelId === keep.channelId && current.epoch === keep.epoch;
+  };
+  if (!ownsKeep()) return;
+  // После раскатки lease-таблица у уже открытой legacy-вкладки пуста. Первый claim обязан
+  // найти её голосовую публикацию во всех доступных пользователю комнатах; пассивные вкладки
+  // без vc/mic не трогаем. При наличии previousLease остаётся более строгий exact revoke.
+  const serverIds = previousLease
+    ? [previousLease.serverId]
+    : db.prepare('SELECT server_id FROM memberships WHERE user_id=? LIMIT 64').all(userId).map(row => row.server_id);
+  try {
+    const listed = await Promise.allSettled(serverIds.map(async serverId => ({
+      serverId,
+      participants: await withTimeout(rsc.listParticipants('srv:' + serverId), 2500, 'listParticipants'),
+    })));
+    if (!ownsKeep()) return;
+    const victims = [];
+    for (const result of listed) {
+      if (result.status !== 'fulfilled') continue;
+      for (const participant of result.value.participants) {
+        if (baseIdentity(participant.identity) !== username || participant.identity === username + '#' + keep.sessionId) continue;
+        if (previousLease) {
+          if (participant.identity !== username + '#' + previousLease.sessionId) continue;
+          const attrs = participant.attributes || {};
+          if (String(attrs.voiceSession || '') !== previousLease.sessionId || Number(attrs.voiceEpoch) !== previousLease.epoch) continue;
+        } else {
+          const attrs = participant.attributes || {};
+          const hasMic = (participant.tracks || []).some(track => track.source === 2);
+          if (!attrs.vc && !hasMic) continue;
+        }
+        victims.push({ serverId: result.value.serverId, identity: participant.identity });
+      }
+    }
+    if (!ownsKeep()) return;
+    // Mutating request остаётся зарегистрированным даже после bounded wait. Пока он реально не
+    // settle'нулся, та же identity не может reclaim lease — поздний remove не кикнет нового owner.
+    const removals = victims.map(victim => scheduleVoiceEviction(victim.serverId, victim.identity));
+    await Promise.allSettled(removals.map(removal => withTimeout(removal, 2500, 'removeParticipant')));
+  } catch (e) { /* heartbeat + periodic client lease audit are the bounded fallback */ }
+}
+async function voiceSessionConnected(serverId, identity) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const participants = await withTimeout(rsc.listParticipants('srv:' + serverId), 2500, 'listParticipants');
+      if (participants.some(p => p.identity === identity)) return true;
+    } catch (e) { if (attempt === 2) return null; }
+    await new Promise(resolve => setTimeout(resolve, 80 * (attempt + 1)));
+  }
+  return false;
+}
+async function voiceSessionConnectedOnce(serverId, identity) {
+  try {
+    const participants = await withTimeout(rsc.listParticipants('srv:' + serverId), 1500, 'listParticipants');
+    return participants.some(p => p.identity === identity);
+  } catch (e) { return null; }
+}
+
+// Reading/snapshotting never changes ownership. In particular, reconnecting
+// an old device cannot steal voice from the device that claimed it last.
+app.get('/api/voice/lease', requireAuth, (req, res) => {
+  res.json(leaseResponse(voiceLeases.read(req.user.id), 'snapshot'));
+});
+
+// Reserve a server-ordered intent before any slow WebRTC/media work. Minting
+// never revokes the active device; it only prevents an older delayed claim
+// from overtaking a newer tab/device intent.
+app.post('/api/voice/lease/intent', requireAuth, async (req, res, next) => {
+  const sessionId = String(req.body.sessionId || '');
+  const serverId = String(req.body.serverId || '');
+  const channelId = String(req.body.channelId || '');
+  const clientIntent = Number(req.body.clientIntent);
+  if (!VOICE_SESSION_RE.test(sessionId) || !VOICE_RESOURCE_RE.test(serverId) || !VOICE_RESOURCE_RE.test(channelId)
+    || !Number.isSafeInteger(clientIntent) || clientIntent < 1) {
+    return res.status(400).json({ error: 'Invalid voice intent parameters' });
+  }
+  try {
+    const state = await serializeVoiceClaim(req.user.id, async () => {
+      if (!db.prepare('SELECT 1 FROM memberships WHERE user_id=? AND server_id=?').get(req.user.id, serverId)) {
+        return { status: 403, error: 'Not a server member' };
+      }
+      if (!db.prepare('SELECT 1 FROM voice_channels WHERE id=? AND server_id=?').get(channelId, serverId)) {
+        return { status: 404, error: 'Voice channel not found' };
+      }
+      return voiceLeases.mint(req.user.id, { sessionId, serverId, channelId, clientIntent });
+    });
+    if (state.error) return res.status(state.status).json({ error: state.error });
+    res.json({
+      ok: true,
+      ...voiceLeaseEvent(state, state.reason),
+      ticket: state.ticket,
+      clientIntent,
+      idempotent: Boolean(state.idempotent),
+    });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/voice/lease/claim', requireAuth, async (req, res, next) => {
+  const sessionId = String(req.body.sessionId || '');
+  const serverId = String(req.body.serverId || '');
+  const channelId = String(req.body.channelId || '');
+  const ticket = req.body.ticket == null ? null : Number(req.body.ticket);
+  const clientIntent = Number(req.body.clientIntent == null ? req.body.intent : req.body.clientIntent);
+  if (!VOICE_SESSION_RE.test(sessionId) || !VOICE_RESOURCE_RE.test(serverId) || !VOICE_RESOURCE_RE.test(channelId)
+    || !Number.isSafeInteger(clientIntent) || clientIntent < 1
+    || (ticket !== null && (!Number.isSafeInteger(ticket) || ticket < 1))) {
+    return res.status(400).json({ error: 'Invalid voice lease parameters' });
+  }
+  let requestCanceled = false;
+  const markCanceled = () => { requestCanceled = true; };
+  const markClosed = () => { if (!res.writableEnded) requestCanceled = true; };
+  const canceled = () => requestCanceled || req.aborted || res.destroyed;
+  req.once('aborted', markCanceled);
+  res.once('close', markClosed);
+  try {
+    const result = await serializeVoiceClaim(req.user.id, async () => {
+      if (canceled()) return { canceled: true };
+      if (voiceEvictionPending(serverId, req.user.username + '#' + sessionId)) {
+        return { status: 409, error: 'Voice session is still closing' };
+      }
+      // Повторяем authorization/resource checks ВНУТРИ per-user очереди: пока claim ждал
+      // предыдущий revoke, пользователя могли удалить с сервера или удалить сам канал.
+      if (!db.prepare('SELECT 1 FROM memberships WHERE user_id=? AND server_id=?').get(req.user.id, serverId)) {
+        return { status: 403, error: 'Not a server member' };
+      }
+      if (!db.prepare('SELECT 1 FROM voice_channels WHERE id=? AND server_id=?').get(channelId, serverId)) {
+        return { status: 404, error: 'Voice channel not found' };
+      }
+      const connected = await voiceSessionConnected(serverId, req.user.username + '#' + sessionId);
+      if (canceled()) return { canceled: true };
+      if (connected !== true) return { status: connected === null ? 503 : 409, error: connected === null ? 'Voice service unavailable' : 'Voice session is no longer active' };
+      // Последний sync fence непосредственно перед transaction: между ним и claim больше нет await.
+      if (!db.prepare('SELECT 1 FROM memberships WHERE user_id=? AND server_id=?').get(req.user.id, serverId)) {
+        return { status: 403, error: 'Not a server member' };
+      }
+      if (!db.prepare('SELECT 1 FROM voice_channels WHERE id=? AND server_id=?').get(channelId, serverId)) {
+        return { status: 404, error: 'Voice channel not found' };
+      }
+      if (canceled()) return { canceled: true };
+      const previousLease = voiceLeases.read(req.user.id).lease;
+      const claimed = ticket === null
+        ? voiceLeases.claim(req.user.id, { sessionId, serverId, channelId, intent: clientIntent })
+        : voiceLeases.claimTicket(req.user.id, { ticket, sessionId, serverId, channelId, clientIntent });
+      if (claimed.accepted && !claimed.idempotent) {
+        await revokeOlderVoiceParticipants(req.user.id, req.user.username, claimed.lease, previousLease);
+        // Телефон/вкладка могли исчезнуть, пока сервер завершал takeover старой сессии. Не
+        // объявляем owner участника, которого уже нет в комнате.
+        const connectedAfterTakeover = await voiceSessionConnectedOnce(serverId, req.user.username + '#' + sessionId);
+        // Пока выполнялся bounded revoke, участника/канал/сервер могли удалить. Не публикуем
+        // устаревший claimed после административного revoke и не возвращаем клиенту ложный owner.
+        const current = voiceLeases.read(req.user.id).lease;
+        const stillOwns = current && current.sessionId === claimed.lease.sessionId && current.epoch === claimed.lease.epoch
+          && current.serverId === serverId && current.channelId === channelId;
+        const stillAllowed = db.prepare('SELECT 1 FROM memberships WHERE user_id=? AND server_id=?').get(req.user.id, serverId)
+          && db.prepare('SELECT 1 FROM voice_channels WHERE id=? AND server_id=?').get(channelId, serverId);
+        if (!stillOwns || !stillAllowed) {
+          if (stillOwns) invalidateVoiceLease(req.user.id, lease => lease.epoch === claimed.lease.epoch, 'revoked');
+          return { ...voiceLeases.read(req.user.id), accepted: false, reason: 'revoked' };
+        }
+        if (connectedAfterTakeover !== true) {
+          invalidateVoiceLease(req.user.id, lease => lease.epoch === claimed.lease.epoch, 'session-gone');
+          return { ...voiceLeases.read(req.user.id), accepted: false, reason: 'session-gone' };
+        }
+        notifyUser(req.user.id, voiceLeaseEvent(claimed, 'claimed'));
+        // Losing only the HTTP response must not undo a completed handoff.
+        // The exact accepted ticket is recoverable through snapshot/retry.
+        if (canceled()) return { canceled: true };
+      }
+      return claimed;
+    });
+    if (result.canceled || canceled()) return;
+    if (result.error) return res.status(result.status).json({ error: result.error });
+    const state = result;
+    const payload = voiceLeaseEvent(state, state.reason || (state.accepted ? 'claimed' : 'stale'));
+    res.json({ ok: true, ...payload, ticket: state.ticket, idempotent: Boolean(state.idempotent) });
+  } catch (error) { if (!canceled()) next(error); }
+  finally { req.off('aborted', markCanceled); res.off('close', markClosed); }
+});
+
+app.post('/api/voice/lease/release', requireAuth, async (req, res, next) => {
+  const sessionId = String(req.body.sessionId || '');
+  const epoch = Number(req.body.epoch);
+  if (!VOICE_SESSION_RE.test(sessionId) || !Number.isSafeInteger(epoch) || epoch < 1) {
+    return res.status(400).json({ error: 'Invalid voice lease parameters' });
+  }
+  try {
+    const state = await serializeVoiceClaim(req.user.id, async () => {
+      const released = voiceLeases.release(req.user.id, sessionId, epoch);
+      if (released.released) notifyUser(req.user.id, voiceLeaseEvent(released, 'released'));
+      return released;
+    });
+    res.json({ ok: true, ...voiceLeaseEvent(state, state.reason), released: state.released });
+  } catch (error) { next(error); }
+});
 
 /* ---------------- AUTH ---------------- */
 app.post('/api/register', (req, res) => {
@@ -688,6 +985,9 @@ app.delete('/api/admin/servers/:id/members/:userId', requireAdmin, (req, res) =>
   db.prepare('DELETE FROM memberships WHERE user_id=? AND server_id=?').run(uid, s.id);
   db.prepare('DELETE FROM member_roles WHERE user_id=? AND server_id=?').run(uid, s.id);
   db.prepare('DELETE FROM server_settings WHERE user_id=? AND server_id=?').run(uid, s.id);
+  invalidateVoiceLease(uid, lease => lease.serverId === s.id, 'membership-revoked');
+  const ku = db.prepare('SELECT username FROM users WHERE id=?').get(uid);
+  if (ku) evictUserFromRoom(s.id, ku.username);
   res.json({ ok: true });
 });
 
@@ -1108,9 +1408,10 @@ app.post('/api/servers/:id/kick', requireAuth, (req, res) => {
   db.prepare('DELETE FROM memberships WHERE user_id=? AND server_id=?').run(uid, s.id);
   db.prepare('DELETE FROM member_roles WHERE user_id=? AND server_id=?').run(uid, s.id);
   db.prepare('DELETE FROM server_settings WHERE user_id=? AND server_id=?').run(uid, s.id);
+  invalidateVoiceLease(uid, lease => lease.serverId === s.id, 'membership-revoked');
   const ku = db.prepare('SELECT username FROM users WHERE id=?').get(uid);
   // выгоняем ВСЕ live-сессии юзера из комнаты (identity = username#nonce)
-  if (ku) { try { rsc.listParticipants('srv:' + s.id).then(ps => ps.filter(p => baseIdentity(p.identity) === ku.username).forEach(p => rsc.removeParticipant('srv:' + s.id, p.identity).catch(() => {}))).catch(() => {}); } catch (e) {} }
+  if (ku) evictUserFromRoom(s.id, ku.username);
   res.json({ ok: true });
 });
 
@@ -1119,6 +1420,10 @@ app.post('/api/servers/:id/leave', requireAuth, (req, res) => {
   if (!s) return res.status(404).json({ error: 'нет' });
   if (s.owner_id === req.user.id) return res.status(400).json({ error: 'Владелец не может выйти — удали сервер' });
   db.prepare('DELETE FROM memberships WHERE user_id=? AND server_id=?').run(req.user.id, s.id);
+  db.prepare('DELETE FROM member_roles WHERE user_id=? AND server_id=?').run(req.user.id, s.id);
+  db.prepare('DELETE FROM server_settings WHERE user_id=? AND server_id=?').run(req.user.id, s.id);
+  invalidateVoiceLease(req.user.id, lease => lease.serverId === s.id, 'membership-revoked');
+  evictUserFromRoom(s.id, req.user.username);
   res.json({ ok: true });
 });
 
@@ -1126,13 +1431,7 @@ app.delete('/api/servers/:id', requireAuth, (req, res) => {
   const s = db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id);
   if (!s) return res.status(404).json({ error: 'нет' });
   if (s.owner_id !== req.user.id) return res.status(403).json({ error: 'Только владелец' });
-  db.prepare('DELETE FROM memberships WHERE server_id=?').run(s.id);
-  db.prepare('DELETE FROM invites WHERE server_id=?').run(s.id);
-  db.prepare('DELETE FROM server_settings WHERE server_id=?').run(s.id);
-  db.prepare('DELETE FROM roles WHERE server_id=?').run(s.id);
-  db.prepare('DELETE FROM member_roles WHERE server_id=?').run(s.id);
-  db.prepare('DELETE FROM messages WHERE server_id=?').run(s.id);
-  db.prepare('DELETE FROM servers WHERE id=?').run(s.id);
+  purgeServer(s.id);
   res.json({ ok: true });
 });
 
@@ -1271,7 +1570,14 @@ app.delete('/api/servers/:id/channels/:cid', requireAuth, (req, res) => {
   if (!can(req.user.id, sid, PERM.MANAGE_CHANNELS)) return res.status(403).json({ error: 'Нет прав' });
   const count = db.prepare('SELECT COUNT(*) c FROM voice_channels WHERE server_id=?').get(sid).c;
   if (count <= 1) return res.status(400).json({ error: 'Нельзя удалить последний голосовой канал' });
+  const channel = db.prepare('SELECT 1 FROM voice_channels WHERE id=? AND server_id=?').get(req.params.cid, sid);
+  if (!channel) return res.status(404).json({ error: 'Канал не найден' });
+  // Удаление занятого канала — атомарный server-side leave для его владельцев lease. Закрытая
+  // вкладка могла оставить lease без participant, поэтому вечный 409 по одной БД-строке недопустим.
+  invalidateVoiceLeasesForChannel(sid, req.params.cid, 'channel-deleted');
+  evictLegacyVoiceChannelParticipants(sid, req.params.cid);
   db.prepare('DELETE FROM voice_channels WHERE id=? AND server_id=?').run(req.params.cid, sid);
+  notifyServerMembers(sid, { t: 'server-refresh', serverId: sid, reason: 'channels' });
   res.json({ channels: channelsOf(sid) });
 });
 
@@ -1289,9 +1595,13 @@ app.get('/api/servers/:id/token', requireAuth, async (req, res) => {
   if (!s) return res.status(404).json({ error: 'нет' });
   if (!isMember(req.user.id, s.id)) return res.status(403).json({ error: 'Ты не участник' });
   try {
-    const at = new AccessToken(KEY, SECRET, { identity: req.user.username + '#' + crypto.randomBytes(4).toString('hex'), name: req.user.display_name, ttl: '12h' });
+    // Connected clients refresh LiveKit grants automatically. Keep the initial
+    // grant short-lived so a token copied from an evicted device cannot be
+    // reused hours after its voice lease was transferred or revoked.
+    const voiceSession = crypto.randomBytes(4).toString('hex');
+    const at = new AccessToken(KEY, SECRET, { identity: req.user.username + '#' + voiceSession, name: req.user.display_name, ttl: '10m' });
     at.addGrant({ roomJoin: true, room: 'srv:' + s.id, canPublish: true, canSubscribe: true, canPublishData: true, canUpdateOwnMetadata: true });
-    res.json({ token: await at.toJwt(), url: WS_URL, room: 'srv:' + s.id });
+    res.json({ token: await at.toJwt(), url: WS_URL, room: 'srv:' + s.id, sessionId: voiceSession });
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
@@ -1565,14 +1875,26 @@ server.on('upgrade', (req, socket, head) => {
   if (!uid) { socket.destroy(); return; }
   notifyWss.handleUpgrade(req, socket, head, (ws) => {
     ws._away = false; // idle-статус сессии: клиент шлёт {t:'presence',away} при бездействии. Юзер «away» (жёлтый), если ВСЕ его сокеты idle.
+    ws._isAlive = true;
     let set = notifyConns.get(uid); if (!set) { set = new Set(); notifyConns.set(uid, set); }
     set.add(ws);
+    // A newly opened socket only observes the lease; reconnect never claims it.
+    try { ws.send(JSON.stringify(voiceLeaseEvent(voiceLeases.read(uid), 'snapshot'))); } catch (e) { /**/ }
     ws.on('close', () => { const s = notifyConns.get(uid); if (s) { s.delete(ws); if (!s.size) notifyConns.delete(uid); } });
+    ws.on('pong', () => { ws._isAlive = true; });
     ws.on('error', () => { try { ws.close(); } catch (e) {} });
     ws.on('message', (data) => { try { const d = JSON.parse(data); if (d && d.t === 'presence') ws._away = !!d.away; } catch (e) { /* ping/мусор игнорим */ } });
   });
 });
-// heartbeat: закрываем мёртвые notify-сокеты, иначе висят в notifyConns
-setInterval(() => { for (const set of notifyConns.values()) for (const ws of set) { if (ws.readyState === 1) { try { ws.ping(); } catch (e) {} } } }, 30000).unref?.();
+// heartbeat: half-open TCP может выглядеть OPEN бесконечно и «проглатывать» handoff notify.
+// На каждом тике предыдущий ping обязан иметь pong; иначе terminate запускает клиентский reconnect.
+setInterval(() => {
+  for (const set of notifyConns.values()) for (const ws of set) {
+    if (ws.readyState !== 1) continue;
+    if (ws._isAlive === false) { try { ws.terminate(); } catch (e) {} continue; }
+    ws._isAlive = false;
+    try { ws.ping(); } catch (e) { try { ws.terminate(); } catch (e2) {} }
+  }
+}, 30000).unref?.();
 
 server.listen(3000, () => console.log('voice API (servers+sqlite) + tree ws + notify ws on :3000'));

@@ -638,7 +638,7 @@ function ImageLightbox({ attachment, onClose }: { attachment: Attachment; onClos
 
 // вложения сообщения: картинки — грид миниатюр (клик → лайтбокс), остальные файлы — чипы со
 // скачиванием (форс-download на сервере, см. GET /api/files/:name — не инлайн, любое расширение).
-function MessageAttachments({ files, onImageClick }: { files: Attachment[]; onImageClick: (a: Attachment) => void }) {
+function MessageAttachments({ files, onImageClick, onImageLoad }: { files: Attachment[]; onImageClick: (a: Attachment) => void; onImageLoad?: () => void }) {
   const toast = useStore((s) => s.toast);
   const downloads = useSyncExternalStore(subscribeDownloads, getDownloads);
   const images = files.filter((f) => f.kind === 'image');
@@ -659,7 +659,7 @@ function MessageAttachments({ files, onImageClick }: { files: Attachment[]; onIm
         <div className="msg-img-grid">
           {images.map((f, i) => (
             <button key={i} className="msg-img-wrap" onClick={() => onImageClick(f)}>
-              <img className="msg-img" src={resolveUploadUrl(f.url)} alt="" loading="lazy" />
+              <img className="msg-img" src={resolveUploadUrl(f.url)} alt="" loading="lazy" onLoad={onImageLoad} />
             </button>
           ))}
         </div>
@@ -687,6 +687,8 @@ const COMMANDS: { name: string; desc: string }[] = [
 // Базовый индекс для virtuoso firstItemIndex: при догрузке старых сообщений его уменьшаем
 // на кол-во добавленных сверху — так virtuoso держит якорь скролла на месте (prepend-паттерн).
 const VIRT_BASE_INDEX = 1_000_000;
+const CHAT_NEAR_BOTTOM_PX = 140;
+const CHAT_STRICT_BOTTOM_PX = 8;
 
 // Шапка списка чата: спиннер во время догрузки старых сообщений / метка начала истории.
 // Определена на уровне модуля (стабильная ссылка) — иначе virtuoso ремонтит её на каждый рендер.
@@ -755,7 +757,7 @@ function Chat() {
   const messages = eng.messages;
   const [replyTo, setReplyTo] = useState<ChatMessage | null>(null); // на какое сообщение отвечаем
   const [flashId, setFlashId] = useState<number | null>(null);      // подсветка оригинала при переходе по цитате
-  const [reactTarget, setReactTarget] = useState<{ sid: number; anchor: DOMRect } | null>(null); // 7TV-пикер для реакции
+  const [reactTarget, setReactTarget] = useState<{ target: { id: number; sid?: number | null }; anchor: DOMRect } | null>(null); // 7TV-пикер для реакции
   const [editing, setEditing] = useState<{ id: number; sid: number } | null>(null); // инлайн-редактирование
   const [editText, setEditText] = useState('');
   const [actionsFor, setActionsFor] = useState<number | null>(null); // touch: явное меню действий сообщения
@@ -805,9 +807,18 @@ function Chat() {
 
   // --- виртуальный список чата (react-virtuoso) ---
   const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const detachScrollerRef = useRef<(() => void) | null>(null);
+  const bottomStackRef = useRef<HTMLDivElement>(null);
+  const bottomLockFrameRef = useRef<number | null>(null);
+  const bottomLockSecondFrameRef = useRef<number | null>(null);
   const [pill, setPill] = useState(0);            // счётчик непрочитанных (пока не внизу)
   const [atBottom, setAtBottom] = useState(true);
   const atBottomRef = useRef(true);
+  // near-bottom управляет только автоподхватом новых чужих сообщений. Строгое состояние
+  // atBottom (<=8px) отдельно управляет read receipt, badge и кнопкой перехода вниз.
+  const nearBottomRef = useRef(true);
+  const forceBottomRef = useRef(false);           // локальная отправка обязана показать свой append
+  const appendCursorRef = useRef<{ serverId?: string; tailId: number | null; count: number }>({ tailId: null, count: 0 });
   const [dividerFade, setDividerFade] = useState(false); // дивайдер «Новые сообщения» гаснет, когда юзер увидел границу
   const [focusTick, setFocusTick] = useState(0); // тикает на focus/blur/visibility — «увидел глазами» зависит от фокуса окна
   // Якорь virtuoso DERIVED из engine-стейта (prepend/срез) — меняется ВМЕСТЕ с messages (один emit),
@@ -816,8 +827,8 @@ function Chat() {
   const firstItemIndex = VIRT_BASE_INDEX - eng.chatPrepended + eng.chatTrimmed;
   const [olderBusy, setOlderBusy] = useState(false); // идёт догрузка старых
   const loadingOlder = useRef(false);                // защита от повторного startReached
+  const olderRequestSeq = useRef(0);
   const olderReady = useRef(false);                  // гейт: не грузить старое, пока вход не устаканился
-  const prevLastId = useRef<number | null>(null);    // id последнего сообщения — детект append vs prepend
   const lastAckedRef = useRef<number | null>(null);   // последний месседж (local id), для которого послан readAll — не спамим POST
   const lastTagAt = useRef(0);                         // троттл звука-пинга сообщений (не в фокусе) — не строчить пулемётом
   // автокомплит упоминаний (@ник)
@@ -825,11 +836,117 @@ function Chat() {
   const [mIdx, setMIdx] = useState(0);
   const popRef = useRef<HTMLDivElement>(null); // контейнер попапа автокомплита — для скролла выделения
 
-  const onAtBottom = useCallback((b: boolean) => { atBottomRef.current = b; setAtBottom(b); }, []);
-  const scrollToBottom = useCallback(() => {
-    setPill(0);
-    virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'smooth' });
+  // Классифицируем только настоящий suffix-append. Локальные id живут стабильно всю сессию:
+  // - prepend оставляет прежний хвост последним;
+  // - delete хвоста делает прежний id отсутствующим;
+  // - CAP/trim срезает начало, но прежний хвост остаётся и новые элементы идут после него.
+  // Поэтому ни пагинация, ни delete, ни replace истории больше не выглядят как новое сообщение.
+  const appendCursor = appendCursorRef.current;
+  const sameAppendSource = appendCursor.serverId === activeId;
+  let appendedMessages: ChatMessage[] = [];
+  if (sameAppendSource) {
+    if (appendCursor.tailId == null) {
+      if (appendCursor.count === 0 && messages.length > 0) appendedMessages = messages;
+    } else {
+      const previousTailIndex = messages.findIndex((m) => m.id === appendCursor.tailId);
+      if (previousTailIndex >= 0 && previousTailIndex < messages.length - 1) appendedMessages = messages.slice(previousTailIndex + 1);
+    }
+  }
+  const isSuffixAppend = appendedMessages.length > 0;
+  const appendHasMine = isSuffixAppend && appendedMessages.some((m) => m.mine);
+  const wasNearBottomBeforeAppend = nearBottomRef.current;
+  const shouldFollowAppend = isSuffixAppend && (appendHasMine || forceBottomRef.current || wasNearBottomBeforeAppend);
+  const keepBottomForThisLayout = atBottomRef.current || forceBottomRef.current;
+
+  const lockToBottom = useCallback(() => {
+    const scroll = () => virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' });
+    scroll();
+    if (bottomLockFrameRef.current != null) window.cancelAnimationFrame(bottomLockFrameRef.current);
+    if (bottomLockSecondFrameRef.current != null) window.cancelAnimationFrame(bottomLockSecondFrameRef.current);
+    // Virtuoso измеряет динамические строки после commit. Два коротких кадра закрывают именно
+    // этот measurement-window, не создавая таймеров, которые позже вырвут пользователя из истории.
+    bottomLockFrameRef.current = window.requestAnimationFrame(() => {
+      scroll();
+      bottomLockSecondFrameRef.current = window.requestAnimationFrame(scroll);
+    });
   }, []);
+  const onAtBottom = useCallback((b: boolean) => {
+    atBottomRef.current = b;
+    setAtBottom(b);
+    if (b) {
+      nearBottomRef.current = true;
+      forceBottomRef.current = false;
+      setPill(0);
+    }
+  }, []);
+  const scrollToBottom = useCallback(() => {
+    // Badge очищается только из onAtBottom после фактического достижения true bottom.
+    forceBottomRef.current = true;
+    virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
+  }, []);
+
+  const bindScroller = useCallback((ref: HTMLElement | null | Window) => {
+    detachScrollerRef.current?.();
+    detachScrollerRef.current = null;
+    const el = ref instanceof HTMLElement ? ref : null;
+    if (!el) return;
+    const updateNearBottom = () => {
+      const distance = Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
+      nearBottomRef.current = distance <= CHAT_NEAR_BOTTOM_PX;
+    };
+    const cancelForcedScroll = () => { forceBottomRef.current = false; };
+    const cancelForcedKey = (event: KeyboardEvent) => {
+      if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) cancelForcedScroll();
+    };
+    el.addEventListener('scroll', updateNearBottom, { passive: true });
+    el.addEventListener('wheel', cancelForcedScroll, { passive: true });
+    el.addEventListener('touchstart', cancelForcedScroll, { passive: true });
+    el.addEventListener('pointerdown', cancelForcedScroll, { passive: true });
+    el.addEventListener('keydown', cancelForcedKey);
+    updateNearBottom();
+    detachScrollerRef.current = () => {
+      el.removeEventListener('scroll', updateNearBottom);
+      el.removeEventListener('wheel', cancelForcedScroll);
+      el.removeEventListener('touchstart', cancelForcedScroll);
+      el.removeEventListener('pointerdown', cancelForcedScroll);
+      el.removeEventListener('keydown', cancelForcedKey);
+    };
+  }, []);
+  useEffect(() => () => {
+    detachScrollerRef.current?.();
+    if (bottomLockFrameRef.current != null) window.cancelAnimationFrame(bottomLockFrameRef.current);
+    if (bottomLockSecondFrameRef.current != null) window.cancelAnimationFrame(bottomLockSecondFrameRef.current);
+  }, []);
+
+  useLayoutEffect(() => {
+    appendCursorRef.current = {
+      serverId: activeId,
+      tailId: messages.length ? messages[messages.length - 1].id : null,
+      count: messages.length,
+    };
+    if (shouldFollowAppend) lockToBottom();
+  }, [activeId, messages, shouldFollowAppend, lockToBottom]);
+
+  // Нижняя область меняет высоту из-за reply, вложений, update-banner, mobile wrapping и клавиатуры.
+  // ResizeObserver удерживает низ только если пользователь был реально pinned; читающего историю
+  // он не трогает. Известные React-перестройки дополнительно закрыты layout-effect до observer tick.
+  const bottomLayoutReadyRef = useRef<string | undefined>(undefined);
+  useLayoutEffect(() => {
+    if (bottomLayoutReadyRef.current !== activeId) { bottomLayoutReadyRef.current = activeId; return; }
+    if (keepBottomForThisLayout) lockToBottom();
+  }, [activeId, replyTo?.id, staged.length, updateReady, nativeUpdate, keepBottomForThisLayout, lockToBottom]);
+  useLayoutEffect(() => {
+    const node = bottomStackRef.current;
+    if (!node || typeof ResizeObserver === 'undefined') return;
+    let previousHeight = node.getBoundingClientRect().height;
+    const observer = new ResizeObserver(([entry]) => {
+      const nextHeight = entry?.contentRect.height ?? node.getBoundingClientRect().height;
+      if (Math.abs(nextHeight - previousHeight) > 0.5 && (atBottomRef.current || forceBottomRef.current)) lockToBottom();
+      previousHeight = nextHeight;
+    });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [activeId, lockToBottom]);
 
   // смена сервера: сброс состояния виртуального списка (Virtuoso ремонтится по key={activeId})
   useLayoutEffect(() => {
@@ -837,11 +954,12 @@ function Chat() {
     // на входе: если есть непрочитанные — сеем счётчик jump-кнопки и стартуем НЕ внизу (позиция у
     // дивайдера, см. initialTopMostItemIndex), иначе внизу
     const unreadHere = unreadServer > 0 ? messages.filter((m) => m.sid != null && m.sid > baseline && !m.mine).length : 0;
-    setPill(unreadHere); setAtBottom(unreadHere === 0); atBottomRef.current = unreadHere === 0; setReplyTo(null);
+    setPill(unreadHere); setAtBottom(unreadHere === 0); atBottomRef.current = unreadHere === 0;
+    nearBottomRef.current = unreadHere === 0; forceBottomRef.current = false; setReplyTo(null);
     // сброс стейджинга вложений при смене сервера — не тащим прикреплённые файлы между чатами
     setStaged((s) => { s.forEach((it) => it.previewUrl && URL.revokeObjectURL(it.previewUrl)); return []; });
     setSendQueued(false);
-    prevLastId.current = null; lastAckedRef.current = null; loadingOlder.current = false; setOlderBusy(false);
+    lastAckedRef.current = null; ++olderRequestSeq.current; loadingOlder.current = false; setOlderBusy(false);
     // не даём startReached стрельнуть догрузкой прямо на маунте (пока идёт scroll-to-bottom и оседание)
     olderReady.current = false;
     setDividerFade(false);
@@ -853,11 +971,6 @@ function Chat() {
     if (unreadHere === 0) for (const d of [90, 320, 750]) settle.push(window.setTimeout(() => { if (atBottomRef.current) virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end' }); }, d));
     return () => { clearTimeout(t); settle.forEach((s) => clearTimeout(s)); };
   }, [activeId]);
-
-  // «Увидел своими глазами» = чат этого сервера открыт, проскроллен ВНИЗ И окно В ФОКУСЕ/видимо.
-  // Только тогда новое сообщение прочитано. Свернул окно / ушёл в игру / проскроллил вверх — чужие
-  // сообщения копятся в непрочитанное, даже если чат формально открыт (главное правило: не увидел → +1).
-  const seenNow = () => atBottomRef.current && document.visibilityState === 'visible' && document.hasFocus();
 
   // focus/blur/visibility окна → пере-триггер эффекта прочтения (вернулся в окно внизу чата = прочитал)
   useEffect(() => {
@@ -872,22 +985,22 @@ function Chat() {
     };
   }, []);
 
-  // append нового сообщения: pill (⌄) растёт по СКРОЛЛУ (есть сообщения ниже), непрочитанное — по
-  // ФОКУСУ. prepend старых меняет messages[0], но не последний id → ничего не трогает.
+  // Только настоящий suffix-append влияет на pill/unread. Батч после reconnect учитывается целиком;
+  // delete/prepend/status/edit не создают ложные сообщения и звуки.
   useEffect(() => {
-    const lastMsg = messages.length ? messages[messages.length - 1] : null;
-    const last = lastMsg ? lastMsg.id : null;
-    // !lastMsg.sys — системные события (стрим начал/закончил) НЕ считаются непрочитанным чатом.
-    if (prevLastId.current !== null && last !== prevLastId.current && lastMsg && !lastMsg.mine && !lastMsg.sys) {
-      if (!atBottomRef.current) setPill((p) => p + 1);       // индикатор скролла: есть сообщения ниже
-      if (!seenNow() && activeId) bumpUnreadStore(activeId);  // непрочитанное: не в фокусе или не внизу
-      // Discord-стиль: апп свёрнут/не в фокусе, но ты на сервере → пинг на КАЖДОЕ сообщение (звук тега).
-      // Меншены исключаем — у них свой пинг из notify (иначе двойной звук). Троттл — не строчить пулемётом.
-      if (!document.hasFocus() && !lastMsg.mention) { const now = Date.now(); if (now - lastTagAt.current > 900) { lastTagAt.current = now; playSound('tag'); } }
+    if (!isSuffixAppend) return;
+    const incoming = appendedMessages.filter((m) => !m.mine && !m.sys);
+    if (!incoming.length) return;
+    if (!shouldFollowAppend) setPill((p) => p + incoming.length);
+    const focused = document.visibilityState === 'visible' && document.hasFocus();
+    if ((!focused || !shouldFollowAppend) && activeId) bumpUnreadStore(activeId, incoming.length);
+    // Меншены уже имеют свой notify-звук. Для reconnect-батча обычных сообщений — один tag,
+    // а не пулемёт из N звуков.
+    if (!document.hasFocus() && incoming.some((m) => !m.mention)) {
+      const now = Date.now();
+      if (now - lastTagAt.current > 900) { lastTagAt.current = now; playSound('tag'); }
     }
-    prevLastId.current = last;
-  }, [messages, activeId, bumpUnreadStore]);
-  useEffect(() => { if (atBottom) setPill(0); }, [atBottom]);
+  }, [messages, activeId, bumpUnreadStore, isSuffixAppend, shouldFollowAppend]);
   // Дивайдер «Новые сообщения» не висит вечно: как юзер добрался до низа и увидел границу (окно видимо),
   // через ~4.5с плавно гасим его (CSS-transition). Сброс — в entry-эффекте при смене сервера.
   useEffect(() => {
@@ -918,17 +1031,25 @@ function Chat() {
     const cursor = E.chatOldestCursor;
     const reqId = activeId;
     if (cursor == null || !reqId) return;
+    const historyGeneration = E.chatHistoryGeneration;
+    const requestSeq = ++olderRequestSeq.current;
     loadingOlder.current = true; setOlderBusy(true);
     try {
       const h = await api.getMessages(reqId, cursor, 30);
       // за время запроса могли переключить сервер — не вклеиваем чужую страницу в чужой чат
-      if (useStore.getState().active?.id !== reqId) return;
+      if (useStore.getState().active?.id !== reqId || getEngine() !== E) return;
+      if (E.chatHistoryGeneration !== historyGeneration || E.chatOldestCursor !== cursor) return;
       // prependHistory растит messages И chatPrepended в ОДНОМ emit → firstItemIndex (derived) сдвигается
       // атомарно с данными, virtuoso держит позицию на прежнем сообщении (без прыжка). Отдельный
       // setFirstItemIndex больше не нужен (был вторым источником и давал рассинхрон/прыжок).
       E.prependHistory(h.messages, h.hasMore);
     } catch { /**/ }
-    finally { loadingOlder.current = false; setOlderBusy(false); }
+    finally {
+      if (olderRequestSeq.current === requestSeq) {
+        loadingOlder.current = false;
+        setOlderBusy(false);
+      }
+    }
   }, [E, activeId]);
 
   // --- reply (ответ на сообщение) ---
@@ -957,11 +1078,16 @@ function Chat() {
   }, [messages]);
   useEffect(() => { if (flashId == null) return; const t = window.setTimeout(() => setFlashId(null), 1300); return () => clearTimeout(t); }, [flashId]);
   // реакция + доскролл: пилюля растит высоту последнего сообщения — если я внизу, держим его в поле зрения
-  const reactTo = useCallback((sid: number, emote: { id: string; name: string }) => {
-    E.toggleReaction(sid, emote);
+  const reactTo = useCallback((target: { id: number; sid?: number | null }, emote: { id: string; name: string }) => {
+    E.toggleMessageReaction(target, emote);
     const last = messages.length ? messages[messages.length - 1] : null;
-    if (last && last.sid === sid && atBottomRef.current) requestAnimationFrame(() => virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end' }));
+    if (last && last.id === target.id && atBottomRef.current) requestAnimationFrame(() => virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end' }));
   }, [E, messages]);
+  const onMessageImageLoad = useCallback(() => {
+    // Изображение получает реальную высоту асинхронно. Удерживаем его в поле зрения только для
+    // pinned/forced чата; при чтении истории измерение строки не меняет пользовательский якорь.
+    if (atBottomRef.current || forceBottomRef.current) lockToBottom();
+  }, [lockToBottom]);
 
   async function runCommand(raw: string) {
     const active = useStore.getState().active;
@@ -1029,14 +1155,15 @@ function Chat() {
     const ready = staged.filter((s) => s.status === 'ready' && s.attachment).map((s) => s.attachment!);
     if (!t && !ready.length) return;
     if (t.startsWith('/')) { runCommand(t); setText(''); return; }
+    // Ставим intent ДО синхронного optimistic push в engine: собственный append обязан дойти
+    // до true bottom, даже если пользователь перед отправкой читал историю.
+    forceBottomRef.current = true;
     const em: Record<string, string> = {};
     t.split(/\s+/).forEach((w) => { if (emoteMap.has(w)) em[w] = emoteMap.get(w)!; });
     E.sendChatWithEmotes(t, em, undefined, replyTo ? buildReplyRef(replyTo) : undefined, ready.length ? ready : undefined);
     setText(''); setReplyTo(null); setStaged([]);
     if (activeId) localStorage.removeItem(DRAFT_KEY + activeId); // отправлено — черновик снят
-    // Скролл к низу после отправки делает followOutput (last.mine → 'auto') уже ПОСЛЕ аппенда.
-    // Синхронный scrollToBottom тут скроллил бы к СТАРОМУ последнему (оптимистичное сообщение
-    // ещё не в data Virtuoso) → визуальный прыжок мимо. setPill сбросит эффект atBottom.
+    // Реальный доскролл выполняет suffix-append layout effect уже после появления сообщения в data.
   }
   // очередь на отправку: как только последнее вложение долилось (успешно или с ошибкой — send()
   // сам отфильтрует неудачные), стреляем реальной отправкой без повторного нажатия юзером.
@@ -1163,6 +1290,8 @@ function Chat() {
     // (cont, 2px между сообщениями одного автора) несколько подряд идущих превью сливаются в кашу.
     // Добавляем чуть больше воздуха сверху именно таким продолжениям, не трогая обычный текст.
     const hasMedia = !!m.img || !!(m.files && m.files.length);
+    const canReact = m.sid != null || !!m.mkey;
+    const reactionTarget = { id: m.id, sid: m.sid };
     return (
       <div className={'virt-row' + (cont ? ' cont' : '') + (cont && hasMedia ? ' cont-media' : '')}>
         <div className={'msg' + (m.sys ? ' sys' : '') + (m.mine ? ' me' : '') + (m.mention ? ' mentioned' : '') + (m.id === flashId ? ' flash' : '') + (m.status === 'failed' ? ' failed' : '')}>
@@ -1184,20 +1313,20 @@ function Chat() {
                     {m.edited && !m.sys ? <span className="medit" title="Изменено">(изменено)</span> : null}
                   </div>
                 ) : null}
-                {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox({ url: m.img!, name: m.img!.split('/').pop() || 'image', size: 0, mime: 'image/*', kind: 'image' })}><img className="msg-img" src={resolveUploadUrl(m.img)} alt="" loading="lazy" /></button> : null}
-                {m.files && m.files.length ? <MessageAttachments files={m.files} onImageClick={setLightbox} /> : null}
+                {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox({ url: m.img!, name: m.img!.split('/').pop() || 'image', size: 0, mime: 'image/*', kind: 'image' })}><img className="msg-img" src={resolveUploadUrl(m.img)} alt="" loading="lazy" onLoad={onMessageImageLoad} /></button> : null}
+                {m.files && m.files.length ? <MessageAttachments files={m.files} onImageClick={setLightbox} onImageLoad={onMessageImageLoad} /> : null}
                 {m.status === 'failed' ? <div className="msg-failed"><Icon name="warn" sm />Не отправлено<button onClick={() => getEngine()?.retrySend(m.id)}>Повторить</button></div> : null}
-                {(() => { const reacts = m.sid != null ? E.getReactions(m.sid) : []; return reacts.length ? (
+                {(() => { const reacts = E.getReactions(m.sid, m.id); return reacts.length ? (
                   <div className="msg-reacts">
-                    {reacts.map((r) => <button key={r.id} className={'react-pill' + (r.mine ? ' mine' : '')} title={r.name} onClick={() => m.sid != null && reactTo(m.sid, { id: r.id, name: r.name })}><EmoteImg id={r.id} alt={r.name} /><b>{r.count}</b></button>)}
-                    <button className="react-add" data-tip="Добавить реакцию" onClick={(e) => m.sid != null && setReactTarget({ sid: m.sid, anchor: e.currentTarget.getBoundingClientRect() })}><Icon name="react" sm /></button>
+                    {reacts.map((r) => <button key={r.id} className={'react-pill' + (r.mine ? ' mine' : '')} title={r.name} onClick={() => canReact && reactTo(reactionTarget, { id: r.id, name: r.name })}><EmoteImg id={r.id} alt={r.name} /><b>{r.count}</b></button>)}
+                    {canReact ? <button className="react-add" data-tip="Добавить реакцию" onClick={(e) => setReactTarget({ target: reactionTarget, anchor: e.currentTarget.getBoundingClientRect() })}><Icon name="react" sm /></button> : null}
                   </div>
                 ) : null; })()}
               </div>
               {!m.sys && editing?.id !== m.id ? <>
                 <button className="msg-more" aria-label="Действия с сообщением" aria-expanded={actionsFor === m.id} aria-controls={`msg-actions-${m.id}`} onClick={(e) => { e.stopPropagation(); setActionsFor((id) => id === m.id ? null : m.id); }}><Icon name="more" sm /></button>
                 <div id={`msg-actions-${m.id}`} className={'msg-actions' + (actionsFor === m.id ? ' open' : '')} onMouseDown={(e) => e.preventDefault()}>
-                  {m.sid != null ? <button className="msg-act" aria-label="Добавить реакцию" data-tip="Реакция" onClick={(e) => { setReactTarget({ sid: m.sid!, anchor: e.currentTarget.getBoundingClientRect() }); setActionsFor(null); }}><Icon name="react" sm /></button> : null}
+                  {canReact ? <button className="msg-act" aria-label="Добавить реакцию" data-tip="Реакция" onClick={(e) => { setReactTarget({ target: reactionTarget, anchor: e.currentTarget.getBoundingClientRect() }); setActionsFor(null); }}><Icon name="react" sm /></button> : null}
                   <button className="msg-act" aria-label="Ответить" data-tip="Ответить" onClick={() => { startReply(m); setActionsFor(null); }}><Icon name="reply" sm /></button>
                   {m.text ? <button className="msg-act" aria-label="Копировать текст" data-tip="Копировать текст" onClick={() => { navigator.clipboard?.writeText(m.text!).then(() => useStore.getState().toast('Скопировано', 'ok')).catch(() => {}); setActionsFor(null); }}><Icon name="copy" sm /></button> : null}
                   {m.mine && m.text && m.sid != null ? <button className="msg-act" aria-label="Изменить сообщение" data-tip="Изменить" onClick={() => { setEditing({ id: m.id, sid: m.sid! }); setEditText(m.text); setActionsFor(null); }}><Icon name="edit" sm /></button> : null}
@@ -1213,40 +1342,59 @@ function Chat() {
 
   return (
     <div id="chat">
-      {messages.length === 0 ? (
-        <div id="msgs"><div className="msgs-inner"><div id="chatEmpty">Общий чат сервера. Пиши сюда — видят все участники онлайн.</div></div></div>
-      ) : (
-        <Virtuoso
-          key={activeId}
-          ref={virtuosoRef}
-          className="virt-msgs"
-          data={messages}
-          firstItemIndex={firstItemIndex}
-          initialTopMostItemIndex={firstUnread >= 0 ? { index: firstUnread, align: 'start' } : { index: Math.max(0, messages.length - 1), align: 'end' }}
-          alignToBottom
-          startReached={loadOlder}
-          followOutput={(bottom) => {
-            // Своё или системное сообщение — ВСЕГДА прыгаем к низу (требование: видеть конец чата),
-            // даже если проскроллены вверх. Чужие — только если уже у низа (не дёргаем при чтении истории).
-            const last = messages.length ? messages[messages.length - 1] : null;
-            return last && (last.mine || last.sys) ? 'auto' : bottom ? 'auto' : false;
-          }}
-          atBottomThreshold={120}
-          atBottomStateChange={onAtBottom}
-          increaseViewportBy={{ top: 600, bottom: 400 }}
-          computeItemKey={(_, m) => m.id}
-          context={{ busy: olderBusy, hasMore: eng.chatHasMore }}
-          components={{ Header: ChatOlderHeader, Footer: ChatFooter }}
-          itemContent={(_, m) => {
-            const dayTs = dayFirst.get(m.id);
-            const dayDiv = dayTs != null ? <div className="msg-daydiv"><span>{fmtDay(dayTs)}</span></div> : null;
-            if (m.id === firstUnreadId) return <>{dayDiv}<div className="msg-newwrap"><div className={'msg-newdiv' + (dividerFade ? ' faded' : '')}><span>Новые сообщения</span></div>{renderMessage(m)}</div></>;
-            return dayDiv ? <>{dayDiv}{renderMessage(m)}</> : renderMessage(m);
-          }}
-        />
-      )}
-      {olderBusy ? <div className="chat-load-top"><span className="chat-load"><span className="spin" style={{ width: 14, height: 14, margin: 0 }} />Загрузка сообщений…</span></div> : null}
-      {!atBottom ? <button id="scrollbtn" aria-label="Прокрутить вниз" data-tip="К последним" onClick={scrollToBottom}><Icon name="chevron" />{pill > 0 ? <span className="sb-badge">{pill > 99 ? '99+' : pill}</span> : null}</button> : null}
+      <div className="chat-feed">
+        {messages.length === 0 ? (
+          <div id="msgs"><div className="msgs-inner"><div id="chatEmpty">Общий чат сервера. Пиши сюда — видят все участники онлайн.</div></div></div>
+        ) : (
+          <Virtuoso
+            key={activeId}
+            ref={virtuosoRef}
+            scrollerRef={bindScroller}
+            className="virt-msgs"
+            data={messages}
+            firstItemIndex={firstItemIndex}
+            initialTopMostItemIndex={firstUnread >= 0 ? { index: firstUnread, align: 'start' } : { index: Math.max(0, messages.length - 1), align: 'end' }}
+            alignToBottom
+            startReached={loadOlder}
+            // Важно передавать именно false, когда читается история: Virtuoso трактует саму
+            // callback-функцию как включённый follow при уменьшении viewport (reply/keyboard).
+            followOutput={shouldFollowAppend || forceBottomRef.current || atBottom ? 'auto' : false}
+            atBottomThreshold={CHAT_STRICT_BOTTOM_PX}
+            atBottomStateChange={onAtBottom}
+            increaseViewportBy={{ top: 600, bottom: 400 }}
+            computeItemKey={(_, m) => m.id}
+            context={{ busy: olderBusy, hasMore: eng.chatHasMore }}
+            components={{ Header: ChatOlderHeader, Footer: ChatFooter }}
+            itemContent={(_, m) => {
+              const dayTs = dayFirst.get(m.id);
+              const dayDiv = dayTs != null ? <div className="msg-daydiv"><span>{fmtDay(dayTs)}</span></div> : null;
+              if (m.id === firstUnreadId) return <>{dayDiv}<div className="msg-newwrap"><div className={'msg-newdiv' + (dividerFade ? ' faded' : '')}><span>Новые сообщения</span></div>{renderMessage(m)}</div></>;
+              return dayDiv ? <>{dayDiv}{renderMessage(m)}</> : renderMessage(m);
+            }}
+          />
+        )}
+        {olderBusy ? <div className="chat-load-top"><span className="chat-load"><span className="spin" style={{ width: 14, height: 14, margin: 0 }} />Загрузка сообщений…</span></div> : null}
+        {!atBottom ? <button id="scrollbtn" aria-label="Прокрутить вниз" data-tip="К последним" onClick={scrollToBottom}><Icon name="chevron" />{pill > 0 ? <span className="sb-badge">{pill > 99 ? '99+' : pill}</span> : null}</button> : null}
+      </div>
+      <div className="chat-bottom" ref={bottomStackRef}>
+      {acOpen ? (
+        <div className={'mention-pop' + (replyTo ? ' with-reply' : '')} role="listbox" ref={popRef}>
+          <div className="mpop-h">{slashMode ? 'Команды' : 'Упомянуть'}</div>
+          {slashMode
+            ? cmdCands.map((c, i) => (
+              <button key={c.name} className={'mpop-row' + (i === mIdx ? ' sel' : '')} onMouseDown={(e) => { e.preventDefault(); insertCommand(c.name); }} onMouseEnter={() => setMIdx(i)}>
+                <span className="mpop-cmd">/{c.name}</span><span className="mpop-desc">{c.desc}</span>
+              </button>))
+            : mCands.map((x, i) => (
+              <button key={x.username} className={'mpop-row' + (i === mIdx ? ' sel' : '')} onMouseDown={(e) => { e.preventDefault(); insertMention(mentionToken(x)); }} onMouseEnter={() => setMIdx(i)}>
+                <span className="mpop-av" style={{ background: x.everyone ? 'var(--accent)' : (x.avatarUrl ? '#0000' : avColor(x.displayName, x.avatarColor)) }}>
+                  {x.everyone ? '@' : x.avatarUrl ? <img className="avimg" src={resolveUploadUrl(x.avatarUrl)} alt="" /> : initial(x.displayName)}
+                </span>
+                <span className="mpop-nm">{x.displayName}</span>
+                {!x.everyone && x.username.toLowerCase() !== x.displayName.toLowerCase() ? <span className="mpop-u">@{x.username}</span> : null}
+              </button>))}
+        </div>
+      ) : null}
       {/* лейн печатающих зарезервирован всегда (min-height) — badge не наслаивается на последнее сообщение */}
       <div className="typing-ind" aria-live="polite">
         {eng.typing.length > 0 ? (
@@ -1274,24 +1422,7 @@ function Chat() {
           </button>
         </div>
       ) : null}
-      {acOpen ? (
-        <div className={'mention-pop' + (replyTo ? ' with-reply' : '')} role="listbox" ref={popRef}>
-          <div className="mpop-h">{slashMode ? 'Команды' : 'Упомянуть'}</div>
-          {slashMode
-            ? cmdCands.map((c, i) => (
-              <button key={c.name} className={'mpop-row' + (i === mIdx ? ' sel' : '')} onMouseDown={(e) => { e.preventDefault(); insertCommand(c.name); }} onMouseEnter={() => setMIdx(i)}>
-                <span className="mpop-cmd">/{c.name}</span><span className="mpop-desc">{c.desc}</span>
-              </button>))
-            : mCands.map((x, i) => (
-              <button key={x.username} className={'mpop-row' + (i === mIdx ? ' sel' : '')} onMouseDown={(e) => { e.preventDefault(); insertMention(mentionToken(x)); }} onMouseEnter={() => setMIdx(i)}>
-                <span className="mpop-av" style={{ background: x.everyone ? 'var(--accent)' : (x.avatarUrl ? '#0000' : avColor(x.displayName, x.avatarColor)) }}>
-                  {x.everyone ? '@' : x.avatarUrl ? <img className="avimg" src={resolveUploadUrl(x.avatarUrl)} alt="" /> : initial(x.displayName)}
-                </span>
-                <span className="mpop-nm">{x.displayName}</span>
-                {!x.everyone && x.username.toLowerCase() !== x.displayName.toLowerCase() ? <span className="mpop-u">@{x.username}</span> : null}
-              </button>))}
-        </div>
-      ) : null}
+      <div className="composer-shell">
       {replyTo ? (
         <div className="reply-bar">
           <Icon name="reply" sm />
@@ -1323,7 +1454,6 @@ function Chat() {
         <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple style={{ display: 'none' }} onChange={(e) => { const files = Array.from(e.target.files || []); if (files.length) stageFiles(files, 'image'); e.target.value = ''; }} />
         <input ref={attachFileRef} type="file" multiple style={{ display: 'none' }} onChange={(e) => { const files = Array.from(e.target.files || []); if (files.length) stageFiles(files, 'file'); e.target.value = ''; }} />
         <input id="msgIn" placeholder="Сообщение..." maxLength={1000} autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false} name="chat-message" value={text}
-          onFocus={() => { if (!atBottomRef.current) scrollToBottom(); }}
           onPaste={(e) => {
             const items = e.clipboardData?.items; if (!items) return;
             const imgs: File[] = [];
@@ -1335,10 +1465,12 @@ function Chat() {
           {sendQueued ? <span className="spin" style={{ margin: 0, width: 14, height: 14 }} /> : <Icon name="send" />}
         </button>
       </div>
+      </div>
+      </div>
       {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} onClose={() => setPickAnchor(undefined)}
         onPick={(e: Emote) => { setText((t) => t + (t && !t.endsWith(' ') ? ' ' : '') + e.name + ' '); }} /> : null}
       {reactTarget ? <EmotePicker anchor={reactTarget.anchor} onClose={() => setReactTarget(null)}
-        onPick={(e: Emote) => { reactTo(reactTarget.sid, e); setReactTarget(null); }} /> : null}
+        onPick={(e: Emote) => { reactTo(reactTarget.target, e); setReactTarget(null); }} /> : null}
       {lightbox ? <ImageLightbox attachment={lightbox} onClose={() => setLightbox(null)} /> : null}
     </div>
   );

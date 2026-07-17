@@ -2,6 +2,9 @@
   "name": "voice-api",
   "version": "3.0.0",
   "private": true,
+  "scripts": {
+    "test:voice-lease": "node voice-lease-test.js"
+  },
   "dependencies": {
     "express": "^4.19.2",
     "livekit-server-sdk": "^2.9.0",

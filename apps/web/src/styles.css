@@ -495,11 +495,14 @@
   #mini .vwrap{height:168px;box-shadow:var(--sh-2)}
 
   /* chat (reused) */
-  #chat{background:var(--panel);border-left:1px solid var(--line-2);display:flex;flex-direction:column;min-height:0;position:relative;grid-column:1;transition:border-color .28s}
+  #chat{background:var(--panel);border-left:1px solid var(--line-2);display:flex;flex-direction:column;min-height:0;overflow:hidden;position:relative;grid-column:1;transition:border-color .28s}
   #content.split #chat{grid-column:2;overflow:hidden;min-width:0}
   /* как у панели участников: контент чата держит открытую ширину, колонка обрезает при сворачивании (без переверстки) */
   #content.split #chat>:not(#scrollbtn):not(.mob-chat-toggle){min-width:var(--chat-w,340px)}
-  #msgs{flex:1;overflow-y:auto;overflow-x:hidden;display:flex;flex-direction:column}
+  .chat-feed{flex:1 1 auto;min-width:0;min-height:0;position:relative;display:flex;flex-direction:column;overflow:hidden}
+  .chat-bottom{flex:0 0 auto;min-width:0;position:relative;z-index:2;background:var(--panel)}
+  .composer-shell{position:relative;min-width:0;flex:0 0 auto}
+  #msgs{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;display:flex;flex-direction:column}
   .msgs-inner{margin-top:auto;display:flex;flex-direction:column;gap:11px;padding:14px}
   /* виртуальный список чата (react-virtuoso): скроллер занимает всё место; отступы/зазор — на строках */
   .virt-msgs{flex:1;min-height:0;overflow-x:hidden}
@@ -545,7 +548,7 @@
   .reply-quote.jumpable:hover .rq-text{color:var(--txt)}
   .msg.flash .msg-content{animation:msgFlash 1.3s ease-out;border-radius:6px}
   @keyframes msgFlash{0%,55%{box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 45%,transparent)}100%{box-shadow:0 0 0 3px transparent}}
-  .reply-bar{display:flex;align-items:center;gap:8px;margin:0 12px;padding:7px 12px;background:var(--panel2);border:1px solid var(--line-2);border-bottom:none;border-radius:10px 10px 0 0;font-size:13px;color:var(--muted);animation:sbIn .16s ease-out}
+  .reply-bar{display:flex;flex:0 0 auto;align-items:center;gap:8px;margin:0 12px;padding:7px 12px;background:var(--panel2);border:1px solid var(--line-2);border-bottom:none;border-radius:10px 10px 0 0;font-size:13px;color:var(--muted);animation:sbIn .16s ease-out}
   .reply-bar>.ic{font-size:16px;color:var(--muted);flex:0 0 auto;transform:scaleX(-1)}
   .reply-bar .rb-to{flex:0 0 auto;white-space:nowrap}
   .reply-bar .rb-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;opacity:.8}
@@ -643,7 +646,7 @@
   .dl-act:disabled{opacity:.35;pointer-events:none}
   .dl-empty{padding:22px 8px;text-align:center;color:var(--muted);font-size:13px}
   /* панель прикреплённых вложений над инпутом чата — предпросмотр перед отправкой */
-  .attach-panel{display:flex;flex-wrap:wrap;gap:8px;margin:8px 12px 0;padding:10px;background:var(--panel2);border:1px solid var(--line-2);border-radius:10px}
+  .attach-panel{display:flex;flex:0 1 auto;flex-wrap:wrap;gap:8px;max-height:min(32dvh,220px);overflow:auto;overscroll-behavior:contain;margin:8px 12px 0;padding:10px;background:var(--panel2);border:1px solid var(--line-2);border-radius:10px}
   .attach-chip{position:relative;display:flex;align-items:center;gap:8px;max-width:220px;padding:6px 28px 6px 6px;background:var(--panel3);border:1px solid var(--line-2);border-radius:9px}
   .attach-chip.err{border-color:var(--red)}
   .attach-thumb{width:36px;height:36px;border-radius:6px;object-fit:cover;flex:0 0 auto}
@@ -675,7 +678,7 @@
   @keyframes pcardIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
   /* flex-wrap: в УЗКОМ чате (сплит при просмотре стрима) кнопка «Установить» переносится под текст,
      а не сжимается/распирает контейнер; текст — в одну строку с ellipsis, не переносится в столбик. */
-  .update-bar{display:flex;container-type:inline-size;flex-wrap:wrap;align-items:center;gap:10px 12px;margin:10px 14px 14px;padding:12px 14px;background:linear-gradient(90deg,rgba(88,101,242,.18),rgba(88,101,242,.07));border:1px solid var(--accent);border-radius:12px;box-shadow:0 4px 18px -6px rgba(88,101,242,.5);animation:popIn .2s cubic-bezier(.2,.8,.4,1)}
+  .update-bar{display:flex;flex:0 0 auto;container-type:inline-size;flex-wrap:wrap;align-items:center;gap:10px 12px;margin:10px 14px 14px;padding:12px 14px;background:linear-gradient(90deg,rgba(88,101,242,.18),rgba(88,101,242,.07));border:1px solid var(--accent);border-radius:12px;box-shadow:0 4px 18px -6px rgba(88,101,242,.5);animation:popIn .2s cubic-bezier(.2,.8,.4,1)}
   .update-bar .ub-ic{width:38px;height:38px;flex:0 0 auto;border-radius:10px;background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center}
   .update-bar .ub-ic .ic{animation:ubspin 2.4s linear infinite}
   .update-bar .ub-txt{flex:1 1 150px;min-width:0;display:flex;flex-direction:column;gap:2px}
@@ -690,7 +693,7 @@
   @container (max-width: 400px){ .update-bar .ub-btn{flex:1 1 100%;margin-left:0;justify-content:center} }
   .home-body .update-bar{margin:0 0 22px}  /* на главной — без боковых отступов, как download-card */
   @keyframes ubspin{to{transform:rotate(360deg)}}
-  .typing-ind{display:flex;align-items:center;gap:8px;padding:2px 16px 5px;font-size:12.5px;color:var(--muted);min-height:19px}
+  .typing-ind{display:flex;flex:0 0 24px;align-items:center;gap:8px;height:24px;padding:2px 16px 5px;font-size:12.5px;color:var(--muted);overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
   .tdots{display:inline-flex;gap:3px;align-items:center;flex:0 0 auto}
   .tdots i{width:5px;height:5px;border-radius:50%;background:var(--muted);display:block;animation:tbounce 1.2s infinite ease-in-out}
   .tdots i:nth-child(2){animation-delay:.15s}
@@ -699,7 +702,7 @@
   .av{border-radius:50%;display:flex;align-items:center;justify-content:center;flex:0 0 auto;position:relative}
   .avimg{width:100%;height:100%;object-fit:cover;border-radius:inherit;display:block}
   #chatEmpty{color:var(--muted);font-size:13px;text-align:center;margin:auto;line-height:1.6;padding:20px}
-  #scrollbtn{position:absolute;right:18px;bottom:80px;width:42px;height:42px;padding:0;border-radius:50%;background:var(--panel3);color:var(--txt);display:flex;align-items:center;justify-content:center;box-shadow:var(--sh-2);z-index:5;transform-origin:center bottom;animation:sbIn .24s cubic-bezier(.34,1.56,.64,1)}
+  #scrollbtn{position:absolute;right:18px;bottom:12px;width:42px;height:42px;padding:0;border-radius:50%;background:var(--panel3);color:var(--txt);display:flex;align-items:center;justify-content:center;box-shadow:var(--sh-2);z-index:5;transform-origin:center bottom;animation:sbIn .24s cubic-bezier(.34,1.56,.64,1)}
   #scrollbtn:hover{background:var(--panel4);color:var(--txt-h);transform:translateY(-1px)}
   #scrollbtn:active{transform:translateY(0)}
   #scrollbtn .ic{font-size:24px}
@@ -715,7 +718,7 @@
   .msg-daydiv{display:flex;align-items:center;gap:12px;margin:10px 4px 6px;color:var(--muted);font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}
   .msg-daydiv::before,.msg-daydiv::after{content:'';flex:1;height:1px;background:var(--line-2)}
   .msg-daydiv span{flex:0 0 auto;padding:2px 10px;background:var(--panel2);border-radius:20px}
-  .chat-in{display:flex;gap:8px;padding:12px;border-top:1px solid var(--line-2)}
+  .chat-in{display:flex;flex:0 0 auto;gap:8px;padding:12px;border-top:1px solid var(--line-2)}
   .chat-in #sendBtn{background:var(--accent);color:#fff;flex:0 0 auto;width:44px;display:flex;align-items:center;justify-content:center;padding:0;border-radius:var(--r-sm);transition:opacity .15s,background .15s}
   .chat-in #sendBtn:hover{background:var(--accent-h)}.chat-in #sendBtn.empty{opacity:.45;pointer-events:none}
   .chat-in .emo-toggle{background:var(--panel2);color:var(--muted);flex:0 0 auto;width:44px;display:flex;align-items:center;justify-content:center;padding:0;border-radius:var(--r-sm)}
@@ -1172,7 +1175,7 @@
   .who-role{font-size:9.5px;font-weight:700;line-height:1.6;padding:0 6px;border-radius:9999px;border:1px solid;letter-spacing:.2px;text-transform:none}
 
   /* ---- автокомплит @упоминаний и /команд ---- */
-  .mention-pop{position:absolute;left:12px;right:12px;bottom:70px;z-index:40;background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-md);box-shadow:var(--sh-2),var(--hair);max-height:280px;overflow-y:auto;animation:popIn .12s ease-out}
+  .mention-pop{position:absolute;left:12px;right:12px;bottom:calc(100% + 8px);z-index:40;background:var(--panel);border:1px solid var(--line-2);border-radius:var(--r-md);box-shadow:var(--sh-2),var(--hair);max-height:min(280px,42dvh);overflow-y:auto;animation:popIn .12s ease-out}
   .mention-pop .mpop-h{font-size:10.5px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--muted);padding:9px 12px 5px}
   .mpop-row{display:flex;align-items:center;gap:10px;width:100%;padding:8px 12px;background:transparent;border-radius:0;color:var(--txt);text-align:left}
   .mpop-row.sel,.mpop-row:hover{background:var(--panel3)}
@@ -1216,7 +1219,7 @@
   /* mobile */
   #mtabs{display:none}
   @media(max-width:900px){
-    #app.on{grid-template-columns:60px 1fr}
+    #app.on{grid-template-columns:64px 1fr}
     .railbtn{width:42px;height:42px}
     #server.on{grid-template-columns:1fr}
     #channels,#members{display:none}
@@ -1257,7 +1260,7 @@
   @media(max-width:900px){
     #root{height:100dvh}
     #app.on{padding-left:env(safe-area-inset-left);padding-right:env(safe-area-inset-right)}
-    #mtabs{left:calc(60px + env(safe-area-inset-left));padding-right:env(safe-area-inset-right)}
+    #mtabs{left:calc(64px + env(safe-area-inset-left));padding-right:env(safe-area-inset-right)}
     .railbtn{width:46px;height:46px}
     #content.split .mob-chat-toggle{bottom:calc(58px + env(safe-area-inset-bottom, 0px) + 8px)}
     .srv-header .hbtn.mob-hide{display:none}
@@ -1270,10 +1273,8 @@
     .live-card{scroll-snap-align:start}
     /* чат: не даём min-width:340 распирать split-чат */
     #content.split.show-chat #chat>:not(#scrollbtn):not(.mob-chat-toggle){min-width:0}
-    /* mention-pop: тач-строки + над таб-баром/reply-баром */
+    /* mention-pop якорится к верхней границе composer-shell; высота reply/attachments не вычисляется вручную */
     .mpop-row{min-height:44px;padding:11px 12px}
-    .mention-pop{bottom:calc(70px + 54px + env(safe-area-inset-bottom))}
-    .mention-pop.with-reply{bottom:calc(70px + 54px + 40px + env(safe-area-inset-bottom))}
     /* стрим: контролы переносятся, а не обрезаются overflow:hidden */
     .vbar{flex-wrap:wrap;gap:6px;padding:8px 8px 8px 52px}
     .vbar .vb-vol{flex:1 1 60px;width:auto;min-width:40px}
@@ -1569,6 +1570,15 @@ html,body,#root{width:100%;min-width:0;height:100%;height:100dvh}
 .home-body .update-bar,.home-body .dl-card{border-radius:16px;margin-bottom:14px}
 .home-enter>*{animation-duration:.36s}
 
+/* Плавающий голосовой док не перекрывает последние действия, даже с высокой очередью музыки. */
+body:has(#voicedock) #home .home-body,
+body:has(#voicedock) .admin{padding-bottom:max(132px,calc(118px + env(safe-area-inset-bottom)))}
+body:has(#voicedock .music) #home .home-body,
+body:has(#voicedock .music) .admin{padding-bottom:max(190px,calc(176px + env(safe-area-inset-bottom)))}
+body:has(#voicedock .music.open) #home .home-body,
+body:has(#voicedock .music.open) .admin{padding-bottom:max(132px,calc(min(68dvh,520px) + 24px + env(safe-area-inset-bottom)))}
+#voicedock .vd-panel{max-height:min(68dvh,520px);overflow-y:auto;overscroll-behavior:contain}
+
 .home-hero{
   container:home-hero / inline-size;
   position:relative;
@@ -1603,6 +1613,7 @@ html,body,#root{width:100%;min-width:0;height:100%;height:100dvh}
 .home-hero.is-voice{border-color:color-mix(in srgb,var(--green) 25%,var(--line-2))}
 .hero-copy{align-self:center;min-width:0;position:relative;z-index:1}
 .hero-kicker{display:inline-flex;align-items:center;gap:9px;max-width:100%;margin-bottom:16px;color:var(--muted);font-size:12px;font-weight:750;letter-spacing:.05em;text-transform:uppercase}
+.hero-kicker>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .hero-kicker .hero-signal{width:9px;height:9px;flex:0 0 auto;border-radius:50%;background:var(--accent);box-shadow:0 0 0 5px color-mix(in srgb,var(--accent) 13%,transparent),0 0 18px color-mix(in srgb,var(--accent) 60%,transparent)}
 .is-live .hero-signal{background:var(--live);box-shadow:0 0 0 5px var(--live-glow),0 0 18px var(--live)}
 .is-voice .hero-signal{background:var(--green);box-shadow:0 0 0 5px color-mix(in srgb,var(--green) 14%,transparent),0 0 18px color-mix(in srgb,var(--green) 55%,transparent)}
@@ -1709,8 +1720,8 @@ html,body,#root{width:100%;min-width:0;height:100%;height:100dvh}
 }
 
 /* Умеренный планшет: один рабочий слой + вкладки вместо трёх зажатых панелей. */
-@media (min-width:901px) and (max-width:1180px){
-  #app.on{grid-template-columns:64px minmax(0,1fr)}
+@media (min-width:641px) and (max-width:1240px){
+  #app.on{grid-template-columns:64px minmax(0,1fr);padding-left:env(safe-area-inset-left);padding-right:env(safe-area-inset-right)}
   #rail{gap:7px;padding-inline:0}
   .railbtn{width:44px;height:44px}
   #server.on{grid-template-columns:minmax(0,1fr)}
@@ -1718,7 +1729,7 @@ html,body,#root{width:100%;min-width:0;height:100%;height:100dvh}
   #server.on.tab-channels #channels,#server.on.tab-members #members{display:flex}
   #server.on.tab-channels #main,#server.on.tab-members #main{display:none}
   .rz{display:none}
-  #mtabs{display:flex;position:fixed;left:64px;right:0;bottom:0;z-index:20;padding-bottom:env(safe-area-inset-bottom);background:color-mix(in srgb,var(--panel) 94%,transparent);border-top:1px solid var(--line-2);backdrop-filter:blur(18px)}
+  #mtabs{display:flex;position:fixed;left:calc(64px + env(safe-area-inset-left));right:0;bottom:0;z-index:20;padding-right:env(safe-area-inset-right);padding-bottom:env(safe-area-inset-bottom);background:color-mix(in srgb,var(--panel) 94%,transparent);border-top:1px solid var(--line-2);backdrop-filter:blur(18px)}
   #mtabs button{flex:1;min-height:58px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;padding:8px;background:transparent;border-radius:0;color:var(--muted);font-size:11px}
   #mtabs button.active{color:var(--accent-txt)}
   #mtabs .ic{font-size:20px}
@@ -1735,7 +1746,7 @@ html,body,#root{width:100%;min-width:0;height:100%;height:100dvh}
 }
 
 /* Compact desktop сохраняет три панели, но не принимает опасные сохранённые максимумы. */
-@media (min-width:1181px) and (max-width:1360px){
+@media (min-width:1241px) and (max-width:1360px){
   #server.on{grid-template-columns:min(var(--ch-w,290px),280px) minmax(0,1fr) min(var(--mem-w,244px),220px)}
   .rz-ch,.rz-mem{display:none}
 }
@@ -1760,12 +1771,14 @@ html,body,#root{width:100%;min-width:0;height:100%;height:100dvh}
 
 /* Общий mobile/tablet слой. */
 @media (max-width:900px){
-  .home-hd{padding:9px 16px;padding-top:max(9px,env(safe-area-inset-top));padding-right:max(16px,env(safe-area-inset-right));gap:10px}
-  .home-body{padding:18px 16px calc(82px + env(safe-area-inset-bottom));padding-right:max(16px,env(safe-area-inset-right))}
+  .home-hd{padding:9px 16px;padding-top:max(9px,env(safe-area-inset-top));gap:10px}
+  .home-body{padding:18px 16px calc(82px + env(safe-area-inset-bottom))}
   body:has(#voicedock) #home .home-body{padding-bottom:calc(158px + env(safe-area-inset-bottom))}
   body:has(#voicedock) .admin{padding-bottom:calc(158px + env(safe-area-inset-bottom))}
-  body:has(#voicedock .music.open) #home .home-body{padding-bottom:calc(min(68dvh,520px) + 24px + env(safe-area-inset-bottom))}
-  body:has(#voicedock .music.open) .admin{padding-bottom:calc(min(68dvh,520px) + 24px + env(safe-area-inset-bottom))}
+  body:has(#voicedock .music) #home .home-body{padding-bottom:calc(270px + env(safe-area-inset-bottom))}
+  body:has(#voicedock .music) .admin{padding-bottom:calc(270px + env(safe-area-inset-bottom))}
+  body:has(#voicedock .music.open) #home .home-body{padding-bottom:max(158px,calc(min(68dvh,520px) + 24px + env(safe-area-inset-bottom)))}
+  body:has(#voicedock .music.open) .admin{padding-bottom:max(158px,calc(min(68dvh,520px) + 24px + env(safe-area-inset-bottom)))}
   #voicedock{left:max(10px,env(safe-area-inset-left));right:max(10px,env(safe-area-inset-right));bottom:calc(10px + env(safe-area-inset-bottom));width:auto;max-width:430px;margin-inline:auto}
   #voicedock .vd-panel{max-height:min(68dvh,520px);overflow-y:auto;overscroll-behavior:contain}
   #members{padding-bottom:calc(58px + env(safe-area-inset-bottom))}
@@ -1807,6 +1820,21 @@ html,body,#root{width:100%;min-width:0;height:100%;height:100dvh}
   .railbtn.connected::before{width:18px;background:var(--accent)}
   .railbtn .dot{border-color:var(--bg)}
   #mtabs{left:0;padding-left:env(safe-area-inset-left);padding-right:env(safe-area-inset-right)}
+
+  /* На телефоне выбор устройства становится компактным bottom-sheet: оба списка
+     выходят из clipping-контекста VoiceDock и гарантированно помещаются между safe-area. */
+  .vd-devmenu,.vd-devmenu.up{
+    position:fixed;
+    left:max(16px,env(safe-area-inset-left));
+    right:max(16px,env(safe-area-inset-right));
+    top:auto;
+    bottom:calc(16px + env(safe-area-inset-bottom));
+    width:auto;
+    min-width:0;
+    max-width:none;
+    max-height:min(60dvh,360px);
+    transform:none;
+  }
 
   .home-hd{min-height:58px;padding:8px 12px;padding-right:max(12px,env(safe-area-inset-right));padding-left:max(12px,env(safe-area-inset-left))}
   .home-hd .home-brand canvas{width:36px!important;height:36px!important}
@@ -1863,9 +1891,13 @@ html,body,#root{width:100%;min-width:0;height:100%;height:100dvh}
   .lb-val{font-size:12px}.lb-foot{padding-inline:12px}
 }
 
+/* Заранее разгружаем хедер, пока действия ещё показываются с подписями. */
+@media (max-width:520px){
+  .hd-context{display:none}
+}
+
 /* Очень узкие телефоны: header и метрики остаются читаемыми, кнопки не слипаются. */
 @media (max-width:420px){
-  .hd-context{display:none}
   .hd-create,.hd-join{width:44px;padding:0}
   .hd-create>span,.hd-join>span{display:none}
   .home-section-head{display:block}
@@ -1874,7 +1906,7 @@ html,body,#root{width:100%;min-width:0;height:100%;height:100dvh}
   .home-metric small{font-size:9.5px}
   .ha-people>span{display:none}
   .ha-live{display:none}
-  .dl-card{padding:12px}.dl-card .dl-ic{width:40px;height:40px}.dl-btn{min-height:44px}
+  .dl-card{padding:12px}.dl-card .dl-ic{width:40px;height:40px}.dl-btn{width:100%;min-height:44px;flex:1 1 100%;justify-content:center}
   .modal{padding:calc(10px + env(safe-area-inset-top)) max(8px,env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) max(8px,env(safe-area-inset-left))}
   .modal .box,.modal .profile-modal{width:100%;max-width:none;padding:18px;border-radius:18px}
   .modal .profile-modal{padding:0}
@@ -1888,9 +1920,6 @@ html,body,#root{width:100%;min-width:0;height:100%;height:100dvh}
   .chat-in #msgIn{grid-column:1 / 5;grid-row:1;width:100%;min-width:0;height:44px}
   .chat-in #sendBtn{grid-column:5;grid-row:1;width:44px;height:44px}
   .chat-in .emo-toggle{grid-row:2;width:44px;height:44px}
-  .mention-pop{bottom:calc(108px + 58px + env(safe-area-inset-bottom))}
-  .mention-pop.with-reply{bottom:calc(108px + 58px + 40px + env(safe-area-inset-bottom))}
-  #scrollbtn{bottom:122px}
   .typing-ind{padding-inline:10px}
   .reply-bar{margin-inline:8px}
 }
