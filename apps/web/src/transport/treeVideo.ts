@@ -77,19 +77,28 @@ function treeWsUrl(): string {
   return base + (base.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
 }
 
-// Приёмный буфер зрителя 300мс (дефолт Chrome ~50мс). NACK-ретрансмит УЖЕ работает (webrtc-rs
+// Приёмный буфер зрителя (дефолт Chrome ~50мс). NACK-ретрансмит УЖЕ работает (webrtc-rs
 // configure_nack активен на всех H.264-легах — верифицировано), но опоздавший за буфер пакет
-// декодер выбрасывает и фризит до keyframe. Один NACK-цикл ≈ 50-100мс (тик Generator) + RTT
-// (RU↔Москва ~10-40мс); двойной ≈ 150-200мс. 300мс покрывают двойной цикл, оставаясь терпимой
-// задержкой (было 500 — многовато для чистых зрителей; слабым потери компенсирует авто-понижение
-// рендишна). Цена — +~0.3с (бюджет инварианта — «видео < 2с»). Ставим на ОБА приёмника
-// (audio+video): буфер только у видео развёл бы губы со звуком.
-const JITTER_TARGET_MS = 300;
-function bufferReceiver(r: RTCRtpReceiver | null | undefined) {
+// декодер выбрасывает и фризит до keyframe. Буфер АДАПТИВНЫЙ по rtt апстрима: один NACK-цикл
+// ≈ NACK_GENERATOR_INTERVAL(50мс) + rtt, берём ДВА цикла (пакет может потеряться дважды подряд) →
+// target = 2×(50 + rtt) = 100 + 2·rtt, клампим в [300, 600]. Близкий зритель (rtt≈0) держит
+// минимум 300 — не наказываем задержкой; дальний (RU↔Москва 150-250мс) получает до 600, чтобы
+// ретрансмит успел до playout (плоские 300 их не покрывали — двойной цикл при rtt 180 ≈ 460мс).
+// Цена дальнему — до +0.6с (бюджет инварианта — «видео < 2с»). rtt берём из ТОПОЛОГИИ сервера
+// (TreeNode.rtt = n.linkRtt, RR-замер РОДИТЕЛЯ о линке до нас): для веба это parent↔viewer, для
+// натива — vrelay↔Rust (webview-PC лупбек, свой candidate-pair rtt≈0 тут бесполезен). Ставим на
+// ОБА приёмника (audio+video): буфер только у видео развёл бы губы со звуком.
+const JITTER_MIN_MS = 300;
+const JITTER_MAX_MS = 600;
+function jitterTargetForRtt(rttMs: number): number {
+  const t = 100 + 2 * Math.max(0, rttMs || 0); // 2×(NACK_GENERATOR_INTERVAL + rtt)
+  return Math.min(JITTER_MAX_MS, Math.max(JITTER_MIN_MS, t));
+}
+function applyJitterTarget(r: RTCRtpReceiver | null | undefined, targetMs: number) {
   if (!r) return;
   const rr = r as any;
-  try { rr.jitterBufferTarget = JITTER_TARGET_MS; } catch { /**/ }        // стандарт (мс)
-  try { rr.playoutDelayHint = JITTER_TARGET_MS / 1000; } catch { /**/ }   // legacy-имя Chrome (сек)
+  try { rr.jitterBufferTarget = targetMs; } catch { /**/ }        // стандарт (мс)
+  try { rr.playoutDelayHint = targetMs / 1000; } catch { /**/ }   // legacy-имя Chrome (сек)
 }
 
 // Форс H.264 (инвариант 4) на видео-трансивере PC при приёме от родителя (receiver.track video).
@@ -620,7 +629,7 @@ export class TreeVideoTransport implements VideoTransport {
       }
     };
     pc.ontrack = (e) => {
-      bufferReceiver(e.receiver);
+      this.applyJitter(streamId);
       // Оба kind в контейнер: аудио стрима едет тем же <video> (см. upsertTrack).
       this.upsertTrack(streamId, e.track);
     };
@@ -697,7 +706,7 @@ export class TreeVideoTransport implements VideoTransport {
     st.pc = pc;
     pc.onicecandidate = (e) => { if (e.candidate) nativeWatchIce(streamId, e.candidate).catch(() => {}); };
     pc.ontrack = (e) => {
-      bufferReceiver(e.receiver);
+      this.applyJitter(streamId);
       this.upsertTrack(streamId, e.track);
     };
     try {
@@ -726,7 +735,22 @@ export class TreeVideoTransport implements VideoTransport {
   /* ---------- topology / manual peer pick ---------- */
   private setTopology(streamId: string, topo: TreeTopology) {
     this.topologyByStream.set(streamId, topo);
+    // Свежий rtt апстрима → переподстраиваем приёмный буфер (дальнему зрителю больше запаса на
+    // ретрансмит, близкому — минимум). Топология приходит регулярно (health/abr-тик сервера).
+    this.applyJitter(streamId);
     this.topologyCbs.forEach((cb) => cb(streamId));
+  }
+  // Адаптивный jitter-буфер: target из rtt СВОЕГО узла в топологии (RR-замер родителя о линке до
+  // нас). Применяем ко ВСЕМ приёмникам PC (audio+video — иначе рассинхрон губ). Идемпотентно:
+  // зовётся на ontrack (первичное) и на каждый setTopology (rtt-обновление). Нет топологии/rtt=0 →
+  // минимум 300 (прежнее плоское поведение, безопасный дефолт до первого RR).
+  private applyJitter(streamId: string) {
+    const pc = this.watches.get(streamId)?.pc ?? this.nativeWatches.get(streamId)?.pc ?? null;
+    if (!pc) return;
+    const topo = this.topologyByStream.get(streamId);
+    const you = topo?.you ? topo.nodes.find((n) => n.id === topo.you) : null;
+    const target = jitterTargetForRtt(you?.rtt ?? 0);
+    for (const r of pc.getReceivers()) applyJitterTarget(r, target);
   }
   getTopology(streamId: string): TreeTopology | null { return this.topologyByStream.get(streamId) || null; }
   getParentId(streamId: string): string | null {
