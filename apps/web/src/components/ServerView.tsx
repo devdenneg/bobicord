@@ -929,8 +929,16 @@ function Chat() {
   const scrollToBottom = useCallback(() => {
     // Badge очищается только из onAtBottom после фактического достижения true bottom.
     bottomFollowIntentRef.current = true;
+    const scroller = scrollerElementRef.current;
+    const distance = scroller ? Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) : Number.POSITIVE_INFINITY;
+    // Short unread-list уже физически внизу и не может сгенерировать новый scroll event.
+    // Явный клик пользователя в этом случае сам подтверждает bottom/read intent.
+    if (distance <= CHAT_STRICT_BOTTOM_PX) {
+      onAtBottom(true);
+      return;
+    }
     scrollToPhysicalBottom(prefersReducedMotion() ? 'auto' : 'smooth');
-  }, [scrollToPhysicalBottom]);
+  }, [onAtBottom, scrollToPhysicalBottom]);
 
   const bindScroller = useCallback((ref: HTMLElement | null | Window) => {
     detachScrollerRef.current?.();
