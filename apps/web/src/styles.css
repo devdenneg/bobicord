@@ -662,12 +662,11 @@
   .msg.sys.stream-state .tx>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .msg .tx img.emo{height:26px;vertical-align:-7px;margin:-2px 1px}
   .msg .tx.big img.emo{height:44px;vertical-align:-12px}
-  .msg-img-wrap{display:inline-block;max-width:min(340px,100%);border-radius:10px;overflow:hidden;border:1px solid var(--line-2);line-height:0;padding:0;background:none;cursor:zoom-in}
-  .msg-img{display:block;max-width:100%;max-height:300px;object-fit:contain}
+  .msg-img-wrap{display:inline-block;width:min(340px,100%);aspect-ratio:4/3;border-radius:10px;overflow:hidden;border:1px solid var(--line-2);line-height:0;padding:0;background:var(--panel2);cursor:zoom-in}
+  .msg-img{display:block;width:100%;height:100%;object-fit:contain}
   .msg-files{display:flex;flex-direction:column;gap:6px}
   .msg-img-grid{display:flex;flex-wrap:wrap;gap:6px}
-  .msg-img-grid .msg-img-wrap{margin-top:0;max-width:180px}
-  .msg-img-grid .msg-img{max-height:180px}
+  .msg-img-grid .msg-img-wrap{width:min(180px,100%);aspect-ratio:1/1;margin-top:0}
   .msg-file{display:flex;align-items:center;gap:9px;max-width:min(320px,100%);padding:8px 10px;background:var(--panel2);border:1px solid var(--line-2);border-radius:10px;color:var(--txt);transition:background .12s,border-color .12s}
   .msg-file:hover{background:var(--panel3);border-color:var(--line)}
   .msg-file .ic{flex:0 0 auto;color:var(--muted);font-size:19px}
@@ -872,8 +871,9 @@
   .vd-caret:hover,.vd-caret.on{background:var(--panel4);color:var(--txt-h)}
   .vd-caret .ic{font-size:11px}
   .vd-devwrap{position:relative;display:flex}
-  .vd-devmenu{position:absolute;left:0;top:calc(100% + 6px);z-index:75;min-width:210px;max-width:290px;max-height:250px;overflow-y:auto;background:var(--bg2);border:1px solid var(--line-2);border-radius:11px;box-shadow:var(--sh-2);padding:5px}
-  .vd-devmenu.up{top:auto;bottom:calc(100% + 6px)}
+  .vd-devmenu{position:fixed;left:var(--vd-menu-left,8px);top:var(--vd-menu-top,8px);z-index:180;min-width:210px;max-width:290px;max-height:var(--vd-menu-max-height,250px);overflow-y:auto;overscroll-behavior:contain;background:var(--bg2);border:1px solid var(--line-2);border-radius:11px;box-shadow:var(--sh-2);padding:5px;visibility:hidden;transform-origin:left top}
+  .vd-devmenu.ready{visibility:visible}
+  .vd-devmenu.up{transform-origin:left bottom}
   .vd-devh{font-size:10px;font-weight:700;letter-spacing:.5px;color:var(--muted);padding:5px 9px 3px}
   .vd-devitem{display:block;width:100%;text-align:left;padding:7px 9px;border-radius:7px;background:none;color:var(--txt);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .vd-devitem:hover{background:var(--panel3)}
@@ -3172,30 +3172,9 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
   #home .srv-card:hover,#home .live-card:hover{transform:none}
 }
 
-/* Profile banners: local image/GIF or an opaque GIPHY reference. */
-.sr-only{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important}
+/* Uploaded profile image/GIF backgrounds. */
 .profile-banner-media{position:relative;display:block;overflow:hidden;pointer-events:none}
 .profile-banner-media>img{display:block;width:100%;height:100%;object-fit:cover;object-position:center;user-select:none}
-.giphy-mini{
-  position:absolute;
-  z-index:3;
-  right:5px;
-  bottom:4px;
-  display:inline-flex;
-  align-items:center;
-  padding:2px 3px;
-  border:1px solid rgba(255,255,255,.18);
-  border-radius:5px;
-  background:rgba(5,6,10,.72);
-  box-shadow:0 2px 7px rgba(0,0,0,.38);
-}
-.giphy-mini img{display:block;width:42px;height:auto}
-.giphy-credit{z-index:5;display:inline-flex;align-items:center;gap:6px;max-width:min(230px,72%);padding:4px 6px;border:1px solid rgba(255,255,255,.16);border-radius:7px;background:rgba(5,6,10,.78);box-shadow:0 4px 13px rgba(0,0,0,.3);backdrop-filter:blur(8px)}
-.giphy-credit>a{min-width:0;display:flex;align-items:center;color:#f4f5fa;text-decoration:none}
-.giphy-credit>a:first-child{flex:0 0 auto}
-.giphy-credit img{display:block;width:72px;height:auto}
-.giphy-credit .giphy-credit-source,.giphy-credit>i{overflow:hidden;color:#d9dce8;font:650 9px/1.2 var(--ui);font-style:normal;text-overflow:ellipsis;white-space:nowrap}
-.giphy-credit .giphy-credit-source:hover{color:#fff;text-decoration:underline}
 
 /* В строке картинка живёт только в собственном clipped-слое: LIVE badge не режется. */
 .pi .head.has-profile-banner{position:relative;isolation:isolate}
@@ -3218,8 +3197,6 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
   transition:opacity var(--workspace-ease),filter var(--workspace-ease),transform 360ms ease;
 }
 .pi .head:hover .member-row-banner>img,.pi .head:focus-visible .member-row-banner>img{opacity:.72;filter:saturate(1) brightness(.78) contrast(1.04);transform:scale(1.015)}
-.member-row-banner .giphy-mini{right:3px;bottom:2px;padding:1px 2px;opacity:.78}
-.member-row-banner .giphy-mini img{width:34px}
 #members .member-row-banner{width:68%}
 .vchan-list .member-row-banner{width:61%}
 
@@ -3235,8 +3212,6 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
   pointer-events:none;
   background:linear-gradient(90deg,color-mix(in srgb,var(--workspace-side) 36%,transparent),transparent 58%),linear-gradient(0deg,color-mix(in srgb,var(--workspace-side) 52%,transparent),transparent 62%);
 }
-.pcard-cover-banner .giphy-mini{right:7px;bottom:6px}
-.pcard-banner-credit{position:absolute;top:11px;right:11px}
 
 /* Profile editor preview and controls. */
 .modal .profile-modal{display:flex;max-height:calc(100dvh - 32px);flex-direction:column}
@@ -3253,8 +3228,6 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .pm-hero>:not(.pm-hero-banner){position:relative;z-index:2}
 .pm-hero-banner{position:absolute!important;z-index:0!important;inset:0;width:100%;height:100%}
 .pm-hero-banner>img{opacity:.9;filter:saturate(.96) brightness(.78);transform:scale(1.02)}
-.pm-hero-banner .giphy-mini{right:10px;bottom:8px}
-.pm-hero>.pm-banner-credit{position:absolute;right:10px;bottom:8px}
 .pm-av{border:3px solid color-mix(in srgb,var(--workspace-side) 86%,transparent);box-shadow:0 12px 26px -12px #000,inset 0 0 0 1px rgba(255,255,255,.12)}
 .pm-banner-actions{
   position:absolute!important;
@@ -3286,42 +3259,11 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .pm-banner-actions .spin{width:13px;height:13px;margin:0}
 .pm-body{min-height:0;overflow-y:auto;overscroll-behavior:contain}
 
-/* GIPHY search is intentionally direct-to-client per GIPHY API requirements. */
-.giphy-picker{margin:10px 0 14px;padding:10px;border:1px solid var(--workspace-stroke);border-radius:13px;background:var(--workspace-raised);box-shadow:inset 0 1px 0 rgba(255,255,255,.025)}
-.giphy-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
-.giphy-head>div{min-width:0;display:flex;flex-direction:column;gap:2px}
-.giphy-head b{color:var(--txt-h);font-size:12.5px}.giphy-head span{overflow:hidden;color:var(--muted);font-size:9.5px;text-overflow:ellipsis;white-space:nowrap}
-.giphy-head button{width:32px;height:32px;flex:0 0 auto;border:1px solid var(--workspace-stroke);border-radius:9px;background:var(--workspace-side);color:var(--txt)}
-.giphy-head button:hover{border-color:var(--workspace-stroke-hi);background:var(--workspace-hover);color:var(--txt-h)}
-.giphy-search{height:40px;display:flex;align-items:center;gap:8px;padding:0 10px;border:1px solid var(--workspace-stroke);border-radius:10px;background:var(--workspace-bg);color:var(--muted)}
-.giphy-search:focus-within{border-color:var(--workspace-stroke-hi);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 10%,transparent)}
-.giphy-search input{flex:1;min-width:0;height:100%;padding:0;border:0!important;background:transparent!important;box-shadow:none!important;color:var(--txt-h);font-size:13px}
-.giphy-search .spin{width:15px;height:15px;margin:0}
-.giphy-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;max-height:286px;margin-top:8px;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
-.giphy-item{position:relative;min-width:0;aspect-ratio:1.35;overflow:hidden;padding:0;border:1px solid transparent;border-radius:9px;background:var(--workspace-bg)}
-.giphy-item:hover,.giphy-item:focus-visible{border-color:var(--accent-txt);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 16%,transparent)}
-.giphy-item img{display:block;width:100%;height:100%;object-fit:cover;transition:transform 180ms ease,filter 180ms ease}
-.giphy-item:hover img{transform:scale(1.035);filter:brightness(1.08)}
-.giphy-item span{position:absolute;right:4px;bottom:4px;max-width:calc(100% - 8px);overflow:hidden;padding:3px 5px;border-radius:5px;background:rgba(0,0,0,.72);color:#fff;font-size:9px;text-overflow:ellipsis;white-space:nowrap}
-.giphy-state{display:flex;align-items:center;justify-content:center;min-height:72px;padding:12px;color:var(--muted);font-size:11.5px;text-align:center}
-.giphy-state.err{color:var(--red)}
-.giphy-state.setup{min-height:150px;flex-direction:column;gap:7px;border:1px dashed var(--workspace-stroke);border-radius:10px;background:var(--workspace-bg)}
-.giphy-state.setup>.ic{font-size:21px;color:var(--yellow)}
-.giphy-state.setup b{color:var(--txt-h);font-size:12.5px}.giphy-state.setup span{max-width:310px;line-height:1.45}
-.giphy-state code{padding:2px 4px;border-radius:4px;background:var(--workspace-raised);color:var(--accent-txt);font-size:10px}
-.giphy-state a{color:var(--accent-txt);font-weight:700;text-decoration:none}.giphy-state a:hover{text-decoration:underline}
-.giphy-powered{width:max-content;display:flex;align-items:center;margin:10px 2px 0 auto;padding:5px 7px;border-radius:7px;background:#08090d;text-decoration:none}
-.giphy-powered img{display:block;width:96px;height:auto}
-
 @media (max-width:520px){
   .pm-banner-actions{right:52px}
   .pm-banner-actions button{padding-inline:8px}
   .pm-banner-actions>button:first-child>span:last-child{display:none}
-  .giphy-grid{grid-template-columns:repeat(2,minmax(0,1fr));max-height:320px}
-  .giphy-credit{max-width:62%;gap:4px;padding:3px 5px}
-  .giphy-credit img{width:62px}
-  .giphy-credit .giphy-credit-source,.giphy-credit>i{font-size:8px}
 }
 @media (prefers-reduced-motion:reduce){
-  .member-row-banner>img,.giphy-item img{transition:none;transform:none!important}
+  .member-row-banner>img{transition:none;transform:none!important}
 }

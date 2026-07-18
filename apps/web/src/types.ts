@@ -144,6 +144,10 @@ export interface Attachment {
   size: number;
   mime: string;
   kind: 'image' | 'file';
+  // Сервер возвращает реальные размеры загруженной картинки. Они позволяют
+  // зарезервировать место до decode и не менять высоту строки Virtuoso на onLoad.
+  width?: number;
+  height?: number;
 }
 
 export interface ChatMessage {

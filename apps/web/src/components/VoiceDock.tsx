@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Room } from 'livekit-client';
 import { useStore, getEngine } from '../store';
 import { useEngine } from '../hooks';
@@ -57,10 +58,12 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
   const [open, setOpen] = useState(false);
   const [devs, setDevs] = useState<MediaDeviceInfo[]>([]);
   const [activeIndex, setActiveIndex] = useState(0);
+  const [position, setPosition] = useState<{ left: number; top: number; maxHeight: number; above: boolean } | null>(null);
   const cur = kind === 'input' ? getSettings().input : getSettings().output;
   const ref = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const openFocusRef = useRef<'selected' | 'first' | 'last'>('selected');
   const optionCount = devs.length + 1;
   const focusOption = (index: number) => {
     const next = Math.max(0, Math.min(optionCount - 1, index));
@@ -69,27 +72,104 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
   };
   const closeMenu = (restoreFocus = false) => {
     setOpen(false);
+    setPosition(null);
     if (restoreFocus) requestAnimationFrame(() => triggerRef.current?.focus());
   };
   const openMenu = (initial: 'selected' | 'first' | 'last' = 'selected') => {
+    openFocusRef.current = initial;
     const selected = cur ? devs.findIndex((device) => device.deviceId === cur) + 1 : 0;
     const next = initial === 'first' ? 0 : initial === 'last' ? optionCount - 1 : Math.max(0, selected);
     setActiveIndex(next);
+    setPosition(null);
     setOpen(true);
     requestAnimationFrame(() => menuRef.current?.querySelector<HTMLElement>(`[data-menu-index="${next}"]`)?.focus());
   };
   useEffect(() => {
     if (!open) return;
-    const load = () => Room.getLocalDevices(kind === 'input' ? 'audioinput' : 'audiooutput').then((d) => setDevs(d as MediaDeviceInfo[])).catch(() => {});
+    const load = () => Room.getLocalDevices(kind === 'input' ? 'audioinput' : 'audiooutput').then((devices) => {
+      const nextDevices = devices as MediaDeviceInfo[];
+      setDevs(nextDevices);
+      const selected = cur ? nextDevices.findIndex((device) => device.deviceId === cur) + 1 : 0;
+      const intent = openFocusRef.current;
+      const next = intent === 'first' ? 0 : intent === 'last' ? nextDevices.length : Math.max(0, selected);
+      openFocusRef.current = 'selected';
+      setActiveIndex(next);
+      requestAnimationFrame(() => menuRef.current?.querySelector<HTMLElement>(`[data-menu-index="${next}"]`)?.focus());
+    }).catch(() => {});
     load();
-    const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) closeMenu(); };
-    document.addEventListener('mousedown', onDoc);
+    const onDoc = (e: PointerEvent) => {
+      const target = e.target as Node | null;
+      if (!target || ref.current?.contains(target) || menuRef.current?.contains(target)) return;
+      closeMenu();
+    };
+    document.addEventListener('pointerdown', onDoc, true);
     navigator.mediaDevices?.addEventListener?.('devicechange', load);
     return () => {
-      document.removeEventListener('mousedown', onDoc);
+      document.removeEventListener('pointerdown', onDoc, true);
       navigator.mediaDevices?.removeEventListener?.('devicechange', load);
     };
-  }, [open, kind]);
+  }, [open, kind, cur]);
+  useLayoutEffect(() => {
+    if (!open) return;
+    let frame = 0;
+    const update = () => {
+      frame = 0;
+      const trigger = triggerRef.current;
+      const menu = menuRef.current;
+      if (!trigger || !menu) return;
+
+      const triggerRect = trigger.getBoundingClientRect();
+      const menuWidth = menu.offsetWidth || 210;
+      const naturalHeight = Math.min(menu.scrollHeight || menu.offsetHeight || 250, 250);
+      const viewportWidth = document.documentElement.clientWidth;
+      const viewportHeight = document.documentElement.clientHeight;
+      const gutter = 8;
+      const gap = 6;
+      const availableAbove = Math.max(0, triggerRect.top - gap - gutter);
+      const availableBelow = Math.max(0, viewportHeight - gutter - triggerRect.bottom - gap);
+      const preferredSpace = up ? availableAbove : availableBelow;
+      const fallbackSpace = up ? availableBelow : availableAbove;
+      const usePreferredSide = preferredSpace >= naturalHeight || preferredSpace >= fallbackSpace;
+      const placeAbove = usePreferredSide ? !!up : !up;
+      const available = placeAbove ? availableAbove : availableBelow;
+      const maxHeight = Math.max(1, Math.min(250, available));
+      const renderedHeight = Math.min(naturalHeight, maxHeight);
+      const maxLeft = Math.max(gutter, viewportWidth - gutter - menuWidth);
+      const left = Math.min(Math.max(triggerRect.left, gutter), maxLeft);
+      const desiredTop = placeAbove ? triggerRect.top - gap - renderedHeight : triggerRect.bottom + gap;
+      const maxTop = Math.max(gutter, viewportHeight - gutter - renderedHeight);
+      const top = Math.min(Math.max(desiredTop, gutter), maxTop);
+
+      setPosition((current) => current
+        && Math.abs(current.left - left) < .5
+        && Math.abs(current.top - top) < .5
+        && Math.abs(current.maxHeight - maxHeight) < .5
+        && current.above === placeAbove
+        ? current
+        : { left, top, maxHeight, above: placeAbove });
+    };
+    const scheduleUpdate = () => {
+      if (frame) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(update);
+    };
+
+    update();
+    window.addEventListener('resize', scheduleUpdate);
+    window.addEventListener('scroll', scheduleUpdate, true);
+    window.visualViewport?.addEventListener('resize', scheduleUpdate);
+    window.visualViewport?.addEventListener('scroll', scheduleUpdate);
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(scheduleUpdate);
+    if (menuRef.current) observer?.observe(menuRef.current);
+    if (triggerRef.current) observer?.observe(triggerRef.current);
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      window.removeEventListener('resize', scheduleUpdate);
+      window.removeEventListener('scroll', scheduleUpdate, true);
+      window.visualViewport?.removeEventListener('resize', scheduleUpdate);
+      window.visualViewport?.removeEventListener('scroll', scheduleUpdate);
+      observer?.disconnect();
+    };
+  }, [devs.length, open, up]);
   useEffect(() => {
     if (open && activeIndex >= optionCount) focusOption(optionCount - 1);
   }, [activeIndex, open, optionCount]);
@@ -123,30 +203,38 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
       closeMenu();
     }
   };
-  return (
+  const menu = open && typeof document !== 'undefined' ? createPortal(
+    <div ref={menuRef} id={`vd-device-${kind}`}
+      className={'vd-devmenu' + ((position?.above ?? up) ? ' up' : '') + (position ? ' ready' : '')}
+      style={position ? {
+        '--vd-menu-left': `${position.left}px`,
+        '--vd-menu-top': `${position.top}px`,
+        '--vd-menu-max-height': `${position.maxHeight}px`,
+      } as React.CSSProperties : undefined}
+      role="menu" aria-label={kind === 'input' ? 'Микрофоны' : 'Устройства вывода'} onKeyDown={onMenuKeyDown}>
+      <div className="vd-devh" aria-hidden="true">{kind === 'input' ? 'МИКРОФОН' : 'ВЫВОД ЗВУКА'}</div>
+      <button role="menuitemradio" aria-checked={!cur} tabIndex={activeIndex === 0 ? 0 : -1} data-menu-index="0"
+        className={'vd-devitem' + (!cur ? ' on' : '')} onFocus={() => setActiveIndex(0)} onClick={() => pick('')}>По умолчанию</button>
+      {devs.map((d, index) => (
+        <button role="menuitemradio" aria-checked={cur === d.deviceId} tabIndex={activeIndex === index + 1 ? 0 : -1}
+          data-menu-index={index + 1} key={d.deviceId} className={'vd-devitem' + (cur === d.deviceId ? ' on' : '')}
+          onFocus={() => setActiveIndex(index + 1)} onClick={() => pick(d.deviceId)}>
+          {d.label || 'Устройство ' + d.deviceId.slice(0, 6)}
+        </button>
+      ))}
+    </div>,
+    document.body,
+  ) : null;
+  return <>
     <div className="vd-devwrap" ref={ref}>
       <button ref={triggerRef} className={'vd-caret' + (open ? ' on' : '')} aria-expanded={open} aria-haspopup="menu" aria-controls={`vd-device-${kind}`}
         aria-label={kind === 'input' ? 'Выбрать микрофон' : 'Выбрать устройство вывода'}
-        data-tip={kind === 'input' ? 'Выбрать микрофон' : 'Выбрать устройство вывода'}
+        data-tip={open ? undefined : (kind === 'input' ? 'Выбрать микрофон' : 'Выбрать устройство вывода')}
         onKeyDown={onTriggerKeyDown}
         onClick={() => open ? closeMenu() : openMenu()}><Icon name="chevron" sm /></button>
-      {open ? (
-        <div ref={menuRef} id={`vd-device-${kind}`} className={'vd-devmenu' + (up ? ' up' : '')} role="menu"
-          aria-label={kind === 'input' ? 'Микрофоны' : 'Устройства вывода'} onKeyDown={onMenuKeyDown}>
-          <div className="vd-devh" aria-hidden="true">{kind === 'input' ? 'МИКРОФОН' : 'ВЫВОД ЗВУКА'}</div>
-          <button role="menuitemradio" aria-checked={!cur} tabIndex={activeIndex === 0 ? 0 : -1} data-menu-index="0"
-            className={'vd-devitem' + (!cur ? ' on' : '')} onFocus={() => setActiveIndex(0)} onClick={() => pick('')}>По умолчанию</button>
-          {devs.map((d, index) => (
-            <button role="menuitemradio" aria-checked={cur === d.deviceId} tabIndex={activeIndex === index + 1 ? 0 : -1}
-              data-menu-index={index + 1} key={d.deviceId} className={'vd-devitem' + (cur === d.deviceId ? ' on' : '')}
-              onFocus={() => setActiveIndex(index + 1)} onClick={() => pick(d.deviceId)}>
-              {d.label || 'Устройство ' + d.deviceId.slice(0, 6)}
-            </button>
-          ))}
-        </div>
-      ) : null}
     </div>
-  );
+    {menu}
+  </>;
 }
 
 // Ряд контролов: мик (+▾ вход), наушники/оглох (+▾ вывод), трансляция, настройки. up — меню вверх (для дока внизу).

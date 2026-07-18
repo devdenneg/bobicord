@@ -93,14 +93,14 @@ export const api = {
   me: () => req<{ user: User; servers: ServerSummary[] }>('GET', '/me'),
   updateMe: (patch: { displayName?: string; bio?: string; avatarColor?: number; avatarUrl?: string; profileBannerUrl?: string }) =>
     req<{ user: User }>('PATCH', '/me', patch),
-  uploadImage: async (file: Blob): Promise<{ url: string }> => {
+  uploadImage: async (file: Blob): Promise<{ url: string; width: number; height: number }> => {
     const headers: Record<string, string> = { 'Content-Type': file.type || 'application/octet-stream' };
     if (token) headers['Authorization'] = 'Bearer ' + token;
     const r = await fetch(API_BASE + '/api/upload', { method: 'POST', headers, body: file });
     let d: any = {};
     try { d = await r.json(); } catch { /* ignore */ }
     if (!r.ok) throw new Error(d?.error || 'Ошибка ' + r.status);
-    return d as { url: string };
+    return d as { url: string; width: number; height: number };
   },
   uploadProfileBanner: async (file: Blob, signal?: AbortSignal): Promise<{ url: string }> => {
     const headers: Record<string, string> = { 'Content-Type': file.type || 'application/octet-stream' };

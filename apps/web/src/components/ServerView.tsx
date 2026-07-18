@@ -11,7 +11,7 @@ import { EmoteImg } from './EmoteImg';
 import { EmotePicker } from './EmotePicker';
 import { VoiceDock, VoiceControls } from './VoiceDock';
 import { StreamerWidget } from './StreamerWidget';
-import { ProfileBannerAttribution, ProfileBannerMedia } from './ProfileBanner';
+import { normalizeProfileBanner, ProfileBannerMedia } from './ProfileBanner';
 import { getSettings, setSettings } from '../settings';
 import { fmtDuration, levelProgress } from '../leveling';
 import { playSound } from '../sounds';
@@ -162,7 +162,7 @@ function ProfileCard({ m, rect, onEnter, onLeave }: { m: Member; rect: DOMRect; 
   const presence = streaming ? 'В эфире' : pr?.inVoice ? 'В голосовом канале' : pr?.away ? 'Отошёл' : pr?.online ? 'В сети' : 'Не в сети';
   const presenceClass = streaming ? 'live' : pr?.online ? 'online' : 'offline';
   const bio = ((me && m.username === me.username ? (me.bio || m.bio) : m.bio) || '').trim();
-  const profileBannerUrl = me && m.username === me.username ? (me.profileBannerUrl ?? '') : m.profileBannerUrl;
+  const profileBannerUrl = normalizeProfileBanner(me && m.username === me.username ? me.profileBannerUrl : m.profileBannerUrl);
   useEffect(() => {
     if (!active?.statsEnabled || m.stats) { setFallbackStats(null); setStatsFailed(false); setStatsEmpty(false); return; }
     let alive = true;
@@ -185,9 +185,8 @@ function ProfileCard({ m, rect, onEnter, onLeave }: { m: Member; rect: DOMRect; 
   return (
     <div className={'pcard' + (streaming ? ' is-live' : '')} style={style} onMouseEnter={onEnter} onMouseLeave={onLeave}>
       <div className={'pcard-cover' + (profileBannerUrl ? ' has-media' : '')} aria-hidden="true">
-        <ProfileBannerMedia value={profileBannerUrl} className="pcard-cover-banner" attribution={false} />
+        <ProfileBannerMedia value={profileBannerUrl} className="pcard-cover-banner" />
       </div>
-      <ProfileBannerAttribution value={profileBannerUrl} className="pcard-banner-credit" />
       <div className="pcard-head">
         <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} size={78} live={streaming} dot={pr?.online ? 'online' : 'offline'} />
         <span className={'pcard-presence ' + presenceClass}><i />{presence}</span>
@@ -282,7 +281,7 @@ function VoiceParticipantRow({ m, anim }: { m: Member; anim?: string }) {
   const streaming = pr?.streaming;
   const isLocal = m.username === me.username;
   const remote = !isLocal;
-  const profileBannerUrl = isLocal ? (me.profileBannerUrl ?? '') : m.profileBannerUrl;
+  const profileBannerUrl = normalizeProfileBanner(isLocal ? me.profileBannerUrl : m.profileBannerUrl);
   const watching = !!eng.watching[m.username];
   const pending = !!eng.pending[m.username];
   const [vol, setVol] = useState(() => Math.round(E.userVolOf(m.username) * 100));
@@ -595,7 +594,7 @@ function MemberRow({ m, anim }: { m: Member; anim?: string }) {
   const st = pr?.inVoice ? 'voice' : pr?.away ? 'away' : pr?.online ? 'online' : 'offline';
   const streaming = pr?.streaming;
   const self = m.username === me.username;
-  const profileBannerUrl = self ? (me.profileBannerUrl ?? '') : m.profileBannerUrl;
+  const profileBannerUrl = normalizeProfileBanner(self ? me.profileBannerUrl : m.profileBannerUrl);
   const watching = !!eng.watching[m.username];
   const pending = !!eng.pending[m.username];
   const canKick = !!active && active.ownerId === me.id && !self && m.role !== 'owner';
@@ -834,7 +833,25 @@ function ImageLightbox({ attachment, onClose }: { attachment: Attachment; onClos
 
 // вложения сообщения: картинки — грид миниатюр (клик → лайтбокс), остальные файлы — чипы со
 // скачиванием (форс-download на сервере, см. GET /api/files/:name — не инлайн, любое расширение).
-function MessageAttachments({ files, onImageClick, onImageLoad }: { files: Attachment[]; onImageClick: (a: Attachment) => void; onImageLoad?: () => void }) {
+function messageImageStyle(file?: Pick<Attachment, 'width' | 'height'>, compact = false): CSSProperties {
+  const maxWidth = compact ? 180 : 340;
+  const maxHeight = compact ? 180 : 300;
+  const width = Number(file?.width);
+  const height = Number(file?.height);
+  if (!(width > 0 && height > 0)) {
+    return { width: `min(${maxWidth}px, 100%)`, aspectRatio: compact ? '1 / 1' : '4 / 3' };
+  }
+  // Keep hostile/corrupt metadata from creating a thousands-of-pixels-tall row.
+  // The image itself remains fully visible through object-fit inside this safe frame.
+  const ratio = Math.max(.2, Math.min(5, width / height));
+  const displayWidth = Math.min(maxWidth, width, maxHeight * ratio);
+  return {
+    width: `min(${Math.max(1, Math.round(displayWidth))}px, 100%)`,
+    aspectRatio: String(ratio),
+  };
+}
+
+function MessageAttachments({ files, onImageClick }: { files: Attachment[]; onImageClick: (a: Attachment) => void }) {
   const toast = useStore((s) => s.toast);
   const downloads = useSyncExternalStore(subscribeDownloads, getDownloads);
   const images = files.filter((f) => f.kind === 'image');
@@ -854,8 +871,8 @@ function MessageAttachments({ files, onImageClick, onImageLoad }: { files: Attac
       {images.length ? (
         <div className="msg-img-grid">
           {images.map((f, i) => (
-            <button key={i} className="msg-img-wrap" onClick={() => onImageClick(f)}>
-              <img className="msg-img" src={resolveUploadUrl(f.url)} alt="" loading="lazy" onLoad={onImageLoad} />
+            <button key={i} className="msg-img-wrap" style={messageImageStyle(f, true)} onClick={() => onImageClick(f)}>
+              <img className="msg-img" src={resolveUploadUrl(f.url)} alt="" loading="lazy" />
             </button>
           ))}
         </div>
@@ -1009,8 +1026,9 @@ function Chat() {
   const detachScrollerRef = useRef<(() => void) | null>(null);
   const bottomStackRef = useRef<HTMLDivElement>(null);
   const bottomLockFrameRef = useRef<number | null>(null);
-  const bottomHeightTimerRef = useRef<number | null>(null);
-  const lastTotalListHeightRef = useRef<number | null>(null);
+  const bottomLockPassesRef = useRef(0);
+  const ownSendPendingRef = useRef(false);
+  const ownSendSettlingRef = useRef(false);
   const [pill, setPill] = useState(0);            // счётчик непрочитанных (пока не внизу)
   const [atBottom, setAtBottom] = useState(true);
   // Строгое состояние atBottom (<=8px) управляет read receipt, badge и кнопкой перехода вниз.
@@ -1054,6 +1072,7 @@ function Chat() {
     }
   }
   const isSuffixAppend = appendedMessages.length > 0;
+  const ownExplicitAppend = isSuffixAppend && ownSendPendingRef.current && appendedMessages.some((message) => message.mine);
   // Только authoritative pin/локальный send могут подхватить append. `mine` не подходит:
   // своё сообщение с другой вкладки не должно вырывать текущую вкладку из читаемой истории.
   const shouldFollowAppend = isSuffixAppend && bottomFollowIntentRef.current;
@@ -1076,47 +1095,56 @@ function Chat() {
   }, []);
   const cancelBottomLockFrames = useCallback(() => {
     if (bottomLockFrameRef.current != null) window.cancelAnimationFrame(bottomLockFrameRef.current);
-    if (bottomHeightTimerRef.current != null) window.clearTimeout(bottomHeightTimerRef.current);
     bottomLockFrameRef.current = null;
-    bottomHeightTimerRef.current = null;
+    bottomLockPassesRef.current = 0;
+    ownSendSettlingRef.current = false;
   }, []);
   const detachBottomFollow = useCallback(() => {
     bottomFollowIntentRef.current = false;
     bottomFollowGenerationRef.current += 1;
     cancelBottomLockFrames();
   }, [cancelBottomLockFrames]);
-  const lockToBottom = useCallback(() => {
+  const lockToBottom = useCallback((passes = 1) => {
     const generation = bottomFollowGenerationRef.current;
     const canFollow = () => bottomFollowIntentRef.current && bottomFollowGenerationRef.current === generation;
     if (!canFollow()) return;
-    cancelBottomLockFrames();
-    // One coalesced correction after layout is enough. Further real height changes arrive via
-    // totalListHeightChanged and replace this RAF instead of stacking competing scroll writes.
-    bottomLockFrameRef.current = window.requestAnimationFrame(() => {
+    // Never let a one-frame composer/ResizeObserver correction downgrade the stronger
+    // bounded settle used by an explicit send. Calls coalesce by taking the larger budget.
+    bottomLockPassesRef.current = Math.max(bottomLockPassesRef.current, Math.max(1, passes));
+    if (bottomLockFrameRef.current != null) return;
+    const run = () => {
       bottomLockFrameRef.current = null;
-      if (!canFollow()) return;
+      if (!canFollow()) {
+        bottomLockPassesRef.current = 0;
+        ownSendSettlingRef.current = false;
+        return;
+      }
       scrollToPhysicalBottom('auto');
-    });
-  }, [cancelBottomLockFrames, scrollToPhysicalBottom]);
-  const onTotalListHeightChanged = useCallback((height: number) => {
-    const previousHeight = lastTotalListHeightRef.current;
-    lastTotalListHeightRef.current = height;
-    if (!bottomFollowIntentRef.current) return;
-    if (previousHeight != null && Math.abs(height - previousHeight) < 0.01) return;
-    if (bottomHeightTimerRef.current != null) window.clearTimeout(bottomHeightTimerRef.current);
-    const generation = bottomFollowGenerationRef.current;
-    // Trailing correction: animated/fractional measurements are allowed to settle while Virtuoso
-    // owns the active scroll. We only verify the physical bottom once after the resize burst.
-    bottomHeightTimerRef.current = window.setTimeout(() => {
-      bottomHeightTimerRef.current = null;
-      if (!bottomFollowIntentRef.current || bottomFollowGenerationRef.current !== generation) return;
-      lockToBottom();
-    }, 64);
-  }, [lockToBottom]);
+      bottomLockPassesRef.current = Math.max(0, bottomLockPassesRef.current - 1);
+      if (bottomLockPassesRef.current > 0) {
+        bottomLockFrameRef.current = window.requestAnimationFrame(run);
+        return;
+      }
+      if (ownSendSettlingRef.current) {
+        ownSendSettlingRef.current = false;
+        const scroller = scrollerElementRef.current;
+        const distance = scroller ? Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) : 0;
+        const reachedBottom = distance <= CHAT_STRICT_BOTTOM_PX;
+        setAtBottom(reachedBottom);
+        if (reachedBottom) setPill(0);
+      }
+    };
+    bottomLockFrameRef.current = window.requestAnimationFrame(run);
+  }, [scrollToPhysicalBottom]);
   const onAtBottom = useCallback((reportedBottom: boolean) => {
     // На unread-entry Virtuoso может кратко сообщить true на пустой/ещё не позиционированной
     // геометрии. Bottom принимается только если pin уже разрешён explicit/user-down intent.
-    const b = reportedBottom && bottomFollowIntentRef.current;
+    if (!reportedBottom && ownSendSettlingRef.current && bottomFollowIntentRef.current) return;
+    const scroller = scrollerElementRef.current;
+    const physicalDistance = scroller ? Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) : Number.POSITIVE_INFINITY;
+    // Ignore a stale Virtuoso `false` emitted from the pre-layout geometry when the DOM is
+    // already at the real bottom. This is what previously flashed the down-arrow after send.
+    const b = (reportedBottom || physicalDistance <= CHAT_STRICT_BOTTOM_PX) && bottomFollowIntentRef.current;
     setAtBottom(b);
     if (b) {
       setPill(0);
@@ -1251,11 +1279,20 @@ function Chat() {
       tailId: messages.length ? messages[messages.length - 1].id : null,
       count: messages.length,
     };
-    if (shouldFollowAppend) {
+    if (ownExplicitAppend) {
+      ownSendPendingRef.current = false;
       bottomFollowIntentRef.current = true;
+      ownSendSettlingRef.current = true;
+      setAtBottom(true);
+      setPill(0);
+      // Index alignment gives Virtuoso the semantic target; three bounded physical passes
+      // cover its row/footer measurement and the composer shrinking in the same commit.
+      virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' });
+      lockToBottom(3);
+    } else if (shouldFollowAppend && !atBottom) {
       lockToBottom();
     }
-  }, [activeId, historyGeneration, messages, shouldFollowAppend, lockToBottom]);
+  }, [activeId, historyGeneration, messages, ownExplicitAppend, shouldFollowAppend, atBottom, lockToBottom]);
 
   // Нижняя область меняет высоту из-за reply, вложений, update-banner, mobile wrapping и клавиатуры.
   // ResizeObserver удерживает низ только если пользователь был реально pinned; читающего историю
@@ -1292,7 +1329,7 @@ function Chat() {
     const startPinned = unreadServer === 0;
     bottomFollowGenerationRef.current += 1;
     cancelBottomLockFrames();
-    lastTotalListHeightRef.current = null;
+    ownSendPendingRef.current = false;
     setPill(unreadServer > 0 ? Math.max(unreadHere, unreadServer) : 0);
     setAtBottom(startPinned);
     bottomFollowIntentRef.current = startPinned;
@@ -1305,8 +1342,8 @@ function Chat() {
     olderReady.current = false;
     setDividerFade(false);
     const t = window.setTimeout(() => { olderReady.current = true; }, 700);
-    // После первого физического scroll любое последующее измерение общей высоты ловит
-    // totalListHeightChanged. Pin живёт без таймаута и снимается только ручным уходом вверх.
+    // После первого физического scroll поздние измерения строк удерживает followOutput.
+    // Pin живёт без таймаута и снимается только ручным уходом вверх.
     if (startPinned) lockToBottom();
     return () => {
       bottomFollowIntentRef.current = false;
@@ -1428,12 +1465,6 @@ function Chat() {
     const last = messages.length ? messages[messages.length - 1] : null;
     if (last && last.id === target.id && bottomFollowIntentRef.current) requestAnimationFrame(lockToBottom);
   }, [E, messages, lockToBottom]);
-  const onMessageImageLoad = useCallback(() => {
-    // Изображение получает реальную высоту асинхронно. Удерживаем его в поле зрения только для
-    // pinned/forced чата; при чтении истории измерение строки не меняет пользовательский якорь.
-    if (bottomFollowIntentRef.current) lockToBottom();
-  }, [lockToBottom]);
-
   async function runCommand(raw: string) {
     const active = useStore.getState().active;
     const [cmd] = raw.slice(1).split(/\s+/);
@@ -1466,8 +1497,8 @@ function Chat() {
           let attachment: Attachment;
           if (kind === 'image') {
             const small = await downscaleImage(f);
-            const { url } = await api.uploadImage(small);
-            attachment = { url, name: small.name, size: small.size, mime: small.type, kind: 'image' };
+            const { url, width, height } = await api.uploadImage(small);
+            attachment = { url, name: small.name, size: small.size, mime: small.type, kind: 'image', width, height };
           } else {
             const { url, name, size } = await api.uploadFile(f);
             attachment = { url, name, size, mime: f.type, kind: 'file' };
@@ -1503,9 +1534,14 @@ function Chat() {
     // Ставим intent ДО синхронного optimistic push в engine: собственный append обязан дойти
     // до true bottom, даже если пользователь перед отправкой читал историю.
     bottomFollowIntentRef.current = true;
+    ownSendPendingRef.current = true;
+    ownSendSettlingRef.current = true;
+    setAtBottom(true);
+    setPill(0);
     const em: Record<string, string> = {};
     t.split(/\s+/).forEach((w) => { if (emoteMap.has(w)) em[w] = emoteMap.get(w)!; });
     E.sendChatWithEmotes(t, em, undefined, replyTo ? buildReplyRef(replyTo) : undefined, ready.length ? ready : undefined);
+    staged.forEach((item) => { if (item.previewUrl) URL.revokeObjectURL(item.previewUrl); });
     setText(''); setReplyTo(null); setStaged([]);
     if (activeId) localStorage.removeItem(DRAFT_KEY + activeId); // отправлено — черновик снят
     // Реальный доскролл выполняет suffix-append layout effect уже после появления сообщения в data.
@@ -1658,8 +1694,8 @@ function Chat() {
                     {m.edited && !m.sys ? <span className="medit" title="Изменено">(изменено)</span> : null}
                   </div>
                 ) : null}
-                {m.img ? <button className="msg-img-wrap" onClick={() => setLightbox({ url: m.img!, name: m.img!.split('/').pop() || 'image', size: 0, mime: 'image/*', kind: 'image' })}><img className="msg-img" src={resolveUploadUrl(m.img)} alt="" loading="lazy" onLoad={onMessageImageLoad} /></button> : null}
-                {m.files && m.files.length ? <MessageAttachments files={m.files} onImageClick={setLightbox} onImageLoad={onMessageImageLoad} /> : null}
+                {m.img ? <button className="msg-img-wrap" style={messageImageStyle()} onClick={() => setLightbox({ url: m.img!, name: m.img!.split('/').pop() || 'image', size: 0, mime: 'image/*', kind: 'image' })}><img className="msg-img" src={resolveUploadUrl(m.img)} alt="" loading="lazy" /></button> : null}
+                {m.files && m.files.length ? <MessageAttachments files={m.files} onImageClick={setLightbox} /> : null}
                 {m.status === 'failed' ? <div className="msg-failed"><Icon name="warn" sm />Не отправлено<button onClick={() => getEngine()?.retrySend(m.id)}>Повторить</button></div> : null}
                 {(() => { const reacts = E.getReactions(m.sid, m.id); return reacts.length ? (
                   <div className="msg-reacts">
@@ -1706,7 +1742,6 @@ function Chat() {
             followOutput={bottomFollowIntentRef.current ? 'auto' : false}
             atBottomThreshold={CHAT_STRICT_BOTTOM_PX}
             atBottomStateChange={onAtBottom}
-            totalListHeightChanged={onTotalListHeightChanged}
             increaseViewportBy={{ top: 600, bottom: 400 }}
             computeItemKey={(_, m) => m.id}
             context={{ busy: olderBusy, hasMore: eng.chatHasMore }}

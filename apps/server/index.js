@@ -211,6 +211,13 @@ for (const sql of [
   "ALTER TABLE messages ADD COLUMN meta TEXT NOT NULL DEFAULT ''",           // JSON доп-данных сообщения (для levelup: {level})
 ]) { try { db.exec(sql); } catch (e) { /* column already exists */ } }
 
+// Старые версии могли хранить внешний provider-id вместо локального upload URL.
+// После миграции разрешены только файлы из /api/uploads; очищаем лишь этот legacy-префикс.
+try {
+  const cleared = db.prepare("UPDATE users SET profile_banner_url='' WHERE profile_banner_url GLOB 'giphy:*'").run().changes;
+  if (cleared) console.log(`[db] cleared ${cleared} legacy external profile banner reference(s)`);
+} catch (e) { console.warn('[db] failed to clear legacy external profile banners:', e?.message || e); }
+
 // Статистика участника на сервере (рейтинг/уровни). Копится СЕРВЕРОМ (сэмплер голоса/стрима +
 // событие сообщения) — клиенту не доверяем. xp/level — кэш, пересчитываются из счётчиков.
 try {
@@ -476,7 +483,6 @@ const pubUser = u => ({ id: u.id, username: u.username, displayName: u.display_n
 // Имена всегда выпускает наш upload route: 12 random bytes + расширение из проверенного MIME.
 // Узкий regexp не пропускает `..`, произвольные имена и не-image расширения в профили/чат.
 const UPLOAD_RE = /^\/api\/uploads\/[a-f0-9]{24}\.(?:png|jpg|gif|webp)$/;
-const GIPHY_PROFILE_BANNER_RE = /^giphy:[a-zA-Z0-9]{1,128}$/; // непрозрачный ID; внешние URL в профиле не храним
 const pubServer = s => ({ id: s.id, name: s.name, ownerId: s.owner_id, iconColor: s.icon_color, iconUrl: s.icon_url || '', description: s.description || '', musicEnabled: !!s.music_enabled, statsEnabled: !!s.stats_enabled });
 
 /* ---------------- Рейтинг + уровни (экспериментальная фича) ---------------- */
@@ -1157,7 +1163,7 @@ app.patch('/api/me', requireAuth, (req, res) => {
   if (req.body.profileBannerUrl != null) {
     const v = String(req.body.profileBannerUrl);
     previousProfileBanner = String(db.prepare('SELECT profile_banner_url FROM users WHERE id=?').get(req.user.id)?.profile_banner_url || '');
-    if (!(v === '' || UPLOAD_RE.test(v) || GIPHY_PROFILE_BANNER_RE.test(v))) return res.status(400).json({ error: 'Неверный фон профиля' });
+    if (!(v === '' || UPLOAD_RE.test(v))) return res.status(400).json({ error: 'Неверный фон профиля' });
     if (UPLOAD_RE.test(v) && v !== previousProfileBanner) {
       const tracked = db.prepare('SELECT user_id FROM profile_banner_uploads WHERE url=?').get(v);
       if (!tracked || tracked.user_id !== req.user.id) return res.status(400).json({ error: 'Фон нужно загрузить через редактор профиля' });
@@ -1340,7 +1346,7 @@ function saveImageUpload(req, res, profileBanner = false) {
     try { fs.unlinkSync(path.join(UPLOADS_DIR, name)); } catch (_) { /**/ }
     return res.status(500).json({ error: 'Не удалось сохранить файл' });
   }
-  res.json({ url });
+  res.json({ url, width: info.width, height: info.height });
 }
 
 app.use('/api/uploads', express.static(UPLOADS_DIR, { maxAge: '30d', immutable: true, index: false, fallthrough: false, setHeaders: (res) => res.setHeader('X-Content-Type-Options', 'nosniff') }));
@@ -1919,7 +1925,11 @@ function sanitizeAttachments(raw) {
     const name = String(a.name || '').slice(0, 255);
     const size = Number.isFinite(a.size) ? Math.max(0, Math.min(10 * 1024 * 1024, a.size)) : 0;
     const mime = String(a.mime || '').slice(0, 100);
-    out.push({ url, name, size, mime, kind });
+    const width = kind === 'image' && Number.isFinite(a.width) ? Math.max(1, Math.min(4096, Math.round(a.width))) : 0;
+    const height = kind === 'image' && Number.isFinite(a.height) ? Math.max(1, Math.min(4096, Math.round(a.height))) : 0;
+    const ratio = width && height ? width / height : 0;
+    const safeDimensions = ratio >= .1 && ratio <= 10;
+    out.push({ url, name, size, mime, kind, ...(safeDimensions ? { width, height } : {}) });
   }
   return out;
 }

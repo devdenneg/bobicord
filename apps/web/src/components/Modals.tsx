@@ -14,7 +14,7 @@ import { Backdrop } from './Backdrop';
 import { BroadcastModal } from './BroadcastModal';
 import { DownloadsModal } from './DownloadsModal';
 import { LeaderboardModal } from './Leaderboard';
-import { GiphyPicker, ProfileBannerAttribution, ProfileBannerMedia } from './ProfileBanner';
+import { normalizeProfileBanner, ProfileBannerMedia } from './ProfileBanner';
 import { isTauri, setGlobalHotkeys } from '../native';
 import { enableNotifications, notifSupported, notifPermission } from '../notify';
 import { unsubscribePush, syncPushPrefs } from '../push';
@@ -90,15 +90,13 @@ function ProfileModal() {
   const me = useStore((s) => s.me)!;
   const [dn, setDn] = useState(me.displayName); const [bio, setBio] = useState(me.bio || ''); const [color, setColor] = useState(me.avatarColor);
   const [avatarUrl, setAvatarUrl] = useState(me.avatarUrl || '');
-  const [bannerUrl, setBannerUrl] = useState(me.profileBannerUrl || '');
+  const [bannerUrl, setBannerUrl] = useState(normalizeProfileBanner(me.profileBannerUrl));
   const [err, setErr] = useState(''); const [busy, setBusy] = useState(false); const [uploading, setUploading] = useState(false);
-  const [bannerUploading, setBannerUploading] = useState(false); const [giphyOpen, setGiphyOpen] = useState(false);
+  const [bannerUploading, setBannerUploading] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const bannerRef = useRef<HTMLInputElement>(null);
-  const giphyTriggerRef = useRef<HTMLButtonElement>(null);
   const bannerAbortRef = useRef<AbortController | null>(null);
   const bannerUploadSeq = useRef(0);
-  const pendingGiphySendRef = useRef('');
   const pendingLocalBannerRef = useRef('');
   const cleanupPendingLocalBanner = (preserve = '') => {
     const url = pendingLocalBannerRef.current;
@@ -111,10 +109,6 @@ function ProfileModal() {
     bannerAbortRef.current?.abort();
     cleanupPendingLocalBanner();
     useStore.getState().setModal(null);
-  };
-  const closeGiphy = () => {
-    setGiphyOpen(false);
-    window.requestAnimationFrame(() => giphyTriggerRef.current?.focus());
   };
   const cancelBannerUpload = () => {
     bannerUploadSeq.current += 1;
@@ -139,10 +133,6 @@ function ProfileModal() {
     setBusy(true);
     try {
       const d = await api.updateMe({ displayName: dn.trim(), bio, avatarColor: color, avatarUrl, profileBannerUrl: bannerUrl });
-      if (bannerUrl.startsWith('giphy:') && pendingGiphySendRef.current) {
-        fetch(pendingGiphySendRef.current, { mode: 'no-cors', keepalive: true }).catch(() => {});
-        pendingGiphySendRef.current = '';
-      }
       if (pendingLocalBannerRef.current === bannerUrl) pendingLocalBannerRef.current = '';
       useStore.getState().setMe(d.user); useStore.getState().refreshMembers(); useStore.getState().refreshServers(); close(); useStore.getState().toast('Профиль сохранён', 'ok');
     }
@@ -156,7 +146,7 @@ function ProfileModal() {
     const sequence = ++bannerUploadSeq.current;
     const controller = new AbortController();
     bannerAbortRef.current = controller;
-    setBannerUploading(true); setErr(''); setGiphyOpen(false);
+    setBannerUploading(true); setErr('');
     try {
       const prepared = file.type === 'image/gif' ? file : await downscaleImage(file, 1600, .84);
       if (controller.signal.aborted || sequence !== bannerUploadSeq.current) return;
@@ -167,7 +157,6 @@ function ProfileModal() {
       }
       cleanupPendingLocalBanner(url);
       pendingLocalBannerRef.current = url;
-      pendingGiphySendRef.current = '';
       setBannerUrl(url);
     } catch (e: any) {
       if (sequence === bannerUploadSeq.current && e?.name !== 'AbortError') setErr(e?.message || 'Ошибка загрузки фона');
@@ -178,12 +167,10 @@ function ProfileModal() {
   return <Backdrop onClose={close} label="Профиль" boxClass="profile-modal">
     <button className="settings-x" onClick={close} aria-label="Закрыть"><Icon name="close" /></button>
     <div className={'pm-hero' + (bannerUrl ? ' has-banner' : '')}>
-      <ProfileBannerMedia value={bannerUrl} className="pm-hero-banner" attribution={false} />
-      <ProfileBannerAttribution value={bannerUrl} className="pm-banner-credit" />
+      <ProfileBannerMedia value={bannerUrl} className="pm-hero-banner" />
       <div className="pm-banner-actions" aria-label="Фон профиля">
         <button type="button" disabled={bannerUploading || busy} aria-label="Загрузить фон профиля" data-tip="Загрузить картинку или GIF" onClick={() => bannerRef.current?.click()}>{bannerUploading ? <span className="spin" /> : <Icon name="image" sm />}<span>Фон</span></button>
-        <button ref={giphyTriggerRef} type="button" disabled={bannerUploading || busy} className={giphyOpen ? 'on' : ''} aria-expanded={giphyOpen} aria-label="Выбрать фон из GIPHY" data-tip="Выбрать GIF из GIPHY" onClick={() => giphyOpen ? closeGiphy() : setGiphyOpen(true)}><span aria-hidden="true">GIF</span></button>
-        {bannerUrl ? <button type="button" disabled={bannerUploading || busy} className="danger" aria-label="Убрать фон профиля" data-tip="Убрать фон" onClick={() => { cancelBannerUpload(); cleanupPendingLocalBanner(); pendingGiphySendRef.current = ''; setGiphyOpen(false); setBannerUrl(''); }}><Icon name="close" sm /></button> : null}
+        {bannerUrl ? <button type="button" disabled={bannerUploading || busy} className="danger" aria-label="Убрать фон профиля" data-tip="Убрать фон" onClick={() => { cancelBannerUpload(); cleanupPendingLocalBanner(); setBannerUrl(''); }}><Icon name="close" sm /></button> : null}
       </div>
       <button type="button" className="pm-av" onClick={() => fileRef.current?.click()} aria-label="Загрузить аватар" title="Загрузить аватар" style={{ background: avatarUrl ? '#0000' : avColor(dn, color) }}>
         {avatarUrl ? <img className="avimg" src={resolveUploadUrl(avatarUrl)} alt="" /> : initial(dn)}
@@ -201,7 +188,6 @@ function ProfileModal() {
       </div>
       <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; if (f) pickAvatar(f); e.target.value = ''; }} />
       <input ref={bannerRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; if (f) pickBanner(f); e.target.value = ''; }} />
-      {giphyOpen ? <GiphyPicker onClose={closeGiphy} onSelect={(value, sendAnalyticsUrl) => { cancelBannerUpload(); cleanupPendingLocalBanner(); pendingGiphySendRef.current = sendAnalyticsUrl || ''; setBannerUrl(value); closeGiphy(); }} /> : null}
       <div className="fld"><label>Отображаемое имя</label><input value={dn} maxLength={32} onChange={(e) => setDn(e.target.value)} /></div>
       <div className="fld"><label>О себе</label><textarea value={bio} maxLength={200} rows={2} placeholder="пара слов о себе" onChange={(e) => setBio(e.target.value)} /></div>
       <div className="fld"><label>Цвет аватара{avatarUrl ? ' (когда без фото)' : ''}</label><div className="colorpick">{AV_COLORS.map((c, i) => <button type="button" key={i} className={'cp' + (i === color ? ' sel' : '')} style={{ background: c }} aria-label={`Цвет аватара ${i + 1}`} aria-pressed={i === color} onClick={() => setColor(i)} />)}</div></div>

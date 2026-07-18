@@ -67,8 +67,6 @@ jobs:
           tags: |
             ${{ env.IMAGE_WEB }}:latest
             ${{ env.IMAGE_WEB }}:${{ github.sha }}
-          build-args: |
-            VITE_GIPHY_API_KEY=${{ secrets.GIPHY_WEB_API_KEY }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
