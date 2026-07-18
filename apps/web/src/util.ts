@@ -21,10 +21,29 @@ export const comboLabel = (codes: string[]): string => (codes.length ? codes.map
 export const normKey = (c: string): string => c.replace(/^(Control|Shift|Alt|Meta)(Left|Right)$/, '$1');
 
 // Даунскейл картинки перед аплоадом в чат: длинная сторона ≤1920px, ре-энкод в WebP (все форматы —
-// единый путь, лучшее сжатие). GIF не трогаем (canvas убивает анимацию). Если результат вдруг
+// единый путь, лучшее сжатие). GIF и animated WebP не трогаем (canvas оставляет только первый кадр). Если результат вдруг
 // тяжелее оригинала (мелкие/уже сжатые картинки) — возвращаем оригинал как есть.
+async function isAnimatedWebP(file: File): Promise<boolean> {
+  if (file.type.toLowerCase() !== 'image/webp') return false;
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  if (bytes.length < 20) return false;
+  const tag = (offset: number) => String.fromCharCode(bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]);
+  if (tag(0) !== 'RIFF' || tag(8) !== 'WEBP') return false;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let offset = 12;
+  while (offset + 8 <= bytes.length) {
+    const kind = tag(offset);
+    const size = view.getUint32(offset + 4, true);
+    if (kind === 'ANIM' || kind === 'ANMF') return true;
+    const next = offset + 8 + size + (size & 1);
+    if (next <= offset || next > bytes.length) return false;
+    offset = next;
+  }
+  return false;
+}
+
 export async function downscaleImage(file: File, maxSide = 1920, quality = 0.82): Promise<File> {
-  if (file.type === 'image/gif') return file;
+  if (file.type === 'image/gif' || await isAnimatedWebP(file)) return file;
   const bitmap = await createImageBitmap(file).catch(() => null);
   if (!bitmap) return file;
   const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));

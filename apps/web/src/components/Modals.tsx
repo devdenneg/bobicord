@@ -169,7 +169,7 @@ function ProfileModal() {
     <div className={'pm-hero' + (bannerUrl ? ' has-banner' : '')}>
       <ProfileBannerMedia value={bannerUrl} className="pm-hero-banner" />
       <div className="pm-banner-actions" aria-label="Фон профиля">
-        <button type="button" disabled={bannerUploading || busy} aria-label="Загрузить фон профиля" data-tip="Загрузить картинку или GIF" onClick={() => bannerRef.current?.click()}>{bannerUploading ? <span className="spin" /> : <Icon name="image" sm />}<span>Фон</span></button>
+        <button type="button" disabled={bannerUploading || busy} aria-label="Загрузить фон профиля" data-tip="Картинка, GIF или animated WebP" onClick={() => bannerRef.current?.click()}>{bannerUploading ? <span className="spin" /> : <Icon name="image" sm />}<span>Фон</span></button>
         {bannerUrl ? <button type="button" disabled={bannerUploading || busy} className="danger" aria-label="Убрать фон профиля" data-tip="Убрать фон" onClick={() => { cancelBannerUpload(); cleanupPendingLocalBanner(); setBannerUrl(''); }}><Icon name="close" sm /></button> : null}
       </div>
       <button type="button" className="pm-av" onClick={() => fileRef.current?.click()} aria-label="Загрузить аватар" title="Загрузить аватар" style={{ background: avatarUrl ? '#0000' : avColor(dn, color) }}>

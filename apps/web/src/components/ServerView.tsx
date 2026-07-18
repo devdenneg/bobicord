@@ -1028,13 +1028,17 @@ function Chat() {
   const bottomLockFrameRef = useRef<number | null>(null);
   const bottomLockPassesRef = useRef(0);
   const ownSendPendingRef = useRef(false);
-  const ownSendSettlingRef = useRef(false);
+  const initialBottomPendingRef = useRef(unreadServer === 0);
+  const bottomSettleActiveRef = useRef(false);
   const [pill, setPill] = useState(0);            // счётчик непрочитанных (пока не внизу)
   const [atBottom, setAtBottom] = useState(true);
   // Строгое состояние atBottom (<=8px) управляет read receipt, badge и кнопкой перехода вниз.
   // Persistent user intent: пока пользователь сам не ушёл вверх, любое позднее измерение Virtuoso
   // (footer, новая строка, failed-state, реакция, картинка) снова доводит список до физического низа.
-  const bottomFollowIntentRef = useRef(false);
+  // Seed the very first Virtuoso render with the entry decision. Updating this ref only
+  // from the later layout effect is too late: Virtuoso reads followOutput during mount.
+  const bottomFollowIntentRef = useRef(unreadServer === 0);
+  const bottomFollowServerRef = useRef(activeId);
   const bottomFollowGenerationRef = useRef(0);    // инвалидирует RAF старого сервера/ручного pin
   const appendCursorRef = useRef<{ serverId?: string; historyGeneration: number | null; tailId: number | null; count: number }>({ historyGeneration: null, tailId: null, count: 0 });
   const [dividerFade, setDividerFade] = useState(false); // дивайдер «Новые сообщения» гаснет, когда юзер увидел границу
@@ -1073,10 +1077,16 @@ function Chat() {
   }
   const isSuffixAppend = appendedMessages.length > 0;
   const ownExplicitAppend = isSuffixAppend && ownSendPendingRef.current && appendedMessages.some((message) => message.mine);
+  const initialPinnedHydration = messages.length > 0 && initialBottomPendingRef.current && bottomFollowIntentRef.current;
   // Только authoritative pin/локальный send могут подхватить append. `mine` не подходит:
   // своё сообщение с другой вкладки не должно вырывать текущую вкладку из читаемой истории.
   const shouldFollowAppend = isSuffixAppend && bottomFollowIntentRef.current;
-  const keepBottomForThisLayout = bottomFollowIntentRef.current;
+  const keepBottomForThisLayout = bottomFollowServerRef.current !== activeId
+    ? unreadServer === 0
+    : bottomFollowIntentRef.current;
+  const hasBottomIntent = useCallback(() => (
+    bottomFollowServerRef.current !== activeId ? unreadServer === 0 : bottomFollowIntentRef.current
+  ), [activeId, unreadServer]);
 
   const scrollToPhysicalBottom = useCallback((behavior: ScrollBehavior = 'auto') => {
     // Virtuoso учитывает Footer при align:end лишь после его асинхронного измерения. При старом
@@ -1097,9 +1107,10 @@ function Chat() {
     if (bottomLockFrameRef.current != null) window.cancelAnimationFrame(bottomLockFrameRef.current);
     bottomLockFrameRef.current = null;
     bottomLockPassesRef.current = 0;
-    ownSendSettlingRef.current = false;
+    bottomSettleActiveRef.current = false;
   }, []);
   const detachBottomFollow = useCallback(() => {
+    initialBottomPendingRef.current = false;
     bottomFollowIntentRef.current = false;
     bottomFollowGenerationRef.current += 1;
     cancelBottomLockFrames();
@@ -1116,7 +1127,7 @@ function Chat() {
       bottomLockFrameRef.current = null;
       if (!canFollow()) {
         bottomLockPassesRef.current = 0;
-        ownSendSettlingRef.current = false;
+        bottomSettleActiveRef.current = false;
         return;
       }
       scrollToPhysicalBottom('auto');
@@ -1125,8 +1136,8 @@ function Chat() {
         bottomLockFrameRef.current = window.requestAnimationFrame(run);
         return;
       }
-      if (ownSendSettlingRef.current) {
-        ownSendSettlingRef.current = false;
+      if (bottomSettleActiveRef.current) {
+        bottomSettleActiveRef.current = false;
         const scroller = scrollerElementRef.current;
         const distance = scroller ? Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) : 0;
         const reachedBottom = distance <= CHAT_STRICT_BOTTOM_PX;
@@ -1136,20 +1147,38 @@ function Chat() {
     };
     bottomLockFrameRef.current = window.requestAnimationFrame(run);
   }, [scrollToPhysicalBottom]);
+  const settleToBottom = useCallback((passes = 3) => {
+    bottomFollowIntentRef.current = true;
+    bottomSettleActiveRef.current = true;
+    setAtBottom(true);
+    setPill(0);
+    // The semantic target lets Virtuoso render the last row. Physical passes then include
+    // the asynchronously measured footer and any row-size corrections in the same mount.
+    virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' });
+    lockToBottom(passes);
+  }, [lockToBottom]);
+  const onTotalListHeightChanged = useCallback(() => {
+    if (!hasBottomIntent()) return;
+    // This is Virtuoso's authoritative signal that a row/header/footer measurement landed.
+    // Re-verify the physical bottom instead of guessing whether an image/font/footer resized.
+    bottomSettleActiveRef.current = true;
+    lockToBottom(2);
+  }, [hasBottomIntent, lockToBottom]);
   const onAtBottom = useCallback((reportedBottom: boolean) => {
     // На unread-entry Virtuoso может кратко сообщить true на пустой/ещё не позиционированной
     // геометрии. Bottom принимается только если pin уже разрешён explicit/user-down intent.
-    if (!reportedBottom && ownSendSettlingRef.current && bottomFollowIntentRef.current) return;
+    const bottomIntent = hasBottomIntent();
+    if (!reportedBottom && (initialBottomPendingRef.current || bottomSettleActiveRef.current) && bottomIntent) return;
     const scroller = scrollerElementRef.current;
     const physicalDistance = scroller ? Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) : Number.POSITIVE_INFINITY;
     // Ignore a stale Virtuoso `false` emitted from the pre-layout geometry when the DOM is
     // already at the real bottom. This is what previously flashed the down-arrow after send.
-    const b = (reportedBottom || physicalDistance <= CHAT_STRICT_BOTTOM_PX) && bottomFollowIntentRef.current;
+    const b = (reportedBottom || physicalDistance <= CHAT_STRICT_BOTTOM_PX) && bottomIntent;
     setAtBottom(b);
     if (b) {
       setPill(0);
     }
-  }, []);
+  }, [hasBottomIntent]);
   const scrollToBottom = useCallback(() => {
     // Badge очищается только из onAtBottom после фактического достижения true bottom.
     bottomFollowIntentRef.current = true;
@@ -1279,20 +1308,21 @@ function Chat() {
       tailId: messages.length ? messages[messages.length - 1].id : null,
       count: messages.length,
     };
-    if (ownExplicitAppend) {
+    if (initialPinnedHydration) {
+      initialBottomPendingRef.current = false;
       ownSendPendingRef.current = false;
-      bottomFollowIntentRef.current = true;
-      ownSendSettlingRef.current = true;
-      setAtBottom(true);
-      setPill(0);
+      // Virtuoso defers its own initial scroll for several animation frames. Keep the
+      // bounded physical pin alive beyond that window and the footer ResizeObserver pass.
+      settleToBottom(8);
+    } else if (ownExplicitAppend) {
+      ownSendPendingRef.current = false;
       // Index alignment gives Virtuoso the semantic target; three bounded physical passes
       // cover its row/footer measurement and the composer shrinking in the same commit.
-      virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' });
-      lockToBottom(3);
+      settleToBottom(3);
     } else if (shouldFollowAppend && !atBottom) {
       lockToBottom();
     }
-  }, [activeId, historyGeneration, messages, ownExplicitAppend, shouldFollowAppend, atBottom, lockToBottom]);
+  }, [activeId, historyGeneration, messages, initialPinnedHydration, ownExplicitAppend, shouldFollowAppend, atBottom, lockToBottom, settleToBottom]);
 
   // Нижняя область меняет высоту из-за reply, вложений, update-banner, mobile wrapping и клавиатуры.
   // ResizeObserver удерживает низ только если пользователь был реально pinned; читающего историю
@@ -1330,6 +1360,8 @@ function Chat() {
     bottomFollowGenerationRef.current += 1;
     cancelBottomLockFrames();
     ownSendPendingRef.current = false;
+    initialBottomPendingRef.current = startPinned;
+    bottomFollowServerRef.current = activeId;
     setPill(unreadServer > 0 ? Math.max(unreadHere, unreadServer) : 0);
     setAtBottom(startPinned);
     bottomFollowIntentRef.current = startPinned;
@@ -1344,14 +1376,18 @@ function Chat() {
     const t = window.setTimeout(() => { olderReady.current = true; }, 700);
     // После первого физического scroll поздние измерения строк удерживает followOutput.
     // Pin живёт без таймаута и снимается только ручным уходом вверх.
-    if (startPinned) lockToBottom();
+    if (startPinned && messages.length > 0) {
+      initialBottomPendingRef.current = false;
+      settleToBottom(8);
+    }
     return () => {
+      initialBottomPendingRef.current = false;
       bottomFollowIntentRef.current = false;
       bottomFollowGenerationRef.current += 1;
       cancelBottomLockFrames();
       clearTimeout(t);
     };
-  }, [activeId, cancelBottomLockFrames, lockToBottom]);
+  }, [activeId, cancelBottomLockFrames, settleToBottom]);
 
   // focus/blur/visibility окна → пере-триггер эффекта прочтения (вернулся в окно внизу чата = прочитал)
   useEffect(() => {
@@ -1535,7 +1571,7 @@ function Chat() {
     // до true bottom, даже если пользователь перед отправкой читал историю.
     bottomFollowIntentRef.current = true;
     ownSendPendingRef.current = true;
-    ownSendSettlingRef.current = true;
+    bottomSettleActiveRef.current = true;
     setAtBottom(true);
     setPill(0);
     const em: Record<string, string> = {};
@@ -1739,9 +1775,10 @@ function Chat() {
             startReached={loadOlder}
             // Важно передавать именно false, когда читается история: Virtuoso трактует саму
             // callback-функцию как включённый follow при уменьшении viewport (reply/keyboard).
-            followOutput={bottomFollowIntentRef.current ? 'auto' : false}
+            followOutput={keepBottomForThisLayout ? 'auto' : false}
             atBottomThreshold={CHAT_STRICT_BOTTOM_PX}
             atBottomStateChange={onAtBottom}
+            totalListHeightChanged={onTotalListHeightChanged}
             increaseViewportBy={{ top: 600, bottom: 400 }}
             computeItemKey={(_, m) => m.id}
             context={{ busy: olderBusy, hasMore: eng.chatHasMore }}
