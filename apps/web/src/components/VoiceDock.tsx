@@ -26,6 +26,7 @@ function NativeBroadcastButton() {
   if (!eng.inVoice) return null;
   return (
     <button className={'vd-btn' + (live ? ' danger-on' : '')} aria-pressed={live}
+      aria-label={live ? 'Трансляция идёт' : 'Транслировать экран'}
       data-tip={live ? 'Трансляция идёт' : 'Транслировать экран'}
       onClick={() => useStore.getState().setModal('broadcast')}>
       <Icon name={live ? 'screen-stop' : 'screen'} sm />
@@ -42,6 +43,7 @@ function ShareButton() {
   const live = !!eng.presence[me.username]?.streaming;
   return (
     <button className={'vd-btn' + (live ? ' danger-on' : '')} aria-pressed={live}
+      aria-label={live ? 'Остановить трансляцию' : 'Транслировать экран'}
       data-tip={live ? 'Трансляция идёт' : 'Транслировать экран'}
       onClick={() => E.share()}>
       <Icon name={live ? 'screen-stop' : 'screen'} sm />
@@ -54,31 +56,90 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
   const E = getEngine();
   const [open, setOpen] = useState(false);
   const [devs, setDevs] = useState<MediaDeviceInfo[]>([]);
+  const [activeIndex, setActiveIndex] = useState(0);
   const cur = kind === 'input' ? getSettings().input : getSettings().output;
   const ref = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const optionCount = devs.length + 1;
+  const focusOption = (index: number) => {
+    const next = Math.max(0, Math.min(optionCount - 1, index));
+    setActiveIndex(next);
+    requestAnimationFrame(() => menuRef.current?.querySelector<HTMLElement>(`[data-menu-index="${next}"]`)?.focus());
+  };
+  const closeMenu = (restoreFocus = false) => {
+    setOpen(false);
+    if (restoreFocus) requestAnimationFrame(() => triggerRef.current?.focus());
+  };
+  const openMenu = (initial: 'selected' | 'first' | 'last' = 'selected') => {
+    const selected = cur ? devs.findIndex((device) => device.deviceId === cur) + 1 : 0;
+    const next = initial === 'first' ? 0 : initial === 'last' ? optionCount - 1 : Math.max(0, selected);
+    setActiveIndex(next);
+    setOpen(true);
+    requestAnimationFrame(() => menuRef.current?.querySelector<HTMLElement>(`[data-menu-index="${next}"]`)?.focus());
+  };
   useEffect(() => {
     if (!open) return;
-    Room.getLocalDevices(kind === 'input' ? 'audioinput' : 'audiooutput').then((d) => setDevs(d as MediaDeviceInfo[])).catch(() => {});
-    const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
+    const load = () => Room.getLocalDevices(kind === 'input' ? 'audioinput' : 'audiooutput').then((d) => setDevs(d as MediaDeviceInfo[])).catch(() => {});
+    load();
+    const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) closeMenu(); };
     document.addEventListener('mousedown', onDoc);
-    return () => document.removeEventListener('mousedown', onDoc);
+    navigator.mediaDevices?.addEventListener?.('devicechange', load);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+      navigator.mediaDevices?.removeEventListener?.('devicechange', load);
+    };
   }, [open, kind]);
+  useEffect(() => {
+    if (open && activeIndex >= optionCount) focusOption(optionCount - 1);
+  }, [activeIndex, open, optionCount]);
   const pick = (id: string) => {
     setSettings(kind === 'input' ? { input: id } : { output: id });
     if (kind === 'input') E?.reapplyMic(); else E?.applyOutput();
-    setOpen(false);
+    closeMenu(true);
+  };
+  const onTriggerKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      openMenu(e.key === 'ArrowDown' ? 'first' : 'last');
+    } else if (e.key === 'Escape' && open) {
+      e.preventDefault();
+      closeMenu(true);
+    }
+  };
+  const onMenuKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const delta = e.key === 'ArrowDown' ? 1 : -1;
+      focusOption((activeIndex + delta + optionCount) % optionCount);
+    } else if (e.key === 'Home' || e.key === 'End') {
+      e.preventDefault();
+      focusOption(e.key === 'Home' ? 0 : optionCount - 1);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      closeMenu(true);
+    } else if (e.key === 'Tab') {
+      closeMenu();
+    }
   };
   return (
     <div className="vd-devwrap" ref={ref}>
-      <button className={'vd-caret' + (open ? ' on' : '')} aria-expanded={open}
+      <button ref={triggerRef} className={'vd-caret' + (open ? ' on' : '')} aria-expanded={open} aria-haspopup="menu" aria-controls={`vd-device-${kind}`}
+        aria-label={kind === 'input' ? 'Выбрать микрофон' : 'Выбрать устройство вывода'}
         data-tip={kind === 'input' ? 'Выбрать микрофон' : 'Выбрать устройство вывода'}
-        onClick={() => setOpen((o) => !o)}><Icon name="chevron" sm /></button>
+        onKeyDown={onTriggerKeyDown}
+        onClick={() => open ? closeMenu() : openMenu()}><Icon name="chevron" sm /></button>
       {open ? (
-        <div className={'vd-devmenu' + (up ? ' up' : '')}>
-          <div className="vd-devh">{kind === 'input' ? 'МИКРОФОН' : 'ВЫВОД ЗВУКА'}</div>
-          <button className={'vd-devitem' + (!cur ? ' on' : '')} onClick={() => pick('')}>По умолчанию</button>
-          {devs.map((d) => (
-            <button key={d.deviceId} className={'vd-devitem' + (cur === d.deviceId ? ' on' : '')} onClick={() => pick(d.deviceId)}>
+        <div ref={menuRef} id={`vd-device-${kind}`} className={'vd-devmenu' + (up ? ' up' : '')} role="menu"
+          aria-label={kind === 'input' ? 'Микрофоны' : 'Устройства вывода'} onKeyDown={onMenuKeyDown}>
+          <div className="vd-devh" aria-hidden="true">{kind === 'input' ? 'МИКРОФОН' : 'ВЫВОД ЗВУКА'}</div>
+          <button role="menuitemradio" aria-checked={!cur} tabIndex={activeIndex === 0 ? 0 : -1} data-menu-index="0"
+            className={'vd-devitem' + (!cur ? ' on' : '')} onFocus={() => setActiveIndex(0)} onClick={() => pick('')}>По умолчанию</button>
+          {devs.map((d, index) => (
+            <button role="menuitemradio" aria-checked={cur === d.deviceId} tabIndex={activeIndex === index + 1 ? 0 : -1}
+              data-menu-index={index + 1} key={d.deviceId} className={'vd-devitem' + (cur === d.deviceId ? ' on' : '')}
+              onFocus={() => setActiveIndex(index + 1)} onClick={() => pick(d.deviceId)}>
               {d.label || 'Устройство ' + d.deviceId.slice(0, 6)}
             </button>
           ))}
@@ -99,15 +160,15 @@ export function VoiceControls({ up }: { up?: boolean }) {
   return (
     <div className="vd-controls">
       <div className="vd-grp">
-        <button className={micClass} aria-pressed={muted} data-tip="Микрофон · M" onClick={() => E.toggleMic()}><Icon name={muted ? 'mic-off' : 'mic'} sm /></button>
+        <button className={micClass} aria-pressed={muted} aria-label={muted ? 'Включить микрофон' : 'Выключить микрофон'} data-tip="Микрофон · M" onClick={() => E.toggleMic()}><Icon name={muted ? 'mic-off' : 'mic'} sm /></button>
         <DeviceMenu kind="input" up={up} />
       </div>
       <div className="vd-grp">
-        <button className={'vd-btn' + (eng.deafened ? ' danger-on' : '')} aria-pressed={eng.deafened} data-tip="Заглушить · D" onClick={() => E.toggleDeaf()}><Icon name={eng.deafened ? 'head-off' : 'head'} sm /></button>
+        <button className={'vd-btn' + (eng.deafened ? ' danger-on' : '')} aria-pressed={eng.deafened} aria-label={eng.deafened ? 'Включить звук' : 'Заглушить звук'} data-tip="Заглушить · D" onClick={() => E.toggleDeaf()}><Icon name={eng.deafened ? 'head-off' : 'head'} sm /></button>
         <DeviceMenu kind="output" up={up} />
       </div>
       {isTauri ? <NativeBroadcastButton /> : <ShareButton />}
-      <button className="vd-btn vd-set" data-tip="Настройки звука" onClick={() => useStore.getState().setModal('settings')}><Icon name="gear" sm /></button>
+      <button className="vd-btn vd-set" aria-label="Настройки звука" data-tip="Настройки звука" onClick={() => useStore.getState().setModal('settings')}><Icon name="gear" sm /></button>
     </div>
   );
 }
@@ -139,7 +200,7 @@ function VoicePanel({ controls }: { controls?: boolean }) {
           <div className="vd-txt"><b>{status}</b><span>{chName ? chName + ' · ' : ''}{srvName}</span></div>
         </button>
         <div className={'conn-ind q-' + q} data-tip={qTip} aria-label={'Качество связи: ' + qTip} tabIndex={0}><i /><i /><i /></div>
-        <button className="vd-btn vd-leave" data-tip="Выйти из голосового" onClick={() => E.leaveVoice()}><Icon name="leave" sm /></button>
+        <button className="vd-btn vd-leave" aria-label="Выйти из голосового канала" data-tip="Выйти из голосового" onClick={() => E.leaveVoice()}><Icon name="leave" sm /></button>
       </div>
       {controls ? <VoiceControls up /> : null}
       <MusicPlayer enabled={!!srv?.musicEnabled} />

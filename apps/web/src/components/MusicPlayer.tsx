@@ -126,11 +126,11 @@ export function MusicPlayer({ enabled }: { enabled: boolean }) {
           <div className="mus-sub">{cur ? (m.playing ? '♪ играет' : 'пауза') + (cur.by ? ' · ' + cur.by : '') : 'вставь ссылку YouTube'}</div>
         </div>
         <div className="mus-ctrls">
-          <button className="mus-b" onClick={() => useMusic.getState().prev()} disabled={m.index <= 0} data-tip="Назад"><Icon name="skip-prev" sm /></button>
-          <button className="mus-b play" onClick={() => useMusic.getState().toggle()} disabled={!m.queue.length} data-tip="Пауза/играть"><Icon name={m.playing ? 'pause' : 'play'} sm /></button>
-          <button className="mus-b" onClick={() => useMusic.getState().next()} disabled={m.index + 1 >= m.queue.length} data-tip="Дальше"><Icon name="skip-next" sm /></button>
+          <button className="mus-b" aria-label="Предыдущий трек" onClick={() => useMusic.getState().prev()} disabled={m.index <= 0} data-tip="Назад"><Icon name="skip-prev" sm /></button>
+          <button className="mus-b play" aria-label={m.playing ? 'Пауза' : 'Воспроизвести'} aria-pressed={m.playing} onClick={() => useMusic.getState().toggle()} disabled={!m.queue.length} data-tip="Пауза/играть"><Icon name={m.playing ? 'pause' : 'play'} sm /></button>
+          <button className="mus-b" aria-label="Следующий трек" onClick={() => useMusic.getState().next()} disabled={m.index + 1 >= m.queue.length} data-tip="Дальше"><Icon name="skip-next" sm /></button>
         </div>
-        <button className={'mus-caret' + (open ? ' on' : '')} onClick={() => setOpen((o) => !o)} data-tip={open ? 'Свернуть' : 'Развернуть'}><Icon name="chevron" sm /></button>
+        <button className={'mus-caret' + (open ? ' on' : '')} aria-label={open ? 'Свернуть плеер' : 'Развернуть плеер'} aria-expanded={open} onClick={() => setOpen((o) => !o)} data-tip={open ? 'Свернуть' : 'Развернуть'}><Icon name="chevron" sm /></button>
       </div>
 
       {needGesture ? <button className="mus-gesture" onClick={gesture}>▶ Включить звук (браузер требует нажатие)</button> : null}
@@ -146,21 +146,21 @@ export function MusicPlayer({ enabled }: { enabled: boolean }) {
           </div>
           <div className="mus-vol">
             <Icon name="speaker" sm />
-            <input type="range" min={0} max={100} value={vol} onChange={(e) => applyVol(+e.target.value)} data-tip="Громкость (только у тебя)" />
+            <input type="range" min={0} max={100} value={vol} aria-label="Громкость музыки" onChange={(e) => applyVol(+e.target.value)} data-tip="Громкость (только у тебя)" />
             <span className="mus-t">{vol}%</span>
           </div>
           <div className="mus-add">
             <input placeholder="Ссылка YouTube…" value={addUrl} disabled={adding} onChange={(e) => { setAddUrl(e.target.value); setErr(''); }} onKeyDown={(e) => { if (e.key === 'Enter') onAdd(); }} />
-            <button onClick={onAdd} disabled={adding || !addUrl.trim()} data-tip="Добавить в очередь">{adding ? <span className="mus-spin" /> : <Icon name="plus" sm />}</button>
+            <button aria-label="Добавить ссылку в очередь" onClick={onAdd} disabled={adding || !addUrl.trim()} data-tip="Добавить в очередь">{adding ? <span className="mus-spin" /> : <Icon name="plus" sm />}</button>
           </div>
           {err ? <div className="mus-err">{err}</div> : null}
           <div className="mus-queue">
             {m.queue.length === 0 ? <div className="mus-empty">Очередь пуста — добавь трек</div> : null}
             {m.queue.map((t, i) => (
               <div key={i} className={'mus-q' + (i === m.index ? ' cur' : '')}>
-                <button className="mus-q-i" onClick={() => useMusic.getState().jump(i)} data-tip="Играть">{i === m.index && m.playing ? '♪' : i + 1}</button>
+                <button className="mus-q-i" aria-label={`Воспроизвести ${t.title}`} onClick={() => useMusic.getState().jump(i)} data-tip="Играть">{i === m.index && m.playing ? '♪' : i + 1}</button>
                 <span className="mus-q-t" title={t.title}>{t.title}</span>
-                <button className="mus-q-x" onClick={() => useMusic.getState().remove(i)} data-tip="Убрать">×</button>
+                <button className="mus-q-x" aria-label={`Убрать ${t.title} из очереди`} onClick={() => useMusic.getState().remove(i)} data-tip="Убрать">×</button>
               </div>
             ))}
           </div>

@@ -4,6 +4,7 @@ export interface User {
   displayName: string;
   avatarColor: number;
   avatarUrl?: string;
+  profileBannerUrl?: string;
   bio: string;
   isAdmin?: boolean;
 }
@@ -75,15 +76,26 @@ export interface ServerSummary {
   lastRead?: number; // id последнего прочитанного сообщения (для дивайдера «новые» в чате)
 }
 
+export interface MemberStats {
+  voiceSec: number;
+  streamSec: number;
+  messages: number;
+  xp: number;
+  level: number;
+  progress: { level: number; xp: number; into: number; span: number; next: number };
+}
+
 export interface Member {
   id: string;
   username: string;
   displayName: string;
   avatarColor: number;
   avatarUrl?: string;
+  profileBannerUrl?: string;
   bio?: string;
   role: string;
   roles?: Role[];
+  stats?: MemberStats;
 }
 
 export interface ServerDetail {

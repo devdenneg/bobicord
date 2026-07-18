@@ -45,7 +45,7 @@ export function AdminPage() {
       <div className="admin-head">
         <button className="admin-back" onClick={goHome}><Icon name="chevron" sm /> На главную</button>
         <h1>Админка</h1>
-        <button className="admin-refresh" onClick={load} data-tip="Обновить"><Icon name="refresh" sm /></button>
+        <button className="admin-refresh" aria-label="Обновить данные" onClick={load} data-tip="Обновить"><Icon name="refresh" sm /></button>
       </div>
 
       {loading && !data ? <div className="admin-msg">Загрузка…</div>
@@ -76,7 +76,7 @@ export function AdminPage() {
                       <span>владелец: {s.owner ? s.owner.displayName + ' @' + s.owner.username : '—'} · {s.memberCount} участн.</span>
                     </div>
                     <span className={'admin-chev' + (expanded.has(s.id) ? ' open' : '')}><Icon name="chevron" sm /></span>
-                    <button className="admin-del" onClick={(e) => { e.stopPropagation(); delServer(s); }} data-tip="Удалить сервер"><Icon name="trash" sm /></button>
+                    <button className="admin-del" aria-label={`Удалить сервер ${s.name}`} onClick={(e) => { e.stopPropagation(); delServer(s); }} data-tip="Удалить сервер"><Icon name="trash" sm /></button>
                   </div>
                   {expanded.has(s.id) ? (
                     <div className="admin-members">
@@ -84,7 +84,7 @@ export function AdminPage() {
                         <div key={u.id} className="admin-mrow">
                           <span className="admin-mav" style={{ background: avColor(u.displayName) }}>{initial(u.displayName)}</span>
                           <span className="admin-mnm">{u.displayName} <i>@{u.username}</i></span>
-                          {u.role === 'owner' ? <span className="admin-badge owner">владелец</span> : <button className="admin-x" onClick={() => removeMember(s, u)} data-tip="Убрать из сервера">×</button>}
+                          {u.role === 'owner' ? <span className="admin-badge owner">владелец</span> : <button className="admin-x" aria-label={`Убрать ${u.displayName} из сервера ${s.name}`} onClick={() => removeMember(s, u)} data-tip="Убрать из сервера">×</button>}
                         </div>
                       ))}
                     </div>
@@ -107,7 +107,7 @@ export function AdminPage() {
                       <span>@{u.username} · в {u.serverCount} серв · владелец {u.ownedCount}</span>
                     </div>
                     <button className="admin-adm" disabled={isBoot} onClick={() => toggleAdmin(u)}>{u.isAdmin ? 'Забрать' : 'Выдать'} админку</button>
-                    <button className="admin-del" disabled={isBoot || isSelf} onClick={() => delUser(u)} data-tip={isBoot ? 'Нельзя' : isSelf ? 'Это ты' : 'Удалить юзера'}><Icon name="trash" sm /></button>
+                    <button className="admin-del" aria-label={`Удалить пользователя ${u.displayName}`} disabled={isBoot || isSelf} onClick={() => delUser(u)} data-tip={isBoot ? 'Нельзя' : isSelf ? 'Это ты' : 'Удалить юзера'}><Icon name="trash" sm /></button>
                   </div>
                 );
               })}

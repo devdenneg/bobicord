@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS users(
   passhash TEXT NOT NULL,
   avatar_color INTEGER NOT NULL DEFAULT 0,
   avatar_url TEXT NOT NULL DEFAULT '',
+  profile_banner_url TEXT NOT NULL DEFAULT '',
   bio TEXT NOT NULL DEFAULT '',
   created INTEGER NOT NULL
 );
@@ -166,6 +167,12 @@ CREATE TABLE IF NOT EXISTS push_prefs(
   mention INTEGER NOT NULL DEFAULT 1,
   stream INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS profile_banner_uploads(
+  url TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  created INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS read_state(
   user_id TEXT NOT NULL,
   server_id TEXT NOT NULL,
@@ -173,6 +180,7 @@ CREATE TABLE IF NOT EXISTS read_state(
   PRIMARY KEY(user_id, server_id)
 );
 CREATE INDEX IF NOT EXISTS idx_push_user ON push_subs(user_id);
+CREATE INDEX IF NOT EXISTS idx_profile_banner_upload_user ON profile_banner_uploads(user_id, created);
 CREATE INDEX IF NOT EXISTS idx_vc_server ON voice_channels(server_id, position);
 CREATE INDEX IF NOT EXISTS idx_msg_server ON messages(server_id, created);
 CREATE INDEX IF NOT EXISTS idx_msg_server_id ON messages(server_id, id);
@@ -187,6 +195,7 @@ const voiceLeases = createVoiceLeaseStore(db);
 /* add new columns to pre-existing DBs (idempotent — throws if column exists) */
 for (const sql of [
   "ALTER TABLE users ADD COLUMN avatar_url TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE users ADD COLUMN profile_banner_url TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE messages ADD COLUMN image TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE messages ADD COLUMN reply_to TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE servers ADD COLUMN description TEXT NOT NULL DEFAULT ''",
@@ -463,8 +472,11 @@ function notifyServerMembers(serverId, payload) {
 }
 function serverName(sid) { const s = db.prepare('SELECT name FROM servers WHERE id=?').get(sid); return s ? s.name : 'Сервер'; }
 
-const pubUser = u => ({ id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '', bio: u.bio, isAdmin: !!u.is_admin || u.username === BOOTSTRAP_ADMIN });
-const UPLOAD_RE = /^\/api\/uploads\/[a-zA-Z0-9._-]+$/; // локальный путь к загрузке
+const pubUser = u => ({ id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '', profileBannerUrl: u.profile_banner_url || '', bio: u.bio, isAdmin: !!u.is_admin || u.username === BOOTSTRAP_ADMIN });
+// Имена всегда выпускает наш upload route: 12 random bytes + расширение из проверенного MIME.
+// Узкий regexp не пропускает `..`, произвольные имена и не-image расширения в профили/чат.
+const UPLOAD_RE = /^\/api\/uploads\/[a-f0-9]{24}\.(?:png|jpg|gif|webp)$/;
+const GIPHY_PROFILE_BANNER_RE = /^giphy:[a-zA-Z0-9]{1,128}$/; // непрозрачный ID; внешние URL в профиле не храним
 const pubServer = s => ({ id: s.id, name: s.name, ownerId: s.owner_id, iconColor: s.icon_color, iconUrl: s.icon_url || '', description: s.description || '', musicEnabled: !!s.music_enabled, statsEnabled: !!s.stats_enabled });
 
 /* ---------------- Рейтинг + уровни (экспериментальная фича) ---------------- */
@@ -1140,25 +1152,211 @@ app.patch('/api/me', requireAuth, (req, res) => {
     const v = String(req.body.avatarUrl);
     if (v === '' || UPLOAD_RE.test(v)) au = v; else return res.status(400).json({ error: 'Неверный аватар' });
   }
+  let pbu = null;
+  let previousProfileBanner = '';
+  if (req.body.profileBannerUrl != null) {
+    const v = String(req.body.profileBannerUrl);
+    previousProfileBanner = String(db.prepare('SELECT profile_banner_url FROM users WHERE id=?').get(req.user.id)?.profile_banner_url || '');
+    if (!(v === '' || UPLOAD_RE.test(v) || GIPHY_PROFILE_BANNER_RE.test(v))) return res.status(400).json({ error: 'Неверный фон профиля' });
+    if (UPLOAD_RE.test(v) && v !== previousProfileBanner) {
+      const tracked = db.prepare('SELECT user_id FROM profile_banner_uploads WHERE url=?').get(v);
+      if (!tracked || tracked.user_id !== req.user.id) return res.status(400).json({ error: 'Фон нужно загрузить через редактор профиля' });
+    }
+    pbu = v;
+  }
   if (dn !== null && dn.length < 1) return res.status(400).json({ error: 'Имя не может быть пустым' });
-  db.prepare('UPDATE users SET display_name=COALESCE(?,display_name), bio=COALESCE(?,bio), avatar_color=COALESCE(?,avatar_color), avatar_url=COALESCE(?,avatar_url) WHERE id=?')
-    .run(dn, bio, ac, au, req.user.id);
+  db.prepare('UPDATE users SET display_name=COALESCE(?,display_name), bio=COALESCE(?,bio), avatar_color=COALESCE(?,avatar_color), avatar_url=COALESCE(?,avatar_url), profile_banner_url=COALESCE(?,profile_banner_url) WHERE id=?')
+    .run(dn, bio, ac, au, pbu, req.user.id);
+  if (pbu !== null && previousProfileBanner && previousProfileBanner !== pbu) deleteOwnedProfileBannerIfUnused(req.user.id, previousProfileBanner);
   const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
   res.json({ user: pubUser(u) });
 });
 
-/* ---------------- IMAGE UPLOADS (avatars + chat, <=10MB) ---------------- */
+/* ---------------- IMAGE UPLOADS (avatars + profile banners + chat, <=10MB) ---------------- */
 const MIME_EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' };
-app.use('/api/uploads', express.static(UPLOADS_DIR, { maxAge: '30d', immutable: true, index: false, fallthrough: false, setHeaders: (res) => res.setHeader('X-Content-Type-Options', 'nosniff') }));
-app.post('/api/upload', requireAuth, express.raw({ type: Object.keys(MIME_EXT), limit: '10mb' }), (req, res) => {
+const PROFILE_BANNER_QUOTA_BYTES = 40 * 1024 * 1024;
+const PROFILE_BANNER_PENDING_TTL = 30 * 60 * 1000;
+
+function imageSignatureMatches(body, ext) {
+  if (!Buffer.isBuffer(body)) return false;
+  if (ext === 'png') return body.length >= 8 && body.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  if (ext === 'jpg') return body.length >= 3 && body[0] === 0xff && body[1] === 0xd8 && body[2] === 0xff;
+  if (ext === 'gif') return body.length >= 6 && (body.subarray(0, 6).toString('ascii') === 'GIF87a' || body.subarray(0, 6).toString('ascii') === 'GIF89a');
+  if (ext === 'webp') return body.length >= 12 && body.subarray(0, 4).toString('ascii') === 'RIFF' && body.subarray(8, 12).toString('ascii') === 'WEBP';
+  return false;
+}
+
+function skipGifSubBlocks(body, offset) {
+  while (offset < body.length) {
+    const size = body[offset++];
+    if (size === 0) return offset;
+    if (offset + size > body.length) return -1;
+    offset += size;
+  }
+  return -1;
+}
+
+function inspectGif(body) {
+  if (body.length < 13) return null;
+  const width = body.readUInt16LE(6), height = body.readUInt16LE(8);
+  const packed = body[10];
+  let offset = 13 + ((packed & 0x80) ? 3 * (1 << ((packed & 0x07) + 1)) : 0);
+  let frames = 0;
+  while (offset < body.length) {
+    const marker = body[offset++];
+    if (marker === 0x3b) return frames > 0 ? { width, height, frames } : null;
+    if (marker === 0x21) {
+      if (offset >= body.length) return null;
+      offset += 1; // extension label
+      offset = skipGifSubBlocks(body, offset);
+      if (offset < 0) return null;
+      continue;
+    }
+    if (marker !== 0x2c || offset + 9 > body.length) return null;
+    const frameWidth = body.readUInt16LE(offset + 4), frameHeight = body.readUInt16LE(offset + 6);
+    const framePacked = body[offset + 8];
+    if (!frameWidth || !frameHeight || frameWidth > 4096 || frameHeight > 4096 || frameWidth * frameHeight > 16_777_216) return null;
+    offset += 9;
+    if (framePacked & 0x80) offset += 3 * (1 << ((framePacked & 0x07) + 1));
+    if (offset >= body.length) return null;
+    offset += 1; // LZW minimum code size
+    offset = skipGifSubBlocks(body, offset);
+    if (offset < 0 || ++frames > 300) return null;
+  }
+  return null;
+}
+
+function inspectJpeg(body) {
+  let offset = 2;
+  const sof = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
+  while (offset + 3 < body.length) {
+    while (offset < body.length && body[offset] !== 0xff) offset++;
+    while (offset < body.length && body[offset] === 0xff) offset++;
+    if (offset >= body.length) return null;
+    const marker = body[offset++];
+    if (marker === 0xd9 || marker === 0xda) return null;
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd8)) continue;
+    if (offset + 2 > body.length) return null;
+    const length = body.readUInt16BE(offset);
+    if (length < 2 || offset + length > body.length) return null;
+    if (sof.has(marker)) {
+      if (length < 7) return null;
+      return { width: body.readUInt16BE(offset + 5), height: body.readUInt16BE(offset + 3), frames: 1 };
+    }
+    offset += length;
+  }
+  return null;
+}
+
+function readUInt24LE(body, offset) { return body[offset] | (body[offset + 1] << 8) | (body[offset + 2] << 16); }
+function inspectWebp(body) {
+  let offset = 12;
+  let width = 0, height = 0, frames = 0;
+  while (offset + 8 <= body.length) {
+    const kind = body.subarray(offset, offset + 4).toString('ascii');
+    const size = body.readUInt32LE(offset + 4);
+    const start = offset + 8;
+    if (start + size > body.length) return null;
+    if (kind === 'VP8X' && size >= 10) {
+      width = readUInt24LE(body, start + 4) + 1;
+      height = readUInt24LE(body, start + 7) + 1;
+    }
+    if (kind === 'VP8 ' && size >= 10 && body[start + 3] === 0x9d && body[start + 4] === 0x01 && body[start + 5] === 0x2a) {
+      width ||= body.readUInt16LE(start + 6) & 0x3fff;
+      height ||= body.readUInt16LE(start + 8) & 0x3fff;
+    }
+    if (kind === 'VP8L' && size >= 5 && body[start] === 0x2f) {
+      const b0 = body[start + 1], b1 = body[start + 2], b2 = body[start + 3], b3 = body[start + 4];
+      width ||= 1 + b0 + ((b1 & 0x3f) << 8);
+      height ||= 1 + (b1 >> 6) + (b2 << 2) + ((b3 & 0x0f) << 10);
+    }
+    if (kind === 'ANMF') {
+      if (size < 16 || ++frames > 300) return null;
+      const frameWidth = readUInt24LE(body, start + 6) + 1;
+      const frameHeight = readUInt24LE(body, start + 9) + 1;
+      if (!frameWidth || !frameHeight || frameWidth > 4096 || frameHeight > 4096 || frameWidth * frameHeight > 16_777_216) return null;
+    }
+    offset = start + size + (size & 1);
+  }
+  return width && height ? { width, height, frames: frames || 1 } : null;
+}
+
+function inspectImage(body, ext) {
+  if (ext === 'png') {
+    if (body.length < 24 || body.subarray(12, 16).toString('ascii') !== 'IHDR') return null;
+    return { width: body.readUInt32BE(16), height: body.readUInt32BE(20), frames: 1 };
+  }
+  if (ext === 'jpg') return inspectJpeg(body);
+  if (ext === 'gif') return inspectGif(body);
+  if (ext === 'webp') return inspectWebp(body);
+  return null;
+}
+
+function profileBannerIsReferenced(url) {
+  if (db.prepare('SELECT 1 FROM users WHERE avatar_url=? OR profile_banner_url=? LIMIT 1').get(url, url)) return true;
+  if (db.prepare('SELECT 1 FROM servers WHERE icon_url=? LIMIT 1').get(url)) return true;
+  const contains = `%${url}%`; // strict generated URL has no SQL LIKE wildcard characters
+  return !!db.prepare('SELECT 1 FROM messages WHERE image=? OR attachments LIKE ? OR reply_to LIKE ? LIMIT 1').get(url, contains, contains);
+}
+
+function deleteOwnedProfileBannerIfUnused(userId, url) {
+  if (!UPLOAD_RE.test(url) || profileBannerIsReferenced(url)) return false;
+  const tracked = db.prepare('SELECT user_id FROM profile_banner_uploads WHERE url=?').get(url);
+  if (!tracked || tracked.user_id !== userId) return false; // legacy/chat files are never deleted here
+  const name = url.slice('/api/uploads/'.length);
+  try { fs.unlinkSync(path.join(UPLOADS_DIR, name)); }
+  catch (e) { if (e?.code !== 'ENOENT') return false; }
+  db.prepare('DELETE FROM profile_banner_uploads WHERE url=?').run(url);
+  return true;
+}
+
+function pruneStaleProfileBannerUploads(userId, cutoff = Date.now() - PROFILE_BANNER_PENDING_TTL) {
+  const rows = userId
+    ? db.prepare('SELECT url,user_id FROM profile_banner_uploads WHERE user_id=? AND created<?').all(userId, cutoff)
+    : db.prepare('SELECT url,user_id FROM profile_banner_uploads WHERE created<?').all(cutoff);
+  for (const row of rows) deleteOwnedProfileBannerIfUnused(row.user_id, row.url);
+}
+
+function saveImageUpload(req, res, profileBanner = false) {
   const ct = String(req.headers['content-type'] || '').split(';')[0].trim();
   const ext = MIME_EXT[ct];
   if (!ext || !Buffer.isBuffer(req.body) || req.body.length === 0) return res.status(400).json({ error: 'Только картинки: png, jpg, gif, webp' });
+  if (!imageSignatureMatches(req.body, ext)) return res.status(400).json({ error: 'Содержимое файла не соответствует формату изображения' });
+  const info = inspectImage(req.body, ext);
+  if (!info || !info.width || !info.height) return res.status(400).json({ error: 'Повреждённое или неподдерживаемое изображение' });
+  if (info.width > 4096 || info.height > 4096 || info.width * info.height > 16_777_216) return res.status(400).json({ error: 'Изображение слишком большое: максимум 4096 px и 16 Мп' });
+  if (profileBanner) {
+    if (info.width > 2560 || info.height > 2560 || info.width * info.height > 5_242_880) return res.status(400).json({ error: 'Фон профиля слишком большой: максимум 2560 px и 5 Мп' });
+    pruneStaleProfileBannerUploads(req.user.id);
+    const used = Number(db.prepare('SELECT COALESCE(SUM(size),0) total FROM profile_banner_uploads WHERE user_id=?').get(req.user.id)?.total || 0);
+    if (used + req.body.length > PROFILE_BANNER_QUOTA_BYTES) return res.status(413).json({ error: 'Лимит фонов профиля исчерпан — сохрани или замени текущий фон' });
+  }
   const name = crypto.randomBytes(12).toString('hex') + '.' + ext;
-  try { fs.writeFileSync(path.join(UPLOADS_DIR, name), req.body); }
-  catch (e) { return res.status(500).json({ error: 'Не удалось сохранить файл' }); }
-  res.json({ url: '/api/uploads/' + name });
+  const url = '/api/uploads/' + name;
+  try {
+    fs.writeFileSync(path.join(UPLOADS_DIR, name), req.body, { flag: 'wx' });
+    if (profileBanner) db.prepare('INSERT INTO profile_banner_uploads(url,user_id,size,created) VALUES(?,?,?,?)').run(url, req.user.id, req.body.length, Date.now());
+  } catch (e) {
+    try { fs.unlinkSync(path.join(UPLOADS_DIR, name)); } catch (_) { /**/ }
+    return res.status(500).json({ error: 'Не удалось сохранить файл' });
+  }
+  res.json({ url });
+}
+
+app.use('/api/uploads', express.static(UPLOADS_DIR, { maxAge: '30d', immutable: true, index: false, fallthrough: false, setHeaders: (res) => res.setHeader('X-Content-Type-Options', 'nosniff') }));
+app.post('/api/upload/profile-banner', requireAuth, express.raw({ type: Object.keys(MIME_EXT), limit: '10mb' }), (req, res) => saveImageUpload(req, res, true));
+app.delete('/api/upload/profile-banner', requireAuth, (req, res) => {
+  const url = String(req.body?.url || '');
+  if (!UPLOAD_RE.test(url)) return res.status(400).json({ error: 'Неверный файл фона' });
+  const tracked = db.prepare('SELECT user_id FROM profile_banner_uploads WHERE url=?').get(url);
+  if (!tracked || tracked.user_id !== req.user.id) return res.status(404).json({ error: 'Файл фона не найден' });
+  if (profileBannerIsReferenced(url)) return res.status(409).json({ error: 'Фон уже используется' });
+  res.json({ ok: true, removed: deleteOwnedProfileBannerIfUnused(req.user.id, url) });
 });
+app.post('/api/upload', requireAuth, express.raw({ type: Object.keys(MIME_EXT), limit: '10mb' }), (req, res) => saveImageUpload(req, res, false));
+
+const profileBannerPruneTimer = setInterval(() => { try { pruneStaleProfileBannerUploads(null); } catch (e) { /**/ } }, 60 * 60 * 1000);
+profileBannerPruneTimer.unref?.();
 
 /* ---------------- 7TV PROXY (обход блокировки эмоутов у части RU-провайдеров) ----------------
  * У части юзеров домены 7TV (7tv.app в реестре РКН с 11.10.2024 за ЛГБТ-эмоут) режутся на уровне
@@ -1391,9 +1589,29 @@ app.get('/api/servers/:id', requireAuth, (req, res) => {
   if (!s) return res.status(404).json({ error: 'Сервер не найден' });
   if (!isMember(req.user.id, s.id)) return res.status(403).json({ error: 'Ты не участник этого сервера' });
   const members = db.prepare(`
-    SELECT u.id,u.username,u.display_name,u.avatar_color,u.avatar_url,u.bio,m.role FROM memberships m
-    JOIN users u ON u.id=m.user_id WHERE m.server_id=? ORDER BY (m.role='owner') DESC, u.display_name ASC`).all(s.id)
-    .map(u => ({ id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '', bio: u.bio || '', role: u.role, roles: rolesOfMember(s.id, u.id) }));
+    SELECT u.id,u.username,u.display_name,u.avatar_color,u.avatar_url,u.profile_banner_url,u.bio,m.role,
+      COALESCE(us.voice_sec,0) stat_voice_sec, COALESCE(us.stream_sec,0) stat_stream_sec,
+      COALESCE(us.messages,0) stat_messages, COALESCE(us.xp,0) stat_xp
+    FROM memberships m
+    JOIN users u ON u.id=m.user_id
+    LEFT JOIN user_stats us ON us.server_id=m.server_id AND us.user_id=m.user_id
+    WHERE m.server_id=? ORDER BY (m.role='owner') DESC, u.display_name ASC`).all(s.id)
+    .map(u => {
+      const member = { id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '', profileBannerUrl: u.profile_banner_url || '', bio: u.bio || '', role: u.role, roles: rolesOfMember(s.id, u.id) };
+      if (s.stats_enabled) {
+        const xp = Number(u.stat_xp) || 0;
+        const progress = stats.levelProgress(xp);
+        member.stats = {
+          voiceSec: Number(u.stat_voice_sec) || 0,
+          streamSec: Number(u.stat_stream_sec) || 0,
+          messages: Number(u.stat_messages) || 0,
+          xp,
+          level: progress.level,
+          progress,
+        };
+      }
+      return member;
+    });
   ensureDefaultChannel(s.id);
   res.json({ server: { ...pubServer(s), memberCount: members.length, roles: rolesOfServer(s.id), channels: channelsOf(s.id) }, members, myRole: roleOf(req.user.id, s.id), myPerms: permsOf(req.user.id, s.id) });
 });

@@ -81,8 +81,8 @@ export function DownloadsModal() {
                   <div className="dl-meta">{missing ? 'Удалено' : `${fmtSize(d.size)} · ${fmtDate(d.savedAt)}`}</div>
                 </div>
                 <div className="dl-actions">
-                  {isTauri && d.path ? <button className="dl-act" disabled={missing} data-tip="Показать в папке" onClick={() => revealInFolder(d.path!)}><Icon name="folder" sm /></button> : null}
-                  <button className="dl-act" data-tip="Убрать из списка" onClick={() => removeDownload(d.id)}><Icon name="close" sm /></button>
+                  {isTauri && d.path ? <button className="dl-act" aria-label={`Показать ${d.name} в папке`} disabled={missing} data-tip="Показать в папке" onClick={() => revealInFolder(d.path!)}><Icon name="folder" sm /></button> : null}
+                  <button className="dl-act" aria-label={`Убрать ${d.name} из списка`} data-tip="Убрать из списка" onClick={() => removeDownload(d.id)}><Icon name="close" sm /></button>
                 </div>
               </div>
             );

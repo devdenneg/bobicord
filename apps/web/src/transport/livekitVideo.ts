@@ -21,6 +21,12 @@ export class LiveKitVideoTransport implements VideoTransport {
 
   private videoTracks = new Map<string, LocalVideoTrack | RemoteTrack>();
   private streamInfoByKey = new Map<string, StreamInfo>();
+  // A logical stream is keyed by the base username, while LiveKit participants are
+  // per-session identities. Keep the selected session explicit so a second tab/device
+  // can take over without tearing down the logical watch.
+  private watchedUsers = new Set<string>();
+  private activeWatchSession = new Map<string, string>();
+  private announcedScreenSessions = new Set<string>();
 
   private streamStartCbs = new Set<(identity: string, silent: boolean) => void>();
   private streamStopCbs = new Set<(identity: string) => void>();
@@ -37,7 +43,8 @@ export class LiveKitVideoTransport implements VideoTransport {
       .on(RoomEvent.LocalTrackPublished, this.onLocalPub)
       .on(RoomEvent.LocalTrackUnpublished, this.onLocalUnpub)
       .on(RoomEvent.TrackPublished, this.onRemotePub)
-      .on(RoomEvent.TrackUnpublished, this.onRemoteUnpub);
+      .on(RoomEvent.TrackUnpublished, this.onRemoteUnpub)
+      .on(RoomEvent.ParticipantDisconnected, this.onParticipantDisconnected);
   }
   onRoomConnected() {
     if (!this.room) return;
@@ -55,8 +62,13 @@ export class LiveKitVideoTransport implements VideoTransport {
         .off(RoomEvent.LocalTrackPublished, this.onLocalPub)
         .off(RoomEvent.LocalTrackUnpublished, this.onLocalUnpub)
         .off(RoomEvent.TrackPublished, this.onRemotePub)
-        .off(RoomEvent.TrackUnpublished, this.onRemoteUnpub);
+        .off(RoomEvent.TrackUnpublished, this.onRemoteUnpub)
+        .off(RoomEvent.ParticipantDisconnected, this.onParticipantDisconnected);
     }
+    this.watchedUsers.forEach((username) => this.setUserSubscribed(username, false));
+    this.watchedUsers.clear();
+    this.activeWatchSession.clear();
+    this.announcedScreenSessions.clear();
     this.videoTracks.clear();
     this.streamInfoByKey.clear();
     this.room = null;
@@ -91,20 +103,51 @@ export class LiveKitVideoTransport implements VideoTransport {
     if (a && a.track) { try { await room.localParticipant.unpublishTrack(a.track, true); } catch { /**/ } }
   }
   isBroadcasting(_streamId: string) { const room = this.bcRoom(); return !!(room && room.localParticipant.isScreenShareEnabled); }
-  // участник по базовому username (несколько сессий одного юзера → берём вещающую)
-  private byUser(username: string): RemoteParticipant | undefined {
-    if (!this.room) return undefined;
-    let any: RemoteParticipant | undefined;
+  private participantsByUser(username: string): RemoteParticipant[] {
+    const out: RemoteParticipant[] = [];
+    if (!this.room) return out;
     for (const p of this.room.remoteParticipants.values()) {
       if (baseUid(p.identity) !== username) continue;
-      if (p.getTrackPublication(Track.Source.ScreenShare)) return p;
-      any = p;
+      out.push(p);
     }
-    return any;
+    return out;
+  }
+  private broadcastingParticipant(username: string, excludeIdentity?: string): RemoteParticipant | undefined {
+    const activeIdentity = this.activeWatchSession.get(username);
+    const participants = this.participantsByUser(username);
+    const active = activeIdentity && activeIdentity !== excludeIdentity
+      ? participants.find((p) => p.identity === activeIdentity && !!p.getTrackPublication(Track.Source.ScreenShare))
+      : undefined;
+    return active || participants.find((p) => p.identity !== excludeIdentity && !!p.getTrackPublication(Track.Source.ScreenShare));
+  }
+  private setParticipantSubscribed(p: RemoteParticipant, subscribed: boolean) {
+    const video = p.getTrackPublication(Track.Source.ScreenShare);
+    const audio = p.getTrackPublication(Track.Source.ScreenShareAudio);
+    [video, audio].forEach((pub) => {
+      if (!pub) return;
+      try { (pub as any).setSubscribed(subscribed); } catch { /**/ }
+    });
+  }
+  private setUserSubscribed(username: string, subscribed: boolean) {
+    this.participantsByUser(username).forEach((p) => this.setParticipantSubscribed(p, subscribed));
+  }
+  private activateWatchSession(username: string, next?: RemoteParticipant) {
+    const previousIdentity = this.activeWatchSession.get(username);
+    if (previousIdentity === next?.identity) {
+      if (next) this.setParticipantSubscribed(next, true);
+      return;
+    }
+    const previous = previousIdentity ? this.room?.remoteParticipants.get(previousIdentity) : undefined;
+    if (previous) this.setParticipantSubscribed(previous, false);
+    if (next) {
+      this.activeWatchSession.set(username, next.identity);
+      this.setParticipantSubscribed(next, true);
+    } else {
+      this.activeWatchSession.delete(username);
+    }
   }
   isRemoteBroadcasting(username: string) {
-    const p = this.byUser(username);
-    return !!(p && p.getTrackPublication(Track.Source.ScreenShare));
+    return !!this.broadcastingParticipant(username);
   }
 
   async getScreenStats(_streamId: string): Promise<string | null> {
@@ -126,14 +169,13 @@ export class LiveKitVideoTransport implements VideoTransport {
   /* ---------- watching (remote) ---------- */
   watch(streamId: string, _quality?: string) {
     // Д3: quality игнорируется — LiveKit-путь идёт через SFU, деревьев/рендишнов нет.
-    const p = this.byUser(streamId); if (!p) return;
-    const v = p.getTrackPublication(Track.Source.ScreenShare), a = p.getTrackPublication(Track.Source.ScreenShareAudio);
-    [v, a].forEach((pub) => { if (pub) { try { (pub as any).setSubscribed(true); } catch { /**/ } } });
+    this.watchedUsers.add(streamId);
+    this.activateWatchSession(streamId, this.broadcastingParticipant(streamId));
   }
   unwatch(streamId: string) {
-    const p = this.byUser(streamId); if (!p) return;
-    const v = p.getTrackPublication(Track.Source.ScreenShare), a = p.getTrackPublication(Track.Source.ScreenShareAudio);
-    [v, a].forEach((pub) => { if (pub) { try { (pub as any).setSubscribed(false); } catch { /**/ } } });
+    this.watchedUsers.delete(streamId);
+    this.setUserSubscribed(streamId, false);
+    this.activeWatchSession.delete(streamId);
   }
 
   /* ---------- track registry ---------- */
@@ -156,12 +198,38 @@ export class LiveKitVideoTransport implements VideoTransport {
 
   /* ---------- room events (video-domain only; mic/chat stay in engine.ts) ---------- */
   private onRemotePub = (pub: TrackPublication, p: RemoteParticipant, silent?: boolean) => {
+    const username = baseUid(p.identity);
+    if (pub.source === Track.Source.ScreenShareAudio) {
+      if (this.watchedUsers.has(username) && this.activeWatchSession.get(username) === p.identity) {
+        try { (pub as any).setSubscribed(true); } catch { /**/ }
+      }
+      return;
+    }
     if (pub.source !== Track.Source.ScreenShare) return;
-    this.streamStartCbs.forEach((cb) => cb(baseUid(p.identity), !!silent));
+    if (this.watchedUsers.has(username)) {
+      const active = this.broadcastingParticipant(username);
+      this.activateWatchSession(username, active || p);
+    }
+    if (this.announcedScreenSessions.has(p.identity)) return;
+    this.announcedScreenSessions.add(p.identity);
+    this.streamStartCbs.forEach((cb) => cb(p.identity, !!silent));
   };
   private onRemoteUnpub = (pub: TrackPublication, p: RemoteParticipant) => {
     if (pub.source !== Track.Source.ScreenShare) return;
-    this.streamStopCbs.forEach((cb) => cb(baseUid(p.identity)));
+    const username = baseUid(p.identity);
+    if (this.watchedUsers.has(username) && this.activeWatchSession.get(username) === p.identity) {
+      this.setParticipantSubscribed(p, false);
+      this.activateWatchSession(username, this.broadcastingParticipant(username, p.identity));
+    }
+    if (!this.announcedScreenSessions.delete(p.identity)) return;
+    this.streamStopCbs.forEach((cb) => cb(p.identity));
+  };
+  private onParticipantDisconnected = (p: RemoteParticipant) => {
+    const username = baseUid(p.identity);
+    if (this.watchedUsers.has(username) && this.activeWatchSession.get(username) === p.identity) {
+      this.activateWatchSession(username, this.broadcastingParticipant(username, p.identity));
+    }
+    if (this.announcedScreenSessions.delete(p.identity)) this.streamStopCbs.forEach((cb) => cb(p.identity));
   };
   private onSub = (track: RemoteTrack, pub: TrackPublication, p: RemoteParticipant) => {
     if (track.kind !== Track.Kind.Video) return;

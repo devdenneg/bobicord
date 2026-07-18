@@ -91,7 +91,7 @@ export const api = {
   login: (username: string, password: string) =>
     req<{ token: string; user: User }>('POST', '/login', { username, password }),
   me: () => req<{ user: User; servers: ServerSummary[] }>('GET', '/me'),
-  updateMe: (patch: { displayName?: string; bio?: string; avatarColor?: number; avatarUrl?: string }) =>
+  updateMe: (patch: { displayName?: string; bio?: string; avatarColor?: number; avatarUrl?: string; profileBannerUrl?: string }) =>
     req<{ user: User }>('PATCH', '/me', patch),
   uploadImage: async (file: Blob): Promise<{ url: string }> => {
     const headers: Record<string, string> = { 'Content-Type': file.type || 'application/octet-stream' };
@@ -102,6 +102,16 @@ export const api = {
     if (!r.ok) throw new Error(d?.error || 'Ошибка ' + r.status);
     return d as { url: string };
   },
+  uploadProfileBanner: async (file: Blob, signal?: AbortSignal): Promise<{ url: string }> => {
+    const headers: Record<string, string> = { 'Content-Type': file.type || 'application/octet-stream' };
+    if (token) headers['Authorization'] = 'Bearer ' + token;
+    const r = await fetch(API_BASE + '/api/upload/profile-banner', { method: 'POST', headers, body: file, signal });
+    let d: any = {};
+    try { d = await r.json(); } catch { /* ignore */ }
+    if (!r.ok) throw new Error(d?.error || 'Ошибка ' + r.status);
+    return d as { url: string };
+  },
+  deleteProfileBannerUpload: (url: string) => req<{ ok: boolean; removed: boolean }>('DELETE', '/upload/profile-banner', { url }),
   // произвольный файл-вложение (любое расширение, <=10MB) — раздаётся форс-скачиванием, не инлайн.
   // Имя передаём отдельным заголовком (raw body = сами байты файла, без multipart).
   uploadFile: async (file: File): Promise<{ url: string; name: string; size: number }> => {

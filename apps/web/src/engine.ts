@@ -51,12 +51,15 @@ export interface Snapshot {
 
 type EmoteListener = (streamerId: string, emoteId: string, by: string, x: number, size?: string) => void;
 export type LevelListener = (level: number, open: boolean, threshold: number) => void;
+type StreamSource = 'livekit' | 'tree';
 type SinkableAudioContext = AudioContext & {
   setSinkId?: (deviceId: string) => Promise<void>;
 };
 
 // шкала чувствительности ввода: rms(0..1) -> dB(-80..0) -> норм.уровень(0..1), сравнимый с порогом
 const WATCH_MAX = 4; // грид: сколько чужих стримов зритель смотрит разом (веб — tree-WS/PC на стрим, натив — Rust relay-слот на стрим)
+const STREAM_EDGE_GRACE_MS = 500;
+const STREAM_MESSAGE_AGGREGATE_MS = 30_000;
 const MIN_DB = -50; // шкала подогнана под уже обработанный браузером сигнал (AGC/NS), а не под теоретический динамический диапазон
 function rmsToDb(rms: number): number { if (rms <= 0) return MIN_DB; return Math.max(MIN_DB, Math.min(0, 20 * Math.log10(rms))); }
 function dbToNorm(db: number): number { return Math.max(0, Math.min(1, (db - MIN_DB) / -MIN_DB)); }
@@ -165,6 +168,13 @@ export class Engine {
   // (см. transportFor).
   private liveKitT: VideoTransport = new LiveKitVideoTransport();
   private treeT: VideoTransport = new TreeVideoTransport();
+  // One logical stream can briefly be announced by both transports (or flap on reconnect).
+  // Keep source edges separate and publish UI/chat/sound only after the union settles.
+  private streamSources = new Map<string, Set<string>>();
+  private stableStreams = new Set<string>();
+  private streamEdgeTimers = new Map<string, number>();
+  private streamEdgeGeneration = 0;
+  private streamStateMessages = new Map<string, { messageId: number; lastAt: number; changes: number }>();
   private screenAudioEls = new Map<string, HTMLMediaElement>();
   private voiceAudioEls = new Map<string, { identity: string; track: RemoteTrack; el: HTMLMediaElement }>();
   private watching = new Set<string>();
@@ -246,35 +256,17 @@ export class Engine {
     this.me = me;
     this.hooks = hooks;
     const onVideoTrack = (_key: string, _track: unknown, identity: string, isLocal: boolean) => {
-      if (!isLocal) this.pendingWatch.delete(identity);
+      if (!isLocal) this.completeWatch(baseUid(identity));
       this.emit();
     };
-    const onStreamStart = (identity: string, silent: boolean) => {
-      this.emit();
-      if (!silent) {
-        const who = this.nameOf(identity);
-        this.sysMsg(`📺 ${who} начал трансляцию — «▶ Смотреть» в списке`);
-        playSound('streamOn');
-        this.hooks.toast(who + ' начал трансляцию', 'info');
-        notify('stream', { title: who, body: 'начал(а) трансляцию', tag: 'stream:' + this.viewServerId }); // тег как у серверного push → local+push схлопываются в один баннер
-      }
-    };
-    const onStreamStop = (identity: string) => {
-      // Разрываем watch явно (idempotent, no-op если уже не смотрели) — иначе
-      // при обрыве вещателя <video> остаётся с последним кадром/чёрным экраном
-      // навсегда: без unwatch() PeerConnection и трек никто не закрывает.
-      this.transportFor(identity).unwatch(identity);
-      this.watchT.delete(identity);
-      this.watching.delete(identity); this.pendingWatch.delete(identity);
-      this.sysMsg(`${this.nameOf(identity)} закончил трансляцию`);
-      if (baseUid(identity) !== this.me.username) playSound('streamOff'); // свой streamOff играет stopShare (без задвоения)
-      this.emit();
-    };
-    for (const t of [this.liveKitT, this.treeT]) {
+    const onStreamStart = (source: StreamSource, identity: string, silent: boolean) => this.onStreamSourceStart(source, identity, silent);
+    const onStreamStop = (source: StreamSource, identity: string) => this.onStreamSourceStop(source, identity);
+    const transports: Array<[StreamSource, VideoTransport]> = [['livekit', this.liveKitT], ['tree', this.treeT]];
+    for (const [source, t] of transports) {
       t.onVideoTrack(onVideoTrack as any);
       t.onVideoTrackRemoved(() => this.emit());
-      t.onStreamStart(onStreamStart);
-      t.onStreamStop(onStreamStop);
+      t.onStreamStart((identity, silent) => onStreamStart(source, identity, silent));
+      t.onStreamStop((identity) => onStreamStop(source, identity));
     }
     // Э8: топология дерева меняется (join/leave/reparent) — перерисовать UI пикера пиров.
     this.treeT.onTopology?.(() => this.emit());
@@ -455,6 +447,7 @@ export class Engine {
   /* ---------- connection ---------- */
   async connect(url: string, token: string, serverId: string, sessionId: string) {
     const connectEpoch = ++this.connectEpoch;
+    this.resetStreamEdges();
     const outputCtx = this.getOutputContext();
     const r = new Room({
       adaptiveStream: true, dynacast: true,
@@ -635,6 +628,8 @@ export class Engine {
       this.liveKitT.setBroadcastRoom?.(null);
     }
     if (wasViewing) {
+      this.resetStreamEdges();
+      this.clearAllWatches();
       ++this.connectEpoch;
       this.roomReady = false;
       this.viewRoom = null; this.viewServerId = '';
@@ -668,6 +663,7 @@ export class Engine {
   // Полный teardown (logout / выход с сервера, где я в голосе): рвём ОБЕ комнаты + всё состояние.
   disconnect() {
     ++this.voiceEpoch; ++this.connectEpoch;
+    this.resetStreamEdges();
     this.voiceClaimPending = 0; this.deferredVoiceLease = null; this.matchedVoiceLease = null;
     this.voiceLeaseVerifying = false; ++this.voiceLeaseVerifySeq;
     const oldVoiceRoom = this.voiceRoom;
@@ -686,8 +682,9 @@ export class Engine {
     this.keepAliveOff();
     document.querySelectorAll('#audioSink audio').forEach((a) => a.remove());
     this.clearVoiceAudio();
+    this.clearAllWatches();
     this.liveKitT.detach(); this.treeT.detach(); this.screenAudioEls.clear();
-    this.watching.clear(); this.pendingWatch.clear(); this.watchT.clear(); this.streamWatchers.clear();
+    this.streamWatchers.clear();
     this.perMuteByServer.clear(); this.volsByServer.clear(); this.messages = []; this.reactions.clear(); this.reactionWrites.clear(); this.reactionWriteSeq.clear(); this.reactionWriteDesired.clear(); this.pendingSend.clear(); this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0; ++this.chatGeneration;
     this.onlineHint.clear(); this.awayHint.clear(); this.voiceHint = {}; this.typingUsers.clear();
     this.activeVoiceSessions.clear();
@@ -705,8 +702,9 @@ export class Engine {
   // view-состояние (чат/стримы/presence-хинты/typing) и рвём viewRoom, ТОЛЬКО если она не голосовая.
   detachView() {
     ++this.connectEpoch;
+    this.resetStreamEdges();
     this.messages = []; this.reactions.clear(); this.reactionWrites.clear(); this.reactionWriteSeq.clear(); this.reactionWriteDesired.clear(); this.pendingSend.clear(); this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0; ++this.chatGeneration;
-    this.watching.clear(); this.pendingWatch.clear(); this.watchT.clear(); this.streamWatchers.clear();
+    this.clearAllWatches(); this.streamWatchers.clear();
     // presence-хинты и typing принадлежат ПРЕДЫДУЩЕМУ смотримому серверу
     this.onlineHint.clear(); this.awayHint.clear(); this.voiceHint = {}; this.typingUsers.clear();
     this.liveKitT.detach(); this.treeT.detach();
@@ -1067,12 +1065,106 @@ export class Engine {
         void this.setVoiceAttributes(this.viewRoom, this.wantedVoiceAttributes(this.viewRoom));
     }
   }
+  private cancelStreamEdge(username: string) {
+    const pending = this.streamEdgeTimers.get(username);
+    if (pending) window.clearTimeout(pending);
+    this.streamEdgeTimers.delete(username);
+  }
+  private resetStreamEdges() {
+    this.streamEdgeGeneration += 1;
+    this.streamEdgeTimers.forEach((pending) => window.clearTimeout(pending));
+    this.streamEdgeTimers.clear();
+    this.streamSources.clear();
+    this.stableStreams.clear();
+    this.streamStateMessages.clear();
+  }
+  private publishStreamState(username: string, who: string, live: boolean) {
+    const now = Date.now();
+    const current = this.streamStateMessages.get(username);
+    const baseText = `${who} ${live ? 'начал трансляцию' : 'закончил трансляцию'}`;
+    const messageIndex = current
+      ? this.messages.findIndex((message) => message.id === current.messageId && message.kind === 'stream-state')
+      : -1;
+    const hasUserMessageAfter = messageIndex >= 0 && this.messages.slice(messageIndex + 1).some((message) => !message.sys);
+    if (current && messageIndex >= 0 && !hasUserMessageAfter && now - current.lastAt <= STREAM_MESSAGE_AGGREGATE_MS) {
+      const changes = current.changes + 1;
+      const messages = [...this.messages];
+      const updated = { ...messages[messageIndex], text: `${baseText} · статус менялся ${changes}×`, ts: now };
+      // The aggregate now represents the newest edge. If unrelated system rows were
+      // appended after it, move the stable row to the tail instead of leaving a fresh
+      // timestamp in the middle of older content.
+      messages.splice(messageIndex, 1);
+      messages.push(updated);
+      this.messages = messages;
+      this.streamStateMessages.set(username, { messageId: current.messageId, lastAt: now, changes });
+      this.emit();
+      return;
+    }
+    const messageId = this.pushMsg(null, baseText, true, undefined, undefined, undefined, now, undefined, undefined, undefined, undefined, 'stream-state');
+    this.streamStateMessages.set(username, { messageId, lastAt: now, changes: 1 });
+  }
+  private scheduleStreamEdge(username: string, who: string) {
+    const current = this.streamEdgeTimers.get(username);
+    if (current) window.clearTimeout(current);
+    const generation = this.streamEdgeGeneration;
+    const serverId = this.viewServerId;
+    const id = window.setTimeout(() => {
+      this.streamEdgeTimers.delete(username);
+      if (generation !== this.streamEdgeGeneration || serverId !== this.viewServerId) return;
+      const live = this.isStreaming(username);
+      const wasLive = this.stableStreams.has(username);
+      if (!live) {
+        // Teardown only after the union of LiveKit + tree stayed down through the grace window.
+        this.clearWatch(username);
+      }
+      if (live === wasLive) { this.emit(); return; }
+      if (live) {
+        this.stableStreams.add(username);
+        this.publishStreamState(username, who, true);
+        playSound('streamOn');
+        this.hooks.toast(who + ' начал трансляцию', 'info');
+        notify('stream', { title: who, body: 'начал(а) трансляцию', tag: 'stream:' + this.viewServerId });
+      } else {
+        this.stableStreams.delete(username);
+        this.publishStreamState(username, who, false);
+        if (username !== this.me.username) playSound('streamOff');
+      }
+    }, STREAM_EDGE_GRACE_MS);
+    this.streamEdgeTimers.set(username, id);
+  }
+  private onStreamSourceStart(source: StreamSource, identity: string, silent: boolean) {
+    const username = baseUid(identity);
+    let sources = this.streamSources.get(username);
+    if (!sources) { sources = new Set<string>(); this.streamSources.set(username, sources); }
+    const sourceIdentity = `${source}:${identity}`;
+    const sourceWasLive = sources.has(sourceIdentity);
+    sources.add(sourceIdentity);
+    this.emit();
+    if (silent) {
+      this.cancelStreamEdge(username);
+      if (this.isStreaming(username)) this.stableStreams.add(username);
+      return;
+    }
+    if (sourceWasLive) return;
+    this.scheduleStreamEdge(username, this.nameOf(username));
+  }
+  private onStreamSourceStop(source: StreamSource, identity: string) {
+    const username = baseUid(identity);
+    const sources = this.streamSources.get(username);
+    const sourceWasLive = sources?.delete(`${source}:${identity}`) ?? false;
+    if (sources && sources.size === 0) this.streamSources.delete(username);
+    this.emit();
+    if (!sourceWasLive) return;
+    // Even if another source is recorded, reconcile against the transports after a short grace;
+    // this heals missed/asymmetric reconnect events without emitting false stop/start pairs.
+    this.scheduleStreamEdge(username, this.nameOf(username));
+  }
   private isStreaming(username: string): boolean {
     if (username === this.me.username) {
       // web self-share (LiveKit) ИЛИ НАТИВНЫЙ self-стрим: его поднимает Rust, web-treeT в дерево НЕ
       // вещает (treeT.isBroadcasting всегда false) — берём из discovery liveStreams (isRemoteBroadcasting),
       // куда сервер шлёт stream-live И самому вещателю. Иначе стример не видел свой LIVE (другие — видели).
-      return this.liveKitT.isBroadcasting(username) || this.treeT.isRemoteBroadcasting(username);
+      return this.liveKitT.isBroadcasting(username) || this.liveKitT.isRemoteBroadcasting(username) || this.treeT.isRemoteBroadcasting(username);
     }
     return this.liveKitT.isRemoteBroadcasting(username) || this.treeT.isRemoteBroadcasting(username);
   }
@@ -2009,6 +2101,39 @@ export class Engine {
   /* ---------- streams (thin facades over VideoTransport) ---------- */
   getVideoTrack(key: string) { return this.liveKitT.getVideoTrack(key) ?? this.treeT.getVideoTrack(key); }
 
+  private cancelWatchTimer(identity: string) {
+    const timer = this.watchTimers.get(identity);
+    if (timer !== undefined) window.clearTimeout(timer);
+    this.watchTimers.delete(identity);
+  }
+  private cancelAllWatchTimers() {
+    this.watchTimers.forEach((timer) => window.clearTimeout(timer));
+    this.watchTimers.clear();
+  }
+  private completeWatch(identity: string) {
+    this.cancelWatchTimer(identity);
+    this.pendingWatch.delete(identity);
+  }
+  private clearWatch(identity: string) {
+    const transport = this.watchT.get(identity) ?? this.transportFor(identity);
+    this.cancelWatchTimer(identity);
+    this.watching.delete(identity);
+    this.pendingWatch.delete(identity);
+    transport.unwatch(identity);
+    this.watchT.delete(identity);
+  }
+  private clearAllWatches() {
+    this.cancelAllWatchTimers();
+    const identities = new Set([...this.watching, ...this.pendingWatch, ...this.watchT.keys()]);
+    identities.forEach((identity) => {
+      const transport = this.watchT.get(identity) ?? this.transportFor(identity);
+      transport.unwatch(identity);
+    });
+    this.watching.clear();
+    this.pendingWatch.clear();
+    this.watchT.clear();
+  }
+
   // Д3: quality пробрасывается в транспорт (выбор рендишн-дерева). Дефолт 'source' — UI-ключ
   // остаётся базовым identity; смена качества (Д4) = closeWatch()+watch(identity, q). transportFor
   // не меняется (пин по identity).
@@ -2020,6 +2145,9 @@ export class Engine {
       this.hooks.toast(`Максимум ${WATCH_MAX} трансляции одновременно — закрой одну`, 'warn');
       return;
     }
+    // Repeated UI/reconnect signals must not arm a second timeout over an already
+    // successful (or still pending) attempt. Quality changes explicitly close first.
+    if (this.watching.has(identity)) return;
     // no `this.room` participant guard here: a tree broadcaster (Э2) is a native peer,
     // not a LiveKit room participant (voice and video are separate transports now) —
     // existence is the VideoTransport's job (it no-ops safely on an unknown identity).
@@ -2030,23 +2158,18 @@ export class Engine {
     if (!localStorage.getItem('sprayTip')) { localStorage.setItem('sprayTip', '1'); this.hooks.toast('Кинь эмоут зрителям — 😃 в углу трансляции', 'info'); }
     this.emit();
     const timer = window.setTimeout(() => {
+      // A cancelled/replaced attempt is not allowed to tear down its successor.
+      if (this.watchTimers.get(identity) !== timer) return;
       this.watchTimers.delete(identity);
       if (this.pendingWatch.has(identity)) {
-        this.pendingWatch.delete(identity); this.watching.delete(identity);
-        this.transportFor(identity).unwatch(identity);
-        this.watchT.delete(identity);
+        this.clearWatch(identity);
         this.hooks.toast('Не удалось подключиться к трансляции', 'err'); this.emit();
       }
     }, 10000);
     this.watchTimers.set(identity, timer);
   }
   closeWatch(identity: string) {
-    this.watching.delete(identity); this.pendingWatch.delete(identity);
-    // Таймер watch() (10с "не удалось подключиться") иначе переживал явный закрытие —
-    // если закрыли до коннекта, он всё равно стрелял и повторно звал unwatch()+toast.
-    const t = this.watchTimers.get(identity); if (t) { clearTimeout(t); this.watchTimers.delete(identity); }
-    this.transportFor(identity).unwatch(identity);
-    this.watchT.delete(identity);
+    this.clearWatch(identity);
     const m = this.streamWatchers.get(identity); if (m) { m.delete(this.me.username); }
     this.dataSend({ t: 'watch', s: identity, id: this.me.username, n: this.me.displayName, on: false });
     this.emit();
@@ -2144,7 +2267,7 @@ export class Engine {
   }
   private wset(sid: string) { let m = this.streamWatchers.get(sid); if (!m) { m = new Map(); this.streamWatchers.set(sid, m); } return m; }
   private cleanupWatchers() { const now = Date.now(); let ch = false; this.streamWatchers.forEach((m) => m.forEach((v, wid) => { if (now - v.ts > 9000) { m.delete(wid); ch = true; } })); if (ch) this.emit(); }
-  private cleanupPeer(id: string) { this.streamWatchers.delete(id); this.streamWatchers.forEach((m) => m.delete(id)); this.detachAnalyser(id); this.watching.delete(id); this.pendingWatch.delete(id); this.watchT.delete(id); const sa = this.screenAudioEls.get(id); if (sa) { try { sa.remove(); } catch { /**/ } this.screenAudioEls.delete(id); } } // защитно: при резком обрыве TrackUnsubscribed может не прийти → стрим-аудио залипнет
+  private cleanupPeer(id: string) { this.streamWatchers.delete(id); this.streamWatchers.forEach((m) => m.delete(id)); this.detachAnalyser(id); this.clearWatch(id); const sa = this.screenAudioEls.get(id); if (sa) { try { sa.remove(); } catch { /**/ } this.screenAudioEls.delete(id); } } // защитно: при резком обрыве TrackUnsubscribed может не прийти → стрим-аудио залипнет
 
   /* ---------- volumes ---------- */
   private volsFor(serverId: string | null | undefined) {
@@ -2304,7 +2427,9 @@ export class Engine {
     // если первый POST на самом деле дошёл (потерян лишь ответ), сервер проигнорит дубль.
     this.hooks.persistMessage(p.text, p.em, p.img, p.reply, localId, p.key, p.files);
   }
-  sysMsg(text: string) { this.pushMsg(null, text, true); }
+  sysMsg(text: string, meta?: { kind?: string }) {
+    this.pushMsg(null, text, true, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, meta?.kind);
+  }
   private mapHistory(list: HistoryMessage[]): ChatMessage[] {
     return list.map((m) => {
       if (m.em) for (const k in m.em) this.onEmoteResolve?.(k, m.em[k]);
@@ -2319,6 +2444,7 @@ export class Engine {
   // начальная страница истории (последние N) — заменяет весь чат, ставит курсор на самое старое
   loadHistory(list: HistoryMessage[], hasMore = false) {
     ++this.chatGeneration;
+    this.streamStateMessages.clear();
     this.reactions.clear();
     this.messages = this.mapHistory(list);
     this.chatMore = hasMore;
@@ -2331,22 +2457,38 @@ export class Engine {
   // 2) по сигнатуре (автор+текст+картинка) — live-эхо от onData НЕ имеет sid, поэтому без этого
   //    refetchChat притаскивал те же сообщения из истории (уже с sid) и они дублировались.
   //    Совпавшему live-сообщению «усыновляем» серверный sid — дальше дедуп идёт по sid.
-  // Свои сообщения не трогаем (показаны оптимистично, приходят с m.uid === me.id).
+  // Оптимистичные и чужие realtime-копии сохраняют локальный id; история лишь усыновляет sid
+  // и авторитетные поля, поэтому React-ключи не прыгают при восстановлении связи.
   mergeRecent(list: HistoryMessage[]) {
     if (!list.length) return;
-    const haveSids = new Set(this.messages.map((m) => m.sid).filter((s): s is number => s != null));
+    const existingBySid = new Map<number, ChatMessage>();
+    const duplicateLocalIds = new Set<number>();
+    this.messages.forEach((message) => {
+      if (message.sid == null) return;
+      if (existingBySid.has(message.sid)) duplicateLocalIds.add(message.id);
+      else existingBySid.set(message.sid, message);
+    });
+    const haveSids = new Set(existingBySid.keys());
     const filesSig = (files?: Attachment[]) => (files && files.length ? files.map((f) => f.url).join(',') : '');
-    const sig = (uid?: string, text?: string, img?: string, files?: Attachment[]) => `${uid || ''}${text || ''}${img || ''}${filesSig(files)}`;
+    const sig = (uid?: string, text?: string, img?: string, files?: Attachment[]) => JSON.stringify([uid || '', text || '', img || '', filesSig(files)]);
     const liveBySig = new Map<string, ChatMessage[]>();
     for (const m of this.messages) {
       if (m.sid == null && !m.sys && m.uid) { const k = sig(m.uid, m.text, m.img, m.files); (liveBySig.get(k) || liveBySig.set(k, []).get(k)!).push(m); }
     }
     const add: HistoryMessage[] = [];
+    const historyForLocal = new Map<number, HistoryMessage>();
+    const pendingReactionAdoptions: Array<[number, number]> = [];
+    const seenIncomingSids = new Set<number>();
     let adopted = false;
+    let canonicalized = false;
     let reactionsChanged = false;
     for (const m of list) {
       if (m.id == null) continue;
+      if (seenIncomingSids.has(m.id)) continue;
+      seenIncomingSids.add(m.id);
       if (haveSids.has(m.id)) {
+        const existing = existingBySid.get(m.id);
+        if (existing) { historyForLocal.set(existing.id, m); canonicalized = true; }
         const authoritative = new Map((m.reactions || []).map((r) => [r.id, { name: r.name, count: r.count, mine: r.mine }]));
         const current = this.reactions.get(m.id);
         if (current) for (const [emoteId, reaction] of current) {
@@ -2369,24 +2511,77 @@ export class Engine {
       // оптимистичная копия лежит в liveBySig и усыновит sid; реально пропущенное попадёт в add.
       const bucket = liveBySig.get(sig(m.uid, m.text, m.img, m.files));
       if (bucket && bucket.length) {
-        const live = bucket.shift()!;
-        live.sid = m.id;
-        this.adoptPendingReactions(live.id, m.id);
-        adopted = true;
-        continue;
+        let bestIndex = -1;
+        let bestDelta = Number.POSITIVE_INFINITY;
+        for (let i = 0; i < bucket.length; i++) {
+          const delta = Math.abs((bucket[i].ts ?? m.ts) - m.ts);
+          if (delta < bestDelta) { bestDelta = delta; bestIndex = i; }
+        }
+        // Realtime timestamps use the client clock and history uses the server clock;
+        // allow a bounded skew, but do not pair identical messages hours apart.
+        if (bestIndex >= 0 && bestDelta <= 5 * 60_000) {
+          const live = bucket.splice(bestIndex, 1)[0];
+          historyForLocal.set(live.id, m);
+          pendingReactionAdoptions.push([live.id, m.id]);
+          adopted = true;
+          continue;
+        }
       } // усыновили sid, не дублируем
       add.push(m);
+      haveSids.add(m.id);
     }
-    if (!add.length) { if (adopted || reactionsChanged) this.emit(); return; }
+    const canonicalize = (current: ChatMessage, history: HistoryMessage): ChatMessage => {
+      const mine = history.uid === this.me.id;
+      return {
+        ...current,
+        sid: history.id,
+        uid: history.uid,
+        who: history.name,
+        text: history.text,
+        mine,
+        sys: false,
+        color: history.color,
+        img: history.img,
+        files: history.files,
+        ts: history.ts,
+        mention: !mine && (this.textMentionsMe(history.text) || this.replyToMe(history.reply)),
+        reply: history.reply,
+        edited: history.edited,
+        status: undefined,
+        kind: history.kind,
+        level: history.level,
+      };
+    };
+    let merged = this.messages.filter((message) => !duplicateLocalIds.has(message.id)).map((message) => {
+      const history = historyForLocal.get(message.id);
+      return history ? canonicalize(message, history) : message;
+    });
     const mapped = this.mapHistory(add);
-    this.messages = [...this.messages, ...mapped];
+    if (mapped.length) merged = [...merged, ...mapped];
+    if (mapped.length || adopted || canonicalized || duplicateLocalIds.size) {
+      // HTTP can return an older missed row after a newer realtime row has already
+      // arrived. Sort the union by canonical time/sid while preserving every existing
+      // local id (React key) and using the prior order as the final stable tie-breaker.
+      this.messages = merged
+        .map((message, index) => ({ message, index }))
+        .sort((a, b) => {
+          const byTime = (a.message.ts ?? 0) - (b.message.ts ?? 0);
+          if (byTime) return byTime;
+          if (a.message.sid != null && b.message.sid != null && a.message.sid !== b.message.sid) return a.message.sid - b.message.sid;
+          return a.index - b.index;
+        })
+        .map(({ message }) => message);
+    }
+    pendingReactionAdoptions.forEach(([localId, sid]) => {
+      if (this.adoptPendingReactions(localId, sid)) reactionsChanged = true;
+    });
     const mentioned = mapped.filter((m) => m.mention); // один звук, а не по сообщению (не спамим при длинном обрыве)
     if (mentioned.length) {
       // звук тега играет само уведомление (notify) — как в Discord; на обычные сообщения не звучим
       this.hooks.toast(mentioned.length === 1 ? `${mentioned[0].who} упомянул тебя` : `Тебя упомянули · ${mentioned.length}`, 'info');
       notify('mention', { title: mentioned.length === 1 ? String(mentioned[0].who) : 'Упоминания', body: mentioned.length === 1 ? String(mentioned[0].text || '').slice(0, 140) : `Тебя упомянули · ${mentioned.length}`, tag: 'mention:' + this.viewServerId });
     }
-    this.emit();
+    if (mapped.length || adopted || canonicalized || duplicateLocalIds.size || reactionsChanged) this.emit();
   }
   // догрузка более старых сообщений при скролле вверх — prepend в начало, курсор сдвигается назад
   prependHistory(list: HistoryMessage[], hasMore: boolean) {
@@ -2401,6 +2596,7 @@ export class Engine {
   // очистка чата (админ): локально + всем; сервер уже почищен вызывающей стороной
   clearMessages(byName?: string) {
     ++this.chatGeneration;
+    this.streamStateMessages.clear();
     this.messages = [];
     this.dataSend({ t: 'clear', by: byName || this.me.displayName });
     this.emit();
@@ -2633,7 +2829,7 @@ export class Engine {
           notify('mention', { title: d.name, body: String(d.text || '').slice(0, 140) || fallback, tag: 'mention:' + this.viewServerId });
         }
       }
-      else if (d.t === 'clear') { ++this.chatGeneration; this.messages = []; this.reactions.clear(); this.emit(); this.sysMsg((d.by || 'Админ') + ' очистил чат'); }
+      else if (d.t === 'clear') { ++this.chatGeneration; this.streamStateMessages.clear(); this.messages = []; this.reactions.clear(); this.emit(); this.sysMsg((d.by || 'Админ') + ' очистил чат'); }
       else if (d.t === 'emote') this.emoteListeners.forEach((f) => f(d.s, d.e, d.by, d.x, d.sz));
       else if (d.t === 'watch') { const m = this.wset(d.s); if (d.on) m.set(d.id, { name: d.n, color: d.c ?? 0, avatarUrl: d.a, ts: Date.now() }); else m.delete(d.id); this.emit(); }
       else if (d.t === 'typing') { if (d.name && d.name !== this.me.displayName) { this.typingUsers.set(d.name, Date.now() + 3500); this.emit(); setTimeout(() => this.pruneTyping(), 3600); } }

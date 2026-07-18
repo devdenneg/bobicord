@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react';
+import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from 'react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { useStore, getEngine } from '../store';
 import { api, resolveUploadUrl } from '../api';
@@ -11,12 +11,14 @@ import { EmoteImg } from './EmoteImg';
 import { EmotePicker } from './EmotePicker';
 import { VoiceDock, VoiceControls } from './VoiceDock';
 import { StreamerWidget } from './StreamerWidget';
+import { ProfileBannerAttribution, ProfileBannerMedia } from './ProfileBanner';
 import { getSettings, setSettings } from '../settings';
+import { fmtDuration, levelProgress } from '../leveling';
 import { playSound } from '../sounds';
 import { applyNativeUpdate } from '../nativeUpdate';
 import { isTauri, saveFileDialog, openFile, pathsExist } from '../native';
 import { getDownloads, addDownload, subscribeDownloads, type DownloadItem } from '../downloads';
-import type { Attachment, ChatMessage, Emote, Member, ReplyRef, Role } from '../types';
+import type { Attachment, ChatMessage, Emote, Leaderboard, Member, MemberStats, ReplyRef, Role } from '../types';
 import { PERM, hasPerm } from '../types';
 
 const MAX_ATTACH = 5;
@@ -41,14 +43,49 @@ interface StagedAttachment {
 }
 let stageSeq = 1;
 
-function Avatar({ name, ci, url, size = 32, dot, live, liveApp }: { name: string; ci: number; url?: string; size?: number; dot?: string; live?: boolean; liveApp?: { appName?: string; appIcon?: string } | null }) {
+const profileStatsCache = new Map<string, { until: number; data: Leaderboard }>();
+const profileStatsPending = new Map<string, Promise<Leaderboard>>();
+function loadProfileStats(serverId: string): Promise<Leaderboard> {
+  const cached = profileStatsCache.get(serverId);
+  if (cached && cached.until > Date.now()) return Promise.resolve(cached.data);
+  const pending = profileStatsPending.get(serverId);
+  if (pending) return pending;
+  const request = api.getLeaderboard(serverId).then((data) => {
+    profileStatsCache.set(serverId, { until: Date.now() + 30_000, data });
+    return data;
+  }).finally(() => profileStatsPending.delete(serverId));
+  profileStatsPending.set(serverId, request);
+  return request;
+}
+
+function memberStatsFromLeaderboard(data: Leaderboard, member: Member): MemberStats | null {
+  if (data.enabled === false) return null;
+  const levelRow = data.categories?.level?.find((row) => row.uid === member.id);
+  const voiceRow = data.categories?.voice?.find((row) => row.uid === member.id);
+  const streamRow = data.categories?.stream?.find((row) => row.uid === member.id);
+  if (!levelRow && !voiceRow && !streamRow) return null;
+  const xp = levelRow?.value || 0;
+  const progress = levelProgress(xp);
+  return {
+    voiceSec: voiceRow?.value || 0,
+    streamSec: streamRow?.value || 0,
+    messages: 0,
+    xp,
+    level: levelRow?.level ?? progress.level,
+    progress,
+  };
+}
+
+function Avatar({ name, ci, url, size = 32, dot, live }: { name: string; ci: number; url?: string; size?: number; dot?: string; live?: boolean }) {
+  const [imageFailed, setImageFailed] = useState(false);
+  useEffect(() => setImageFailed(false), [url]);
+  const showImage = !!url && !imageFailed;
   return (
-    <div className={'av' + (live ? ' live' : '')} style={{ width: size, height: size, fontSize: size * 0.44, background: url ? '#0000' : avColor(name, ci) }}>
-      {url ? <img className="avimg" src={resolveUploadUrl(url)} alt="" /> : initial(name)}
-      {dot ? <span className={'sdot ' + dot} /> : null}
-      {live ? <span className="av-live" title={liveApp?.appName ? `Стримит ${liveApp.appName}` : 'В эфире'}>LIVE</span> : null}
-      {/* иконка игры — наверх-вправо: низ по центру занимает LIVE-бейдж (иначе наслаиваются) */}
-      {live && liveApp?.appIcon ? <img src={`data:image/png;base64,${liveApp.appIcon}`} alt="" title={liveApp.appName ? `Стримит ${liveApp.appName}` : undefined} style={{ position: 'absolute', right: -3, top: -3, width: 14, height: 14, borderRadius: 3, border: '2px solid var(--bg-alt, #111)', objectFit: 'contain' }} /> : null}
+    <div className={'av' + (live ? ' live' : '')} aria-label={name}
+      style={{ width: size, height: size, fontSize: size * 0.44, background: showImage ? '#0000' : avColor(name, ci) }}>
+      {showImage ? <img className="avimg" src={resolveUploadUrl(url!)} alt="" onError={() => setImageFailed(true)} /> : initial(name)}
+      {dot && !live ? <span className={'sdot ' + dot} /> : null}
+      {live ? <span className="av-live" aria-hidden="true">LIVE</span> : null}
     </div>
   );
 }
@@ -58,39 +95,132 @@ function useHoverCard() {
   const [rect, setRect] = useState<DOMRect | null>(null);
   const ref = useRef<HTMLDivElement>(null);
   const t = useRef<number | undefined>(undefined);
+  const closeT = useRef<number | undefined>(undefined);
   const isTouch = typeof matchMedia !== 'undefined' && matchMedia('(hover:none)').matches;
-  const onEnter = () => { if (isTouch) return; t.current = window.setTimeout(() => { if (ref.current) setRect(ref.current.getBoundingClientRect()); }, 320); };
-  const onLeave = () => { if (isTouch) return; window.clearTimeout(t.current); setRect(null); };
-  // тач: открыть/закрыть карточку по тапу (на десктопе no-op — работает hover)
-  const onTap = () => { if (!isTouch) return; setRect((r) => (r ? null : (ref.current ? ref.current.getBoundingClientRect() : null))); };
-  useEffect(() => () => window.clearTimeout(t.current), []);
+  const cancelClose = () => { if (closeT.current) window.clearTimeout(closeT.current); closeT.current = undefined; };
+  const scheduleClose = () => { cancelClose(); closeT.current = window.setTimeout(() => setRect(null), 180); };
+  const openNow = () => {
+    cancelClose();
+    window.clearTimeout(t.current);
+    if (ref.current) setRect(ref.current.getBoundingClientRect());
+  };
+  const closeNow = () => {
+    window.clearTimeout(t.current);
+    cancelClose();
+    setRect(null);
+  };
+  const onEnter = () => { if (isTouch) return; cancelClose(); window.clearTimeout(t.current); t.current = window.setTimeout(() => { if (ref.current) setRect(ref.current.getBoundingClientRect()); }, 320); };
+  const onLeave = () => { if (isTouch) return; window.clearTimeout(t.current); scheduleClose(); };
+  const onCardEnter = () => { if (!isTouch) cancelClose(); };
+  const onCardLeave = () => { if (!isTouch) scheduleClose(); };
+  const onFocus = () => { if (!isTouch) openNow(); };
+  const onBlur = () => { if (!isTouch) scheduleClose(); };
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+    if (event.key === 'Escape') { setRect(null); return; }
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    setRect((current) => current ? null : (ref.current ? ref.current.getBoundingClientRect() : null));
+  };
+  // Явный клик работает на любом устройстве; hover остаётся быстрым desktop-preview.
+  const onToggle = () => {
+    if (!isTouch) { openNow(); return; }
+    setRect((r) => (r ? null : (ref.current ? ref.current.getBoundingClientRect() : null)));
+  };
+  useEffect(() => () => { window.clearTimeout(t.current); window.clearTimeout(closeT.current); }, []);
   // тач-дисмисс открытой карточки: тап вне / скролл / ресайз
   useEffect(() => {
     if (!isTouch || !rect) return;
     const close = () => setRect(null);
-    const id = window.setTimeout(() => { document.addEventListener('pointerdown', close); window.addEventListener('scroll', close, true); window.addEventListener('resize', close); }, 0);
-    return () => { window.clearTimeout(id); document.removeEventListener('pointerdown', close); window.removeEventListener('scroll', close, true); window.removeEventListener('resize', close); };
+    const closeOutside = (event: Event) => {
+      const target = event.target;
+      if (target instanceof Node && ref.current?.contains(target)) return;
+      if (target instanceof Element && target.closest('.pcard')) return;
+      close();
+    };
+    const closeOnScroll = (event: Event) => { if (!(event.target instanceof Element && event.target.closest('.pcard'))) close(); };
+    const id = window.setTimeout(() => { document.addEventListener('pointerdown', closeOutside); window.addEventListener('scroll', closeOnScroll, true); window.addEventListener('resize', close); }, 0);
+    return () => { window.clearTimeout(id); document.removeEventListener('pointerdown', closeOutside); window.removeEventListener('scroll', closeOnScroll, true); window.removeEventListener('resize', close); };
   }, [isTouch, rect]);
-  return { ref, rect, onEnter, onLeave, onTap };
+  return { ref, rect, close: closeNow, onEnter, onLeave, onToggle, onFocus, onBlur, onKeyDown, onCardEnter, onCardLeave };
 }
 
-function ProfileCard({ m, rect }: { m: Member; rect: DOMRect }) {
+function ProfileCard({ m, rect, onEnter, onLeave }: { m: Member; rect: DOMRect; onEnter?: () => void; onLeave?: () => void }) {
   const me = useStore((s) => s.me);
+  const active = useStore((s) => s.active);
+  const eng = useEngine();
+  const E = getEngine();
+  const [fallbackStats, setFallbackStats] = useState<MemberStats | null>(null);
+  const [statsFailed, setStatsFailed] = useState(false);
+  const [statsEmpty, setStatsEmpty] = useState(false);
+  const pr = eng.presence[m.username];
+  const streaming = !!pr?.streaming;
+  const streamMeta = streaming ? E?.getStreamAppMeta(m.username) : null;
+  const streamName = pr?.game?.name || streamMeta?.appName || 'Трансляция';
+  const streamIcon = pr?.game?.icon || streamMeta?.appIcon;
+  const showSeparateCapture = !!(streaming && streamMeta?.appName && pr?.game?.name
+    && streamMeta.appName.toLocaleLowerCase() !== pr.game.name.toLocaleLowerCase());
+  const presence = streaming ? 'В эфире' : pr?.inVoice ? 'В голосовом канале' : pr?.away ? 'Отошёл' : pr?.online ? 'В сети' : 'Не в сети';
+  const presenceClass = streaming ? 'live' : pr?.online ? 'online' : 'offline';
   const bio = ((me && m.username === me.username ? (me.bio || m.bio) : m.bio) || '').trim();
+  const profileBannerUrl = me && m.username === me.username ? (me.profileBannerUrl ?? '') : m.profileBannerUrl;
+  useEffect(() => {
+    if (!active?.statsEnabled || m.stats) { setFallbackStats(null); setStatsFailed(false); setStatsEmpty(false); return; }
+    let alive = true;
+    setStatsFailed(false); setStatsEmpty(false);
+    loadProfileStats(active.id)
+      .then((data) => { if (alive) { const value = memberStatsFromLeaderboard(data, m); setFallbackStats(value); setStatsEmpty(!value); } })
+      .catch(() => { if (alive) setStatsFailed(true); });
+    return () => { alive = false; };
+  }, [active?.id, active?.statsEnabled, m]);
   const onRight = rect.left < window.innerWidth / 2;
-  const top = Math.max(8, Math.min(rect.top - 6, window.innerHeight - 260));
-  const style: CSSProperties = onRight ? { left: rect.right + 10, top } : { right: window.innerWidth - rect.left + 10, top };
+  const statsData = m.stats || fallbackStats;
+  const statsEnabled = !!active?.statsEnabled;
+  const hasStats = !!(statsEnabled && statsData);
+  const top = Math.max(8, Math.min(rect.top - 6, window.innerHeight - (statsEnabled ? 480 : 370)));
+  const progress = statsData?.progress;
+  const progressPct = progress?.span ? Math.max(0, Math.min(100, progress.into / progress.span * 100)) : 0;
+  const preferredLeft = onRight ? rect.right + 10 : rect.left - 306;
+  const left = Math.max(8, Math.min(preferredLeft, window.innerWidth - 304));
+  const style: CSSProperties = { left, top };
   return (
-    <div className="pcard" style={style}>
-      <div className="pcard-av" style={{ background: m.avatarUrl ? '#0000' : avColor(m.displayName, m.avatarColor) }}>
-        {m.avatarUrl ? <img className="avimg" src={resolveUploadUrl(m.avatarUrl)} alt="" /> : initial(m.displayName)}
+    <div className={'pcard' + (streaming ? ' is-live' : '')} style={style} onMouseEnter={onEnter} onMouseLeave={onLeave}>
+      <div className={'pcard-cover' + (profileBannerUrl ? ' has-media' : '')} aria-hidden="true">
+        <ProfileBannerMedia value={profileBannerUrl} className="pcard-cover-banner" attribution={false} />
       </div>
-      <div className="pcard-name">{m.displayName}{m.role === 'owner' ? <span className="rl" title="Владелец">👑</span> : null}</div>
-      <div className="pcard-user">@{m.username}</div>
+      <ProfileBannerAttribution value={profileBannerUrl} className="pcard-banner-credit" />
+      <div className="pcard-head">
+        <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} size={78} live={streaming} dot={pr?.online ? 'online' : 'offline'} />
+        <span className={'pcard-presence ' + presenceClass}><i />{presence}</span>
+      </div>
+      <div className="pcard-identity">
+        <div className="pcard-name">{m.displayName}{m.role === 'owner' ? <span className="rl" title="Владелец">👑</span> : null}</div>
+        <div className="pcard-user">@{m.username}</div>
+      </div>
+      {streaming ? <div className="pcard-activity live">
+        <span className="pcard-activity-icon">{streamIcon ? <img src={`data:image/png;base64,${streamIcon}`} alt="" /> : <Icon name="screen" sm />}</span>
+        <span><b>В эфире</b><i>{streamName}</i></span>
+      </div> : pr?.game ? <div className="pcard-activity game">
+        <span className="pcard-activity-icon">{pr.game.icon ? <img src={`data:image/png;base64,${pr.game.icon}`} alt="" /> : '🎮'}</span>
+        <span><b>Играет</b><i>{pr.game.name}</i></span>
+      </div> : null}
+      {showSeparateCapture && streamMeta?.appName ? <div className="pcard-secondary-activity">Трансляция · {streamMeta.appName}</div> : null}
       {m.roles && m.roles.length ? (<>
         <div className="pcard-label">Роли</div>
-        <div className="pcard-roles">{m.roles.map((r) => <span key={r.id} className="role-badge" style={{ background: (r.color || 'var(--panel3)') + '22', color: r.color || 'var(--muted)', borderColor: (r.color || 'var(--line-2)') + '55' }}>{r.name}</span>)}</div>
+        <div className="pcard-roles">{m.roles.map((r) => <RoleBadge r={r} key={r.id} />)}</div>
       </>) : null}
+      {hasStats && statsData ? <>
+        <div className="pcard-label pcard-level-label"><span>Активность</span><b>Уровень {statsData.level}</b></div>
+        <div className="pcard-xp">
+          <div className="pcard-xp-meta"><span>{progress?.into.toLocaleString('ru-RU')} XP</span><span>{progress?.span.toLocaleString('ru-RU')} XP</span></div>
+          <div className="pcard-xp-track"><i style={{ width: `${progressPct}%` }} /></div>
+        </div>
+        <div className="pcard-stats">
+          <div><Icon name="speaker" sm /><span>В голосе</span><b>{fmtDuration(statsData.voiceSec)}</b></div>
+          <div><Icon name="screen" sm /><span>В эфире</span><b>{fmtDuration(statsData.streamSec)}</b></div>
+          {m.stats ? <div><Icon name="chat" sm /><span>Сообщения</span><b>{statsData.messages.toLocaleString('ru-RU')}</b></div> : null}
+          <div><Icon name="trophy" sm /><span>Всего XP</span><b>{statsData.xp.toLocaleString('ru-RU')}</b></div>
+        </div>
+      </> : statsEnabled ? <div className={'pcard-stats-state' + (statsFailed ? ' failed' : '')}>{statsEmpty ? 'Активность ещё не накоплена' : statsFailed ? 'Статистика временно недоступна' : <><span className="spin" /> Загружаю активность…</>}</div> : null}
       <div className="pcard-label">О себе</div>
       <div className={'pcard-bio' + (bio ? '' : ' empty')}>{bio || 'Ничего не указано'}</div>
     </div>
@@ -144,11 +274,15 @@ function VoiceParticipantRow({ m, anim }: { m: Member; anim?: string }) {
   const E = getEngine()!;
   const me = useStore((s) => s.me)!;
   const [open, setOpen] = useState(false);
+  const [openUp, setOpenUp] = useState(false);
+  const rowRef = useRef<HTMLDivElement>(null);
+  const closeTimerRef = useRef<number | undefined>(undefined);
   const pr = eng.presence[m.username];
   const speaking = eng.speaking[m.username];
   const streaming = pr?.streaming;
   const isLocal = m.username === me.username;
   const remote = !isLocal;
+  const profileBannerUrl = isLocal ? (me.profileBannerUrl ?? '') : m.profileBannerUrl;
   const watching = !!eng.watching[m.username];
   const pending = !!eng.pending[m.username];
   const [vol, setVol] = useState(() => Math.round(E.userVolOf(m.username) * 100));
@@ -156,21 +290,71 @@ function VoiceParticipantRow({ m, anim }: { m: Member; anim?: string }) {
   const connecting = isLocal && eng.voiceConnecting;
   const rowId = `vc-${m.username}`;
   const hc = useHoverCard();
+  const streamMeta = streaming ? E.getStreamAppMeta(m.username) : null;
+  const activityName = streaming ? (pr?.game?.name || streamMeta?.appName || 'Трансляция') : pr?.game?.name;
+  const activityIcon = streaming ? (pr?.game?.icon || streamMeta?.appIcon) : pr?.game?.icon;
+  const armAutoClose = () => {
+    if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+    closeTimerRef.current = window.setTimeout(() => {
+      const controls = rowRef.current?.querySelector('.exp-surface');
+      const restoreFocus = document.activeElement instanceof Node && !!controls?.contains(document.activeElement);
+      setOpen(false);
+      if (restoreFocus) window.requestAnimationFrame(() => rowRef.current?.querySelector<HTMLElement>('.head')?.focus());
+    }, 5_000);
+  };
+  const closeAndRestoreFocus = () => {
+    setOpen(false);
+    window.requestAnimationFrame(() => rowRef.current?.querySelector<HTMLElement>('.head')?.focus());
+  };
+  const toggleOpen = () => {
+    if (!open) {
+      const row = rowRef.current?.getBoundingClientRect();
+      const scroller = rowRef.current?.closest('.ch-body')?.getBoundingClientRect();
+      const lowerEdge = Math.min(window.innerHeight - 8, (scroller?.bottom || window.innerHeight) - 8);
+      setOpenUp(!!row && row.bottom + 108 > lowerEdge && row.top - 108 > (scroller?.top || 0));
+      window.dispatchEvent(new CustomEvent('voice-participant-open', { detail: m.username }));
+    }
+    setOpen((value) => !value);
+  };
+  useEffect(() => {
+    const closeOther = (event: Event) => { if ((event as CustomEvent<string>).detail !== m.username) setOpen(false); };
+    window.addEventListener('voice-participant-open', closeOther);
+    return () => window.removeEventListener('voice-participant-open', closeOther);
+  }, [m.username]);
+  useEffect(() => {
+    if (!open) return;
+    armAutoClose();
+    const closeOutside = (event: PointerEvent) => { if (event.target instanceof Node && !rowRef.current?.contains(event.target)) setOpen(false); };
+    document.addEventListener('pointerdown', closeOutside, true);
+    return () => {
+      document.removeEventListener('pointerdown', closeOutside, true);
+      if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = undefined;
+    };
+  }, [open]);
   return (
-    <div className={'pi' + (remote ? ' clickable' : '') + (streaming ? ' streaming' : '') + (talking ? ' speaking' : '') + (open ? ' open' : '') + (connecting ? ' connecting' : '') + (anim ? ' ' + anim : '')} data-spk={m.username}>
-      <div className="head"
-        ref={hc.ref} onMouseEnter={remote ? hc.onEnter : undefined} onMouseLeave={remote ? hc.onLeave : undefined}
-        role={remote ? 'button' : undefined} tabIndex={remote ? 0 : undefined}
+    <div ref={rowRef} className={'pi' + (remote ? ' clickable' : '') + (streaming ? ' streaming' : '') + (talking ? ' speaking' : '') + (open ? ' open' : '') + (openUp ? ' popover-up' : '') + (connecting ? ' connecting' : '') + (anim ? ' ' + anim : '')} data-spk={m.username}>
+      <div className={'head' + (profileBannerUrl ? ' has-profile-banner' : '')}
+        ref={hc.ref} onMouseEnter={hc.onEnter} onMouseLeave={hc.onLeave}
+        onFocus={remote ? undefined : hc.onFocus} onBlur={remote ? undefined : hc.onBlur}
+        role="button" tabIndex={0}
+        aria-label={remote ? `Настройки громкости и профиль ${m.displayName}` : `Профиль ${m.displayName}`}
         aria-expanded={remote ? open : undefined} aria-controls={remote ? rowId : undefined}
-        onClick={() => remote && setOpen((v) => !v)}
-        onKeyDown={(e) => { if (remote && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); setOpen((v) => !v); } }}>
-        <div className={'av' + (streaming ? ' live' : '')} style={{ background: m.avatarUrl ? '#0000' : avColor(m.displayName, m.avatarColor) }}>
-          {m.avatarUrl ? <img className="avimg" src={resolveUploadUrl(m.avatarUrl)} alt="" /> : initial(m.displayName)}
-          {streaming ? (() => { const meta = E.getStreamAppMeta(m.username); const gname = meta?.appName || pr?.game?.name; return <span className="av-live" title={gname ? `Стримит ${gname}` : 'В эфире'}>LIVE</span>; })() : null}
-        </div>
+        onClick={() => { if (remote) { hc.close(); toggleOpen(); } else hc.onToggle(); }}
+        onKeyDown={(e) => {
+          if (e.target !== e.currentTarget) return;
+          if (remote && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); hc.close(); toggleOpen(); }
+          else { if (remote && e.key === 'Escape') setOpen(false); hc.onKeyDown(e); }
+        }}>
+        <ProfileBannerMedia value={profileBannerUrl} className="member-row-banner" compact />
+        <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} size={30} live={!!streaming} />
         <div className="vc-id">
           <div className="nm" title={m.displayName}>{m.displayName}{isLocal && !connecting ? ' (ты)' : ''}</div>
           {connecting ? <span className="vc-connecting">подключение…</span> : null}
+          {!connecting && activityName ? <span className={'vc-activity ' + (streaming ? 'is-live' : 'is-game')} title={(streaming ? 'В эфире: ' : 'Играет: ') + activityName}>
+            <span className="vc-activity-icon">{activityIcon ? <img src={`data:image/png;base64,${activityIcon}`} alt="" /> : streaming ? <Icon name="screen" sm /> : '🎮'}</span>
+            <b>{streaming ? 'LIVE' : 'Игра'}</b><span>· {activityName}</span>
+          </span> : null}
         </div>
         {/* Правый статус-блок: фикс-колонки [watch][game][mic][chev]. game стоит вплотную к
             зарезервированным mic(visibility:hidden)+chev → игро-иконки всех рядов в одной вертикали
@@ -183,25 +367,40 @@ function VoiceParticipantRow({ m, anim }: { m: Member; anim?: string }) {
             {pending ? <span className="spin" style={{ margin: 0, width: 13, height: 13 }} /> : <Icon name={watching ? 'eye-off' : 'eye'} />}
           </button>
         ) : null}
-        {pr?.game ? (
-          <span className="vcg" data-tip={'Играет в ' + pr.game.name}>{pr.game.icon ? <img src={`data:image/png;base64,${pr.game.icon}`} alt="" /> : <span className="gpad">🎮</span>}</span>
-        ) : null}
         {connecting
           ? <span className="spin" style={{ margin: 0, width: 14, height: 14 }} aria-label="Подключение" />
           : <div className={'micst' + (pr?.micMuted ? ' off' : '')} aria-label={pr?.micMuted ? (pr?.deafened ? 'Оглох' : 'Микрофон выключен') : undefined}><Icon name={pr?.deafened ? 'head-off' : 'mic-off'} /></div>}
         {remote ? <div className="chev" aria-hidden="true"><Icon name="chevron" sm /></div> : <div className="chev chev-pad" aria-hidden="true" />}
       </div>
       {remote ? (
-        <div className="exp" id={rowId}>
-          <Icon name="speaker" sm />
-          <input type="range" min={0} max={200} value={vol} aria-label={`Громкость: ${m.displayName}`}
-            onChange={(e) => { let v = +e.target.value; if (Math.abs(v - 100) < 4) v = 100; setVol(v); E.setUserVol(m.username, v / 100); }}
-            onDoubleClick={() => { setVol(100); E.setUserVol(m.username, 1); }} />
-          <span className="vlbl">{vol}%</span>
-          <button className={'mut' + (E.isMutedFor(m.username) ? ' on' : '')} aria-label="Заглушить у себя" data-tip="Не слышать этого человека" onClick={(e) => { e.stopPropagation(); E.toggleUserMute(m.username); }}><Icon name="volume-off" sm /></button>
+        <div className="exp-wrap" id={rowId} aria-hidden={!open}>
+          <div className="exp">
+            <div className="exp-surface" onPointerDown={armAutoClose} onFocusCapture={armAutoClose} onKeyDown={(event) => {
+              if (event.key === 'Escape') {
+                event.preventDefault();
+                event.stopPropagation();
+                closeAndRestoreFocus();
+              } else {
+                armAutoClose();
+              }
+            }}>
+              <div className="exp-title"><span><Icon name="speaker" sm />Личная громкость</span><strong>{vol}%</strong></div>
+              <div className="exp-controls">
+                <input type="range" min={0} max={200} value={vol} tabIndex={open ? 0 : -1} aria-label={`Громкость: ${m.displayName}`}
+                  style={{ ['--volume' as string]: `${vol / 2}%` } as CSSProperties}
+                  onChange={(e) => { armAutoClose(); let v = +e.target.value; if (Math.abs(v - 100) < 4) v = 100; setVol(v); E.setUserVol(m.username, v / 100); }}
+                  onDoubleClick={() => { setVol(100); E.setUserVol(m.username, 1); }} />
+                <button className={'mut' + (E.isMutedFor(m.username) ? ' on' : '')} tabIndex={open ? 0 : -1}
+                  aria-pressed={E.isMutedFor(m.username)}
+                  aria-label={E.isMutedFor(m.username) ? `Снова слышать ${m.displayName}` : `Заглушить у себя ${m.displayName}`}
+                  data-tip={E.isMutedFor(m.username) ? 'Снова слышать этого человека' : 'Не слышать этого человека'}
+                  onClick={(e) => { e.stopPropagation(); E.toggleUserMute(m.username); }}><Icon name="volume-off" sm /></button>
+              </div>
+            </div>
+          </div>
         </div>
       ) : null}
-      {remote && hc.rect ? <ProfileCard m={m} rect={hc.rect} /> : null}
+      {hc.rect ? <ProfileCard m={m} rect={hc.rect} onEnter={hc.onCardEnter} onLeave={hc.onCardLeave} /> : null}
     </div>
   );
 }
@@ -291,8 +490,8 @@ function VoiceChannelItem({ channel, membersInChannel, canManage, canDelete, min
         {!editing && membersInChannel.length ? <span className="vchan-n">{membersInChannel.length}</span> : null}
         {canManage && !editing ? (
           <span className="vchan-actions" onClick={(e) => e.stopPropagation()}>
-            <button className="vchan-act" data-tip="Переименовать" onClick={() => setEditing(true)}><Icon name="edit" sm /></button>
-            {canDelete ? <button className="vchan-act del" data-tip="Удалить канал" onClick={() => setConfirmDel(true)}><Icon name="trash" sm /></button> : null}
+            <button className="vchan-act" aria-label={`Переименовать канал ${channel.name}`} data-tip="Переименовать" onClick={() => setEditing(true)}><Icon name="edit" sm /></button>
+            {canDelete ? <button className="vchan-act del" aria-label={`Удалить канал ${channel.name}`} data-tip="Удалить канал" onClick={() => setConfirmDel(true)}><Icon name="trash" sm /></button> : null}
           </span>
         ) : null}
       </div>
@@ -332,8 +531,8 @@ function CreateChannelRow() {
       <input autoFocus placeholder="Название канала" maxLength={24} value={name}
         onChange={(e) => setName(e.target.value)}
         onKeyDown={(e) => { if (e.key === 'Enter') submit(); if (e.key === 'Escape') { setName(''); setOpen(false); } }} />
-      <button className="vchan-create-ok" disabled={!name.trim() || busy} data-tip="Создать" onClick={submit}>{busy ? <span className="spin" style={{ margin: 0, width: 13, height: 13 }} /> : <Icon name="check" sm />}</button>
-      <button className="vchan-create-x" data-tip="Отмена" onClick={() => { setName(''); setOpen(false); }}><Icon name="close" sm /></button>
+      <button className="vchan-create-ok" aria-label="Создать голосовой канал" disabled={!name.trim() || busy} data-tip="Создать" onClick={submit}>{busy ? <span className="spin" style={{ margin: 0, width: 13, height: 13 }} /> : <Icon name="check" sm />}</button>
+      <button className="vchan-create-x" aria-label="Отменить создание канала" data-tip="Отмена" onClick={() => { setName(''); setOpen(false); }}><Icon name="close" sm /></button>
     </div>
   );
 }
@@ -343,31 +542,12 @@ function CreateChannelRow() {
 
 // роли сразу за ником; что не влезло — сворачиваем в «+N» с тултипом всех ролей
 function roleBadge(r: Role) {
-  return <span key={r.id} className="role-badge" style={{ background: (r.color || 'var(--panel3)') + '22', color: r.color || 'var(--muted)', borderColor: (r.color || 'var(--line-2)') + '55' }}>{r.name}</span>;
+  return <span key={r.id} className="role-badge" style={{ ['--role-color' as string]: r.color || 'var(--muted)' } as CSSProperties}><i className="role-dot" /><span className="rb-t">{r.name}</span></span>;
 }
-// бейдж роли: если имя не влезает в max-width — пускаем бегущую строку (ping-pong), иначе обычный ellipsis
 function RoleBadge({ r }: { r: Role }) {
-  const outer = useRef<HTMLSpanElement>(null);
-  const inner = useRef<HTMLSpanElement>(null);
-  const [shift, setShift] = useState(0);
-  useLayoutEffect(() => {
-    const o = outer.current, i = inner.current; if (!o || !i) return;
-    const compute = () => {
-      const cs = getComputedStyle(o);
-      const avail = o.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
-      const over = i.scrollWidth - avail;
-      setShift(over > 1 ? over : 0);
-    };
-    compute();
-    const ro = new ResizeObserver(compute); ro.observe(o);
-    return () => ro.disconnect();
-  }, [r.name]);
-  const marq = shift > 0 && !prefersReducedMotion();
-  const style: CSSProperties = { background: (r.color || 'var(--panel3)') + '22', color: r.color || 'var(--muted)', borderColor: (r.color || 'var(--line-2)') + '55' };
-  const innerStyle: CSSProperties | undefined = marq ? { ['--marq' as string]: -shift + 'px', animationDuration: (2 + shift / 28).toFixed(2) + 's' } as CSSProperties : undefined;
   return (
-    <span ref={outer} key={r.id} className={'role-badge' + (marq ? ' marquee' : '')} style={style} data-tip={shift > 0 ? r.name : undefined}>
-      <span ref={inner} className="rb-t" style={innerStyle}>{r.name}</span>
+    <span className="role-badge" style={{ ['--role-color' as string]: r.color || 'var(--muted)' } as CSSProperties} data-tip={r.name}>
+      <i className="role-dot" /><span className="rb-t">{r.name}</span>
     </span>
   );
 }
@@ -415,15 +595,14 @@ function MemberRow({ m, anim }: { m: Member; anim?: string }) {
   const st = pr?.inVoice ? 'voice' : pr?.away ? 'away' : pr?.online ? 'online' : 'offline';
   const streaming = pr?.streaming;
   const self = m.username === me.username;
+  const profileBannerUrl = self ? (me.profileBannerUrl ?? '') : m.profileBannerUrl;
   const watching = !!eng.watching[m.username];
   const pending = !!eng.pending[m.username];
   const canKick = !!active && active.ownerId === me.id && !self && m.role !== 'owner';
   const hc = useHoverCard();
-  // Стример: игру показываем ТОЛЬКО оверлеем на аватаре (LIVE + иконка игры) — отдельная гейм-пилюля
-  // была бы дублем (очевидно, стримит то, во что играет). Оверлею даём фолбэк pr.game (мета-иконка
-  // стрима бывает пустой). Не-стример игрок → обычная гейм-пилюля ниже.
-  const liveApp = streaming ? (() => { const meta = E.getStreamAppMeta(m.username); return { appName: meta?.appName || pr?.game?.name, appIcon: meta?.appIcon || pr?.game?.icon }; })() : null;
-  const showGamePill = !!pr?.game && !streaming;
+  const streamMeta = streaming ? E.getStreamAppMeta(m.username) : null;
+  const activityName = streaming ? (pr?.game?.name || streamMeta?.appName || 'Трансляция') : pr?.game?.name;
+  const activityIcon = streaming ? (pr?.game?.icon || streamMeta?.appIcon) : pr?.game?.icon;
   async function kick(e: React.MouseEvent) {
     e.stopPropagation();
     if (!active) return;
@@ -433,26 +612,27 @@ function MemberRow({ m, anim }: { m: Member; anim?: string }) {
   }
   return (
     <div className={'pi ' + st + (streaming ? ' streaming' : '') + (anim ? ' ' + anim : '')} data-spk={m.username}>
-      <div className="head" ref={hc.ref} onClick={self ? undefined : hc.onTap} onMouseEnter={self ? undefined : hc.onEnter} onMouseLeave={self ? undefined : hc.onLeave}>
-        <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} dot={st} live={streaming} liveApp={liveApp} />
+      <div className={'head' + (profileBannerUrl ? ' has-profile-banner' : '')} ref={hc.ref} role="button" tabIndex={0} aria-label={`Профиль ${m.displayName}`}
+        onClick={hc.onToggle} onMouseEnter={hc.onEnter} onMouseLeave={hc.onLeave}
+        onFocus={hc.onFocus} onBlur={hc.onBlur} onKeyDown={(event) => { if (event.target === event.currentTarget) hc.onKeyDown(event); }}>
+        <ProfileBannerMedia value={profileBannerUrl} className="member-row-banner" compact />
+        <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} size={36} dot={st} live={!!streaming} />
         <div className="pi-main">
-          {/* нет игры → роли ИНЛАЙН сразу после ника (одна строка). Есть игра → ник ↑, игра+роли ↓. */}
           <div className="pi-l1">
             <div className="nm" style={roleColorOf(m) ? { color: roleColorOf(m) } : undefined}>{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div>
-            {!showGamePill && m.roles && m.roles.length > 0 ? <MemberRoles roles={m.roles} /> : null}
           </div>
-          {pr?.game && !streaming ? (
+          {activityName || (m.roles && m.roles.length > 0) ? (
             <div className="pi-l2">
-              <span className="pi-game mem" data-tip={'Играет в ' + pr.game.name}>
-                {pr.game.icon ? <img src={`data:image/png;base64,${pr.game.icon}`} alt="" /> : <span className="gpad">🎮</span>}
-                <span className="pg-nm">{pr.game.name}</span>
-              </span>
+              {activityName ? <span className={'pi-activity ' + (streaming ? 'is-live' : 'is-game')} data-tip={(streaming ? 'В эфире: ' : 'Играет: ') + activityName}>
+                <span className="pi-activity-icon">{activityIcon ? <img src={`data:image/png;base64,${activityIcon}`} alt="" /> : streaming ? <Icon name="screen" sm /> : '🎮'}</span>
+                <b>{streaming ? 'LIVE' : 'Игра'}</b><span className="pi-activity-name">· {activityName}</span>
+              </span> : null}
               {m.roles && m.roles.length > 0 ? <MemberRoles roles={m.roles} /> : null}
             </div>
           ) : null}
         </div>
         <div className="pi-ctl">
-          {!self && streaming && !pr?.inVoice ? (
+          {!self && streaming ? (
             <button className={'watchbtn' + (watching ? ' on' : '')} disabled={pending}
               aria-label={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}
               data-tip={watching ? 'Закрыть трансляцию' : 'Смотреть трансляцию'}
@@ -460,10 +640,10 @@ function MemberRow({ m, anim }: { m: Member; anim?: string }) {
               {pending ? <span className="spin" style={{ margin: 0, width: 13, height: 13 }} /> : <Icon name={watching ? 'eye-off' : 'eye'} />}
             </button>
           ) : null}
-          {canKick ? <button className="mkick" data-tip="Выгнать" onClick={kick}><Icon name="close" sm /></button> : null}
+          {canKick ? <button className="mkick" aria-label={`Выгнать ${m.displayName}`} data-tip="Выгнать" onClick={kick}><Icon name="close" sm /></button> : null}
         </div>
       </div>
-      {!self && hc.rect ? <ProfileCard m={m} rect={hc.rect} /> : null}
+      {hc.rect ? <ProfileCard m={m} rect={hc.rect} onEnter={hc.onCardEnter} onLeave={hc.onCardLeave} /> : null}
     </div>
   );
 }
@@ -475,6 +655,11 @@ function Members() {
   const setModal = useStore((s) => s.setModal);
   const online = members.filter((m) => eng.presence[m.username]?.online);
   const offline = members.filter((m) => !eng.presence[m.username]?.online);
+  const [query, setQuery] = useState('');
+  const normalizedQuery = query.trim().toLocaleLowerCase('ru-RU');
+  const matchesQuery = (m: Member) => !normalizedQuery
+    || m.displayName.toLocaleLowerCase('ru-RU').includes(normalizedQuery)
+    || m.username.toLocaleLowerCase('ru-RU').includes(normalizedQuery);
 
   // анимация смены online<->offline: строка уезжает вправо из старой секции (ghost, схлопывается)
   // и въезжает справа в новую. enter — юзеры с анимацией входа; exit — ghost'ы в покидаемой секции.
@@ -509,6 +694,8 @@ function Members() {
   const onSet = new Set(online.map((m) => m.username));
   const onlineRender = members.filter((m) => onSet.has(m.username) || exit.get(m.username) === 'on');
   const offlineRender = members.filter((m) => !onSet.has(m.username) || exit.get(m.username) === 'off');
+  const visibleOnline = onlineRender.filter(matchesQuery);
+  const visibleOffline = offlineRender.filter(matchesQuery);
   const animOf = (m: Member, sectionOnline: boolean): string => {
     const isNow = sectionOnline ? onSet.has(m.username) : !onSet.has(m.username);
     if (!isNow) return 'mrow-exit';                                  // ghost в покидаемой секции
@@ -517,14 +704,23 @@ function Members() {
 
   return (
     <aside id="members">
-      <div className="m-sec" style={{ borderBottom: '1px solid var(--line-2)', height: 50, display: 'flex', alignItems: 'center', gap: 6 }}>Участники · <span>{members.length}</span>
-        {active?.statsEnabled ? <button className="m-trophy tip-b" data-tip="Рейтинг и уровни" onClick={() => setModal('leaderboard')}><Icon name="trophy" sm /></button> : null}
+      <header className="members-head">
+        <div className="members-title"><span>Участники</span><b>{members.length}</b></div>
+        {active?.statsEnabled ? <button className="m-trophy tip-b" aria-label="Рейтинг и уровни" data-tip="Рейтинг и уровни" onClick={() => setModal('leaderboard')}><Icon name="trophy" sm /></button> : null}
+      </header>
+      <div className="members-search" role="search">
+        <Icon name="search" sm />
+        <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Найти участника" aria-label="Найти участника" />
+        {query ? <button aria-label="Очистить поиск" onClick={() => setQuery('')}><Icon name="close" sm /></button> : null}
       </div>
       <div id="mlist">
-        {online.length ? <div className="m-sec" style={{ padding: '10px 8px 4px' }}>В сети — {online.length}</div> : null}
-        {onlineRender.map((m) => <MemberRow m={m} anim={animOf(m, true)} key={m.username} />)}
-        {offline.length ? <div className="m-sec" style={{ padding: '10px 8px 4px' }}>Не в сети — {offline.length}</div> : null}
-        {offlineRender.map((m) => <MemberRow m={m} anim={animOf(m, false)} key={m.username} />)}
+        {visibleOnline.length ? <div className="m-sec">В сети <span>{visibleOnline.length}</span></div> : null}
+        {visibleOnline.map((m) => <MemberRow m={m} anim={animOf(m, true)} key={m.username} />)}
+        {visibleOffline.length ? <div className="m-sec">Не в сети <span>{visibleOffline.length}</span></div> : null}
+        {visibleOffline.map((m) => <MemberRow m={m} anim={animOf(m, false)} key={m.username} />)}
+        {normalizedQuery && !visibleOnline.length && !visibleOffline.length ? (
+          <div className="members-empty"><Icon name="search" /><b>Никого не нашли</b><span>Попробуй другой ник или логин.</span></div>
+        ) : null}
       </div>
     </aside>
   );
@@ -688,6 +884,9 @@ const COMMANDS: { name: string; desc: string }[] = [
 // на кол-во добавленных сверху — так virtuoso держит якорь скролла на месте (prepend-паттерн).
 const VIRT_BASE_INDEX = 1_000_000;
 const CHAT_STRICT_BOTTOM_PX = 8;
+// Raw scroll writes closer than this are visually meaningless, but can fight Virtuoso's
+// fractional ResizeObserver compensation and create a visible 1px up/down feedback loop.
+const CHAT_BOTTOM_EPSILON_PX = 1.25;
 
 // Шапка списка чата: спиннер во время догрузки старых сообщений / метка начала истории.
 // Определена на уровне модуля (стабильная ссылка) — иначе virtuoso ремонтит её на каждый рендер.
@@ -810,8 +1009,8 @@ function Chat() {
   const detachScrollerRef = useRef<(() => void) | null>(null);
   const bottomStackRef = useRef<HTMLDivElement>(null);
   const bottomLockFrameRef = useRef<number | null>(null);
-  const bottomLockSecondFrameRef = useRef<number | null>(null);
-  const bottomHeightFrameRef = useRef<number | null>(null);
+  const bottomHeightTimerRef = useRef<number | null>(null);
+  const lastTotalListHeightRef = useRef<number | null>(null);
   const [pill, setPill] = useState(0);            // счётчик непрочитанных (пока не внизу)
   const [atBottom, setAtBottom] = useState(true);
   // Строгое состояние atBottom (<=8px) управляет read receipt, badge и кнопкой перехода вниз.
@@ -866,19 +1065,20 @@ function Chat() {
     // Физический scrollHeight не зависит от item-index anchor и закрывает уже измеренную геометрию целиком.
     const scroller = scrollerElementRef.current;
     if (scroller) {
-      scroller.scrollTo({ top: scroller.scrollHeight, behavior });
-      return;
+      const maxScrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+      if (Math.abs(maxScrollTop - scroller.scrollTop) <= CHAT_BOTTOM_EPSILON_PX) return false;
+      scroller.scrollTo({ top: maxScrollTop, behavior });
+      return true;
     }
     // Fallback на короткое окно между mount Virtuoso и получением scrollerRef.
     virtuosoRef.current?.scrollTo({ top: Number.MAX_SAFE_INTEGER, behavior });
+    return true;
   }, []);
   const cancelBottomLockFrames = useCallback(() => {
     if (bottomLockFrameRef.current != null) window.cancelAnimationFrame(bottomLockFrameRef.current);
-    if (bottomLockSecondFrameRef.current != null) window.cancelAnimationFrame(bottomLockSecondFrameRef.current);
-    if (bottomHeightFrameRef.current != null) window.cancelAnimationFrame(bottomHeightFrameRef.current);
+    if (bottomHeightTimerRef.current != null) window.clearTimeout(bottomHeightTimerRef.current);
     bottomLockFrameRef.current = null;
-    bottomLockSecondFrameRef.current = null;
-    bottomHeightFrameRef.current = null;
+    bottomHeightTimerRef.current = null;
   }, []);
   const detachBottomFollow = useCallback(() => {
     bottomFollowIntentRef.current = false;
@@ -889,33 +1089,29 @@ function Chat() {
     const generation = bottomFollowGenerationRef.current;
     const canFollow = () => bottomFollowIntentRef.current && bottomFollowGenerationRef.current === generation;
     if (!canFollow()) return;
-    const scroll = () => scrollToPhysicalBottom('auto');
     cancelBottomLockFrames();
-    scroll();
-    // Virtuoso измеряет динамические строки после commit. Два коротких кадра закрывают именно
-    // этот measurement-window, не создавая таймеров, которые позже вырвут пользователя из истории.
+    // One coalesced correction after layout is enough. Further real height changes arrive via
+    // totalListHeightChanged and replace this RAF instead of stacking competing scroll writes.
     bottomLockFrameRef.current = window.requestAnimationFrame(() => {
       bottomLockFrameRef.current = null;
       if (!canFollow()) return;
-      scroll();
-      bottomLockSecondFrameRef.current = window.requestAnimationFrame(() => {
-        bottomLockSecondFrameRef.current = null;
-        if (!canFollow()) return;
-        scroll();
-      });
+      scrollToPhysicalBottom('auto');
     });
   }, [cancelBottomLockFrames, scrollToPhysicalBottom]);
-  const onTotalListHeightChanged = useCallback(() => {
+  const onTotalListHeightChanged = useCallback((height: number) => {
+    const previousHeight = lastTotalListHeightRef.current;
+    lastTotalListHeightRef.current = height;
     if (!bottomFollowIntentRef.current) return;
+    if (previousHeight != null && Math.abs(height - previousHeight) < 0.01) return;
+    if (bottomHeightTimerRef.current != null) window.clearTimeout(bottomHeightTimerRef.current);
     const generation = bottomFollowGenerationRef.current;
-    if (bottomHeightFrameRef.current != null) window.cancelAnimationFrame(bottomHeightFrameRef.current);
-    // Callback приходит из ResizeObserver Virtuoso. Выходим в следующий кадр, чтобы scrollHeight
-    // уже содержал новую геометрию, и ещё раз проверяем intent/generation перед прокруткой.
-    bottomHeightFrameRef.current = window.requestAnimationFrame(() => {
-      bottomHeightFrameRef.current = null;
+    // Trailing correction: animated/fractional measurements are allowed to settle while Virtuoso
+    // owns the active scroll. We only verify the physical bottom once after the resize burst.
+    bottomHeightTimerRef.current = window.setTimeout(() => {
+      bottomHeightTimerRef.current = null;
       if (!bottomFollowIntentRef.current || bottomFollowGenerationRef.current !== generation) return;
       lockToBottom();
-    });
+    }, 64);
   }, [lockToBottom]);
   const onAtBottom = useCallback((reportedBottom: boolean) => {
     // На unread-entry Virtuoso может кратко сообщить true на пустой/ещё не позиционированной
@@ -933,7 +1129,7 @@ function Chat() {
     const distance = scroller ? Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) : Number.POSITIVE_INFINITY;
     // Short unread-list уже физически внизу и не может сгенерировать новый scroll event.
     // Явный клик пользователя в этом случае сам подтверждает bottom/read intent.
-    if (distance <= CHAT_STRICT_BOTTOM_PX) {
+    if (distance <= CHAT_BOTTOM_EPSILON_PX) {
       onAtBottom(true);
       return;
     }
@@ -960,13 +1156,14 @@ function Chat() {
       if (manualArmFrame != null) window.cancelAnimationFrame(manualArmFrame);
       manualArmFrame = null;
       const distance = Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
-      if (distance <= CHAT_STRICT_BOTTOM_PX) {
+      if (distance <= CHAT_BOTTOM_EPSILON_PX) {
         bottomFollowIntentRef.current = true;
         manualDown = false;
         onAtBottom(true);
       }
     };
     const scheduleManualDownArm = () => {
+      if (bottomFollowIntentRef.current) return;
       manualDown = true;
       if (manualArmFrame != null) window.cancelAnimationFrame(manualArmFrame);
       // Даже если short-list уже зажат внизу и scroll event не случится, явный down-input
@@ -980,7 +1177,7 @@ function Chat() {
       const distance = Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
       // Re-arm только после ЯВНОГО пользовательского движения вниз. Голый scrollTop здесь не годится:
       // Virtuoso сам корректирует его при measurement и не должен случайно detach/re-arm pin.
-      if (manualDown && distance <= CHAT_STRICT_BOTTOM_PX) armFollowAtPhysicalBottom();
+      if (manualDown && distance <= CHAT_BOTTOM_EPSILON_PX) armFollowAtPhysicalBottom();
     };
     const onWheel = (event: WheelEvent) => {
       if (event.deltaY < 0) {
@@ -1095,6 +1292,7 @@ function Chat() {
     const startPinned = unreadServer === 0;
     bottomFollowGenerationRef.current += 1;
     cancelBottomLockFrames();
+    lastTotalListHeightRef.current = null;
     setPill(unreadServer > 0 ? Math.max(unreadHere, unreadServer) : 0);
     setAtBottom(startPinned);
     bottomFollowIntentRef.current = startPinned;
@@ -1440,8 +1638,8 @@ function Chat() {
     const canReact = m.sid != null || !!m.mkey;
     const reactionTarget = { id: m.id, sid: m.sid };
     return (
-      <div className={'virt-row' + (cont ? ' cont' : '') + (cont && hasMedia ? ' cont-media' : '')}>
-        <div className={'msg' + (m.sys ? ' sys' : '') + (m.mine ? ' me' : '') + (m.mention ? ' mentioned' : '') + (m.id === flashId ? ' flash' : '') + (m.status === 'failed' ? ' failed' : '')}>
+      <div className={'virt-row' + (m.sys ? ' sys-row' : '') + (cont ? ' cont' : '') + (cont && hasMedia ? ' cont-media' : '')}>
+        <div className={'msg' + (m.sys ? ' sys' : '') + (m.kind === 'stream-state' ? ' stream-state' : '') + (m.mine ? ' me' : '') + (m.mention ? ' mentioned' : '') + (m.id === flashId ? ' flash' : '') + (m.status === 'failed' ? ' failed' : '')}>
           {!m.sys ? <div className="msg-av">{!cont ? <Avatar name={m.who || ''} ci={m.color ?? 0} url={author?.avatarUrl} size={36} /> : null}</div> : null}
           <div className="msg-body">
             {replyQuote}
@@ -1456,7 +1654,7 @@ function Chat() {
                   </div>
                 ) : m.sys || m.text ? (
                   <div className={'tx' + (big ? ' big' : '')}>
-                    {m.sys ? m.text : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : 'link' in p ? <a key={i} className="msg-link" href={p.link} target="_blank" rel="noreferrer">{p.link}</a> : 'mention' in p ? <span key={i} className="mention-tag">{p.mention}</span> : <EmoteImg key={i} className="emo" id={p.emo} alt={p.name} title={p.name} />))}
+                    {m.sys ? (m.kind === 'stream-state' ? <><Icon name="screen" sm /><span>{m.text}</span></> : m.text) : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : 'link' in p ? <a key={i} className="msg-link" href={p.link} target="_blank" rel="noreferrer">{p.link}</a> : 'mention' in p ? <span key={i} className="mention-tag">{p.mention}</span> : <EmoteImg key={i} className="emo" id={p.emo} alt={p.name} title={p.name} />))}
                     {m.edited && !m.sys ? <span className="medit" title="Изменено">(изменено)</span> : null}
                   </div>
                 ) : null}
@@ -1466,7 +1664,7 @@ function Chat() {
                 {(() => { const reacts = E.getReactions(m.sid, m.id); return reacts.length ? (
                   <div className="msg-reacts">
                     {reacts.map((r) => <button key={r.id} className={'react-pill' + (r.mine ? ' mine' : '')} title={r.name} onClick={() => canReact && reactTo(reactionTarget, { id: r.id, name: r.name })}><EmoteImg id={r.id} alt={r.name} /><b>{r.count}</b></button>)}
-                    {canReact ? <button className="react-add" data-tip="Добавить реакцию" onClick={(e) => setReactTarget({ target: reactionTarget, anchor: e.currentTarget.getBoundingClientRect() })}><Icon name="react" sm /></button> : null}
+                    {canReact ? <button className="react-add" aria-label="Добавить реакцию" data-tip="Добавить реакцию" onClick={(e) => setReactTarget({ target: reactionTarget, anchor: e.currentTarget.getBoundingClientRect() })}><Icon name="react" sm /></button> : null}
                   </div>
                 ) : null; })()}
               </div>
@@ -1491,7 +1689,7 @@ function Chat() {
     <div id="chat">
       <div className="chat-feed">
         {messages.length === 0 ? (
-          <div id="msgs"><div className="msgs-inner"><div id="chatEmpty">Общий чат сервера. Пиши сюда — видят все участники онлайн.</div></div></div>
+          <div id="msgs"><div className="msgs-inner"><div id="chatEmpty"><span className="chat-empty-icon"><Icon name="chat" /></span><b>Начало общего чата</b><span>Здесь можно писать, отвечать, делиться файлами и реакциями.</span></div></div></div>
         ) : (
           <Virtuoso
             key={activeId}
@@ -1576,7 +1774,7 @@ function Chat() {
           <Icon name="reply" sm />
           <span className="rb-to">Ответ <b style={{ color: (byName.get(replyTo.who || '') && roleColorOf(byName.get(replyTo.who || '')!)) || avColor(replyTo.who || '', replyTo.color) }}>{replyTo.who}</b></span>
           <span className="rb-text">{replySnippet(buildReplyRef(replyTo))}</span>
-          <button className="rb-close" data-tip="Отменить · Esc" onClick={() => setReplyTo(null)}><Icon name="close" sm /></button>
+          <button className="rb-close" aria-label="Отменить ответ" data-tip="Отменить · Esc" onClick={() => setReplyTo(null)}><Icon name="close" sm /></button>
         </div>
       ) : null}
       {staged.length ? (
@@ -1589,19 +1787,19 @@ function Chat() {
                 <span className="attach-size">{s.status === 'error' ? 'Ошибка загрузки' : fmtSize(s.size)}</span>
               </div>
               {s.status === 'uploading' ? <span className="spin" /> : null}
-              <button className="attach-remove" data-tip="Убрать" onClick={() => removeStaged(s.key)}><Icon name="close" sm /></button>
+              <button className="attach-remove" aria-label={`Убрать вложение ${s.name}`} data-tip="Убрать" onClick={() => removeStaged(s.key)}><Icon name="close" sm /></button>
             </div>
           ))}
         </div>
       ) : null}
       <div className="chat-in">
-        <button id="emoBtn" ref={emoBtnRef} className={'emo-toggle' + (pickAnchor !== undefined ? ' on' : '')} data-tip="7TV эмоуты"
+        <button id="emoBtn" ref={emoBtnRef} className={'emo-toggle' + (pickAnchor !== undefined ? ' on' : '')} aria-label="Открыть 7TV эмоуты" aria-expanded={pickAnchor !== undefined} data-tip="7TV эмоуты"
           onClick={() => setPickAnchor((a) => (a === undefined ? emoBtnRef.current!.getBoundingClientRect() : undefined))}><Icon name="smile" /></button>
-        <button className="emo-toggle" data-tip="Прикрепить картинку (или Ctrl+V)" onClick={() => fileRef.current?.click()}><Icon name="image" /></button>
-        <button className="emo-toggle" data-tip="Прикрепить файл" onClick={() => attachFileRef.current?.click()}><Icon name="attach" /></button>
+        <button className="emo-toggle" aria-label="Прикрепить картинку" data-tip="Прикрепить картинку (или Ctrl+V)" onClick={() => fileRef.current?.click()}><Icon name="image" /></button>
+        <button className="emo-toggle" aria-label="Прикрепить файл" data-tip="Прикрепить файл" onClick={() => attachFileRef.current?.click()}><Icon name="attach" /></button>
         <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple style={{ display: 'none' }} onChange={(e) => { const files = Array.from(e.target.files || []); if (files.length) stageFiles(files, 'image'); e.target.value = ''; }} />
         <input ref={attachFileRef} type="file" multiple style={{ display: 'none' }} onChange={(e) => { const files = Array.from(e.target.files || []); if (files.length) stageFiles(files, 'file'); e.target.value = ''; }} />
-        <input id="msgIn" placeholder="Сообщение..." maxLength={1000} autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false} name="chat-message" value={text}
+        <input id="msgIn" placeholder="Написать в #общий" aria-label="Сообщение в общий чат" maxLength={1000} autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false} name="chat-message" value={text}
           onPaste={(e) => {
             const items = e.clipboardData?.items; if (!items) return;
             const imgs: File[] = [];
@@ -1609,7 +1807,7 @@ function Chat() {
             if (imgs.length) { e.preventDefault(); stageFiles(imgs, 'image'); }
           }}
           onChange={(e) => { const v = e.target.value; setText(v); if (v.trim()) E.sendTyping(); setMention(detectMention(v, e.target.selectionStart ?? v.length)); setMIdx(0); }} onKeyDown={onComposerKey} />
-        <button id="sendBtn" className={(text.trim() || staged.some((s) => s.status !== 'error')) ? '' : 'empty'} data-tip={sendQueued ? 'Отправится, как только вложения загрузятся' : 'Отправить · Enter'} onClick={send}>
+        <button id="sendBtn" className={(text.trim() || staged.some((s) => s.status !== 'error')) ? '' : 'empty'} aria-label={sendQueued ? 'Сообщение отправится после загрузки вложений' : 'Отправить сообщение'} data-tip={sendQueued ? 'Отправится, как только вложения загрузятся' : 'Отправить · Enter'} onClick={send}>
           {sendQueued ? <span className="spin" style={{ margin: 0, width: 14, height: 14 }} /> : <Icon name="send" />}
         </button>
       </div>
@@ -1737,7 +1935,7 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
           </div>
         ))}
       </div>
-      <div className={'watchers' + (wOpen ? ' open' : '')} onClick={(e) => { e.stopPropagation(); setWOpen((v) => !v); }}>
+      <div className={'watchers' + (wOpen ? ' open' : '')} role="button" tabIndex={0} aria-label={`Смотрят трансляцию: ${watchers.length}`} aria-expanded={wOpen} onClick={(e) => { e.stopPropagation(); setWOpen((v) => !v); }} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); setWOpen((v) => !v); } }}>
         {watchers.slice(0, 4).map((w, i) => <div className="wa" key={i} style={{ background: w.avatarUrl ? '#0000' : avColor(w.name, w.color) }} title={w.name}>{w.avatarUrl ? <img className="avimg" src={resolveUploadUrl(w.avatarUrl)} alt="" /> : initial(w.name)}</div>)}
         <div className="wc"><Icon name="eye" sm />{watchers.length}</div>
         {watchers.length ? (
@@ -1747,27 +1945,27 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
           </div>
         ) : null}
       </div>
-      <button className="spray" ref={sprayRef} data-tip="Кинуть эмоут — увидят все зрители"
+      <button className="spray" ref={sprayRef} aria-label="Кинуть эмоут в трансляцию" data-tip="Кинуть эмоут — увидят все зрители"
         onClick={(e) => { e.stopPropagation(); setPickAnchor((a) => (a === undefined ? sprayRef.current!.getBoundingClientRect() : undefined)); }}><Icon name="smile" sm /></button>
-      <div className="vbar" onDoubleClick={(e) => e.stopPropagation()}>
+      <div className="vbar" role="toolbar" aria-label="Управление трансляцией" onDoubleClick={(e) => e.stopPropagation()}>
         {!isLocal ? (
           <>
-            <button className="vb-btn" data-tip={svol === 0 ? 'Включить звук' : 'Заглушить'} onClick={toggleMute}><Icon name={svol === 0 ? 'volume-off' : 'speaker'} sm /></button>
-            <input className="vb-vol" type="range" min={0} max={100} value={svol} onChange={(e) => setVol(+e.target.value)} />
+            <button className="vb-btn" aria-label={svol === 0 ? 'Включить звук трансляции' : 'Заглушить трансляцию'} data-tip={svol === 0 ? 'Включить звук' : 'Заглушить'} onClick={toggleMute}><Icon name={svol === 0 ? 'volume-off' : 'speaker'} sm /></button>
+            <input className="vb-vol" aria-label="Громкость трансляции" type="range" min={0} max={100} value={svol} onChange={(e) => setVol(+e.target.value)} />
             <span className="vb-pct">{svol}%</span>
           </>
         ) : <span className="vb-lbl">🖥 Твоя трансляция</span>}
         <div className="vb-sp" />
-        {!isLocal ? <button className={'vb-btn' + (qualOpen ? ' active' : '')} data-tip="Качество" onClick={() => setQualOpen((v) => !v)}><Icon name="gear" sm /></button> : null}
-        {!isLocal ? <button className={'vb-btn' + (treeOpen ? ' active' : '')} data-tip="Дерево трансляции — выбрать пира" onClick={() => setTreeOpen((v) => !v)}><Icon name="users" sm /></button> : null}
-        <button className="vb-btn" data-tip="Картинка-в-картинке" onClick={togglePip}><Icon name="pip" sm /></button>
-        <button className="vb-btn" data-tip="Во весь экран" onClick={toggleFs}><Icon name="fullscreen" sm /></button>
-        {!isLocal ? <button className="vb-btn danger" data-tip="Закрыть трансляцию" onClick={() => E.closeWatch(identity)}><Icon name="close" sm /></button> : null}
+        {!isLocal ? <button className={'vb-btn' + (qualOpen ? ' active' : '')} aria-label="Выбрать качество трансляции" aria-expanded={qualOpen} data-tip="Качество" onClick={() => setQualOpen((v) => !v)}><Icon name="gear" sm /></button> : null}
+        {!isLocal ? <button className={'vb-btn' + (treeOpen ? ' active' : '')} aria-label="Открыть дерево трансляции" aria-expanded={treeOpen} data-tip="Дерево трансляции — выбрать пира" onClick={() => setTreeOpen((v) => !v)}><Icon name="users" sm /></button> : null}
+        <button className="vb-btn" aria-label="Открыть картинку в картинке" data-tip="Картинка-в-картинке" onClick={togglePip}><Icon name="pip" sm /></button>
+        <button className="vb-btn" aria-label="Открыть на весь экран" data-tip="Во весь экран" onClick={toggleFs}><Icon name="fullscreen" sm /></button>
+        {!isLocal ? <button className="vb-btn danger" aria-label="Закрыть трансляцию" data-tip="Закрыть трансляцию" onClick={() => E.closeWatch(identity)}><Icon name="close" sm /></button> : null}
       </div>
       {!isLocal && treeOpen ? <TreePeerPanel identity={identity} onClose={() => setTreeOpen(false)} /> : null}
       {!isLocal && qualOpen ? <QualityMenu identity={identity} onClose={() => setQualOpen(false)} /> : null}
       <div className="statsbox">
-        <button className="stats-toggle" data-tip={statsOn ? 'Скрыть статистику' : 'Показать статистику'} onClick={(e) => { e.stopPropagation(); setStatsOn((v) => !v); }}><Icon name="info" sm /></button>
+        <button className="stats-toggle" aria-label={statsOn ? 'Скрыть статистику трансляции' : 'Показать статистику трансляции'} aria-pressed={statsOn} data-tip={statsOn ? 'Скрыть статистику' : 'Показать статистику'} onClick={(e) => { e.stopPropagation(); setStatsOn((v) => !v); }}><Icon name="info" sm /></button>
         {statsOn && stats ? <div className="stats" dangerouslySetInnerHTML={{ __html: stats }} /> : null}
       </div>
       {pickAnchor !== undefined ? <EmotePicker anchor={pickAnchor} sizePicker onClose={() => setPickAnchor(undefined)} onPick={(em) => E.fling(identity, em, emoteSize)} /> : null}
@@ -1812,11 +2010,11 @@ function TreePeerPanel({ identity, onClose }: { identity: string; onClose: () =>
     return set;
   })();
   return (
-    <div className="treepanel" onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}
+    <div className="treepanel" role="dialog" aria-label="Дерево трансляции" onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}
       style={{ position: 'absolute', left: '50%', transform: 'translateX(-50%)', bottom: 62, width: 'min(280px, calc(100% - 24px))', maxHeight: 320, overflow: 'auto', background: 'rgba(20,22,28,.96)', backdropFilter: 'blur(16px)', WebkitBackdropFilter: 'blur(16px)', border: '1px solid rgba(255,255,255,.12)', borderRadius: 12, padding: 10, zIndex: 7, color: '#fff', fontSize: 12, boxShadow: '0 10px 30px rgba(0,0,0,.5)' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
         <b>Дерево трансляции</b>
-        <button className="vb-btn" onClick={onClose}><Icon name="close" sm /></button>
+        <button className="vb-btn" aria-label="Закрыть дерево трансляции" onClick={onClose}><Icon name="close" sm /></button>
       </div>
       {!topo || !topo.nodes.length ? <div style={{ opacity: .6 }}>Нет данных о дереве</div> : <>
         {(() => {
@@ -1880,11 +2078,11 @@ function QualityMenu({ identity, onClose }: { identity: string; onClose: () => v
   const label: Record<string, string> = { source: 'Исходное (source)', '1080': '1080p', '720': '720p', '480': '480p', '360': '360p' };
   const items = onlySource ? ['source'] : ['auto', ...renditions];
   return (
-    <div className="qualpanel" onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}
+    <div className="qualpanel" role="dialog" aria-label="Качество трансляции" onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}
       style={{ position: 'absolute', left: '50%', transform: 'translateX(-50%)', bottom: 62, width: 'min(220px, calc(100% - 24px))', background: 'rgba(20,22,28,.96)', backdropFilter: 'blur(16px)', WebkitBackdropFilter: 'blur(16px)', border: '1px solid rgba(255,255,255,.12)', borderRadius: 12, padding: 10, zIndex: 7, color: '#fff', fontSize: 12, boxShadow: '0 10px 30px rgba(0,0,0,.5)' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
         <b>Качество</b>
-        <button className="vb-btn" onClick={onClose}><Icon name="close" sm /></button>
+        <button className="vb-btn" aria-label="Закрыть выбор качества" onClick={onClose}><Icon name="close" sm /></button>
       </div>
       {!viaServer ? (
         <div style={{ opacity: .6, lineHeight: 1.4 }}>Качество наследуется от родителя — выбор доступен только при просмотре через сервер.</div>
@@ -1928,25 +2126,23 @@ function Stage({ minimized, setMin }: { minimized: boolean; setMin: (v: boolean)
 /* ---------- Channels sidebar (left) ---------- */
 function Channels() {
   const active = useStore((s) => s.active)!;
-  const me = useStore((s) => s.me)!;
   const setModal = useStore((s) => s.setModal);
-  const eng = useEngine();
-  const muted = eng.localMicMuted;
-  const deaf = eng.deafened;
-  // статус под ником: пред-установка/состояние мика видны ещё ДО входа в канал (Discord-стиль)
-  const statusText = eng.micUnavailable ? 'Микрофон недоступен' : deaf ? 'Звук выключен' : muted ? 'Микрофон выключен' : 'В сети';
   return (
     <div id="channels">
-      <div className="ch-header" role="button" tabIndex={0} data-tip="Меню сервера" onClick={() => setModal('srvmenu')}>
-        <span className="chn">{active.name}</span><Icon name="info" sm />
-      </div>
+      <header className="ch-header">
+        <button className="ch-server-main" aria-label={`Открыть меню сервера ${active.name}`} onClick={() => setModal('srvmenu')}>
+          <span className="ch-server-mark" style={{ background: active.iconUrl ? '#0000' : avColor(active.name, active.iconColor) }}>
+            {active.iconUrl ? <img className="avimg" src={resolveUploadUrl(active.iconUrl)} alt="" /> : initial(active.name)}
+          </span>
+          <span className="ch-server-copy"><span className="chn">{active.name}</span><span className="ch-server-meta">{active.memberCount} участников</span></span>
+          <span className="ch-menu" aria-hidden="true"><Icon name="chevron" sm /></span>
+        </button>
+      </header>
       <div className="ch-body"><VoiceChannels /></div>
       <StreamerWidget />
       <VoiceDock variant="inline" />
-      {/* нижняя аккаунт-панель (всегда): полный ряд контролов (mic▾ / наушники▾ / трансляция / настройки).
-          Работают и ВНЕ голоса — выбор устройства + пред-установка мута/оглушения до входа (Discord-стиль). */}
+      {/* Компактный ряд голосовых контролов. Профиль уже доступен в глобальном rail. */}
       <div className="user-panel">
-        <div className="up-i" onClick={() => setModal('profile')}><b>{me.displayName}</b><span>{statusText}</span></div>
         <VoiceControls up />
       </div>
     </div>
@@ -1980,6 +2176,7 @@ function useResizable(key: string, def: number, min: number, max: number, edge: 
 
 export function ServerView() {
   const eng = useEngine();
+  const active = useStore((s) => s.active)!;
   const setModal = useStore((s) => s.setModal);
   const entryTab = useStore((s) => s.serverEntryTab);
   const [minimized, setMin] = useState(false);
@@ -1990,38 +2187,58 @@ export function ServerView() {
   // CTA «Смотреть» с главной сначала подключает транспорт, затем добавляет stream в snapshot.
   // На телефоне сразу показываем сцену, а не оставляем пользователя на вкладке «Голос».
   useEffect(() => { if (hasStreams) setMtab('main'); }, [hasStreams]);
-  const chan = useResizable('w:channels', 290, 270, 440, 'right');
-  const mem = useResizable('w:members', 244, 216, 400, 'left');
+  const chan = useResizable('w:channels', 292, 264, 360, 'right');
+  const mem = useResizable('w:members', 304, 264, 360, 'left');
   const chatW = useResizable('w:chat', 340, 260, 640, 'left');
   const [membersOpen, setMembersOpen] = useState(() => localStorage.getItem('membersOpen') !== '0');
   useEffect(() => { localStorage.setItem('membersOpen', membersOpen ? '1' : '0'); }, [membersOpen]);
+  const [supportOpen, setSupportOpen] = useState(false);
+  const [mediumWorkspace, setMediumWorkspace] = useState(() => window.innerWidth > 900 && window.innerWidth <= 1240);
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width:901px) and (max-width:1240px)');
+    const sync = () => { setMediumWorkspace(mq.matches); if (!mq.matches) setSupportOpen(false); };
+    sync(); mq.addEventListener('change', sync);
+    return () => mq.removeEventListener('change', sync);
+  }, []);
+  const [channelsOpen, setChannelsOpen] = useState(() => localStorage.getItem('channelsOpen') !== '0');
+  useEffect(() => { localStorage.setItem('channelsOpen', channelsOpen ? '1' : '0'); }, [channelsOpen]);
   const [showChat, setShowChat] = useState(false);
   useEffect(() => { if (!split) setShowChat(false); }, [split]);
   // В split-режиме stage обязан сохранить рабочую ширину: правая панель чата и участники
   // взаимоисключаются. Иначе сохранённые пользователем ширины могут полностью зажать видео.
-  const toggleSplitChat = () => setShowChat((open) => { const next = !open; if (next) setMembersOpen(false); return next; });
-  const toggleMembers = () => setMembersOpen((open) => { const next = !open; if (next) setShowChat(false); return next; });
+  const toggleSplitChat = () => setShowChat((open) => { const next = !open; if (next) { setMembersOpen(false); setSupportOpen(false); } return next; });
+  const toggleMembers = () => {
+    if (mediumWorkspace) { setSupportOpen((open) => { const next = !open; if (next) setShowChat(false); return next; }); return; }
+    setMembersOpen((open) => { const next = !open; if (next) setShowChat(false); return next; });
+  };
+  const membersVisible = mediumWorkspace ? supportOpen : membersOpen;
   // трансляция открылась → сразу прячем участников (место под видео); закрылась → возвращаем, если прятали сами
   const prevSplit = useRef(false);
   const autoHidMembers = useRef(false);
   useEffect(() => {
     if (split === prevSplit.current) return;
-    if (split) { if (membersOpen) { autoHidMembers.current = true; setMembersOpen(false); } }
+    if (split) {
+      setSupportOpen(false);
+      if (membersOpen) { autoHidMembers.current = true; setMembersOpen(false); }
+    }
     else if (autoHidMembers.current) { autoHidMembers.current = false; setMembersOpen(true); }
     prevSplit.current = split;
   }, [split, membersOpen]);
 
   return (
     <>
-      <section id="server" className={'on' + (mtab !== 'main' ? ' tab-' + mtab : '')} style={{ '--ch-w': chan.w + 'px', '--mem-w': (membersOpen ? mem.w : 0) + 'px', '--mem-open': mem.w + 'px' } as CSSProperties}>
+      <section id="server" className={'on' + (mtab !== 'main' ? ' tab-' + mtab : '') + (channelsOpen ? '' : ' ch-collapsed') + (membersOpen ? '' : ' mem-collapsed') + (supportOpen ? ' support-open' : '')} style={{ '--ch-w': (channelsOpen ? chan.w : 0) + 'px', '--ch-open': chan.w + 'px', '--mem-w': (membersOpen ? mem.w : 0) + 'px', '--mem-open': mem.w + 'px' } as CSSProperties}>
         <Channels />
         <div id="main">
           <div className="srv-header">
-            <div className="hn"><Icon name="hash" sm /><span>общий</span></div>
-            {split ? <button className={'hbtn' + (showChat ? ' on' : '')} data-tip={showChat ? 'Скрыть чат' : 'Показать чат'} onClick={toggleSplitChat}><Icon name="chat" sm /></button> : null}
-            <button className={'hbtn mob-hide' + (membersOpen ? ' on' : '')} data-tip={membersOpen ? 'Скрыть участников' : 'Показать участников'} onClick={toggleMembers}><Icon name="users" sm /></button>
-            <button className="hbtn" data-tip="Пригласить" onClick={() => setModal('invite')}><Icon name="link" sm /></button>
-            <button className="hbtn mob-only" data-tip="Настройки" onClick={() => setModal('settings')}><Icon name="gear" sm /></button>
+            <button className={'hbtn pane-toggle channels-toggle' + (channelsOpen ? ' on' : '')} aria-label={channelsOpen ? 'Скрыть каналы' : 'Показать каналы'} aria-pressed={channelsOpen} data-tip={channelsOpen ? 'Скрыть каналы' : 'Показать каналы'} onClick={() => setChannelsOpen((open) => !open)}><Icon name="menu" sm /></button>
+            <div className="hn"><span className="channel-mark"><Icon name="hash" sm /></span><span className="channel-copy"><b>общий</b><small>{active.description || 'Общий чат сервера'}</small></span></div>
+            <div className="srv-actions">
+              {split ? <button className={'hbtn' + (showChat ? ' on' : '')} aria-label={showChat ? 'Скрыть чат' : 'Показать чат'} aria-pressed={showChat} data-tip={showChat ? 'Скрыть чат' : 'Показать чат'} onClick={toggleSplitChat}><Icon name="chat" sm /></button> : null}
+              <button className={'hbtn mob-hide' + (membersVisible ? ' on' : '')} aria-label={membersVisible ? 'Скрыть участников' : 'Показать участников'} aria-pressed={membersVisible} data-tip={membersVisible ? 'Скрыть участников' : 'Показать участников'} onClick={toggleMembers}><Icon name="users" sm /></button>
+              <button className="hbtn" aria-label="Пригласить на сервер" data-tip="Пригласить" onClick={() => setModal('invite')}><Icon name="link" sm /></button>
+              <button className="hbtn mob-only" aria-label="Открыть настройки" data-tip="Настройки" onClick={() => setModal('settings')}><Icon name="gear" sm /></button>
+            </div>
           </div>
           <div id="content" className={(split ? 'split' : '') + (split && showChat ? ' show-chat' : '')} style={{ '--chat-w': chatW.w + 'px' } as CSSProperties}>
             <Stage minimized={minimized} setMin={setMin} />
@@ -2034,11 +2251,11 @@ export function ServerView() {
         <div className="rz rz-ch" onMouseDown={chan.onDown} title="Потяни, чтобы изменить ширину" />
         {membersOpen ? <div className="rz rz-mem" onMouseDown={mem.onDown} title="Потяни, чтобы изменить ширину" /> : null}
       </section>
-      <div id="mtabs">
-        <button className={mtab === 'channels' ? 'active' : ''} aria-label="Голосовые каналы" onClick={() => setMtab('channels')}><Icon name="speaker" />Голос</button>
-        <button className={mtab === 'main' ? 'active' : ''} aria-label={hasStreams ? 'Трансляция и чат' : 'Чат'} onClick={() => setMtab('main')}><Icon name={hasStreams ? 'screen' : 'chat'} />{hasStreams ? 'Эфир' : 'Чат'}</button>
-        <button className={mtab === 'members' ? 'active' : ''} aria-label="Участники" onClick={() => setMtab('members')}><Icon name="users" />Люди</button>
-      </div>
+      <nav id="mtabs" aria-label="Разделы сервера">
+        <button className={mtab === 'channels' ? 'active' : ''} aria-label="Голосовые каналы" aria-current={mtab === 'channels' ? 'page' : undefined} onClick={() => setMtab('channels')}><Icon name="speaker" />Каналы</button>
+        <button className={mtab === 'main' ? 'active' : ''} aria-label={hasStreams ? 'Трансляция и чат' : 'Чат'} aria-current={mtab === 'main' ? 'page' : undefined} onClick={() => setMtab('main')}><Icon name={hasStreams ? 'screen' : 'chat'} />{hasStreams ? 'Эфир' : 'Чат'}</button>
+        <button className={mtab === 'members' ? 'active' : ''} aria-label="Участники" aria-current={mtab === 'members' ? 'page' : undefined} onClick={() => setMtab('members')}><Icon name="users" />Участники</button>
+      </nav>
     </>
   );
 }

@@ -18,6 +18,7 @@ import { isTauri, setGlobalHotkeys, onGlobalHotkey, setDetectableGames } from '.
 import type { ServerSummary, OnlineMember, KeybindAction } from './types';
 import { LogoLoader } from './components/LogoLoader';
 import { initNotifications } from './notify';
+import { TooltipLayer } from './components/TooltipLayer';
 
 // версия принудительного сброса хоткеев на новые дефолты — см. эффект хоткеев ниже
 const HK_RESET_V = 1;
@@ -38,27 +39,31 @@ function Rail() {
   const activeId = view === 'server' ? (active?.id || loadingServerId) : null;
   return (
     <nav id="rail" aria-label="Серверы и разделы">
-      <button className={'railbtn tip-l' + (view === 'home' ? ' active' : '')} aria-label="Домой" data-tip="Домой" onClick={goHome}><Icon name="home" /></button>
-      <div className="rail-sep" />
-      {servers.map((s) => {
-        const un = activeId === s.id ? 0 : (unread[s.id] || 0); // активный не бейджим (читаем его)
-        return (
-        <button key={s.id} className={'railbtn tip-l' + (activeId === s.id ? ' active' : '') + (eng.voiceServerId === s.id && activeId !== s.id ? ' connected' : '') + (un ? ' unread' : '')}
-          aria-label={s.name + (eng.voiceServerId === s.id && activeId !== s.id ? ' — вы в голосовом канале' : '')}
-          data-tip={eng.voiceServerId === s.id && activeId !== s.id ? s.name + ' · в голосе' : s.name}
-          style={{ background: s.iconUrl ? '#0000' : avColor(s.name, s.iconColor) }} onClick={() => openServer(s.id)}>
-          {s.iconUrl ? <img className="avimg" src={resolveUploadUrl(s.iconUrl)} alt="" /> : initial(s.name)}{(s.online || []).some((m) => m.inVoice) ? <span className="dot green" /> : null}
-          {un ? <span className="rail-badge">{un > 99 ? '99+' : un}</span> : null}
-        </button>
-        );
-      })}
-      <button className="railbtn rail-add tip-l" aria-label="Создать сервер или войти" data-tip="Создать / войти" onClick={() => setModal('create')}><Icon name="plus" /></button>
+      <div className="rail-primary">
+        <button className={'railbtn tip-l' + (view === 'home' ? ' active' : '')} aria-label="Домой" data-tip="Домой" onClick={goHome}><Icon name="home" /></button>
+        <div className="rail-sep" />
+        {servers.map((s) => {
+          const un = activeId === s.id ? 0 : (unread[s.id] || 0); // активный не бейджим (читаем его)
+          return (
+          <button key={s.id} className={'railbtn tip-l' + (activeId === s.id ? ' active' : '') + (eng.voiceServerId === s.id && activeId !== s.id ? ' connected' : '') + (un ? ' unread' : '')}
+            aria-label={s.name + (eng.voiceServerId === s.id && activeId !== s.id ? ' — вы в голосовом канале' : '')}
+            data-tip={eng.voiceServerId === s.id && activeId !== s.id ? s.name + ' · в голосе' : s.name}
+            style={{ background: s.iconUrl ? '#0000' : avColor(s.name, s.iconColor) }} onClick={() => openServer(s.id)}>
+            {s.iconUrl ? <img className="avimg" src={resolveUploadUrl(s.iconUrl)} alt="" /> : initial(s.name)}{(s.online || []).some((m) => m.inVoice) ? <span className="dot green" /> : null}
+            {un ? <span className="rail-badge">{un > 99 ? '99+' : un}</span> : null}
+          </button>
+          );
+        })}
+        <button className="railbtn rail-add tip-l" aria-label="Создать сервер или войти" data-tip="Создать / войти" onClick={() => setModal('create')}><Icon name="plus" /></button>
+      </div>
       <div className="rail-grow" />
-      {me.isAdmin ? <button className="railbtn rail-admin tip-l" aria-label="Админка" data-tip="Админка" onClick={goAdmin}><Icon name="users" /></button> : null}
-      {/* Настройки — глобально в рейле (доступны и на главной, не только внутри сервера) */}
-      <button className="railbtn rail-set tip-l" aria-label="Настройки" data-tip="Настройки" onClick={() => setModal('settings')}><Icon name="gear" /></button>
-      <button className="railbtn rail-dl tip-l" aria-label="Загрузки" data-tip="Загрузки" onClick={() => setModal('downloads')}><Icon name="download" /></button>
-      <button className="railbtn rail-me tip-l" aria-label="Профиль" data-tip="Профиль" style={{ background: me.avatarUrl ? '#0000' : avColor(me.displayName, me.avatarColor) }} onClick={() => setModal('profile')}>{me.avatarUrl ? <img className="avimg" src={resolveUploadUrl(me.avatarUrl)} alt="" /> : initial(me.displayName)}</button>
+      <div className="rail-tools" role="group" aria-label="Инструменты аккаунта">
+        {me.isAdmin ? <button className="railbtn rail-admin tip-l" aria-label="Админка" data-tip="Админка" onClick={goAdmin}><Icon name="users" /></button> : null}
+        {/* Настройки — глобально в рейле (доступны и на главной, не только внутри сервера) */}
+        <button className="railbtn rail-set tip-l" aria-label="Настройки" data-tip="Настройки" onClick={() => setModal('settings')}><Icon name="gear" /></button>
+        <button className="railbtn rail-dl tip-l" aria-label="Загрузки" data-tip="Загрузки" onClick={() => setModal('downloads')}><Icon name="download" /></button>
+        <button className="railbtn rail-me tip-l" aria-label="Профиль" data-tip="Профиль" style={{ background: me.avatarUrl ? '#0000' : avColor(me.displayName, me.avatarColor) }} onClick={() => setModal('profile')}>{me.avatarUrl ? <img className="avimg" src={resolveUploadUrl(me.avatarUrl)} alt="" /> : initial(me.displayName)}</button>
+      </div>
     </nav>
   );
 }
@@ -452,20 +457,29 @@ function Home() {
 // (каналы · чат · участники), чтобы переход «загрузка → контент» был плавным, без прыжка.
 // Ширины берём из тех же localStorage-ключей, что и настоящий ServerView (иначе колонки скакнут).
 function ServerSkeleton() {
-  const chW = +(localStorage.getItem('w:channels') || 290);
-  const memW = +(localStorage.getItem('w:members') || 244);
+  const entryTab = useStore((s) => s.serverEntryTab);
+  const chW = +(localStorage.getItem('w:channels') || 292);
+  const memW = +(localStorage.getItem('w:members') || 304);
+  const singlePane = window.innerWidth <= 900;
+  const compactDesktop = window.innerWidth >= 1241 && window.innerWidth <= 1360;
+  const skeletonChW = compactDesktop ? Math.min(chW, 280) : chW;
+  const skeletonMemW = compactDesktop ? Math.min(memW, 220) : memW;
+  const chOpen = window.innerWidth <= 1240 || localStorage.getItem('channelsOpen') !== '0';
   const memOpen = localStorage.getItem('membersOpen') !== '0';
+  const showChannels = singlePane ? entryTab === 'channels' : chOpen;
+  const showMain = !singlePane || entryTab === 'main';
+  const showMembers = singlePane ? entryTab === 'members' : memOpen;
   const rows = (n: number) => Array.from({ length: n });
   return (
     <div className="srv-sk" aria-busy="true" aria-label="Загрузка сервера">
-      <div className="sk-col sk-ch" style={{ width: chW }}>
+      {showChannels ? <div className="sk-col sk-ch" style={{ width: singlePane ? '100%' : skeletonChW, display: singlePane ? 'flex' : undefined }}>
         <div className="sk-line sk-title" style={{ width: '55%' }} />
         <div className="sk-voicecard">
           <div className="sk-line" style={{ width: '58%' }} />
           {rows(3).map((_, i) => <div className="sk-vrow" key={i}><span className="sk-av" /><span className="sk-line" style={{ width: `${48 + (i % 3) * 14}%` }} /></div>)}
         </div>
-      </div>
-      <div className="sk-col sk-main">
+      </div> : null}
+      {showMain ? <div className="sk-col sk-main">
         <div className="sk-header"><span className="sk-line" style={{ width: 90 }} /></div>
         <div className="sk-chat">
           {rows(8).map((_, i) => (
@@ -476,9 +490,9 @@ function ServerSkeleton() {
           ))}
         </div>
         <div className="sk-composer"><span className="sk-line" /></div>
-      </div>
-      {memOpen ? (
-        <div className="sk-col sk-mem" style={{ width: memW }}>
+      </div> : null}
+      {showMembers ? (
+        <div className="sk-col sk-mem" style={{ width: singlePane ? '100%' : skeletonMemW, display: singlePane ? 'flex' : undefined }}>
           <div className="sk-line sk-title" style={{ width: '45%' }} />
           {rows(7).map((_, i) => <div className="sk-vrow" key={i}><span className="sk-av" /><span className="sk-line" style={{ width: `${44 + (i % 4) * 13}%` }} /></div>)}
         </div>
@@ -616,6 +630,7 @@ export function App() {
     <>
       <IconSprite />
       <Toasts />
+      <TooltipLayer />
       {view === 'loading' ? (
         <div className="overlay" style={{ background: 'var(--bg)' }}>
           <LogoLoader size={200} />

@@ -126,7 +126,7 @@ export function StreamerWidget() {
       <div className="sw-head">
         <span className="sw-live"><Icon name="screen" sm /></span>
         <div className="sw-htxt"><b>Трансляция идёт</b><span title={stats?.source || ''}>{stats?.source || 'подготовка…'}</span></div>
-        <button className="sw-mini" onClick={() => setCollapsed(true)} data-tip="Свернуть виджет"><Icon name="chevron" sm /></button>
+        <button className="sw-mini" aria-label="Свернуть виджет трансляции" onClick={() => setCollapsed(true)} data-tip="Свернуть виджет"><Icon name="chevron" sm /></button>
       </div>
 
       {/* Превью-тумбнейл кадра (натив). Hover учащает эмит до 1с, уход — обратно 3с. */}
@@ -166,7 +166,7 @@ export function StreamerWidget() {
             <span className="sw-schip" title="Битрейт факт/цель">{mbps(stats.bitrateActualBps)}/{mbps(stats.bitrateTargetBps, 1)} Мбит</span>
             <span className="sw-schip" title="FPS кодера/цель">{stats.encoderFps.toFixed(0)}/{stats.targetFps} fps</span>
             <span className="sw-schip" title="Разрешение">{stats.width}×{stats.height}</span>
-            <button className="sw-more" onClick={() => setShowAll((v) => !v)} data-tip={showAll ? 'Скрыть подробности' : 'Подробнее'}>
+            <button className="sw-more" aria-label={showAll ? 'Скрыть подробности трансляции' : 'Показать подробности трансляции'} aria-expanded={showAll} onClick={() => setShowAll((v) => !v)} data-tip={showAll ? 'Скрыть подробности' : 'Подробнее'}>
               <Icon name="info" sm />
             </button>
           </div>
@@ -183,10 +183,10 @@ export function StreamerWidget() {
 
       {/* Управление: стоп · настройки · смена источника. */}
       <div className="sw-ctrls">
-        <button className="sw-btn sw-stop" disabled={busy} onClick={stop} data-tip="Остановить трансляцию"><Icon name="screen-stop" sm /></button>
-        <button className="sw-btn" onClick={() => useStore.getState().setModal('broadcast')} data-tip="Настройки трансляции"><Icon name="gear" sm /></button>
+        <button className="sw-btn sw-stop" aria-label="Остановить трансляцию" disabled={busy} onClick={stop} data-tip="Остановить трансляцию"><Icon name="screen-stop" sm /></button>
+        <button className="sw-btn" aria-label="Настройки трансляции" onClick={() => useStore.getState().setModal('broadcast')} data-tip="Настройки трансляции"><Icon name="gear" sm /></button>
         <div className="sw-srcwrap" ref={srcRef}>
-          <button className={'sw-btn' + (srcOpen ? ' on' : '')} disabled={busy} onClick={() => setSrcOpen((v) => !v)} data-tip="Сменить источник">
+          <button className={'sw-btn' + (srcOpen ? ' on' : '')} aria-label="Сменить источник трансляции" aria-expanded={srcOpen} disabled={busy} onClick={() => setSrcOpen((v) => !v)} data-tip="Сменить источник">
             <Icon name="screen" sm /><Icon name="chevron" sm />
           </button>
           {srcOpen ? (

@@ -7,13 +7,14 @@ import { THEMES, getTheme, setTheme } from '../theme';
 import { playSound } from '../sounds';
 import { Icon } from '../Icon';
 import { MicMeter } from './MicMeter';
-import { AV_COLORS, avColor, initial, keyLabel, comboLabel } from '../util';
+import { AV_COLORS, avColor, downscaleImage, initial, keyLabel, comboLabel } from '../util';
 import type { AudioSettings, InvitePreview, Role, Member, KeybindAction } from '../types';
 import { PERM, PERM_LIST, hasPerm } from '../types';
 import { Backdrop } from './Backdrop';
 import { BroadcastModal } from './BroadcastModal';
 import { DownloadsModal } from './DownloadsModal';
 import { LeaderboardModal } from './Leaderboard';
+import { GiphyPicker, ProfileBannerAttribution, ProfileBannerMedia } from './ProfileBanner';
 import { isTauri, setGlobalHotkeys } from '../native';
 import { enableNotifications, notifSupported, notifPermission } from '../notify';
 import { unsubscribePush, syncPushPrefs } from '../push';
@@ -86,12 +87,46 @@ function cropSquare(file: File, size: number): Promise<Blob> {
 }
 
 function ProfileModal() {
-  const close = () => useStore.getState().setModal(null);
   const me = useStore((s) => s.me)!;
   const [dn, setDn] = useState(me.displayName); const [bio, setBio] = useState(me.bio || ''); const [color, setColor] = useState(me.avatarColor);
   const [avatarUrl, setAvatarUrl] = useState(me.avatarUrl || '');
+  const [bannerUrl, setBannerUrl] = useState(me.profileBannerUrl || '');
   const [err, setErr] = useState(''); const [busy, setBusy] = useState(false); const [uploading, setUploading] = useState(false);
+  const [bannerUploading, setBannerUploading] = useState(false); const [giphyOpen, setGiphyOpen] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  const bannerRef = useRef<HTMLInputElement>(null);
+  const giphyTriggerRef = useRef<HTMLButtonElement>(null);
+  const bannerAbortRef = useRef<AbortController | null>(null);
+  const bannerUploadSeq = useRef(0);
+  const pendingGiphySendRef = useRef('');
+  const pendingLocalBannerRef = useRef('');
+  const cleanupPendingLocalBanner = (preserve = '') => {
+    const url = pendingLocalBannerRef.current;
+    if (!url || url === preserve) return;
+    pendingLocalBannerRef.current = '';
+    api.deleteProfileBannerUpload(url).catch(() => {});
+  };
+  const close = () => {
+    bannerUploadSeq.current += 1;
+    bannerAbortRef.current?.abort();
+    cleanupPendingLocalBanner();
+    useStore.getState().setModal(null);
+  };
+  const closeGiphy = () => {
+    setGiphyOpen(false);
+    window.requestAnimationFrame(() => giphyTriggerRef.current?.focus());
+  };
+  const cancelBannerUpload = () => {
+    bannerUploadSeq.current += 1;
+    bannerAbortRef.current?.abort();
+    bannerAbortRef.current = null;
+    setBannerUploading(false);
+  };
+  useEffect(() => () => {
+    bannerUploadSeq.current += 1;
+    bannerAbortRef.current?.abort();
+    cleanupPendingLocalBanner();
+  }, []);
   async function pickAvatar(file: File) {
     if (!file.type.startsWith('image/')) { setErr('Можно только картинки'); return; }
     if (file.size > 10 * 1024 * 1024) { setErr('Картинка больше 10 МБ'); return; }
@@ -102,16 +137,58 @@ function ProfileModal() {
   }
   async function save() {
     setBusy(true);
-    try { const d = await api.updateMe({ displayName: dn.trim(), bio, avatarColor: color, avatarUrl }); useStore.getState().setMe(d.user); useStore.getState().refreshMembers(); useStore.getState().refreshServers(); close(); useStore.getState().toast('Профиль сохранён', 'ok'); }
+    try {
+      const d = await api.updateMe({ displayName: dn.trim(), bio, avatarColor: color, avatarUrl, profileBannerUrl: bannerUrl });
+      if (bannerUrl.startsWith('giphy:') && pendingGiphySendRef.current) {
+        fetch(pendingGiphySendRef.current, { mode: 'no-cors', keepalive: true }).catch(() => {});
+        pendingGiphySendRef.current = '';
+      }
+      if (pendingLocalBannerRef.current === bannerUrl) pendingLocalBannerRef.current = '';
+      useStore.getState().setMe(d.user); useStore.getState().refreshMembers(); useStore.getState().refreshServers(); close(); useStore.getState().toast('Профиль сохранён', 'ok');
+    }
     catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+  }
+  async function pickBanner(file: File) {
+    const allowed = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+    if (!allowed.has(file.type)) { setErr('Фон: PNG, JPEG, WebP или GIF'); return; }
+    if (file.size > 10 * 1024 * 1024) { setErr('Фон больше 10 МБ'); return; }
+    bannerAbortRef.current?.abort();
+    const sequence = ++bannerUploadSeq.current;
+    const controller = new AbortController();
+    bannerAbortRef.current = controller;
+    setBannerUploading(true); setErr(''); setGiphyOpen(false);
+    try {
+      const prepared = file.type === 'image/gif' ? file : await downscaleImage(file, 1600, .84);
+      if (controller.signal.aborted || sequence !== bannerUploadSeq.current) return;
+      const { url } = await api.uploadProfileBanner(prepared, controller.signal);
+      if (controller.signal.aborted || sequence !== bannerUploadSeq.current) {
+        api.deleteProfileBannerUpload(url).catch(() => {});
+        return;
+      }
+      cleanupPendingLocalBanner(url);
+      pendingLocalBannerRef.current = url;
+      pendingGiphySendRef.current = '';
+      setBannerUrl(url);
+    } catch (e: any) {
+      if (sequence === bannerUploadSeq.current && e?.name !== 'AbortError') setErr(e?.message || 'Ошибка загрузки фона');
+    } finally {
+      if (sequence === bannerUploadSeq.current) { bannerAbortRef.current = null; setBannerUploading(false); }
+    }
   }
   return <Backdrop onClose={close} label="Профиль" boxClass="profile-modal">
     <button className="settings-x" onClick={close} aria-label="Закрыть"><Icon name="close" /></button>
-    <div className="pm-hero">
-      <div className="pm-av" onClick={() => fileRef.current?.click()} title="Загрузить аватар" style={{ background: avatarUrl ? '#0000' : avColor(dn, color) }}>
+    <div className={'pm-hero' + (bannerUrl ? ' has-banner' : '')}>
+      <ProfileBannerMedia value={bannerUrl} className="pm-hero-banner" attribution={false} />
+      <ProfileBannerAttribution value={bannerUrl} className="pm-banner-credit" />
+      <div className="pm-banner-actions" aria-label="Фон профиля">
+        <button type="button" disabled={bannerUploading || busy} aria-label="Загрузить фон профиля" data-tip="Загрузить картинку или GIF" onClick={() => bannerRef.current?.click()}>{bannerUploading ? <span className="spin" /> : <Icon name="image" sm />}<span>Фон</span></button>
+        <button ref={giphyTriggerRef} type="button" disabled={bannerUploading || busy} className={giphyOpen ? 'on' : ''} aria-expanded={giphyOpen} aria-label="Выбрать фон из GIPHY" data-tip="Выбрать GIF из GIPHY" onClick={() => giphyOpen ? closeGiphy() : setGiphyOpen(true)}><span aria-hidden="true">GIF</span></button>
+        {bannerUrl ? <button type="button" disabled={bannerUploading || busy} className="danger" aria-label="Убрать фон профиля" data-tip="Убрать фон" onClick={() => { cancelBannerUpload(); cleanupPendingLocalBanner(); pendingGiphySendRef.current = ''; setGiphyOpen(false); setBannerUrl(''); }}><Icon name="close" sm /></button> : null}
+      </div>
+      <button type="button" className="pm-av" onClick={() => fileRef.current?.click()} aria-label="Загрузить аватар" title="Загрузить аватар" style={{ background: avatarUrl ? '#0000' : avColor(dn, color) }}>
         {avatarUrl ? <img className="avimg" src={resolveUploadUrl(avatarUrl)} alt="" /> : initial(dn)}
         {uploading ? <span className="spin" style={{ position: 'absolute', inset: 0, margin: 'auto' }} /> : <span className="pm-av-edit"><Icon name="edit" sm /></span>}
-      </div>
+      </button>
       <div className="pm-id">
         <div className="pm-nm">{dn.trim() || 'Без имени'}</div>
         <div className="pm-un">@{me.username}</div>
@@ -123,13 +200,15 @@ function ProfileModal() {
         {avatarUrl ? <button className="ghost" style={{ margin: 0, padding: '7px 14px', fontSize: 13, width: 'auto', color: 'var(--red)' }} onClick={() => setAvatarUrl('')}>Убрать</button> : null}
       </div>
       <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; if (f) pickAvatar(f); e.target.value = ''; }} />
+      <input ref={bannerRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; if (f) pickBanner(f); e.target.value = ''; }} />
+      {giphyOpen ? <GiphyPicker onClose={closeGiphy} onSelect={(value, sendAnalyticsUrl) => { cancelBannerUpload(); cleanupPendingLocalBanner(); pendingGiphySendRef.current = sendAnalyticsUrl || ''; setBannerUrl(value); closeGiphy(); }} /> : null}
       <div className="fld"><label>Отображаемое имя</label><input value={dn} maxLength={32} onChange={(e) => setDn(e.target.value)} /></div>
       <div className="fld"><label>О себе</label><textarea value={bio} maxLength={200} rows={2} placeholder="пара слов о себе" onChange={(e) => setBio(e.target.value)} /></div>
-      <div className="fld"><label>Цвет аватара{avatarUrl ? ' (когда без фото)' : ''}</label><div className="colorpick">{AV_COLORS.map((c, i) => <div key={i} className={'cp' + (i === color ? ' sel' : '')} style={{ background: c }} onClick={() => setColor(i)} />)}</div></div>
+      <div className="fld"><label>Цвет аватара{avatarUrl ? ' (когда без фото)' : ''}</label><div className="colorpick">{AV_COLORS.map((c, i) => <button type="button" key={i} className={'cp' + (i === color ? ' sel' : '')} style={{ background: c }} aria-label={`Цвет аватара ${i + 1}`} aria-pressed={i === color} onClick={() => setColor(i)} />)}</div></div>
       <div className="err">{err}</div>
       <div className="pm-foot">
-        <button className="ghost pm-logout" style={{ margin: 0 }} onClick={() => useStore.getState().logout()}><Icon name="leave" sm />Выйти</button>
-        <button className="primary" style={{ margin: 0 }} disabled={busy} onClick={save}>Сохранить</button>
+        <button className="ghost pm-logout" style={{ margin: 0 }} onClick={() => { cleanupPendingLocalBanner(); useStore.getState().logout(); }}><Icon name="leave" sm />Выйти</button>
+        <button className="primary" style={{ margin: 0 }} disabled={busy || uploading || bannerUploading} onClick={save}>Сохранить</button>
       </div>
     </div>
   </Backdrop>;
@@ -139,9 +218,16 @@ function ServerMenuModal() {
   const close = () => useStore.getState().setModal(null);
   const active = useStore((s) => s.active)!;
   const [err, setErr] = useState('');
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
   const owner = active.myRole === 'owner';
   const canManage = owner || hasPerm(active.myPerms || 0, PERM.MANAGE_SERVER) || hasPerm(active.myPerms || 0, PERM.MANAGE_ROLES);
-  async function leave() { try { if (owner) await api.deleteServer(active.id); else await api.leaveServer(active.id); close(); useStore.getState().toast('Готово', 'ok'); useStore.getState().exitServer(); } catch (e: any) { setErr(e.message); } }
+  async function leave() {
+    if (busy) return;
+    setBusy(true); setErr('');
+    try { if (owner) await api.deleteServer(active.id); else await api.leaveServer(active.id); close(); useStore.getState().toast(owner ? 'Сервер удалён' : 'Ты покинул сервер', 'ok'); useStore.getState().exitServer(); }
+    catch (e: any) { setErr(e.message); setBusy(false); }
+  }
   return <Backdrop onClose={close} label="Сервер">
     <div className="srv-menu-head">
       <div className="sm-ic" style={{ background: active.iconUrl ? '#0000' : avColor(active.name, active.iconColor) }}>{active.iconUrl ? <img className="avimg" src={resolveUploadUrl(active.iconUrl)} alt="" /> : initial(active.name)}</div>
@@ -152,10 +238,21 @@ function ServerMenuModal() {
       <button className="sm-act" onClick={() => useStore.getState().setModal('invite')}><Icon name="link" sm />Пригласить</button>
       {canManage ? <button className="sm-act accent" onClick={() => useStore.getState().setModal('srvsettings')}><Icon name="gear" sm />Настройки сервера</button> : null}
     </div>
-    <div className="rowbtns">
-      <button className="sm-act" onClick={close}>Закрыть</button>
-      <button className="sm-act danger" onClick={leave}><Icon name="leave" sm />{owner ? 'Удалить сервер' : 'Покинуть сервер'}</button>
-    </div>
+    {confirming ? (
+      <div className="danger-confirm" role="alert">
+        <span className="danger-confirm-icon"><Icon name="warn" /></span>
+        <div className="danger-confirm-copy"><b>{owner ? `Удалить «${active.name}»?` : `Покинуть «${active.name}»?`}</b><span>{owner ? 'Сервер, история и приглашения будут удалены без возможности восстановления.' : 'Чтобы вернуться, понадобится новое приглашение.'}</span></div>
+        <div className="danger-confirm-actions">
+          <button className="sm-act" disabled={busy} onClick={() => setConfirming(false)}>Отмена</button>
+          <button className="sm-act danger" disabled={busy} onClick={leave}>{busy ? <span className="spin" /> : <Icon name="leave" sm />}{owner ? 'Удалить навсегда' : 'Покинуть'}</button>
+        </div>
+      </div>
+    ) : (
+      <div className="rowbtns">
+        <button className="sm-act" onClick={close}>Закрыть</button>
+        <button className="sm-act danger" onClick={() => setConfirming(true)}><Icon name="leave" sm />{owner ? 'Удалить сервер' : 'Покинуть сервер'}</button>
+      </div>
+    )}
     <div className="err">{err}</div>
   </Backdrop>;
 }
@@ -180,7 +277,7 @@ function InviteModal() {
   return <Backdrop onClose={close} label="Пригласить">
     <h2><Icon name="link" />Пригласить друзей</h2>
     <p className="msub">Ссылка одноразово живёт 30 минут. Просрочилась — жми «Новая ссылка».</p>
-    <div className="invite-box"><input readOnly value={link} /><button data-tip="Копировать" disabled={!link || expired} onClick={() => copy(link)}>📋</button></div>
+    <div className="invite-box"><input readOnly value={link} /><button aria-label="Копировать ссылку приглашения" data-tip="Копировать" disabled={!link || expired} onClick={() => copy(link)}>📋</button></div>
     <div style={{ fontSize: 12.5, color: expired ? 'var(--red)' : 'var(--muted)', margin: '8px 2px 0' }}>{link ? (expired ? 'Ссылка истекла — создай новую' : `Действует ещё: ${left}`) : 'Создаю ссылку…'}</div>
     <button className="ghost" style={{ marginTop: 12 }} disabled={busy} onClick={gen}><Icon name="refresh" sm />Новая ссылка</button>
     <button className="close" onClick={close}>Готово</button>
@@ -471,12 +568,12 @@ function SettingsModal() {
           {tab === 'appearance' && <>
             <h2><Icon name="palette" />Оформление</h2>
             <div className="fld"><label>Тема оформления</label>
-              <div className="theme-grid">
+              <div className="theme-grid" role="group" aria-label="Тема оформления">
                 {THEMES.map((t) => (
-                  <button key={t.id} className={'theme-op' + (getTheme() === t.id ? ' active' : '')} onClick={() => { setTheme(t.id); rerender(); }}>
-                    <span className="theme-sw">{t.swatch.map((c, i) => <i key={i} style={{ background: c }} />)}</span>
-                    <span className="theme-nm">{t.name}</span>
-                    {getTheme() === t.id ? <Icon name="check" sm /> : null}
+                    <button type="button" key={t.id} aria-pressed={getTheme() === t.id} className={'theme-op' + (getTheme() === t.id ? ' active' : '')} onClick={() => { setTheme(t.id); rerender(); }}>
+                      <span className="theme-sw">{t.swatch.map((c, i) => <i key={i} style={{ background: c }} />)}</span>
+                      <span className="theme-copy"><span className="theme-nm">{t.name}</span><small>{t.description}</small></span>
+                      {getTheme() === t.id ? <Icon name="check" sm /> : null}
                   </button>
                 ))}
               </div>

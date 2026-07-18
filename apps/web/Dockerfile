@@ -4,6 +4,8 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .
+ARG VITE_GIPHY_API_KEY
+ENV VITE_GIPHY_API_KEY=${VITE_GIPHY_API_KEY}
 RUN npm run build
 
 # --- serve (caddy отдаёт статику + проксирует api/livekit) ---
