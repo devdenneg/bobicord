@@ -64,7 +64,7 @@ jobs:
               read -r current_seq < "$seq_file"
               case "$current_seq" in ''|*[!0-9]*) echo "invalid deployed web release sequence" >&2; exit 1;; esac
             fi
-            printf '%s\n' "$current_seq"
+            printf 'RELAYAPP_WEB_SEQUENCE=%s\n' "$current_seq"
 
       - name: Fence stale web release
         id: fence
@@ -75,8 +75,13 @@ jobs:
         run: |
           set -e
           candidate_seq="$CANDIDATE_SEQUENCE"
-          current_seq=$(printf '%s' "$DEPLOYED_SEQUENCE" | tr -d '[:space:]')
+          sequence_lines=$(printf '%s\n' "$DEPLOYED_SEQUENCE" \
+            | sed -nE 's/^(out: )?RELAYAPP_WEB_SEQUENCE=(0|[1-9][0-9]*)\r?$/\2/p')
+          sequence_count=$(printf '%s\n' "$sequence_lines" | sed '/^$/d' | wc -l | tr -d '[:space:]')
           case "$candidate_seq" in ''|*[!0-9]*) echo "invalid candidate web release sequence" >&2; exit 1;; esac
+          [ "$sequence_count" = "1" ] \
+            || { echo "expected exactly one deployed web release sequence" >&2; exit 1; }
+          current_seq=$(printf '%s\n' "$sequence_lines" | sed -n '1p')
           case "$current_seq" in ''|*[!0-9]*) echo "invalid deployed web release sequence" >&2; exit 1;; esac
           if [ "$candidate_seq" -le "$current_seq" ]; then
             echo "deploy_allowed=false" >> "$GITHUB_OUTPUT"
