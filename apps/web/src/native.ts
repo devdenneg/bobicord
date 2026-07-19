@@ -1,5 +1,6 @@
 // IPC bridge to Tauri native shell (apps/native). No-op in browser.
 import { getToken } from './api';
+import { normalizeExternalHttpUrl } from './linkify';
 
 export const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
@@ -7,6 +8,20 @@ export async function pingNative(): Promise<string | null> {
   if (!isTauri) return null;
   const { invoke } = await import('@tauri-apps/api/core');
   return invoke<string>('ping');
+}
+
+/** Opens an HTTP(S) URL in the user's default browser, never inside the app webview. */
+export async function openExternalUrl(url: string): Promise<void> {
+  const safeUrl = normalizeExternalHttpUrl(url);
+  if (!safeUrl) throw new Error('Unsupported external URL');
+  if (isTauri) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    await invoke('open_external_url', { url: safeUrl });
+    return;
+  }
+  const opened = window.open(safeUrl, '_blank', 'noopener,noreferrer');
+  if (!opened) throw new Error('External URL was blocked');
+  opened.opener = null;
 }
 
 export interface GameInfo { name: string; icon: string | null }

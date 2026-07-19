@@ -9,6 +9,7 @@ import { avColor, initial, prefersReducedMotion, downscaleImage } from '../util'
 import { emoteMap } from '../emotes';
 import { EmoteImg } from './EmoteImg';
 import { EmotePicker } from './EmotePicker';
+import { ExternalLink } from './ExternalLink';
 import { VoiceDock, VoiceControls } from './VoiceDock';
 import { StreamerWidget } from './StreamerWidget';
 import { normalizeProfileBanner, ProfileBannerMedia } from './ProfileBanner';
@@ -19,6 +20,8 @@ import { applyNativeUpdate } from '../nativeUpdate';
 import { isTauri, saveFileDialog, openFile, pathsExist } from '../native';
 import { getDownloads, addDownload, subscribeDownloads, type DownloadItem } from '../downloads';
 import { sendActiveChat } from '../notifyws';
+import { linkifyHttpUrls } from '../linkify';
+import { fetchTitle, parseYouTubeVideo, type YouTubeVideoRef } from '../youtube';
 import type { Attachment, ChatMessage, Emote, Leaderboard, Member, MemberStats, ReleaseNote, ReplyRef, Role } from '../types';
 import { PERM, hasPerm } from '../types';
 
@@ -727,7 +730,7 @@ function Members() {
 }
 
 /* ---------- Chat ---------- */
-type RichPart = string | { emo: string; name: string } | { link: string } | { mention: string };
+type RichPart = string | { emo: string; name: string } | { link: string; label: string } | { mention: string };
 // сначала вырезаем упоминания (в т.ч. многословные ники по списку известных имён), остальное токенизируем
 function renderRich(text: string, names?: Set<string>): RichPart[] {
   const out: RichPart[] = [];
@@ -735,7 +738,18 @@ function renderRich(text: string, names?: Set<string>): RichPart[] {
     for (const tok of chunk.split(/(\s+)/)) {
       if (!tok) continue;
       if (emoteMap.has(tok)) out.push({ emo: emoteMap.get(tok)!, name: tok });
-      else if (/^https?:\/\/[^\s]+$/i.test(tok)) out.push({ link: tok });
+      else if (/https?:\/\//i.test(tok)) {
+        const linkParts = linkifyHttpUrls(tok);
+        const foundLink = linkParts.some((part) => typeof part !== 'string');
+        if (foundLink) {
+          for (const part of linkParts) {
+            if (typeof part === 'string') out.push(part);
+            else out.push({ link: part.href, label: part.label });
+          }
+        } else {
+          out.push(tok);
+        }
+      }
       else if ((!names || names.size === 0) && /^@[^\s@]{1,32}$/.test(tok)) out.push({ mention: tok });
       else out.push(tok);
     }
@@ -762,6 +776,37 @@ function renderRich(text: string, names?: Set<string>): RichPart[] {
   }
   tokenize(text.slice(last));
   return out;
+}
+
+function YouTubePreview({ video }: { video: YouTubeVideoRef }) {
+  const [title, setTitle] = useState('Видео на YouTube');
+  const [thumbnailFailed, setThumbnailFailed] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    setTitle('Видео на YouTube');
+    setThumbnailFailed(false);
+    void fetchTitle(video.videoId).then((nextTitle) => {
+      if (active && nextTitle && nextTitle !== video.videoId) setTitle(nextTitle);
+    });
+    return () => { active = false; };
+  }, [video.videoId]);
+
+  return (
+    <ExternalLink href={video.canonicalUrl} className="yt-preview" aria-label={`Открыть видео «${title}» на YouTube во внешнем браузере`}>
+      <span className={'yt-preview-media' + (thumbnailFailed ? ' failed' : '')}>
+        {!thumbnailFailed ? (
+          <img src={video.thumbnailUrl} alt="" loading="lazy" referrerPolicy="no-referrer" onError={() => setThumbnailFailed(true)} />
+        ) : null}
+        <span className="yt-preview-play" aria-hidden="true"><Icon name="play" /></span>
+      </span>
+      <span className="yt-preview-copy">
+        <span className="yt-preview-service">YouTube</span>
+        <span className="yt-preview-title" title={title}>{title}</span>
+        <span className="yt-preview-open">Открыть видео <Icon name="open-in" sm /></span>
+      </span>
+    </ExternalLink>
+  );
 }
 function fmtTime(ts?: number): string {
   if (!ts) return '';
@@ -1735,6 +1780,18 @@ function Chat() {
     const parts = m.sys ? null : renderRich(m.text, mentionNames);
     const emoCount = parts ? parts.filter((p) => typeof p === 'object' && 'emo' in p).length : 0;
     const hasLink = parts ? parts.some((p) => typeof p === 'object' && 'link' in p) : false;
+    const youtubePreviews: YouTubeVideoRef[] = [];
+    if (parts) {
+      const seenVideoIds = new Set<string>();
+      for (const part of parts) {
+        if (typeof part === 'string' || !('link' in part)) continue;
+        const video = parseYouTubeVideo(part.link);
+        if (!video || seenVideoIds.has(video.videoId)) continue;
+        seenVideoIds.add(video.videoId);
+        youtubePreviews.push(video);
+        if (youtubePreviews.length >= 4) break;
+      }
+    }
     const big = !!parts && !hasLink && emoCount >= 1 && emoCount <= 3 && parts.every((p) => typeof p !== 'string' || !p.trim());
     const author = m.who ? byName.get(m.who) : undefined;
     const aRoles = author?.roles || [];
@@ -1759,7 +1816,7 @@ function Chat() {
     // сообщения с вложениями визуально «тяжелее» простого текста — при плотной Telegram-группировке
     // (cont, 2px между сообщениями одного автора) несколько подряд идущих превью сливаются в кашу.
     // Добавляем чуть больше воздуха сверху именно таким продолжениям, не трогая обычный текст.
-    const hasMedia = !!m.img || !!(m.files && m.files.length);
+    const hasMedia = youtubePreviews.length > 0 || !!m.img || !!(m.files && m.files.length);
     const canReact = m.sid != null || !!m.mkey;
     const reactionTarget = { id: m.id, sid: m.sid };
     return (
@@ -1779,8 +1836,13 @@ function Chat() {
                   </div>
                 ) : m.sys || m.text ? (
                   <div className={'tx' + (big ? ' big' : '')}>
-                    {m.sys ? (m.kind === 'stream-state' ? <><Icon name="screen" sm /><span>{m.text}</span></> : m.text) : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : 'link' in p ? <a key={i} className="msg-link" href={p.link} target="_blank" rel="noreferrer">{p.link}</a> : 'mention' in p ? <span key={i} className="mention-tag">{p.mention}</span> : <EmoteImg key={i} className="emo" id={p.emo} alt={p.name} title={p.name} />))}
+                    {m.sys ? (m.kind === 'stream-state' ? <><Icon name="screen" sm /><span>{m.text}</span></> : m.text) : parts!.map((p, i) => (typeof p === 'string' ? <span key={i}>{p}</span> : 'link' in p ? <ExternalLink key={i} className="msg-link" href={p.link} aria-label={`${p.label} — открыть во внешнем браузере`}>{p.label}</ExternalLink> : 'mention' in p ? <span key={i} className="mention-tag">{p.mention}</span> : <EmoteImg key={i} className="emo" id={p.emo} alt={p.name} title={p.name} />))}
                     {m.edited && !m.sys ? <span className="medit" title="Изменено">(изменено)</span> : null}
+                  </div>
+                ) : null}
+                {youtubePreviews.length ? (
+                  <div className="yt-previews">
+                    {youtubePreviews.map((video) => <YouTubePreview key={video.videoId} video={video} />)}
                   </div>
                 ) : null}
                 {m.img ? <button className="msg-img-wrap" style={messageImageStyle()} onClick={() => setLightbox({ url: m.img!, name: m.img!.split('/').pop() || 'image', size: 0, mime: 'image/*', kind: 'image' })}><img className="msg-img" src={resolveUploadUrl(m.img)} alt="" loading="lazy" /></button> : null}

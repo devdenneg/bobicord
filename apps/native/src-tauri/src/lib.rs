@@ -13,6 +13,35 @@ fn ping() -> &'static str {
   "pong"
 }
 
+// Open web links through the operating system instead of navigating the app webview.
+// Validate again at the IPC boundary because renderer-side checks are not a security boundary.
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+  let normalized = url.trim();
+  let lower = normalized.to_ascii_lowercase();
+  if normalized.len() > 8192
+    || normalized.chars().any(|c| c.is_control() || c.is_whitespace())
+    || !(lower.starts_with("https://") || lower.starts_with("http://"))
+  {
+    return Err("unsupported external URL".into());
+  }
+  let authority = normalized
+    .split_once("://")
+    .map(|(_, rest)| rest)
+    .unwrap_or("")
+    .split(|c| c == '/' || c == '?' || c == '#')
+    .next()
+    .unwrap_or("");
+  if authority.is_empty() || authority.contains('@') {
+    return Err("invalid external URL".into());
+  }
+  std::process::Command::new("explorer")
+    .arg(normalized)
+    .spawn()
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
 #[derive(serde::Serialize)]
 struct MonitorInfo { index: usize, name: String }
 
@@ -355,7 +384,7 @@ pub fn run() {
       std::thread::spawn(branding::fix_shortcuts);
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![ping, list_monitors, list_windows, detect_game, foreground_fullscreen, set_detectable_games, start_broadcast, set_broadcast_source, stop_broadcast, set_preview_interval, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys, open_file, reveal_in_folder, paths_exist, diag::diag_take_log])
+    .invoke_handler(tauri::generate_handler![ping, open_external_url, list_monitors, list_windows, detect_game, foreground_fullscreen, set_detectable_games, start_broadcast, set_broadcast_source, stop_broadcast, set_preview_interval, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys, open_file, reveal_in_folder, paths_exist, diag::diag_take_log])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }
