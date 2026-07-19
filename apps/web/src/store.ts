@@ -5,7 +5,7 @@ import { emoteMap } from './emotes';
 import { setSettings } from './settings';
 import { notifPermission } from './notify';
 import { ensurePushSubscribed, unsubscribePush } from './push';
-import { connectNotifyWs, disconnectNotifyWs } from './notifyws';
+import { acknowledgeReleaseMerge, connectNotifyWs, disconnectNotifyWs } from './notifyws';
 import { startIdleWatch } from './idle';
 import { initMusic } from './music';
 import { preloadSounds } from './sounds';
@@ -208,15 +208,32 @@ export const useStore = create<AppState>((set, get) => ({
           .then((r) => engine?.markSendResult(localId, true, r?.id))
           .catch(() => engine?.markSendResult(localId, false));
       },
-      refetchChat: (sid) => {
+      refetchChat: (sid, expectedServerId) => {
         const a = get().active; if (!a) return;
-        const id = a.id, epoch = viewEpoch, targetEngine = engine;
+        const id = expectedServerId || a.id;
+        if (a.id !== id) return;
+        const epoch = viewEpoch, targetEngine = engine, startedAt = Date.now();
         const exactCursor = sid != null && Number.isSafeInteger(sid) ? sid + 1 : undefined;
-        api.getMessages(id, exactCursor, exactCursor == null ? 30 : 1).then((d) => {
+        const stillCurrent = () => {
           const current = get();
-          if (viewEpoch !== epoch || current.viewServerId !== id || current.active?.id !== id || engine !== targetEngine) return;
-          targetEngine?.mergeRecent(d.messages);
-        }).catch(() => {});
+          return viewEpoch === epoch && current.view === 'server' && current.active?.id === id
+            && current.viewServerId === id && engine === targetEngine;
+        };
+        const scheduleRetry = (attempt: number) => {
+          if (exactCursor == null || !stillCurrent() || Date.now() - startedAt >= 15 * 60_000) return;
+          const delay = Math.min(10_000, 600 * (2 ** Math.min(attempt, 5)));
+          window.setTimeout(() => { if (stillCurrent()) fetchRecent(attempt + 1); }, delay);
+        };
+        const fetchRecent = (attempt = 0) => {
+          api.getMessages(id, exactCursor, exactCursor == null ? 30 : 1).then((d) => {
+            if (!stillCurrent()) return;
+            const exactRelease = sid != null && d.messages.some((message) => message.id === sid && message.kind === 'release');
+            if (sid != null && !exactRelease) { scheduleRetry(attempt); return; }
+            targetEngine?.mergeRecent(d.messages, exactRelease ? { tailSafeRelease: true } : undefined);
+            if (exactRelease) acknowledgeReleaseMerge();
+          }).catch(() => scheduleRetry(attempt));
+        };
+        fetchRecent();
       },
       // Let the engine observe failures so it can roll optimistic state back.
       reactMessage: (serverId, sid, emoteId, emoteName, add) => api.reactMessage(serverId, sid, emoteId, emoteName, add).then(() => undefined),
@@ -462,7 +479,8 @@ export const useStore = create<AppState>((set, get) => ({
   goAdmin: () => { if (location.pathname !== '/admin') history.pushState({}, '', '/admin'); set({ view: 'admin' }); },
 }));
 
-// доступное обновление тоже добавляет +1 к бейджу таскбара
+// Доступное обновление тоже добавляет +1 к бейджу таскбара.
+// Presence видимого чата ведёт ServerView: только он знает mobile-tab и скрыта ли панель эфиром.
 useStore.subscribe((s, prev) => { if (s.updateReady !== prev.updateReady) updateAppBadge(); });
 
 export function orderedMembers(members: Member[], presence: Record<string, { online: boolean }>): { online: Member[]; offline: Member[] } {

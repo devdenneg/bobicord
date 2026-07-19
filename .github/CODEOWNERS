@@ -1,0 +1,12 @@
+# Commit policy and release automation require an explicit owner review on protected main.
+/.github/CODEOWNERS @devdenneg
+/AGENTS.md @devdenneg
+/.gitattributes @devdenneg
+/.gitmessage @devdenneg
+/.githooks/ @devdenneg
+/scripts/install-git-hooks.mjs @devdenneg
+/scripts/release-notes.mjs @devdenneg
+/scripts/release-notes.test.mjs @devdenneg
+/.github/workflows/commit-policy.yml @devdenneg
+/.github/workflows/deploy.yml @devdenneg
+/.github/workflows/build-windows.yml @devdenneg

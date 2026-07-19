@@ -3,6 +3,7 @@
   "version": "3.0.0",
   "private": true,
   "scripts": {
+    "test:release-notes": "node release-notes-test.js",
     "test:voice-lease": "node voice-lease-test.js"
   },
   "dependencies": {

@@ -6,10 +6,11 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const Database = require('better-sqlite3');
-const { AccessToken, RoomServiceClient } = require('livekit-server-sdk');
+const { AccessToken, RoomServiceClient, DataPacket_Kind } = require('livekit-server-sdk');
 const { WebSocketServer } = require('ws');
 const { attachTreeServer } = require('./tree');
 const { createVoiceLeaseStore, voiceLeaseEvent, selectVoiceState } = require('./voiceLease');
+const { installReleaseSchema, parseReleaseMeta, prepareRelease, finalizeRelease } = require('./releaseNotes');
 const stats = require('./stats'); // рейтинг + уровни (экспериментальная фича)
 
 const app = express();
@@ -34,7 +35,13 @@ app.use((req, res, next) => {
 const DIAG_MAX_BODY = '2mb';
 const jsonSmall = express.json({ limit: '32kb' });
 const jsonDiag = express.json({ limit: DIAG_MAX_BODY });
-app.use((req, res, next) => (req.path === '/api/diag/session' ? jsonDiag : jsonSmall)(req, res, next));
+const jsonRelease = express.json({ limit: '512kb' });
+app.use((req, res, next) => {
+  const parser = req.path === '/api/diag/session'
+    ? jsonDiag
+    : (req.path.startsWith('/internal/releases/') ? jsonRelease : jsonSmall);
+  return parser(req, res, next);
+});
 
 const KEY = process.env.LK_KEY;
 const SECRET = process.env.LK_SECRET;
@@ -191,6 +198,7 @@ CREATE INDEX IF NOT EXISTS idx_roles_server ON roles(server_id);
 CREATE INDEX IF NOT EXISTS idx_mroles ON member_roles(server_id, user_id);
 `);
 const voiceLeases = createVoiceLeaseStore(db);
+installReleaseSchema(db);
 
 /* add new columns to pre-existing DBs (idempotent — throws if column exists) */
 for (const sql of [
@@ -534,7 +542,7 @@ function memberCount(sid) { return db.prepare('SELECT COUNT(*) c FROM membership
 function purgeServer(sid) {
   invalidateVoiceLeasesForServer(sid, 'server-deleted');
   evictRoomParticipants(sid);
-  for (const t of ['memberships', 'invites', 'server_settings', 'roles', 'member_roles', 'messages', 'voice_channels', 'read_state']) db.prepare(`DELETE FROM ${t} WHERE server_id=?`).run(sid);
+  for (const t of ['memberships', 'invites', 'server_settings', 'roles', 'member_roles', 'messages', 'voice_channels', 'read_state', 'deploy_release_targets']) db.prepare(`DELETE FROM ${t} WHERE server_id=?`).run(sid);
   db.prepare('DELETE FROM servers WHERE id=?').run(sid);
 }
 // Полный снос юзера: сначала его сервера-владения (иначе осиротеют), потом все его записи.
@@ -551,10 +559,10 @@ function purgeUser(uid) {
   db.prepare('DELETE FROM voice_leases WHERE user_id=?').run(uid);
   db.prepare('DELETE FROM users WHERE id=?').run(uid);
 }
-// Непрочитанные: чат-сообщения сервера НОВЕЕ last_read юзера и НЕ его собственные. Системных
-// событий (стрим/обновление) в БД нет — их клиент добавляет к бейджу локально.
+// Непрочитанные: только пользовательские сообщения новее last_read и не свои. Release-патчноут
+// хранится в истории, но не создаёт badge тем, кто не был его живой аудиторией при обновлении.
 const _lastReadStmt = db.prepare('SELECT last_read FROM read_state WHERE user_id=? AND server_id=?');
-const _unreadStmt = db.prepare('SELECT COUNT(*) c FROM messages WHERE server_id=? AND id>? AND user_id!=?');
+const _unreadStmt = db.prepare("SELECT COUNT(*) c FROM messages WHERE server_id=? AND id>? AND user_id!=? AND kind!='release'");
 function unreadCount(uid, sid) {
   const r = _lastReadStmt.get(uid, sid);
   if (!r) {
@@ -1908,7 +1916,18 @@ app.get('/api/servers/:id/messages', requireAuth, (req, res) => {
   }
   res.json({
     hasMore,
-    messages: page.map(r => ({ id: r.id, uid: r.user_id, name: r.display_name, color: r.avatar_color, text: r.text, em: JSON.parse(r.emotes || '{}'), img: r.image || '', files: JSON.parse(r.attachments || '[]'), reply: r.reply_to ? JSON.parse(r.reply_to) : undefined, ts: r.created, edited: !!r.edited, reactions: reactByMsg.has(r.id) ? [...reactByMsg.get(r.id).values()] : undefined, kind: r.kind || undefined, level: r.kind === 'levelup' && r.meta ? (JSON.parse(r.meta).level || undefined) : undefined })),
+    messages: page.map((r) => {
+      let level;
+      if (r.kind === 'levelup' && r.meta) { try { level = JSON.parse(r.meta).level || undefined; } catch { /**/ } }
+      const release = parseReleaseMeta(r.kind, r.meta);
+      return {
+        id: r.id, uid: r.user_id, name: r.display_name, color: r.avatar_color, text: r.text,
+        em: JSON.parse(r.emotes || '{}'), img: r.image || '', files: JSON.parse(r.attachments || '[]'),
+        reply: r.reply_to ? JSON.parse(r.reply_to) : undefined, ts: r.created, edited: !!r.edited,
+        reactions: reactByMsg.has(r.id) ? [...reactByMsg.get(r.id).values()] : undefined,
+        kind: r.kind || undefined, level, release,
+      };
+    }),
   });
 });
 // вложения: до 5 на сообщение, url валиден для своего kind (картинки — /api/uploads/*, инлайн;
@@ -2039,6 +2058,112 @@ app.delete('/api/servers/:id/messages/:mid', requireAuth, (req, res) => {
 
 app.get('/healthz', (req, res) => res.send('ok'));
 
+/* ---------- INTERNAL RELEASE PATCH NOTES ----------
+ * CI вызывает эти маршруты только изнутри token-контейнера. Prepare выполняется ДО замены
+ * контейнеров и фиксирует аудиторию открытых чатов; finalize — только после успешного health-check.
+ * Тот же CI-attempt идемпотентен, а новый attempt может переснять незавершённую попытку, пока ни
+ * один обязательный компонент ещё не подтвердил успешное обновление. */
+function releaseInternalAuthorized(req, action) {
+  const remote = String(req.socket.remoteAddress || '').replace(/^::ffff:/u, '');
+  if (remote !== '127.0.0.1' && remote !== '::1') return false;
+  const sha = String((req.body && req.body.sha) || '').toLowerCase();
+  const source = String((req.body && req.body.source) || '').toLowerCase();
+  const attempt = String((req.body && req.body.attempt) || `${sha}:1`).toLowerCase();
+  const supplied = String(req.headers['x-release-signature'] || '');
+  if (!/^[0-9a-f]{40}$/u.test(sha) || !['web', 'desktop', 'manual'].includes(source)
+    || !new RegExp(`^${sha}:[1-9][0-9]{0,8}$`, 'u').test(attempt) || !/^[0-9a-f]{64}$/u.test(supplied)) return false;
+  const expected = crypto.createHmac('sha256', SESSION_SECRET).update(`release:${action}:${sha}:${source}:${attempt}`).digest('hex');
+  return crypto.timingSafeEqual(Buffer.from(supplied, 'hex'), Buffer.from(expected, 'hex'));
+}
+
+const RELEASE_RECONNECT_WINDOW_MS = 15 * 60 * 1000;
+const RELEASE_REFRESH_COOLDOWN_MS = 3000;
+const _recentReleaseForServerStmt = db.prepare(`SELECT t.message_id messageId,r.finalized
+  FROM deploy_release_targets t JOIN deploy_releases r ON r.sha=t.sha
+  WHERE t.server_id=? AND t.message_id IS NOT NULL AND r.state='published' AND r.finalized>=?
+  ORDER BY r.finalized DESC LIMIT 1`);
+
+function sendReleaseRefresh(ws, serverId, messageId) {
+  const sid = Number(messageId);
+  if (!serverId || !Number.isSafeInteger(sid) || sid <= 0 || ws.readyState !== 1) return false;
+  if (!ws._releaseRefreshAckSids) ws._releaseRefreshAckSids = new Set();
+  if (!ws._releaseRefreshSentAt) ws._releaseRefreshSentAt = new Map();
+  if (ws._releaseRefreshAckSids.has(sid)) return false;
+  const now = Date.now();
+  if (now - (ws._releaseRefreshSentAt.get(sid) || 0) < RELEASE_REFRESH_COOLDOWN_MS) return false;
+  try {
+    ws.send(JSON.stringify({ t: 'chat-refresh', serverId, lastReleaseSid: sid }));
+    // Sending the command is not an ACK: the following HTTP history merge may still fail.
+    // The client acknowledges lastReleaseSid in its next presence frame only after that merge.
+    ws._releaseRefreshSentAt.set(sid, now);
+    return true;
+  } catch { return false; }
+}
+
+function recoverRecentReleaseForSocket(ws, serverId) {
+  const delivery = _recentReleaseForServerStmt.get(serverId, Date.now() - RELEASE_RECONNECT_WINDOW_MS);
+  if (delivery) sendReleaseRefresh(ws, serverId, delivery.messageId);
+}
+
+function refreshReleaseChats(deliveries) {
+  const wanted = new Map(deliveries.map((delivery) => [delivery.serverId, delivery.messageId]));
+  for (const sockets of notifyConns.values()) for (const ws of sockets) {
+    const messageId = wanted.get(ws._activeServerId);
+    if (messageId != null) sendReleaseRefresh(ws, ws._activeServerId, messageId);
+  }
+}
+
+async function broadcastReleaseLive(result) {
+  if (result.state !== 'published' || !result.release) return [];
+  const text = result.text;
+  const mkey = `release:${result.sha}`;
+  const tasks = result.deliveries.map(async (delivery) => {
+    const packet = {
+      t: 'chat', kind: 'release', sid: Number(delivery.messageId), ts: result.release.publishedAt,
+      uid: 'system:release', name: 'RelayApp', color: 4, text, mkey, release: result.release,
+    };
+    await rsc.sendData(`srv:${delivery.serverId}`, Buffer.from(JSON.stringify(packet)), DataPacket_Kind.RELIABLE, {});
+    return delivery.serverId;
+  });
+  const settled = await Promise.allSettled(tasks);
+  settled.forEach((entry, index) => {
+    if (entry.status === 'rejected') console.warn(`[release] live broadcast ${result.deliveries[index].serverId}:`, entry.reason?.message || entry.reason);
+  });
+  refreshReleaseChats(result.deliveries);
+  return settled;
+}
+
+app.post('/internal/releases/prepare', (req, res) => {
+  if (!releaseInternalAuthorized(req, 'prepare')) return res.status(403).json({ error: 'forbidden' });
+  try {
+    const result = prepareRelease(db, notifyConns, req.body);
+    console.log(`[release] prepare ${result.sha.slice(0, 8)}: ${result.targets.length} server(s), ${result.audience} active user(s), ${result.created ? 'snapshot saved' : 'already known'}`);
+    res.json({ ok: true, ...result });
+  } catch (error) {
+    console.error('[release] prepare:', error.message || error);
+    res.status(400).json({ error: error.message || 'prepare failed' });
+  }
+});
+
+app.post('/internal/releases/finalize', async (req, res) => {
+  if (!releaseInternalAuthorized(req, 'finalize')) return res.status(403).json({ error: 'forbidden' });
+  try {
+    const result = finalizeRelease(db, req.body.sha, req.body.source, req.body.attempt);
+    // The first publisher uses LiveKit + notify refresh. An idempotent finalize retry avoids a
+    // second legacy chat packet and only retries the trusted history refresh with the same sid.
+    if (result.state === 'published' && result.changed) await broadcastReleaseLive(result);
+    else if (result.state === 'published') refreshReleaseChats(result.deliveries);
+    console.log(`[release] finalize ${result.sha.slice(0, 8)}/${result.source}: ${result.state}, ${result.deliveries.length} server(s), pending=${result.pendingComponents.join(',') || 'none'}`);
+    res.json({
+      ok: true, sha: result.sha, source: result.source, state: result.state, changed: result.changed,
+      servers: result.deliveries.length, pendingComponents: result.pendingComponents,
+    });
+  } catch (error) {
+    console.error('[release] finalize:', error.message || error);
+    res.status(400).json({ error: error.message || 'finalize failed' });
+  }
+});
+
 // Диагностика прод-обрывов: упавший промис/исключение раньше могли молча ронять процесс
 // (docker перезапускал, причина терялась, если логи контейнера пересоздавались) — фиксируем
 // стек явно. uncaughtException НЕ глушим (процесс должен упасть и перезапуститься чистым).
@@ -2103,6 +2228,10 @@ server.on('upgrade', (req, socket, head) => {
   if (!uid) { socket.destroy(); return; }
   notifyWss.handleUpgrade(req, socket, head, (ws) => {
     ws._away = false; // idle-статус сессии: клиент шлёт {t:'presence',away} при бездействии. Юзер «away» (жёлтый), если ВСЕ его сокеты idle.
+    ws._activeServerId = '';
+    ws._userId = uid;
+    ws._releaseRefreshAckSids = new Set();
+    ws._releaseRefreshSentAt = new Map();
     ws._isAlive = true;
     let set = notifyConns.get(uid); if (!set) { set = new Set(); notifyConns.set(uid, set); }
     set.add(ws);
@@ -2111,7 +2240,27 @@ server.on('upgrade', (req, socket, head) => {
     ws.on('close', () => { const s = notifyConns.get(uid); if (s) { s.delete(ws); if (!s.size) notifyConns.delete(uid); } });
     ws.on('pong', () => { ws._isAlive = true; });
     ws.on('error', () => { try { ws.close(); } catch (e) {} });
-    ws.on('message', (data) => { try { const d = JSON.parse(data); if (d && d.t === 'presence') ws._away = !!d.away; } catch (e) { /* ping/мусор игнорим */ } });
+    ws.on('message', (data) => {
+      try {
+        const d = JSON.parse(data);
+        if (!d || d.t !== 'presence') return;
+        ws._away = !!d.away;
+        const requested = typeof d.activeServerId === 'string' ? d.activeServerId.trim().slice(0, 80) : '';
+        const activeServerId = requested && isMember(uid, requested) ? requested : '';
+        const changed = activeServerId !== ws._activeServerId;
+        ws._activeServerId = activeServerId;
+        const lastReleaseSid = Number(d.lastReleaseSid);
+        if (Number.isSafeInteger(lastReleaseSid) && lastReleaseSid > 0) {
+          ws._releaseRefreshAckSids.add(lastReleaseSid);
+          ws._releaseRefreshSentAt.delete(lastReleaseSid);
+        }
+        // Не refetch-им историю на каждом обычном входе. Узкая recovery-проверка нужна только
+        // для недавнего release, который мог быть записан, пока API/notify-WS перезапускались.
+        if (changed && activeServerId && ws.readyState === 1) {
+          recoverRecentReleaseForSocket(ws, activeServerId);
+        }
+      } catch (e) { /* ping/мусор игнорим */ }
+    });
   });
 });
 // heartbeat: half-open TCP может выглядеть OPEN бесконечно и «проглатывать» handoff notify.

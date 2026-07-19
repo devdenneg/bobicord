@@ -24,7 +24,7 @@ services:
       - ./livekit.yaml:/etc/livekit.yaml:ro
 
   token:
-    image: ghcr.io/devdenneg/bobicord-server:latest
+    image: ghcr.io/devdenneg/bobicord-server:${IMAGE_TAG:-latest}
     pull_policy: always
     restart: unless-stopped
     logging: *logging
@@ -94,7 +94,7 @@ services:
   # (COMPOSE_PROFILES=local-media в .env). Двух агентов одновременно быть не должно:
   # findVrelayAgent() в tree.js возьмёт того, кто подключился раньше.
   vrelay:
-    image: ghcr.io/devdenneg/bobicord-vrelay:latest
+    image: ghcr.io/devdenneg/bobicord-vrelay:${IMAGE_TAG:-latest}
     profiles: ["local-media"]
     pull_policy: always
     network_mode: host
@@ -133,7 +133,7 @@ services:
 
   caddy:
     # запечены статика фронта + Caddyfile
-    image: ghcr.io/devdenneg/bobicord-web:latest
+    image: ghcr.io/devdenneg/bobicord-web:${IMAGE_TAG:-latest}
     pull_policy: always
     network_mode: host
     restart: unless-stopped

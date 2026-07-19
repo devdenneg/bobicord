@@ -17,13 +17,12 @@ on:
       - .dockerignore
   workflow_dispatch:
 
-# Два пуша подряд запускали ДВА деплоя параллельно. Оба тегают образы `:latest` и делают
-# `docker compose pull` — если старый прогон финиширует последним, прод откатывается на
-# устаревший код. Сериализуем. cancel-in-progress: false намеренно: отмена посреди
-# `docker compose up -d` оставила бы прод в полусостоянии; лучше дождаться и накатить следом.
+# Прод-деплои сериализованы и используют immutable SHA-теги. `queue: max` сохраняет до 100
+# ожидающих push в FIFO-очереди: промежуточное обновление не вытесняется третьим, а отмены
+# посреди `docker compose up -d` не оставляют прод в полусостоянии.
 concurrency:
-  group: deploy-${{ github.ref }}
-  cancel-in-progress: false
+  group: relayapp-production
+  queue: max
 
 env:
   IMAGE_SERVER: ghcr.io/devdenneg/bobicord-server
@@ -31,13 +30,88 @@ env:
   IMAGE_VRELAY: ghcr.io/devdenneg/bobicord-vrelay
 
 jobs:
-  build:
+  release_guard:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    outputs:
+      deploy_allowed: ${{ steps.fence.outputs.deploy_allowed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute candidate release sequence
+        id: candidate
+        run: echo "sequence=$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+
+      # The workflow-level production queue keeps this read stable until the run finishes.
+      # Check before Docker build/push and before SCP so a stale rerun cannot move :latest or
+      # replace the production compose files even temporarily. The remote vrelay compose keeps
+      # using :latest and therefore receives only images from an accepted, newer sequence.
+      - name: Read deployed web sequence
+        id: deployed
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          capture_stdout: true
+          script: |
+            set -e
+            seq_file=/opt/voice/data/web-release-sequence
+            current_seq=0
+            if [ -f "$seq_file" ]; then
+              read -r current_seq < "$seq_file"
+              case "$current_seq" in ''|*[!0-9]*) echo "invalid deployed web release sequence" >&2; exit 1;; esac
+            fi
+            printf '%s\n' "$current_seq"
+
+      - name: Fence stale web release
+        id: fence
+        shell: bash
+        env:
+          CANDIDATE_SEQUENCE: ${{ steps.candidate.outputs.sequence }}
+          DEPLOYED_SEQUENCE: ${{ steps.deployed.outputs.stdout }}
+        run: |
+          set -e
+          candidate_seq="$CANDIDATE_SEQUENCE"
+          current_seq=$(printf '%s' "$DEPLOYED_SEQUENCE" | tr -d '[:space:]')
+          case "$candidate_seq" in ''|*[!0-9]*) echo "invalid candidate web release sequence" >&2; exit 1;; esac
+          case "$current_seq" in ''|*[!0-9]*) echo "invalid deployed web release sequence" >&2; exit 1;; esac
+          if [ "$candidate_seq" -le "$current_seq" ]; then
+            echo "deploy_allowed=false" >> "$GITHUB_OUTPUT"
+            echo "stale web release ignored before build/upload: $candidate_seq <= $current_seq"
+          else
+            echo "deploy_allowed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: release_guard
+    if: needs.release_guard.outputs.deploy_allowed == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      release_sequence: ${{ steps.release_meta.outputs.sequence }}
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Compute release sequence
+        id: release_meta
+        run: echo "sequence=$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Validate commit patch notes
+        env:
+          RELEASE_FROM: ${{ github.event.before }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: node scripts/release-notes.mjs validate --from "$RELEASE_FROM" --to "$RELEASE_SHA"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -89,6 +163,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build Russian patch note payload
+        env:
+          RELEASE_FROM: ${{ github.event.before }}
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_REDEPLOY: ${{ github.event_name != 'push' }}
+        run: |
+          extra=()
+          if [ "$RELEASE_REDEPLOY" = "true" ]; then extra+=(--no-announce); fi
+          node scripts/release-notes.mjs generate --from "$RELEASE_FROM" --to "$RELEASE_SHA" --source web --attempt "${{ github.sha }}:${{ github.run_attempt }}" --output deploy-release.json "${extra[@]}"
 
       # держим docker-compose.yml и coturn/turnserver.conf на VPS в актуальном состоянии
       # (.env/livekit.yaml не трогаем — они правятся руками на хосте).
@@ -103,6 +193,15 @@ jobs:
           source: "docker-compose.yml,coturn/turnserver.conf"
           target: /opt/voice
 
+      - name: Copy patch note payload to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          source: "deploy-release.json"
+          target: /opt/voice/data
+
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1
         with:
@@ -111,11 +210,69 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           script: |
             set -e
+            candidate_seq=${{ needs.build.outputs.release_sequence }}
+            case "$candidate_seq" in ''|*[!0-9]*) echo "invalid web release sequence" >&2; exit 1;; esac
+            seq_file=/opt/voice/data/web-release-sequence
+            current_seq=0
+            if [ -f "$seq_file" ]; then read -r current_seq < "$seq_file" || current_seq=0; fi
+            case "$current_seq" in ''|*[!0-9]*) current_seq=0;; esac
+            if [ "$candidate_seq" -le "$current_seq" ]; then
+              echo "stale web release ignored: $candidate_seq <= $current_seq"
+              exit 0
+            fi
             echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u devdenneg --password-stdin
             cd /opt/voice
+            export IMAGE_TAG=${{ github.sha }}
+            # Pull does not change the running release, so do the slow network work first and
+            # snapshot the actually open chats immediately before compose up.
             docker compose pull
+            prepared=0
+            skip_marker=/opt/voice/data/release-note.${{ github.sha }}.skip
+            # Начиная со второго релиза, старый API фиксирует точную аудиторию ДО рестарта.
+            # Первый rollout механизма не может восстановить точный дорестартовый snapshot,
+            # поэтому его патчноут осознанно пропускаем и никогда не переснимаем аудиторию позже.
+            if [ -f "$skip_marker" ]; then
+              echo "Патчноут этого rollout уже помечен как bootstrap-skip"
+            elif docker compose exec -T token test -f /app/publish-release.js; then
+              docker compose exec -T token node publish-release.js prepare /app/data/deploy-release.json
+              prepared=1
+            else
+              touch "$skip_marker"
+              echo "legacy API: точный снимок аудитории до обновления недоступен; патчноут этого rollout будет пропущен"
+            fi
             docker compose up -d
+            ready=0
+            for attempt in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:3000/healthz >/dev/null; then ready=1; break; fi
+              sleep 2
+            done
+            if [ "$ready" -ne 1 ]; then
+              echo "voice API did not become healthy" >&2
+              exit 1
+            fi
+            public_ready=0
+            for attempt in $(seq 1 15); do
+              if docker compose ps --status running --services | grep -qx token \
+                && docker compose ps --status running --services | grep -qx caddy \
+                && curl -fsS https://reelay.online/ >/dev/null; then
+                public_ready=1
+                break
+              fi
+              sleep 2
+            done
+            if [ "$public_ready" -ne 1 ]; then
+              echo "public web release did not become healthy" >&2
+              exit 1
+            fi
+            if [ "$prepared" -eq 1 ]; then
+              docker compose exec -T token node publish-release.js finalize /app/data/deploy-release.json
+            else
+              echo "Патчноут пропущен: до обновления не удалось зафиксировать точную аудиторию"
+            fi
+            seq_tmp="$seq_file.tmp.$$"
+            printf '%s\n' "$candidate_seq" > "$seq_tmp"
+            mv "$seq_tmp" "$seq_file"
             # coturn и vrelay здесь больше не поднимаются: они под профилем local-media и живут
             # на отдельном VPS (deploy/vrelay-remote/). Прежний `docker compose restart coturn`
             # снят — на сервисе вне активного профиля он падает и валит весь деплой.
-            docker image prune -f
+            docker image prune -af --filter "until=168h"

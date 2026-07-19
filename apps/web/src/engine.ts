@@ -2,7 +2,7 @@ import {
   Room, RoomEvent, Track, LocalAudioTrack, AudioPresets, ConnectionQuality,
   type RemoteParticipant, type Participant, type TrackPublication, type RemoteTrack,
 } from 'livekit-client';
-import type { User, Member, ChatMessage, Emote, HistoryMessage, ReplyRef, Attachment, Reaction } from './types';
+import type { User, Member, ChatMessage, Emote, HistoryMessage, ReplyRef, Attachment, Reaction, ReleaseNote } from './types';
 import { baseUid } from './util';
 import { notify } from './notify';
 import { api, type VoiceLeaseEvent } from './api';
@@ -69,7 +69,7 @@ interface EngineHooks {
   saveSettings: (serverId: string, vols: { users: Record<string, number>; streams: Record<string, number> }) => void;
   peerJoined: (identity: string) => void;
   persistMessage: (text: string, em: Record<string, string>, image: string | undefined, reply: ReplyRef | undefined, localId: number, key: string, files?: Attachment[], kind?: string, level?: number) => void;
-  refetchChat?: (sid?: number) => void; // sid адресно сверяет реакцию; без sid догружает реконнект
+  refetchChat?: (sid?: number, serverId?: string) => void; // sid адресно сверяет строку; serverId отделяет history recovery от готовности LiveKit
   endBroadcast?: () => void; // остановить нативную трансляцию (Rust) при выходе из голосового — browser-share гасит stopShare
   reactMessage?: (serverId: string, sid: number, emoteId: string, emoteName: string, add: boolean) => Promise<void>; // персист реакции
   editMessage?: (serverId: string, sid: number, text: string) => void;   // персист редактирования
@@ -83,6 +83,39 @@ let msgSeq = 1;
 // если первый POST дошёл, а ответ потерялся
 function newClientKey(): string {
   try { return crypto.randomUUID(); } catch { return Date.now().toString(36) + Math.random().toString(36).slice(2, 10); }
+}
+
+const MAX_DATE_TIMESTAMP = 8_640_000_000_000_000;
+
+function normalizeReleaseTimestamp(value: unknown): number | undefined {
+  const parsed = typeof value === 'number'
+    ? value
+    : (typeof value === 'string' && value.length <= 64 ? Date.parse(value) : Number.NaN);
+  return Number.isFinite(parsed) && parsed > 0 && parsed <= MAX_DATE_TIMESTAMP ? parsed : undefined;
+}
+
+// Release metadata crosses both HTTP history and the LiveKit data channel. Keep the
+// renderer insulated from malformed/oversized payloads even though the server also
+// validates the generated Patch-Note.
+function normalizeReleaseNote(value: unknown): ReleaseNote | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const source = value as Record<string, unknown>;
+  const sha = typeof source.sha === 'string' ? source.sha.trim() : '';
+  const title = typeof source.title === 'string' ? source.title.trim().slice(0, 80) : '';
+  if (!/^[0-9a-f]{7,64}$/i.test(sha) || !title) return null;
+  const notes = Array.isArray(source.notes)
+    ? source.notes
+      .filter((note): note is string => typeof note === 'string')
+      .map((note) => note.trim().slice(0, 200))
+      .filter(Boolean)
+      .slice(0, 30)
+    : [];
+  if (!notes.length) return null;
+  const release: ReleaseNote = { sha, title, notes };
+  if (typeof source.version === 'string' && source.version.trim()) release.version = source.version.trim().slice(0, 48);
+  const publishedAt = normalizeReleaseTimestamp(source.publishedAt);
+  if (publishedAt != null) release.publishedAt = publishedAt;
+  return release;
 }
 
 function mapQuality(q: ConnectionQuality): VoiceQuality {
@@ -685,7 +718,7 @@ export class Engine {
     this.clearAllWatches();
     this.liveKitT.detach(); this.treeT.detach(); this.screenAudioEls.clear();
     this.streamWatchers.clear();
-    this.perMuteByServer.clear(); this.volsByServer.clear(); this.messages = []; this.reactions.clear(); this.reactionWrites.clear(); this.reactionWriteSeq.clear(); this.reactionWriteDesired.clear(); this.pendingSend.clear(); this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0; ++this.chatGeneration;
+    this.perMuteByServer.clear(); this.volsByServer.clear(); this.messages = []; this.tailSafeReleaseSids.clear(); this.reactions.clear(); this.reactionWrites.clear(); this.reactionWriteSeq.clear(); this.reactionWriteDesired.clear(); this.pendingSend.clear(); this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0; ++this.chatGeneration;
     this.onlineHint.clear(); this.awayHint.clear(); this.voiceHint = {}; this.typingUsers.clear();
     this.activeVoiceSessions.clear();
     this.subscriptionRetries.clear();
@@ -703,7 +736,7 @@ export class Engine {
   detachView() {
     ++this.connectEpoch;
     this.resetStreamEdges();
-    this.messages = []; this.reactions.clear(); this.reactionWrites.clear(); this.reactionWriteSeq.clear(); this.reactionWriteDesired.clear(); this.pendingSend.clear(); this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0; ++this.chatGeneration;
+    this.messages = []; this.tailSafeReleaseSids.clear(); this.reactions.clear(); this.reactionWrites.clear(); this.reactionWriteSeq.clear(); this.reactionWriteDesired.clear(); this.pendingSend.clear(); this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0; ++this.chatGeneration;
     this.clearAllWatches(); this.streamWatchers.clear();
     // presence-хинты и typing принадлежат ПРЕДЫДУЩЕМУ смотримому серверу
     this.onlineHint.clear(); this.awayHint.clear(); this.voiceHint = {}; this.typingUsers.clear();
@@ -2377,11 +2410,9 @@ export class Engine {
     if (!reply) return false;
     return (!!reply.uid && reply.uid === this.me.id) || reply.author === this.me.displayName;
   }
-  private pushMsg(who: string | null, text: string, sys: boolean, color?: number, mineOverride?: boolean, img?: string, ts?: number, uid?: string, reply?: ReplyRef, files?: Attachment[], mkey?: string, kind?: string, level?: number): number {
-    const mine = mineOverride !== undefined ? mineOverride : (!sys && who === this.me.displayName);
-    const mention = !sys && !mine && (this.textMentionsMe(text) || this.replyToMe(reply));
+  private appendMessage(message: Omit<ChatMessage, 'id'>): number {
     const id = msgSeq++;
-    const next = [...this.messages, { id, uid, who, text, mine, sys, color, img, files, ts: ts ?? Date.now(), mention, reply, mkey, kind, level }];
+    const next = [...this.messages, { id, ...message }];
     // кап на память сессии; срез идёт с НАЧАЛА, поэтому копим trimmedFront — компонент на столько же
     // поднимет firstItemIndex virtuoso, иначе якорь скролла рассинхронится и контент прыгнет.
     const CAP = 1000;
@@ -2389,6 +2420,11 @@ export class Engine {
     else this.messages = next;
     this.emit();
     return id;
+  }
+  private pushMsg(who: string | null, text: string, sys: boolean, color?: number, mineOverride?: boolean, img?: string, ts?: number, uid?: string, reply?: ReplyRef, files?: Attachment[], mkey?: string, kind?: string, level?: number): number {
+    const mine = mineOverride !== undefined ? mineOverride : (!sys && who === this.me.displayName);
+    const mention = !sys && !mine && (this.textMentionsMe(text) || this.replyToMe(reply));
+    return this.appendMessage({ uid, who, text, mine, sys, color, img, files, ts: ts ?? Date.now(), mention, reply, mkey, kind, level });
   }
   // статус отправки моего сообщения (для «не отправлено · повторить»)
   private pendingSend = new Map<number, { text: string; em: Record<string, string>; img?: string; reply?: ReplyRef; key: string; files?: Attachment[] }>();
@@ -2430,6 +2466,25 @@ export class Engine {
   sysMsg(text: string, meta?: { kind?: string }) {
     this.pushMsg(null, text, true, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, meta?.kind);
   }
+  private chatRefreshTimers = new Map<string, number>();
+  private lastChatRefresh = new Map<string, number>();
+  private tailSafeReleaseSids = new Set<number>();
+  refreshChat(targetSid?: number, logicalServerId?: string) {
+    const exactSid = Number.isSafeInteger(targetSid) && (targetSid || 0) > 0 ? targetSid : undefined;
+    // Notify-WS может восстановиться раньше LiveKit. Для exact release сервер чата приходит
+    // из авторитетного notify-frame; обычный recent-путь по-прежнему использует viewRoom.
+    const serverId = (typeof logicalServerId === 'string' && logicalServerId.trim()) || this.viewServerId;
+    const key = `${serverId || 'none'}:${exactSid == null ? 'recent' : `sid:${exactSid}`}`;
+    if (this.chatRefreshTimers.has(key) || Date.now() - (this.lastChatRefresh.get(key) || 0) < 1200) return;
+    const timer = window.setTimeout(() => {
+      this.chatRefreshTimers.delete(key);
+      if (serverId && (exactSid != null || this.viewServerId === serverId)) {
+        this.lastChatRefresh.set(key, Date.now());
+        this.hooks.refetchChat?.(exactSid, serverId);
+      }
+    }, 50);
+    this.chatRefreshTimers.set(key, timer);
+  }
   private mapHistory(list: HistoryMessage[]): ChatMessage[] {
     return list.map((m) => {
       if (m.em) for (const k in m.em) this.onEmoteResolve?.(k, m.em[k]);
@@ -2438,7 +2493,28 @@ export class Engine {
         if (m.reactions && m.reactions.length) this.reactions.set(m.id, new Map(m.reactions.map((r) => [r.id, { name: r.name, count: r.count, mine: r.mine }])));
         else this.reactions.delete(m.id);
       }
-      return { id: msgSeq++, sid: m.id, uid: m.uid, who: m.name, text: m.text, mine: m.uid === this.me.id, sys: false, color: m.color, img: m.img, files: m.files, ts: m.ts, mention: m.uid !== this.me.id && (this.textMentionsMe(m.text) || this.replyToMe(m.reply)), reply: m.reply, edited: m.edited, kind: m.kind, level: m.level };
+      const isRelease = m.kind === 'release';
+      const release = isRelease ? normalizeReleaseNote(m.release) || undefined : undefined;
+      const mine = !isRelease && m.uid === this.me.id;
+      return {
+        id: msgSeq++,
+        sid: m.id,
+        uid: isRelease ? 'system:release' : m.uid,
+        who: isRelease ? null : m.name,
+        text: m.text,
+        mine,
+        sys: isRelease,
+        color: isRelease ? undefined : m.color,
+        img: isRelease ? undefined : m.img,
+        files: isRelease ? undefined : m.files,
+        ts: isRelease ? (normalizeReleaseTimestamp(m.ts) ?? normalizeReleaseTimestamp(release?.publishedAt) ?? Date.now()) : m.ts,
+        mention: !isRelease && !mine && (this.textMentionsMe(m.text) || this.replyToMe(m.reply)),
+        reply: isRelease ? undefined : m.reply,
+        edited: !isRelease && m.edited,
+        kind: m.kind,
+        level: m.level,
+        release,
+      };
     });
   }
   // начальная страница истории (последние N) — заменяет весь чат, ставит курсор на самое старое
@@ -2447,6 +2523,7 @@ export class Engine {
     this.streamStateMessages.clear();
     this.reactions.clear();
     this.messages = this.mapHistory(list);
+    this.tailSafeReleaseSids.clear();
     this.chatMore = hasMore;
     this.oldestSid = list.length ? (list[0].id ?? null) : null; // list в ASC-порядке, [0] — самое старое
     this.trimmedFront = 0; this.chatPrepended = 0; // новая история — счётчики якоря virtuoso сбрасываются
@@ -2459,8 +2536,13 @@ export class Engine {
   //    Совпавшему live-сообщению «усыновляем» серверный sid — дальше дедуп идёт по sid.
   // Оптимистичные и чужие realtime-копии сохраняют локальный id; история лишь усыновляет sid
   // и авторитетные поля, поэтому React-ключи не прыгают при восстановлении связи.
-  mergeRecent(list: HistoryMessage[]) {
+  mergeRecent(list: HistoryMessage[], options?: { tailSafeRelease?: boolean }) {
     if (!list.length) return;
+    if (options?.tailSafeRelease) {
+      for (const message of list) {
+        if (message.kind === 'release' && message.id != null && Number.isSafeInteger(message.id)) this.tailSafeReleaseSids.add(message.id);
+      }
+    }
     const existingBySid = new Map<number, ChatMessage>();
     const duplicateLocalIds = new Set<number>();
     this.messages.forEach((message) => {
@@ -2531,25 +2613,28 @@ export class Engine {
       haveSids.add(m.id);
     }
     const canonicalize = (current: ChatMessage, history: HistoryMessage): ChatMessage => {
-      const mine = history.uid === this.me.id;
+      const isRelease = history.kind === 'release';
+      const release = isRelease ? normalizeReleaseNote(history.release) || undefined : undefined;
+      const mine = !isRelease && history.uid === this.me.id;
       return {
         ...current,
         sid: history.id,
-        uid: history.uid,
-        who: history.name,
+        uid: isRelease ? 'system:release' : history.uid,
+        who: isRelease ? null : history.name,
         text: history.text,
         mine,
-        sys: false,
-        color: history.color,
-        img: history.img,
-        files: history.files,
-        ts: history.ts,
-        mention: !mine && (this.textMentionsMe(history.text) || this.replyToMe(history.reply)),
-        reply: history.reply,
-        edited: history.edited,
+        sys: isRelease,
+        color: isRelease ? undefined : history.color,
+        img: isRelease ? undefined : history.img,
+        files: isRelease ? undefined : history.files,
+        ts: isRelease ? (normalizeReleaseTimestamp(history.ts) ?? normalizeReleaseTimestamp(release?.publishedAt) ?? Date.now()) : history.ts,
+        mention: !isRelease && !mine && (this.textMentionsMe(history.text) || this.replyToMe(history.reply)),
+        reply: isRelease ? undefined : history.reply,
+        edited: !isRelease && history.edited,
         status: undefined,
         kind: history.kind,
         level: history.level,
+        release,
       };
     };
     let merged = this.messages.filter((message) => !duplicateLocalIds.has(message.id)).map((message) => {
@@ -2562,15 +2647,20 @@ export class Engine {
       // HTTP can return an older missed row after a newer realtime row has already
       // arrived. Sort the union by canonical time/sid while preserving every existing
       // local id (React key) and using the prior order as the final stable tie-breaker.
-      this.messages = merged
-        .map((message, index) => ({ message, index }))
-        .sort((a, b) => {
-          const byTime = (a.message.ts ?? 0) - (b.message.ts ?? 0);
-          if (byTime) return byTime;
-          if (a.message.sid != null && b.message.sid != null && a.message.sid !== b.message.sid) return a.message.sid - b.message.sid;
-          return a.index - b.index;
-        })
-        .map(({ message }) => message);
+      // Exact release recovery is intentionally append-only. Inserting a tall card into
+      // the middle changes Virtuoso indexes without a matching firstItemIndex delta and
+      // moves the viewport. A repeated exact fetch canonicalizes the same local row in place.
+      this.messages = options?.tailSafeRelease || this.tailSafeReleaseSids.size > 0
+        ? merged
+        : merged
+          .map((message, index) => ({ message, index }))
+          .sort((a, b) => {
+            const byTime = (a.message.ts ?? 0) - (b.message.ts ?? 0);
+            if (byTime) return byTime;
+            if (a.message.sid != null && b.message.sid != null && a.message.sid !== b.message.sid) return a.message.sid - b.message.sid;
+            return a.index - b.index;
+          })
+          .map(({ message }) => message);
     }
     pendingReactionAdoptions.forEach(([localId, sid]) => {
       if (this.adoptPendingReactions(localId, sid)) reactionsChanged = true;
@@ -2598,6 +2688,7 @@ export class Engine {
     ++this.chatGeneration;
     this.streamStateMessages.clear();
     this.messages = [];
+    this.tailSafeReleaseSids.clear();
     this.dataSend({ t: 'clear', by: byName || this.me.displayName });
     this.emit();
     this.sysMsg((byName || this.me.displayName) + ' очистил чат');
@@ -2816,6 +2907,13 @@ export class Engine {
       if (d.t === 'music') { if (room === this.voiceRoom) this.onMusicMessage?.(d); return; }
       // чат/clear/emote/watch/typing — данные ПРОСМАТРИВАЕМОГО сервера, приходят по viewRoom
       if (room !== this.viewRoom) return;
+      // Release-пакет из RoomService не имеет participant-sender. Не доверяем его
+      // payload: он лишь просит сверить авторитетную HTTP-историю. Пакет от обычного
+      // участника с kind=release игнорируем, чтобы нельзя было подделать карточку RelayApp.
+      if (d.t === 'release' || (d.t === 'chat' && d.kind === 'release')) {
+        if (!sender) this.refreshChat(typeof d.sid === 'number' ? d.sid : undefined, this.viewServerId);
+        return;
+      }
       if (d.t === 'chat') {
         if (d.em) for (const k in d.em) this.onEmoteResolve?.(k, d.em[k]);
         this.typingUsers.delete(d.name);
@@ -2829,7 +2927,7 @@ export class Engine {
           notify('mention', { title: d.name, body: String(d.text || '').slice(0, 140) || fallback, tag: 'mention:' + this.viewServerId });
         }
       }
-      else if (d.t === 'clear') { ++this.chatGeneration; this.streamStateMessages.clear(); this.messages = []; this.reactions.clear(); this.emit(); this.sysMsg((d.by || 'Админ') + ' очистил чат'); }
+      else if (d.t === 'clear') { ++this.chatGeneration; this.streamStateMessages.clear(); this.messages = []; this.tailSafeReleaseSids.clear(); this.reactions.clear(); this.emit(); this.sysMsg((d.by || 'Админ') + ' очистил чат'); }
       else if (d.t === 'emote') this.emoteListeners.forEach((f) => f(d.s, d.e, d.by, d.x, d.sz));
       else if (d.t === 'watch') { const m = this.wset(d.s); if (d.on) m.set(d.id, { name: d.n, color: d.c ?? 0, avatarUrl: d.a, ts: Date.now() }); else m.delete(d.id); this.emit(); }
       else if (d.t === 'typing') { if (d.name && d.name !== this.me.displayName) { this.typingUsers.set(d.name, Date.now() + 3500); this.emit(); setTimeout(() => this.pruneTyping(), 3600); } }

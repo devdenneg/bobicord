@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+ROOT="$(git rev-parse --show-toplevel)"
+exec node "$ROOT/scripts/release-notes.mjs" validate-message --file "$1"

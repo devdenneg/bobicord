@@ -18,7 +18,8 @@ import { playSound } from '../sounds';
 import { applyNativeUpdate } from '../nativeUpdate';
 import { isTauri, saveFileDialog, openFile, pathsExist } from '../native';
 import { getDownloads, addDownload, subscribeDownloads, type DownloadItem } from '../downloads';
-import type { Attachment, ChatMessage, Emote, Leaderboard, Member, MemberStats, ReplyRef, Role } from '../types';
+import { sendActiveChat } from '../notifyws';
+import type { Attachment, ChatMessage, Emote, Leaderboard, Member, MemberStats, ReleaseNote, ReplyRef, Role } from '../types';
 import { PERM, hasPerm } from '../types';
 
 const MAX_ATTACH = 5;
@@ -766,6 +767,52 @@ function fmtTime(ts?: number): string {
   if (!ts) return '';
   try { return new Date(ts).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }); } catch { return ''; }
 }
+
+const RELEASE_PREVIEW_LIMIT = 6;
+const MAX_DATE_TIMESTAMP = 8_640_000_000_000_000;
+
+function safeIsoTime(ts?: number): string | null {
+  if (!Number.isFinite(ts) || !ts || ts < 0 || ts > MAX_DATE_TIMESTAMP) return null;
+  try { return new Date(ts).toISOString(); } catch { return null; }
+}
+
+function ReleasePatchCard({ release, ts }: { release: ReleaseNote; ts?: number }) {
+  const [expanded, setExpanded] = useState(false);
+  const hiddenCount = Math.max(0, release.notes.length - RELEASE_PREVIEW_LIMIT);
+  const notes = expanded ? release.notes : release.notes.slice(0, RELEASE_PREVIEW_LIMIT);
+  const version = release.version
+    ? (/^v/i.test(release.version) ? release.version : `v${release.version}`)
+    : null;
+  const dateTime = safeIsoTime(ts);
+  return (
+    <div className="virt-row release-row">
+      <article className="release-card" aria-label={`Обновление: ${release.title}`}>
+        <span className="release-announcer" role="status" aria-live="polite" aria-atomic="true">
+          {`${release.title}. ${release.notes.join('. ')}`}
+        </span>
+        <span className="release-mark" aria-hidden="true"><Icon name="download" /></span>
+        <div className="release-copy">
+          <header className="release-head">
+            <span className="release-kicker"><span className="release-pulse" />Обновление</span>
+            {dateTime ? <time dateTime={dateTime}>{fmtTime(ts)}</time> : null}
+          </header>
+          <h3>{release.title}</h3>
+          <ul>{notes.map((note, index) => <li key={`${index}:${note}`}><span>{note}</span></li>)}</ul>
+          {version || hiddenCount ? (
+            <footer>
+              {version ? <span className="release-version">{version}</span> : null}
+              {hiddenCount ? (
+                <button type="button" className="release-more" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>
+                  {expanded ? 'Свернуть' : `Показать ещё ${hiddenCount}`}
+                </button>
+              ) : null}
+            </footer>
+          ) : null}
+        </div>
+      </article>
+    </div>
+  );
+}
 // Единая логика "сохранить вложение" — общая для чипов файлов в чате и кнопки в лайтбоксе
 // картинки. В нативе (Tauri) — настоящий системный диалог «Сохранить как» (plugin-dialog +
 // запись байт через plugin-fs). В вебе — fetch() в Blob + локальная blob:-ссылка (a.click(),
@@ -998,7 +1045,7 @@ function Chat() {
   // «0 непрочитанных» — дивайдера нет и вход СТРОГО в низ (иначе чат открывается у верха истории при
   // отсутствии новых). При unread>0 позиционируем по baseline как раньше.
   const unreadServer = useStore((s) => s.unread[activeId || ''] || 0);
-  const firstUnread = unreadServer > 0 ? messages.findIndex((m) => m.sid != null && m.sid > baseline && !m.mine) : -1;
+  const firstUnread = unreadServer > 0 ? messages.findIndex((m) => m.sid != null && m.sid > baseline && !m.mine && !m.sys) : -1;
   const firstUnreadId = firstUnread >= 0 ? messages[firstUnread].id : null;
   // Разделители дней: id первого сообщения каждой календарной даты (сравниваем локальный день с предыдущим).
   const dayFirst = useMemo(() => {
@@ -1353,7 +1400,7 @@ function Chat() {
     // firstItemIndex теперь DERIVED (сбрасывается engine.loadHistory: chatPrepended/Trimmed=0) — руками не трогаем.
     // на входе: если есть непрочитанные — сеем счётчик jump-кнопки и стартуем НЕ внизу (позиция у
     // дивайдера, см. initialTopMostItemIndex), иначе внизу
-    const unreadHere = unreadServer > 0 ? messages.filter((m) => m.sid != null && m.sid > baseline && !m.mine).length : 0;
+    const unreadHere = unreadServer > 0 ? messages.filter((m) => m.sid != null && m.sid > baseline && !m.mine && !m.sys).length : 0;
     // История может приехать уже ПОСЛЕ activeId. Решение о pin принимаем по серверному unread,
     // а не по пока ещё пустому messages, иначе первый history batch ошибочно утащит чат вниз.
     const startPinned = unreadServer === 0;
@@ -1664,6 +1711,12 @@ function Chat() {
 
   // рендер одного сообщения (itemContent virtuoso). Чужие — слева с аватаром, свои — справа без.
   const renderMessage = (m: typeof messages[number]) => {
+    // Патчноут — системное сообщение с фиксированной геометрией: без аватара, реакций,
+    // reply/action-bar и прочих пользовательских affordance. Так поздний realtime-патчноут
+    // не маскируется под сообщение участника и не создаёт лишних интерактивных состояний.
+    if (m.kind === 'release' && m.release) {
+      return <ReleasePatchCard release={m.release} ts={m.ts} />;
+    }
     // Карточка достижения уровня (рейтинг-фича) — своя вёрстка, не обычный пузырь
     if (m.kind === 'levelup') {
       const lvAuthor = m.who ? byName.get(m.who) : undefined;
@@ -2276,6 +2329,18 @@ export function ServerView() {
   useEffect(() => { localStorage.setItem('channelsOpen', channelsOpen ? '1' : '0'); }, [channelsOpen]);
   const [showChat, setShowChat] = useState(false);
   useEffect(() => { if (!split) setShowChat(false); }, [split]);
+  const [singlePaneWorkspace, setSinglePaneWorkspace] = useState(() => window.matchMedia('(max-width:900px)').matches);
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width:900px)');
+    const sync = () => setSinglePaneWorkspace(mq.matches);
+    sync(); mq.addEventListener('change', sync);
+    return () => mq.removeEventListener('change', sync);
+  }, []);
+  const chatVisible = (!singlePaneWorkspace || mtab === 'main') && (!split || showChat);
+  useEffect(() => {
+    sendActiveChat(chatVisible ? active.id : null);
+    return () => sendActiveChat(null);
+  }, [active.id, chatVisible]);
   // В split-режиме stage обязан сохранить рабочую ширину: правая панель чата и участники
   // взаимоисключаются. Иначе сохранённые пользователем ширины могут полностью зажать видео.
   const toggleSplitChat = () => setShowChat((open) => { const next = !open; if (next) { setMembersOpen(false); setSupportOpen(false); } return next; });

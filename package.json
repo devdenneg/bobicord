@@ -4,9 +4,13 @@
   "version": "1.0.0",
   "description": "Discord-подобный голос / чат / стриминг на LiveKit",
   "scripts": {
+    "prepare": "node scripts/install-git-hooks.mjs",
+    "hooks:install": "node scripts/install-git-hooks.mjs",
     "dev": "npm --prefix apps/web run dev",
     "build": "npm --prefix apps/web run build",
     "typecheck": "npm --prefix apps/web run typecheck",
+    "test:release-notes": "node --test scripts/release-notes.test.mjs",
+    "release:validate": "node scripts/release-notes.mjs validate",
     "diag": "node scripts/diag.mjs",
     "up": "docker compose up -d --build",
     "down": "docker compose down",

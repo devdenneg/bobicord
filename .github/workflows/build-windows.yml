@@ -3,19 +3,29 @@ name: build-windows
 on:
   push:
     branches: [main]
+    paths:
+      - apps/native/**
+      - apps/web/**
+      - apps/relay-core/**
+      - .github/workflows/build-windows.yml
   workflow_dispatch:
 
-# Версия = 0.1.<git rev-list --count HEAD>, а релизы заливаются на VPS с rm:true. Два прогона
-# наперегонки: старый финиширует последним -> затирает latest.json более НИЗКОЙ версией ->
-# updater у юзеров видит откат. Сериализуем. cancel-in-progress: false — отмена посреди scp
-# оставила бы releases/ пустым (updater ловил бы 404).
+# Версия = 0.1.<git rev-list --count HEAD>. Прод-сборки сериализованы; `queue: max` сохраняет
+# до 100 ожидающих push в FIFO-очереди, поэтому промежуточный патчноут не теряется, а более
+# старый installer не может позже затереть latest.json новой версии.
 concurrency:
-  group: build-windows-${{ github.ref }}
-  cancel-in-progress: false
+  group: relayapp-production
+  queue: max
 
 jobs:
   build:
+    if: github.ref == 'refs/heads/main'
     runs-on: windows-latest
+    outputs:
+      release_owner: ${{ steps.release_note.outputs.owner }}
+      release_announce: ${{ steps.release_note.outputs.announce }}
+      required_components: ${{ steps.release_note.outputs.required_components }}
+      release_sequence: ${{ steps.ver.outputs.seq }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,6 +34,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+
+      - name: Validate commit patch notes
+        env:
+          RELEASE_FROM: ${{ github.event.before }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: node scripts/release-notes.mjs validate --from "$env:RELEASE_FROM" --to "$env:RELEASE_SHA"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -45,7 +61,29 @@ jobs:
       - name: Compute version
         id: ver
         shell: bash
-        run: echo "v=0.1.$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          seq=$(git rev-list --count HEAD)
+          echo "seq=$seq" >> "$GITHUB_OUTPUT"
+          echo "v=0.1.$seq" >> "$GITHUB_OUTPUT"
+
+      - name: Build Russian patch note payload
+        id: release_note
+        shell: bash
+        env:
+          RELEASE_FROM: ${{ github.event.before }}
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_REDEPLOY: ${{ github.event_name != 'push' }}
+        run: |
+          extra=()
+          if [ "$RELEASE_REDEPLOY" = "true" ]; then extra+=(--no-announce); fi
+          node scripts/release-notes.mjs generate --from "$RELEASE_FROM" --to "$RELEASE_SHA" --source desktop --version "${{ steps.ver.outputs.v }}" --attempt "${{ github.sha }}:${{ github.run_attempt }}" --output out/release-note.json "${extra[@]}"
+          owner=$(jq -r '.owner' out/release-note.json)
+          announce=$(jq -r '.announce' out/release-note.json)
+          required_components=$(jq -c '.requiredComponents' out/release-note.json)
+          echo "owner=$owner" >> "$GITHUB_OUTPUT"
+          echo "announce=$announce" >> "$GITHUB_OUTPUT"
+          echo "required_components=$required_components" >> "$GITHUB_OUTPUT"
+          echo "Patch-note route: owner=$owner, announce=$announce, components=$required_components"
 
       - name: Patch version in tauri.conf.json
         shell: bash
@@ -91,11 +129,10 @@ jobs:
           exe=$(ls "$nsis"/*-setup.exe)
           sig=$(cat "$nsis"/*-setup.exe.sig)
           mkdir -p out && cp "$exe" out/
-          cat > out/latest.json <<EOF
-          { "version": "$v", "notes": "Автосборка main",
-            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "platforms": { "windows-x86_64": { "signature": "$sig", "url": "https://reelay.online/api/app/$(basename "$exe")" } } }
-          EOF
+          notes=$(jq -r 'if (.notes | length) > 0 then (.notes | map("• " + .) | join("\n")) else "Техническое обновление RelayApp" end' out/release-note.json)
+          jq -n --arg version "$v" --arg notes "$notes" --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg signature "$sig" --arg url "https://reelay.online/api/app/$(basename "$exe")" \
+            '{version:$version,notes:$notes,pub_date:$date,platforms:{"windows-x86_64":{signature:$signature,url:$url}}}' > out/latest.json
 
       # Payload (exe + latest.json) отдаём как артефакт — заливку на VPS делает
       # отдельный job `upload` на ubuntu (appleboy/scp-action — Docker-контейнер-экшен,
@@ -115,8 +152,8 @@ jobs:
           if-no-files-found: error
 
   # Заливка на VPS в том, смонтированный в server (/app/data/releases). Отдельный
-  # ubuntu-job, т.к. scp-action контейнерный (на windows не запускается). rm:true чистит
-  # старые exe — клиент всегда берёт url из свежего latest.json. SSH-секреты — как в deploy.yml.
+  # ubuntu-job, т.к. scp-action контейнерный (на windows не запускается). Сначала файлы
+  # попадают в закрытый staging, затем latest.json атомарно промотируется последним.
   upload:
     needs: build
     runs-on: ubuntu-latest
@@ -126,13 +163,88 @@ jobs:
           name: release-payload
           path: out
 
-      - name: Upload to VPS
+      - name: Copy patch note payload to VPS
+        if: needs.build.outputs.release_announce == 'true'
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
-          source: "out/*"
-          target: /opt/voice/data/releases
+          source: "out/release-note.json"
+          target: /opt/voice/data
+          strip_components: 1
+
+      # Installer first lands outside the public updater directory. Only after the whole upload
+      # succeeds do we snapshot active chats and atomically promote latest.json.
+      - name: Upload desktop release to staging
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          source: "out/*-setup.exe,out/latest.json"
+          target: /opt/voice/data/release-staging/${{ github.sha }}
           strip_components: 1
           rm: true
+
+      - name: Promote desktop release and complete patch note
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            set -e
+            cd /opt/voice
+            stage=/opt/voice/data/release-staging/${{ github.sha }}
+            releases=/opt/voice/data/releases
+            test -f "$stage/latest.json"
+            new_exe=$(find "$stage" -maxdepth 1 -type f -name '*-setup.exe' -printf '%f\n' | head -n 1)
+            test -n "$new_exe"
+            case "$new_exe" in *[!A-Za-z0-9._-]*) echo "unsafe installer name" >&2; exit 1;; esac
+            test -f "$stage/$new_exe"
+
+            candidate_seq=${{ needs.build.outputs.release_sequence }}
+            case "$candidate_seq" in ''|*[!0-9]*) echo "invalid desktop release sequence" >&2; exit 1;; esac
+            seq_file=/opt/voice/data/desktop-release-sequence
+            current_seq=0
+            if [ -f "$seq_file" ]; then
+              read -r current_seq < "$seq_file" || current_seq=0
+            elif [ -f "$releases/latest.json" ]; then
+              current_seq=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"[0-9][0-9]*\.[0-9][0-9]*\.\([0-9][0-9]*\)".*/\1/p' "$releases/latest.json" | head -n 1)
+            fi
+            case "$current_seq" in ''|*[!0-9]*) current_seq=0;; esac
+            if [ "$candidate_seq" -le "$current_seq" ]; then
+              echo "stale desktop release ignored: $candidate_seq <= $current_seq"
+              find "$stage" -maxdepth 1 -type f -delete
+              rmdir "$stage"
+              exit 0
+            fi
+
+            prepared=0
+            if [ "${{ needs.build.outputs.release_announce }}" = "true" ]; then
+              skip_marker=/opt/voice/data/release-note.${{ github.sha }}.skip
+              if [ -f "$skip_marker" ]; then
+                echo "Патчноут этого rollout уже помечен как bootstrap-skip"
+              elif docker compose exec -T token test -f /app/publish-release.js; then
+                docker compose exec -T token node publish-release.js prepare /app/data/release-note.json
+                prepared=1
+              else
+                touch "$skip_marker"
+                echo "legacy API: точный снимок аудитории до обновления недоступен; патчноут этого rollout будет пропущен"
+              fi
+            fi
+
+            mkdir -p "$releases"
+            mv "$stage/$new_exe" "$releases/$new_exe"
+            mv "$stage/latest.json" "$releases/latest.json"
+            test "$releases" = /opt/voice/data/releases
+            find "$releases" -maxdepth 1 -type f -name '*-setup.exe' ! -name "$new_exe" -delete
+            rmdir "$stage"
+
+            if [ "$prepared" -eq 1 ]; then
+              docker compose exec -T token node publish-release.js finalize /app/data/release-note.json
+            fi
+            seq_tmp="$seq_file.tmp.$$"
+            printf '%s\n' "$candidate_seq" > "$seq_tmp"
+            mv "$seq_tmp" "$seq_file"

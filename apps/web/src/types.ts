@@ -150,6 +150,16 @@ export interface Attachment {
   height?: number;
 }
 
+// Подготовленное для пользователей описание обновления. Оно приходит из
+// выделенного Patch-Note блока, а не из произвольного текста коммита.
+export interface ReleaseNote {
+  sha: string;
+  title: string;
+  notes: string[];
+  version?: string;
+  publishedAt?: number | string;
+}
+
 export interface ChatMessage {
   id: number; // локальный монотонный ключ (React key), НЕ id строки в БД
   sid?: number; // id строки в БД (курсор пагинации) — есть только у сообщений из истории
@@ -169,6 +179,7 @@ export interface ChatMessage {
   mkey?: string; // клиентский ключ сообщения — по нему ВСЕ клиенты усыновляют серверный sid (для реакций/edit на чужих live-сообщениях)
   kind?: string; // '' обычное | 'levelup' карточка достижения уровня
   level?: number; // для kind='levelup' — достигнутый уровень
+  release?: ReleaseNote; // для kind='release' — системная карточка обновления
 }
 
 export interface HistoryMessage {
@@ -186,6 +197,7 @@ export interface HistoryMessage {
   reactions?: Reaction[]; // агрегат реакций из истории
   kind?: string; // 'levelup' — карточка достижения
   level?: number; // достигнутый уровень (для kind='levelup')
+  release?: ReleaseNote; // metadata системного kind='release'
 }
 
 // Рейтинг сервера (экспериментальная фича, off по умолчанию). Категории: уровень (overall), голос, эфир.
