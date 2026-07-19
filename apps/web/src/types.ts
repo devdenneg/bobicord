@@ -9,6 +9,56 @@ export interface User {
   isAdmin?: boolean;
 }
 
+export interface EmailChallenge {
+  /** Opaque server-issued identifier. `challengeId` is accepted during rollout for compatibility. */
+  id?: string;
+  flowId?: string;
+  challengeId?: string;
+  emailMasked?: string;
+  maskedEmail?: string;
+  expiresAt: number;
+  resendAt: number;
+  attemptsRemaining?: number;
+  delivered?: boolean;
+}
+
+export type AccountStatus =
+  | { state: 'ready'; challenge?: never }
+  | { state: 'email_required'; challenge?: never }
+  | { state: 'email_verification'; challenge?: EmailChallenge };
+
+export interface SessionResponse {
+  user: User;
+  account: AccountStatus;
+}
+
+export interface AuthResponse extends SessionResponse {
+  token: string;
+}
+
+export interface ChallengeResponse {
+  challenge?: EmailChallenge;
+  flowId?: string;
+  challengeId?: string;
+  emailMasked?: string;
+  maskedEmail?: string;
+  expiresAt?: number;
+  resendAt?: number;
+  attemptsRemaining?: number;
+  delivered?: boolean;
+  account?: AccountStatus;
+}
+
+export interface RegistrationInvite {
+  code: string;
+  createdAt?: number;
+  expiresAt: number;
+  uses?: number;
+  maxUses?: number;
+  emailSends?: number;
+  maxEmailSends?: number;
+}
+
 // Админ-панель (/admin) — обзор всех серверов/юзеров
 export interface AdminMember { id: string; username: string; displayName: string; role: string }
 export interface AdminServer {
@@ -18,7 +68,7 @@ export interface AdminServer {
 }
 export interface AdminUser {
   id: string; username: string; displayName: string; avatarColor: number; avatarUrl?: string;
-  isAdmin: boolean; created: number; serverCount: number; ownedCount: number;
+  isAdmin: boolean; emailVerified?: boolean; created: number; serverCount: number; ownedCount: number;
 }
 export interface AdminOverview { stats: { servers: number; users: number }; servers: AdminServer[]; users: AdminUser[] }
 

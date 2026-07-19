@@ -3,7 +3,7 @@ import { useEffect, useRef } from 'react';
 let bodyLockDepth = 0;
 let bodyOverflowBeforeDialogs = '';
 
-export function Backdrop({ children, onClose, label, wide, boxClass }: { children: React.ReactNode; onClose: () => void; label?: string; wide?: boolean; boxClass?: string }) {
+export function Backdrop({ children, onClose, label, wide, boxClass, dismissible = true }: { children: React.ReactNode; onClose: () => void; label?: string; wide?: boolean; boxClass?: string; dismissible?: boolean }) {
   const panelRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
@@ -24,7 +24,7 @@ export function Backdrop({ children, onClose, label, wide, boxClass }: { childre
     const focusFrame = requestAnimationFrame(() => { if (isTop()) (first || panel)?.focus(); });
     const onKeyDown = (e: KeyboardEvent) => {
       if (!isTop()) return;
-      if (e.key === 'Escape') { e.preventDefault(); closeRef.current(); return; }
+      if (e.key === 'Escape' && dismissible) { e.preventDefault(); closeRef.current(); return; }
       if (e.key !== 'Tab') return;
       const items = focusables();
       if (!items.length) { e.preventDefault(); panel?.focus(); return; }
@@ -41,6 +41,6 @@ export function Backdrop({ children, onClose, label, wide, boxClass }: { childre
       if (bodyLockDepth === 0) document.body.style.overflow = bodyOverflowBeforeDialogs;
       if (previous?.isConnected) previous.focus();
     };
-  }, []);
-  return <div className="modal show" onMouseDown={(e) => e.target === e.currentTarget && onClose()}><div ref={panelRef} tabIndex={-1} className={'box' + (wide ? ' box-wide' : '') + (boxClass ? ' ' + boxClass : '')} role="dialog" aria-modal="true" aria-label={label}>{children}</div></div>;
+  }, [dismissible]);
+  return <div className="modal show" onMouseDown={(e) => { if (dismissible && e.target === e.currentTarget) onClose(); }}><div ref={panelRef} tabIndex={-1} className={'box' + (wide ? ' box-wide' : '') + (boxClass ? ' ' + boxClass : '')} role="dialog" aria-modal="true" aria-label={label}>{children}</div></div>;
 }

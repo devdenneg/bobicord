@@ -7,8 +7,8 @@
 // RTP детям). Сессия сама уходит по idle (нет живых детей) или по vrelay-release
 // (дренаж/обрушение дерева) — агент чистит её из карты и готов к повторной активации.
 //
-// Auth: /tree проверяет session-JWT (HS256, SESSION_SECRET) без DB-lookup — минтим сами
-// с uid 'virtual-relay'; только этому uid сервер верит флаг virtual (tree.js).
+// Auth: /tree принимает отдельный короткоживущий service-JWT (HS256,
+// VRELAY_AUTH_SECRET). Секрет пользовательских сессий этому хосту не передаётся.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,9 +25,12 @@ use relay_core::relay::{self, RelayConfig, RelayHandle};
 use relay_core::transcode;
 
 const VRELAY_UID: &str = "virtual-relay"; // должен совпадать с VRELAY_UID в tree.js
+const VRELAY_TOKEN_TYPE: &str = "vrelay";
+const VRELAY_TOKEN_AUDIENCE: &str = "relay-tree";
+const VRELAY_TOKEN_TTL_SEC: u64 = 5 * 60;
 
 struct Cfg {
-    session_secret: String,
+    auth_secret: String,
     ws_url: String,
     max_children: u32,
     idle: Duration,
@@ -37,14 +40,17 @@ struct Cfg {
 
 impl Cfg {
     fn from_env() -> Result<Self, String> {
-        let session_secret = std::env::var("SESSION_SECRET").map_err(|_| "SESSION_SECRET не задан".to_string())?;
+        let auth_secret = validate_auth_secret(
+            std::env::var("VRELAY_AUTH_SECRET")
+                .map_err(|_| "VRELAY_AUTH_SECRET не задан".to_string())?,
+        )?;
         let ws_url = std::env::var("TREE_WS_URL").unwrap_or_else(|_| "ws://127.0.0.1:3000/tree".into());
         let max_children: u32 = std::env::var("VRELAY_MAX_CHILDREN").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
         let idle_sec: u64 = std::env::var("VRELAY_IDLE_SEC").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
         let max_streams: usize = std::env::var("VRELAY_MAX_STREAMS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
         let out_mbps: u32 = std::env::var("VRELAY_OUT_MBPS").ok().and_then(|v| v.parse().ok()).unwrap_or(15); // замер прода: устойчивая отдача 14-20 Мбит/с (см. docker-compose.yml)
         Ok(Self {
-            session_secret,
+            auth_secret,
             ws_url,
             max_children,
             idle: Duration::from_secs(idle_sec),
@@ -54,17 +60,65 @@ impl Cfg {
     }
 }
 
-#[derive(Serialize)]
-struct Claims { id: String, exp: usize }
+fn validate_auth_secret(secret: String) -> Result<String, String> {
+    let lowered = secret.to_ascii_lowercase();
+    let obvious_placeholder = [
+        "change_me",
+        "change-me",
+        "changeme",
+        "placeholder",
+        "example",
+        "dev-secret",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle));
+    let all_same = secret.as_bytes().windows(2).all(|pair| pair[0] == pair[1]);
+    if secret.as_bytes().len() < 32
+        || secret.trim() != secret
+        || secret.chars().any(char::is_whitespace)
+        || obvious_placeholder
+        || all_same
+    {
+        return Err(
+            "VRELAY_AUTH_SECRET слабый: нужен отдельный случайный секрет минимум 32 байта"
+                .to_string(),
+        );
+    }
+    Ok(secret)
+}
 
-/// Session-JWT с uid агента. Свежий на каждое подключение (exp сутки — с запасом
-/// больше жизни любого коннекта; сервер проверяет exp на handshake, не после).
+#[derive(Serialize)]
+struct Claims {
+    id: String,
+    sub: String,
+    typ: String,
+    aud: String,
+    iat: u64,
+    exp: u64,
+}
+
+/// Короткоживущий service-JWT агента. Сервер проверяет подпись, алгоритм и все claims
+/// только на handshake; уже открытый WebSocket живёт независимо от exp.
 fn mint_token(secret: &str) -> String {
-    use jsonwebtoken::{encode, EncodingKey, Header};
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as usize;
-    let claims = Claims { id: VRELAY_UID.into(), exp: now + 24 * 3600 };
-    encode(&Header::default(), &claims, &EncodingKey::from_secret(secret.as_bytes()))
-        .expect("HS256-подпись JWT не может упасть на валидном секрете")
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let claims = Claims {
+        id: VRELAY_UID.into(),
+        sub: VRELAY_UID.into(),
+        typ: VRELAY_TOKEN_TYPE.into(),
+        aud: VRELAY_TOKEN_AUDIENCE.into(),
+        iat: now,
+        exp: now + VRELAY_TOKEN_TTL_SEC,
+    };
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .expect("HS256-подпись JWT не может упасть на валидном секрете")
 }
 
 type Streams = Arc<Mutex<HashMap<String, RelayHandle>>>;
@@ -76,7 +130,7 @@ type Renditions = Arc<Mutex<HashMap<String, RelayHandle>>>;
 /// Одна жизнь control-соединения: hello -> цикл (pong на ping, vrelay-activate -> сессия).
 /// Возврат = соединение умерло (вызывающий реконнектится с backoff).
 async fn run_control(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditions) -> Result<(), String> {
-    let url = format!("{}?token={}", cfg.ws_url, mint_token(&cfg.session_secret));
+    let url = format!("{}?token={}", cfg.ws_url, mint_token(&cfg.auth_secret));
     let (ws, _) = tokio_tungstenite::connect_async(&url).await.map_err(|e| e.to_string())?;
     let (mut write, mut read) = ws.split();
     // maxTranscodes — транскод-ёмкость агента (кап одновременных ffmpeg-рендишнов). Сервер по
@@ -199,7 +253,7 @@ async fn activate(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditions, st
     log::info!("stream {stream_id}: активация{} (серверов в работе: {})", if persistent { " (ingest, постоянная)" } else { "" }, map.len());
     let handle = relay::start(None, RelayConfig {
         stream_id: stream_id.to_string(),
-        ws_url: format!("{}?token={}", cfg.ws_url, mint_token(&cfg.session_secret)),
+        ws_url: format!("{}?token={}", cfg.ws_url, mint_token(&cfg.auth_secret)),
         identity: "server".into(),
         server_id,
         max_children: cfg.max_children,
@@ -261,7 +315,7 @@ async fn rendition_start(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditi
         // ставит корня в дерево `stream_id::rendition` (унифицировано с онлайн-зрителями рендишна).
         stream_id: stream_id.to_string(),
         quality: rendition.to_string(),
-        ws_url: format!("{}?token={}", cfg.ws_url, mint_token(&cfg.session_secret)),
+        ws_url: format!("{}?token={}", cfg.ws_url, mint_token(&cfg.auth_secret)),
         identity: format!("vrelay-{rendition}"),
         server_id,
         max_children: cfg.max_children,
@@ -391,7 +445,10 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_udp_snmp;
+    use super::{
+        mint_token, parse_udp_snmp, validate_auth_secret, VRELAY_TOKEN_AUDIENCE,
+        VRELAY_TOKEN_TTL_SEC, VRELAY_TOKEN_TYPE, VRELAY_UID,
+    };
 
     // Реальная форма /proc/net/snmp (усечённая): две Udp:-строки, имена и значения.
     const SNMP: &str = "\
@@ -420,5 +477,40 @@ UdpLite: 0 0 0 0 0 0 0";
     fn udplite_not_confused() {
         let only_lite = "UdpLite: RcvbufErrors\nUdpLite: 999";
         assert_eq!(parse_udp_snmp(only_lite, "RcvbufErrors"), None);
+    }
+
+    #[test]
+    fn rejects_weak_vrelay_secrets() {
+        assert!(validate_auth_secret("short".into()).is_err());
+        assert!(validate_auth_secret("change_me_to_random_hex_but_long_enough".into()).is_err());
+        assert!(validate_auth_secret("a".repeat(64)).is_err());
+        assert!(validate_auth_secret(" 7f8e9d0c1b2a39485766758493a2b1c0".into()).is_err());
+        assert!(validate_auth_secret("7f8e9d0c1b2a39485766758493a2b1c0".into()).is_ok());
+    }
+
+    #[test]
+    fn service_token_has_strict_identity_and_short_lifetime() {
+        use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+
+        let secret = "7f8e9d0c1b2a39485766758493a2b1c0";
+        let token = mint_token(secret);
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_audience(&[VRELAY_TOKEN_AUDIENCE]);
+        validation.sub = Some(VRELAY_UID.into());
+        validation.set_required_spec_claims(&["exp", "sub", "aud", "iat"]);
+        let decoded = decode::<serde_json::Value>(
+            &token,
+            &DecodingKey::from_secret(secret.as_bytes()),
+            &validation,
+        )
+        .expect("service token must verify");
+        let claims = decoded.claims;
+        assert_eq!(claims["id"].as_str(), Some(VRELAY_UID));
+        assert_eq!(claims["sub"].as_str(), Some(VRELAY_UID));
+        assert_eq!(claims["typ"].as_str(), Some(VRELAY_TOKEN_TYPE));
+        assert_eq!(claims["aud"].as_str(), Some(VRELAY_TOKEN_AUDIENCE));
+        let iat = claims["iat"].as_u64().expect("iat");
+        let exp = claims["exp"].as_u64().expect("exp");
+        assert_eq!(exp - iat, VRELAY_TOKEN_TTL_SEC);
     }
 }

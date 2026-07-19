@@ -6,6 +6,7 @@ import { api, resolveUploadUrl } from './api';
 import { Icon, IconSprite } from './Icon';
 import { deriveLiveItems, deriveGames, rankServers, dominant, clusterOrder, type LiveItem, type GameGroup } from './homeData';
 import { Auth } from './components/Auth';
+import { AccountEmailGate } from './components/AccountEmailGate';
 import { Toasts } from './components/Toasts';
 import { ServerView } from './components/ServerView';
 import { AdminPage } from './components/AdminPage';
@@ -505,6 +506,7 @@ export function App() {
   const view = useStore((s) => s.view);
   const loadingServer = useStore((s) => s.loadingServer);
   const me = useStore((s) => s.me);
+  const accountGate = useStore((s) => s.accountGate);
 
   // Уведомления: при первом входе (после логина) запрашиваем разрешение автоматически и
   // включаем — отключить можно в Настройках → Уведомления (там же ставится опт-аут, чтобы
@@ -631,7 +633,7 @@ export function App() {
       <IconSprite />
       <Toasts />
       <TooltipLayer />
-      {view === 'loading' ? (
+      {accountGate ? <AccountEmailGate /> : view === 'loading' ? (
         <div className="overlay" style={{ background: 'var(--bg)' }}>
           <LogoLoader size={200} />
         </div>

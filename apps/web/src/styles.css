@@ -146,14 +146,14 @@
   .card .sub{margin:0 0 20px;color:var(--muted);font-size:14px;line-height:1.5}
   .row{margin-bottom:12px}
   .row label{display:block;font-size:12px;font-weight:600;letter-spacing:.3px;color:var(--muted);margin:0 0 6px;text-transform:uppercase}
-  .primary{width:100%;min-width:12ch;background:var(--accent);color:#fff;font-weight:600;margin-top:8px;padding:13px;border-radius:var(--r-sm);box-shadow:0 2px 8px -1px color-mix(in srgb,var(--accent) 50%,transparent);background-image:linear-gradient(180deg,rgba(255,255,255,.07),transparent)}
+  .primary{width:100%;min-width:12ch;background:var(--accent);color:var(--accent-fg,#fff);font-weight:600;margin-top:8px;padding:13px;border-radius:var(--r-sm);box-shadow:0 2px 8px -1px color-mix(in srgb,var(--accent) 50%,transparent);background-image:linear-gradient(180deg,rgba(255,255,255,.07),transparent)}
   .primary:hover{background:var(--accent-h);box-shadow:0 4px 14px -2px color-mix(in srgb,var(--accent) 60%,transparent)}
-  .primary:disabled{opacity:1;background:var(--accent-h)}
+  .primary:disabled{opacity:.72;background:color-mix(in srgb,var(--accent) 62%,var(--panel3));color:color-mix(in srgb,var(--accent-fg,#fff) 72%,var(--muted));box-shadow:none}
   .ghost{width:100%;background:var(--panel2);margin-top:8px;padding:12px}
   .err{color:var(--red);font-size:13px;min-height:18px;margin-top:8px}
   .tabs2{display:flex;gap:4px;margin-bottom:18px;background:var(--panel2);padding:4px;border-radius:var(--r-sm)}
   .tabs2 button{flex:1;background:transparent;color:var(--muted);padding:9px;font-weight:500}
-  .tabs2 button.active{background:var(--accent);color:#fff}
+  .tabs2 button.active{background:var(--accent);color:var(--accent-fg,#fff)}
   .link{background:none;color:var(--accent-txt);padding:8px 0;width:100%;font-size:13.5px}
   /* промо-карточка десктоп-приложения на главной (вместо старого FAB) — с анимацией внимания */
   .dl-card{position:relative;overflow:hidden;display:flex;align-items:center;gap:14px;margin-bottom:22px;padding:13px 15px;border-radius:var(--r-md);background:linear-gradient(120deg,color-mix(in srgb,var(--accent) 15%,var(--panel)),var(--panel) 70%);border:1px solid color-mix(in srgb,var(--accent) 32%,var(--line-2));animation:dlGlow 3s ease-in-out infinite}
@@ -172,6 +172,72 @@
   .dl-btn:hover{background:var(--accent-h)}
   @media(max-width:560px){.dl-card{flex-wrap:wrap}.dl-txt{flex:1 1 60%}}
   .link:hover{background:none;text-decoration:underline}
+
+  /* Полный auth-flow: вход, invite-регистрация, подтверждение почты и восстановление. */
+  .auth-overlay{min-height:100dvh;padding:calc(18px + env(safe-area-inset-top)) calc(18px + env(safe-area-inset-right)) calc(18px + env(safe-area-inset-bottom)) calc(18px + env(safe-area-inset-left));overscroll-behavior:contain}
+  .auth-card{width:min(468px,100%);max-height:calc(100dvh - 36px - env(safe-area-inset-top) - env(safe-area-inset-bottom));overflow-y:auto;overscroll-behavior:contain;padding:28px 30px}
+  .auth-brand{align-items:center;margin-bottom:20px}
+  .auth-brand>div:last-child{display:flex;min-width:0;flex-direction:column;gap:2px}
+  .auth-brand small{color:var(--muted);font-size:12.5px;line-height:1.35}
+  .auth-heading{display:flex;align-items:center;gap:12px;margin-bottom:16px}
+  .auth-heading h1{flex:1;min-width:0;font-size:22px;outline:none}
+  .auth-step{flex:0 0 auto;border:1px solid color-mix(in srgb,var(--accent) 40%,var(--line-2));border-radius:999px;padding:3px 9px;color:var(--accent-txt);background:color-mix(in srgb,var(--accent) 10%,transparent);font-size:11px;font-weight:700}
+  .auth-copy{margin:0 0 16px;color:var(--muted);font-size:13.5px;line-height:1.5}
+  .auth-copy b{color:var(--txt-h);overflow-wrap:anywhere}
+  .auth-label-line{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:6px}
+  .auth-label-line label{margin:0}
+  .auth-label-line button{width:auto;padding:2px 0;border-radius:4px;background:none;color:var(--accent-txt);font-size:12.5px}
+  .auth-label-line button:hover{background:none;text-decoration:underline}
+  .auth-password{position:relative}
+  .auth-password>input{padding-right:48px}
+  .auth-password-toggle{position:absolute;top:50%;right:6px;width:36px;height:36px;padding:0;transform:translateY(-50%);display:flex;align-items:center;justify-content:center;border-radius:8px;background:transparent;color:var(--muted)}
+  .auth-password-toggle:hover{background:var(--panel3);color:var(--txt-h)}
+  .auth-password-toggle:active{transform:translateY(-50%) scale(.94)}
+  .auth-hint{margin-top:6px;color:var(--muted);font-size:11.5px;line-height:1.4}
+  .auth-field-error{margin-top:6px;color:var(--red);font-size:12px;line-height:1.35}
+  .auth-form-error{display:flex;align-items:flex-start;gap:8px;margin-top:12px;padding:9px 11px;border:1px solid color-mix(in srgb,var(--red) 42%,transparent);border-radius:9px;background:color-mix(in srgb,var(--red) 10%,transparent);color:color-mix(in srgb,var(--red) 76%,var(--txt-h));font-size:12.5px;line-height:1.4}
+  .auth-form-error .ic{margin-top:1px;flex:0 0 auto;color:var(--red)}
+  .auth-code-text{text-transform:uppercase;letter-spacing:.08em;font-family:var(--num);font-weight:700}
+  .auth-otp-row{text-align:center}
+  .auth-otp-row>label{display:block;text-align:left}
+  .auth-otp{height:62px;text-align:center;padding:8px 8px 8px 18px;font:800 28px/1 var(--num);font-variant-numeric:tabular-nums;letter-spacing:.36em;background:linear-gradient(90deg,var(--panel2),color-mix(in srgb,var(--accent) 8%,var(--panel2)))}
+  .auth-secondary-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px}
+  .auth-secondary-row .link{min-height:40px;margin:0;white-space:normal;line-height:1.3}
+  .auth-state{display:flex;flex-direction:column;align-items:center;text-align:center;padding:5px 0 0}
+  .auth-state-icon{width:52px;height:52px;border-radius:16px;display:flex;align-items:center;justify-content:center;margin-bottom:12px;color:var(--accent-txt);background:color-mix(in srgb,var(--accent) 14%,var(--panel2));border:1px solid color-mix(in srgb,var(--accent) 30%,var(--line-2))}
+  .auth-state-icon.success{color:var(--green);background:color-mix(in srgb,var(--green) 12%,var(--panel2));border-color:color-mix(in srgb,var(--green) 30%,var(--line-2))}
+  .auth-state-icon.danger{color:var(--red);background:color-mix(in srgb,var(--red) 11%,var(--panel2));border-color:color-mix(in srgb,var(--red) 30%,var(--line-2))}
+  .auth-state p{margin:0 0 16px;color:var(--muted);font-size:13.5px;line-height:1.55}
+  .auth-state .primary{margin-top:0}
+  .auth-live{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+
+  /* Непропускаемый gate старых аккаунтов. Он существует до инициализации realtime-части приложения. */
+  .modal .account-email-gate{position:relative;width:min(460px,96vw);overflow-y:auto;padding:26px}
+  .gate-head{display:flex;align-items:center;gap:13px;margin-bottom:10px}
+  .gate-icon{width:48px;height:48px;flex:0 0 auto;border-radius:15px;display:flex;align-items:center;justify-content:center;color:var(--accent-txt);background:linear-gradient(145deg,color-mix(in srgb,var(--accent) 23%,var(--panel2)),var(--panel2));border:1px solid color-mix(in srgb,var(--accent) 38%,var(--line-2))}
+  .gate-kicker{display:block;margin-bottom:2px;color:var(--accent-txt);font-size:10.5px;font-weight:800;letter-spacing:.7px;text-transform:uppercase}
+  .gate-head h2{margin:0}
+  .account-email-gate .msub{line-height:1.5}
+  .account-email-gate .msub b{color:var(--txt-h)}
+  .gate-or{display:flex;align-items:center;gap:10px;margin:2px 0 12px;color:var(--muted);font-size:10.5px;letter-spacing:.02em}
+  .gate-or::before,.gate-or::after{content:'';height:1px;flex:1;background:var(--line-2)}
+  .gate-or span{flex:0 0 auto}
+  .gate-foot{display:flex;align-items:center;gap:12px;margin-top:18px;padding-top:14px;border-top:1px solid var(--line-2)}
+  .gate-foot span{flex:1;min-width:0;color:var(--muted);font-size:11.5px;line-height:1.4}
+  .gate-foot button{flex:0 0 auto;padding:7px 10px;background:transparent;color:var(--muted);font-size:12.5px}
+  .gate-foot button:hover{background:var(--panel2);color:var(--txt-h)}
+
+  @media(max-width:560px){
+    .auth-overlay{align-items:flex-start;padding:0;background:var(--panel)}
+    .auth-card{width:100%;max-height:none;min-height:100dvh;padding:calc(22px + env(safe-area-inset-top)) max(18px,env(safe-area-inset-right)) calc(24px + env(safe-area-inset-bottom)) max(18px,env(safe-area-inset-left));border:0;border-radius:0;box-shadow:none;animation:none}
+    .auth-brand{margin-bottom:24px}
+    .auth-brand .logo{width:48px;height:48px}
+    .auth-heading h1{font-size:21px}
+    .auth-secondary-row{grid-template-columns:1fr}
+    .auth-secondary-row .link{min-height:44px}
+    .modal .account-email-gate{width:100%;max-width:none;min-height:calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom));max-height:none;border-radius:0;padding:24px 18px;display:flex;flex-direction:column;justify-content:center}
+    .gate-foot{margin-top:22px}
+  }
 
   /* ---------- APP SHELL ---------- */
   #app{display:none;height:100%}
@@ -1442,6 +1508,42 @@
 .admin-adm{font-size:12.5px;font-weight:600;color:var(--txt);background:var(--panel2);padding:7px 12px;border-radius:var(--r-sm);flex:0 0 auto;white-space:nowrap}
 .admin-adm:hover:not(:disabled){background:var(--panel3)}
 .admin-adm:disabled{opacity:.35;cursor:not-allowed}
+.admin-support-code{position:relative;display:flex;align-items:center;gap:12px;padding:13px 44px 13px 15px;border:1px solid color-mix(in srgb,var(--accent) 48%,var(--line-2));border-radius:var(--r-md);background:color-mix(in srgb,var(--accent) 10%,var(--panel));box-shadow:var(--sh-1)}
+.admin-support-code>div{min-width:0;flex:1}.admin-support-code span,.admin-support-code small{display:block;color:var(--muted);font-size:11px;line-height:1.4}.admin-support-code code{display:block;margin:3px 0;color:var(--txt-h);font:800 20px/1.2 var(--num);letter-spacing:.12em}.admin-support-code>button:not(.admin-support-close){display:inline-flex;align-items:center;gap:6px;min-height:36px;padding:0 12px;border:1px solid var(--line-2);border-radius:9px;background:var(--panel2);color:var(--txt);font-weight:700}.admin-support-close{position:absolute;top:8px;right:9px;width:28px;height:28px;border-radius:8px;color:var(--muted);font-size:20px}.admin-support-close:hover{background:var(--panel2);color:var(--txt-h)}
+.admin-access{padding:20px;border:1px solid var(--line-2);border-radius:16px;background:linear-gradient(145deg,color-mix(in srgb,var(--accent) 8%,var(--panel)),var(--panel));box-shadow:var(--sh-1),var(--hair)}
+.admin-access-head{display:flex;align-items:center;gap:12px;margin-bottom:10px}
+.admin-access-icon{width:46px;height:46px;flex:0 0 auto;border-radius:14px;display:flex;align-items:center;justify-content:center;color:var(--accent-txt);background:color-mix(in srgb,var(--accent) 16%,var(--panel2));border:1px solid color-mix(in srgb,var(--accent) 35%,var(--line-2))}
+.admin-access-head>div>span{display:block;color:var(--accent-txt);font-size:10.5px;font-weight:800;text-transform:uppercase;letter-spacing:.7px}
+.admin-access-head h2{margin:2px 0 0;color:var(--txt-h);font-size:19px}
+.admin-access>p{max-width:620px;margin:0 0 18px;color:var(--muted);font-size:13px;line-height:1.5}
+.admin-invite-card{padding:15px;border:1px solid color-mix(in srgb,var(--accent) 28%,var(--line-2));border-radius:13px;background:color-mix(in srgb,var(--bg2) 78%,transparent)}
+.admin-invite-label{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px;color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}
+.admin-invite-label i{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:2px 8px;font-style:normal;font-size:10px;text-transform:none;letter-spacing:0}
+.admin-invite-label i::before{content:'';width:6px;height:6px;border-radius:50%;background:currentColor}
+.admin-invite-label i.active{color:var(--green);background:color-mix(in srgb,var(--green) 12%,transparent)}
+.admin-invite-label i.expired{color:var(--yellow);background:color-mix(in srgb,var(--yellow) 12%,transparent)}
+.admin-invite-code{display:flex;align-items:center;gap:10px}
+.admin-invite-code code{flex:1;min-width:0;padding:12px 14px;border:1px solid var(--line-2);border-radius:10px;background:var(--panel2);color:var(--txt-h);font:800 21px/1.2 var(--num);letter-spacing:.12em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;user-select:all;-webkit-user-select:all}
+.admin-invite-code button{min-height:46px;display:flex;align-items:center;gap:7px;padding:0 14px;border:1px solid color-mix(in srgb,var(--accent) 34%,var(--line-2));background:color-mix(in srgb,var(--accent) 13%,var(--panel2));color:var(--accent-txt);font-size:12.5px;font-weight:700}
+.admin-invite-code button:hover{background:color-mix(in srgb,var(--accent) 22%,var(--panel2))}
+.admin-invite-meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-top:12px}
+.admin-invite-meta>span{min-width:0;padding:9px 10px;border-radius:9px;background:color-mix(in srgb,var(--panel2) 76%,transparent)}
+.admin-invite-meta b{display:block;overflow:hidden;text-overflow:ellipsis;color:var(--txt-h);font:700 12px/1.3 var(--num);white-space:nowrap}
+.admin-invite-meta small{display:block;margin-top:3px;overflow:hidden;text-overflow:ellipsis;color:var(--muted);font-size:10.5px;white-space:nowrap}
+.admin-invite-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.admin-invite-actions .danger{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 35%,var(--line-2))}
+.admin-invite-state{display:flex;align-items:center;gap:8px;min-height:86px;padding:14px;border-radius:12px;background:var(--panel2);color:var(--muted);font-size:13px}
+.admin-invite-state.error{color:var(--red)}
+.admin-invite-state.error>span{flex:1}
+.admin-invite-state button,.admin-invite-reload{display:flex;align-items:center;justify-content:center;gap:7px;padding:8px 12px;font-size:12.5px}
+.admin-invite-reload{width:100%;margin-top:12px}
+@media(max-width:560px){
+  .admin-access{padding:15px}
+  .admin-invite-code{align-items:stretch;flex-direction:column}
+  .admin-invite-code code{font-size:18px;text-align:center}
+  .admin-invite-code button{justify-content:center}
+  .admin-invite-meta{grid-template-columns:1fr}
+  .admin-invite-meta b,.admin-invite-meta small{white-space:normal}
+}
 
 /* ── Совместное прослушивание YouTube (мини-плеер в VoiceDock) ── */
 .music{margin-top:8px;background:var(--panel);border:1px solid var(--line-2);border-radius:11px;overflow:hidden}
@@ -3347,4 +3449,11 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 }
 @media (prefers-reduced-motion:reduce){
   .member-row-banner>img{transition:none;transform:none!important}
+}
+
+/* Финальный mobile override: обязательный account gate остаётся полноэкранным даже поверх
+   более поздних общих правил модалок профиля/настроек. */
+@media (max-width:560px){
+  .modal:has(.account-email-gate){align-items:stretch;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);background:var(--panel);backdrop-filter:none}
+  .modal .box.account-email-gate{width:100%;max-width:none;min-height:calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom));max-height:none;padding:24px 18px;border:0;border-radius:0;box-shadow:none;justify-content:flex-start;overflow-y:auto}
 }

@@ -36,7 +36,7 @@ jobs:
     outputs:
       deploy_allowed: ${{ steps.fence.outputs.deploy_allowed }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 
@@ -50,7 +50,7 @@ jobs:
       # using :latest and therefore receives only images from an accepted, newer sequence.
       - name: Read deployed web sequence
         id: deployed
-        uses: appleboy/ssh-action@v1
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
@@ -95,11 +95,11 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
 
@@ -113,17 +113,41 @@ jobs:
           RELEASE_SHA: ${{ github.sha }}
         run: node scripts/release-notes.mjs validate --from "$RELEASE_FROM" --to "$RELEASE_SHA"
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Verify server authentication and release boundaries
+        run: |
+          npm --prefix apps/server ci
+          node --check apps/server/index.js
+          node --check apps/server/auth.js
+          node --check apps/server/bootstrap-admin.js
+          node --check apps/server/mailer.js
+          node --check apps/server/vrelayAuth.js
+          node --check apps/server/runtimeRevocation.js
+          node --check apps/server/tree.js
+          npm --prefix apps/server run test:bootstrap-admin
+          npm --prefix apps/server run test:auth
+          npm --prefix apps/server run test:mailer
+          npm --prefix apps/server run test:vrelay-auth
+          npm --prefix apps/server run test:runtime-revocation
+          npm --prefix apps/server run test:release-notes
+          npm --prefix apps/server run test:voice-lease
+
+      - name: Verify web authentication build
+        run: |
+          npm --prefix apps/web ci
+          npm --prefix apps/web run typecheck
+          npm --prefix apps/web run build
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build & push server image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: ./apps/server
           push: true
@@ -134,7 +158,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Build & push web image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: ./apps/web
           push: true
@@ -147,7 +171,7 @@ jobs:
       # Э9: headless виртуальный fallback-relay. Контекст — корень репо (path-dep на
       # apps/relay-core), см. apps/relay/Dockerfile и корневой .dockerignore.
       - name: Build & push vrelay image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: apps/relay/Dockerfile
@@ -162,11 +186,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
 
@@ -185,7 +209,7 @@ jobs:
       # turnserver.conf — bind-mount из ./coturn; без копирования правки конфига coturn
       # молча не доезжали, хотя coturn/** и триггерит этот workflow.
       - name: Copy compose to VPS
-        uses: appleboy/scp-action@v0.1.7
+        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
@@ -194,7 +218,7 @@ jobs:
           target: /opt/voice
 
       - name: Copy patch note payload to VPS
-        uses: appleboy/scp-action@v0.1.7
+        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
@@ -203,11 +227,14 @@ jobs:
           target: /opt/voice/data
 
       - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
+          envs: GHCR_TOKEN
           script: |
             set -e
             candidate_seq=${{ needs.build.outputs.release_sequence }}
@@ -220,12 +247,129 @@ jobs:
               echo "stale web release ignored: $candidate_seq <= $current_seq"
               exit 0
             fi
-            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u devdenneg --password-stdin
+            printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u devdenneg --password-stdin
             cd /opt/voice
             export IMAGE_TAG=${{ github.sha }}
+            # Validate the rendered model without printing it: the full config contains existing
+            # runtime credentials. Required email enforcement is allowed only after the managed
+            # SMTP endpoint and root-owned secret files have been provisioned on this API host.
+            docker compose config --quiet
+            read_compose_env() {
+              lookup_key="$1"
+              docker compose config --environment \
+                | awk -F= -v key="$lookup_key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }'
+            }
+            check_auth_secret() {
+              secret_path="$1"
+              secret_label="$2"
+              minimum_bytes="$3"
+              if [ ! -f "$secret_path" ] || [ ! -s "$secret_path" ]; then
+                echo "email auth preflight failed: $secret_label is missing or empty" >&2
+                exit 1
+              fi
+              secret_mode=$(stat -c '%a' "$secret_path")
+              secret_uid=$(stat -c '%u' "$secret_path")
+              [ "$secret_uid" = "0" ] \
+                || { echo "email auth preflight failed: $secret_label must be owned by root" >&2; exit 1; }
+              case "$secret_mode" in
+                400|600) ;;
+                *) echo "email auth preflight failed: $secret_label must have mode 400 or 600" >&2; exit 1;;
+              esac
+              secret_size=$(wc -c < "$secret_path")
+              [ "$secret_size" -ge "$minimum_bytes" ] \
+                || { echo "email auth preflight failed: $secret_label is too short" >&2; exit 1; }
+            }
+            vrelay_auth_secret=$(read_compose_env VRELAY_AUTH_SECRET)
+            session_secret=$(read_compose_env SESSION_SECRET)
+            session_secret_bytes=$(printf '%s' "$session_secret" | wc -c | tr -d '[:space:]')
+            [ "$session_secret_bytes" -ge 32 ] \
+              || { echo "session auth preflight failed: SESSION_SECRET must be at least 32 bytes" >&2; exit 1; }
+            session_secret_lower=$(printf '%s' "$session_secret" | tr '[:upper:]' '[:lower:]')
+            case "$session_secret_lower" in
+              *change_me*|*change-me*|*changeme*|*placeholder*|*example*|*dev-secret*)
+                echo "session auth preflight failed: SESSION_SECRET is a placeholder" >&2
+                exit 1
+                ;;
+            esac
+            case "$session_secret" in
+              *[[:space:]]*) echo "session auth preflight failed: SESSION_SECRET contains whitespace" >&2; exit 1;;
+            esac
+            session_unique_bytes=$(printf '%s' "$session_secret" | fold -w1 | sort -u | wc -l | tr -d '[:space:]')
+            [ "$session_unique_bytes" -gt 1 ] \
+              || { echo "session auth preflight failed: SESSION_SECRET is not random" >&2; exit 1; }
+            vrelay_secret_bytes=$(printf '%s' "$vrelay_auth_secret" | wc -c | tr -d '[:space:]')
+            [ "$vrelay_secret_bytes" -ge 32 ] \
+              || { echo "vrelay auth preflight failed: VRELAY_AUTH_SECRET must be at least 32 bytes" >&2; exit 1; }
+            [ "$vrelay_auth_secret" != "$session_secret" ] \
+              || { echo "vrelay auth preflight failed: VRELAY_AUTH_SECRET must differ from SESSION_SECRET" >&2; exit 1; }
+            vrelay_secret_lower=$(printf '%s' "$vrelay_auth_secret" | tr '[:upper:]' '[:lower:]')
+            case "$vrelay_secret_lower" in
+              *change_me*|*change-me*|*changeme*|*placeholder*|*example*|*dev-secret*)
+                echo "vrelay auth preflight failed: VRELAY_AUTH_SECRET is a placeholder" >&2
+                exit 1
+                ;;
+            esac
+            case "$vrelay_auth_secret" in
+              *[[:space:]]*) echo "vrelay auth preflight failed: VRELAY_AUTH_SECRET contains whitespace" >&2; exit 1;;
+            esac
+            vrelay_unique_bytes=$(printf '%s' "$vrelay_auth_secret" | fold -w1 | sort -u | wc -l | tr -d '[:space:]')
+            [ "$vrelay_unique_bytes" -gt 1 ] \
+              || { echo "vrelay auth preflight failed: VRELAY_AUTH_SECRET is not random" >&2; exit 1; }
+            vrelay_accept_legacy=$(read_compose_env VRELAY_ACCEPT_LEGACY_SESSION_TOKEN)
+            [ -n "$vrelay_accept_legacy" ] || vrelay_accept_legacy=0
+            case "$vrelay_accept_legacy" in
+              0) ;;
+              1) echo "SECURITY WARNING: temporary legacy vrelay authentication is enabled" >&2 ;;
+              *) echo "vrelay auth preflight failed: VRELAY_ACCEPT_LEGACY_SESSION_TOKEN must be 0 or 1" >&2; exit 1;;
+            esac
+            auth_email_enforcement=$(read_compose_env AUTH_EMAIL_ENFORCEMENT)
+            [ -n "$auth_email_enforcement" ] || auth_email_enforcement=disabled
+            case "$auth_email_enforcement" in
+              disabled|optional|required) ;;
+              *) echo "email auth preflight failed: unsupported AUTH_EMAIL_ENFORCEMENT mode" >&2; exit 1;;
+            esac
+            if [ "$auth_email_enforcement" != "disabled" ]; then
+              smtp_host=$(read_compose_env SMTP_HOST)
+              smtp_user=$(read_compose_env SMTP_USER)
+              mail_from_address=$(read_compose_env MAIL_FROM_ADDRESS)
+              smtp_secret_source=$(read_compose_env SMTP_PASSWORD_SECRET_FILE)
+              pepper_secret_source=$(read_compose_env AUTH_CODE_PEPPER_SECRET_FILE)
+              [ -n "$smtp_host" ] || { echo "email auth preflight failed: SMTP_HOST is empty" >&2; exit 1; }
+              [ -n "$smtp_user" ] || { echo "email auth preflight failed: SMTP_USER is empty" >&2; exit 1; }
+              case "$mail_from_address" in
+                *@*.*) ;;
+                *) echo "email auth preflight failed: MAIL_FROM_ADDRESS is empty or invalid" >&2; exit 1;;
+              esac
+              [ "$smtp_secret_source" = "/opt/voice/secrets/smtp_password" ] \
+                || { echo "email auth preflight failed: SMTP password secret source is not provisioned" >&2; exit 1; }
+              [ "$pepper_secret_source" = "/opt/voice/secrets/auth_code_pepper" ] \
+                || { echo "email auth preflight failed: auth pepper secret source is not provisioned" >&2; exit 1; }
+              check_auth_secret /opt/voice/secrets/smtp_password smtp_password 1
+              check_auth_secret /opt/voice/secrets/auth_code_pepper auth_code_pepper 32
+              session_secret_hash=$(printf '%s' "$session_secret" | sha256sum | awk '{print $1}')
+              pepper_secret_hash=$(tr -d '\r\n' < /opt/voice/secrets/auth_code_pepper | sha256sum | awk '{print $1}')
+              [ "$session_secret_hash" != "$pepper_secret_hash" ] \
+                || { echo "email auth preflight failed: auth pepper must differ from SESSION_SECRET" >&2; exit 1; }
+            fi
             # Pull does not change the running release, so do the slow network work first and
             # snapshot the actually open chats immediately before compose up.
             docker compose pull
+            # The immutable candidate itself validates port/TLS combinations and performs an
+            # authenticated SMTP handshake while the previous release is still serving users.
+            if [ "$auth_email_enforcement" != "disabled" ]; then
+              docker compose run --rm --no-deps token node -e \
+                "const a=require('./auth'); const m=require('./mailer').createSmtpMailer(); if(a.readCodePepperFile(process.env.AUTH_CODE_PEPPER_FILE).length<32||!m.configured) process.exit(2); m.verify().then(ok=>process.exit(ok?0:3)).catch(()=>process.exit(4))"
+            fi
+            # Once auth baseline is activated, images without version-aware sessions must never
+            # be started again: they would resurrect revoked JWTs after a reset or email binding.
+            docker compose run --rm --no-deps --entrypoint test token -f /app/auth.js
+            auth_baseline_file=/opt/voice/data/auth-baseline-sequence
+            if [ -f "$auth_baseline_file" ]; then
+              read -r auth_baseline_seq < "$auth_baseline_file"
+              case "$auth_baseline_seq" in ''|*[!0-9]*) echo "invalid auth baseline sequence" >&2; exit 1;; esac
+              [ "$candidate_seq" -ge "$auth_baseline_seq" ] \
+                || { echo "refusing to deploy an image older than the auth baseline" >&2; exit 1; }
+            fi
             prepared=0
             skip_marker=/opt/voice/data/release-note.${{ github.sha }}.skip
             # Начиная со второго релиза, старый API фиксирует точную аудиторию ДО рестарта.
@@ -239,6 +383,12 @@ jobs:
             else
               touch "$skip_marker"
               echo "legacy API: точный снимок аудитории до обновления недоступен; патчноут этого rollout будет пропущен"
+            fi
+            if [ ! -f "$auth_baseline_file" ]; then
+              baseline_tmp="$auth_baseline_file.tmp.$$"
+              printf '%s\n' "$candidate_seq" > "$baseline_tmp"
+              mv "$baseline_tmp" "$auth_baseline_file"
+              echo "Authentication baseline pre-armed; recovery must use an auth-capable image even if startup fails"
             fi
             docker compose up -d
             ready=0
@@ -263,6 +413,25 @@ jobs:
             if [ "$public_ready" -ne 1 ]; then
               echo "public web release did not become healthy" >&2
               exit 1
+            fi
+            # Persist the verified immutable tag so a later manual `docker compose up` or host
+            # reboot cannot silently fall back to a mutable image. Preserve .env ownership/mode.
+            env_tmp=".env.image-tag.$$"
+            umask 077
+            awk -v tag="$IMAGE_TAG" '
+              BEGIN { written=0 }
+              /^IMAGE_TAG=/ { if (!written) { print "IMAGE_TAG=" tag; written=1 } next }
+              { print }
+              END { if (!written) print "IMAGE_TAG=" tag }
+            ' .env > "$env_tmp"
+            chmod --reference=.env "$env_tmp"
+            chown --reference=.env "$env_tmp"
+            mv "$env_tmp" .env
+            auth_baseline_active=/opt/voice/data/auth-baseline-active
+            if [ ! -f "$auth_baseline_active" ]; then
+              active_tmp="$auth_baseline_active.tmp.$$"
+              printf '%s\n' "$candidate_seq" > "$active_tmp"
+              mv "$active_tmp" "$auth_baseline_active"
             fi
             if [ "$prepared" -eq 1 ]; then
               docker compose exec -T token node publish-release.js finalize /app/data/deploy-release.json

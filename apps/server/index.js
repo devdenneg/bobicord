@@ -4,28 +4,62 @@ const http = require('http');
 const crypto = require('crypto');
 const express = require('express');
 const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
 const Database = require('better-sqlite3');
 const { AccessToken, RoomServiceClient, DataPacket_Kind } = require('livekit-server-sdk');
 const { WebSocketServer } = require('ws');
 const { attachTreeServer } = require('./tree');
 const { createVoiceLeaseStore, voiceLeaseEvent, selectVoiceState } = require('./voiceLease');
+const { installRuntimeRevocationSchema } = require('./runtimeRevocation');
 const { installReleaseSchema, parseReleaseMeta, prepareRelease, finalizeRelease } = require('./releaseNotes');
+const {
+  AuthError, installAuthSchema, installVerifiedRegistrationGuard, createAuthManager, readCodePepperFile,
+  passwordPrehash, formatPasswordHash,
+} = require('./auth');
+const { createSmtpMailer } = require('./mailer');
+const {
+  VRELAY_UID,
+  isStrongVrelaySecret,
+  isVrelayShapedToken,
+  verifyVrelayToken,
+} = require('./vrelayAuth');
 const stats = require('./stats'); // рейтинг + уровни (экспериментальная фича)
 
 const app = express();
-// Нативный (Tauri) клиент грузит локальный bundle — его origin (tauri://localhost)
-// всегда кросс-доменный к API. Auth — только Bearer-токен (без cookies), поэтому
-// wildcard-CORS безопасен: credentials не используются.
+// Production Caddy is the single public hop in front of the API; port 3000 is bound to host
+// loopback only. Trust exactly that one hop so rate limits see the client address Caddy supplies.
+app.set('trust proxy', 1);
+const corsOrigins = new Set([
+  'https://reelay.online',
+  'https://www.reelay.online',
+  'tauri://localhost',
+  'http://tauri.localhost',
+  'https://tauri.localhost',
+]);
+if (process.env.NODE_ENV !== 'production') {
+  corsOrigins.add('http://localhost:5173');
+  corsOrigins.add('http://127.0.0.1:5173');
+}
+for (const origin of String(process.env.CORS_ALLOWED_ORIGINS || '').split(',')) {
+  const normalized = origin.trim();
+  if (normalized) corsOrigins.add(normalized);
+}
+// Нативный Tauri-клиент обращается к prod API со своего origin. Разрешаем только
+// известные origins; запросы без Origin остаются доступны нативным сервисам и health-check.
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
+  const origin = String(req.headers.origin || '');
+  const allowed = !origin || corsOrigins.has(origin);
+  if (origin && allowed) {
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Vary', 'Origin');
+  }
   res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
   // X-Attachment-Name — кастомный заголовок POST /api/upload-file (имя файла для форс-скачивания).
   // Без него в нативе (кросс-доменный запрос, tauri://localhost → прод-API) CORS-preflight не
   // пропускал бы заголовок → реальный POST блокировался браузером ещё до отправки («ошибка загрузки»
   // на любой файл). В вебе не всплывало — там same-origin через Caddy, CORS не участвует вовсе.
   res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Attachment-Name');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  res.header('Access-Control-Max-Age', '600');
+  if (req.method === 'OPTIONS') return allowed ? res.sendStatus(204) : res.sendStatus(403);
   next();
 });
 // POST /api/diag/session — единственный JSON-роут с большим телом (лог вещателя,
@@ -45,8 +79,42 @@ app.use((req, res, next) => {
 
 const KEY = process.env.LK_KEY;
 const SECRET = process.env.LK_SECRET;
-const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-secret-change';
-if (!process.env.SESSION_SECRET) console.warn('WARN: SESSION_SECRET не задан в env — использую дефолт. Задай его в .env на VPS для безопасности сессий.');
+function strongSessionSecret(value) {
+  const secret = String(value || '');
+  return Buffer.byteLength(secret, 'utf8') >= 32
+    && secret.trim() === secret
+    && !/\s/u.test(secret)
+    && !/(change[_-]?me|placeholder|example|dev-secret)/iu.test(secret)
+    && !secret.split('').every((character) => character === secret[0]);
+}
+let SESSION_SECRET = String(process.env.SESSION_SECRET || '');
+if (!strongSessionSecret(SESSION_SECRET)) {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('SESSION_SECRET должен быть случайным секретом минимум 32 байта');
+  }
+  SESSION_SECRET = crypto.randomBytes(32).toString('hex');
+  console.warn('WARN: SESSION_SECRET не задан или слабый; для этой локальной сессии создан временный случайный секрет.');
+}
+const VRELAY_AUTH_SECRET = String(process.env.VRELAY_AUTH_SECRET || '');
+const VRELAY_LEGACY_MODE = String(process.env.VRELAY_ACCEPT_LEGACY_SESSION_TOKEN || '0').trim();
+if (!['0', '1'].includes(VRELAY_LEGACY_MODE)) {
+  throw new Error('VRELAY_ACCEPT_LEGACY_SESSION_TOKEN должен быть 0 или 1');
+}
+const VRELAY_ACCEPT_LEGACY_SESSION_TOKEN = VRELAY_LEGACY_MODE === '1';
+const VRELAY_AUTH_SECRET_VALID = isStrongVrelaySecret(VRELAY_AUTH_SECRET, SESSION_SECRET);
+if (!VRELAY_AUTH_SECRET_VALID) {
+  const reason = 'VRELAY_AUTH_SECRET должен быть отдельным случайным секретом минимум 32 байта и не совпадать с SESSION_SECRET';
+  if (process.env.NODE_ENV === 'production') throw new Error(reason);
+  console.warn(`WARN: ${reason}; service-JWT медиарелея отключены в локальной среде.`);
+}
+if (VRELAY_ACCEPT_LEGACY_SESSION_TOKEN) {
+  console.warn('SECURITY WARN: временно разрешены старые vrelay-токены на SESSION_SECRET; обнови media VPS и верни VRELAY_ACCEPT_LEGACY_SESSION_TOKEN=0.');
+}
+const AUTH_EMAIL_ENFORCEMENT_RAW = String(process.env.AUTH_EMAIL_ENFORCEMENT || '').trim();
+if (AUTH_EMAIL_ENFORCEMENT_RAW && !['disabled', 'optional', 'required'].includes(AUTH_EMAIL_ENFORCEMENT_RAW)) {
+  throw new Error('AUTH_EMAIL_ENFORCEMENT должен быть disabled, optional или required');
+}
+const AUTH_EMAIL_ENFORCEMENT = AUTH_EMAIL_ENFORCEMENT_RAW || 'disabled';
 // вынесено в env (CLAUDE.md инвариант); дефолт — текущий прод-хост, для обратной совместимости
 const WS_URL = process.env.LK_WS_URL || 'wss://138-16-170-21.sslip.io';
 // coturn (Evolution-TZ Э3): TURN_SECRET пусто => TURN отключён, дереву достаётся только STUN
@@ -186,6 +254,21 @@ CREATE TABLE IF NOT EXISTS read_state(
   last_read INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(user_id, server_id)
 );
+CREATE TABLE IF NOT EXISTS auth_runtime_revocations(
+  user_id TEXT PRIMARY KEY,
+  username TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  revoked_before_version INTEGER NOT NULL DEFAULT 0,
+  created INTEGER NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS auth_runtime_revocation_rooms(
+  user_id TEXT NOT NULL,
+  server_id TEXT NOT NULL,
+  revoked_before_version INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(user_id,server_id)
+);
 CREATE INDEX IF NOT EXISTS idx_push_user ON push_subs(user_id);
 CREATE INDEX IF NOT EXISTS idx_profile_banner_upload_user ON profile_banner_uploads(user_id, created);
 CREATE INDEX IF NOT EXISTS idx_vc_server ON voice_channels(server_id, position);
@@ -199,6 +282,8 @@ CREATE INDEX IF NOT EXISTS idx_mroles ON member_roles(server_id, user_id);
 `);
 const voiceLeases = createVoiceLeaseStore(db);
 installReleaseSchema(db);
+installAuthSchema(db);
+installRuntimeRevocationSchema(db);
 
 /* add new columns to pre-existing DBs (idempotent — throws if column exists) */
 for (const sql of [
@@ -217,6 +302,7 @@ for (const sql of [
   "ALTER TABLE servers ADD COLUMN stats_enabled INTEGER NOT NULL DEFAULT 0", // рейтинг+уровни (эксперимент, off по умолчанию)
   "ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT ''",           // '' обычное | 'levelup' карточка достижения
   "ALTER TABLE messages ADD COLUMN meta TEXT NOT NULL DEFAULT ''",           // JSON доп-данных сообщения (для levelup: {level})
+  "ALTER TABLE auth_runtime_revocations ADD COLUMN revoked_before_version INTEGER NOT NULL DEFAULT 0",
 ]) { try { db.exec(sql); } catch (e) { /* column already exists */ } }
 
 // Старые версии могли хранить внешний provider-id вместо локального upload URL.
@@ -273,15 +359,26 @@ try {
     const obj = JSON.parse(fs.readFileSync(legacy, 'utf8'));
     const ins = db.prepare('INSERT OR IGNORE INTO users(id,username,display_name,passhash,avatar_color,bio,created) VALUES(?,?,?,?,?,?,?)');
     const now = Date.now();
-    for (const uname of Object.keys(obj)) {
-      const u = obj[uname];
-      if (!u || !u.passhash) continue;
-      ins.run(newId('u'), uname, uname, u.passhash, hashColor(uname), '', u.created || now);
-    }
+    const migrate = db.transaction(() => {
+      for (const uname of Object.keys(obj)) {
+        const u = obj[uname];
+        if (!u || !u.passhash) continue;
+        ins.run(newId('u'), uname, uname, u.passhash, hashColor(uname), '', u.created || now);
+      }
+    });
+    if (migrate.immediate) migrate.immediate(); else migrate();
     fs.renameSync(legacy, legacy + '.migrated');
     console.log('migrated legacy users:', Object.keys(obj).length);
-  } catch (e) { console.log('legacy migration skipped:', e.message); }
+  } catch (error) {
+    // Installing the verified-email trigger after a partial/failed migration would make the
+    // remaining legacy file impossible to import on the next start. Stop and let the operator
+    // fix the file/permissions; no auth-capable release is activated in this state.
+    throw new Error(`legacy users migration failed: ${error && error.message || error}`);
+  }
 })();
+// Persist the new registration invariant in SQLite so rolling back an application image cannot
+// accidentally bring back the legacy no-email registration endpoint.
+installVerifiedRegistrationGuard(db);
 
 /* ---------------- helpers ---------------- */
 function newId(prefix) { return prefix + '_' + crypto.randomBytes(8).toString('hex'); }
@@ -289,30 +386,81 @@ function inviteCode() { return crypto.randomBytes(6).toString('base64url'); }
 function hashColor(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0; return h % 8; }
 const UNAME = /^[a-zA-Z0-9_]{3,20}$/;
 const norm = u => String(u || '').trim().toLowerCase();
-const makeSession = id => jwt.sign({ id }, SESSION_SECRET, { expiresIn: '30d' });
+let authManager = null;
+
+function bearerToken(req) {
+  const header = req.headers.authorization || '';
+  return header.startsWith('Bearer ') ? header.slice(7) : '';
+}
+
+function sendAuthError(res, error) {
+  const retryAfterMs = Number(error && error.details && error.details.retryAfterMs) || 0;
+  const retryAfter = retryAfterMs > 0 ? Math.max(1, Math.ceil(retryAfterMs / 1000)) : undefined;
+  if (retryAfter) res.setHeader('Retry-After', String(retryAfter));
+  return res.status(error.status || 400).json({
+    error: {
+      code: error.code || 'AUTH_ERROR',
+      message: error.message || 'Не удалось выполнить действие.',
+      ...(error.details && error.details.field ? { field: error.details.field } : {}),
+      ...(error.details ? { details: error.details } : {}),
+      ...(retryAfter ? { retryAfter } : {}),
+    },
+  });
+}
+
+function authRoute(handler) {
+  return (req, res, next) => Promise.resolve().then(() => handler(req, res, next)).catch((error) => {
+    if (error instanceof AuthError) return sendAuthError(res, error);
+    return next(error);
+  });
+}
+
+function authContext(req, { requireVerified = false } = {}) {
+  if (!authManager) return null;
+  try { return authManager.verifySession(bearerToken(req), { requireVerified }); }
+  catch { return null; }
+}
 
 function authUser(req) {
-  const h = req.headers.authorization || '';
-  const t = h.startsWith('Bearer ') ? h.slice(7) : '';
-  try {
-    const p = jwt.verify(t, SESSION_SECRET);
-    if (p.id) return db.prepare('SELECT * FROM users WHERE id=?').get(p.id) || null;
-    if (p.u) return db.prepare('SELECT * FROM users WHERE username=?').get(p.u) || null; // legacy session
-    return null;
-  } catch (e) { return null; }
+  const context = authContext(req);
+  return context ? context.user : null;
 }
+
+function requireSession(req, res, next) {
+  if (!authManager) return res.status(503).json({ error: { code: 'AUTH_STARTING', message: 'Авторизация запускается. Попробуйте ещё раз.' } });
+  try {
+    const context = authManager.verifySession(bearerToken(req));
+    req.user = context.user;
+    req.authState = context.state;
+    return next();
+  } catch (error) {
+    if (error instanceof AuthError) return sendAuthError(res, error);
+    return next(error);
+  }
+}
+
 function requireAuth(req, res, next) {
-  const u = authUser(req);
-  if (!u) return res.status(401).json({ error: 'Не авторизован' });
-  req.user = u; next();
+  if (!authManager) return res.status(503).json({ error: { code: 'AUTH_STARTING', message: 'Авторизация запускается. Попробуйте ещё раз.' } });
+  try {
+    const context = authManager.verifySession(bearerToken(req), { requireVerified: true });
+    req.user = context.user;
+    req.authState = context.state;
+    return next();
+  } catch (error) {
+    if (error instanceof AuthError) return sendAuthError(res, error);
+    return next(error);
+  }
 }
 // Админ = флаг is_admin ИЛИ бутстрап-логин denis (на случай, если флаг ещё не засеян).
 const BOOTSTRAP_ADMIN = 'denis';
 function requireAdmin(req, res, next) {
-  const u = authUser(req);
-  if (!u) return res.status(401).json({ error: 'Не авторизован' });
-  if (!u.is_admin && u.username !== BOOTSTRAP_ADMIN) return res.status(403).json({ error: 'Только админ' });
-  req.user = u; next();
+  return requireAuth(req, res, (error) => {
+    if (error) return next(error);
+    if (!req.user.is_admin && req.user.username !== BOOTSTRAP_ADMIN) {
+      return res.status(403).json({ error: { code: 'ADMIN_ONLY', message: 'Только для администратора.' } });
+    }
+    return next();
+  });
 }
 const rsc = new RoomServiceClient(WS_URL.replace('wss://', 'https://'), KEY, SECRET);
 // LiveKit identity = `username#<nonce>` (уникально на сессию — иначе второй девайс кикает первого).
@@ -487,7 +635,42 @@ function notifyServerMembers(serverId, payload) {
 }
 function serverName(sid) { const s = db.prepare('SELECT name FROM servers WHERE id=?').get(sid); return s ? s.name : 'Сервер'; }
 
-const pubUser = u => ({ id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '', profileBannerUrl: u.profile_banner_url || '', bio: u.bio, isAdmin: !!u.is_admin || u.username === BOOTSTRAP_ADMIN });
+const pubUser = u => ({
+  id: u.id,
+  username: u.username,
+  displayName: u.display_name,
+  avatarColor: u.avatar_color,
+  avatarUrl: u.avatar_url || '',
+  profileBannerUrl: u.profile_banner_url || '',
+  bio: u.bio,
+  isAdmin: !!u.is_admin || u.username === BOOTSTRAP_ADMIN,
+  emailVerified: !!u.email_verified_at,
+});
+
+function publicAccountState(state) {
+  if (!state || !state.emailRequired) return { state: 'ready' };
+  if (state.activeBinding) {
+    return {
+      state: 'email_verification',
+      challenge: {
+        id: state.activeBinding.flowId,
+        flowId: state.activeBinding.flowId,
+        challengeId: state.activeBinding.flowId,
+        maskedEmail: state.activeBinding.maskedEmail,
+        emailMasked: state.activeBinding.maskedEmail,
+        expiresAt: state.activeBinding.expiresAt,
+        resendAt: state.activeBinding.resendAt,
+        attemptsRemaining: state.activeBinding.attemptsRemaining,
+        delivered: state.activeBinding.delivered,
+      },
+    };
+  }
+  return { state: 'email_required' };
+}
+
+function sessionPayload(user, state = authManager.sessionState(user)) {
+  return { user: pubUser(user), account: publicAccountState(state) };
+}
 // Имена всегда выпускает наш upload route: 12 random bytes + расширение из проверенного MIME.
 // Узкий regexp не пропускает `..`, произвольные имена и не-image расширения в профили/чат.
 const UPLOAD_RE = /^\/api\/uploads\/[a-f0-9]{24}\.(?:png|jpg|gif|webp)$/;
@@ -549,15 +732,45 @@ function purgeServer(sid) {
 function purgeUser(uid) {
   const account = db.prepare('SELECT username FROM users WHERE id=?').get(uid);
   const joinedServers = db.prepare('SELECT server_id FROM memberships WHERE user_id=?').all(uid).map(row => row.server_id);
+  if (account) {
+    // The version bump atomically snapshots exact LiveKit rooms and clears push/voice state.
+    db.prepare('UPDATE users SET session_version=session_version+1 WHERE id=?').run(uid);
+    void revokeRuntimeSessions(uid, account.username, 'account-deleted');
+  }
   invalidateVoiceLease(uid, () => true, 'account-deleted');
   if (account) for (const serverId of joinedServers) evictUserFromRoom(serverId, account.username);
   for (const s of db.prepare('SELECT id FROM servers WHERE owner_id=?').all(uid)) purgeServer(s.id);
   for (const t of ['memberships', 'member_roles', 'server_settings', 'messages', 'read_state']) db.prepare(`DELETE FROM ${t} WHERE user_id=?`).run(uid);
   for (const t of ['user_settings', 'push_subs', 'push_prefs']) db.prepare(`DELETE FROM ${t} WHERE user_id=?`).run(uid);
+  if (authManager) authManager.purgeUser(uid);
   db.prepare('DELETE FROM voice_session_intents WHERE user_id=?').run(uid);
   db.prepare('DELETE FROM voice_user_intents WHERE user_id=?').run(uid);
   db.prepare('DELETE FROM voice_leases WHERE user_id=?').run(uid);
   db.prepare('DELETE FROM users WHERE id=?').run(uid);
+}
+
+function closeLocalRuntimeSessions(userId, username, reason) {
+  const sockets = notifyConns.get(userId);
+  if (sockets) {
+    for (const ws of [...sockets]) {
+      try { ws.close(4001, reason); } catch { try { ws.terminate(); } catch { /* noop */ } }
+    }
+  }
+  if (treeSrv && treeSrv.peers) {
+    for (const peer of treeSrv.peers.values()) {
+      if (peer.ws && (peer.ws.__uid === userId || peer.ws.__uid === username)) {
+        try { peer.ws.close(4001, reason); } catch { try { peer.ws.terminate(); } catch { /* noop */ } }
+      }
+    }
+  }
+}
+
+async function revokeRuntimeSessions(userId, username, reason = 'session-revoked') {
+  // The users.session_version trigger has already persisted exact room targets and revoked push/
+  // voice state in the same transaction as the account mutation. This function only closes local
+  // sockets and drains that durable queue; it must never reconstruct or bulk-delete targets.
+  closeLocalRuntimeSessions(userId, username, reason);
+  await drainRuntimeRevocation(userId);
 }
 // Непрочитанные: только пользовательские сообщения новее last_read и не свои. Release-патчноут
 // хранится в истории, но не создаёт badge тем, кто не был его живой аудиторией при обновлении.
@@ -633,17 +846,89 @@ function invalidateVoiceLeasesForChannel(serverId, channelId, reason = 'channel-
   const rows = db.prepare('SELECT user_id FROM voice_leases WHERE active=1 AND server_id=? AND channel_id=?').all(serverId, channelId);
   for (const row of rows) invalidateVoiceLease(row.user_id, lease => lease.serverId === serverId && lease.channelId === channelId, reason);
 }
-function evictRoomParticipants(serverId, username) {
+function liveKitResourceMissing(error) {
+  const status = Number(error && (error.statusCode || error.status));
+  const code = String(error && error.code || '').toLowerCase();
+  const message = String(error && error.message || '').toLowerCase();
+  return status === 404 || code === 'not_found' || code === 'not-found' || code === '5'
+    || /(?:room|participant|resource).*(?:not found|does not exist)/u.test(message);
+}
+function liveKitSessionVersion(identity, username) {
+  const value = String(identity || '');
+  const prefix = String(username || '') + '#v';
+  if (!value.startsWith(prefix)) return null;
+  const match = /^v([0-9]+)\./u.exec(value.slice(prefix.length - 1));
+  if (!match) return null;
+  const version = Number(match[1]);
+  return Number.isSafeInteger(version) && version >= 0 ? version : null;
+}
+async function evictRoomParticipantsAwait(serverId, username, revokedBeforeVersion = null) {
   const roomName = 'srv:' + serverId;
-  try {
-    void withTimeout(rsc.listParticipants(roomName), 2500, 'listParticipants')
-      .then(participants => Promise.allSettled(participants
-        .filter(p => !username || baseIdentity(p.identity) === username)
-        .map(p => withTimeout(rsc.removeParticipant(roomName, p.identity), 2500, 'removeParticipant'))))
-      .catch(() => {});
-  } catch (e) { /** room may already be gone */ }
+  let participants;
+  try { participants = await withTimeout(rsc.listParticipants(roomName), 2500, 'listParticipants'); }
+  catch (error) {
+    if (liveKitResourceMissing(error)) return;
+    throw error;
+  }
+  await Promise.all(participants
+    .filter((participant) => {
+      if (!username) return true;
+      if (baseIdentity(participant.identity) !== username) return false;
+      if (revokedBeforeVersion === null) return true;
+      const version = liveKitSessionVersion(participant.identity, username);
+      return version === null || version < revokedBeforeVersion;
+    })
+    .map(async (participant) => {
+      try { await withTimeout(rsc.removeParticipant(roomName, participant.identity), 2500, 'removeParticipant'); }
+      catch (error) { if (!liveKitResourceMissing(error)) throw error; }
+    }));
+}
+function evictRoomParticipants(serverId, username) {
+  void evictRoomParticipantsAwait(serverId, username).catch(() => { /** room may already be gone */ });
 }
 function evictUserFromRoom(serverId, username) { evictRoomParticipants(serverId, username); }
+let runtimeRevocationRetryRunning = false;
+async function drainRuntimeRevocation(userId) {
+  const item = db.prepare('SELECT * FROM auth_runtime_revocations WHERE user_id=?').get(userId);
+  if (!item) return true;
+  const targets = db.prepare(`SELECT server_id,revoked_before_version
+    FROM auth_runtime_revocation_rooms WHERE user_id=?`).all(userId);
+  const results = await Promise.allSettled(targets.map(async (target) => {
+    await evictRoomParticipantsAwait(
+      target.server_id, item.username, Number(target.revoked_before_version) || 0,
+    );
+    db.prepare(`DELETE FROM auth_runtime_revocation_rooms
+      WHERE user_id=? AND server_id=? AND revoked_before_version=?`)
+      .run(userId, target.server_id, target.revoked_before_version);
+  }));
+  const remaining = db.prepare('SELECT 1 FROM auth_runtime_revocation_rooms WHERE user_id=? LIMIT 1').get(userId);
+  if (!remaining) {
+    db.prepare(`DELETE FROM auth_runtime_revocations WHERE user_id=? AND revoked_before_version=?
+      AND NOT EXISTS(SELECT 1 FROM auth_runtime_revocation_rooms WHERE user_id=?)`)
+      .run(userId, item.revoked_before_version, userId);
+    return true;
+  }
+  if (results.some((result) => result.status === 'rejected')) {
+    const attempts = (Number(item.attempts) || 0) + 1;
+    const delay = Math.min(5 * 60_000, 5000 * (2 ** Math.min(attempts - 1, 6)));
+    db.prepare(`UPDATE auth_runtime_revocations SET attempts=?,next_attempt=?
+      WHERE user_id=? AND revoked_before_version=?`)
+      .run(attempts, Date.now() + delay, userId, item.revoked_before_version);
+    console.warn('[auth] LiveKit session eviction queued for retry', { userId, attempts });
+  }
+  return false;
+}
+async function retryRuntimeRevocations() {
+  if (runtimeRevocationRetryRunning) return;
+  runtimeRevocationRetryRunning = true;
+  try {
+    const queued = db.prepare('SELECT * FROM auth_runtime_revocations WHERE next_attempt<=? ORDER BY created ASC LIMIT 10').all(Date.now());
+    for (const item of queued) {
+      await drainRuntimeRevocation(item.user_id);
+    }
+  } finally { runtimeRevocationRetryRunning = false; }
+}
+setInterval(() => { void retryRuntimeRevocations(); }, 15_000).unref?.();
 function evictLegacyVoiceChannelParticipants(serverId, channelId) {
   const roomName = 'srv:' + serverId;
   try {
@@ -874,26 +1159,144 @@ app.post('/api/voice/lease/release', requireAuth, async (req, res, next) => {
 });
 
 /* ---------------- AUTH ---------------- */
-app.post('/api/register', (req, res) => {
-  const uname = norm(req.body.username);
-  const pass = String(req.body.password || '');
-  if (!UNAME.test(uname)) return res.status(400).json({ error: 'Логин: 3-20 символов, латиница/цифры/_' });
-  if (pass.length < 4) return res.status(400).json({ error: 'Пароль минимум 4 символа' });
-  if (db.prepare('SELECT 1 FROM users WHERE username=?').get(uname)) return res.status(409).json({ error: 'Логин занят' });
-  const id = newId('u');
-  db.prepare('INSERT INTO users(id,username,display_name,passhash,avatar_color,bio,created) VALUES(?,?,?,?,?,?,?)')
-    .run(id, uname, uname, bcrypt.hashSync(pass, 10), hashColor(uname), '', Date.now());
-  const u = db.prepare('SELECT * FROM users WHERE id=?').get(id);
-  res.json({ token: makeSession(id), user: pubUser(u), username: u.username });
+const DUMMY_LOGIN_HASH = formatPasswordHash(bcrypt.hashSync(passwordPrehash('relayapp-invalid-login-probe'), 12));
+
+app.get('/api/auth/session', requireSession, (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(sessionPayload(req.user, req.authState));
 });
 
-app.post('/api/login', (req, res) => {
+// Старый прямой endpoint больше не создаёт аккаунты: регистрация атомарно завершается только
+// после проверки суточного приглашения и кода из письма.
+app.post('/api/register', (req, res) => res.status(410).json({
+  error: {
+    code: 'INVITE_REGISTRATION_REQUIRED',
+    message: 'Регистрация доступна только по пригласительному коду с подтверждением почты.',
+  },
+}));
+
+app.post('/api/login', authRoute(async (req, res) => {
   const uname = norm(req.body.username);
   const pass = String(req.body.password || '');
+  authManager.checkLoginRate({ username: uname, ip: req.ip });
   const u = db.prepare('SELECT * FROM users WHERE username=?').get(uname);
-  if (!u || !bcrypt.compareSync(pass, u.passhash)) return res.status(401).json({ error: 'Неверный логин или пароль' });
-  res.json({ token: makeSession(u.id), user: pubUser(u), username: u.username });
-});
+  const valid = await authManager.comparePassword(u ? u.passhash : DUMMY_LOGIN_HASH, pass);
+  if (!u || !valid) {
+    authManager.checkLoginRate({ username: uname, ip: req.ip, success: false });
+    throw new AuthError(401, 'INVALID_CREDENTIALS', 'Неверный логин или пароль.');
+  }
+  authManager.checkLoginRate({ username: uname, ip: req.ip, success: true });
+  // Upgrade a successful legacy raw-bcrypt hash with compare-and-swap. Never migrate a legacy
+  // credential beyond bcrypt's 72-byte boundary: bcrypt may have ignored its suffix.
+  if (!String(u.passhash || '').startsWith('prehash-v1$')
+    && Buffer.byteLength(pass, 'utf8') <= 72
+    && Buffer.byteLength(pass.normalize('NFC'), 'utf8') <= 72) {
+    const upgraded = await authManager.hashPassword(pass);
+    const changed = db.prepare('UPDATE users SET passhash=? WHERE id=? AND passhash=?').run(upgraded, u.id, u.passhash);
+    if (changed.changes === 1) u.passhash = upgraded;
+  }
+  const state = authManager.sessionState(u);
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ token: authManager.issueSession(u), ...sessionPayload(u, state), username: u.username });
+}));
+
+app.post('/api/auth/register/start', authRoute(async (req, res) => {
+  const challenge = await authManager.startRegistration({
+    username: req.body.username,
+    email: req.body.email,
+    password: req.body.password,
+    inviteCode: req.body.inviteCode,
+    requestId: req.body.requestId,
+    ip: req.ip,
+  });
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(challenge);
+}));
+
+app.post('/api/auth/register/verify', authRoute((req, res) => {
+  const result = authManager.verifyRegistration({ flowId: req.body.flowId, code: req.body.code, ip: req.ip });
+  const user = db.prepare('SELECT * FROM users WHERE id=?').get(result.user.id);
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ token: authManager.issueSession(user), ...sessionPayload(user) });
+}));
+
+app.post('/api/auth/register/resend', authRoute(async (req, res) => {
+  const challenge = await authManager.resendRegistration({ flowId: req.body.flowId, ip: req.ip });
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(challenge);
+}));
+
+app.post('/api/auth/email/start', requireSession, authRoute(async (req, res) => {
+  const challenge = await authManager.startEmailBinding({
+    userId: req.user.id,
+    email: req.body.email,
+    password: req.body.currentPassword,
+    supportCode: req.body.supportCode,
+    requestId: req.body.requestId,
+    ip: req.ip,
+  });
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(challenge);
+}));
+
+app.post('/api/auth/email/verify', requireSession, authRoute(async (req, res) => {
+  const result = authManager.verifyEmailBinding({
+    userId: req.user.id,
+    flowId: req.body.flowId,
+    code: req.body.code,
+    ip: req.ip,
+  });
+  const user = db.prepare('SELECT * FROM users WHERE id=?').get(result.user.id);
+  await revokeRuntimeSessions(user.id, user.username, 'email-verified');
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ token: authManager.issueSession(user), ...sessionPayload(user) });
+}));
+
+app.post('/api/auth/email/resend', requireSession, authRoute(async (req, res) => {
+  const challenge = await authManager.resendEmailBinding({
+    userId: req.user.id,
+    flowId: req.body.flowId,
+    ip: req.ip,
+  });
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(challenge);
+}));
+
+app.post('/api/auth/password/forgot', authRoute(async (req, res) => {
+  await authManager.startPasswordReset({ email: req.body.email, ip: req.ip });
+  res.setHeader('Cache-Control', 'no-store');
+  // Ответ намеренно одинаков для существующего и неизвестного адреса.
+  res.status(202).json({ ok: true });
+}));
+
+app.post('/api/auth/password/reset/inspect', authRoute((req, res) => {
+  const result = authManager.inspectPasswordReset({ token: req.body.token, ip: req.ip });
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(result);
+}));
+
+app.post('/api/auth/password/reset', authRoute(async (req, res) => {
+  const result = await authManager.completePasswordReset({
+    token: req.body.token,
+    newPassword: req.body.password,
+    ip: req.ip,
+  });
+  if (result.userId && result.username) await revokeRuntimeSessions(result.userId, result.username, 'password-reset');
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ ok: true, username: result.username });
+}));
+
+app.get('/api/admin/registration-invite', requireAdmin, authRoute((req, res) => {
+  const invite = authManager.currentInvite(req.user);
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ ...invite, expiresAt: invite.validUntil });
+}));
+
+app.post('/api/admin/registration-invite/rotate', requireAdmin, authRoute((req, res) => {
+  const invite = authManager.rotateInvite(req.user);
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ ...invite, expiresAt: invite.validUntil });
+}));
 
 /* ---------------- Discord detectable-games (аллоулист для натив-детекта игры) ---------------- */
 // Дистиллируем публичный список Discord (тысячи игр) в компактный [{name, exes:[win32 path-suffix]}].
@@ -987,7 +1390,7 @@ app.get('/api/admin/overview', requireAdmin, (req, res) => {
   });
   const users = db.prepare('SELECT * FROM users ORDER BY created ASC').all().map((u) => ({
     id: u.id, username: u.username, displayName: u.display_name, avatarColor: u.avatar_color, avatarUrl: u.avatar_url || '',
-    isAdmin: !!u.is_admin, created: u.created,
+    isAdmin: !!u.is_admin, created: u.created, emailVerified: !!u.email_verified_at,
     serverCount: db.prepare('SELECT COUNT(*) c FROM memberships WHERE user_id=?').get(u.id).c,
     ownedCount: db.prepare('SELECT COUNT(*) c FROM servers WHERE owner_id=?').get(u.id).c,
   }));
@@ -1830,7 +2233,8 @@ app.get('/api/servers/:id/token', requireAuth, async (req, res) => {
     // Connected clients refresh LiveKit grants automatically. Keep the initial
     // grant short-lived so a token copied from an evicted device cannot be
     // reused hours after its voice lease was transferred or revoked.
-    const voiceSession = crypto.randomBytes(4).toString('hex');
+    const sessionVersion = Math.max(0, Number(req.user.session_version) || 0);
+    const voiceSession = `v${sessionVersion}.${crypto.randomBytes(4).toString('hex')}`;
     const at = new AccessToken(KEY, SECRET, { identity: req.user.username + '#' + voiceSession, name: req.user.display_name, ttl: '10m' });
     at.addGrant({ roomJoin: true, room: 'srv:' + s.id, canPublish: true, canSubscribe: true, canPublishData: true, canUpdateOwnMetadata: true });
     res.json({ token: await at.toJwt(), url: WS_URL, room: 'srv:' + s.id, sessionId: voiceSession });
@@ -1930,6 +2334,14 @@ app.get('/api/servers/:id/messages', requireAuth, (req, res) => {
     }),
   });
 });
+
+// Migration recovery: after checking the person outside RelayApp, exact denis can issue a short
+// one-time support code. The code is shown only in this response; it never unlocks every session.
+app.post('/api/admin/users/:id/email-binding-support-code', requireAdmin, authRoute((req, res) => {
+  const result = authManager.createEmailBindingSupportCode(req.user, req.params.id);
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ ok: true, ...result });
+}));
 // вложения: до 5 на сообщение, url валиден для своего kind (картинки — /api/uploads/*, инлайн;
 // файлы — /api/files/*, форс-скачивание — см. FILE ATTACHMENTS выше), остальные поля — санитайз размера.
 function sanitizeAttachments(raw) {
@@ -2202,14 +2614,33 @@ app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
   if (err && (err.type === 'entity.too.large' || err.status === 413)) return res.status(413).json({ error: 'Файл больше 10 МБ' });
   if (err && err.status === 404) return res.status(404).json({ error: 'Не найдено' });
-  if (err) return res.status(400).json({ error: 'Ошибка запроса' });
+  if (err && (err.type === 'entity.parse.failed' || (err.status === 400 && err instanceof SyntaxError))) {
+    return res.status(400).json({ error: { code: 'INVALID_JSON', message: 'Некорректный JSON.' } });
+  }
+  if (err) {
+    console.error('[api] unexpected request failure', { name: err.name || 'Error', code: err.code || '' });
+    return res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Внутренняя ошибка. Повторите запрос.' } });
+  }
   next();
 });
 
 /* ---------- relay-дерево: WS-сигналинг на том же порту (Э1) ---------- */
 const server = http.createServer(app);
 const treeSrv = attachTreeServer(server, {
-  sessionSecret: SESSION_SECRET,
+  verifySession: (token) => {
+    const encoded = String(token || '');
+    if (isVrelayShapedToken(encoded)) {
+      return verifyVrelayToken(encoded, {
+        authSecret: VRELAY_AUTH_SECRET,
+        sessionSecret: SESSION_SECRET,
+        allowLegacy: VRELAY_ACCEPT_LEGACY_SESSION_TOKEN,
+        onLegacy: () => console.warn('SECURITY WARN: принято legacy vrelay-подключение на SESSION_SECRET. Заверши ротацию медиарелея.'),
+      });
+    }
+    if (!authManager) throw new Error('auth is starting');
+    const context = authManager.verifySession(encoded, { requireVerified: true });
+    return { id: context.user.id, u: context.user.username };
+  },
   path: '/tree',
   stunServers: STUN_URLS.map((urls) => ({ urls })),
   turnSecret: TURN_SECRET,
@@ -2222,9 +2653,13 @@ const notifyWss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
   let url; try { url = new URL(req.url, 'http://internal'); } catch { return; }
   if (url.pathname !== '/ws') return; // не наш путь — оставляем tree-хендлеру
-  let p; try { p = jwt.verify(url.searchParams.get('token') || '', SESSION_SECRET); }
+  let context;
+  try {
+    if (!authManager) throw new Error('auth is starting');
+    context = authManager.verifySession(url.searchParams.get('token') || '', { requireVerified: true });
+  }
   catch (e) { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
-  const uid = p.id || (p.u && (db.prepare('SELECT id FROM users WHERE username=?').get(p.u) || {}).id);
+  const uid = context.user.id;
   if (!uid) { socket.destroy(); return; }
   notifyWss.handleUpgrade(req, socket, head, (ws) => {
     ws._away = false; // idle-статус сессии: клиент шлёт {t:'presence',away} при бездействии. Юзер «away» (жёлтый), если ВСЕ его сокеты idle.
@@ -2274,4 +2709,96 @@ setInterval(() => {
   }
 }, 30000).unref?.();
 
-server.listen(3000, () => console.log('voice API (servers+sqlite) + tree ws + notify ws on :3000'));
+function boundedIntegerEnv(name, fallback, min, max) {
+  const raw = process.env[name];
+  if (raw === undefined || String(raw).trim() === '') return fallback;
+  const value = Number(String(raw).trim());
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new Error(`${name} должен быть целым числом от ${min} до ${max}`);
+  }
+  return value;
+}
+
+function inviteTimeZoneEnv() {
+  const raw = process.env.REGISTRATION_INVITE_TIMEZONE;
+  const value = raw === undefined || String(raw).trim() === '' ? 'Europe/Moscow' : String(raw).trim();
+  try {
+    new Intl.DateTimeFormat('ru-RU', { timeZone: value }).format(new Date());
+    return value;
+  } catch { throw new Error('REGISTRATION_INVITE_TIMEZONE содержит неизвестную временную зону'); }
+}
+
+function readCodePepper() {
+  return readCodePepperFile(process.env.AUTH_CODE_PEPPER_FILE);
+}
+
+async function startServer() {
+  const mailer = createSmtpMailer();
+  let smtpReady = false;
+  if (mailer.configured) {
+    try { smtpReady = await mailer.verify(); }
+    catch { smtpReady = false; }
+  }
+  const codePepper = readCodePepper();
+  const sessionSecretBytes = Buffer.from(SESSION_SECRET, 'utf8');
+  if (codePepper.length > 0 && codePepper.length === sessionSecretBytes.length
+    && crypto.timingSafeEqual(codePepper, sessionSecretBytes)) {
+    throw new Error('AUTH_CODE_PEPPER должен отличаться от SESSION_SECRET');
+  }
+  if (AUTH_EMAIL_ENFORCEMENT === 'required' && codePepper.length < 32) {
+    throw new Error('required email authentication has no code pepper');
+  }
+  if (!smtpReady || codePepper.length < 32) {
+    if (AUTH_EMAIL_ENFORCEMENT === 'required') {
+      console.warn('[auth] email delivery is unavailable; verified accounts stay accessible, unverified accounts remain blocked');
+    } else {
+      console.warn('[auth] email delivery is unavailable; legacy sessions remain accessible until SMTP is configured');
+    }
+  }
+  authManager = createAuthManager({
+    db,
+    mailer,
+    codePepper,
+    sessionSecret: SESSION_SECRET,
+    logger: {
+      warn: (message) => console.warn(message),
+      error: (message) => console.error(message),
+    },
+    config: {
+      emailEnforcement: AUTH_EMAIL_ENFORCEMENT,
+      emailCodeTtlMs: boundedIntegerEnv('EMAIL_CODE_TTL_SEC', 600, 120, 1800) * 1000,
+      emailCodeMaxAttempts: boundedIntegerEnv('EMAIL_CODE_MAX_ATTEMPTS', 5, 3, 10),
+      sendCooldownMs: boundedIntegerEnv('EMAIL_SEND_COOLDOWN_SEC', 60, 15, 900) * 1000,
+      sendMaxPerHour: boundedIntegerEnv('EMAIL_SEND_MAX_PER_HOUR', 5, 2, 20),
+      resetTtlMs: boundedIntegerEnv('PASSWORD_RESET_TTL_SEC', 900, 300, 7200) * 1000,
+      resetSendCooldownMs: boundedIntegerEnv('PASSWORD_RESET_SEND_COOLDOWN_SEC', 60, 30, 900) * 1000,
+      inviteTimeZone: inviteTimeZoneEnv(),
+      inviteMaxUses: boundedIntegerEnv('REGISTRATION_INVITE_MAX_USES', 25, 1, 1000),
+      inviteMaxSends: boundedIntegerEnv('REGISTRATION_INVITE_MAX_EMAILS', 50, 1, 2000),
+    },
+  });
+  const bootstrapAdmin = db.prepare("SELECT is_admin,email_verified_at FROM users WHERE username='denis'").get();
+  if (process.env.NODE_ENV === 'production' && !bootstrapAdmin) {
+    throw new Error('Администратор denis отсутствует; остановите API и выполните npm run bootstrap:admin');
+  }
+  if (AUTH_EMAIL_ENFORCEMENT === 'required'
+    && (!bootstrapAdmin || !bootstrapAdmin.is_admin || !bootstrapAdmin.email_verified_at)) {
+    throw new Error('required email authentication needs verified administrator denis with is_admin=1');
+  }
+  if (bootstrapAdmin && (!bootstrapAdmin.is_admin || !bootstrapAdmin.email_verified_at)) {
+    console.warn('[auth] denis must verify email and have is_admin=1 before required enforcement');
+  }
+  authManager.cleanup();
+  setInterval(() => authManager.cleanup(), 15 * 60 * 1000).unref?.();
+  if (mailer.configured) {
+    setInterval(() => {
+      if (!mailer.available) mailer.verify().catch(() => {});
+    }, 60 * 1000).unref?.();
+  }
+  server.listen(3000, () => console.log('voice API (servers+sqlite) + tree ws + notify ws on :3000'));
+}
+
+startServer().catch(() => {
+  console.error('[auth] startup stopped: secure authentication could not be initialized');
+  process.exit(1);
+});

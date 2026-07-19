@@ -14,7 +14,7 @@ x-logging: &logging
 
 services:
   livekit:
-    image: livekit/livekit-server:latest
+    image: livekit/livekit-server:v1.13.1@sha256:2c6869d2d5ff6c9c0166f47be1c92dad6928bfecfa5e4060a6ece48db8accfa3
     command: --config /etc/livekit.yaml
     network_mode: host
     restart: unless-stopped
@@ -24,15 +24,45 @@ services:
       - ./livekit.yaml:/etc/livekit.yaml:ro
 
   token:
-    image: ghcr.io/devdenneg/bobicord-server:${IMAGE_TAG:-latest}
+    image: ghcr.io/devdenneg/bobicord-server:${IMAGE_TAG:?IMAGE_TAG_is_required}
     pull_policy: always
     restart: unless-stopped
     logging: *logging
     environment:
+      - NODE_ENV=production
       - LK_KEY=${LK_KEY}
       - LK_SECRET=${LK_SECRET}
-      - SESSION_SECRET=${SESSION_SECRET}
+      - SESSION_SECRET=${SESSION_SECRET:?SESSION_SECRET_is_required}
+      # Отдельный service-JWT secret медиарелея. Никогда не совпадает с SESSION_SECRET:
+      # удалённый media VPS не должен уметь выпускать пользовательские/admin-сессии.
+      - VRELAY_AUTH_SECRET=${VRELAY_AUTH_SECRET:?VRELAY_AUTH_SECRET_is_required}
+      # Только для первого двухфазного rollout старого media VPS; после его обновления вернуть 0.
+      - VRELAY_ACCEPT_LEGACY_SESSION_TOKEN=${VRELAY_ACCEPT_LEGACY_SESSION_TOKEN:-0}
       - LK_WS_URL=${LK_WS_URL}
+      # Email auth is rolled out in three stages: disabled for delivery testing, optional for the
+      # migration UI, required for server-side enforcement. Credentials never live
+      # in this environment block: the app reads them from the read-only Compose secrets below.
+      - APP_PUBLIC_URL=${APP_PUBLIC_URL:-https://reelay.online}
+      - AUTH_EMAIL_ENFORCEMENT=${AUTH_EMAIL_ENFORCEMENT:-disabled}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
+      - MAIL_FROM_NAME=${MAIL_FROM_NAME:-RelayApp}
+      - MAIL_FROM_ADDRESS=${MAIL_FROM_ADDRESS:-}
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_SECURE=${SMTP_SECURE:-0}
+      - SMTP_REQUIRE_TLS=${SMTP_REQUIRE_TLS:-1}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD_FILE=/run/secrets/smtp_password
+      - AUTH_CODE_PEPPER_FILE=/run/secrets/auth_code_pepper
+      - EMAIL_CODE_TTL_SEC=${EMAIL_CODE_TTL_SEC:-600}
+      - EMAIL_CODE_MAX_ATTEMPTS=${EMAIL_CODE_MAX_ATTEMPTS:-5}
+      - EMAIL_SEND_COOLDOWN_SEC=${EMAIL_SEND_COOLDOWN_SEC:-60}
+      - EMAIL_SEND_MAX_PER_HOUR=${EMAIL_SEND_MAX_PER_HOUR:-5}
+      - PASSWORD_RESET_TTL_SEC=${PASSWORD_RESET_TTL_SEC:-900}
+      - PASSWORD_RESET_SEND_COOLDOWN_SEC=${PASSWORD_RESET_SEND_COOLDOWN_SEC:-60}
+      - REGISTRATION_INVITE_TIMEZONE=${REGISTRATION_INVITE_TIMEZONE:-Europe/Moscow}
+      - REGISTRATION_INVITE_MAX_USES=${REGISTRATION_INVITE_MAX_USES:-25}
+      - REGISTRATION_INVITE_MAX_EMAILS=${REGISTRATION_INVITE_MAX_EMAILS:-50}
       - TURN_SECRET=${TURN_SECRET}
       - TURN_URLS=${TURN_URLS}
       - TURN_TTL_SEC=${TURN_TTL_SEC:-600}
@@ -51,6 +81,9 @@ services:
       - MEDIA_RELAY_SECRET=${MEDIA_RELAY_SECRET:-}
     volumes:
       - ./data:/app/data
+    secrets:
+      - smtp_password
+      - auth_code_pepper
     ports:
       - "127.0.0.1:3000:3000"
 
@@ -62,7 +95,7 @@ services:
   # через машину, от которой мы уехали. Профиль неактивен по умолчанию, поэтому `up -d` его не
   # поднимает. Откат: COMPOSE_PROFILES=local-media в .env (+ погасить удалённый стек).
   coturn:
-    image: coturn/coturn:latest
+    image: coturn/coturn:4.12.0@sha256:161cedd63c5414c2136f306098e02e9aede74606cedad8b9b8581aae1da4e732
     profiles: ["local-media"]
     network_mode: host
     restart: unless-stopped
@@ -94,7 +127,7 @@ services:
   # (COMPOSE_PROFILES=local-media в .env). Двух агентов одновременно быть не должно:
   # findVrelayAgent() в tree.js возьмёт того, кто подключился раньше.
   vrelay:
-    image: ghcr.io/devdenneg/bobicord-vrelay:${IMAGE_TAG:-latest}
+    image: ghcr.io/devdenneg/bobicord-vrelay:${IMAGE_TAG:?IMAGE_TAG_is_required}
     profiles: ["local-media"]
     pull_policy: always
     network_mode: host
@@ -107,7 +140,7 @@ services:
         max-size: "200m"
         max-file: "3"
     environment:
-      - SESSION_SECRET=${SESSION_SECRET}
+      - VRELAY_AUTH_SECRET=${VRELAY_AUTH_SECRET:?VRELAY_AUTH_SECRET_is_required}
       - TREE_WS_URL=ws://127.0.0.1:3000/tree
       # Д1: server-first делает vrelay постоянным медиаузлом. egress ≈ битрейт × дети —
       # через виртуала идёт ВЕСЬ видеотрафик. Число детей по полосе НЕ режем: браузерный
@@ -133,7 +166,7 @@ services:
 
   caddy:
     # запечены статика фронта + Caddyfile
-    image: ghcr.io/devdenneg/bobicord-web:${IMAGE_TAG:-latest}
+    image: ghcr.io/devdenneg/bobicord-web:${IMAGE_TAG:?IMAGE_TAG_is_required}
     pull_policy: always
     network_mode: host
     restart: unless-stopped
@@ -145,3 +178,12 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+
+# Existing installations do not have mail credentials yet. /dev/null keeps the optional rollout
+# bootable; before switching AUTH_EMAIL_ENFORCEMENT=required, point both source variables at the
+# root-owned non-empty files documented in README.md. Only token receives these mounts.
+secrets:
+  smtp_password:
+    file: ${SMTP_PASSWORD_SECRET_FILE:-/dev/null}
+  auth_code_pepper:
+    file: ${AUTH_CODE_PEPPER_SECRET_FILE:-/dev/null}

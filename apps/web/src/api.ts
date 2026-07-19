@@ -1,4 +1,8 @@
-import type { User, ServerSummary, Member, ServerDetail, InvitePreview, HistoryMessage, Role, VoiceChannel, Attachment, AdminOverview, Emote } from './types';
+import type {
+  User, ServerSummary, Member, ServerDetail, InvitePreview, HistoryMessage, Role, VoiceChannel,
+  Attachment, AdminOverview, Emote, AuthResponse, ChallengeResponse,
+  RegistrationInvite, SessionResponse,
+} from './types';
 
 let token: string | null = localStorage.getItem('sess');
 export const getToken = () => token;
@@ -59,14 +63,66 @@ export interface VoiceIntentTicket extends VoiceLeaseEvent {
   idempotent?: boolean;
 }
 
-async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code: string;
+  readonly field?: string;
+  readonly retryAfter?: number;
+  readonly details?: Record<string, unknown>;
+  readonly attemptsRemaining?: number;
+
+  constructor(message: string, options: {
+    status?: number;
+    code?: string;
+    field?: string;
+    retryAfter?: number;
+    details?: Record<string, unknown>;
+    attemptsRemaining?: number;
+  } = {}) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = options.status || 0;
+    this.code = options.code || 'UNKNOWN_ERROR';
+    this.field = options.field;
+    this.retryAfter = options.retryAfter;
+    this.details = options.details;
+    this.attemptsRemaining = options.attemptsRemaining;
+  }
+}
+
+export const isApiError = (error: unknown): error is ApiError => error instanceof ApiError;
+
+interface RequestOptions {
+  auth?: boolean;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  headers?: Record<string, string>;
+}
+
+function retryAfterSeconds(response: Response, data: any): number | undefined {
+  const raw = data?.error?.retryAfter ?? data?.error?.details?.retryAfter ?? data?.retryAfter;
+  const numeric = Number(raw);
+  if (Number.isFinite(numeric) && numeric >= 0) return Math.ceil(numeric);
+  const header = response.headers.get('Retry-After');
+  if (!header) return undefined;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds);
+  const at = Date.parse(header);
+  return Number.isFinite(at) ? Math.max(0, Math.ceil((at - Date.now()) / 1000)) : undefined;
+}
+
+async function req<T>(method: string, path: string, body?: unknown, options: RequestOptions = {}): Promise<T> {
   const headers: Record<string, string> = {};
-  if (token) headers['Authorization'] = 'Bearer ' + token;
+  if (options.auth !== false && token) headers['Authorization'] = 'Bearer ' + token;
+  Object.assign(headers, options.headers || {});
   const opt: RequestInit = { method, headers };
   if (body !== undefined) { headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
   // таймаут: мёртвый TCP иначе оставляет промис висеть вечно → «отправляется» без failed/повтора
   const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-  const timer = ctrl ? setTimeout(() => ctrl.abort(), 15000) : null;
+  const relayAbort = () => ctrl?.abort();
+  if (options.signal?.aborted) ctrl?.abort();
+  else options.signal?.addEventListener('abort', relayAbort, { once: true });
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), options.timeoutMs ?? 15000) : null;
   if (ctrl) opt.signal = ctrl.signal;
   let r: Response;
   let d: any = {};
@@ -76,20 +132,61 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
     try { d = await r.json(); parsed = true; }
     catch (e) { if (ctrl?.signal.aborted) throw e; }
   }
-  catch (e) { throw new Error(ctrl?.signal.aborted ? 'Таймаут запроса' : (e instanceof Error ? e.message : 'Сеть недоступна')); }
-  finally { if (timer !== null) clearTimeout(timer); }
-  if (!r.ok) throw new Error(d?.error || 'Ошибка ' + r.status);
+  catch (e) {
+    const externallyAborted = Boolean(options.signal?.aborted);
+    throw new ApiError(
+      externallyAborted ? 'Запрос отменён' : ctrl?.signal.aborted ? 'Сервер не ответил вовремя' : 'Не удалось связаться с сервером',
+      { code: externallyAborted ? 'REQUEST_ABORTED' : ctrl?.signal.aborted ? 'REQUEST_TIMEOUT' : 'NETWORK_ERROR' },
+    );
+  }
+  finally {
+    if (timer !== null) clearTimeout(timer);
+    options.signal?.removeEventListener('abort', relayAbort);
+  }
+  if (!r.ok) {
+    const raw = d?.error;
+    const detail = raw && typeof raw === 'object' ? raw : d;
+    const message = typeof raw === 'string' ? raw : detail?.message || 'Ошибка ' + r.status;
+    const details = detail?.details && typeof detail.details === 'object' ? detail.details as Record<string, unknown> : undefined;
+    const attemptsRemaining = Number(detail?.attemptsRemaining ?? details?.attemptsRemaining);
+    throw new ApiError(message, {
+      status: r.status,
+      code: detail?.code || (r.status === 401 ? 'UNAUTHORIZED' : 'HTTP_ERROR'),
+      field: detail?.field || details?.field as string | undefined,
+      retryAfter: retryAfterSeconds(r, d),
+      details,
+      attemptsRemaining: Number.isFinite(attemptsRemaining) && attemptsRemaining >= 0 ? Math.floor(attemptsRemaining) : undefined,
+    });
+  }
+  if (r.status === 204) return undefined as T;
   // 200, но тело не JSON (напр. index.html при неверном API_BASE в нативе) — падаем
   // громко, а не отдаём {} наверх (иначе me/servers undefined → белый экран на home).
-  if (!parsed) throw new Error('Некорректный ответ сервера (' + path + ')');
+  if (!parsed) throw new ApiError('Некорректный ответ сервера (' + path + ')', { status: r.status, code: 'INVALID_RESPONSE' });
   return d as T;
 }
 
 export const api = {
-  register: (username: string, password: string) =>
-    req<{ token: string; user: User }>('POST', '/register', { username, password }),
+  authSession: () => req<SessionResponse>('GET', '/auth/session'),
   login: (username: string, password: string) =>
-    req<{ token: string; user: User }>('POST', '/login', { username, password }),
+    req<AuthResponse>('POST', '/login', { username, password }, { auth: false }),
+  registerStart: (payload: { username: string; email: string; password: string; inviteCode: string; requestId: string }) =>
+    req<ChallengeResponse>('POST', '/auth/register/start', payload, { auth: false }),
+  registerVerify: (flowId: string, code: string) =>
+    req<AuthResponse>('POST', '/auth/register/verify', { flowId, code }, { auth: false }),
+  registerResend: (flowId: string) =>
+    req<ChallengeResponse>('POST', '/auth/register/resend', { flowId }, { auth: false }),
+  emailStart: (email: string, currentPassword: string, requestId: string, supportCode?: string) =>
+    req<ChallengeResponse>('POST', '/auth/email/start', { email, currentPassword, requestId, supportCode }),
+  emailVerify: (flowId: string, code: string) =>
+    req<SessionResponse & { token?: string }>('POST', '/auth/email/verify', { flowId, code }),
+  emailResend: (flowId: string) =>
+    req<ChallengeResponse>('POST', '/auth/email/resend', { flowId }),
+  forgotPassword: (email: string) =>
+    req<{ ok?: boolean; resendAt?: number }>('POST', '/auth/password/forgot', { email }, { auth: false }),
+  inspectPasswordReset: (token: string) =>
+    req<{ valid?: boolean; username?: string; expiresAt?: number }>('POST', '/auth/password/reset/inspect', { token }, { auth: false }),
+  resetPassword: (token: string, password: string) =>
+    req<{ ok?: boolean; username?: string }>('POST', '/auth/password/reset', { token, password }, { auth: false }),
   me: () => req<{ user: User; servers: ServerSummary[] }>('GET', '/me'),
   updateMe: (patch: { displayName?: string; bio?: string; avatarColor?: number; avatarUrl?: string; profileBannerUrl?: string }) =>
     req<{ user: User }>('PATCH', '/me', patch),
@@ -201,6 +298,19 @@ export const api = {
   adminRemoveMember: (serverId: string, userId: string) => req<{ ok: boolean }>('DELETE', `/admin/servers/${serverId}/members/${userId}`),
   adminDeleteUser: (id: string) => req<{ ok: boolean }>('DELETE', `/admin/users/${id}`),
   adminSetAdmin: (id: string, admin: boolean) => req<{ ok: boolean; isAdmin: boolean }>('POST', `/admin/users/${id}/admin`, { admin }),
+  adminEmailBindingSupportCode: (id: string) => req<{ ok: boolean; userId: string; code: string; expiresAt: number }>(
+    'POST', `/admin/users/${id}/email-binding-support-code`, {},
+  ),
+  adminRegistrationInvite: async () => {
+    const response = await req<RegistrationInvite & { validUntil?: number }>('GET', '/admin/registration-invite');
+    const rawExpiry = response.expiresAt || response.validUntil || 0;
+    return { ...response, expiresAt: rawExpiry && rawExpiry < 1_000_000_000_000 ? rawExpiry * 1000 : rawExpiry };
+  },
+  adminRotateRegistrationInvite: async () => {
+    const response = await req<RegistrationInvite & { validUntil?: number }>('POST', '/admin/registration-invite/rotate', {});
+    const rawExpiry = response.expiresAt || response.validUntil || 0;
+    return { ...response, expiresAt: rawExpiry && rawExpiry < 1_000_000_000_000 ? rawExpiry * 1000 : rawExpiry };
+  },
   // Диагностика стрима: клиент сдаёт сессию по её окончании (см. diag.ts). Тело крупнее
   // обычного (лог + семплы) — сервер парсит этот путь отдельным express.json({limit:'2mb'}).
   diagSession: (payload: unknown) => req<{ ok: boolean; name: string }>('POST', '/diag/session', payload),

@@ -720,6 +720,7 @@ class TreeManager {
 function attachTreeServer(httpServer, opts) {
   const {
     sessionSecret,
+    verifySession,
     path: wsPath = '/tree',
     stunServers = [{ urls: 'stun:stun.l.google.com:19302' }],
     turnSecret = '',           // Evolution-TZ Э3: пусто = TURN отключён (только STUN, как раньше)
@@ -746,7 +747,7 @@ function attachTreeServer(httpServer, opts) {
     if (url.pathname !== wsPath) return; // не наш путь — оставляем другим upgrade-хендлерам
     const token = url.searchParams.get('token') || '';
     let payload;
-    try { payload = jwt.verify(token, sessionSecret); }
+    try { payload = typeof verifySession === 'function' ? verifySession(token) : jwt.verify(token, sessionSecret); }
     catch (e) { tlog(`ws 401 (${e.message}) from ${req.socket.remoteAddress}`); socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
     wss.handleUpgrade(req, socket, head, (ws) => {
       ws.__uid = payload.id || payload.u || 'anon';

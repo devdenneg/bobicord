@@ -3,7 +3,40 @@ import { api, resolveUploadUrl } from '../api';
 import { useStore } from '../store';
 import { Icon } from '../Icon';
 import { avColor, initial } from '../util';
-import type { AdminOverview, AdminServer, AdminMember, AdminUser } from '../types';
+import type { AdminOverview, AdminServer, AdminMember, AdminUser, RegistrationInvite } from '../types';
+
+function RegistrationInviteCard({ invite, now, onReload, onRotate }: {
+  invite: RegistrationInvite; now: number; onReload: () => void; onRotate: () => void;
+}) {
+  const toast = useStore((state) => state.toast);
+  const expiresAt = invite.expiresAt < 1_000_000_000_000 ? invite.expiresAt * 1000 : invite.expiresAt;
+  const seconds = Math.max(0, Math.ceil((expiresAt - now) / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+  const countdown = [hours, minutes, secs].map((value) => String(value).padStart(2, '0')).join(':');
+  const expires = new Intl.DateTimeFormat('ru-RU', { day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' }).format(expiresAt);
+  const copy = () => {
+    if (!navigator.clipboard) { toast('Выделите код и скопируйте вручную', 'info'); return; }
+    navigator.clipboard.writeText(invite.code).then(() => toast('Код скопирован', 'ok')).catch(() => toast('Не удалось скопировать код', 'err'));
+  };
+  return (
+    <div className="admin-invite-card">
+      <div className="admin-invite-label"><span>Текущий код</span><i className={seconds ? 'active' : 'expired'}>{seconds ? 'действует' : 'обновляется'}</i></div>
+      <div className="admin-invite-code"><code>{invite.code}</code><button type="button" aria-label="Копировать пригласительный код" onClick={copy}><Icon name="copy" sm /><span>Копировать</span></button></div>
+      <div className="admin-invite-meta">
+        <span><b>{seconds ? countdown : '00:00:00'}</b><small>до автоматической смены</small></span>
+        <span><b>{expires}</b><small>срок действия</small></span>
+        {invite.uses != null ? <span><b>{invite.uses}{invite.maxUses != null ? ` / ${invite.maxUses}` : ''}</b><small>регистраций по коду</small></span> : null}
+        {invite.emailSends != null ? <span><b>{invite.emailSends}{invite.maxEmailSends != null ? ` / ${invite.maxEmailSends}` : ''}</b><small>писем по коду</small></span> : null}
+      </div>
+      <div className="admin-invite-actions">
+        {!seconds ? <button type="button" className="admin-invite-reload" onClick={onReload}><Icon name="refresh" sm />Получить новый код</button> : null}
+        <button type="button" className="admin-invite-reload danger" onClick={onRotate}><Icon name="refresh" sm />Сменить код сейчас</button>
+      </div>
+    </div>
+  );
+}
 
 // Минимальная админ-панель (/admin): обзор всех серверов и юзеров + удаление сервера/участника/юзера
 // и выдача админки. Доступ гейтится и на клиенте (me.isAdmin), и на сервере (requireAdmin).
@@ -14,14 +47,45 @@ export function AdminPage() {
   const [data, setData] = useState<AdminOverview | null>(null);
   const [err, setErr] = useState('');
   const [loading, setLoading] = useState(true);
-  const [tab, setTab] = useState<'servers' | 'users'>('servers');
+  const [tab, setTab] = useState<'servers' | 'users' | 'access'>('servers');
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [registrationInvite, setRegistrationInvite] = useState<RegistrationInvite | null>(null);
+  const [inviteError, setInviteError] = useState('');
+  const [inviteLoading, setInviteLoading] = useState(false);
+  const [now, setNow] = useState(Date.now());
+  const [bindingSupport, setBindingSupport] = useState<{ user: AdminUser; code: string; expiresAt: number } | null>(null);
+  const isBootstrapAdmin = me?.username === 'denis';
 
   const load = useCallback(() => {
     setLoading(true); setErr('');
     api.adminOverview().then(setData).catch((e) => setErr(e?.message || 'Ошибка')).finally(() => setLoading(false));
   }, []);
   useEffect(() => { load(); }, [load]);
+
+  const loadRegistrationInvite = useCallback(() => {
+    if (!isBootstrapAdmin) return;
+    setInviteLoading(true); setInviteError('');
+    api.adminRegistrationInvite().then(setRegistrationInvite).catch((error) => setInviteError(error?.message || 'Не удалось получить код')).finally(() => setInviteLoading(false));
+  }, [isBootstrapAdmin]);
+  const rotateRegistrationInvite = async () => {
+    if (!confirm('Сразу отозвать текущий пригласительный код? Все незавершённые регистрации с ним перестанут подтверждаться.')) return;
+    setInviteLoading(true); setInviteError('');
+    try { setRegistrationInvite(await api.adminRotateRegistrationInvite()); toast('Пригласительный код обновлён', 'ok'); }
+    catch (error: any) { setInviteError(error?.message || 'Не удалось обновить код'); }
+    finally { setInviteLoading(false); }
+  };
+  useEffect(() => { if (isBootstrapAdmin) loadRegistrationInvite(); }, [isBootstrapAdmin, loadRegistrationInvite]);
+  useEffect(() => {
+    if (tab !== 'access') return;
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [tab]);
+  useEffect(() => {
+    if (!registrationInvite?.expiresAt) return;
+    const delay = Math.min(Math.max(1000, registrationInvite.expiresAt - Date.now() + 1000), 2_147_000_000);
+    const id = window.setTimeout(loadRegistrationInvite, delay);
+    return () => clearTimeout(id);
+  }, [registrationInvite?.expiresAt, loadRegistrationInvite]);
 
   const delServer = async (s: AdminServer) => {
     if (!confirm(`Удалить сервер «${s.name}» со всеми сообщениями и участниками? Необратимо.`)) return;
@@ -37,6 +101,17 @@ export function AdminPage() {
   };
   const toggleAdmin = async (u: AdminUser) => {
     try { await api.adminSetAdmin(u.id, !u.isAdmin); load(); } catch (e: any) { toast(e?.message || 'Ошибка', 'err'); }
+  };
+  const issueBindingSupportCode = async (u: AdminUser) => {
+    if (!confirm(`Вы проверили личность ${u.displayName} (@${u.username}) вне RelayApp? Код позволит один раз привязать почту без старого пароля.`)) return;
+    try {
+      const result = await api.adminEmailBindingSupportCode(u.id);
+      setBindingSupport({ user: u, code: result.code, expiresAt: result.expiresAt });
+    } catch (e: any) { toast(e?.message || 'Не удалось выдать код', 'err'); }
+  };
+  const copyBindingSupportCode = () => {
+    if (!bindingSupport || !navigator.clipboard) { toast('Скопируйте код вручную', 'info'); return; }
+    navigator.clipboard.writeText(bindingSupport.code).then(() => toast('Одноразовый код скопирован', 'ok')).catch(() => toast('Не удалось скопировать код', 'err'));
   };
   const toggleExp = (id: string) => setExpanded((p) => { const n = new Set(p); n.has(id) ? n.delete(id) : n.add(id); return n; });
 
@@ -60,6 +135,7 @@ export function AdminPage() {
           <div className="admin-tabs">
             <button className={tab === 'servers' ? 'on' : ''} onClick={() => setTab('servers')}>Серверы</button>
             <button className={tab === 'users' ? 'on' : ''} onClick={() => setTab('users')}>Юзеры</button>
+            {isBootstrapAdmin ? <button className={tab === 'access' ? 'on' : ''} onClick={() => setTab('access')}>Доступ</button> : null}
           </div>
 
           {tab === 'servers' ? (
@@ -92,8 +168,15 @@ export function AdminPage() {
                 </div>
               ))}
             </div>
-          ) : (
+          ) : tab === 'users' ? (
             <div className="admin-list">
+              {bindingSupport ? (
+                <div className="admin-support-code" role="status">
+                  <div><span>Одноразовый код для @{bindingSupport.user.username}</span><code>{bindingSupport.code}</code><small>Действует до {new Intl.DateTimeFormat('ru-RU', { hour: '2-digit', minute: '2-digit' }).format(bindingSupport.expiresAt)}. Передайте только после проверки личности; повторно код не показывается.</small></div>
+                  <button type="button" onClick={copyBindingSupportCode}><Icon name="copy" sm /> Копировать</button>
+                  <button type="button" className="admin-support-close" aria-label="Скрыть одноразовый код" onClick={() => setBindingSupport(null)}>×</button>
+                </div>
+              ) : null}
               {data.users.map((u) => {
                 const isSelf = me?.id === u.id;
                 const isBoot = u.username === 'denis';
@@ -104,15 +187,28 @@ export function AdminPage() {
                     </span>
                     <div className="admin-unm">
                       <b>{u.displayName}{u.isAdmin ? <span className="admin-badge admin">админ</span> : null}</b>
-                      <span>@{u.username} · в {u.serverCount} серв · владелец {u.ownedCount}</span>
+                      <span>@{u.username} · {u.emailVerified ? 'почта подтверждена' : 'без почты'} · в {u.serverCount} серв · владелец {u.ownedCount}</span>
                     </div>
+                    {isBootstrapAdmin && !u.emailVerified ? <button className="admin-adm" onClick={() => issueBindingSupportCode(u)}>Код привязки</button> : null}
                     <button className="admin-adm" disabled={isBoot} onClick={() => toggleAdmin(u)}>{u.isAdmin ? 'Забрать' : 'Выдать'} админку</button>
                     <button className="admin-del" aria-label={`Удалить пользователя ${u.displayName}`} disabled={isBoot || isSelf} onClick={() => delUser(u)} data-tip={isBoot ? 'Нельзя' : isSelf ? 'Это ты' : 'Удалить юзера'}><Icon name="trash" sm /></button>
                   </div>
                 );
               })}
             </div>
-          )}
+          ) : isBootstrapAdmin ? (
+            <section className="admin-access" aria-labelledby="admin-access-title" aria-busy={inviteLoading || undefined}>
+              <div className="admin-access-head">
+                <span className="admin-access-icon"><Icon name="shield" /></span>
+                <div><span>Регистрация</span><h2 id="admin-access-title">Суточный код доступа</h2></div>
+              </div>
+              <p>Передавайте код только тем, кому разрешено создать аккаунт. Сервер автоматически заменит его после окончания срока.</p>
+              {inviteLoading && !registrationInvite ? <div className="admin-invite-state"><span className="spin" /> Получаем код…</div>
+              : inviteError ? <div className="admin-invite-state error" role="alert"><Icon name="warn" sm /><span>{inviteError}</span><button type="button" onClick={loadRegistrationInvite}>Повторить</button></div>
+              : registrationInvite ? <RegistrationInviteCard invite={registrationInvite} now={now} onReload={loadRegistrationInvite} onRotate={rotateRegistrationInvite} />
+              : null}
+            </section>
+          ) : null}
         </>
       ) : null}
     </div>

@@ -27,11 +27,11 @@ jobs:
       required_components: ${{ steps.release_note.outputs.required_components }}
       release_sequence: ${{ steps.ver.outputs.seq }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0 # полная история — иначе git rev-list --count HEAD = 1 (shallow) → версия всегда 0.1.1
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
 
@@ -41,11 +41,11 @@ jobs:
           RELEASE_SHA: ${{ github.sha }}
         run: node scripts/release-notes.mjs validate --from "$env:RELEASE_FROM" --to "$env:RELEASE_SHA"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: x86_64-pc-windows-msvc
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: apps/native/src-tauri -> target
 
@@ -137,13 +137,13 @@ jobs:
       # Payload (exe + latest.json) отдаём как артефакт — заливку на VPS делает
       # отдельный job `upload` на ubuntu (appleboy/scp-action — Docker-контейнер-экшен,
       # НЕ работает на windows-раннере: "Container action is only supported on Linux").
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-payload
           path: out/*
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: RelayApp-windows
           path: |
@@ -158,14 +158,14 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: release-payload
           path: out
 
       - name: Copy patch note payload to VPS
         if: needs.build.outputs.release_announce == 'true'
-        uses: appleboy/scp-action@v0.1.7
+        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
@@ -177,7 +177,7 @@ jobs:
       # Installer first lands outside the public updater directory. Only after the whole upload
       # succeeds do we snapshot active chats and atomically promote latest.json.
       - name: Upload desktop release to staging
-        uses: appleboy/scp-action@v0.1.7
+        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
@@ -188,7 +188,7 @@ jobs:
           rm: true
 
       - name: Promote desktop release and complete patch note
-        uses: appleboy/ssh-action@v1
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}

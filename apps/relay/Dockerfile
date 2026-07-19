@@ -7,7 +7,10 @@ FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY apps/relay-core ./apps/relay-core
 COPY apps/relay ./apps/relay
-RUN cargo build --release --manifest-path apps/relay/Cargo.toml
+# Security-boundary tests run in the same pinned dependency graph as the release binary.
+# `--release` lets the following build reuse compiled dependencies instead of building twice.
+RUN cargo test --release --locked --manifest-path apps/relay/Cargo.toml \
+    && cargo build --release --locked --manifest-path apps/relay/Cargo.toml
 
 FROM debian:bookworm-slim
 # ca-certificates — на случай TREE_WS_URL по wss:// (rustls webpki); по умолчанию агент

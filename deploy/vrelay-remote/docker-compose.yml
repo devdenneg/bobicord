@@ -17,7 +17,7 @@
 
 services:
   vrelay:
-    image: ghcr.io/devdenneg/bobicord-vrelay:latest
+    image: ghcr.io/devdenneg/bobicord-vrelay:${VRELAY_IMAGE_TAG:?VRELAY_IMAGE_TAG_is_required}
     pull_policy: always
     network_mode: host
     restart: unless-stopped
@@ -29,9 +29,10 @@ services:
         max-size: "200m"
         max-file: "3"
     environment:
-      # Тот же секрет, что у token на проде: агент минтит им session-JWT с uid virtual-relay,
-      # tree.js проверяет его на upgrade. Хранить в .env с chmod 600.
-      - SESSION_SECRET=${SESSION_SECRET}
+      # Узкоспециализированный ключ service-JWT для /tree. Пользовательский SESSION_SECRET
+      # на media VPS не копируется. Значение должно совпадать только с VRELAY_AUTH_SECRET
+      # основного token-сервиса; хранить в .env с chmod 600.
+      - VRELAY_AUTH_SECRET=${VRELAY_AUTH_SECRET:?VRELAY_AUTH_SECRET_is_required}
       # Публичный /tree прод-Caddy. wss поддержан (tokio-tungstenite, rustls-tls-webpki-roots).
       - TREE_WS_URL=${TREE_WS_URL:-wss://reelay.online/tree}
       # Прямых детей у медиаузла. Формула: (замеренная_отдача_Мбит × 0.7) / битрейт_стрима_Мбит.
@@ -50,7 +51,7 @@ services:
       - RUST_LOG=${RUST_LOG:-info}
 
   coturn:
-    image: coturn/coturn:latest
+    image: coturn/coturn:4.12.0@sha256:161cedd63c5414c2136f306098e02e9aede74606cedad8b9b8581aae1da4e732
     network_mode: host
     restart: unless-stopped
     logging:

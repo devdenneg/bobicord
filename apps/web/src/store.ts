@@ -11,16 +11,21 @@ import { initMusic } from './music';
 import { preloadSounds } from './sounds';
 import { isTauri, stopNativeBroadcast } from './native';
 import { endAnyBroadcasterSession, flushPendingDiag } from './diag';
-import type { User, ServerSummary, Member, ServerDetail, Toast, ToastKind } from './types';
+import type { User, ServerSummary, Member, ServerDetail, Toast, ToastKind, AccountStatus } from './types';
 
 let engine: Engine | null = null;
 export const getEngine = () => engine;
+export const PASSWORD_RESET_STORAGE_KEY = 'relay.auth.password-reset.v1';
 
 let saveTimer: number | null = null;
 
 interface AppState {
   view: 'loading' | 'auth' | 'home' | 'server' | 'admin';
   me: User | null;
+  pendingUser: User | null;
+  accountGate: AccountStatus | null;
+  passwordResetToken: string | null;
+  sessionError: string;
   servers: ServerSummary[];
   active: ServerDetail | null;
   members: Member[];
@@ -49,6 +54,9 @@ interface AppState {
   setModal: (m: AppState['modal'], prefill?: string) => void;
   setBroadcastLive: (v: boolean) => void;
 
+  acceptSession: (user: User, account?: AccountStatus) => Promise<void>;
+  setAccountGate: (account: AccountStatus | null) => void;
+  setPasswordResetToken: (token: string | null) => void;
   afterAuth: (user: User) => Promise<void>;
   loadMe: () => Promise<void>;
   logout: () => void;
@@ -173,7 +181,7 @@ let unreadTimer: number | null = null;
 let toastSeq = 1;
 
 export const useStore = create<AppState>((set, get) => ({
-  view: 'loading', me: null, servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, viewServerId: null, serverEntryTab: 'channels', pendingSwitchId: null, updateReady: false, nativeUpdate: null, emoteSize: (localStorage.getItem('emoteSize') as 'sm' | 'md' | 'lg') || 'md', toasts: [], modal: null, joinPrefill: '', broadcastLive: false, unread: {}, lastRead: {},
+  view: 'loading', me: null, pendingUser: null, accountGate: null, passwordResetToken: null, sessionError: '', servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, viewServerId: null, serverEntryTab: 'channels', pendingSwitchId: null, updateReady: false, nativeUpdate: null, emoteSize: (localStorage.getItem('emoteSize') as 'sm' | 'md' | 'lg') || 'md', toasts: [], modal: null, joinPrefill: '', broadcastLive: false, unread: {}, lastRead: {},
 
   toast: (text, kind) => {
     const id = toastSeq++;
@@ -183,9 +191,38 @@ export const useStore = create<AppState>((set, get) => ({
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
   setModal: (m, prefill) => set({ modal: m, joinPrefill: prefill ?? get().joinPrefill }),
   setBroadcastLive: (v) => set({ broadcastLive: v }),
+  setAccountGate: (account) => set({ accountGate: account, modal: null }),
+  setPasswordResetToken: (passwordResetToken) => {
+    try {
+      if (passwordResetToken) sessionStorage.setItem(PASSWORD_RESET_STORAGE_KEY, passwordResetToken);
+      else sessionStorage.removeItem(PASSWORD_RESET_STORAGE_KEY);
+    } catch { /* an unavailable sessionStorage must not break recovery */ }
+    set({ passwordResetToken });
+  },
 
   setMe: (u) => { engine?.setMe(u); set({ me: u }); },
   setEmoteSize: (s) => { localStorage.setItem('emoteSize', s); set({ emoteSize: s }); },
+
+  acceptSession: async (user, account = { state: 'ready' }) => {
+    if (account.state !== 'ready') {
+      set({
+        view: 'auth', me: null, pendingUser: user, accountGate: account,
+        sessionError: '', modal: null, active: null, members: [], loadingServer: false,
+        loadingServerId: null, viewServerId: null,
+      });
+      return;
+    }
+    set({ pendingUser: null, accountGate: null, sessionError: '', view: 'loading', modal: null });
+    try { await get().afterAuth(user); }
+    catch (error) {
+      engine?.disconnect(); engine = null;
+      set({
+        view: 'auth', me: null, pendingUser: null, accountGate: null,
+        sessionError: error instanceof Error ? error.message : 'Не удалось загрузить аккаунт',
+      });
+      throw error;
+    }
+  },
 
   afterAuth: async (user) => {
     // Досылаем диаг-сессии, не ушедшие в прошлый раз (сеть моргнула / апп закрыли на
@@ -249,7 +286,7 @@ export const useStore = create<AppState>((set, get) => ({
       },
     });
     engine.onEmoteResolve = (name, id) => emoteMap.set(name, id);
-    set({ me: user });
+    set({ me: user, pendingUser: null, accountGate: null, sessionError: '' });
     await get().loadMe();
     set({ view: 'home' });
     // Web-push: перепривязываем подписку к ТЕКУЩЕМУ аккаунту (endpoint переживает смену юзера/reload,
@@ -262,7 +299,14 @@ export const useStore = create<AppState>((set, get) => ({
     initMusic();       // совместное прослушивание: подписка на music-синк по data-каналу голосовой
     preloadSounds(); // прогреть звуки (fetch+decode+нормализация громкости) — первый проигрыш без задержки
     const pend = sessionStorage.getItem('pendingInvite');
-    if (pend) { sessionStorage.removeItem('pendingInvite'); set({ modal: 'join', joinPrefill: pend }); }
+    const pendingOpenServer = sessionStorage.getItem('pendingOpenServer');
+    if (pend) {
+      sessionStorage.removeItem('pendingInvite'); sessionStorage.removeItem('pendingOpenServer');
+      set({ modal: 'join', joinPrefill: pend });
+    } else if (pendingOpenServer) {
+      sessionStorage.removeItem('pendingOpenServer');
+      void get().openServer(pendingOpenServer);
+    }
   },
 
   loadMe: async () => {
