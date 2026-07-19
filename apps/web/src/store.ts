@@ -43,7 +43,7 @@ interface AppState {
   nativeUpdate: { version: string; obj: any } | null;
   emoteSize: 'sm' | 'md' | 'lg';
   toasts: Toast[];
-  modal: null | 'create' | 'join' | 'profile' | 'srvmenu' | 'invite' | 'srvsettings' | 'settings' | 'broadcast' | 'switchServer' | 'downloads' | 'leaderboard';
+  modal: null | 'create' | 'join' | 'profile' | 'srvmenu' | 'invite' | 'srvsettings' | 'settings' | 'broadcast' | 'switchServer' | 'downloads' | 'leaderboard' | 'releaseHistory';
   joinPrefill: string;
   broadcastLive: boolean;
   unread: Record<string, number>; // непрочитанные по серверам (бейдж в рейле/таскбаре)

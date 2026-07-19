@@ -52,6 +52,7 @@ import EmojiEventsRounded from '@mui/icons-material/EmojiEventsRounded';
 import MoreHorizRounded from '@mui/icons-material/MoreHorizRounded';
 import SearchRounded from '@mui/icons-material/SearchRounded';
 import MenuOpenRounded from '@mui/icons-material/MenuOpenRounded';
+import NewReleasesRounded from '@mui/icons-material/NewReleasesRounded';
 
 const MAP: Record<string, SvgIconComponent> = {
   play: PlayArrowRounded, pause: PauseRounded, 'skip-prev': SkipPreviousRounded, 'skip-next': SkipNextRounded,
@@ -74,7 +75,7 @@ const MAP: Record<string, SvgIconComponent> = {
   attach: AttachFileRounded, file: InsertDriveFileRounded,
   folder: FolderRounded, 'open-in': OpenInNewRounded,
   trophy: EmojiEventsRounded,
-  search: SearchRounded, menu: MenuOpenRounded,
+  search: SearchRounded, menu: MenuOpenRounded, updates: NewReleasesRounded,
 };
 
 export function Icon({ name, sm }: { name: string; sm?: boolean }) {

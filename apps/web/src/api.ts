@@ -1,7 +1,7 @@
 import type {
   User, ServerSummary, Member, ServerDetail, InvitePreview, HistoryMessage, Role, VoiceChannel,
   Attachment, AdminOverview, Emote, AuthResponse, ChallengeResponse,
-  RegistrationInvite, SessionResponse,
+  RegistrationInvite, ReleaseHistoryResponse, SessionResponse,
 } from './types';
 
 let token: string | null = localStorage.getItem('sess');
@@ -188,6 +188,7 @@ export const api = {
   resetPassword: (token: string, password: string) =>
     req<{ ok?: boolean; username?: string }>('POST', '/auth/password/reset', { token, password }, { auth: false }),
   me: () => req<{ user: User; servers: ServerSummary[] }>('GET', '/me'),
+  releaseHistory: (signal?: AbortSignal) => req<ReleaseHistoryResponse>('GET', '/releases/history', undefined, { signal }),
   updateMe: (patch: { displayName?: string; bio?: string; avatarColor?: number; avatarUrl?: string; profileBannerUrl?: string }) =>
     req<{ user: User }>('PATCH', '/me', patch),
   uploadImage: async (file: Blob): Promise<{ url: string; width: number; height: number }> => {

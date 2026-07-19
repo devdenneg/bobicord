@@ -34,6 +34,7 @@ function Rail() {
   const openServer = useStore((s) => s.openServer);
   const goHome = useStore((s) => s.goHome);
   const setModal = useStore((s) => s.setModal);
+  const modal = useStore((s) => s.modal);
   const goAdmin = useStore((s) => s.goAdmin);
   const unread = useStore((s) => s.unread);
   // подсвечиваем сервер только когда реально смотрим его (на главной — home активна)
@@ -60,6 +61,7 @@ function Rail() {
       <div className="rail-grow" />
       <div className="rail-tools" role="group" aria-label="Инструменты аккаунта">
         {me.isAdmin ? <button className="railbtn rail-admin tip-l" aria-label="Админка" data-tip="Админка" onClick={goAdmin}><Icon name="users" /></button> : null}
+        <button className={'railbtn rail-updates tip-l' + (modal === 'releaseHistory' ? ' active' : '')} aria-label="Что нового" aria-pressed={modal === 'releaseHistory'} data-tip="Что нового" onClick={() => setModal('releaseHistory')}><Icon name="updates" /></button>
         {/* Настройки — глобально в рейле (доступны и на главной, не только внутри сервера) */}
         <button className="railbtn rail-set tip-l" aria-label="Настройки" data-tip="Настройки" onClick={() => setModal('settings')}><Icon name="gear" /></button>
         <button className="railbtn rail-dl tip-l" aria-label="Загрузки" data-tip="Загрузки" onClick={() => setModal('downloads')}><Icon name="download" /></button>

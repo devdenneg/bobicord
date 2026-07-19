@@ -7,6 +7,7 @@ const {
   finalizeRelease,
   formatReleaseText,
   installReleaseSchema,
+  listReleaseHistory,
   parseReleaseMeta,
   prepareRelease,
 } = require('./releaseNotes');
@@ -295,6 +296,90 @@ function candidate(sha, note, components) {
   };
   runCase(true);
   runCase(false);
+})();
+
+// History is global per successful deployment, not per delivery target. It includes zero-audience
+// skips, excludes every unfinished/failed/empty row, and has a deterministic bounded order.
+(() => {
+  const db = makeDb();
+  const insert = db.prepare(`INSERT INTO deploy_releases(
+    sha,source,title,notes,version,state,created,finalized
+  ) VALUES(?,?,?,?,?,?,?,?)`);
+  const eligible = [];
+  for (let index = 0; index < 12; index++) {
+    const sha = (index + 1).toString(16).padStart(40, '0');
+    const state = index === 11 ? 'skipped' : 'published';
+    const finalized = index >= 9 ? 5000 : 1000 + index;
+    const created = index >= 10 ? 900 : 800 + index;
+    const notes = [`Улучшение номер ${index + 1} успешно доставлено пользователям.`];
+    insert.run(sha, 'web', `Обновление ${index + 1}`, JSON.stringify(notes), `1.0.${index}`, state, created, finalized);
+    eligible.push({ sha, created, finalized, state });
+  }
+
+  const excludedRows = [
+    ['a'.repeat(40), 'pending', JSON.stringify(['Это обновление ещё только готовится.']), 9000],
+    ['b'.repeat(40), 'prepared', JSON.stringify(['Это обновление ещё не завершено.']), 9001],
+    ['c'.repeat(40), 'failed', JSON.stringify(['Это обновление завершилось с ошибкой.']), 9002],
+    ['d'.repeat(40), 'superseded', JSON.stringify(['Это обновление заменено следующим.']), 9003],
+    ['e'.repeat(40), 'published', '[]', 9004],
+  ];
+  excludedRows.forEach(([sha, state, notes, finalized], index) => {
+    insert.run(sha, 'web', 'Скрытое обновление', notes, '', state, 2000 + index, finalized);
+  });
+  insert.run('f'.repeat(40), 'web', 'Без даты', JSON.stringify(['У этой записи нет даты завершения.']), '', 'published', 3000, 0);
+
+  const topSha = eligible.slice().sort((left, right) => right.finalized - left.finalized
+    || right.created - left.created || right.sha.localeCompare(left.sha))[0].sha;
+  db.prepare('INSERT INTO deploy_release_targets(sha,server_id,audience) VALUES(?,?,?)').run(topSha, 's1', 1);
+  db.prepare('INSERT INTO deploy_release_targets(sha,server_id,audience) VALUES(?,?,?)').run(topSha, 's2', 3);
+
+  const history = listReleaseHistory(db, 50);
+  const expected = eligible.slice().sort((left, right) => right.finalized - left.finalized
+    || right.created - left.created || right.sha.localeCompare(left.sha)).slice(0, 10);
+  assert.strictEqual(history.length, 10);
+  assert.deepStrictEqual(history.map((release) => release.sha), expected.map((release) => release.sha));
+  assert.ok(history.some((release) => release.sha === eligible[11].sha), 'zero-audience skip is visible');
+  assert.strictEqual(history.filter((release) => release.sha === topSha).length, 1, 'delivery targets do not duplicate a release');
+  assert.deepStrictEqual(Object.keys(history[0]), ['sha', 'title', 'notes', 'version', 'publishedAt']);
+  assert.ok(history.every((release) => Number.isSafeInteger(release.publishedAt)));
+  assert.deepStrictEqual(listReleaseHistory(db, 2).map((release) => release.sha), expected.slice(0, 2).map((release) => release.sha));
+  assert.deepStrictEqual(listReleaseHistory(db, 0), []);
+  db.close();
+})();
+
+// Public history normalizes legacy/corrupt text, removes duplicate notes and never exposes
+// internal release columns. Invalid rows do not consume one of the ten public slots.
+(() => {
+  const db = makeDb();
+  const insert = db.prepare(`INSERT INTO deploy_releases(
+    sha,source,title,notes,version,state,created,finalized
+  ) VALUES(?,?,?,?,?,?,?,?)`);
+  insert.run('b'.repeat(40), 'web', 'Повреждённая запись', '{broken', '', 'published', 3000, 7000);
+  insert.run('c'.repeat(40), 'web', 'Пустая запись', JSON.stringify(['мало', '\u0000']), '', 'skipped', 3001, 6999);
+  insert.run('8'.repeat(40), 'web', 'Legacy entry', JSON.stringify(['English-only patch note stays hidden.']), '', 'published', 3002, 6998);
+  insert.run('A'.repeat(40), 'web', '\u0000  Новое   в RelayApp \n', JSON.stringify([
+    '  Исправлена   плавность чата.  ',
+    'исправлена плавность чата.',
+    'Новая кнопка показывает прошлые обновления.',
+    { internal: 'Не строковое внутреннее значение.' },
+    '\u0000',
+  ]), ' 2.4.0-beta.1 \n', 'published', 2000, 6000);
+  insert.run('9'.repeat(40), 'web', '\u0000', JSON.stringify([
+    'История обновлений доступна на всех устройствах.',
+  ]), 'внутренняя-сборка', 'skipped', 1000, 5000);
+
+  const history = listReleaseHistory(db);
+  assert.strictEqual(history.length, 2);
+  assert.deepStrictEqual(history[0], {
+    sha: 'a'.repeat(40),
+    title: 'Новое в RelayApp',
+    notes: ['Исправлена плавность чата.', 'Новая кнопка показывает прошлые обновления.'],
+    version: '2.4.0-beta.1',
+    publishedAt: 6000,
+  });
+  assert.strictEqual(history[1].title, 'Обновление RelayApp');
+  assert.strictEqual(history[1].version, '');
+  db.close();
 })();
 
 console.log('release notes tests: ok');

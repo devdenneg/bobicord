@@ -1,6 +1,7 @@
 const SYSTEM_USER_ID = 'system:release';
 const SYSTEM_NAME = 'RelayApp';
 const RELEASE_KIND = 'release';
+const DEFAULT_RELEASE_TITLE = 'Обновление RelayApp';
 const SHA_RE = /^[0-9a-f]{40}$/i;
 const SOURCE_ORDER = ['web', 'desktop', 'manual'];
 const SAFE_SOURCE = new Set(SOURCE_ORDER);
@@ -58,6 +59,8 @@ function installReleaseSchema(db) {
     CREATE INDEX IF NOT EXISTS idx_release_targets_server ON deploy_release_targets(server_id, sha);
     CREATE INDEX IF NOT EXISTS idx_release_components_sha ON deploy_release_components(sha, completed);
     CREATE INDEX IF NOT EXISTS idx_release_commits_sha ON deploy_release_commits(release_sha, position);
+    CREATE INDEX IF NOT EXISTS idx_release_history ON deploy_releases(finalized DESC, created DESC, sha DESC)
+      WHERE state IN ('published', 'skipped');
   `);
   // The first local iterations of the feature did not have a component barrier. Keep startup
   // forward-compatible with such a DB instead of requiring a manual migration on the VPS.
@@ -182,7 +185,7 @@ function sanitizeReleasePayload(raw) {
   return {
     sha,
     source,
-    title: 'Обновление RelayApp',
+    title: DEFAULT_RELEASE_TITLE,
     notes: publish ? notes : [],
     version: /^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/u.test(version) ? version : '',
     publish: publish && notes.length > 0,
@@ -451,11 +454,64 @@ function normalizeStoredRelease(row, publishedAt) {
   if (!Array.isArray(notes) || !notes.length) return null;
   return {
     sha: row.sha,
-    title: row.title || 'Обновление RelayApp',
+    title: row.title || DEFAULT_RELEASE_TITLE,
     notes: notes.map((note) => cleanText(note, NOTE_LENGTH)).filter(Boolean).slice(0, NOTE_LIMIT),
     ...(row.version ? { version: row.version } : {}),
     ...(publishedAt ? { publishedAt } : {}),
   };
+}
+
+function normalizeReleaseHistoryRow(row) {
+  if (!row || !SHA_RE.test(String(row.sha || ''))) return null;
+  const publishedAt = Number(row.finalized);
+  if (!Number.isSafeInteger(publishedAt) || publishedAt <= 0) return null;
+  const storedNotes = safeJson(row.notes, []);
+  if (!Array.isArray(storedNotes) || !storedNotes.length) return null;
+
+  const notes = [];
+  const seen = new Set();
+  for (const value of storedNotes) {
+    if (typeof value !== 'string') continue;
+    const note = cleanText(value, NOTE_LENGTH);
+    const key = note.toLocaleLowerCase('ru-RU');
+    if (note.length < 8 || !/[А-Яа-яЁё]/u.test(note) || seen.has(key)) continue;
+    seen.add(key);
+    notes.push(note);
+    if (notes.length >= NOTE_LIMIT) break;
+  }
+  if (!notes.length) return null;
+
+  const version = cleanText(row.version, 32);
+  return {
+    sha: String(row.sha).toLowerCase(),
+    title: cleanText(row.title, 80) || DEFAULT_RELEASE_TITLE,
+    notes,
+    version: /^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/u.test(version) ? version : '',
+    publishedAt,
+  };
+}
+
+function listReleaseHistory(db, rawLimit = 10) {
+  const requestedLimit = Number(rawLimit);
+  const limit = Number.isFinite(requestedLimit)
+    ? Math.max(0, Math.min(10, Math.trunc(requestedLimit)))
+    : 10;
+  if (!limit) return [];
+
+  const releases = [];
+  const seen = new Set();
+  const rows = db.prepare(`SELECT sha,title,notes,version,created,finalized
+    FROM deploy_releases
+    WHERE state IN ('published','skipped') AND finalized>0 AND notes<>'' AND notes<>'[]'
+    ORDER BY finalized DESC,created DESC,sha DESC`).iterate();
+  for (const row of rows) {
+    const release = normalizeReleaseHistoryRow(row);
+    if (!release || seen.has(release.sha)) continue;
+    seen.add(release.sha);
+    releases.push(release);
+    if (releases.length >= limit) break;
+  }
+  return releases;
 }
 
 function formatReleaseText(notes) {
@@ -599,6 +655,7 @@ module.exports = {
   finalizeRelease,
   formatReleaseText,
   installReleaseSchema,
+  listReleaseHistory,
   parseReleaseMeta,
   prepareRelease,
   sanitizeReleasePayload,

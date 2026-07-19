@@ -10,7 +10,9 @@ const { WebSocketServer } = require('ws');
 const { attachTreeServer } = require('./tree');
 const { createVoiceLeaseStore, voiceLeaseEvent, selectVoiceState } = require('./voiceLease');
 const { installRuntimeRevocationSchema } = require('./runtimeRevocation');
-const { installReleaseSchema, parseReleaseMeta, prepareRelease, finalizeRelease } = require('./releaseNotes');
+const {
+  installReleaseSchema, listReleaseHistory, parseReleaseMeta, prepareRelease, finalizeRelease,
+} = require('./releaseNotes');
 const {
   AuthError, installAuthSchema, installVerifiedRegistrationGuard, createAuthManager, readCodePepperFile,
   passwordPrehash, formatPasswordHash,
@@ -1326,6 +1328,13 @@ async function getDetectableGames() {
 }
 app.get('/api/detectable-games', requireAuth, async (req, res) => {
   try { res.json({ games: await getDetectableGames() }); } catch (e) { res.json({ games: [] }); }
+});
+
+app.get('/api/releases/history', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+}, requireAuth, (req, res) => {
+  res.json({ releases: listReleaseHistory(db, 10) });
 });
 
 /* ---------------- PROFILE ---------------- */

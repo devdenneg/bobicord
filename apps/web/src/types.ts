@@ -59,6 +59,18 @@ export interface RegistrationInvite {
   maxEmailSends?: number;
 }
 
+export interface ReleaseHistoryItem {
+  sha: string;
+  title: string;
+  notes: string[];
+  version: string;
+  publishedAt: number;
+}
+
+export interface ReleaseHistoryResponse {
+  releases: ReleaseHistoryItem[];
+}
+
 // Админ-панель (/admin) — обзор всех серверов/юзеров
 export interface AdminMember { id: string; username: string; displayName: string; role: string }
 export interface AdminServer {

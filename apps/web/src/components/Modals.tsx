@@ -14,6 +14,7 @@ import { Backdrop } from './Backdrop';
 import { BroadcastModal } from './BroadcastModal';
 import { DownloadsModal } from './DownloadsModal';
 import { LeaderboardModal } from './Leaderboard';
+import { ReleaseHistoryModal } from './ReleaseHistoryModal';
 import { normalizeProfileBanner, ProfileBannerMedia } from './ProfileBanner';
 import { isTauri, setGlobalHotkeys } from '../native';
 import { enableNotifications, notifSupported, notifPermission } from '../notify';
@@ -632,6 +633,7 @@ export function Modals() {
     case 'switchServer': return <SwitchServerModal />;
     case 'downloads': return <DownloadsModal />;
     case 'leaderboard': return <LeaderboardModal />;
+    case 'releaseHistory': return <ReleaseHistoryModal />;
     default: return null;
   }
 }
