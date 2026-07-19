@@ -3,6 +3,7 @@
 // answerer + фанаут детям); link — общие хелперы webrtc (stats, ICE, fmtp).
 pub mod link;
 pub mod relay;
+mod fanout;
 pub mod signaling;
 // Roadmap-flow-стриминга Д2: серверный транскод рендишнов (RTP→ffmpeg→RTP) — только для
 // vrelay (virtual_relay:true), нативный passthrough-узел его никогда не активирует.

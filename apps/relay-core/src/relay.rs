@@ -43,6 +43,7 @@ use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 use webrtc::track::track_local::{TrackLocal, TrackLocalWriter};
 use webrtc::track::track_remote::TrackRemote;
 
+use crate::fanout::{DownstreamTracks, FanoutHub};
 use crate::link::{now_ms, parse_ice_server, read_link_stats, H264_FMTP};
 use crate::signaling::{self, JoinParams, TreeCmd, TreeEvent};
 use crate::transcode::{self, Feed, Transcode};
@@ -329,6 +330,9 @@ struct RelayManager {
     ice_servers: Vec<RTCIceServer>,
     video_track: Arc<TrackLocalStaticRTP>,
     audio_track: Arc<TrackLocalStaticRTP>,
+    /// Source-путь: отдельные tracks/очереди/writers на downstream. `None` только у
+    /// injected рендишн-корня, который пока сохраняет совместимый shared-track путь.
+    fanout: Option<Arc<FanoutHub>>,
     upstream: Option<Arc<RTCPeerConnection>>,
     parent_id: Option<String>,
     children: HashMap<String, Arc<RTCPeerConnection>>,
@@ -411,6 +415,7 @@ impl RelayManager {
         let registry = configure_twcc_receiver_only(registry, &mut m).map_err(|e| e.to_string())?;
         let api = APIBuilder::new().with_media_engine(m).with_interceptor_registry(registry).build();
 
+        let source_fanout = injected.is_none();
         let (video_track, audio_track) = match injected {
             Some((v, a)) => (v, a),
             None => (
@@ -427,11 +432,28 @@ impl RelayManager {
             ),
         };
 
+        let last_kf_ms = Arc::new(AtomicU64::new(0));
+        let fanout = if source_fanout {
+            let request_cmd = cmd_tx.clone();
+            let request_last = last_kf_ms.clone();
+            let request_keyframe: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                let now = now_ms();
+                if now.saturating_sub(request_last.load(Ordering::Relaxed)) >= 1_000 {
+                    request_last.store(now, Ordering::Relaxed);
+                    let _ = request_cmd.send(TreeCmd::RequestKeyframe);
+                }
+            });
+            Some(Arc::new(FanoutHub::new(stream_id.clone(), request_keyframe)))
+        } else {
+            None
+        };
+
         Ok(Self {
             api,
             ice_servers: vec![RTCIceServer { urls: vec!["stun:stun.l.google.com:19302".to_owned()], ..Default::default() }],
             video_track,
             audio_track,
+            fanout,
             upstream: None,
             parent_id: None,
             children: HashMap::new(),
@@ -439,7 +461,7 @@ impl RelayManager {
             cmd_tx,
             ui,
             stream_id,
-            last_kf_ms: Arc::new(AtomicU64::new(0)),
+            last_kf_ms,
             upstream_state: Arc::new(AtomicU8::new(0)),
             upstream_since_ms: Arc::new(AtomicU64::new(0)),
             renditions: HashMap::new(),
@@ -502,10 +524,11 @@ impl RelayManager {
             Err(e) => { log::error!("relay: upstream new_peer_connection: {e}"); return; }
         };
 
-        // Принятые треки от родителя форвардим БЕЗ транскода в локальные RTP-треки —
-        // те уже привязаны к downstream PC (дети + webview) и фанаутятся туда.
+        // Source-пакеты раскладывает SFU fanout: у каждого downstream отдельные track,
+        // очередь и writer. Shared tracks остаются только совместимым tap для рендишнов.
         let video_local = self.video_track.clone();
         let audio_local = self.audio_track.clone();
+        let fanout = self.fanout.clone();
         // Д2: горячий путь дублирования видео-RTP в транскод(ы). feed_count — быстрый гейт
         // (0 = ни одного рендишна → лок не берём, passthrough как раньше, инвариант цел).
         let video_feeds = self.video_feeds.clone();
@@ -521,6 +544,7 @@ impl RelayManager {
         pc.on_track(Box::new(move |track: Arc<TrackRemote>, _r: Arc<RTCRtpReceiver>, _t: Arc<RTCRtpTransceiver>| {
             let video_local = video_local.clone();
             let audio_local = audio_local.clone();
+            let fanout = fanout.clone();
             let video_feeds = video_feeds.clone();
             let feed_count = feed_count.clone();
             let ingest_sid = ingest_sid.clone();
@@ -550,21 +574,14 @@ impl RelayManager {
                     let (ticks_per_ms, min_gap_ticks) = if is_video { (90u32, 3000u32) } else { (48u32, 960u32) };
                     let mut epoch: Option<EpochOffsets> = None;
 
-                    // Отдача детям — в ОТДЕЛЬНОМ таске. `write_rtp` пишет каждому ребёнку по
-                    // очереди и ждёт; при забитом аплинке узла он упирается в бэкпрешер сокета.
-                    // Раньше это останавливало и чтение от родителя: внутренние буферы webrtc-rs
-                    // переполнялись, и разрывы RTP на входе списывались на «сеть». Теперь затык
-                    // отдачи стоит нам дропов в СВОЕЙ очереди — они видны отдельной цифрой.
+                    // Shared writer нужен только старому injected-пути и passthrough-аудио
+                    // активного рендишна. Обычный source сюда НЕ попадает: его раздаёт fanout
+                    // с отдельными очередями, поэтому один child не блокирует остальных.
                     let cap = if is_video { FANOUT_QUEUE_VIDEO } else { FANOUT_QUEUE_AUDIO };
                     let (tx, mut rx) = tokio::sync::mpsc::channel::<webrtc::rtp::packet::Packet>(cap);
                     let werrs = write_errs.clone();
                     let cpipe = closed_pipe.clone();
                     tokio::spawn(async move {
-                        // Пейсер фанаута УБРАН: на 1080p60 @10-12 Мбит keyframe ~500КБ не влезал в бюджет
-                        // окна, очередь (256) переполнялась → сервер САМ ронял пакеты (фанаут: дропов 1271,
-                        // penis14 2026-07-10) → потери всем зрителям. Форензика (lostPerGap≈1) показала, что
-                        // реальные потери НЕ бёрстовые, и сглаживать нечего. Пишем сразу; бэкпрешер сокета
-                        // отрабатывает try_send-очередь (её смысл — не тормозить чтение от родителя).
                         while let Some(pkt) = rx.recv().await {
                             let res = if is_video { video_local.write_rtp(&pkt).await } else { audio_local.write_rtp(&pkt).await };
                             if let Err(e) = res {
@@ -602,9 +619,18 @@ impl RelayManager {
                                 if is_video && feed_count.load(Ordering::Relaxed) > 0 {
                                     for f in video_feeds.lock().unwrap().values() { f.send_video(&packet); }
                                 }
-                                // Очередь полна — роняем пакет, но НЕ чтение. Зритель добьёт
-                                // потерю через PLI; остановка ingest ударила бы по всем сразу.
-                                if tx.try_send(packet).is_err() {
+                                // Source: быстрая раскладка Arc<Packet> по независимым child-
+                                // очередям. Возвращаемое число — потерянные КОПИИ конкретных
+                                // перегруженных downstream, здоровые очереди продолжают жить.
+                                if let Some(hub) = &fanout {
+                                    let drops = hub.publish(packet.clone(), is_video);
+                                    if drops > 0 { fanout_drops.fetch_add(drops, Ordering::Relaxed); }
+                                }
+                                // Shared track больше не обслуживает source children. Он нужен
+                                // только injected legacy-пути либо аудио активного рендишна.
+                                let needs_shared = fanout.is_none()
+                                    || (!is_video && feed_count.load(Ordering::Relaxed) > 0);
+                                if needs_shared && tx.try_send(packet).is_err() {
                                     fanout_drops.fetch_add(1, Ordering::Relaxed);
                                 }
                                 // GapHealer: дыра в видео не закрылась ретрансмитом за grace →
@@ -685,12 +711,25 @@ impl RelayManager {
     }
 
     // ---- downstream (offerer): общий код для ребёнка и webview ----
-    async fn make_downstream(&self) -> Option<Arc<RTCPeerConnection>> {
+    async fn make_downstream(
+        &self,
+        downstream_id: &str,
+    ) -> Option<(Arc<RTCPeerConnection>, Option<DownstreamTracks>)> {
         let pc = match self.api.new_peer_connection(self.config()).await {
             Ok(pc) => Arc::new(pc),
             Err(e) => { log::error!("relay: downstream new_peer_connection: {e}"); return None; }
         };
-        match pc.add_track(self.video_track.clone() as Arc<dyn TrackLocal + Send + Sync>).await {
+        // Source получает уникальные tracks. Рендишн-корень (fanout=None) сохраняет
+        // прежние injected shared tracks — поведение транскода этим изменением не затронуто.
+        // Subscriber активируем только после успешного offer, чтобы ошибка повторного
+        // assign не выбила уже работающий downstream с тем же id.
+        let isolated = self
+            .fanout
+            .as_ref()
+            .map(|hub| hub.prepare(downstream_id.to_owned()));
+        let video_track = isolated.as_ref().map(|t| t.video.clone()).unwrap_or_else(|| self.video_track.clone());
+        let audio_track = isolated.as_ref().map(|t| t.audio.clone()).unwrap_or_else(|| self.audio_track.clone());
+        match pc.add_track(video_track as Arc<dyn TrackLocal + Send + Sync>).await {
             Ok(sender) => {
                 // PLI/FIR от downstream-зрителя = «дай keyframe». Мы passthrough, сами IDR не
                 // генерим — форвардим запрос корню (сервер релеит request-keyframe -> корень
@@ -714,14 +753,31 @@ impl RelayManager {
                     }
                 });
             }
-            Err(e) => log::error!("relay: add video: {e}"),
+            Err(e) => {
+                log::error!("relay: add video: {e}");
+                if let (Some(hub), Some(tracks)) = (&self.fanout, &isolated) {
+                    hub.discard(tracks);
+                }
+                let _ = pc.close().await;
+                return None;
+            }
         }
-        if let Err(e) = pc.add_track(self.audio_track.clone() as Arc<dyn TrackLocal + Send + Sync>).await { log::error!("relay: add audio: {e}"); }
-        Some(pc)
+        if let Err(e) = pc.add_track(audio_track as Arc<dyn TrackLocal + Send + Sync>).await {
+            log::error!("relay: add audio: {e}");
+            if let (Some(hub), Some(tracks)) = (&self.fanout, &isolated) {
+                hub.discard(tracks);
+            }
+            let _ = pc.close().await;
+            return None;
+        }
+        Some((pc, isolated))
     }
 
     async fn on_assign_child(&mut self, child_id: String) {
-        let pc = match self.make_downstream().await { Some(pc) => pc, None => return };
+        let (pc, isolated) = match self.make_downstream(&child_id).await {
+            Some(downstream) => downstream,
+            None => return,
+        };
         // Просим keyframe у корня только когда транспорт ребёнка встал (Connected), а не
         // сразу при create_offer: IDR, отправленный до готовности DTLS/ICE ребёнка, до него
         // не долетает (сендер роняет пакеты для неустановленного соединения) — раньше это
@@ -750,10 +806,27 @@ impl RelayManager {
         }));
         match pc.create_offer(None).await {
             Ok(offer) => {
-                if let Err(e) = pc.set_local_description(offer.clone()).await { log::error!("relay: child set_local: {e}"); return; }
+                if let Err(e) = pc.set_local_description(offer.clone()).await {
+                    log::error!("relay: child set_local: {e}");
+                    if let (Some(hub), Some(tracks)) = (&self.fanout, &isolated) {
+                        hub.discard(tracks);
+                    }
+                    let _ = pc.close().await;
+                    return;
+                }
+                if let (Some(hub), Some(tracks)) = (&self.fanout, &isolated) {
+                    hub.activate(tracks);
+                }
                 let _ = self.cmd_tx.send(TreeCmd::Offer { to: child_id.clone(), sdp: offer.sdp });
             }
-            Err(e) => { log::error!("relay: child create_offer: {e}"); return; }
+            Err(e) => {
+                log::error!("relay: child create_offer: {e}");
+                if let (Some(hub), Some(tracks)) = (&self.fanout, &isolated) {
+                    hub.discard(tracks);
+                }
+                let _ = pc.close().await;
+                return;
+            }
         }
         if let Some(old) = self.children.insert(child_id, pc) {
             // Повторный assign того же id без leave — старый PC иначе утёк бы.
@@ -780,6 +853,7 @@ impl RelayManager {
     }
 
     async fn on_drop_peer(&mut self, peer_id: String) {
+        if let Some(hub) = &self.fanout { hub.remove(&peer_id); }
         if let Some(pc) = self.children.remove(&peer_id) { let _ = pc.close().await; }
         // если ушёл родитель — сервер пришлёт assign-parent с новым (или конец стрима)
     }
@@ -810,6 +884,7 @@ impl RelayManager {
         for id in dead {
             if let Some(pc) = self.children.remove(&id) {
                 log::info!("relay: ребёнок {id} мёртв (failed/closed) — чищу PC");
+                if let Some(hub) = &self.fanout { hub.remove(&id); }
                 let _ = pc.close().await;
             }
         }
@@ -818,7 +893,11 @@ impl RelayManager {
     // ---- webview (локальный показ через UiSink; мы offerer). Headless (ui=None) — не поднимаем. ----
     async fn start_webview(&mut self) {
         if self.ui.is_none() || self.webview.is_some() { return; }
-        let pc = match self.make_downstream().await { Some(pc) => pc, None => return };
+        const WEBVIEW_ID: &str = "__webview";
+        let (pc, isolated) = match self.make_downstream(WEBVIEW_ID).await {
+            Some(downstream) => downstream,
+            None => return,
+        };
         // Локальный показ тоже должен получить IDR когда встанет транспорт (иначе чёрный
         // экран у самого вещателя-ретранслятора до следующего случайного keyframe).
         let kf_tx = self.cmd_tx.clone();
@@ -845,12 +924,29 @@ impl RelayManager {
         }));
         match pc.create_offer(None).await {
             Ok(offer) => {
-                if let Err(e) = pc.set_local_description(offer.clone()).await { log::error!("relay: webview set_local: {e}"); return; }
+                if let Err(e) = pc.set_local_description(offer.clone()).await {
+                    log::error!("relay: webview set_local: {e}");
+                    if let (Some(hub), Some(tracks)) = (&self.fanout, &isolated) {
+                        hub.discard(tracks);
+                    }
+                    let _ = pc.close().await;
+                    return;
+                }
+                if let (Some(hub), Some(tracks)) = (&self.fanout, &isolated) {
+                    hub.activate(tracks);
+                }
                 if let Some(ui) = &self.ui {
                     ui("relay-watch-offer", json!({ "streamId": self.stream_id, "sdp": offer.sdp }));
                 }
             }
-            Err(e) => { log::error!("relay: webview create_offer: {e}"); return; }
+            Err(e) => {
+                log::error!("relay: webview create_offer: {e}");
+                if let (Some(hub), Some(tracks)) = (&self.fanout, &isolated) {
+                    hub.discard(tracks);
+                }
+                let _ = pc.close().await;
+                return;
+            }
         }
         self.webview = Some(pc);
     }
@@ -871,6 +967,9 @@ impl RelayManager {
 
     async fn close_all(&mut self) {
         if let Some(pc) = self.upstream.take() { let _ = pc.close().await; }
+        // Сначала закрываем per-viewer очереди: writer-задачи перестают принимать пакеты,
+        // затем закрытие PC освобождает bindings без хвоста отложенного видео.
+        if let Some(hub) = &self.fanout { hub.clear(); }
         if let Some(pc) = self.webview.take() { let _ = pc.close().await; }
         for (_, pc) in self.children.drain() { let _ = pc.close().await; }
         // Д2: гасим ffmpeg-транскоды (kill), иначе зомби-процессы на VPS.
@@ -962,6 +1061,7 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
                 }
                 _ = stats_tick.tick() => {
                     mgr.sweep_dead_children().await;
+                    if let Some(hub) = &mgr.fanout { hub.log_health(); }
                     // Watchdog upstream: ICE упал (Failed сразу / Disconnected дольше 6с), а WS
                     // жив — сервер не знает об обрыве, зритель фризит. Просим reparent (мы
                     // answerer, restart_ice не применим — сервер даст нового/того же родителя).
