@@ -15,7 +15,7 @@ const {
 } = require('./releaseNotes');
 const {
   AuthError, installAuthSchema, installVerifiedRegistrationGuard, createAuthManager, readCodePepperFile,
-  passwordPrehash, formatPasswordHash,
+  passwordPrehash, formatPasswordHash, verifiedEmailForOwner,
 } = require('./auth');
 const { createSmtpMailer } = require('./mailer');
 const {
@@ -637,7 +637,9 @@ function notifyServerMembers(serverId, payload) {
 }
 function serverName(sid) { const s = db.prepare('SELECT name FROM servers WHERE id=?').get(sid); return s ? s.name : 'Сервер'; }
 
-const pubUser = u => ({
+// This serializer is only for responses authenticated as this same account owner.
+// Server member/profile serializers intentionally use their own email-free shapes.
+const ownUser = u => ({
   id: u.id,
   username: u.username,
   displayName: u.display_name,
@@ -647,6 +649,7 @@ const pubUser = u => ({
   bio: u.bio,
   isAdmin: !!u.is_admin || u.username === BOOTSTRAP_ADMIN,
   emailVerified: !!u.email_verified_at,
+  email: verifiedEmailForOwner(u),
 });
 
 function publicAccountState(state) {
@@ -671,7 +674,7 @@ function publicAccountState(state) {
 }
 
 function sessionPayload(user, state = authManager.sessionState(user)) {
-  return { user: pubUser(user), account: publicAccountState(state) };
+  return { user: ownUser(user), account: publicAccountState(state) };
 }
 // Имена всегда выпускает наш upload route: 12 random bytes + расширение из проверенного MIME.
 // Узкий regexp не пропускает `..`, произвольные имена и не-image расширения в профили/чат.
@@ -1339,6 +1342,7 @@ app.get('/api/releases/history', (req, res, next) => {
 
 /* ---------------- PROFILE ---------------- */
 app.get('/api/me', requireAuth, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
   const rows = db.prepare(`
     SELECT s.*, m.role FROM servers s JOIN memberships m ON m.server_id=s.id
     WHERE m.user_id=? ORDER BY m.joined ASC`).all(req.user.id);
@@ -1348,7 +1352,7 @@ app.get('/api/me', requireAuth, async (req, res) => {
     const lr = _lastReadStmt.get(req.user.id, s.id);
     return { ...pubServer(s), role: s.role, memberCount: memberCount(s.id), online, onlineCount: online.length, unread, lastRead: lr ? lr.last_read : 0 };
   }));
-  res.json({ user: pubUser(req.user), servers });
+  res.json({ user: ownUser(req.user), servers });
 });
 
 /* live presence for one server's member list (names online right now) */
@@ -1570,6 +1574,7 @@ app.get('/api/diag/sessions/:name', requireAdmin, (req, res) => {
 });
 
 app.patch('/api/me', requireAuth, (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
   const dn = req.body.displayName != null ? String(req.body.displayName).trim().slice(0, 32) : null;
   const bio = req.body.bio != null ? String(req.body.bio).slice(0, 200) : null;
   const ac = req.body.avatarColor != null ? (parseInt(req.body.avatarColor, 10) % 8 + 8) % 8 : null;
@@ -1595,7 +1600,7 @@ app.patch('/api/me', requireAuth, (req, res) => {
     .run(dn, bio, ac, au, pbu, req.user.id);
   if (pbu !== null && previousProfileBanner && previousProfileBanner !== pbu) deleteOwnedProfileBannerIfUnused(req.user.id, previousProfileBanner);
   const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
-  res.json({ user: pubUser(u) });
+  res.json({ user: ownUser(u) });
 });
 
 /* ---------------- IMAGE UPLOADS (avatars + profile banners + chat, <=10MB) ---------------- */

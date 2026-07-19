@@ -21,6 +21,7 @@ function publishedDate(value: number) {
 
 export function ReleaseHistoryModal() {
   const close = () => useStore.getState().setModal(null);
+  const markReleaseHistoryRead = useStore((state) => state.markReleaseHistoryRead);
   const requestRef = useRef<AbortController | null>(null);
   const [releases, setReleases] = useState<ReleaseHistoryItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -34,7 +35,13 @@ export function ReleaseHistoryModal() {
     setError('');
     api.releaseHistory(controller.signal)
       .then((response) => {
-        if (!controller.signal.aborted) setReleases(Array.isArray(response.releases) ? response.releases : []);
+        if (!controller.signal.aborted) {
+          const nextReleases = Array.isArray(response.releases) ? response.releases.slice(0, 10) : [];
+          setReleases(nextReleases);
+          // Ошибка/abort не очищают индикатор: прочитанным считается только реально
+          // загруженное и показанное пользователю окно истории.
+          markReleaseHistoryRead(nextReleases);
+        }
       })
       .catch((failure: unknown) => {
         if (!controller.signal.aborted) {
@@ -44,7 +51,7 @@ export function ReleaseHistoryModal() {
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false);
       });
-  }, []);
+  }, [markReleaseHistoryRead]);
 
   useEffect(() => {
     load();

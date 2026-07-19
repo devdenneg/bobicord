@@ -7,6 +7,9 @@ export interface User {
   profileBannerUrl?: string;
   bio: string;
   isAdmin?: boolean;
+  /** Full verified address is present only in authenticated owner responses. */
+  email?: string;
+  emailVerified?: boolean;
 }
 
 export interface EmailChallenge {

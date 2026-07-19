@@ -156,6 +156,12 @@ function maskEmail(value) {
   return `${shown}${'•'.repeat(Math.max(2, Math.min(6, local.length - shown.length)))}@${email.slice(at + 1)}`;
 }
 
+// The full address is account-private data. Call this helper only while serializing the
+// authenticated account owner; public member/profile payloads must never use it.
+function verifiedEmailForOwner(row) {
+  return row && row.email_verified_at ? String(row.email || '') : '';
+}
+
 function ensureUserColumn(db, name, definition) {
   const columns = new Set(db.prepare('PRAGMA table_info(users)').all().map((column) => column.name));
   if (!columns.size) throw new Error('installAuthSchema requires an existing users table');
@@ -1156,4 +1162,5 @@ module.exports = {
   formatPasswordHash,
   readCodePepperFile,
   maskEmail,
+  verifiedEmailForOwner,
 };

@@ -37,6 +37,7 @@ function Rail() {
   const modal = useStore((s) => s.modal);
   const goAdmin = useStore((s) => s.goAdmin);
   const unread = useStore((s) => s.unread);
+  const releaseUnread = useStore((s) => s.releaseUnread);
   // подсвечиваем сервер только когда реально смотрим его (на главной — home активна)
   const activeId = view === 'server' ? (active?.id || loadingServerId) : null;
   return (
@@ -61,7 +62,13 @@ function Rail() {
       <div className="rail-grow" />
       <div className="rail-tools" role="group" aria-label="Инструменты аккаунта">
         {me.isAdmin ? <button className="railbtn rail-admin tip-l" aria-label="Админка" data-tip="Админка" onClick={goAdmin}><Icon name="users" /></button> : null}
-        <button className={'railbtn rail-updates tip-l' + (modal === 'releaseHistory' ? ' active' : '')} aria-label="Что нового" aria-pressed={modal === 'releaseHistory'} data-tip="Что нового" onClick={() => setModal('releaseHistory')}><Icon name="updates" /></button>
+        <button className={'railbtn rail-updates tip-l' + (modal === 'releaseHistory' ? ' active' : '') + (releaseUnread ? ' has-unread' : '')}
+          aria-label={releaseUnread ? `Что нового — непрочитанных обновлений: ${releaseUnread}` : 'Что нового'}
+          aria-pressed={modal === 'releaseHistory'} data-tip={releaseUnread ? `Что нового · ${releaseUnread}` : 'Что нового'}
+          onClick={() => setModal('releaseHistory')}>
+          <Icon name="updates" />
+          {releaseUnread ? <span className="rail-badge rail-release-badge" aria-hidden="true">{releaseUnread}</span> : null}
+        </button>
         {/* Настройки — глобально в рейле (доступны и на главной, не только внутри сервера) */}
         <button className="railbtn rail-set tip-l" aria-label="Настройки" data-tip="Настройки" onClick={() => setModal('settings')}><Icon name="gear" /></button>
         <button className="railbtn rail-dl tip-l" aria-label="Загрузки" data-tip="Загрузки" onClick={() => setModal('downloads')}><Icon name="download" /></button>

@@ -75,6 +75,9 @@ export function connectNotifyWs() {
     // застать переподключившийся клиент, поэтому сервер просит открытый чат сверить свежий хвост.
     if (d.t === 'chat-refresh') {
       const st = useStore.getState();
+      // Release was committed to history together with the chat card. Active clients can
+      // update the rail badge immediately; background polling remains the fallback.
+      void st.refreshReleaseHistoryUnread().catch(() => {});
       const visibleServerId = st.view === 'server' ? (st.loadingServerId || st.active?.id || st.viewServerId) : null;
       const targetSid = Number(d.lastReleaseSid);
       if (d.serverId && visibleServerId === d.serverId) {

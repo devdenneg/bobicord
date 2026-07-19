@@ -11,11 +11,47 @@ import { initMusic } from './music';
 import { preloadSounds } from './sounds';
 import { isTauri, stopNativeBroadcast } from './native';
 import { endAnyBroadcasterSession, flushPendingDiag } from './diag';
-import type { User, ServerSummary, Member, ServerDetail, Toast, ToastKind, AccountStatus } from './types';
+import type { User, ServerSummary, Member, ServerDetail, Toast, ToastKind, AccountStatus, ReleaseHistoryItem } from './types';
 
 let engine: Engine | null = null;
 export const getEngine = () => engine;
 export const PASSWORD_RESET_STORAGE_KEY = 'relay.auth.password-reset.v1';
+const RELEASE_HISTORY_SEEN_PREFIX = 'relay.release-history.seen.v1:';
+const RELEASE_SHA_RE = /^[0-9a-f]{40}$/u;
+
+function releaseHistorySeenKey(userId: string) {
+  return RELEASE_HISTORY_SEEN_PREFIX + encodeURIComponent(userId);
+}
+
+function releaseShas(releases: ReleaseHistoryItem[]) {
+  const seen = new Set<string>();
+  const shas: string[] = [];
+  for (const release of releases.slice(0, 10)) {
+    const sha = String(release?.sha || '').trim().toLowerCase();
+    if (!RELEASE_SHA_RE.test(sha) || seen.has(sha)) continue;
+    seen.add(sha);
+    shas.push(sha);
+  }
+  return shas;
+}
+
+function storedReleaseHistoryMarker(userId: string) {
+  try {
+    const marker = String(localStorage.getItem(releaseHistorySeenKey(userId)) || '').trim().toLowerCase();
+    return RELEASE_SHA_RE.test(marker) ? marker : '';
+  } catch { return ''; }
+}
+
+function countUnreadReleases(userId: string, releases: ReleaseHistoryItem[]) {
+  const shas = releaseShas(releases);
+  if (!shas.length) return 0;
+  const marker = storedReleaseHistoryMarker(userId);
+  if (!marker) return shas.length;
+  const markerIndex = shas.indexOf(marker);
+  // История ограничена десятью релизами. Если старый маркер уже выпал из окна,
+  // все доступные записи честно считаются непрочитанными.
+  return markerIndex < 0 ? shas.length : markerIndex;
+}
 
 let saveTimer: number | null = null;
 
@@ -48,6 +84,7 @@ interface AppState {
   broadcastLive: boolean;
   unread: Record<string, number>; // непрочитанные по серверам (бейдж в рейле/таскбаре)
   lastRead: Record<string, number>; // id последнего прочитанного (базовая линия дивайдера «новые»)
+  releaseUnread: number; // непрочитанные записи «Что нового» (последние 10, отдельно для аккаунта)
 
   toast: (text: string, kind?: ToastKind) => void;
   dismissToast: (id: number) => void;
@@ -72,6 +109,8 @@ interface AppState {
   markRead: (serverId: string, lastId: number, all?: boolean) => void;   // отметить прочитанным (в самом низу чата); all — «прочитать всё» (сервер last_read=MAX)
   bumpUnread: (serverId: string, n?: number) => void;     // +новое (чат/системное) когда не читаем сервер
   applyRemoteRead: (serverId: string, lastRead: number) => void; // прочитано на ДРУГОМ устройстве (notify-WS)
+  refreshReleaseHistoryUnread: () => Promise<ReleaseHistoryItem[]>;
+  markReleaseHistoryRead: (releases: ReleaseHistoryItem[]) => void;
   refreshMembers: () => Promise<void>;
   refreshServer: () => Promise<void>;
   createChannel: (name: string) => Promise<void>;
@@ -177,11 +216,13 @@ function mergeUnread(map: Record<string, number>) {
   updateAppBadge();
 }
 let unreadTimer: number | null = null;
+let releaseHistoryTimer: number | null = null;
+let releaseHistoryRequest = 0;
 
 let toastSeq = 1;
 
 export const useStore = create<AppState>((set, get) => ({
-  view: 'loading', me: null, pendingUser: null, accountGate: null, passwordResetToken: null, sessionError: '', servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, viewServerId: null, serverEntryTab: 'channels', pendingSwitchId: null, updateReady: false, nativeUpdate: null, emoteSize: (localStorage.getItem('emoteSize') as 'sm' | 'md' | 'lg') || 'md', toasts: [], modal: null, joinPrefill: '', broadcastLive: false, unread: {}, lastRead: {},
+  view: 'loading', me: null, pendingUser: null, accountGate: null, passwordResetToken: null, sessionError: '', servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, viewServerId: null, serverEntryTab: 'channels', pendingSwitchId: null, updateReady: false, nativeUpdate: null, emoteSize: (localStorage.getItem('emoteSize') as 'sm' | 'md' | 'lg') || 'md', toasts: [], modal: null, joinPrefill: '', broadcastLive: false, unread: {}, lastRead: {}, releaseUnread: 0,
 
   toast: (text, kind) => {
     const id = toastSeq++;
@@ -208,7 +249,7 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         view: 'auth', me: null, pendingUser: user, accountGate: account,
         sessionError: '', modal: null, active: null, members: [], loadingServer: false,
-        loadingServerId: null, viewServerId: null,
+        loadingServerId: null, viewServerId: null, releaseUnread: 0,
       });
       return;
     }
@@ -218,7 +259,7 @@ export const useStore = create<AppState>((set, get) => ({
       engine?.disconnect(); engine = null;
       set({
         view: 'auth', me: null, pendingUser: null, accountGate: null,
-        sessionError: error instanceof Error ? error.message : 'Не удалось загрузить аккаунт',
+        sessionError: error instanceof Error ? error.message : 'Не удалось загрузить аккаунт', releaseUnread: 0,
       });
       throw error;
     }
@@ -286,7 +327,7 @@ export const useStore = create<AppState>((set, get) => ({
       },
     });
     engine.onEmoteResolve = (name, id) => emoteMap.set(name, id);
-    set({ me: user, pendingUser: null, accountGate: null, sessionError: '' });
+    set({ me: user, pendingUser: null, accountGate: null, sessionError: '', releaseUnread: 0 });
     await get().loadMe();
     set({ view: 'home' });
     // Web-push: перепривязываем подписку к ТЕКУЩЕМУ аккаунту (endpoint переживает смену юзера/reload,
@@ -317,6 +358,9 @@ export const useStore = create<AppState>((set, get) => ({
     // лёгкий поллинг непрочитанного по всем серверам (для НЕ активных — активный ведёт клиент)
     if (unreadTimer) clearInterval(unreadTimer);
     unreadTimer = window.setInterval(async () => { try { mergeUnread(await api.getUnread()); } catch { /**/ } }, 30000);
+    if (releaseHistoryTimer) clearInterval(releaseHistoryTimer);
+    void get().refreshReleaseHistoryUnread().catch(() => {});
+    releaseHistoryTimer = window.setInterval(() => { void get().refreshReleaseHistoryUnread().catch(() => {}); }, 60000);
   },
   refreshServers: async () => { try { const d = await api.me(); set({ servers: d.servers }); mergeUnread(Object.fromEntries(d.servers.map((s) => [s.id, s.unread || 0]))); } catch { /**/ } },
   markRead: (serverId, lastId, all) => {
@@ -337,6 +381,34 @@ export const useStore = create<AppState>((set, get) => ({
   // (mergeUnread его пропускает — клиент ведёт unread сам, поэтому без этого badge завис бы до реконнекта).
   applyRemoteRead: (serverId, lastRead) => {
     set((s) => ({ unread: { ...s.unread, [serverId]: 0 }, lastRead: { ...s.lastRead, [serverId]: Math.max(s.lastRead[serverId] || 0, lastRead) } }));
+    updateAppBadge();
+  },
+  refreshReleaseHistoryUnread: async () => {
+    const userId = get().me?.id;
+    if (!userId) return [];
+    const request = ++releaseHistoryRequest;
+    const response = await api.releaseHistory();
+    const releases = Array.isArray(response.releases) ? response.releases.slice(0, 10) : [];
+    // Ответ прошлого аккаунта/запроса не должен перезаписать бейдж после relogin.
+    if (request === releaseHistoryRequest && get().me?.id === userId) {
+      set({ releaseUnread: countUnreadReleases(userId, releases) });
+      updateAppBadge();
+    }
+    return releases;
+  },
+  markReleaseHistoryRead: (releases) => {
+    const userId = get().me?.id;
+    const latestSha = releaseShas(releases)[0];
+    if (!userId) return;
+    // Не даём более раннему фоновому запросу вернуть бейдж сразу после прочтения.
+    releaseHistoryRequest++;
+    if (!latestSha) {
+      set({ releaseUnread: 0 });
+      updateAppBadge();
+      return;
+    }
+    try { localStorage.setItem(releaseHistorySeenKey(userId), latestSha); } catch { /**/ }
+    set({ releaseUnread: 0 });
     updateAppBadge();
   },
   refreshMembers: async () => {
@@ -526,6 +598,22 @@ export const useStore = create<AppState>((set, get) => ({
 // Доступное обновление тоже добавляет +1 к бейджу таскбара.
 // Presence видимого чата ведёт ServerView: только он знает mobile-tab и скрыта ли панель эфиром.
 useStore.subscribe((s, prev) => { if (s.updateReady !== prev.updateReady) updateAppBadge(); });
+
+// История читается локально, но строго в пространстве текущего account ID. Синхронизируем
+// вкладки через storage и сразу сверяемся при возврате в приложение; серверный 60-секундный
+// poll остаётся страховкой для долго открытого окна во время нового деплоя.
+function refreshReleaseHistoryOnReturn() {
+  if (!useStore.getState().me) return;
+  void useStore.getState().refreshReleaseHistoryUnread().catch(() => {});
+}
+window.addEventListener('focus', refreshReleaseHistoryOnReturn);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') refreshReleaseHistoryOnReturn();
+});
+window.addEventListener('storage', (event) => {
+  const userId = useStore.getState().me?.id;
+  if (userId && event.key === releaseHistorySeenKey(userId)) refreshReleaseHistoryOnReturn();
+});
 
 export function orderedMembers(members: Member[], presence: Record<string, { online: boolean }>): { online: Member[]; offline: Member[] } {
   const online: Member[] = [], offline: Member[] = [];

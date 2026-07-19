@@ -189,6 +189,7 @@ function ProfileModal() {
       </div>
       <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; if (f) pickAvatar(f); e.target.value = ''; }} />
       <input ref={bannerRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; if (f) pickBanner(f); e.target.value = ''; }} />
+      {me.email ? <div className="fld"><label htmlFor="profile-email">Электронная почта</label><input id="profile-email" type="email" value={me.email} readOnly autoComplete="email" /></div> : null}
       <div className="fld"><label>Отображаемое имя</label><input value={dn} maxLength={32} onChange={(e) => setDn(e.target.value)} /></div>
       <div className="fld"><label>О себе</label><textarea value={bio} maxLength={200} rows={2} placeholder="пара слов о себе" onChange={(e) => setBio(e.target.value)} /></div>
       <div className="fld"><label>Цвет аватара{avatarUrl ? ' (когда без фото)' : ''}</label><div className="colorpick">{AV_COLORS.map((c, i) => <button type="button" key={i} className={'cp' + (i === color ? ' sel' : '')} style={{ background: c }} aria-label={`Цвет аватара ${i + 1}`} aria-pressed={i === color} onClick={() => setColor(i)} />)}</div></div>

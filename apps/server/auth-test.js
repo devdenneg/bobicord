@@ -12,9 +12,16 @@ const {
   installVerifiedRegistrationGuard,
   normalizeEmail,
   validatePassword,
+  verifiedEmailForOwner,
 } = require('./auth');
 
 const STRONG_PASSWORD = 'Верный длинный пароль 2026!';
+
+test('full email is exposed only for a verified account-owner payload', () => {
+  assert.equal(verifiedEmailForOwner({ email: 'owner@example.com', email_verified_at: 1 }), 'owner@example.com');
+  assert.equal(verifiedEmailForOwner({ email: 'pending@example.com', email_verified_at: 0 }), '');
+  assert.equal(verifiedEmailForOwner(null), '');
+});
 
 function immediate() {
   return new Promise((resolve) => setImmediate(resolve));
