@@ -7,6 +7,9 @@ mod hotkeys;
 
 use std::collections::HashMap;
 use tokio::sync::Mutex;
+use windows::core::{w, PCWSTR};
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 #[tauri::command]
 fn ping() -> &'static str {
@@ -35,11 +38,26 @@ fn open_external_url(url: String) -> Result<(), String> {
   if authority.is_empty() || authority.contains('@') {
     return Err("invalid external URL".into());
   }
-  std::process::Command::new("explorer")
-    .arg(normalized)
-    .spawn()
-    .map(|_| ())
-    .map_err(|e| e.to_string())
+  // ShellExecuteW resolves the registered HTTP(S) handler, so the URL opens in the
+  // user's default browser. explorer.exe is not a URL-launching API and can instead
+  // open a regular File Explorer window on some Windows configurations.
+  let wide_url: Vec<u16> = normalized.encode_utf16().chain(std::iter::once(0)).collect();
+  let result = unsafe {
+    ShellExecuteW(
+      None,
+      w!("open"),
+      PCWSTR(wide_url.as_ptr()),
+      PCWSTR::null(),
+      PCWSTR::null(),
+      SW_SHOWNORMAL,
+    )
+  };
+  let code = result.0 as isize;
+  if code > 32 {
+    Ok(())
+  } else {
+    Err(format!("failed to open external URL (ShellExecuteW code {code})"))
+  }
 }
 
 #[derive(serde::Serialize)]

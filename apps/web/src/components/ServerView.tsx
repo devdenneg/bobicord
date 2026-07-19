@@ -801,9 +801,11 @@ function YouTubePreview({ video }: { video: YouTubeVideoRef }) {
         <span className="yt-preview-play" aria-hidden="true"><Icon name="play" /></span>
       </span>
       <span className="yt-preview-copy">
-        <span className="yt-preview-service">YouTube</span>
+        <span className="yt-preview-topline">
+          <span className="yt-preview-service">YouTube</span>
+          <span className="yt-preview-open" aria-hidden="true">Открыть <Icon name="open-in" sm /></span>
+        </span>
         <span className="yt-preview-title" title={title}>{title}</span>
-        <span className="yt-preview-open">Открыть видео <Icon name="open-in" sm /></span>
       </span>
     </ExternalLink>
   );
