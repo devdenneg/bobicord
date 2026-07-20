@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "test:links": "node src/linkify.test.mjs && node src/youtube.test.mjs",
-    "build": "npm run test:links && tsc --noEmit && vite build",
+    "test:volume": "node src/volumeCurve.test.mjs",
+    "test:chat-scroll": "node src/chatScroll.test.mjs",
+    "build": "npm run test:links && npm run test:volume && npm run test:chat-scroll && tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

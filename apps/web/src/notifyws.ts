@@ -9,6 +9,7 @@ import { useStore, getEngine } from './store';
 let ws: WebSocket | null = null;
 let reconnectTimer: number | null = null;
 let closed = false;
+let reconnectPaused = false;
 let presenceAway = false; // последнее заявленное idle-состояние (шлём серверу для away/жёлтого статуса)
 let activeChatServerId: string | null = null; // сервер, чей чат реально открыт в UI (не просто живая LiveKit-комната)
 
@@ -29,7 +30,7 @@ function onVisibilityChange(): void {
 document.addEventListener('visibilitychange', onVisibilityChange);
 
 function scheduleReconnect() {
-  if (reconnectTimer || closed) return;
+  if (reconnectTimer || closed || reconnectPaused) return;
   reconnectTimer = window.setTimeout(() => { reconnectTimer = null; connectNotifyWs(); }, 4000);
 }
 
@@ -56,6 +57,7 @@ export function acknowledgeReleaseMerge(): void {
 
 export function connectNotifyWs() {
   closed = false;
+  if (reconnectPaused) return;
   const token = getToken();
   if (!token) return;
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
@@ -111,8 +113,24 @@ export function connectNotifyWs() {
   current.onerror = () => { try { current.close(); } catch { /**/ } };
 }
 
+// Смена пароля отзывает старую сессию до того, как HTTP-ответ с новым JWT дойдёт до клиента.
+// На этом коротком промежутке нельзя позволять notify-каналу автоматически открыть сокет со
+// старым JWT. Текущий сокет закрываем, но activeChatServerId сохраняем: после handoff сервер
+// сразу снова получит точный presence открытого чата.
+export function pauseNotifyWsReconnect() {
+  reconnectPaused = true;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (ws) { const current = ws; ws = null; try { current.close(); } catch { /**/ } }
+}
+
+export function resumeNotifyWsReconnect() {
+  reconnectPaused = false;
+  connectNotifyWs();
+}
+
 export function disconnectNotifyWs() {
   closed = true;
+  reconnectPaused = false;
   activeChatServerId = null;
   sendPresenceFrame();
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }

@@ -512,6 +512,89 @@ test('forgot-password response is neutral; a 256-bit one-use token resets the pa
   assert.equal(mailer.messages.length, before);
 });
 
+test('authenticated password change keeps a fresh session, revokes old sessions and pending reset links', async (t) => {
+  const fixture = setup({ config: { passwordChangeFailureLimit: 2 } });
+  t.after(() => fixture.close());
+  const { manager, db, mailer } = fixture;
+  const currentPassword = `test-${STRONG_PASSWORD}`;
+  const invite = manager.currentInvite({ username: 'denis' });
+  const challenge = await manager.startRegistration({
+    username: 'passwordowner', password: currentPassword, email: 'passwordowner@example.com',
+    inviteCode: invite.code, requestId: 'signup-password-owner', ip: '203.0.113.70',
+  });
+  const user = manager.verifyRegistration({
+    flowId: challenge.flowId, code: latest(mailer.messages, 'code').code, ip: '203.0.113.70',
+  }).user;
+  const oldToken = manager.issueSession(user.id);
+
+  await manager.startPasswordReset({ email: 'passwordowner@example.com', ip: '203.0.113.71' });
+  await immediate();
+  const pendingReset = latest(mailer.messages, 'reset').token;
+  const nextPassword = 'Новая безопасная парольная фраза 2026!';
+  const changed = await manager.changePassword({
+    userId: user.id, currentPassword, newPassword: nextPassword, ip: '203.0.113.70',
+  });
+  assert.deepEqual(changed, {
+    ok: true, userId: user.id, username: 'passwordowner', sessionVersion: 1,
+  });
+  assert.throws(() => manager.verifySession(oldToken), errorCode('SESSION_REVOKED'));
+  const freshToken = manager.issueSession(user.id);
+  assert.equal(manager.verifySession(freshToken, { requireVerified: true }).user.id, user.id);
+  const stored = db.prepare('SELECT passhash,password_changed_at,session_version FROM users WHERE id=?').get(user.id);
+  assert.match(stored.passhash, /^prehash-v1\$/u);
+  assert.equal(stored.password_changed_at, fixture.now());
+  assert.equal(stored.session_version, 1);
+  assert.equal(await manager.comparePassword(stored.passhash, currentPassword), false);
+  assert.equal(await manager.comparePassword(stored.passhash, nextPassword), true);
+  assert.throws(() => manager.inspectPasswordReset({ token: pendingReset, ip: '203.0.113.71' }), errorCode('RESET_INVALID'));
+  await immediate();
+  const notification = latest(mailer.messages, 'changed');
+  assert.equal(notification.username, 'passwordowner');
+  assert.equal('password' in notification || 'token' in notification, false);
+
+  await assert.rejects(manager.changePassword({
+    userId: user.id, currentPassword: 'неверный пароль', newPassword: 'Ещё одна безопасная парольная фраза!', ip: '203.0.113.72',
+  }), (error) => errorCode('INVALID_CURRENT_PASSWORD')(error) && error.details.attemptsRemaining === 1);
+  await assert.rejects(manager.changePassword({
+    userId: user.id, currentPassword: 'снова неверный', newPassword: 'Ещё одна безопасная парольная фраза!', ip: '203.0.113.73',
+  }), (error) => errorCode('INVALID_CURRENT_PASSWORD')(error) && error.details.attemptsRemaining === 0);
+  await assert.rejects(manager.changePassword({
+    userId: user.id, currentPassword: 'третья попытка', newPassword: 'Ещё одна безопасная парольная фраза!', ip: '203.0.113.74',
+  }), errorCode('PASSWORD_CHANGE_RATE_LIMITED'));
+  await assert.rejects(manager.changePassword({
+    userId: user.id, currentPassword: nextPassword, newPassword: nextPassword, ip: '203.0.113.75',
+  }), errorCode('PASSWORD_CHANGE_RATE_LIMITED'));
+  fixture.advance(15 * 60 * 1000 + 1);
+  await assert.rejects(manager.changePassword({
+    userId: user.id, currentPassword: nextPassword, newPassword: nextPassword, ip: '203.0.113.75',
+  }), errorCode('PASSWORD_UNCHANGED'));
+});
+
+test('parallel password changes use compare-and-swap so only one request can win', async (t) => {
+  const fixture = setup();
+  t.after(() => fixture.close());
+  const currentPassword = 'Исходная безопасная парольная фраза!';
+  const passhash = await fixture.manager.hashPassword(currentPassword);
+  fixture.db.prepare(`INSERT INTO users(
+    id,username,display_name,passhash,avatar_color,bio,is_admin,created,email,email_key,email_verified_at
+  ) VALUES('u_password_race','passwordrace','passwordrace',?,0,'',0,1,'race@example.com','race@example.com',1)`).run(passhash);
+  const attempts = await Promise.allSettled([
+    fixture.manager.changePassword({
+      userId: 'u_password_race', currentPassword, newPassword: 'Первый новый безопасный пароль 2026!', ip: '203.0.113.74',
+    }),
+    fixture.manager.changePassword({
+      userId: 'u_password_race', currentPassword, newPassword: 'Второй новый безопасный пароль 2026!', ip: '203.0.113.74',
+    }),
+  ]);
+  assert.equal(attempts.filter((result) => result.status === 'fulfilled').length, 1);
+  const rejected = attempts.find((result) => result.status === 'rejected');
+  assert.equal(rejected?.status, 'rejected');
+  if (rejected?.status === 'rejected') assert.equal(rejected.reason.code, 'PASSWORD_CHANGE_CONFLICT');
+  assert.equal(fixture.db.prepare('SELECT session_version FROM users WHERE id=?').get('u_password_race').session_version, 1);
+  await immediate();
+  assert.equal(fixture.mailer.messages.filter((message) => message.kind === 'changed').length, 1);
+});
+
 test('login throttling persists per username and IP without making a public username globally lockable', (t) => {
   const fixture = setup({ config: { loginAccountFailureLimit: 2 } });
   t.after(() => fixture.close());

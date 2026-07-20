@@ -5,7 +5,13 @@ import { emoteMap } from './emotes';
 import { setSettings } from './settings';
 import { notifPermission } from './notify';
 import { ensurePushSubscribed, unsubscribePush } from './push';
-import { acknowledgeReleaseMerge, connectNotifyWs, disconnectNotifyWs } from './notifyws';
+import {
+  acknowledgeReleaseMerge,
+  connectNotifyWs,
+  disconnectNotifyWs,
+  pauseNotifyWsReconnect,
+  resumeNotifyWsReconnect,
+} from './notifyws';
 import { startIdleWatch } from './idle';
 import { initMusic } from './music';
 import { preloadSounds } from './sounds';
@@ -121,6 +127,22 @@ interface AppState {
 }
 
 let memberTimer: number | null = null;
+let authSessionHandoffGeneration = 0;
+let activeAuthSessionHandoffGeneration: number | null = null;
+
+function authSessionHandoffActive() {
+  return activeAuthSessionHandoffGeneration != null;
+}
+
+// Пользовательская навигация сильнее фонового восстановления после ротации JWT. Инвалидация
+// не трогает engine напрямую: следующий connectServer уже оградит старые сетевые хвосты viewEpoch,
+// а существующий голос по правилам приложения может продолжать жить при просмотре другого сервера.
+function invalidateAuthSessionHandoff(resumeNotify = true) {
+  if (activeAuthSessionHandoffGeneration == null) return;
+  activeAuthSessionHandoffGeneration = null;
+  authSessionHandoffGeneration += 1;
+  if (resumeNotify) resumeNotifyWsReconnect();
+}
 // Эпоха соединения: инкрементится каждый раз, когда engine-коннект РВЁТСЯ или ЗАМЕНЯЕТСЯ
 // (connectServer/exitServer/logout). Фоновые async-хвосты (connect IIFE, member-poll) захватывают
 // эпоху на старте и сверяют перед записью в стор/engine — иначе протухший хвост прошлого сервера
@@ -307,7 +329,7 @@ export const useStore = create<AppState>((set, get) => ({
             if (!stillCurrent()) return;
             const exactRelease = sid != null && d.messages.some((message) => message.id === sid && message.kind === 'release');
             if (sid != null && !exactRelease) { scheduleRetry(attempt); return; }
-            targetEngine?.mergeRecent(d.messages, exactRelease ? { tailSafeRelease: true } : undefined);
+            targetEngine?.mergeRecent(d.messages);
             if (exactRelease) acknowledgeReleaseMerge();
           }).catch(() => scheduleRetry(attempt));
         };
@@ -323,8 +345,12 @@ export const useStore = create<AppState>((set, get) => ({
         // Terminal LiveKit disconnect уже не восстановится внутренним reconnect. Если это открытый
         // сервер — получаем свежий token через штатный retry connectServer; голос не захватываем
         // автоматически, чтобы старый ПК после offline не выбил активный телефон.
-        if (wasViewing && get().viewServerId === serverId && get().view === 'server') void get().connectServer(serverId);
+        // Во время ротации JWT сервер намеренно закрывает старые realtime-сессии до выдачи
+        // нового токена. Автоматический retry здесь успел бы запросить LiveKit-token со старым
+        // JWT. Handoff сам восстановит нужные комнаты после setToken(newJwt).
+        if (!authSessionHandoffActive() && wasViewing && get().viewServerId === serverId && get().view === 'server') void get().connectServer(serverId);
       },
+      connectionLossExpected: authSessionHandoffActive,
     });
     engine.onEmoteResolve = (name, id) => emoteMap.set(name, id);
     set({ me: user, pendingUser: null, accountGate: null, sessionError: '', releaseUnread: 0 });
@@ -451,6 +477,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   logout: async () => {
+    invalidateAuthSessionHandoff(false);
     viewEpoch++; engine?.disconnect();
     // отписываем web-push ПОКА токен ещё текущего юзера (api.pushUnsubscribe шлёт Bearer) —
     // иначе endpoint остаётся привязан к нему на сервере и его push летели бы следующему юзеру.
@@ -464,6 +491,7 @@ export const useStore = create<AppState>((set, get) => ({
   // уже смотрю → no-op; смотримая комната уже на id (вернулся с главной) → мгновенный показ; иначе — вход
   // (connectServer сам решит: реюз живой голосовой комнаты или новый view-коннект).
   openServer: async (id, watchUser, entryTab) => {
+    invalidateAuthSessionHandoff();
     // Стрим всегда открываем сразу на сцене; обычный вход — в голосе, если вызывающий не уточнил intent.
     set({ serverEntryTab: entryTab || (watchUser ? 'main' : 'channels') });
     const s = get();
@@ -573,6 +601,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   // Подтверждение модалки переключения: рвём текущее соединение и коннектимся к цели.
   confirmSwitchServer: () => {
+    invalidateAuthSessionHandoff();
     const target = get().pendingSwitchId;
     set({ modal: null, pendingSwitchId: null });
     if (target) get().connectServer(target);
@@ -580,6 +609,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   // Полное отключение от сервера + на главную (выход/удаление сервера/ошибка коннекта).
   exitServer: () => {
+    invalidateAuthSessionHandoff();
     viewEpoch++; // in-flight connect/poll прошлого сервера устаревают
     if (memberTimer) clearInterval(memberTimer);
     // Покидаю СМОТРИМЫЙ сервер (leave/delete/ошибка). Если я в голосе ИМЕННО на нём — выхожу и из голоса
@@ -591,9 +621,119 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   // На главную БЕЗ отключения от сервера — соединение (чат/голос/пресенс) живёт, возврат мгновенный.
-  goHome: () => { if (memberTimer) clearInterval(memberTimer); if (location.pathname !== '/') history.replaceState({}, '', '/'); set({ view: 'home' }); get().refreshServers(); },
-  goAdmin: () => { if (location.pathname !== '/admin') history.pushState({}, '', '/admin'); set({ view: 'admin' }); },
+  goHome: () => { invalidateAuthSessionHandoff(); if (memberTimer) clearInterval(memberTimer); if (location.pathname !== '/') history.replaceState({}, '', '/'); set({ view: 'home' }); get().refreshServers(); },
+  goAdmin: () => { invalidateAuthSessionHandoff(); if (location.pathname !== '/admin') history.pushState({}, '', '/admin'); set({ view: 'admin' }); },
 }));
+
+export interface AuthSessionHandoff {
+  generation: number;
+  userId: string;
+  originalView: AppState['view'];
+  viewedServerId: string | null;
+  voiceServerId: string | null;
+  voiceChannelId: string | null;
+}
+
+// Фиксируем realtime-intent ДО запроса смены пароля. Notify-сокет закрывается сразу и не может
+// переподключиться со старым JWT; LiveKit остаётся жить до ответа, чтобы неверный текущий пароль
+// не создавал пользователю лишний разрыв голоса.
+export function beginAuthSessionHandoff(): AuthSessionHandoff {
+  const state = useStore.getState();
+  const snapshot = engine?.getSnapshot();
+  const generation = ++authSessionHandoffGeneration;
+  activeAuthSessionHandoffGeneration = generation;
+  pauseNotifyWsReconnect();
+  return {
+    generation,
+    userId: state.me?.id || '',
+    originalView: state.view,
+    viewedServerId: state.loadingServerId || state.viewServerId || state.active?.id || null,
+    voiceServerId: snapshot?.voiceServerId || null,
+    voiceChannelId: snapshot?.myVoiceChannel || null,
+  };
+}
+
+async function waitForRealtimeRoom(serverId: string, stillCurrent: () => boolean, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!stillCurrent()) return false;
+    const state = useStore.getState();
+    const snapshot = engine?.getSnapshot();
+    if (state.viewServerId === serverId && snapshot?.connected && snapshot.roomReady) return true;
+    if (!state.loadingServerId && state.viewServerId !== serverId) return false;
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+  }
+  return false;
+}
+
+// Вызывать только после установки нового JWT (tokenChanged=true) либо после окончательной ошибки
+// запроса (false). Функция не бросает исключений: пароль уже мог быть изменён, поэтому сбой
+// восстановления realtime не должен превращаться в ложную ошибку смены пароля.
+export async function completeAuthSessionHandoff(plan: AuthSessionHandoff, tokenChanged: boolean): Promise<void> {
+  const stillCurrent = () => activeAuthSessionHandoffGeneration === plan.generation
+    && useStore.getState().me?.id === plan.userId;
+  try {
+    if (!stillCurrent()) return;
+    const currentSnapshot = engine?.getSnapshot();
+    const viewStillAlive = !plan.viewedServerId
+      || (useStore.getState().viewServerId === plan.viewedServerId && !!currentSnapshot?.connected);
+    const voiceStillAlive = !plan.voiceChannelId
+      || (currentSnapshot?.voiceServerId === plan.voiceServerId && currentSnapshot.myVoiceChannel === plan.voiceChannelId);
+
+    if (tokenChanged) {
+      if (!stillCurrent()) return;
+      // Даже если событие серверного disconnect ещё стоит в очереди, старую комнату больше не
+      // переиспользуем: создаём её заново только после того, как api.ts уже видит новый JWT.
+      viewEpoch++;
+      if (memberTimer) clearInterval(memberTimer);
+      engine?.disconnect();
+    }
+
+    if (!stillCurrent()) return;
+    resumeNotifyWsReconnect();
+    if (!tokenChanged && viewStillAlive && voiceStillAlive) return;
+
+    const voiceServerId = plan.voiceChannelId ? plan.voiceServerId : null;
+    if (voiceServerId && plan.voiceChannelId) {
+      if (!stillCurrent()) return;
+      await useStore.getState().connectServer(voiceServerId);
+      if (!stillCurrent()) return;
+      if (await waitForRealtimeRoom(voiceServerId, stillCurrent)) {
+        if (!stillCurrent()) return;
+        await engine?.joinVoice(plan.voiceChannelId);
+        if (!stillCurrent()) return;
+      } else if (stillCurrent()) {
+        useStore.getState().toast('Пароль изменён, но голос не восстановился — подключись к каналу снова', 'warn');
+      }
+    }
+
+    if (plan.viewedServerId && plan.viewedServerId !== voiceServerId) {
+      if (!stillCurrent()) return;
+      await useStore.getState().connectServer(plan.viewedServerId);
+    } else if (plan.viewedServerId && !voiceServerId) {
+      if (!stillCurrent()) return;
+      await useStore.getState().connectServer(plan.viewedServerId);
+    }
+    if (!stillCurrent()) return;
+
+    if (plan.originalView === 'home') {
+      if (memberTimer) clearInterval(memberTimer);
+      if (location.pathname !== '/') history.replaceState({}, '', '/');
+      useStore.setState({ view: 'home' });
+      void useStore.getState().refreshServers();
+    }
+    else if (plan.originalView === 'admin') {
+      if (memberTimer) clearInterval(memberTimer);
+      useStore.setState({ view: 'admin' });
+    }
+  } catch {
+    if (!stillCurrent()) return;
+    resumeNotifyWsReconnect();
+    useStore.getState().toast('Сеанс обновлён, realtime-связь восстановится при повторном входе на сервер', 'warn');
+  } finally {
+    if (activeAuthSessionHandoffGeneration === plan.generation) activeAuthSessionHandoffGeneration = null;
+  }
+}
 
 // Доступное обновление тоже добавляет +1 к бейджу таскбара.
 // Presence видимого чата ведёт ServerView: только он знает mobile-tab и скрыта ли панель эфиром.

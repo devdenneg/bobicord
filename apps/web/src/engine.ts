@@ -14,6 +14,7 @@ import type { VideoTransport } from './transport/videoTransport';
 import { LiveKitVideoTransport } from './transport/livekitVideo';
 import { TreeVideoTransport } from './transport/treeVideo';
 import { createDenoiseNode, destroyDenoiseNode } from './denoise';
+import { userVolumeToGain } from './volumeCurve';
 import type { RnnoiseWorkletNode } from '@sapphi-red/web-noise-suppressor';
 
 export interface GameStatus { name: string; icon?: string }
@@ -75,6 +76,7 @@ interface EngineHooks {
   editMessage?: (serverId: string, sid: number, text: string) => void;   // персист редактирования
   deleteMessage?: (serverId: string, sid: number) => void;               // персист удаления
   connectionLost?: (serverId: string, voiceChannel: string | null, wasViewing: boolean) => void;
+  connectionLossExpected?: () => boolean;
 }
 
 let msgSeq = 1;
@@ -670,7 +672,9 @@ export class Engine {
       document.querySelectorAll('#audioSink audio[data-origin="view"]').forEach((a) => a.remove());
       this.screenAudioEls.clear();
     }
-    this.hooks.toast(wasVoice ? 'Голосовая связь оборвалась — подключись снова' : 'Realtime-связь оборвалась — переподключаюсь…', 'warn');
+    if (!this.hooks.connectionLossExpected?.()) {
+      this.hooks.toast(wasVoice ? 'Голосовая связь оборвалась — подключись снова' : 'Realtime-связь оборвалась — переподключаюсь…', 'warn');
+    }
     this.emit();
     this.hooks.connectionLost?.(serverId, lostChannel, wasViewing);
   }
@@ -718,7 +722,7 @@ export class Engine {
     this.clearAllWatches();
     this.liveKitT.detach(); this.treeT.detach(); this.screenAudioEls.clear();
     this.streamWatchers.clear();
-    this.perMuteByServer.clear(); this.volsByServer.clear(); this.messages = []; this.tailSafeReleaseSids.clear(); this.reactions.clear(); this.reactionWrites.clear(); this.reactionWriteSeq.clear(); this.reactionWriteDesired.clear(); this.pendingSend.clear(); this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0; ++this.chatGeneration;
+    this.perMuteByServer.clear(); this.volsByServer.clear(); this.messages = []; this.reactions.clear(); this.reactionWrites.clear(); this.reactionWriteSeq.clear(); this.reactionWriteDesired.clear(); this.pendingSend.clear(); this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0; ++this.chatGeneration;
     this.onlineHint.clear(); this.awayHint.clear(); this.voiceHint = {}; this.typingUsers.clear();
     this.activeVoiceSessions.clear();
     this.subscriptionRetries.clear();
@@ -736,7 +740,7 @@ export class Engine {
   detachView() {
     ++this.connectEpoch;
     this.resetStreamEdges();
-    this.messages = []; this.tailSafeReleaseSids.clear(); this.reactions.clear(); this.reactionWrites.clear(); this.reactionWriteSeq.clear(); this.reactionWriteDesired.clear(); this.pendingSend.clear(); this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0; ++this.chatGeneration;
+    this.messages = []; this.reactions.clear(); this.reactionWrites.clear(); this.reactionWriteSeq.clear(); this.reactionWriteDesired.clear(); this.pendingSend.clear(); this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0; ++this.chatGeneration;
     this.clearAllWatches(); this.streamWatchers.clear();
     // presence-хинты и typing принадлежат ПРЕДЫДУЩЕМУ смотримому серверу
     this.onlineHint.clear(); this.awayHint.clear(); this.voiceHint = {}; this.typingUsers.clear();
@@ -1123,11 +1127,10 @@ export class Engine {
       const changes = current.changes + 1;
       const messages = [...this.messages];
       const updated = { ...messages[messageIndex], text: `${baseText} · статус менялся ${changes}×`, ts: now };
-      // The aggregate now represents the newest edge. If unrelated system rows were
-      // appended after it, move the stable row to the tail instead of leaving a fresh
-      // timestamp in the middle of older content.
-      messages.splice(messageIndex, 1);
-      messages.push(updated);
+      // Keep the aggregate at the same virtual index. Moving an existing key from the middle
+      // to the tail without a matching firstItemIndex delta invalidates Virtuoso's size anchor
+      // and used to make the viewport jump during noisy stream reconnects.
+      messages[messageIndex] = updated;
       this.messages = messages;
       this.streamStateMessages.set(username, { messageId: current.messageId, lastAt: now, changes });
       this.emit();
@@ -2346,7 +2349,9 @@ export class Engine {
   // восстанавливает). Прямой проход по каждому участнику этого промаха лишён.
   private applyVolumeToParticipant(p: Participant) {
     const u = baseUid(p.identity);
-    const v = (this.deafened || this.muteSet(this.voiceServerId).has(u)) ? 0 : (getSettings().master / 100) * this.voiceUserVolOf(u);
+    const v = (this.deafened || this.muteSet(this.voiceServerId).has(u))
+      ? 0
+      : (getSettings().master / 100) * userVolumeToGain(this.voiceUserVolOf(u));
     try {
       if ((p as any).setVolume) (p as any).setVolume(v);
     } catch { /** webAudio watchdog/reattach повторит; element остаётся muted, обход gain запрещён */ }
@@ -2468,7 +2473,6 @@ export class Engine {
   }
   private chatRefreshTimers = new Map<string, number>();
   private lastChatRefresh = new Map<string, number>();
-  private tailSafeReleaseSids = new Set<number>();
   refreshChat(targetSid?: number, logicalServerId?: string) {
     const exactSid = Number.isSafeInteger(targetSid) && (targetSid || 0) > 0 ? targetSid : undefined;
     // Notify-WS может восстановиться раньше LiveKit. Для exact release сервер чата приходит
@@ -2523,7 +2527,6 @@ export class Engine {
     this.streamStateMessages.clear();
     this.reactions.clear();
     this.messages = this.mapHistory(list);
-    this.tailSafeReleaseSids.clear();
     this.chatMore = hasMore;
     this.oldestSid = list.length ? (list[0].id ?? null) : null; // list в ASC-порядке, [0] — самое старое
     this.trimmedFront = 0; this.chatPrepended = 0; // новая история — счётчики якоря virtuoso сбрасываются
@@ -2536,13 +2539,8 @@ export class Engine {
   //    Совпавшему live-сообщению «усыновляем» серверный sid — дальше дедуп идёт по sid.
   // Оптимистичные и чужие realtime-копии сохраняют локальный id; история лишь усыновляет sid
   // и авторитетные поля, поэтому React-ключи не прыгают при восстановлении связи.
-  mergeRecent(list: HistoryMessage[], options?: { tailSafeRelease?: boolean }) {
+  mergeRecent(list: HistoryMessage[]) {
     if (!list.length) return;
-    if (options?.tailSafeRelease) {
-      for (const message of list) {
-        if (message.kind === 'release' && message.id != null && Number.isSafeInteger(message.id)) this.tailSafeReleaseSids.add(message.id);
-      }
-    }
     const existingBySid = new Map<number, ChatMessage>();
     const duplicateLocalIds = new Set<number>();
     this.messages.forEach((message) => {
@@ -2644,23 +2642,11 @@ export class Engine {
     const mapped = this.mapHistory(add);
     if (mapped.length) merged = [...merged, ...mapped];
     if (mapped.length || adopted || canonicalized || duplicateLocalIds.size) {
-      // HTTP can return an older missed row after a newer realtime row has already
-      // arrived. Sort the union by canonical time/sid while preserving every existing
-      // local id (React key) and using the prior order as the final stable tie-breaker.
-      // Exact release recovery is intentionally append-only. Inserting a tall card into
-      // the middle changes Virtuoso indexes without a matching firstItemIndex delta and
-      // moves the viewport. A repeated exact fetch canonicalizes the same local row in place.
-      this.messages = options?.tailSafeRelease || this.tailSafeReleaseSids.size > 0
-        ? merged
-        : merged
-          .map((message, index) => ({ message, index }))
-          .sort((a, b) => {
-            const byTime = (a.message.ts ?? 0) - (b.message.ts ?? 0);
-            if (byTime) return byTime;
-            if (a.message.sid != null && b.message.sid != null && a.message.sid !== b.message.sid) return a.message.sid - b.message.sid;
-            return a.index - b.index;
-          })
-          .map(({ message }) => message);
+      // Preserve the relative order and virtual index of every existing local key. A whole-list
+      // timestamp sort during reconnect could move the previous tail into the middle, making old
+      // rows look like a fresh suffix and invalidating Virtuoso's measured anchor. Genuinely missed
+      // rows already arrive in server order and are appended once; known rows are canonicalized in place.
+      this.messages = merged;
     }
     pendingReactionAdoptions.forEach(([localId, sid]) => {
       if (this.adoptPendingReactions(localId, sid)) reactionsChanged = true;
@@ -2688,7 +2674,6 @@ export class Engine {
     ++this.chatGeneration;
     this.streamStateMessages.clear();
     this.messages = [];
-    this.tailSafeReleaseSids.clear();
     this.dataSend({ t: 'clear', by: byName || this.me.displayName });
     this.emit();
     this.sysMsg((byName || this.me.displayName) + ' очистил чат');
@@ -2927,7 +2912,7 @@ export class Engine {
           notify('mention', { title: d.name, body: String(d.text || '').slice(0, 140) || fallback, tag: 'mention:' + this.viewServerId });
         }
       }
-      else if (d.t === 'clear') { ++this.chatGeneration; this.streamStateMessages.clear(); this.messages = []; this.tailSafeReleaseSids.clear(); this.reactions.clear(); this.emit(); this.sysMsg((d.by || 'Админ') + ' очистил чат'); }
+      else if (d.t === 'clear') { ++this.chatGeneration; this.streamStateMessages.clear(); this.messages = []; this.reactions.clear(); this.emit(); this.sysMsg((d.by || 'Админ') + ' очистил чат'); }
       else if (d.t === 'emote') this.emoteListeners.forEach((f) => f(d.s, d.e, d.by, d.x, d.sz));
       else if (d.t === 'watch') { const m = this.wset(d.s); if (d.on) m.set(d.id, { name: d.n, color: d.c ?? 0, avatarUrl: d.a, ts: Date.now() }); else m.delete(d.id); this.emit(); }
       else if (d.t === 'typing') { if (d.name && d.name !== this.me.displayName) { this.typingUsers.set(d.name, Date.now() + 3500); this.emit(); setTimeout(() => this.pruneTyping(), 3600); } }

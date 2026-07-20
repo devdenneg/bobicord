@@ -187,6 +187,8 @@ export const api = {
     req<{ valid?: boolean; username?: string; expiresAt?: number }>('POST', '/auth/password/reset/inspect', { token }, { auth: false }),
   resetPassword: (token: string, password: string) =>
     req<{ ok?: boolean; username?: string }>('POST', '/auth/password/reset', { token, password }, { auth: false }),
+  changePassword: (currentPassword: string, newPassword: string) =>
+    req<AuthResponse>('POST', '/auth/password/change', { currentPassword, newPassword }),
   me: () => req<{ user: User; servers: ServerSummary[] }>('GET', '/me'),
   releaseHistory: (signal?: AbortSignal) => req<ReleaseHistoryResponse>('GET', '/releases/history', undefined, { signal }),
   updateMe: (patch: { displayName?: string; bio?: string; avatarColor?: number; avatarUrl?: string; profileBannerUrl?: string }) =>

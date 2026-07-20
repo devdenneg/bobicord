@@ -42,6 +42,8 @@ const DEFAULTS = Object.freeze({
   emailEnforcement: 'optional',
   loginIpLimit: 30,
   loginAccountFailureLimit: 8,
+  passwordChangeIpLimit: 20,
+  passwordChangeFailureLimit: 5,
 });
 
 class AuthError extends Error {
@@ -438,6 +440,24 @@ function createAuthManager(options) {
       fail(429, 'RATE_LIMITED', 'Слишком много попыток. Попробуйте позже.', { retryAfterMs: result.retryAfterMs });
     }
     return result;
+  }
+
+  // Невлияющая на счётчик проверка уже исчерпанного окна. Нужна перед дорогой
+  // проверкой секрета: успешное значение не должно обходить активную блокировку,
+  // а один заблокированный запрос не должен продлевать окно сам по себе.
+  function inspectRate(scope, subject, limit, windowMs) {
+    const at = now();
+    const row = db.prepare('SELECT * FROM auth_rate_limits WHERE scope=? AND key_hash=?')
+      .get(scope, rateHash(scope, subject));
+    if (!row || at - row.window_started >= windowMs) {
+      return { allowed: true, remaining: Math.max(0, limit), retryAfterMs: 0 };
+    }
+    const count = Math.max(0, Number(row.count) || 0);
+    return {
+      allowed: count < limit,
+      remaining: Math.max(0, limit - count),
+      retryAfterMs: count < limit ? 0 : Math.max(1, windowMs - (at - row.window_started)),
+    };
   }
 
   function clearRate(scope, subject) {
@@ -1000,6 +1020,78 @@ function createAuthManager(options) {
     return { ok: true, userId: changed.userId, username: changed.username };
   }
 
+  async function changePassword(input) {
+    const userId = String(input.userId || '');
+    const ip = normalizedIp(input.ip);
+    consumeIpRate('password-change-ip', ip, config.passwordChangeIpLimit, 60 * 60 * 1000);
+    const user = db.prepare('SELECT * FROM users WHERE id=?').get(userId);
+    if (!user) fail(401, 'UNAUTHORIZED', 'Не авторизован.');
+
+    const currentPassword = String(input.currentPassword || '');
+    // Ошибки текущего пароля считаются на весь аккаунт: украденная сессия не должна
+    // получать новый бюджет перебора простой сменой адреса. Отдельный IP-лимит выше
+    // сдерживает распределённую нагрузку на bcrypt и не раскрывает пароль.
+    const failureSubject = user.id;
+    const failureWindowMs = 15 * 60 * 1000;
+    const existingFailureRate = inspectRate('password-change-fail', failureSubject,
+      config.passwordChangeFailureLimit, failureWindowMs);
+    if (!existingFailureRate.allowed) {
+      fail(429, 'PASSWORD_CHANGE_RATE_LIMITED', 'Слишком много попыток. Попробуйте позже.', {
+        field: 'currentPassword', retryAfterMs: existingFailureRate.retryAfterMs,
+      });
+    }
+    const currentValid = currentPassword.length > 0 && currentPassword.length <= 1024
+      ? await comparePassword(user.passhash, currentPassword)
+      : false;
+    if (!currentValid) {
+      const rate = consumeRate('password-change-fail', failureSubject,
+        config.passwordChangeFailureLimit, failureWindowMs, { quiet: true });
+      if (!rate.allowed) {
+        fail(429, 'PASSWORD_CHANGE_RATE_LIMITED', 'Слишком много попыток. Попробуйте позже.', {
+          field: 'currentPassword', retryAfterMs: rate.retryAfterMs,
+        });
+      }
+      fail(400, 'INVALID_CURRENT_PASSWORD', 'Текущий пароль указан неверно.', {
+        field: 'currentPassword', attemptsRemaining: rate.remaining,
+      });
+    }
+    clearRate('password-change-fail', failureSubject);
+
+    const nextCredential = validatePassword(input.newPassword, { username: user.username, email: user.email });
+    if (nextCredential === currentPassword.normalize('NFC')) {
+      fail(400, 'PASSWORD_UNCHANGED', 'Новый пароль должен отличаться от текущего.', { field: 'newPassword' });
+    }
+    const passhash = await hashPassword(nextCredential);
+    const change = db.transaction(() => {
+      const at = now();
+      // Сравнение старого хеша не даёт двум параллельным запросам последовательно
+      // перезаписать пароль, хотя оба начали проверку с одной и той же учётной записью.
+      const updated = db.prepare(`UPDATE users
+        SET passhash=?,password_changed_at=?,session_version=session_version+1
+        WHERE id=? AND passhash=?`).run(passhash, at, user.id, user.passhash);
+      if (updated.changes !== 1) {
+        fail(409, 'PASSWORD_CHANGE_CONFLICT', 'Пароль уже был изменён. Повторите вход и попробуйте снова.');
+      }
+      db.prepare('UPDATE auth_password_resets SET used=1 WHERE user_id=? AND used=0').run(user.id);
+      const fresh = db.prepare('SELECT * FROM users WHERE id=?').get(user.id);
+      return {
+        to: fresh.email_verified_at ? fresh.email : '',
+        userId: fresh.id,
+        username: fresh.username,
+        sessionVersion: Number(fresh.session_version) || 0,
+        changedAt: at,
+      };
+    });
+    const changed = change.immediate ? change.immediate() : change();
+    if (changed.to) dispatchMail(() => mailer.sendPasswordChanged(changed), 'password-changed');
+    return {
+      ok: true,
+      userId: changed.userId,
+      username: changed.username,
+      sessionVersion: changed.sessionVersion,
+    };
+  }
+
   function sessionState(userOrId) {
     const user = typeof userOrId === 'object' && userOrId
       ? userOrId
@@ -1134,6 +1226,7 @@ function createAuthManager(options) {
     startPasswordReset,
     inspectPasswordReset,
     completePasswordReset,
+    changePassword,
     sessionState,
     currentInvite,
     rotateInvite,

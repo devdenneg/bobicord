@@ -1,7 +1,12 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { Room } from 'livekit-client';
-import { api, resolveUploadUrl, webOrigin } from '../api';
-import { useStore, getEngine } from '../store';
+import { api, isApiError, resolveUploadUrl, setToken, webOrigin } from '../api';
+import {
+  beginAuthSessionHandoff,
+  completeAuthSessionHandoff,
+  useStore,
+  getEngine,
+} from '../store';
 import { getSettings, setSettings } from '../settings';
 import { THEMES, getTheme, setTheme } from '../theme';
 import { playSound } from '../sounds';
@@ -87,29 +92,101 @@ function cropSquare(file: File, size: number): Promise<Blob> {
   });
 }
 
+type ProfileTab = 'profile' | 'security';
+type PasswordField = 'currentPassword' | 'newPassword' | 'confirmPassword';
+type PasswordFailure = { message: string; field?: PasswordField };
+
+const PROFILE_PASSWORD_MIN = 15;
+const PROFILE_PASSWORD_MAX = 64;
+// HTML maxLength считает UTF-16 units, а сервер — Unicode code points. Запасной
+// cap защищает DOM от огромной строки, не обрезая корректные пароли с emoji.
+const PROFILE_PASSWORD_INPUT_MAX = 256;
+const textLength = (value: string) => Array.from(value.normalize('NFC')).length;
+
+function ProfilePasswordInput({ id, label, value, autoComplete, maxLength, hint, error, disabled, onChange }: {
+  id: string;
+  label: string;
+  value: string;
+  autoComplete: 'current-password' | 'new-password';
+  maxLength: number;
+  hint: string;
+  error?: string;
+  disabled?: boolean;
+  onChange: (value: string) => void;
+}) {
+  const [visible, setVisible] = useState(false);
+  const hintId = `${id}-hint`;
+  const errorId = `${id}-error`;
+  return <div className="fld pm-password-field">
+    <label htmlFor={id}>{label}</label>
+    <div className="auth-password">
+      <input id={id} type={visible ? 'text' : 'password'} value={value} maxLength={maxLength}
+        name={autoComplete} autoComplete={autoComplete} autoCapitalize="none" spellCheck={false}
+        required aria-required="true" disabled={disabled}
+        aria-invalid={error ? true : undefined} aria-describedby={`${hintId}${error ? ` ${errorId}` : ''}`}
+        onChange={(event) => onChange(event.target.value)} />
+      <button type="button" className="auth-password-toggle" aria-pressed={visible} disabled={disabled}
+        aria-label={visible ? `Скрыть поле «${label}»` : `Показать поле «${label}»`}
+        onClick={() => setVisible((current) => !current)}>
+        <Icon name={visible ? 'eye-off' : 'eye'} sm />
+      </button>
+    </div>
+    <div id={hintId} className="auth-hint">{hint}</div>
+    {error ? <div id={errorId} className="auth-field-error" role="alert">{error}</div> : null}
+  </div>;
+}
+
 function ProfileModal() {
   const me = useStore((s) => s.me)!;
-  const [dn, setDn] = useState(me.displayName); const [bio, setBio] = useState(me.bio || ''); const [color, setColor] = useState(me.avatarColor);
+  const [tab, setTab] = useState<ProfileTab>('profile');
+  const [dn, setDn] = useState(me.displayName);
+  const [bio, setBio] = useState(me.bio || '');
+  const [color, setColor] = useState(me.avatarColor);
   const [avatarUrl, setAvatarUrl] = useState(me.avatarUrl || '');
   const [bannerUrl, setBannerUrl] = useState(normalizeProfileBanner(me.profileBannerUrl));
-  const [err, setErr] = useState(''); const [busy, setBusy] = useState(false); const [uploading, setUploading] = useState(false);
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const [bannerUploading, setBannerUploading] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [passwordBusy, setPasswordBusy] = useState(false);
+  const [passwordFailure, setPasswordFailure] = useState<PasswordFailure | null>(null);
+  const [passwordSuccess, setPasswordSuccess] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
   const bannerRef = useRef<HTMLInputElement>(null);
   const bannerAbortRef = useRef<AbortController | null>(null);
   const bannerUploadSeq = useRef(0);
   const pendingLocalBannerRef = useRef('');
+  const profileDirty = dn.trim() !== me.displayName || bio !== (me.bio || '') || color !== me.avatarColor
+    || avatarUrl !== (me.avatarUrl || '') || bannerUrl !== normalizeProfileBanner(me.profileBannerUrl);
+  const profileNeedsAttention = Boolean(err || !dn.trim());
+  const hasPasswordDraft = Boolean(currentPassword || newPassword || confirmPassword);
+  const interactionLocked = busy || passwordBusy || uploading || bannerUploading;
   const cleanupPendingLocalBanner = (preserve = '') => {
     const url = pendingLocalBannerRef.current;
     if (!url || url === preserve) return;
     pendingLocalBannerRef.current = '';
     api.deleteProfileBannerUpload(url).catch(() => {});
   };
-  const close = () => {
+  const performClose = () => {
     bannerUploadSeq.current += 1;
     bannerAbortRef.current?.abort();
     cleanupPendingLocalBanner();
     useStore.getState().setModal(null);
+  };
+  const requestClose = () => {
+    if (interactionLocked) return;
+    if (profileDirty || hasPasswordDraft) {
+      const message = profileDirty && hasPasswordDraft
+        ? 'Изменения профиля и введённые пароли не сохранены. Закрыть окно и сбросить их?'
+        : profileDirty
+          ? 'Изменения профиля не сохранены. Закрыть окно и сбросить их?'
+          : 'Введённые пароли будут очищены. Закрыть окно?';
+      if (!window.confirm(message)) return;
+    }
+    performClose();
   };
   const cancelBannerUpload = () => {
     bannerUploadSeq.current += 1;
@@ -122,34 +199,59 @@ function ProfileModal() {
     bannerAbortRef.current?.abort();
     cleanupPendingLocalBanner();
   }, []);
+
+  function selectTab(next: ProfileTab, focus = false) {
+    if (passwordBusy) return;
+    setTab(next);
+    if (focus) requestAnimationFrame(() => document.getElementById(`profile-tab-${next}`)?.focus());
+  }
+  function onTabKeyDown(event: ReactKeyboardEvent<HTMLButtonElement>) {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+    event.preventDefault();
+    selectTab(tab === 'profile' ? 'security' : 'profile', true);
+  }
   async function pickAvatar(file: File) {
-    if (!file.type.startsWith('image/')) { setErr('Можно только картинки'); return; }
-    if (file.size > 10 * 1024 * 1024) { setErr('Картинка больше 10 МБ'); return; }
+    if (!file.type.startsWith('image/')) { setErr('Выберите изображение в формате PNG, JPEG, GIF или WebP.'); return; }
+    if (file.size > 10 * 1024 * 1024) { setErr('Размер изображения не должен превышать 10 МБ.'); return; }
     setUploading(true); setErr('');
     try { const blob = await cropSquare(file, 256); const { url } = await api.uploadImage(blob); setAvatarUrl(url); }
-    catch (e: any) { setErr(e?.message || 'Ошибка загрузки'); }
+    catch (e: any) { setErr(e?.message || 'Не удалось загрузить изображение.'); }
     finally { setUploading(false); }
   }
   async function save() {
-    setBusy(true);
+    if (!dn.trim()) {
+      requestAnimationFrame(() => document.getElementById('profile-display-name')?.focus());
+      return;
+    }
+    if (!profileDirty || busy) return;
+    setBusy(true); setErr('');
     try {
       const d = await api.updateMe({ displayName: dn.trim(), bio, avatarColor: color, avatarUrl, profileBannerUrl: bannerUrl });
       if (pendingLocalBannerRef.current === bannerUrl) pendingLocalBannerRef.current = '';
-      useStore.getState().setMe(d.user); useStore.getState().refreshMembers(); useStore.getState().refreshServers(); close(); useStore.getState().toast('Профиль сохранён', 'ok');
+      useStore.getState().setMe(d.user);
+      useStore.getState().refreshMembers();
+      useStore.getState().refreshServers();
+      performClose();
+      useStore.getState().toast('Профиль сохранён', 'ok');
     }
-    catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    catch (e: any) { setErr(e?.message || 'Не удалось сохранить профиль.'); }
+    finally { setBusy(false); }
   }
   async function pickBanner(file: File) {
     const allowed = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
-    if (!allowed.has(file.type)) { setErr('Фон: PNG, JPEG, WebP или GIF'); return; }
-    if (file.size > 10 * 1024 * 1024) { setErr('Фон больше 10 МБ'); return; }
+    if (!allowed.has(file.type)) { setErr('Для фона подойдут PNG, JPEG, WebP или GIF.'); return; }
+    if (file.size > 10 * 1024 * 1024) { setErr('Размер фона не должен превышать 10 МБ.'); return; }
     bannerAbortRef.current?.abort();
     const sequence = ++bannerUploadSeq.current;
     const controller = new AbortController();
     bannerAbortRef.current = controller;
     setBannerUploading(true); setErr('');
     try {
-      const prepared = file.type === 'image/gif' ? file : await downscaleImage(file, 1600, .84);
+      // Canvas/downscale уничтожает анимацию. GIF и WebP отправляем как есть (размер уже
+      // ограничен выше), чтобы animated WebP действительно продолжал играть в профиле.
+      const prepared = file.type === 'image/gif' || file.type === 'image/webp'
+        ? file
+        : await downscaleImage(file, 1600, .84);
       if (controller.signal.aborted || sequence !== bannerUploadSeq.current) return;
       const { url } = await api.uploadProfileBanner(prepared, controller.signal);
       if (controller.signal.aborted || sequence !== bannerUploadSeq.current) {
@@ -160,44 +262,158 @@ function ProfileModal() {
       pendingLocalBannerRef.current = url;
       setBannerUrl(url);
     } catch (e: any) {
-      if (sequence === bannerUploadSeq.current && e?.name !== 'AbortError') setErr(e?.message || 'Ошибка загрузки фона');
+      if (sequence === bannerUploadSeq.current && e?.name !== 'AbortError') setErr(e?.message || 'Не удалось загрузить фон.');
     } finally {
       if (sequence === bannerUploadSeq.current) { bannerAbortRef.current = null; setBannerUploading(false); }
     }
   }
-  return <Backdrop onClose={close} label="Профиль" boxClass="profile-modal">
-    <button className="settings-x" onClick={close} aria-label="Закрыть"><Icon name="close" /></button>
+  function editPassword(setter: (value: string) => void, value: string) {
+    setter(value);
+    setPasswordFailure(null);
+    setPasswordSuccess('');
+  }
+  function rejectPassword(message: string, field?: PasswordField) {
+    setPasswordFailure({ message, field });
+    if (field) requestAnimationFrame(() => document.getElementById(`profile-${field}`)?.focus());
+  }
+  async function changePassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!currentPassword) { rejectPassword('Введите текущий пароль.', 'currentPassword'); return; }
+    const nextLength = textLength(newPassword);
+    if (nextLength < PROFILE_PASSWORD_MIN) { rejectPassword(`Используйте не менее ${PROFILE_PASSWORD_MIN} символов.`, 'newPassword'); return; }
+    if (nextLength > PROFILE_PASSWORD_MAX) { rejectPassword(`Используйте не более ${PROFILE_PASSWORD_MAX} символов.`, 'newPassword'); return; }
+    if (newPassword !== confirmPassword) { rejectPassword('Пароли не совпадают.', 'confirmPassword'); return; }
+    if (newPassword.normalize('NFC') === currentPassword.normalize('NFC')) { rejectPassword('Новый пароль должен отличаться от текущего.', 'newPassword'); return; }
+    setPasswordBusy(true); setPasswordFailure(null); setPasswordSuccess('');
+    const handoff = beginAuthSessionHandoff();
+    let tokenChanged = false;
+    try {
+      const response = await api.changePassword(currentPassword, newPassword.normalize('NFC'));
+      setToken(response.token);
+      tokenChanged = true;
+      useStore.getState().setMe(response.user);
+      setCurrentPassword(''); setNewPassword(''); setConfirmPassword('');
+      setPasswordSuccess('Пароль изменён. Остальные сеансы завершены, а это окно осталось авторизованным.');
+      void syncPushPrefs();
+      // Ротация учётных данных уже завершена. Восстановление LiveKit может занять до 20 секунд
+      // при сетевой проблеме и не должно удерживать форму в состоянии «Меняем пароль…».
+      void completeAuthSessionHandoff(handoff, true);
+      useStore.getState().toast('Пароль изменён', 'ok');
+    } catch (error) {
+      await completeAuthSessionHandoff(handoff, tokenChanged);
+      if (tokenChanged) {
+        useStore.getState().toast('Пароль изменён, но соединение потребуется открыть заново', 'warn');
+        return;
+      }
+      if (isApiError(error)) {
+        const fieldByCode: Record<string, PasswordField> = {
+          INVALID_CURRENT_PASSWORD: 'currentPassword', PASSWORD_CHANGE_RATE_LIMITED: 'currentPassword',
+          WEAK_PASSWORD: 'newPassword', PASSWORD_TOO_LONG: 'newPassword', PASSWORD_UNCHANGED: 'newPassword',
+        };
+        const rawField = error.field;
+        const field = rawField === 'currentPassword' || rawField === 'newPassword' || rawField === 'confirmPassword'
+          ? rawField : fieldByCode[error.code];
+        let message = error.message || 'Не удалось изменить пароль.';
+        if (error.attemptsRemaining !== undefined && error.code === 'INVALID_CURRENT_PASSWORD') message += ` Осталось попыток: ${error.attemptsRemaining}.`;
+        if (error.retryAfter) message += ` Повторите через ${error.retryAfter < 60 ? `${error.retryAfter} сек.` : `${Math.ceil(error.retryAfter / 60)} мин.`}`;
+        rejectPassword(message, field);
+      } else rejectPassword(error instanceof Error ? error.message : 'Не удалось изменить пароль.');
+    } finally { setPasswordBusy(false); }
+  }
+  const passwordFieldError = (field: PasswordField) => passwordFailure?.field === field ? passwordFailure.message : '';
+  const passwordGeneralError = passwordFailure && !passwordFailure.field ? passwordFailure.message : '';
+
+  return <Backdrop onClose={requestClose} label="Профиль и безопасность" boxClass="profile-modal">
+    <button type="button" className="settings-x" disabled={interactionLocked} onClick={requestClose} aria-label="Закрыть"><Icon name="close" /></button>
     <div className={'pm-hero' + (bannerUrl ? ' has-banner' : '')}>
       <ProfileBannerMedia value={bannerUrl} className="pm-hero-banner" />
-      <div className="pm-banner-actions" aria-label="Фон профиля">
-        <button type="button" disabled={bannerUploading || busy} aria-label="Загрузить фон профиля" data-tip="Картинка, GIF или animated WebP" onClick={() => bannerRef.current?.click()}>{bannerUploading ? <span className="spin" /> : <Icon name="image" sm />}<span>Фон</span></button>
-        {bannerUrl ? <button type="button" disabled={bannerUploading || busy} className="danger" aria-label="Убрать фон профиля" data-tip="Убрать фон" onClick={() => { cancelBannerUpload(); cleanupPendingLocalBanner(); setBannerUrl(''); }}><Icon name="close" sm /></button> : null}
+      <div className="pm-banner-actions" role="group" aria-label="Фон профиля">
+        <button type="button" disabled={bannerUploading || busy || passwordBusy} aria-label="Сменить фон профиля" data-tip="PNG, JPEG, GIF или WebP, до 10 МБ" onClick={() => bannerRef.current?.click()}>
+          {bannerUploading ? <span className="spin" /> : <Icon name="image" sm />}<span>{bannerUrl ? 'Сменить фон' : 'Добавить фон'}</span>
+        </button>
+        {bannerUrl ? <button type="button" disabled={bannerUploading || busy || passwordBusy} className="danger pm-banner-remove" aria-label="Убрать фон профиля"
+          onClick={() => { cancelBannerUpload(); cleanupPendingLocalBanner(); setBannerUrl(''); }}><Icon name="trash" sm /><span>Убрать</span></button> : null}
       </div>
-      <button type="button" className="pm-av" onClick={() => fileRef.current?.click()} aria-label="Загрузить аватар" title="Загрузить аватар" style={{ background: avatarUrl ? '#0000' : avColor(dn, color) }}>
+      <button type="button" className="pm-av" disabled={uploading || busy || passwordBusy} onClick={() => fileRef.current?.click()} aria-label="Сменить аватар"
+        title="Сменить аватар" style={{ background: avatarUrl ? '#0000' : avColor(dn, color) }}>
         {avatarUrl ? <img className="avimg" src={resolveUploadUrl(avatarUrl)} alt="" /> : initial(dn)}
         {uploading ? <span className="spin" style={{ position: 'absolute', inset: 0, margin: 'auto' }} /> : <span className="pm-av-edit"><Icon name="edit" sm /></span>}
       </button>
-      <div className="pm-id">
-        <div className="pm-nm">{dn.trim() || 'Без имени'}</div>
-        <div className="pm-un">@{me.username}</div>
-      </div>
+      <div className="pm-id"><div className="pm-nm">{dn.trim() || 'Без имени'}</div><div className="pm-un">@{me.username}</div></div>
     </div>
-    <div className="pm-body">
-      <div className="pm-avbtns">
-        <button className="ghost" style={{ margin: 0, padding: '7px 14px', fontSize: 13, width: 'auto' }} disabled={uploading} onClick={() => fileRef.current?.click()}>{uploading ? 'Загрузка…' : 'Загрузить фото'}</button>
-        {avatarUrl ? <button className="ghost" style={{ margin: 0, padding: '7px 14px', fontSize: 13, width: 'auto', color: 'var(--red)' }} onClick={() => setAvatarUrl('')}>Убрать</button> : null}
+    <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" hidden onChange={(e) => { const file = e.target.files?.[0]; if (file) void pickAvatar(file); e.target.value = ''; }} />
+    <input ref={bannerRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" hidden onChange={(e) => { const file = e.target.files?.[0]; if (file) void pickBanner(file); e.target.value = ''; }} />
+    <div className="pm-tabs" role="tablist" aria-label="Настройки аккаунта">
+      <button id="profile-tab-profile" type="button" role="tab" aria-selected={tab === 'profile'} aria-controls="profile-panel-profile"
+        disabled={passwordBusy} tabIndex={tab === 'profile' ? 0 : -1} className={(tab === 'profile' ? 'active' : '') + (profileDirty || profileNeedsAttention ? ' has-draft' : '')}
+        aria-label={profileNeedsAttention ? 'Профиль, требуется внимание' : profileDirty ? 'Профиль, есть несохранённые изменения' : 'Профиль'}
+        onKeyDown={onTabKeyDown} onClick={() => selectTab('profile')}>
+        <Icon name="edit" sm />Профиль{profileDirty || profileNeedsAttention ? <span className={'pm-tab-dot' + (profileNeedsAttention ? ' error' : '')} aria-hidden="true" /> : null}
+      </button>
+      <button id="profile-tab-security" type="button" role="tab" aria-selected={tab === 'security'} aria-controls="profile-panel-security"
+        disabled={passwordBusy} tabIndex={tab === 'security' ? 0 : -1} className={tab === 'security' ? 'active' : ''} onKeyDown={onTabKeyDown} onClick={() => selectTab('security')}><Icon name="shield" sm />Безопасность</button>
+    </div>
+    <form id="profile-panel-profile" className="pm-body pm-profile-panel" role="tabpanel" hidden={tab !== 'profile'} tabIndex={tab === 'profile' ? 0 : -1} aria-labelledby="profile-tab-profile"
+      noValidate onSubmit={(event) => { event.preventDefault(); void save(); }}>
+      <div className="pm-profile-scroll">
+        <section className="pm-section" aria-labelledby="profile-main-heading">
+        <div className="pm-section-head"><div><h3 id="profile-main-heading">Основная информация</h3><p>Имя и описание видны участникам ваших серверов.</p></div></div>
+        <div className="pm-avbtns" aria-describedby="profile-avatar-help">
+          <button type="button" className="ghost" disabled={uploading || busy} onClick={() => fileRef.current?.click()}><Icon name="image" sm />{uploading ? 'Загрузка…' : avatarUrl ? 'Сменить фото' : 'Добавить фото'}</button>
+          {avatarUrl ? <button type="button" className="ghost danger" disabled={uploading || busy} onClick={() => { setAvatarUrl(''); setErr(''); }}><Icon name="trash" sm />Убрать</button> : null}
+        </div>
+        <div id="profile-avatar-help" className="pm-field-note">Изображение обрежется до квадрата. Максимальный размер — 10 МБ.</div>
+        <div className="fld">
+          <div className="pm-field-head"><label htmlFor="profile-display-name">Отображаемое имя</label><span>{textLength(dn)}/32</span></div>
+          <input id="profile-display-name" name="displayName" value={dn} maxLength={32} autoComplete="nickname"
+            aria-invalid={!dn.trim() || undefined} aria-describedby={`profile-display-name-help${!dn.trim() ? ' profile-display-name-error' : ''}`}
+            onChange={(e) => { setDn(e.target.value); setErr(''); }} />
+          <div id="profile-display-name-help" className="pm-field-note">Так вас увидят в чатах и списках участников.</div>
+          {!dn.trim() ? <div id="profile-display-name-error" className="auth-field-error" role="alert">Введите отображаемое имя.</div> : null}
+        </div>
+        <div className="fld">
+          <div className="pm-field-head"><label htmlFor="profile-bio">О себе</label><span>{textLength(bio)}/200</span></div>
+          <textarea id="profile-bio" value={bio} maxLength={200} rows={3} placeholder="Расскажите немного о себе"
+            aria-describedby="profile-bio-help" onChange={(e) => { setBio(e.target.value); setErr(''); }} />
+          <div id="profile-bio-help" className="pm-field-note">Необязательно. Можно оставить поле пустым.</div>
+        </div>
+        </section>
+        <section className="pm-section" aria-labelledby="profile-look-heading">
+        <div className="pm-section-head"><div><h3 id="profile-look-heading">Цвет аватара</h3><p>{avatarUrl ? 'Используется, если фотография недоступна.' : 'Помогает отличать вас в списках и чате.'}</p></div></div>
+        <div className="colorpick" role="group" aria-label="Цвет аватара">{AV_COLORS.map((value, index) => <button type="button" key={value}
+          className={'cp' + (index === color ? ' sel' : '')} style={{ background: value }} aria-label={`Цвет ${index + 1}`} aria-pressed={index === color}
+          onClick={() => { setColor(index); setErr(''); }} />)}</div>
+        </section>
+        {err ? <div className="pm-inline-error" role="alert"><Icon name="warn" sm /><span>{err}</span></div> : null}
       </div>
-      <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; if (f) pickAvatar(f); e.target.value = ''; }} />
-      <input ref={bannerRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; if (f) pickBanner(f); e.target.value = ''; }} />
-      {me.email ? <div className="fld"><label htmlFor="profile-email">Электронная почта</label><input id="profile-email" type="email" value={me.email} readOnly autoComplete="email" /></div> : null}
-      <div className="fld"><label>Отображаемое имя</label><input value={dn} maxLength={32} onChange={(e) => setDn(e.target.value)} /></div>
-      <div className="fld"><label>О себе</label><textarea value={bio} maxLength={200} rows={2} placeholder="пара слов о себе" onChange={(e) => setBio(e.target.value)} /></div>
-      <div className="fld"><label>Цвет аватара{avatarUrl ? ' (когда без фото)' : ''}</label><div className="colorpick">{AV_COLORS.map((c, i) => <button type="button" key={i} className={'cp' + (i === color ? ' sel' : '')} style={{ background: c }} aria-label={`Цвет аватара ${i + 1}`} aria-pressed={i === color} onClick={() => setColor(i)} />)}</div></div>
-      <div className="err">{err}</div>
       <div className="pm-foot">
-        <button className="ghost pm-logout" style={{ margin: 0 }} onClick={() => { cleanupPendingLocalBanner(); useStore.getState().logout(); }}><Icon name="leave" sm />Выйти</button>
-        <button className="primary" style={{ margin: 0 }} disabled={busy || uploading || bannerUploading} onClick={save}>Сохранить</button>
+        <span className={profileDirty ? 'changed' : ''}>{profileDirty ? 'Есть несохранённые изменения' : 'Все изменения сохранены'}</span>
+        <button type="submit" className="primary" disabled={!profileDirty || !dn.trim() || busy || uploading || bannerUploading}>{busy ? <><span className="spin" />Сохраняем…</> : 'Сохранить'}</button>
       </div>
+    </form>
+    <div id="profile-panel-security" className="pm-body pm-security" role="tabpanel" hidden={tab !== 'security'} tabIndex={tab === 'security' ? 0 : -1} aria-labelledby="profile-tab-security">
+      <section className="pm-section" aria-labelledby="profile-account-heading">
+        <div className="pm-section-head"><div><h3 id="profile-account-heading">Учётная запись</h3><p>Данные для входа и восстановления доступа.</p></div></div>
+        <div className="pm-account-row"><span className="pm-account-icon"><Icon name="check" sm /></span><div><span>Электронная почта</span><strong>{me.email || 'Не привязана'}</strong></div><span className={me.emailVerified ? 'verified' : 'pending'}>{me.emailVerified ? 'Подтверждена' : 'Не подтверждена'}</span></div>
+      </section>
+      <section className="pm-section" aria-labelledby="profile-password-heading">
+        <div className="pm-section-head"><div><h3 id="profile-password-heading">Смена пароля</h3><p>После сохранения остальные устройства выйдут из аккаунта.</p></div></div>
+        <form className="pm-password-form" noValidate onSubmit={changePassword}>
+          <ProfilePasswordInput id="profile-currentPassword" label="Текущий пароль" value={currentPassword} maxLength={1024} disabled={passwordBusy}
+            autoComplete="current-password" hint="Подтвердите действие действующим паролем." error={passwordFieldError('currentPassword')}
+            onChange={(value) => editPassword(setCurrentPassword, value)} />
+          <ProfilePasswordInput id="profile-newPassword" label="Новый пароль" value={newPassword} maxLength={PROFILE_PASSWORD_INPUT_MAX} disabled={passwordBusy}
+            autoComplete="new-password" hint={`От ${PROFILE_PASSWORD_MIN} до ${PROFILE_PASSWORD_MAX} символов. Лучше использовать длинную парольную фразу.`} error={passwordFieldError('newPassword')}
+            onChange={(value) => editPassword(setNewPassword, value)} />
+          <ProfilePasswordInput id="profile-confirmPassword" label="Повторите новый пароль" value={confirmPassword} maxLength={PROFILE_PASSWORD_INPUT_MAX} disabled={passwordBusy}
+            autoComplete="new-password" hint="Повторите новый пароль без изменений." error={passwordFieldError('confirmPassword')}
+            onChange={(value) => editPassword(setConfirmPassword, value)} />
+          {passwordGeneralError ? <div className="auth-form-error" role="alert"><Icon name="warn" sm /><span>{passwordGeneralError}</span></div> : null}
+          {passwordSuccess ? <div className="pm-password-success" role="status"><Icon name="check" sm /><span>{passwordSuccess}</span></div> : null}
+          <button type="submit" className="primary pm-password-submit" disabled={passwordBusy}>{passwordBusy ? <><span className="spin" />Меняем пароль…</> : 'Сменить пароль'}</button>
+        </form>
+      </section>
+      <div className="pm-session-actions"><div><strong>Завершить текущий сеанс</strong><span>На этом устройстве потребуется снова ввести логин и пароль.</span></div><button type="button" className="ghost pm-logout" disabled={interactionLocked} onClick={() => { cleanupPendingLocalBanner(); useStore.getState().logout(); }}><Icon name="leave" sm />Выйти</button></div>
     </div>
   </Backdrop>;
 }

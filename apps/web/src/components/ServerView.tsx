@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from 'react';
-import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
+import { Virtuoso, type ScrollSeekConfiguration, type ScrollSeekPlaceholderProps, type VirtuosoHandle } from 'react-virtuoso';
 import { useStore, getEngine } from '../store';
 import { api, resolveUploadUrl } from '../api';
 import { useEngine } from '../hooks';
@@ -22,6 +22,13 @@ import { getDownloads, addDownload, subscribeDownloads, type DownloadItem } from
 import { sendActiveChat } from '../notifyws';
 import { linkifyHttpUrls } from '../linkify';
 import { fetchTitle, parseYouTubeVideo, type YouTubeVideoRef } from '../youtube';
+import {
+  CHAT_BOTTOM_ENTER_PX,
+  CHAT_BOTTOM_LEAVE_PX,
+  chatBottomDistance,
+  reduceChatScrollState,
+  type ChatScrollDirection,
+} from '../chatScroll';
 import type { Attachment, ChatMessage, Emote, Leaderboard, Member, MemberStats, ReleaseNote, ReplyRef, Role } from '../types';
 import { PERM, hasPerm } from '../types';
 
@@ -994,23 +1001,41 @@ const COMMANDS: { name: string; desc: string }[] = [
 // Базовый индекс для virtuoso firstItemIndex: при догрузке старых сообщений его уменьшаем
 // на кол-во добавленных сверху — так virtuoso держит якорь скролла на месте (prepend-паттерн).
 const VIRT_BASE_INDEX = 1_000_000;
-const CHAT_STRICT_BOTTOM_PX = 8;
-// Raw scroll writes closer than this are visually meaningless, but can fight Virtuoso's
-// fractional ResizeObserver compensation and create a visible 1px up/down feedback loop.
-const CHAT_BOTTOM_EPSILON_PX = 1.25;
 
 // Шапка списка чата: спиннер во время догрузки старых сообщений / метка начала истории.
 // Определена на уровне модуля (стабильная ссылка) — иначе virtuoso ремонтит её на каждый рендер.
 // Лоадер догрузки вынесен из хедера в absolute-оверлей (#chat) — иначе смена высоты хедера в потоке
 // списка дёргала якорь virtuoso (прыжок). Здесь остаётся только фикс-высокая метка «начало истории».
-function ChatOlderHeader({ context }: { context?: { busy?: boolean; hasMore?: boolean } }) {
+function ChatOlderHeader({ context }: { context?: ChatVirtuosoContext }) {
   return (
     <div className="virt-head">
       {context && !context.hasMore ? <span className="virt-head-end">Начало истории</span> : null}
     </div>
   );
 }
-function ChatFooter() { return <div style={{ height: 12 }} />; }
+type ChatVirtuosoContext = {
+  busy?: boolean;
+  hasMore?: boolean;
+  tailRef?: (node: HTMLDivElement | null) => void;
+};
+
+function ChatFooter({ context }: { context?: ChatVirtuosoContext }) {
+  return <div ref={context?.tailRef} className="chat-tail-sentinel" />;
+}
+
+function ChatScrollPlaceholder({ height }: ScrollSeekPlaceholderProps) {
+  return <div className="chat-scroll-placeholder" style={{ height }} aria-hidden="true" />;
+}
+
+const CHAT_SCROLL_SEEK: ScrollSeekConfiguration = {
+  enter: (velocity) => Math.abs(velocity) > 700,
+  exit: (velocity) => Math.abs(velocity) < 120,
+};
+const CHAT_VIRTUOSO_COMPONENTS = {
+  Header: ChatOlderHeader,
+  Footer: ChatFooter,
+  ScrollSeekPlaceholder: ChatScrollPlaceholder,
+};
 
 // Группировка подряд идущих сообщений одного автора (как в Telegram): шапка (имя/время) —
 // только у первого сообщения группы. Группу разрывают: смена автора, системное сообщение,
@@ -1118,23 +1143,28 @@ function Chat() {
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const scrollerElementRef = useRef<HTMLElement | null>(null);
   const detachScrollerRef = useRef<(() => void) | null>(null);
-  const bottomStackRef = useRef<HTMLDivElement>(null);
-  const bottomLockFrameRef = useRef<number | null>(null);
-  const bottomLockPassesRef = useRef(0);
+  const tailElementRef = useRef<HTMLDivElement | null>(null);
+  const tailObserverRef = useRef<IntersectionObserver | null>(null);
+  const bottomSnapFrameRef = useRef<number | null>(null);
+  const bottomSnapBehaviorRef = useRef<'auto' | 'smooth'>('auto');
+  const geometryFrameRef = useRef<number | null>(null);
+  const userDirectionRef = useRef<ChatScrollDirection>('none');
+  const userDirectionTimerRef = useRef<number | null>(null);
   const ownSendPendingRef = useRef(false);
   const initialBottomPendingRef = useRef(unreadServer === 0);
-  const bottomSettleActiveRef = useRef(false);
+  const initialGeometryPendingRef = useRef(true);
+  const smoothJumpPendingRef = useRef(false);
+  const bottomRearmBlockedRef = useRef(false);
   const [pill, setPill] = useState(0);            // счётчик непрочитанных (пока не внизу)
   const [atBottom, setAtBottom] = useState(true);
-  // Строгое состояние atBottom (<=8px) управляет read receipt, badge и кнопкой перехода вниз.
-  // Persistent user intent: пока пользователь сам не ушёл вверх, любое позднее измерение Virtuoso
-  // (footer, новая строка, failed-state, реакция, картинка) снова доводит список до физического низа.
-  // Seed the very first Virtuoso render with the entry decision. Updating this ref only
-  // from the later layout effect is too late: Virtuoso reads followOutput during mount.
+  const atBottomRef = useRef(true);
+  // Геометрия и follow-intent намеренно разделены: atBottom управляет read/unread, а follow
+  // только решает, должен ли новый хвост автоматически оставаться в поле зрения.
   const bottomFollowIntentRef = useRef(unreadServer === 0);
+  const [followingTail, setFollowingTail] = useState(unreadServer === 0);
   const bottomFollowServerRef = useRef(activeId);
-  const bottomFollowGenerationRef = useRef(0);    // инвалидирует RAF старого сервера/ручного pin
   const appendCursorRef = useRef<{ serverId?: string; historyGeneration: number | null; tailId: number | null; count: number }>({ historyGeneration: null, tailId: null, count: 0 });
+  const loadOlderRef = useRef<(() => Promise<void>) | null>(null);
   const [dividerFade, setDividerFade] = useState(false); // дивайдер «Новые сообщения» гаснет, когда юзер увидел границу
   const [focusTick, setFocusTick] = useState(0); // тикает на focus/blur/visibility — «увидел глазами» зависит от фокуса окна
   // Якорь virtuoso DERIVED из engine-стейта (prepend/срез) — меняется ВМЕСТЕ с messages (один emit),
@@ -1175,117 +1205,140 @@ function Chat() {
   // Только authoritative pin/локальный send могут подхватить append. `mine` не подходит:
   // своё сообщение с другой вкладки не должно вырывать текущую вкладку из читаемой истории.
   const shouldFollowAppend = isSuffixAppend && bottomFollowIntentRef.current;
-  const keepBottomForThisLayout = bottomFollowServerRef.current !== activeId
+  const followOutputEnabled = bottomFollowServerRef.current !== activeId
     ? unreadServer === 0
-    : bottomFollowIntentRef.current;
-  const hasBottomIntent = useCallback(() => (
-    bottomFollowServerRef.current !== activeId ? unreadServer === 0 : bottomFollowIntentRef.current
-  ), [activeId, unreadServer]);
+    : followingTail;
 
-  const scrollToPhysicalBottom = useCallback((behavior: ScrollBehavior = 'auto') => {
-    // Virtuoso учитывает Footer при align:end лишь после его асинхронного измерения. При старом
-    // строгом пороге 12px footer в коротком measurement-окне оставляли чат формально не внизу.
-    // Физический scrollHeight не зависит от item-index anchor и закрывает уже измеренную геометрию целиком.
+  const setFollowIntent = useCallback((next: boolean) => {
+    bottomFollowServerRef.current = activeId;
+    bottomFollowIntentRef.current = next;
+    setFollowingTail((current) => current === next ? current : next);
+  }, [activeId]);
+  const commitAtBottom = useCallback((next: boolean) => {
+    atBottomRef.current = next;
+    setAtBottom((current) => current === next ? current : next);
+    if (next) setPill((current) => current === 0 ? current : 0);
+  }, []);
+  const cancelBottomSnap = useCallback(() => {
+    if (bottomSnapFrameRef.current != null) window.cancelAnimationFrame(bottomSnapFrameRef.current);
+    bottomSnapFrameRef.current = null;
+    bottomSnapBehaviorRef.current = 'auto';
+  }, []);
+  const scheduleBottomSnap = useCallback((behavior: 'auto' | 'smooth' = 'auto') => {
+    if (!bottomFollowIntentRef.current) return;
+    if (behavior === 'smooth') bottomSnapBehaviorRef.current = 'smooth';
+    if (bottomSnapFrameRef.current != null) return;
+    bottomSnapFrameRef.current = window.requestAnimationFrame(() => {
+      bottomSnapFrameRef.current = null;
+      if (!bottomFollowIntentRef.current) return;
+      const nextBehavior = bottomSnapBehaviorRef.current;
+      bottomSnapBehaviorRef.current = 'auto';
+      // Один владелец scroll-write: Virtuoso сам учитывает footer, виртуальные размеры и
+      // повторяет позиционирование после собственного listRefresh.
+      virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: nextBehavior });
+    });
+  }, []);
+  const sampleScrollGeometry = useCallback(() => {
     const scroller = scrollerElementRef.current;
-    if (scroller) {
-      const maxScrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
-      if (Math.abs(maxScrollTop - scroller.scrollTop) <= CHAT_BOTTOM_EPSILON_PX) return false;
-      scroller.scrollTo({ top: maxScrollTop, behavior });
-      return true;
+    if (!scroller || initialGeometryPendingRef.current) return;
+    const distance = chatBottomDistance(scroller);
+    const next = reduceChatScrollState({
+      atBottom: atBottomRef.current,
+      following: bottomFollowIntentRef.current,
+    }, distance, userDirectionRef.current, bottomRearmBlockedRef.current);
+    if (next.following !== bottomFollowIntentRef.current) {
+      setFollowIntent(next.following);
+      if (!next.following) {
+        initialBottomPendingRef.current = false;
+        smoothJumpPendingRef.current = false;
+        cancelBottomSnap();
+      }
     }
-    // Fallback на короткое окно между mount Virtuoso и получением scrollerRef.
-    virtuosoRef.current?.scrollTo({ top: Number.MAX_SAFE_INTEGER, behavior });
-    return true;
+    if (next.atBottom) smoothJumpPendingRef.current = false;
+    commitAtBottom(next.atBottom);
+  }, [cancelBottomSnap, commitAtBottom, setFollowIntent]);
+  const scheduleGeometrySample = useCallback(() => {
+    if (geometryFrameRef.current != null) return;
+    geometryFrameRef.current = window.requestAnimationFrame(() => {
+      geometryFrameRef.current = null;
+      sampleScrollGeometry();
+    });
+  }, [sampleScrollGeometry]);
+  const clearUserDirection = useCallback(() => {
+    if (userDirectionTimerRef.current != null) window.clearTimeout(userDirectionTimerRef.current);
+    userDirectionTimerRef.current = null;
+    userDirectionRef.current = 'none';
   }, []);
-  const cancelBottomLockFrames = useCallback(() => {
-    if (bottomLockFrameRef.current != null) window.cancelAnimationFrame(bottomLockFrameRef.current);
-    bottomLockFrameRef.current = null;
-    bottomLockPassesRef.current = 0;
-    bottomSettleActiveRef.current = false;
-  }, []);
+  const noteUserDirection = useCallback((direction: Exclude<ChatScrollDirection, 'none'>) => {
+    if (direction === 'down') bottomRearmBlockedRef.current = false;
+    userDirectionRef.current = direction;
+    if (userDirectionTimerRef.current != null) window.clearTimeout(userDirectionTimerRef.current);
+    // Direction is evidence of manual intent only for the current input burst. Keeping an
+    // old "up" marker around would mistake a later image resize for another manual scroll.
+    userDirectionTimerRef.current = window.setTimeout(() => {
+      userDirectionTimerRef.current = null;
+      userDirectionRef.current = 'none';
+    }, 180);
+    scheduleGeometrySample();
+  }, [scheduleGeometrySample]);
   const detachBottomFollow = useCallback(() => {
     initialBottomPendingRef.current = false;
-    bottomFollowIntentRef.current = false;
-    bottomFollowGenerationRef.current += 1;
-    cancelBottomLockFrames();
-  }, [cancelBottomLockFrames]);
-  const lockToBottom = useCallback((passes = 1) => {
-    const generation = bottomFollowGenerationRef.current;
-    const canFollow = () => bottomFollowIntentRef.current && bottomFollowGenerationRef.current === generation;
-    if (!canFollow()) return;
-    // Never let a one-frame composer/ResizeObserver correction downgrade the stronger
-    // bounded settle used by an explicit send. Calls coalesce by taking the larger budget.
-    bottomLockPassesRef.current = Math.max(bottomLockPassesRef.current, Math.max(1, passes));
-    if (bottomLockFrameRef.current != null) return;
-    const run = () => {
-      bottomLockFrameRef.current = null;
-      if (!canFollow()) {
-        bottomLockPassesRef.current = 0;
-        bottomSettleActiveRef.current = false;
-        return;
-      }
-      scrollToPhysicalBottom('auto');
-      bottomLockPassesRef.current = Math.max(0, bottomLockPassesRef.current - 1);
-      if (bottomLockPassesRef.current > 0) {
-        bottomLockFrameRef.current = window.requestAnimationFrame(run);
-        return;
-      }
-      if (bottomSettleActiveRef.current) {
-        bottomSettleActiveRef.current = false;
-        const scroller = scrollerElementRef.current;
-        const distance = scroller ? Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) : 0;
-        const reachedBottom = distance <= CHAT_STRICT_BOTTOM_PX;
-        setAtBottom(reachedBottom);
-        if (reachedBottom) setPill(0);
-      }
-    };
-    bottomLockFrameRef.current = window.requestAnimationFrame(run);
-  }, [scrollToPhysicalBottom]);
-  const settleToBottom = useCallback((passes = 3) => {
-    bottomFollowIntentRef.current = true;
-    bottomSettleActiveRef.current = true;
-    setAtBottom(true);
-    setPill(0);
-    // The semantic target lets Virtuoso render the last row. Physical passes then include
-    // the asynchronously measured footer and any row-size corrections in the same mount.
-    virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' });
-    lockToBottom(passes);
-  }, [lockToBottom]);
-  const onTotalListHeightChanged = useCallback(() => {
-    if (!hasBottomIntent()) return;
-    // This is Virtuoso's authoritative signal that a row/header/footer measurement landed.
-    // Re-verify the physical bottom instead of guessing whether an image/font/footer resized.
-    bottomSettleActiveRef.current = true;
-    lockToBottom(2);
-  }, [hasBottomIntent, lockToBottom]);
-  const onAtBottom = useCallback((reportedBottom: boolean) => {
-    // На unread-entry Virtuoso может кратко сообщить true на пустой/ещё не позиционированной
-    // геометрии. Bottom принимается только если pin уже разрешён explicit/user-down intent.
-    const bottomIntent = hasBottomIntent();
-    if (!reportedBottom && (initialBottomPendingRef.current || bottomSettleActiveRef.current) && bottomIntent) return;
-    const scroller = scrollerElementRef.current;
-    const physicalDistance = scroller ? Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) : Number.POSITIVE_INFINITY;
-    // Ignore a stale Virtuoso `false` emitted from the pre-layout geometry when the DOM is
-    // already at the real bottom. This is what previously flashed the down-arrow after send.
-    const b = (reportedBottom || physicalDistance <= CHAT_STRICT_BOTTOM_PX) && bottomIntent;
-    setAtBottom(b);
-    if (b) {
-      setPill(0);
-    }
-  }, [hasBottomIntent]);
+    smoothJumpPendingRef.current = false;
+    bottomRearmBlockedRef.current = true;
+    setFollowIntent(false);
+    cancelBottomSnap();
+    commitAtBottom(false);
+  }, [cancelBottomSnap, commitAtBottom, setFollowIntent]);
   const scrollToBottom = useCallback(() => {
-    // Badge очищается только из onAtBottom после фактического достижения true bottom.
-    bottomFollowIntentRef.current = true;
+    setFollowIntent(true);
+    noteUserDirection('down');
     const scroller = scrollerElementRef.current;
-    const distance = scroller ? Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) : Number.POSITIVE_INFINITY;
-    // Short unread-list уже физически внизу и не может сгенерировать новый scroll event.
-    // Явный клик пользователя в этом случае сам подтверждает bottom/read intent.
-    if (distance <= CHAT_BOTTOM_EPSILON_PX) {
-      onAtBottom(true);
+    if (scroller && chatBottomDistance(scroller) <= CHAT_BOTTOM_ENTER_PX) {
+      sampleScrollGeometry();
       return;
     }
-    scrollToPhysicalBottom(prefersReducedMotion() ? 'auto' : 'smooth');
-  }, [onAtBottom, scrollToPhysicalBottom]);
+    smoothJumpPendingRef.current = true;
+    scheduleBottomSnap(prefersReducedMotion() ? 'auto' : 'smooth');
+  }, [noteUserDirection, sampleScrollGeometry, scheduleBottomSnap, setFollowIntent]);
+
+  const rebindTailObserver = useCallback(() => {
+    tailObserverRef.current?.disconnect();
+    tailObserverRef.current = null;
+    const root = scrollerElementRef.current;
+    const tail = tailElementRef.current;
+    if (!root || !tail || typeof IntersectionObserver === 'undefined') return;
+    const observer = new IntersectionObserver(([entry]) => {
+      if (!entry?.isIntersecting && bottomFollowIntentRef.current
+        && userDirectionRef.current !== 'up'
+        && !smoothJumpPendingRef.current && !initialGeometryPendingRef.current) {
+        // Late image/card/text resize moved the one-pixel tail out of view. This transition
+        // happens once per loss of intersection, unlike totalListHeightChanged on every measure.
+        scheduleBottomSnap('auto');
+      }
+    }, { root, threshold: 0.01 });
+    observer.observe(tail);
+    tailObserverRef.current = observer;
+  }, [scheduleBottomSnap]);
+  const bindTail = useCallback((node: HTMLDivElement | null) => {
+    tailElementRef.current = node;
+    rebindTailObserver();
+  }, [rebindTailObserver]);
+  const virtuosoContext = useMemo<ChatVirtuosoContext>(() => ({
+    busy: olderBusy,
+    hasMore: eng.chatHasMore,
+    tailRef: bindTail,
+  }), [bindTail, eng.chatHasMore, olderBusy]);
+  const onTotalListHeightChanged = useCallback((height: number) => {
+    if (!(height > 0) || messages.length === 0) return;
+    initialGeometryPendingRef.current = false;
+    // Measurements only update canonical geometry; they never write scrollTop.
+    scheduleGeometrySample();
+  }, [messages.length, scheduleGeometrySample]);
+  const onAtBottom = useCallback((_reportedBottom: boolean) => {
+    // Virtuoso's callback is a scheduling signal; one DOM geometry classifier owns the truth.
+    // This also accepts a short unread list whose final rows are all physically visible.
+    scheduleGeometrySample();
+  }, [scheduleGeometrySample]);
 
   const bindScroller = useCallback((ref: HTMLElement | null | Window) => {
     detachScrollerRef.current?.();
@@ -1295,55 +1348,41 @@ function Chat() {
     if (!el) return;
     scrollerElementRef.current = el;
     let touchY: number | null = null;
-    let manualDown = false;
     let scrollbarDrag = false;
-    let manualArmFrame: number | null = null;
-    const cancelManualDown = () => {
-      manualDown = false;
-      if (manualArmFrame != null) window.cancelAnimationFrame(manualArmFrame);
-      manualArmFrame = null;
-    };
-    const armFollowAtPhysicalBottom = () => {
-      if (manualArmFrame != null) window.cancelAnimationFrame(manualArmFrame);
-      manualArmFrame = null;
-      const distance = Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
-      if (distance <= CHAT_BOTTOM_EPSILON_PX) {
-        bottomFollowIntentRef.current = true;
-        manualDown = false;
-        onAtBottom(true);
-      }
-    };
-    const scheduleManualDownArm = () => {
-      if (bottomFollowIntentRef.current) return;
-      manualDown = true;
-      if (manualArmFrame != null) window.cancelAnimationFrame(manualArmFrame);
-      // Даже если short-list уже зажат внизу и scroll event не случится, явный down-input
-      // должен восстановить pin. Для реального скролла onScrollerScroll сработает раньше.
-      manualArmFrame = window.requestAnimationFrame(() => {
-        manualArmFrame = null;
-        if (manualDown) armFollowAtPhysicalBottom();
-      });
+    let directScrollInput = false;
+    let directScrollTimer: number | null = null;
+    let lastScrollTop = el.scrollTop;
+    const armDirectScrollInput = () => {
+      directScrollInput = true;
+      if (directScrollTimer != null) window.clearTimeout(directScrollTimer);
+      // Momentum keeps emitting scroll events after touchend. Extend the fence from every
+      // physical delta so inertia cannot outlive the evidence that the user moved the list.
+      directScrollTimer = window.setTimeout(() => {
+        directScrollTimer = null;
+        directScrollInput = false;
+      }, 240);
     };
     const onScrollerScroll = () => {
-      const distance = Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
-      // Re-arm только после ЯВНОГО пользовательского движения вниз. Голый scrollTop здесь не годится:
-      // Virtuoso сам корректирует его при measurement и не должен случайно detach/re-arm pin.
-      if (manualDown && distance <= CHAT_BOTTOM_EPSILON_PX) armFollowAtPhysicalBottom();
+      if (scrollbarDrag || directScrollInput) {
+        if (el.scrollTop < lastScrollTop - 0.5) noteUserDirection('up');
+        else if (el.scrollTop > lastScrollTop + 0.5) noteUserDirection('down');
+        if (directScrollInput) armDirectScrollInput();
+      }
+      lastScrollTop = el.scrollTop;
+      scheduleGeometrySample();
     };
     const onWheel = (event: WheelEvent) => {
-      if (event.deltaY < 0) {
-        cancelManualDown();
-        if (el.scrollTop > 0) detachBottomFollow();
-      } else if (event.deltaY > 0) scheduleManualDownArm();
+      armDirectScrollInput();
+      if (event.deltaY < 0) noteUserDirection('up');
+      else if (event.deltaY > 0) noteUserDirection('down');
     };
-    const onTouchStart = (event: TouchEvent) => { touchY = event.touches[0]?.clientY ?? null; };
+    const onTouchStart = (event: TouchEvent) => { armDirectScrollInput(); touchY = event.touches[0]?.clientY ?? null; };
     const onTouchMove = (event: TouchEvent) => {
+      armDirectScrollInput();
       const nextY = event.touches[0]?.clientY ?? null;
       if (touchY != null && nextY != null) {
-        if (nextY > touchY + 2) {
-          cancelManualDown();
-          if (el.scrollTop > 0) detachBottomFollow();
-        } else if (nextY < touchY - 2) scheduleManualDownArm();
+        if (nextY > touchY + 2) noteUserDirection('up');
+        else if (nextY < touchY - 2) noteUserDirection('down');
       }
       touchY = nextY;
     };
@@ -1353,20 +1392,22 @@ function Chat() {
       const scrollbarGutter = Math.max(14, el.offsetWidth - el.clientWidth + 4);
       if (event.target === el && event.clientX >= rect.right - scrollbarGutter) {
         scrollbarDrag = true;
-        cancelManualDown();
-        if (el.scrollTop > 0) detachBottomFollow();
+        armDirectScrollInput();
+        lastScrollTop = el.scrollTop;
       }
     };
     const onPointerUp = () => {
       if (!scrollbarDrag) return;
       scrollbarDrag = false;
-      armFollowAtPhysicalBottom();
+      scheduleGeometrySample();
     };
     const onKey = (event: KeyboardEvent) => {
-      if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) {
-        cancelManualDown();
-        if (el.scrollTop > 0) detachBottomFollow();
-      } else if (['ArrowDown', 'PageDown', 'End'].includes(event.key)) scheduleManualDownArm();
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('input,textarea,select,[contenteditable="true"]')) return;
+      if (!['ArrowUp', 'PageUp', 'Home', 'ArrowDown', 'PageDown', 'End'].includes(event.key)) return;
+      armDirectScrollInput();
+      if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) noteUserDirection('up');
+      else if (['ArrowDown', 'PageDown', 'End'].includes(event.key)) noteUserDirection('down');
     };
     el.addEventListener('scroll', onScrollerScroll, { passive: true });
     el.addEventListener('wheel', onWheel, { passive: true });
@@ -1375,8 +1416,9 @@ function Chat() {
     el.addEventListener('touchend', onTouchEnd, { passive: true });
     el.addEventListener('pointerdown', onPointerDown, { passive: true });
     window.addEventListener('pointerup', onPointerUp, { passive: true });
-    el.addEventListener('keydown', onKey);
-    onScrollerScroll();
+    window.addEventListener('keydown', onKey);
+    rebindTailObserver();
+    scheduleGeometrySample();
     detachScrollerRef.current = () => {
       el.removeEventListener('scroll', onScrollerScroll);
       el.removeEventListener('wheel', onWheel);
@@ -1385,15 +1427,21 @@ function Chat() {
       el.removeEventListener('touchend', onTouchEnd);
       el.removeEventListener('pointerdown', onPointerDown);
       window.removeEventListener('pointerup', onPointerUp);
-      el.removeEventListener('keydown', onKey);
-      cancelManualDown();
+      window.removeEventListener('keydown', onKey);
+      if (directScrollTimer != null) window.clearTimeout(directScrollTimer);
+      tailObserverRef.current?.disconnect();
+      tailObserverRef.current = null;
       if (scrollerElementRef.current === el) scrollerElementRef.current = null;
     };
-  }, [detachBottomFollow, onAtBottom]);
+  }, [noteUserDirection, rebindTailObserver, scheduleGeometrySample]);
   useEffect(() => () => {
     detachScrollerRef.current?.();
-    detachBottomFollow();
-  }, [detachBottomFollow]);
+    tailObserverRef.current?.disconnect();
+    cancelBottomSnap();
+    if (geometryFrameRef.current != null) window.cancelAnimationFrame(geometryFrameRef.current);
+    geometryFrameRef.current = null;
+    clearUserDirection();
+  }, [cancelBottomSnap, clearUserDirection]);
 
   useLayoutEffect(() => {
     appendCursorRef.current = {
@@ -1405,42 +1453,12 @@ function Chat() {
     if (initialPinnedHydration) {
       initialBottomPendingRef.current = false;
       ownSendPendingRef.current = false;
-      // Virtuoso defers its own initial scroll for several animation frames. Keep the
-      // bounded physical pin alive beyond that window and the footer ResizeObserver pass.
-      settleToBottom(8);
+      scheduleBottomSnap('auto');
     } else if (ownExplicitAppend) {
       ownSendPendingRef.current = false;
-      // Index alignment gives Virtuoso the semantic target; three bounded physical passes
-      // cover its row/footer measurement and the composer shrinking in the same commit.
-      settleToBottom(3);
-    } else if (shouldFollowAppend && !atBottom) {
-      lockToBottom();
+      scheduleBottomSnap('auto');
     }
-  }, [activeId, historyGeneration, messages, initialPinnedHydration, ownExplicitAppend, shouldFollowAppend, atBottom, lockToBottom, settleToBottom]);
-
-  // Нижняя область меняет высоту из-за reply, вложений, update-banner, mobile wrapping и клавиатуры.
-  // ResizeObserver удерживает низ только если пользователь был реально pinned; читающего историю
-  // он не трогает. Известные React-перестройки дополнительно закрыты layout-effect до observer tick.
-  const bottomLayoutReadyRef = useRef<string | undefined>(undefined);
-  useLayoutEffect(() => {
-    if (bottomLayoutReadyRef.current !== activeId) { bottomLayoutReadyRef.current = activeId; return; }
-    if (keepBottomForThisLayout) {
-      bottomFollowIntentRef.current = true;
-      lockToBottom();
-    }
-  }, [activeId, replyTo?.id, staged.length, updateReady, nativeUpdate, keepBottomForThisLayout, lockToBottom]);
-  useLayoutEffect(() => {
-    const node = bottomStackRef.current;
-    if (!node || typeof ResizeObserver === 'undefined') return;
-    let previousHeight = node.getBoundingClientRect().height;
-    const observer = new ResizeObserver(([entry]) => {
-      const nextHeight = entry?.contentRect.height ?? node.getBoundingClientRect().height;
-      if (Math.abs(nextHeight - previousHeight) > 0.5 && bottomFollowIntentRef.current) lockToBottom();
-      previousHeight = nextHeight;
-    });
-    observer.observe(node);
-    return () => observer.disconnect();
-  }, [activeId, lockToBottom]);
+  }, [activeId, historyGeneration, messages, initialPinnedHydration, ownExplicitAppend, scheduleBottomSnap]);
 
   // смена сервера: сброс состояния виртуального списка (Virtuoso ремонтится по key={activeId})
   useLayoutEffect(() => {
@@ -1451,14 +1469,19 @@ function Chat() {
     // История может приехать уже ПОСЛЕ activeId. Решение о pin принимаем по серверному unread,
     // а не по пока ещё пустому messages, иначе первый history batch ошибочно утащит чат вниз.
     const startPinned = unreadServer === 0;
-    bottomFollowGenerationRef.current += 1;
-    cancelBottomLockFrames();
+    cancelBottomSnap();
+    if (geometryFrameRef.current != null) window.cancelAnimationFrame(geometryFrameRef.current);
+    geometryFrameRef.current = null;
+    clearUserDirection();
     ownSendPendingRef.current = false;
     initialBottomPendingRef.current = startPinned;
+    initialGeometryPendingRef.current = true;
+    smoothJumpPendingRef.current = false;
+    bottomRearmBlockedRef.current = false;
     bottomFollowServerRef.current = activeId;
     setPill(unreadServer > 0 ? Math.max(unreadHere, unreadServer) : 0);
-    setAtBottom(startPinned);
-    bottomFollowIntentRef.current = startPinned;
+    setFollowIntent(startPinned);
+    commitAtBottom(startPinned);
     setReplyTo(null);
     // сброс стейджинга вложений при смене сервера — не тащим прикреплённые файлы между чатами
     setStaged((s) => { s.forEach((it) => it.previewUrl && URL.revokeObjectURL(it.previewUrl)); return []; });
@@ -1467,21 +1490,28 @@ function Chat() {
     // не даём startReached стрельнуть догрузкой прямо на маунте (пока идёт scroll-to-bottom и оседание)
     olderReady.current = false;
     setDividerFade(false);
-    const t = window.setTimeout(() => { olderReady.current = true; }, 700);
-    // После первого физического scroll поздние измерения строк удерживает followOutput.
-    // Pin живёт без таймаута и снимается только ручным уходом вверх.
+    const t = window.setTimeout(() => {
+      olderReady.current = true;
+      // A short first page can be non-scrollable. Virtuoso may have emitted startReached while
+      // the mount gate was still closed and will not repeat it for the same start index.
+      const scroller = scrollerElementRef.current;
+      if (E.chatHasMore && scroller && scroller.scrollTop <= 1) void loadOlderRef.current?.();
+    }, 700);
+    // InitialTopMostItemIndex задаёт семантическую позицию, а один scrollToIndex страхует
+    // первичное измерение footer. Дальше tail sentinel реагирует только на реальную потерю хвоста.
     if (startPinned && messages.length > 0) {
       initialBottomPendingRef.current = false;
-      settleToBottom(8);
+      scheduleBottomSnap('auto');
     }
     return () => {
       initialBottomPendingRef.current = false;
       bottomFollowIntentRef.current = false;
-      bottomFollowGenerationRef.current += 1;
-      cancelBottomLockFrames();
+      smoothJumpPendingRef.current = false;
+      bottomRearmBlockedRef.current = false;
+      cancelBottomSnap();
       clearTimeout(t);
     };
-  }, [activeId, cancelBottomLockFrames, settleToBottom]);
+  }, [activeId, cancelBottomSnap, clearUserDirection, commitAtBottom, scheduleBottomSnap, setFollowIntent]);
 
   // focus/blur/visibility окна → пере-триггер эффекта прочтения (вернулся в окно внизу чата = прочитал)
   useEffect(() => {
@@ -1515,7 +1545,7 @@ function Chat() {
   // Дивайдер «Новые сообщения» не висит вечно: как юзер добрался до низа и увидел границу (окно видимо),
   // через ~4.5с плавно гасим его (CSS-transition). Сброс — в entry-эффекте при смене сервера.
   useEffect(() => {
-    if (dividerFade || !atBottom || !bottomFollowIntentRef.current || document.visibilityState !== 'visible') return;
+    if (dividerFade || !atBottom || document.visibilityState !== 'visible') return;
     const t = window.setTimeout(() => setDividerFade(true), 4500);
     return () => clearTimeout(t);
   }, [atBottom, dividerFade, focusTick]);
@@ -1527,6 +1557,8 @@ function Chat() {
   useEffect(() => {
     if (!atBottom || !bottomFollowIntentRef.current || !activeId) return;
     if (document.visibilityState !== 'visible' || !document.hasFocus()) return; // не в фокусе — не прочитано
+    const scroller = scrollerElementRef.current;
+    if (scroller && chatBottomDistance(scroller) > CHAT_BOTTOM_LEAVE_PX) return;
     const lastLocalId = messages.length ? messages[messages.length - 1].id : null;
     if (lastLocalId == null || lastAckedRef.current === lastLocalId) return; // этот последний месседж уже отмечен
     lastAckedRef.current = lastLocalId;
@@ -1562,6 +1594,7 @@ function Chat() {
       }
     }
   }, [E, activeId]);
+  loadOlderRef.current = loadOlder;
 
   // --- reply (ответ на сообщение) ---
   const buildReplyRef = (m: ChatMessage): ReplyRef => {
@@ -1589,12 +1622,9 @@ function Chat() {
     setFlashId(messages[idx].id);
   }, [detachBottomFollow, messages]);
   useEffect(() => { if (flashId == null) return; const t = window.setTimeout(() => setFlashId(null), 1300); return () => clearTimeout(t); }, [flashId]);
-  // реакция + доскролл: пилюля растит высоту последнего сообщения — если я внизу, держим его в поле зрения
   const reactTo = useCallback((target: { id: number; sid?: number | null }, emote: { id: string; name: string }) => {
     E.toggleMessageReaction(target, emote);
-    const last = messages.length ? messages[messages.length - 1] : null;
-    if (last && last.id === target.id && bottomFollowIntentRef.current) requestAnimationFrame(lockToBottom);
-  }, [E, messages, lockToBottom]);
+  }, [E]);
   async function runCommand(raw: string) {
     const active = useStore.getState().active;
     const [cmd] = raw.slice(1).split(/\s+/);
@@ -1663,11 +1693,10 @@ function Chat() {
     if (t.startsWith('/')) { runCommand(t); setText(''); return; }
     // Ставим intent ДО синхронного optimistic push в engine: собственный append обязан дойти
     // до true bottom, даже если пользователь перед отправкой читал историю.
-    bottomFollowIntentRef.current = true;
+    bottomRearmBlockedRef.current = false;
+    setFollowIntent(true);
     ownSendPendingRef.current = true;
-    bottomSettleActiveRef.current = true;
-    setAtBottom(true);
-    setPill(0);
+    smoothJumpPendingRef.current = false;
     const em: Record<string, string> = {};
     t.split(/\s+/).forEach((w) => { if (emoteMap.has(w)) em[w] = emoteMap.get(w)!; });
     E.sendChatWithEmotes(t, em, undefined, replyTo ? buildReplyRef(replyTo) : undefined, ready.length ? ready : undefined);
@@ -1892,14 +1921,18 @@ function Chat() {
             startReached={loadOlder}
             // Важно передавать именно false, когда читается история: Virtuoso трактует саму
             // callback-функцию как включённый follow при уменьшении viewport (reply/keyboard).
-            followOutput={keepBottomForThisLayout ? 'auto' : false}
-            atBottomThreshold={CHAT_STRICT_BOTTOM_PX}
+            followOutput={followOutputEnabled ? 'auto' : false}
+            // Align Virtuoso's internal followOutput classifier with our hysteresis leave-zone.
+            // Otherwise 33–64px became a dead zone: unread stayed suppressed while auto-follow
+            // silently stopped because Virtuoso already considered the list detached.
+            atBottomThreshold={CHAT_BOTTOM_LEAVE_PX}
             atBottomStateChange={onAtBottom}
             totalListHeightChanged={onTotalListHeightChanged}
             increaseViewportBy={{ top: 600, bottom: 400 }}
+            scrollSeekConfiguration={CHAT_SCROLL_SEEK}
             computeItemKey={(_, m) => m.id}
-            context={{ busy: olderBusy, hasMore: eng.chatHasMore }}
-            components={{ Header: ChatOlderHeader, Footer: ChatFooter }}
+            context={virtuosoContext}
+            components={CHAT_VIRTUOSO_COMPONENTS}
             itemContent={(_, m) => {
               const dayTs = dayFirst.get(m.id);
               const dayDiv = dayTs != null ? <div className="msg-daydiv"><span>{fmtDay(dayTs)}</span></div> : null;
@@ -1911,7 +1944,7 @@ function Chat() {
         {olderBusy ? <div className="chat-load-top"><span className="chat-load"><span className="spin" style={{ width: 14, height: 14, margin: 0 }} />Загрузка сообщений…</span></div> : null}
         {!atBottom ? <button id="scrollbtn" aria-label="Прокрутить вниз" data-tip="К последним" onClick={scrollToBottom}><Icon name="chevron" />{pill > 0 ? <span className="sb-badge">{pill > 99 ? '99+' : pill}</span> : null}</button> : null}
       </div>
-      <div className="chat-bottom" ref={bottomStackRef}>
+      <div className="chat-bottom">
       {acOpen ? (
         <div className={'mention-pop' + (replyTo ? ' with-reply' : '')} role="listbox" ref={popRef}>
           <div className="mpop-h">{slashMode ? 'Команды' : 'Упомянуть'}</div>

@@ -1291,6 +1291,19 @@ app.post('/api/auth/password/reset', authRoute(async (req, res) => {
   res.json({ ok: true, username: result.username });
 }));
 
+app.post('/api/auth/password/change', requireAuth, authRoute(async (req, res) => {
+  const result = await authManager.changePassword({
+    userId: req.user.id,
+    currentPassword: req.body.currentPassword,
+    newPassword: req.body.newPassword,
+    ip: req.ip,
+  });
+  const user = db.prepare('SELECT * FROM users WHERE id=?').get(result.userId);
+  await revokeRuntimeSessions(user.id, user.username, 'password-changed');
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ token: authManager.issueSession(user), ...sessionPayload(user) });
+}));
+
 app.get('/api/admin/registration-invite', requireAdmin, authRoute((req, res) => {
   const invite = authManager.currentInvite(req.user);
   res.setHeader('Cache-Control', 'no-store');
