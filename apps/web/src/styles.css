@@ -3548,7 +3548,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .pm-foot{z-index:2;display:flex;align-items:center;flex:0 0 auto;gap:12px;margin:0;padding:13px 20px calc(13px + env(safe-area-inset-bottom));border-top:1px solid var(--workspace-stroke);background:color-mix(in srgb,var(--workspace-raised) 96%,transparent);box-shadow:0 -12px 28px -28px #000;backdrop-filter:blur(14px)}
 .pm-foot>span{flex:1;min-width:0;color:var(--muted);font-size:11px;line-height:1.35}
 .pm-foot>span.changed{color:var(--accent-txt)}
-.pm-foot .primary{display:flex;align-items:center;justify-content:center;gap:8px;flex:0 0 auto;min-width:132px;min-height:42px;margin:0;padding:10px 18px}
+.pm-foot .primary{display:flex;align-items:center;justify-content:center;gap:8px;flex:0 0 auto;width:auto;max-width:100%;min-width:132px;min-height:42px;margin:0;padding:10px 18px}
 .pm-foot .primary .spin,.pm-password-submit .spin{width:15px;height:15px;margin:0}
 .pm-account-row{display:grid;grid-template-columns:38px minmax(0,1fr) auto;align-items:center;gap:11px;padding:11px 12px;border:1px solid var(--workspace-stroke);border-radius:12px;background:color-mix(in srgb,var(--workspace-bg) 46%,transparent)}
 .pm-account-icon{display:grid;place-items:center;width:38px;height:38px;border-radius:11px;background:color-mix(in srgb,var(--green) 13%,var(--workspace-side));color:var(--green)}
@@ -3563,7 +3563,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .profile-modal .pm-password-field:last-of-type{margin-bottom:0}
 .pm-password-field .auth-hint{margin-top:5px}
 .pm-password-field .auth-field-error{margin-top:5px}
-.pm-password-submit{display:flex;align-items:center;justify-content:center;gap:8px;align-self:flex-end;min-width:160px;min-height:42px;margin:15px 0 0;padding:10px 18px}
+.pm-password-submit{display:flex;align-items:center;justify-content:center;gap:8px;align-self:flex-end;width:auto;max-width:100%;min-width:160px;min-height:42px;margin:15px 0 0;padding:10px 18px}
 .pm-password-success{border-color:color-mix(in srgb,var(--green) 40%,transparent);background:color-mix(in srgb,var(--green) 9%,transparent);color:color-mix(in srgb,var(--green) 72%,var(--txt-h))}
 .pm-password-success .ic{color:var(--green)}
 .pm-session-actions{display:flex;align-items:center;gap:16px;margin-top:12px;padding:14px 16px;border:1px solid var(--workspace-stroke);border-radius:14px;background:color-mix(in srgb,var(--workspace-side) 58%,transparent)}
@@ -3589,14 +3589,16 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
   .profile-modal>.settings-x{top:10px;right:10px;width:36px;height:36px}
   .pm-password-submit{align-self:stretch;width:100%}
 }
+@media (max-width:420px){
+  .pm-foot{align-items:stretch;flex-direction:column;gap:8px}
+  .pm-foot .primary{width:100%;min-width:0}
+}
 @media (max-width:390px){
   .pm-banner-actions button{gap:4px;padding-inline:7px}
   .pm-account-row{grid-template-columns:38px minmax(0,1fr)}
   .pm-account-row>span:last-child{grid-column:2;justify-self:start}
   .pm-session-actions{align-items:stretch;flex-direction:column}
   .pm-session-actions .pm-logout{width:100%}
-  .pm-foot{align-items:stretch;flex-direction:column;gap:8px}
-  .pm-foot .primary{width:100%}
 }
 /* Экран с открытой экранной клавиатурой: interactive-widget=resizes-content может
    оставить модалке лишь несколько сотен px высоты. Уменьшаем preview, чтобы flex-body
