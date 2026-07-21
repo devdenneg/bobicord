@@ -25,7 +25,10 @@ import { fetchTitle, parseYouTubeVideo, type YouTubeVideoRef } from '../youtube'
 import {
   CHAT_BOTTOM_ENTER_PX,
   CHAT_BOTTOM_LEAVE_PX,
+  CHAT_PHYSICAL_BOTTOM_EPSILON_PX,
+  CHAT_TAIL_RESERVE_PX,
   chatBottomDistance,
+  chatTailIndexLocation,
   reduceChatScrollState,
   type ChatScrollDirection,
 } from '../chatScroll';
@@ -1020,7 +1023,7 @@ type ChatVirtuosoContext = {
 };
 
 function ChatFooter({ context }: { context?: ChatVirtuosoContext }) {
-  return <div ref={context?.tailRef} className="chat-tail-sentinel" />;
+  return <div ref={context?.tailRef} className="chat-tail-sentinel" style={{ height: CHAT_TAIL_RESERVE_PX }} />;
 }
 
 function ChatScrollPlaceholder({ height }: ScrollSeekPlaceholderProps) {
@@ -1235,7 +1238,7 @@ function Chat() {
       bottomSnapBehaviorRef.current = 'auto';
       // Один владелец scroll-write: Virtuoso сам учитывает footer, виртуальные размеры и
       // повторяет позиционирование после собственного listRefresh.
-      virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: nextBehavior });
+      virtuosoRef.current?.scrollToIndex(chatTailIndexLocation('LAST', nextBehavior));
     });
   }, []);
   const sampleScrollGeometry = useCallback(() => {
@@ -1293,12 +1296,14 @@ function Chat() {
     setFollowIntent(true);
     noteUserDirection('down');
     const scroller = scrollerElementRef.current;
-    if (scroller && chatBottomDistance(scroller) <= CHAT_BOTTOM_ENTER_PX) {
+    const distance = scroller ? chatBottomDistance(scroller) : Number.POSITIVE_INFINITY;
+    if (distance <= CHAT_PHYSICAL_BOTTOM_EPSILON_PX) {
       sampleScrollGeometry();
       return;
     }
-    smoothJumpPendingRef.current = true;
-    scheduleBottomSnap(prefersReducedMotion() ? 'auto' : 'smooth');
+    const behavior = prefersReducedMotion() || distance <= CHAT_BOTTOM_ENTER_PX ? 'auto' : 'smooth';
+    smoothJumpPendingRef.current = behavior === 'smooth';
+    scheduleBottomSnap(behavior);
   }, [noteUserDirection, sampleScrollGeometry, scheduleBottomSnap, setFollowIntent]);
 
   const rebindTailObserver = useCallback(() => {
@@ -1916,7 +1921,9 @@ function Chat() {
             className="virt-msgs"
             data={messages}
             firstItemIndex={firstItemIndex}
-            initialTopMostItemIndex={firstUnread >= 0 ? { index: firstUnread, align: 'start' } : { index: Math.max(0, messages.length - 1), align: 'end' }}
+            initialTopMostItemIndex={firstUnread >= 0
+              ? { index: firstUnread, align: 'start' }
+              : chatTailIndexLocation(Math.max(0, messages.length - 1))}
             alignToBottom
             startReached={loadOlder}
             // Важно передавать именно false, когда читается история: Virtuoso трактует саму

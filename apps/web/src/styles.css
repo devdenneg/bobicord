@@ -671,7 +671,7 @@
   .reply-bar+.chat-in{border-top:1px solid var(--line-2)}
   .virt-head{display:flex;align-items:center;justify-content:center;min-height:14px;padding:10px 0 6px}
   .virt-head-end{font-size:11px;color:var(--muted);opacity:.55}
-  .chat-tail-sentinel{height:12px;overflow-anchor:none}
+  .chat-tail-sentinel{overflow-anchor:none}
   .chat-scroll-placeholder{box-sizing:border-box;padding:6px 14px;background:color-mix(in srgb,var(--workspace-raised,var(--panel2)) 34%,transparent);background-clip:content-box;opacity:.42;contain:strict}
   /* лоадер пагинации: пилюля со спиннером */
   .chat-load{display:inline-flex;align-items:center;gap:8px;padding:5px 12px;background:var(--panel2);border:1px solid var(--line-2);border-radius:20px;font-size:12px;color:var(--muted);box-shadow:0 2px 8px rgba(0,0,0,.2)}

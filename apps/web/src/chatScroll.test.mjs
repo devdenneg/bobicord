@@ -11,7 +11,9 @@ const code = ts.transpileModule(source, {
 const {
   CHAT_BOTTOM_ENTER_PX,
   CHAT_BOTTOM_LEAVE_PX,
+  CHAT_TAIL_RESERVE_PX,
   chatBottomDistance,
+  chatTailIndexLocation,
   reduceChatScrollState,
 } = await import('data:text/javascript,' + encodeURIComponent(code));
 
@@ -35,6 +37,26 @@ equal('rubber-band overscroll is clamped', chatBottomDistance({
   clientHeight: 400,
   scrollTop: 604,
 }), 0);
+equal('a footer measured after the first scroll exposes the exact regression gap', chatBottomDistance({
+  scrollHeight: 1012,
+  clientHeight: 400,
+  scrollTop: 600,
+}), CHAT_TAIL_RESERVE_PX);
+
+equal('the initial tail target covers the asynchronously measured footer',
+  chatTailIndexLocation(29), {
+    index: 29,
+    align: 'end',
+    offset: CHAT_TAIL_RESERVE_PX,
+    behavior: 'auto',
+  });
+equal('a smooth tail jump keeps the same exact footer reserve',
+  chatTailIndexLocation('LAST', 'smooth'), {
+    index: 'LAST',
+    align: 'end',
+    offset: CHAT_TAIL_RESERVE_PX,
+    behavior: 'smooth',
+  });
 
 equal('a detached reader re-arms inside the enter zone', reduceChatScrollState(
   { atBottom: false, following: false },

@@ -1,5 +1,25 @@
 export const CHAT_BOTTOM_ENTER_PX = 32;
 export const CHAT_BOTTOM_LEAVE_PX = 64;
+export const CHAT_PHYSICAL_BOTTOM_EPSILON_PX = 1;
+export const CHAT_TAIL_RESERVE_PX = 12;
+
+export type ChatTailIndex = number | 'LAST';
+export type ChatTailBehavior = 'auto' | 'smooth';
+
+/**
+ * Exact semantic target for the end of the virtual chat.
+ *
+ * Virtuoso measures its Footer asynchronously. The explicit reserve makes the first scroll
+ * reach the browser's physical maximum even during the frame where the footer is already in
+ * the DOM but is not yet included in Virtuoso's measured footer height. Once measured, the
+ * extra offset is harmless because the browser clamps the target to the same physical maximum.
+ */
+export function chatTailIndexLocation<T extends ChatTailIndex>(
+  index: T,
+  behavior: ChatTailBehavior = 'auto',
+) {
+  return { index, align: 'end' as const, offset: CHAT_TAIL_RESERVE_PX, behavior };
+}
 
 export type ChatScrollDirection = 'none' | 'up' | 'down';
 
