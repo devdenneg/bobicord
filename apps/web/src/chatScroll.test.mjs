@@ -18,18 +18,19 @@ const {
   CHAT_TAIL_MAX_SAME_TARGET_WRITES,
   INITIAL_CHAT_PREPEND_SETTLE,
   CHAT_PREPEND_WARMUP_FRAMES,
+  CHAT_PREPEND_STABLE_FRAMES,
+  CHAT_HISTORY_PAGE_SIZE,
+  CHAT_PREPEND_OVERSCAN_ITEMS,
   CHAT_SESSION_MESSAGE_LIMIT,
   advanceChatPrependSettle,
   canStartChatPrepend,
-  canCorrectChatPrependAnchor,
+  canVerifyChatPrependGeometry,
   chatAppendFrontTrim,
   chatBottomDistance,
   classifyChatPrepend,
   classifyChatPrependLifecycle,
   chatPhysicalMaxScrollTop,
-  chatPrependAnchorDelta,
-  isChatPrependGeometryStable,
-  isChatPrependGeometryStreakStable,
+  isChatPrependGeometryQuiet,
   chatRetentionLimitAfterProtectedInsert,
   chatTailIndexLocation,
   chatVirtualFirstItemIndex,
@@ -421,22 +422,19 @@ equal('atomic prepend keeps existing absolute indices stable', {
 }, { before: 999980, after: 999980 });
 equal('front trimming moves the virtual base forward',
   chatVirtualFirstItemIndex(1_000_000, 35, 7), 999972);
-equal('prepend anchor correction preserves the viewport pixel',
-  chatPrependAnchorDelta(84.5, 101.25), 16.75);
-equal('invalid anchor measurements never write scroll position',
-  chatPrependAnchorDelta(Number.NaN, 101.25), 0);
-
-equal('custom prepend correction waits through both Virtuoso frames', [
-  canCorrectChatPrependAnchor(0, Number.NaN),
-  canCorrectChatPrependAnchor(1, Number.NaN),
-  canCorrectChatPrependAnchor(CHAT_PREPEND_WARMUP_FRAMES, Number.NaN),
+equal('prepend overscan measures one page without retriggering its first row',
+  CHAT_PREPEND_OVERSCAN_ITEMS, CHAT_HISTORY_PAGE_SIZE - 1);
+equal('passive prepend verification waits through both Virtuoso frames', [
+  canVerifyChatPrependGeometry(0, Number.NaN),
+  canVerifyChatPrependGeometry(1, Number.NaN),
+  canVerifyChatPrependGeometry(CHAT_PREPEND_WARMUP_FRAMES, Number.NaN),
 ], [false, false, true]);
-equal('an active Virtuoso deviation keeps custom correction fenced', [
-  canCorrectChatPrependAnchor(CHAT_PREPEND_WARMUP_FRAMES, 18.5),
-  canCorrectChatPrependAnchor(CHAT_PREPEND_WARMUP_FRAMES + 1, -0.75),
-  canCorrectChatPrependAnchor(CHAT_PREPEND_WARMUP_FRAMES, 0.5001),
-  canCorrectChatPrependAnchor(CHAT_PREPEND_WARMUP_FRAMES, 0.5),
-  canCorrectChatPrependAnchor(CHAT_PREPEND_WARMUP_FRAMES + 1, 0),
+equal('an active Virtuoso deviation keeps passive verification fenced', [
+  canVerifyChatPrependGeometry(CHAT_PREPEND_WARMUP_FRAMES, 18.5),
+  canVerifyChatPrependGeometry(CHAT_PREPEND_WARMUP_FRAMES + 1, -0.75),
+  canVerifyChatPrependGeometry(CHAT_PREPEND_WARMUP_FRAMES, 0.5001),
+  canVerifyChatPrependGeometry(CHAT_PREPEND_WARMUP_FRAMES, 0.5),
+  canVerifyChatPrependGeometry(CHAT_PREPEND_WARMUP_FRAMES + 1, 0),
 ], [false, false, false, true, true]);
 
 const oscillatingPrevious = {
@@ -445,52 +443,52 @@ const oscillatingPrevious = {
 const oscillatingCurrent = {
   scrollHeight: 1200, clientHeight: 500, scrollTop: 300, anchorTop: 96.5,
 };
-equal('a one-pixel anchor oscillation is not stable even inside target tolerance',
-  isChatPrependGeometryStable(oscillatingPrevious, oscillatingCurrent, 96), false);
-equal('an unchanged anchor inside target tolerance is stable',
-  isChatPrependGeometryStable(oscillatingCurrent, oscillatingCurrent, 96), true);
+equal('a one-pixel anchor oscillation is not quiet',
+  isChatPrependGeometryQuiet(oscillatingPrevious, oscillatingPrevious, oscillatingCurrent), false);
+equal('an unchanged anchor is quiet',
+  isChatPrependGeometryQuiet(oscillatingCurrent, oscillatingCurrent, oscillatingCurrent), true);
 const driftingSamples = [96.5, 96.1, 95.7, 95.5].map((anchorTop) => ({
   scrollHeight: 1200, clientHeight: 500, scrollTop: 300, anchorTop,
 }));
 equal('sub-pixel drift cannot accumulate across the stable streak', [
-  isChatPrependGeometryStreakStable(driftingSamples[0], driftingSamples[0], driftingSamples[1], 96),
-  isChatPrependGeometryStreakStable(driftingSamples[1], driftingSamples[0], driftingSamples[2], 96),
-  isChatPrependGeometryStreakStable(driftingSamples[2], driftingSamples[0], driftingSamples[3], 96),
+  isChatPrependGeometryQuiet(driftingSamples[0], driftingSamples[0], driftingSamples[1]),
+  isChatPrependGeometryQuiet(driftingSamples[1], driftingSamples[0], driftingSamples[2]),
+  isChatPrependGeometryQuiet(driftingSamples[2], driftingSamples[0], driftingSamples[3]),
 ], [true, false, false]);
 
 let prependProgress = INITIAL_CHAT_PREPEND_SETTLE;
 let prependDecision;
-for (let correction = 0; correction < 5; correction++) {
-  prependDecision = advanceChatPrependSettle(prependProgress, false, true);
+for (let moving = 0; moving < 5; moving++) {
+  prependDecision = advanceChatPrependSettle(prependProgress, false);
   prependProgress = prependDecision.progress;
 }
-equal('a fifth prepend correction stays inside the finite settle transaction', {
+equal('a fifth moving frame stays inside the finite settle transaction', {
   done: prependDecision.done,
   frames: prependProgress.frames,
   stableFrames: prependProgress.stableFrames,
 }, { done: false, frames: 5, stableFrames: 0 });
-for (let stable = 0; stable < 3; stable++) {
-  prependDecision = advanceChatPrependSettle(prependProgress, true, false);
+for (let stable = 0; stable < CHAT_PREPEND_STABLE_FRAMES; stable++) {
+  prependDecision = advanceChatPrependSettle(prependProgress, true);
   prependProgress = prependDecision.progress;
 }
-equal('prepend finishes only after three stable frames following the last correction', {
+equal('prepend finishes only after the full quiet window following the last movement', {
   done: prependDecision.done,
   frames: prependProgress.frames,
   stableFrames: prependProgress.stableFrames,
-}, { done: true, frames: 8, stableFrames: 3 });
+}, {
+  done: true,
+  frames: 5 + CHAT_PREPEND_STABLE_FRAMES,
+  stableFrames: CHAT_PREPEND_STABLE_FRAMES,
+});
 
 const almostSettledPrepend = { frames: 8, stableFrames: 2 };
-equal('a late correction resets an almost-settled prepend transaction',
-  advanceChatPrependSettle(almostSettledPrepend, true, true), {
-    progress: { frames: 9, stableFrames: 0 }, done: false,
-  });
-equal('an unresolved visual offset resets stability even with unchanged outer geometry',
-  advanceChatPrependSettle(almostSettledPrepend, false, false), {
+equal('late movement resets an almost-settled prepend transaction',
+  advanceChatPrependSettle(almostSettledPrepend, false), {
     progress: { frames: 9, stableFrames: 0 }, done: false,
   });
 equal('the prepend frame deadline remains a hard bound', [
-  advanceChatPrependSettle({ frames: 52, stableFrames: 0 }, false, true).done,
-  advanceChatPrependSettle({ frames: 53, stableFrames: 0 }, false, true).done,
+  advanceChatPrependSettle({ frames: 52, stableFrames: 0 }, false).done,
+  advanceChatPrependSettle({ frames: 53, stableFrames: 0 }, false).done,
 ], [false, true]);
 
 equal('ordinary live history keeps the normal bounded session window', [

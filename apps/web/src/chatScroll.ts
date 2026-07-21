@@ -6,8 +6,12 @@ export const CHAT_TAIL_STABLE_FRAMES = 2;
 export const CHAT_TAIL_MAX_WRITES = 12;
 export const CHAT_TAIL_MAX_SAME_TARGET_WRITES = 3;
 export const CHAT_PREPEND_WARMUP_FRAMES = 2;
-export const CHAT_PREPEND_STABLE_FRAMES = 3;
+export const CHAT_PREPEND_STABLE_FRAMES = 8;
 export const CHAT_PREPEND_MAX_FRAMES = 54;
+export const CHAT_HISTORY_PAGE_SIZE = 30;
+// Measure the complete incoming page except its first row. Rendering that first row would fire
+// Virtuoso's startReached again and could cascade another request before the user reaches it.
+export const CHAT_PREPEND_OVERSCAN_ITEMS = CHAT_HISTORY_PAGE_SIZE - 1;
 export const CHAT_SESSION_MESSAGE_LIMIT = 1000;
 
 export type ChatTailIndex = number | 'LAST';
@@ -278,65 +282,53 @@ export function classifyChatPrepend(
   };
 }
 
-/** Pixel correction that keeps the same visible item at the same viewport position. */
-export function chatPrependAnchorDelta(beforeTop: number, afterTop: number): number {
-  if (!Number.isFinite(beforeTop) || !Number.isFinite(afterTop)) return 0;
-  return afterTop - beforeTop;
-}
-
 /**
- * Virtuoso applies its own prepend compensation over two animation frames. A custom residual
- * correction must wait for both frames and for the temporary numeric deviation to disappear;
- * `auto`/NaN is the normal align-to-bottom value and does not block the correction.
+ * Virtuoso applies its prepend compensation over two animation frames. The passive guard must
+ * wait for both frames and for the temporary numeric deviation to disappear before it starts
+ * accepting quiet geometry; `auto`/NaN is the normal align-to-bottom value.
  */
-export function canCorrectChatPrependAnchor(elapsedFrames: number, deviation: number): boolean {
+export function canVerifyChatPrependGeometry(elapsedFrames: number, deviation: number): boolean {
   const frames = Math.max(0, Math.floor(finiteOr(elapsedFrames, 0)));
   const hasActiveDeviation = Number.isFinite(deviation) && Math.abs(deviation) > 0.5;
   return frames >= CHAT_PREPEND_WARMUP_FRAMES && !hasActiveDeviation;
 }
 
 /**
- * Advances the finite prepend verification window. A correction always resets stability, but it
- * never consumes a separate write budget: late ResizeObserver waves remain correctable until the
- * geometry is truly stable or the overall frame deadline expires.
+ * Advances the finite passive verification window. No custom scroll writes are allowed here:
+ * Virtuoso remains the sole owner of prepend compensation while this guard only observes it.
  */
 export function advanceChatPrependSettle(
   current: ChatPrependSettleProgress,
   geometryStable: boolean,
-  corrected: boolean,
 ): ChatPrependSettleDecision {
   const frames = Math.max(0, Math.floor(finiteOr(current.frames, 0))) + 1;
   const previousStable = Math.max(0, Math.floor(finiteOr(current.stableFrames, 0)));
-  const stableFrames = corrected ? 0 : geometryStable ? previousStable + 1 : 0;
+  const stableFrames = geometryStable ? previousStable + 1 : 0;
   return {
     progress: { frames, stableFrames },
     done: frames >= CHAT_PREPEND_MAX_FRAMES || stableFrames >= CHAT_PREPEND_STABLE_FRAMES,
   };
 }
 
-/** Geometry is stable only when neither the list nor the visual anchor moved between frames. */
-export function isChatPrependGeometryStable(
+function isSameChatPrependGeometry(
   previous: ChatPrependGeometry | null,
   current: ChatPrependGeometry,
-  targetAnchorTop: number,
 ): boolean {
-  if (!previous || !Number.isFinite(targetAnchorTop)) return false;
+  if (!previous) return false;
   return Math.abs(previous.scrollHeight - current.scrollHeight) <= 0.5
     && Math.abs(previous.clientHeight - current.clientHeight) <= 0.5
     && Math.abs(previous.scrollTop - current.scrollTop) <= 0.5
-    && Math.abs(previous.anchorTop - current.anchorTop) <= 0.5
-    && Math.abs(current.anchorTop - targetAnchorTop) <= 0.5;
+    && Math.abs(previous.anchorTop - current.anchorTop) <= 0.5;
 }
 
-/** Prevents sub-pixel movement from accumulating across an otherwise stable-looking streak. */
-export function isChatPrependGeometryStreakStable(
+/** A fixed baseline prevents sub-pixel movement from accumulating across a quiet-looking streak. */
+export function isChatPrependGeometryQuiet(
   previous: ChatPrependGeometry | null,
   baseline: ChatPrependGeometry | null,
   current: ChatPrependGeometry,
-  targetAnchorTop: number,
 ): boolean {
-  return isChatPrependGeometryStable(previous, current, targetAnchorTop)
-    && isChatPrependGeometryStable(baseline, current, targetAnchorTop);
+  return isSameChatPrependGeometry(previous, current)
+    && isSameChatPrependGeometry(baseline, current);
 }
 
 /**

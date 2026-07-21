@@ -619,7 +619,8 @@
   #msgs{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;display:flex;flex-direction:column}
   .msgs-inner{margin-top:auto;display:flex;flex-direction:column;gap:11px;padding:14px}
   /* виртуальный список чата (react-virtuoso): скроллер занимает всё место; отступы/зазор — на строках */
-  .virt-msgs{flex:1;min-height:0;overflow-x:hidden;overflow-anchor:none}
+  .virt-msgs{flex:1;min-height:0;overflow-x:hidden;overflow-anchor:none;opacity:1;transition:opacity .08s ease-out}
+  .virt-msgs.initial-pinning{opacity:0;pointer-events:none}
   .virt-row{padding:11px 14px 0;position:relative}
   .virt-row.cont{padding-top:2px}          /* продолжение группы того же автора — плотнее */
   .virt-row.cont-media{padding-top:10px}   /* продолжение с картинкой/файлом — больше воздуха, иначе превью сливаются в кашу */
