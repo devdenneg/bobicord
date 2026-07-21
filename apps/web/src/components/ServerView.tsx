@@ -27,10 +27,18 @@ import {
   CHAT_BOTTOM_LEAVE_PX,
   CHAT_PHYSICAL_BOTTOM_EPSILON_PX,
   CHAT_TAIL_RESERVE_PX,
+  INITIAL_CHAT_TAIL_SETTLE,
+  canStartChatPrepend,
   chatBottomDistance,
+  classifyChatPrepend,
+  classifyChatPrependLifecycle,
+  chatPrependAnchorDelta,
   chatTailIndexLocation,
+  chatVirtualFirstItemIndex,
   reduceChatScrollState,
+  reduceChatTailSettle,
   type ChatScrollDirection,
+  type ChatTailSettleState,
 } from '../chatScroll';
 import type { Attachment, ChatMessage, Emote, Leaderboard, Member, MemberStats, ReleaseNote, ReplyRef, Role } from '../types';
 import { PERM, hasPerm } from '../types';
@@ -1004,6 +1012,18 @@ const COMMANDS: { name: string; desc: string }[] = [
 // Базовый индекс для virtuoso firstItemIndex: при догрузке старых сообщений его уменьшаем
 // на кол-во добавленных сверху — так virtuoso держит якорь скролла на месте (prepend-паттерн).
 const VIRT_BASE_INDEX = 1_000_000;
+const CHAT_PREPEND_MAX_CORRECTIONS = 4;
+
+interface ChatPrependTransaction {
+  requestSeq: number;
+  serverId: string;
+  historyGeneration: number;
+  committed: boolean;
+  targetPrepended: number | null;
+  anchorAbsoluteIndex: number | null;
+  anchorTop: number;
+  restoreTail: boolean;
+}
 
 // Шапка списка чата: спиннер во время догрузки старых сообщений / метка начала истории.
 // Определена на уровне модуля (стабильная ссылка) — иначе virtuoso ремонтит её на каждый рендер.
@@ -1026,8 +1046,8 @@ function ChatFooter({ context }: { context?: ChatVirtuosoContext }) {
   return <div ref={context?.tailRef} className="chat-tail-sentinel" style={{ height: CHAT_TAIL_RESERVE_PX }} />;
 }
 
-function ChatScrollPlaceholder({ height }: ScrollSeekPlaceholderProps) {
-  return <div className="chat-scroll-placeholder" style={{ height }} aria-hidden="true" />;
+function ChatScrollPlaceholder({ height, index }: ScrollSeekPlaceholderProps) {
+  return <div className="chat-scroll-placeholder" data-item-index={index} style={{ height }} aria-hidden="true" />;
 }
 
 const CHAT_SCROLL_SEEK: ScrollSeekConfiguration = {
@@ -1150,14 +1170,24 @@ function Chat() {
   const tailObserverRef = useRef<IntersectionObserver | null>(null);
   const bottomSnapFrameRef = useRef<number | null>(null);
   const bottomSnapBehaviorRef = useRef<'auto' | 'smooth'>('auto');
+  const tailSettleFrameRef = useRef<number | null>(null);
+  const tailSettleTokenRef = useRef(0);
+  const tailSettleStateRef = useRef<ChatTailSettleState>(INITIAL_CHAT_TAIL_SETTLE);
+  const virtuosoScrollingRef = useRef(false);
   const geometryFrameRef = useRef<number | null>(null);
   const userDirectionRef = useRef<ChatScrollDirection>('none');
   const userDirectionTimerRef = useRef<number | null>(null);
   const ownSendPendingRef = useRef(false);
   const initialBottomPendingRef = useRef(unreadServer === 0);
+  const initialSemanticIssuedRef = useRef(false);
   const initialGeometryPendingRef = useRef(true);
   const smoothJumpPendingRef = useRef(false);
   const bottomRearmBlockedRef = useRef(false);
+  const prependGuardRef = useRef(false);
+  const prependTransactionRef = useRef<ChatPrependTransaction | null>(null);
+  const prependSettleFrameRef = useRef<number | null>(null);
+  const prependSettleTokenRef = useRef(0);
+  const [prependGuardActive, setPrependGuardActive] = useState(false);
   const [pill, setPill] = useState(0);            // счётчик непрочитанных (пока не внизу)
   const [atBottom, setAtBottom] = useState(true);
   const atBottomRef = useRef(true);
@@ -1173,7 +1203,7 @@ function Chat() {
   // Якорь virtuoso DERIVED из engine-стейта (prepend/срез) — меняется ВМЕСТЕ с messages (один emit),
   // поэтому Virtuoso всегда видит согласованные data+firstItemIndex → чат НЕ прыгает при пагинации.
   // (Раньше был component-state + отдельные setFirstItemIndex → два источника, рассинхрон, прыжок.)
-  const firstItemIndex = VIRT_BASE_INDEX - eng.chatPrepended + eng.chatTrimmed;
+  const firstItemIndex = chatVirtualFirstItemIndex(VIRT_BASE_INDEX, eng.chatPrepended, eng.chatTrimmed);
   const [olderBusy, setOlderBusy] = useState(false); // идёт догрузка старых
   const loadingOlder = useRef(false);                // защита от повторного startReached
   const olderRequestSeq = useRef(0);
@@ -1192,6 +1222,10 @@ function Chat() {
   // Поэтому ни пагинация, ни delete, ни replace истории больше не выглядят как новое сообщение.
   const appendCursor = appendCursorRef.current;
   const historyGeneration = E.chatHistoryGeneration;
+  const activeIdRef = useRef(activeId);
+  const historyGenerationRef = useRef(historyGeneration);
+  activeIdRef.current = activeId;
+  historyGenerationRef.current = historyGeneration;
   const sameAppendSource = appendCursor.serverId === activeId && appendCursor.historyGeneration === historyGeneration;
   let appendedMessages: ChatMessage[] = [];
   if (sameAppendSource) {
@@ -1204,13 +1238,20 @@ function Chat() {
   }
   const isSuffixAppend = appendedMessages.length > 0;
   const ownExplicitAppend = isSuffixAppend && ownSendPendingRef.current && appendedMessages.some((message) => message.mine);
-  const initialPinnedHydration = messages.length > 0 && initialBottomPendingRef.current && bottomFollowIntentRef.current;
+  const initialPinnedHydration = messages.length > 0
+    && initialBottomPendingRef.current
+    && !initialSemanticIssuedRef.current
+    && bottomFollowIntentRef.current;
   // Только authoritative pin/локальный send могут подхватить append. `mine` не подходит:
   // своё сообщение с другой вкладки не должно вырывать текущую вкладку из читаемой истории.
-  const shouldFollowAppend = isSuffixAppend && bottomFollowIntentRef.current;
-  const followOutputEnabled = bottomFollowServerRef.current !== activeId
+  const prependKeepsTailIntent = !prependGuardActive
+    || prependTransactionRef.current?.restoreTail === true;
+  const shouldFollowAppend = isSuffixAppend
+    && bottomFollowIntentRef.current
+    && prependKeepsTailIntent;
+  const followOutputEnabled = !prependGuardActive && (bottomFollowServerRef.current !== activeId
     ? unreadServer === 0
-    : followingTail;
+    : followingTail);
 
   const setFollowIntent = useCallback((next: boolean) => {
     bottomFollowServerRef.current = activeId;
@@ -1227,23 +1268,100 @@ function Chat() {
     bottomSnapFrameRef.current = null;
     bottomSnapBehaviorRef.current = 'auto';
   }, []);
-  const scheduleBottomSnap = useCallback((behavior: 'auto' | 'smooth' = 'auto') => {
-    if (!bottomFollowIntentRef.current) return;
+  const cancelTailSettle = useCallback(() => {
+    ++tailSettleTokenRef.current;
+    if (tailSettleFrameRef.current != null) window.cancelAnimationFrame(tailSettleFrameRef.current);
+    tailSettleFrameRef.current = null;
+    tailSettleStateRef.current = {
+      ...tailSettleStateRef.current,
+      phase: 'cancelled',
+      stableFrames: 0,
+    };
+  }, []);
+  const armTailSettle = useCallback((force = false) => {
+    if (!bottomFollowIntentRef.current || bottomRearmBlockedRef.current
+      || userDirectionRef.current === 'up' || prependGuardRef.current) return;
+    const currentScroller = scrollerElementRef.current;
+    if (!force && !initialBottomPendingRef.current && currentScroller
+      && chatBottomDistance(currentScroller) <= CHAT_PHYSICAL_BOTTOM_EPSILON_PX) return;
+
+    // A running transaction consumes fresh geometry itself. Do not restart its deadline or
+    // forget the already-written target when another ResizeObserver callback arrives.
+    if (tailSettleFrameRef.current != null) return;
+
+    const token = ++tailSettleTokenRef.current;
+    const deadline = window.performance.now() + 2400;
+    tailSettleStateRef.current = { ...INITIAL_CHAT_TAIL_SETTLE };
+
+    const tick = () => {
+      if (token !== tailSettleTokenRef.current) return;
+      const scroller = scrollerElementRef.current;
+      const tail = tailElementRef.current;
+      const geometry = scroller ? {
+        scrollHeight: scroller.scrollHeight,
+        clientHeight: scroller.clientHeight,
+        scrollTop: scroller.scrollTop,
+      } : { scrollHeight: 0, clientHeight: 0, scrollTop: 0 };
+      const waitingForSmoothArrival = smoothJumpPendingRef.current
+        && chatBottomDistance(geometry) > CHAT_BOTTOM_ENTER_PX;
+      const decision = reduceChatTailSettle(tailSettleStateRef.current, {
+        geometry,
+        ready: !!scroller && !!tail && tail.isConnected
+          && tail.getBoundingClientRect().height >= CHAT_TAIL_RESERVE_PX - 0.5
+          && !initialGeometryPendingRef.current
+          && !waitingForSmoothArrival,
+        scrolling: virtuosoScrollingRef.current,
+        following: bottomFollowIntentRef.current,
+        direction: userDirectionRef.current,
+        rearmBlocked: bottomRearmBlockedRef.current,
+        prepend: prependGuardRef.current,
+      });
+      tailSettleStateRef.current = decision.state;
+
+      if (decision.scrollTop != null) {
+        // `scrollToIndex` is semantic and can use a size estimate. This final write targets the
+        // browser's measured maximum. The reducer permits one bounded retry of the same target,
+        // caps total writes, and the caller bounds the whole transaction with a hard deadline.
+        if (virtuosoRef.current) virtuosoRef.current.scrollTo({ top: decision.scrollTop, behavior: 'auto' });
+        else scroller?.scrollTo({ top: decision.scrollTop, behavior: 'auto' });
+      }
+
+      if (decision.state.phase === 'settled') {
+        initialBottomPendingRef.current = false;
+        smoothJumpPendingRef.current = false;
+        tailSettleFrameRef.current = null;
+        return;
+      }
+      if (!decision.keepSampling || window.performance.now() >= deadline) {
+        tailSettleStateRef.current = { ...decision.state, phase: 'cancelled' };
+        tailSettleFrameRef.current = null;
+        return;
+      }
+      tailSettleFrameRef.current = window.requestAnimationFrame(tick);
+    };
+    tailSettleFrameRef.current = window.requestAnimationFrame(tick);
+  }, []);
+  const scheduleBottomSnap = useCallback((
+    behavior: 'auto' | 'smooth' = 'auto',
+    forcePhysicalVerification = false,
+  ) => {
+    if (!bottomFollowIntentRef.current || prependGuardRef.current) return;
     if (behavior === 'smooth') bottomSnapBehaviorRef.current = 'smooth';
     if (bottomSnapFrameRef.current != null) return;
     bottomSnapFrameRef.current = window.requestAnimationFrame(() => {
       bottomSnapFrameRef.current = null;
-      if (!bottomFollowIntentRef.current) return;
+      if (!bottomFollowIntentRef.current || prependGuardRef.current) return;
       const nextBehavior = bottomSnapBehaviorRef.current;
       bottomSnapBehaviorRef.current = 'auto';
-      // Один владелец scroll-write: Virtuoso сам учитывает footer, виртуальные размеры и
-      // повторяет позиционирование после собственного listRefresh.
+      // Virtuoso performs the semantic jump first. The finite physical transaction below waits
+      // until its scrolling/measurement pass ends and verifies the real DOM maximum.
       virtuosoRef.current?.scrollToIndex(chatTailIndexLocation('LAST', nextBehavior));
+      armTailSettle(forcePhysicalVerification);
     });
-  }, []);
+  }, [armTailSettle]);
   const sampleScrollGeometry = useCallback(() => {
     const scroller = scrollerElementRef.current;
-    if (!scroller || initialGeometryPendingRef.current) return;
+    if (!scroller || initialGeometryPendingRef.current || prependGuardRef.current) return;
     const distance = chatBottomDistance(scroller);
     const next = reduceChatScrollState({
       atBottom: atBottomRef.current,
@@ -1255,11 +1373,12 @@ function Chat() {
         initialBottomPendingRef.current = false;
         smoothJumpPendingRef.current = false;
         cancelBottomSnap();
+        cancelTailSettle();
       }
     }
     if (next.atBottom) smoothJumpPendingRef.current = false;
     commitAtBottom(next.atBottom);
-  }, [cancelBottomSnap, commitAtBottom, setFollowIntent]);
+  }, [cancelBottomSnap, cancelTailSettle, commitAtBottom, setFollowIntent]);
   const scheduleGeometrySample = useCallback(() => {
     if (geometryFrameRef.current != null) return;
     geometryFrameRef.current = window.requestAnimationFrame(() => {
@@ -1274,6 +1393,20 @@ function Chat() {
   }, []);
   const noteUserDirection = useCallback((direction: Exclude<ChatScrollDirection, 'none'>) => {
     if (direction === 'down') bottomRearmBlockedRef.current = false;
+    else {
+      const cancellingPinnedArrival = initialBottomPendingRef.current || smoothJumpPendingRef.current;
+      cancelTailSettle();
+      if (cancellingPinnedArrival) {
+        initialBottomPendingRef.current = false;
+        smoothJumpPendingRef.current = false;
+        bottomRearmBlockedRef.current = true;
+        setFollowIntent(false);
+        commitAtBottom(false);
+      }
+      const prependTransaction = prependTransactionRef.current;
+      if (prependTransaction) prependTransaction.restoreTail = false;
+      if (prependGuardRef.current) setFollowIntent(false);
+    }
     userDirectionRef.current = direction;
     if (userDirectionTimerRef.current != null) window.clearTimeout(userDirectionTimerRef.current);
     // Direction is evidence of manual intent only for the current input burst. Keeping an
@@ -1283,15 +1416,16 @@ function Chat() {
       userDirectionRef.current = 'none';
     }, 180);
     scheduleGeometrySample();
-  }, [scheduleGeometrySample]);
+  }, [cancelTailSettle, commitAtBottom, scheduleGeometrySample, setFollowIntent]);
   const detachBottomFollow = useCallback(() => {
     initialBottomPendingRef.current = false;
     smoothJumpPendingRef.current = false;
     bottomRearmBlockedRef.current = true;
     setFollowIntent(false);
     cancelBottomSnap();
+    cancelTailSettle();
     commitAtBottom(false);
-  }, [cancelBottomSnap, commitAtBottom, setFollowIntent]);
+  }, [cancelBottomSnap, cancelTailSettle, commitAtBottom, setFollowIntent]);
   const scrollToBottom = useCallback(() => {
     setFollowIntent(true);
     noteUserDirection('down');
@@ -1303,7 +1437,7 @@ function Chat() {
     }
     const behavior = prefersReducedMotion() || distance <= CHAT_BOTTOM_ENTER_PX ? 'auto' : 'smooth';
     smoothJumpPendingRef.current = behavior === 'smooth';
-    scheduleBottomSnap(behavior);
+    scheduleBottomSnap(behavior, true);
   }, [noteUserDirection, sampleScrollGeometry, scheduleBottomSnap, setFollowIntent]);
 
   const rebindTailObserver = useCallback(() => {
@@ -1313,17 +1447,18 @@ function Chat() {
     const tail = tailElementRef.current;
     if (!root || !tail || typeof IntersectionObserver === 'undefined') return;
     const observer = new IntersectionObserver(([entry]) => {
-      if (!entry?.isIntersecting && bottomFollowIntentRef.current
+      if (entry && entry.intersectionRatio < 1 && bottomFollowIntentRef.current
         && userDirectionRef.current !== 'up'
-        && !smoothJumpPendingRef.current && !initialGeometryPendingRef.current) {
-        // Late image/card/text resize moved the one-pixel tail out of view. This transition
-        // happens once per loss of intersection, unlike totalListHeightChanged on every measure.
-        scheduleBottomSnap('auto');
+        && !smoothJumpPendingRef.current && !initialGeometryPendingRef.current
+        && !prependGuardRef.current) {
+        // The full sentinel must be visible. A low threshold used to accept almost its entire
+        // 12px height as "bottom" and left exactly the small gap visible in the scrollbar.
+        armTailSettle();
       }
-    }, { root, threshold: 0.01 });
+    }, { root, threshold: 1 });
     observer.observe(tail);
     tailObserverRef.current = observer;
-  }, [scheduleBottomSnap]);
+  }, [armTailSettle]);
   const bindTail = useCallback((node: HTMLDivElement | null) => {
     tailElementRef.current = node;
     rebindTailObserver();
@@ -1335,29 +1470,212 @@ function Chat() {
   }), [bindTail, eng.chatHasMore, olderBusy]);
   const onTotalListHeightChanged = useCallback((height: number) => {
     if (!(height > 0) || messages.length === 0) return;
+    const wasInitialGeometryPending = initialGeometryPendingRef.current;
     initialGeometryPendingRef.current = false;
-    // Measurements only update canonical geometry; they never write scrollTop.
+    if (wasInitialGeometryPending) rebindTailObserver();
     scheduleGeometrySample();
-  }, [messages.length, scheduleGeometrySample]);
+    // This is also the wake-up that an initial IntersectionObserver event could previously lose.
+    // The finite settle verifies physical geometry and becomes inert after confirmation.
+    if (bottomFollowIntentRef.current && !prependGuardRef.current) armTailSettle();
+  }, [armTailSettle, messages.length, rebindTailObserver, scheduleGeometrySample]);
   const onAtBottom = useCallback((_reportedBottom: boolean) => {
     // Virtuoso's callback is a scheduling signal; one DOM geometry classifier owns the truth.
     // This also accepts a short unread list whose final rows are all physically visible.
     scheduleGeometrySample();
   }, [scheduleGeometrySample]);
+  const onVirtuosoScrolling = useCallback((scrolling: boolean) => {
+    virtuosoScrollingRef.current = scrolling;
+    if (!scrolling) {
+      smoothJumpPendingRef.current = false;
+      if (bottomFollowIntentRef.current && !prependGuardRef.current) armTailSettle();
+    }
+  }, [armTailSettle]);
+
+  const releaseOlderRequest = useCallback((requestSeq: number) => {
+    if (olderRequestSeq.current !== requestSeq) return;
+    loadingOlder.current = false;
+    setOlderBusy(false);
+  }, []);
+
+  const finishPrependGuard = useCallback((requestSeq: number, restoreTail: boolean) => {
+    const transaction = prependTransactionRef.current;
+    if (!transaction || transaction.requestSeq !== requestSeq) return;
+    ++prependSettleTokenRef.current;
+    if (prependSettleFrameRef.current != null) window.cancelAnimationFrame(prependSettleFrameRef.current);
+    prependSettleFrameRef.current = null;
+    prependTransactionRef.current = null;
+    prependGuardRef.current = false;
+    setPrependGuardActive(false);
+    releaseOlderRequest(requestSeq);
+    scheduleGeometrySample();
+    if (restoreTail && bottomFollowIntentRef.current && !bottomRearmBlockedRef.current) {
+      armTailSettle();
+    }
+  }, [armTailSettle, releaseOlderRequest, scheduleGeometrySample]);
+
+  const beginPrependGuard = useCallback((
+    requestSeq: number,
+    serverId: string,
+    requestHistoryGeneration: number,
+  ) => {
+    if (prependGuardRef.current || prependTransactionRef.current) return false;
+    cancelBottomSnap();
+    cancelTailSettle();
+    ++prependSettleTokenRef.current;
+    if (prependSettleFrameRef.current != null) window.cancelAnimationFrame(prependSettleFrameRef.current);
+    prependSettleFrameRef.current = null;
+    prependGuardRef.current = true;
+    setPrependGuardActive(true);
+    const scroller = scrollerElementRef.current;
+    const restoreTail = bottomFollowIntentRef.current
+      && !!scroller
+      && chatBottomDistance(scroller) <= CHAT_BOTTOM_ENTER_PX;
+    prependTransactionRef.current = {
+      requestSeq,
+      serverId,
+      historyGeneration: requestHistoryGeneration,
+      committed: false,
+      targetPrepended: null,
+      anchorAbsoluteIndex: null,
+      anchorTop: 0,
+      restoreTail,
+    };
+    if (!restoreTail) {
+      setFollowIntent(false);
+      commitAtBottom(false);
+    }
+    return true;
+  }, [cancelBottomSnap, cancelTailSettle, commitAtBottom, setFollowIntent]);
+
+  const capturePrependAnchor = useCallback((requestSeq: number, targetPrepended: number) => {
+    const transaction = prependTransactionRef.current;
+    const scroller = scrollerElementRef.current;
+    if (!transaction || transaction.requestSeq !== requestSeq) return false;
+    transaction.targetPrepended = targetPrepended;
+    transaction.committed = true;
+    if (!scroller) return true;
+    const viewport = scroller.getBoundingClientRect();
+    const rows = Array.from(scroller.querySelectorAll<HTMLElement>(
+      '[data-testid="virtuoso-item-list"] > [data-item-index]',
+    ));
+    const anchor = rows.find((row) => row.getBoundingClientRect().bottom > viewport.top + 0.5)
+      || rows[0];
+    const anchorIndex = Number(anchor?.dataset.itemIndex);
+    transaction.anchorAbsoluteIndex = Number.isFinite(anchorIndex) ? anchorIndex : null;
+    transaction.anchorTop = anchor ? anchor.getBoundingClientRect().top - viewport.top : 0;
+    transaction.restoreTail = transaction.restoreTail && bottomFollowIntentRef.current;
+    return true;
+  }, []);
+
+  const settlePrependAnchor = useCallback((requestSeq: number) => {
+    const transaction = prependTransactionRef.current;
+    if (!transaction || transaction.requestSeq !== requestSeq || !transaction.committed) return;
+    if (prependSettleFrameRef.current != null) return;
+    if (transaction.anchorAbsoluteIndex == null) {
+      finishPrependGuard(requestSeq, transaction.restoreTail);
+      return;
+    }
+
+    const token = ++prependSettleTokenRef.current;
+    let frames = 0;
+    let stableFrames = 0;
+    let corrections = 0;
+    let previousGeometry: { scrollHeight: number; clientHeight: number; scrollTop: number; anchorTop: number } | null = null;
+    const tick = () => {
+      if (token !== prependSettleTokenRef.current) return;
+      // The scheduled callback owns no pending frame once it starts. Clearing here prevents a
+      // stale request from poisoning the single RAF slot used by the next valid transaction.
+      prependSettleFrameRef.current = null;
+      const current = prependTransactionRef.current;
+      const scroller = scrollerElementRef.current;
+      if (!current || current.requestSeq !== requestSeq || !prependGuardRef.current) return;
+      if (!scroller) {
+        finishPrependGuard(requestSeq, false);
+        return;
+      }
+      const currentEngine = getEngine();
+      if (current.serverId !== activeIdRef.current
+        || current.historyGeneration !== historyGenerationRef.current
+        || currentEngine !== E
+        || currentEngine?.chatHistoryGeneration !== current.historyGeneration) {
+        finishPrependGuard(requestSeq, false);
+        return;
+      }
+      const anchor = scroller.querySelector<HTMLElement>(
+        `[data-testid="virtuoso-item-list"] > [data-item-index="${current.anchorAbsoluteIndex}"]`,
+      );
+      if (!anchor) {
+        if (++frames >= 54) finishPrependGuard(requestSeq, current.restoreTail);
+        else prependSettleFrameRef.current = window.requestAnimationFrame(tick);
+        return;
+      }
+
+      const viewportTop = scroller.getBoundingClientRect().top;
+      let anchorTop = anchor.getBoundingClientRect().top - viewportTop;
+      const delta = chatPrependAnchorDelta(current.anchorTop, anchorTop);
+      if (Math.abs(delta) > 0.5) {
+        if (corrections >= CHAT_PREPEND_MAX_CORRECTIONS) {
+          finishPrependGuard(requestSeq, current.restoreTail);
+          return;
+        }
+        // Boundary rows can change height when their date/group predecessor arrives. Restore the
+        // same absolute item to the same viewport pixel while the transaction is isolated.
+        scroller.scrollTop += delta;
+        corrections += 1;
+        anchorTop = anchor.getBoundingClientRect().top - viewportTop;
+        stableFrames = 0;
+      }
+
+      const geometry = {
+        scrollHeight: scroller.scrollHeight,
+        clientHeight: scroller.clientHeight,
+        scrollTop: scroller.scrollTop,
+        anchorTop,
+      };
+      const stable = previousGeometry
+        && Math.abs(previousGeometry.scrollHeight - geometry.scrollHeight) <= 0.5
+        && Math.abs(previousGeometry.clientHeight - geometry.clientHeight) <= 0.5
+        && Math.abs(previousGeometry.scrollTop - geometry.scrollTop) <= 0.5
+        && Math.abs(geometry.anchorTop - current.anchorTop) <= 0.5;
+      stableFrames = stable ? stableFrames + 1 : 0;
+      previousGeometry = geometry;
+      frames += 1;
+
+      if (stableFrames >= 3 || frames >= 54) {
+        prependSettleFrameRef.current = null;
+        finishPrependGuard(requestSeq, current.restoreTail);
+        return;
+      }
+      prependSettleFrameRef.current = window.requestAnimationFrame(tick);
+    };
+    // First correction runs in layout effect before paint; later ResizeObserver compensation is
+    // absorbed by the bounded RAF verification window.
+    tick();
+  }, [E, finishPrependGuard]);
+
+  const cancelPrependRestoreForInput = useCallback(() => {
+    const transaction = prependTransactionRef.current;
+    if (transaction?.committed) finishPrependGuard(transaction.requestSeq, false);
+  }, [finishPrependGuard]);
 
   const bindScroller = useCallback((ref: HTMLElement | null | Window) => {
     detachScrollerRef.current?.();
     detachScrollerRef.current = null;
     scrollerElementRef.current = null;
+    virtuosoScrollingRef.current = false;
     const el = ref instanceof HTMLElement ? ref : null;
-    if (!el) return;
+    if (!el) {
+      const transaction = prependTransactionRef.current;
+      if (transaction) finishPrependGuard(transaction.requestSeq, false);
+      return;
+    }
     scrollerElementRef.current = el;
     let touchY: number | null = null;
     let scrollbarDrag = false;
     let directScrollInput = false;
     let directScrollTimer: number | null = null;
     let lastScrollTop = el.scrollTop;
-    const armDirectScrollInput = () => {
+    const extendDirectScrollInput = () => {
       directScrollInput = true;
       if (directScrollTimer != null) window.clearTimeout(directScrollTimer);
       // Momentum keeps emitting scroll events after touchend. Extend the fence from every
@@ -1367,11 +1685,18 @@ function Chat() {
         directScrollInput = false;
       }, 240);
     };
+    const armDirectScrollInput = () => {
+      cancelTailSettle();
+      cancelPrependRestoreForInput();
+      extendDirectScrollInput();
+    };
     const onScrollerScroll = () => {
       if (scrollbarDrag || directScrollInput) {
         if (el.scrollTop < lastScrollTop - 0.5) noteUserDirection('up');
         else if (el.scrollTop > lastScrollTop + 0.5) noteUserDirection('down');
-        if (directScrollInput) armDirectScrollInput();
+        // Momentum/programmatic compensation may emit more scroll events while the input fence
+        // is active. Extend only the timer here; cancellation belongs to actual input handlers.
+        if (directScrollInput) extendDirectScrollInput();
       }
       lastScrollTop = el.scrollTop;
       scheduleGeometrySample();
@@ -1438,15 +1763,21 @@ function Chat() {
       tailObserverRef.current = null;
       if (scrollerElementRef.current === el) scrollerElementRef.current = null;
     };
-  }, [noteUserDirection, rebindTailObserver, scheduleGeometrySample]);
+  }, [cancelPrependRestoreForInput, cancelTailSettle, finishPrependGuard, noteUserDirection, rebindTailObserver, scheduleGeometrySample]);
   useEffect(() => () => {
     detachScrollerRef.current?.();
     tailObserverRef.current?.disconnect();
     cancelBottomSnap();
+    cancelTailSettle();
     if (geometryFrameRef.current != null) window.cancelAnimationFrame(geometryFrameRef.current);
     geometryFrameRef.current = null;
+    ++prependSettleTokenRef.current;
+    if (prependSettleFrameRef.current != null) window.cancelAnimationFrame(prependSettleFrameRef.current);
+    prependSettleFrameRef.current = null;
+    prependTransactionRef.current = null;
+    prependGuardRef.current = false;
     clearUserDirection();
-  }, [cancelBottomSnap, clearUserDirection]);
+  }, [cancelBottomSnap, cancelTailSettle, clearUserDirection]);
 
   useLayoutEffect(() => {
     appendCursorRef.current = {
@@ -1455,10 +1786,11 @@ function Chat() {
       tailId: messages.length ? messages[messages.length - 1].id : null,
       count: messages.length,
     };
+    if (bottomFollowServerRef.current !== activeId) return;
     if (initialPinnedHydration) {
-      initialBottomPendingRef.current = false;
+      initialSemanticIssuedRef.current = true;
       ownSendPendingRef.current = false;
-      scheduleBottomSnap('auto');
+      scheduleBottomSnap('auto', true);
     } else if (ownExplicitAppend) {
       ownSendPendingRef.current = false;
       scheduleBottomSnap('auto');
@@ -1475,12 +1807,21 @@ function Chat() {
     // а не по пока ещё пустому messages, иначе первый history batch ошибочно утащит чат вниз.
     const startPinned = unreadServer === 0;
     cancelBottomSnap();
+    cancelTailSettle();
+    ++prependSettleTokenRef.current;
+    if (prependSettleFrameRef.current != null) window.cancelAnimationFrame(prependSettleFrameRef.current);
+    prependSettleFrameRef.current = null;
+    prependTransactionRef.current = null;
+    prependGuardRef.current = false;
+    setPrependGuardActive(false);
     if (geometryFrameRef.current != null) window.cancelAnimationFrame(geometryFrameRef.current);
     geometryFrameRef.current = null;
     clearUserDirection();
     ownSendPendingRef.current = false;
     initialBottomPendingRef.current = startPinned;
+    initialSemanticIssuedRef.current = false;
     initialGeometryPendingRef.current = true;
+    virtuosoScrollingRef.current = false;
     smoothJumpPendingRef.current = false;
     bottomRearmBlockedRef.current = false;
     bottomFollowServerRef.current = activeId;
@@ -1505,18 +1846,36 @@ function Chat() {
     // InitialTopMostItemIndex задаёт семантическую позицию, а один scrollToIndex страхует
     // первичное измерение footer. Дальше tail sentinel реагирует только на реальную потерю хвоста.
     if (startPinned && messages.length > 0) {
-      initialBottomPendingRef.current = false;
-      scheduleBottomSnap('auto');
+      initialSemanticIssuedRef.current = true;
+      scheduleBottomSnap('auto', true);
     }
     return () => {
       initialBottomPendingRef.current = false;
+      initialSemanticIssuedRef.current = false;
       bottomFollowIntentRef.current = false;
       smoothJumpPendingRef.current = false;
       bottomRearmBlockedRef.current = false;
       cancelBottomSnap();
+      cancelTailSettle();
       clearTimeout(t);
     };
-  }, [activeId, cancelBottomSnap, clearUserDirection, commitAtBottom, scheduleBottomSnap, setFollowIntent]);
+  }, [activeId, cancelBottomSnap, cancelTailSettle, clearUserDirection, commitAtBottom, scheduleBottomSnap, setFollowIntent]);
+
+  useLayoutEffect(() => {
+    const transaction = prependTransactionRef.current;
+    if (!transaction) return;
+    if (getEngine() !== E) {
+      finishPrependGuard(transaction.requestSeq, false);
+      return;
+    }
+    const decision = classifyChatPrependLifecycle(transaction, {
+      serverId: activeId,
+      historyGeneration,
+      prepended: eng.chatPrepended,
+    });
+    if (decision === 'cancel') finishPrependGuard(transaction.requestSeq, false);
+    else if (decision === 'settle') settlePrependAnchor(transaction.requestSeq);
+  }, [E, activeId, eng.chatPrepended, finishPrependGuard, historyGeneration, settlePrependAnchor]);
 
   // focus/blur/visibility окна → пере-триггер эффекта прочтения (вернулся в окно внизу чата = прочитал)
   useEffect(() => {
@@ -1575,13 +1934,18 @@ function Chat() {
 
   // догрузка более старых сообщений при скролле к верху (курсорная пагинация)
   const loadOlder = useCallback(async () => {
-    if (loadingOlder.current || !olderReady.current || !E.chatHasMore) return;
+    if (!canStartChatPrepend(loadingOlder.current, prependGuardRef.current)
+      || !olderReady.current || !E.chatHasMore) return;
     const cursor = E.chatOldestCursor;
     const reqId = activeId;
     if (cursor == null || !reqId) return;
     const historyGeneration = E.chatHistoryGeneration;
     const requestSeq = ++olderRequestSeq.current;
     loadingOlder.current = true; setOlderBusy(true);
+    if (!beginPrependGuard(requestSeq, reqId, historyGeneration)) {
+      releaseOlderRequest(requestSeq);
+      return;
+    }
     try {
       const h = await api.getMessages(reqId, cursor, 30);
       // за время запроса могли переключить сервер — не вклеиваем чужую страницу в чужой чат
@@ -1590,15 +1954,50 @@ function Chat() {
       // prependHistory растит messages И chatPrepended в ОДНОМ emit → firstItemIndex (derived) сдвигается
       // атомарно с данными, virtuoso держит позицию на прежнем сообщении (без прыжка). Отдельный
       // setFirstItemIndex больше не нужен (был вторым источником и давал рассинхрон/прыжок).
+      const beforeState = E.getSnapshot();
+      const beforeVirtual = {
+        count: beforeState.messages.length,
+        prepended: beforeState.chatPrepended,
+        trimmed: beforeState.chatTrimmed,
+        firstItemIndex: chatVirtualFirstItemIndex(
+          VIRT_BASE_INDEX,
+          beforeState.chatPrepended,
+          beforeState.chatTrimmed,
+        ),
+      };
+      if (!capturePrependAnchor(requestSeq, beforeState.chatPrepended + h.messages.length)) return;
       E.prependHistory(h.messages, h.hasMore);
-    } catch { /**/ }
-    finally {
-      if (olderRequestSeq.current === requestSeq) {
-        loadingOlder.current = false;
-        setOlderBusy(false);
+      if (!h.messages.length) finishPrependGuard(requestSeq, false);
+      else {
+        const afterState = E.getSnapshot();
+        const transition = classifyChatPrepend(beforeVirtual, {
+          count: afterState.messages.length,
+          prepended: afterState.chatPrepended,
+          trimmed: afterState.chatTrimmed,
+          firstItemIndex: chatVirtualFirstItemIndex(
+            VIRT_BASE_INDEX,
+            afterState.chatPrepended,
+            afterState.chatTrimmed,
+          ),
+        }, 0);
+        if (!transition.valid || !transition.anchorPreserved) {
+          finishPrependGuard(requestSeq, prependTransactionRef.current?.restoreTail === true);
+        }
+      }
+    } catch {
+      if (prependTransactionRef.current?.requestSeq === requestSeq) {
+        finishPrependGuard(requestSeq, false);
       }
     }
-  }, [E, activeId]);
+    finally {
+      const transaction = prependTransactionRef.current;
+      if (transaction?.requestSeq === requestSeq && !transaction.committed) {
+        finishPrependGuard(requestSeq, false);
+      } else if (!transaction || transaction.requestSeq !== requestSeq) {
+        releaseOlderRequest(requestSeq);
+      }
+    }
+  }, [E, activeId, beginPrependGuard, capturePrependAnchor, finishPrependGuard, releaseOlderRequest]);
   loadOlderRef.current = loadOlder;
 
   // --- reply (ответ на сообщение) ---
@@ -1934,6 +2333,7 @@ function Chat() {
             // silently stopped because Virtuoso already considered the list detached.
             atBottomThreshold={CHAT_BOTTOM_LEAVE_PX}
             atBottomStateChange={onAtBottom}
+            isScrolling={onVirtuosoScrolling}
             totalListHeightChanged={onTotalListHeightChanged}
             increaseViewportBy={{ top: 600, bottom: 400 }}
             scrollSeekConfiguration={CHAT_SCROLL_SEEK}

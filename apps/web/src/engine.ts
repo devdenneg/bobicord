@@ -722,7 +722,7 @@ export class Engine {
     this.clearAllWatches();
     this.liveKitT.detach(); this.treeT.detach(); this.screenAudioEls.clear();
     this.streamWatchers.clear();
-    this.perMuteByServer.clear(); this.volsByServer.clear(); this.messages = []; this.reactions.clear(); this.reactionWrites.clear(); this.reactionWriteSeq.clear(); this.reactionWriteDesired.clear(); this.pendingSend.clear(); this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0; ++this.chatGeneration;
+    this.perMuteByServer.clear(); this.volsByServer.clear(); this.messages = []; this.reactions.clear(); this.reactionWrites.clear(); this.reactionWriteSeq.clear(); this.reactionWriteDesired.clear(); this.pendingSend.clear(); this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0; this.chatPrepended = 0; ++this.chatGeneration;
     this.onlineHint.clear(); this.awayHint.clear(); this.voiceHint = {}; this.typingUsers.clear();
     this.activeVoiceSessions.clear();
     this.subscriptionRetries.clear();
@@ -740,7 +740,7 @@ export class Engine {
   detachView() {
     ++this.connectEpoch;
     this.resetStreamEdges();
-    this.messages = []; this.reactions.clear(); this.reactionWrites.clear(); this.reactionWriteSeq.clear(); this.reactionWriteDesired.clear(); this.pendingSend.clear(); this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0; ++this.chatGeneration;
+    this.messages = []; this.reactions.clear(); this.reactionWrites.clear(); this.reactionWriteSeq.clear(); this.reactionWriteDesired.clear(); this.pendingSend.clear(); this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0; this.chatPrepended = 0; ++this.chatGeneration;
     this.clearAllWatches(); this.streamWatchers.clear();
     // presence-хинты и typing принадлежат ПРЕДЫДУЩЕМУ смотримому серверу
     this.onlineHint.clear(); this.awayHint.clear(); this.voiceHint = {}; this.typingUsers.clear();
@@ -2674,6 +2674,10 @@ export class Engine {
     ++this.chatGeneration;
     this.streamStateMessages.clear();
     this.messages = [];
+    this.chatMore = false;
+    this.oldestSid = null;
+    this.trimmedFront = 0;
+    this.chatPrepended = 0;
     this.dataSend({ t: 'clear', by: byName || this.me.displayName });
     this.emit();
     this.sysMsg((byName || this.me.displayName) + ' очистил чат');
@@ -2912,7 +2916,18 @@ export class Engine {
           notify('mention', { title: d.name, body: String(d.text || '').slice(0, 140) || fallback, tag: 'mention:' + this.viewServerId });
         }
       }
-      else if (d.t === 'clear') { ++this.chatGeneration; this.streamStateMessages.clear(); this.messages = []; this.reactions.clear(); this.emit(); this.sysMsg((d.by || 'Админ') + ' очистил чат'); }
+      else if (d.t === 'clear') {
+        ++this.chatGeneration;
+        this.streamStateMessages.clear();
+        this.messages = [];
+        this.reactions.clear();
+        this.chatMore = false;
+        this.oldestSid = null;
+        this.trimmedFront = 0;
+        this.chatPrepended = 0;
+        this.emit();
+        this.sysMsg((d.by || 'Админ') + ' очистил чат');
+      }
       else if (d.t === 'emote') this.emoteListeners.forEach((f) => f(d.s, d.e, d.by, d.x, d.sz));
       else if (d.t === 'watch') { const m = this.wset(d.s); if (d.on) m.set(d.id, { name: d.n, color: d.c ?? 0, avatarUrl: d.a, ts: Date.now() }); else m.delete(d.id); this.emit(); }
       else if (d.t === 'typing') { if (d.name && d.name !== this.me.displayName) { this.typingUsers.set(d.name, Date.now() + 3500); this.emit(); setTimeout(() => this.pruneTyping(), 3600); } }
