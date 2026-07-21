@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from 'react';
-import { Virtuoso, type ScrollSeekConfiguration, type ScrollSeekPlaceholderProps, type VirtuosoHandle } from 'react-virtuoso';
+import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { useStore, getEngine } from '../store';
 import { api, resolveUploadUrl } from '../api';
 import { useEngine } from '../hooks';
@@ -1037,7 +1037,6 @@ function ChatOlderHeader({ context }: { context?: ChatVirtuosoContext }) {
   );
 }
 type ChatVirtuosoContext = {
-  busy?: boolean;
   hasMore?: boolean;
   tailRef?: (node: HTMLDivElement | null) => void;
 };
@@ -1046,18 +1045,9 @@ function ChatFooter({ context }: { context?: ChatVirtuosoContext }) {
   return <div ref={context?.tailRef} className="chat-tail-sentinel" style={{ height: CHAT_TAIL_RESERVE_PX }} />;
 }
 
-function ChatScrollPlaceholder({ height, index }: ScrollSeekPlaceholderProps) {
-  return <div className="chat-scroll-placeholder" data-item-index={index} style={{ height }} aria-hidden="true" />;
-}
-
-const CHAT_SCROLL_SEEK: ScrollSeekConfiguration = {
-  enter: (velocity) => Math.abs(velocity) > 700,
-  exit: (velocity) => Math.abs(velocity) < 120,
-};
 const CHAT_VIRTUOSO_COMPONENTS = {
   Header: ChatOlderHeader,
   Footer: ChatFooter,
-  ScrollSeekPlaceholder: ChatScrollPlaceholder,
 };
 
 // Группировка подряд идущих сообщений одного автора (как в Telegram): шапка (имя/время) —
@@ -1464,10 +1454,9 @@ function Chat() {
     rebindTailObserver();
   }, [rebindTailObserver]);
   const virtuosoContext = useMemo<ChatVirtuosoContext>(() => ({
-    busy: olderBusy,
     hasMore: eng.chatHasMore,
     tailRef: bindTail,
-  }), [bindTail, eng.chatHasMore, olderBusy]);
+  }), [bindTail, eng.chatHasMore]);
   const onTotalListHeightChanged = useCallback((height: number) => {
     if (!(height > 0) || messages.length === 0) return;
     const wasInitialGeometryPending = initialGeometryPendingRef.current;
@@ -2336,7 +2325,6 @@ function Chat() {
             isScrolling={onVirtuosoScrolling}
             totalListHeightChanged={onTotalListHeightChanged}
             increaseViewportBy={{ top: 600, bottom: 400 }}
-            scrollSeekConfiguration={CHAT_SCROLL_SEEK}
             computeItemKey={(_, m) => m.id}
             context={virtuosoContext}
             components={CHAT_VIRTUOSO_COMPONENTS}
