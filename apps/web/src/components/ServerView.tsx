@@ -27,18 +27,22 @@ import {
   CHAT_BOTTOM_LEAVE_PX,
   CHAT_PHYSICAL_BOTTOM_EPSILON_PX,
   CHAT_TAIL_RESERVE_PX,
+  INITIAL_CHAT_PREPEND_SETTLE,
   INITIAL_CHAT_TAIL_SETTLE,
+  advanceChatPrependSettle,
   canStartChatPrepend,
   canCorrectChatPrependAnchor,
   chatBottomDistance,
   classifyChatPrepend,
   classifyChatPrependLifecycle,
   chatPrependAnchorDelta,
+  isChatPrependGeometryStreakStable,
   chatTailIndexLocation,
   chatVirtualFirstItemIndex,
   reduceChatScrollState,
   reduceChatTailSettle,
   type ChatScrollDirection,
+  type ChatPrependGeometry,
   type ChatTailSettleState,
 } from '../chatScroll';
 import type { Attachment, ChatMessage, Emote, Leaderboard, Member, MemberStats, ReleaseNote, ReplyRef, Role } from '../types';
@@ -851,8 +855,8 @@ function ReleasePatchCard({ release, ts }: { release: ReleaseNote; ts?: number }
     : null;
   const dateTime = safeIsoTime(ts);
   return (
-    <div className="virt-row release-row">
-      <article className="release-card" data-chat-visual-anchor="" aria-label={`Обновление: ${release.title}`}>
+    <div className="virt-row release-row" data-chat-visual-anchor="">
+      <article className="release-card" aria-label={`Обновление: ${release.title}`}>
         <span className="release-announcer" role="status" aria-live="polite" aria-atomic="true">
           {`${release.title}. ${release.notes.join('. ')}`}
         </span>
@@ -1013,8 +1017,6 @@ const COMMANDS: { name: string; desc: string }[] = [
 // Базовый индекс для virtuoso firstItemIndex: при догрузке старых сообщений его уменьшаем
 // на кол-во добавленных сверху — так virtuoso держит якорь скролла на месте (prepend-паттерн).
 const VIRT_BASE_INDEX = 1_000_000;
-const CHAT_PREPEND_MAX_CORRECTIONS = 4;
-
 interface ChatPrependTransaction {
   requestSeq: number;
   serverId: string;
@@ -1316,6 +1318,11 @@ function Chat() {
 
     const tick = () => {
       if (token !== tailSettleTokenRef.current) return;
+      if (window.performance.now() >= deadline) {
+        tailSettleStateRef.current = { ...tailSettleStateRef.current, phase: 'cancelled' };
+        tailSettleFrameRef.current = null;
+        return;
+      }
       const scroller = scrollerElementRef.current;
       const tail = tailElementRef.current;
       const geometry = scroller ? {
@@ -1341,8 +1348,8 @@ function Chat() {
 
       if (decision.scrollTop != null) {
         // `scrollToIndex` is semantic and can use a size estimate. This final write targets the
-        // browser's measured maximum. The reducer permits one bounded retry of the same target,
-        // caps total writes, and the caller bounds the whole transaction with a hard deadline.
+        // browser's measured maximum. The reducer permits two bounded pullback repairs for the
+        // same target, caps total writes, and the caller bounds the transaction by a deadline.
         if (virtuosoRef.current) virtuosoRef.current.scrollTo({ top: decision.scrollTop, behavior: 'auto' });
         else scroller?.scrollTo({ top: decision.scrollTop, behavior: 'auto' });
       }
@@ -1353,7 +1360,7 @@ function Chat() {
         tailSettleFrameRef.current = null;
         return;
       }
-      if (!decision.keepSampling || window.performance.now() >= deadline) {
+      if (!decision.keepSampling) {
         tailSettleStateRef.current = { ...decision.state, phase: 'cancelled' };
         tailSettleFrameRef.current = null;
         return;
@@ -1611,10 +1618,9 @@ function Chat() {
     }
 
     const token = ++prependSettleTokenRef.current;
-    let frames = 0;
-    let stableFrames = 0;
-    let corrections = 0;
-    let previousGeometry: { scrollHeight: number; clientHeight: number; scrollTop: number; anchorTop: number } | null = null;
+    let settleProgress = INITIAL_CHAT_PREPEND_SETTLE;
+    let previousGeometry: ChatPrependGeometry | null = null;
+    let stableBaselineGeometry: ChatPrependGeometry | null = null;
     const correctVisualOffset = () => {
       const current = prependTransactionRef.current;
       const scroller = scrollerElementRef.current;
@@ -1667,9 +1673,10 @@ function Chat() {
       correctVisualOffset();
       const itemList = scroller.querySelector<HTMLElement>('[data-testid="virtuoso-item-list"]');
       const deviation = Number.parseFloat(itemList?.style.marginTop || '');
-      if (!canCorrectChatPrependAnchor(frames, deviation)) {
-        frames += 1;
-        if (frames >= 54) finishPrependGuard(requestSeq, current.restoreTail);
+      if (!canCorrectChatPrependAnchor(settleProgress.frames, deviation)) {
+        const decision = advanceChatPrependSettle(settleProgress, false, false);
+        settleProgress = decision.progress;
+        if (decision.done) finishPrependGuard(requestSeq, current.restoreTail);
         else prependSettleFrameRef.current = window.requestAnimationFrame(tick);
         return;
       }
@@ -1678,7 +1685,9 @@ function Chat() {
         `[data-testid="virtuoso-item-list"] > [data-item-index="${current.anchorAbsoluteIndex}"]`,
       );
       if (!row) {
-        if (++frames >= 54) finishPrependGuard(requestSeq, current.restoreTail);
+        const decision = advanceChatPrependSettle(settleProgress, false, false);
+        settleProgress = decision.progress;
+        if (decision.done) finishPrependGuard(requestSeq, current.restoreTail);
         else prependSettleFrameRef.current = window.requestAnimationFrame(tick);
         return;
       }
@@ -1687,17 +1696,14 @@ function Chat() {
       const viewportTop = scroller.getBoundingClientRect().top;
       let anchorTop = anchor.getBoundingClientRect().top - viewportTop;
       const delta = chatPrependAnchorDelta(current.anchorTop, anchorTop);
-      if (Math.abs(delta) > 0.5) {
-        if (corrections >= CHAT_PREPEND_MAX_CORRECTIONS) {
-          finishPrependGuard(requestSeq, current.restoreTail);
-          return;
-        }
+      const corrected = Math.abs(delta) > 0.5;
+      if (corrected) {
         // Date/group decoration of the seam row can change after prepend. Restore the stable
         // message content marker only after Virtuoso has completed its own two-frame deviation.
+        // Keep correcting later measurement waves until geometry settles or the existing frame
+        // deadline expires; a write-count cap used to leave a small residual after the 4th wave.
         scroller.scrollTop += delta;
-        corrections += 1;
         anchorTop = anchor.getBoundingClientRect().top - viewportTop;
-        stableFrames = 0;
       }
 
       const geometry = {
@@ -1706,16 +1712,21 @@ function Chat() {
         scrollTop: scroller.scrollTop,
         anchorTop,
       };
-      const stable = previousGeometry
-        && Math.abs(previousGeometry.scrollHeight - geometry.scrollHeight) <= 0.5
-        && Math.abs(previousGeometry.clientHeight - geometry.clientHeight) <= 0.5
-        && Math.abs(previousGeometry.scrollTop - geometry.scrollTop) <= 0.5
-        && Math.abs(geometry.anchorTop - current.anchorTop) <= 0.5;
-      stableFrames = stable ? stableFrames + 1 : 0;
+      const stable = !corrected
+        && current.visualOffsetCorrected
+        && isChatPrependGeometryStreakStable(
+          previousGeometry,
+          stableBaselineGeometry ?? previousGeometry,
+          geometry,
+          current.anchorTop,
+        );
+      if (!stable) stableBaselineGeometry = null;
+      else if (!stableBaselineGeometry) stableBaselineGeometry = previousGeometry;
       previousGeometry = geometry;
-      frames += 1;
+      const decision = advanceChatPrependSettle(settleProgress, stable, corrected);
+      settleProgress = decision.progress;
 
-      if (stableFrames >= 3 || frames >= 54) {
+      if (decision.done) {
         prependSettleFrameRef.current = null;
         finishPrependGuard(requestSeq, current.restoreTail);
         return;

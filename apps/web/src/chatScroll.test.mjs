@@ -15,8 +15,11 @@ const {
   INITIAL_CHAT_TAIL_SETTLE,
   CHAT_TAIL_RESERVE_PX,
   CHAT_TAIL_MAX_WRITES,
+  CHAT_TAIL_MAX_SAME_TARGET_WRITES,
+  INITIAL_CHAT_PREPEND_SETTLE,
   CHAT_PREPEND_WARMUP_FRAMES,
   CHAT_SESSION_MESSAGE_LIMIT,
+  advanceChatPrependSettle,
   canStartChatPrepend,
   canCorrectChatPrependAnchor,
   chatAppendFrontTrim,
@@ -25,6 +28,8 @@ const {
   classifyChatPrependLifecycle,
   chatPhysicalMaxScrollTop,
   chatPrependAnchorDelta,
+  isChatPrependGeometryStable,
+  isChatPrependGeometryStreakStable,
   chatRetentionLimitAfterProtectedInsert,
   chatTailIndexLocation,
   chatVirtualFirstItemIndex,
@@ -341,7 +346,7 @@ equal('the newest retarget is also written only once', {
 let sameTargetRetry = reduceChatTailSettle(repeatedThirdTarget.state, settleInput({
   scrollHeight: 1052, clientHeight: 400, scrollTop: 632,
 }));
-equal('one delayed same-target retry repairs a Virtuoso pullback', {
+equal('the first delayed pullback gets a second exact target write', {
   phase: sameTargetRetry.state.phase,
   scrollTop: sameTargetRetry.scrollTop,
   targetWrites: sameTargetRetry.state.targetWrites,
@@ -352,11 +357,47 @@ sameTargetRetry = reduceChatTailSettle(sameTargetRetry.state, settleInput({
 sameTargetRetry = reduceChatTailSettle(sameTargetRetry.state, settleInput({
   scrollHeight: 1052, clientHeight: 400, scrollTop: 632,
 }));
-equal('a persistently rejected target cancels instead of jittering forever', {
+equal('the second delayed pullback gets the final bounded repair', {
+  phase: sameTargetRetry.state.phase,
+  scrollTop: sameTargetRetry.scrollTop,
+  targetWrites: sameTargetRetry.state.targetWrites,
+}, { phase: 'targeting', scrollTop: 652, targetWrites: CHAT_TAIL_MAX_SAME_TARGET_WRITES });
+const sameTargetCapState = sameTargetRetry.state;
+sameTargetRetry = reduceChatTailSettle(sameTargetRetry.state, settleInput({
+  scrollHeight: 1052, clientHeight: 400, scrollTop: 652,
+}));
+sameTargetRetry = reduceChatTailSettle(sameTargetRetry.state, settleInput({
+  scrollHeight: 1052, clientHeight: 400, scrollTop: 652,
+}));
+equal('physical confirmation settles after repeated pullbacks', {
   phase: sameTargetRetry.state.phase,
   scrollTop: sameTargetRetry.scrollTop,
   keepSampling: sameTargetRetry.keepSampling,
+}, { phase: 'settled', scrollTop: null, keepSampling: false });
+
+let rejectedSameTarget = reduceChatTailSettle(sameTargetCapState, settleInput({
+  scrollHeight: 1052, clientHeight: 400, scrollTop: 632,
+}));
+rejectedSameTarget = reduceChatTailSettle(rejectedSameTarget.state, settleInput({
+  scrollHeight: 1052, clientHeight: 400, scrollTop: 632,
+}));
+equal('a third pullback cancels without starting a visible retry loop', {
+  phase: rejectedSameTarget.state.phase,
+  scrollTop: rejectedSameTarget.scrollTop,
+  keepSampling: rejectedSameTarget.keepSampling,
 }, { phase: 'cancelled', scrollTop: null, keepSampling: false });
+
+let changedAfterSameTargetCap = reduceChatTailSettle(sameTargetCapState, settleInput({
+  scrollHeight: 1072, clientHeight: 400, scrollTop: 652,
+}));
+changedAfterSameTargetCap = reduceChatTailSettle(changedAfterSameTargetCap.state, settleInput({
+  scrollHeight: 1072, clientHeight: 400, scrollTop: 652,
+}));
+equal('new physical growth remains eligible after the old target used its repair budget', {
+  phase: changedAfterSameTargetCap.state.phase,
+  scrollTop: changedAfterSameTargetCap.scrollTop,
+  targetWrites: changedAfterSameTargetCap.state.targetWrites,
+}, { phase: 'targeting', scrollTop: 672, targetWrites: 1 });
 
 let writeCap = reduceChatTailSettle({
   ...INITIAL_CHAT_TAIL_SETTLE,
@@ -397,6 +438,60 @@ equal('an active Virtuoso deviation keeps custom correction fenced', [
   canCorrectChatPrependAnchor(CHAT_PREPEND_WARMUP_FRAMES, 0.5),
   canCorrectChatPrependAnchor(CHAT_PREPEND_WARMUP_FRAMES + 1, 0),
 ], [false, false, false, true, true]);
+
+const oscillatingPrevious = {
+  scrollHeight: 1200, clientHeight: 500, scrollTop: 300, anchorTop: 95.5,
+};
+const oscillatingCurrent = {
+  scrollHeight: 1200, clientHeight: 500, scrollTop: 300, anchorTop: 96.5,
+};
+equal('a one-pixel anchor oscillation is not stable even inside target tolerance',
+  isChatPrependGeometryStable(oscillatingPrevious, oscillatingCurrent, 96), false);
+equal('an unchanged anchor inside target tolerance is stable',
+  isChatPrependGeometryStable(oscillatingCurrent, oscillatingCurrent, 96), true);
+const driftingSamples = [96.5, 96.1, 95.7, 95.5].map((anchorTop) => ({
+  scrollHeight: 1200, clientHeight: 500, scrollTop: 300, anchorTop,
+}));
+equal('sub-pixel drift cannot accumulate across the stable streak', [
+  isChatPrependGeometryStreakStable(driftingSamples[0], driftingSamples[0], driftingSamples[1], 96),
+  isChatPrependGeometryStreakStable(driftingSamples[1], driftingSamples[0], driftingSamples[2], 96),
+  isChatPrependGeometryStreakStable(driftingSamples[2], driftingSamples[0], driftingSamples[3], 96),
+], [true, false, false]);
+
+let prependProgress = INITIAL_CHAT_PREPEND_SETTLE;
+let prependDecision;
+for (let correction = 0; correction < 5; correction++) {
+  prependDecision = advanceChatPrependSettle(prependProgress, false, true);
+  prependProgress = prependDecision.progress;
+}
+equal('a fifth prepend correction stays inside the finite settle transaction', {
+  done: prependDecision.done,
+  frames: prependProgress.frames,
+  stableFrames: prependProgress.stableFrames,
+}, { done: false, frames: 5, stableFrames: 0 });
+for (let stable = 0; stable < 3; stable++) {
+  prependDecision = advanceChatPrependSettle(prependProgress, true, false);
+  prependProgress = prependDecision.progress;
+}
+equal('prepend finishes only after three stable frames following the last correction', {
+  done: prependDecision.done,
+  frames: prependProgress.frames,
+  stableFrames: prependProgress.stableFrames,
+}, { done: true, frames: 8, stableFrames: 3 });
+
+const almostSettledPrepend = { frames: 8, stableFrames: 2 };
+equal('a late correction resets an almost-settled prepend transaction',
+  advanceChatPrependSettle(almostSettledPrepend, true, true), {
+    progress: { frames: 9, stableFrames: 0 }, done: false,
+  });
+equal('an unresolved visual offset resets stability even with unchanged outer geometry',
+  advanceChatPrependSettle(almostSettledPrepend, false, false), {
+    progress: { frames: 9, stableFrames: 0 }, done: false,
+  });
+equal('the prepend frame deadline remains a hard bound', [
+  advanceChatPrependSettle({ frames: 52, stableFrames: 0 }, false, true).done,
+  advanceChatPrependSettle({ frames: 53, stableFrames: 0 }, false, true).done,
+], [false, true]);
 
 equal('ordinary live history keeps the normal bounded session window', [
   chatAppendFrontTrim(CHAT_SESSION_MESSAGE_LIMIT, CHAT_SESSION_MESSAGE_LIMIT),

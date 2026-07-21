@@ -4,7 +4,10 @@ export const CHAT_PHYSICAL_BOTTOM_EPSILON_PX = 1;
 export const CHAT_TAIL_RESERVE_PX = 12;
 export const CHAT_TAIL_STABLE_FRAMES = 2;
 export const CHAT_TAIL_MAX_WRITES = 12;
+export const CHAT_TAIL_MAX_SAME_TARGET_WRITES = 3;
 export const CHAT_PREPEND_WARMUP_FRAMES = 2;
+export const CHAT_PREPEND_STABLE_FRAMES = 3;
+export const CHAT_PREPEND_MAX_FRAMES = 54;
 export const CHAT_SESSION_MESSAGE_LIMIT = 1000;
 
 export type ChatTailIndex = number | 'LAST';
@@ -81,6 +84,28 @@ export interface ChatPrependTransition {
   allowTailSettle: false;
 }
 
+export interface ChatPrependSettleProgress {
+  frames: number;
+  stableFrames: number;
+}
+
+export interface ChatPrependSettleDecision {
+  progress: ChatPrependSettleProgress;
+  done: boolean;
+}
+
+export interface ChatPrependGeometry {
+  scrollHeight: number;
+  clientHeight: number;
+  scrollTop: number;
+  anchorTop: number;
+}
+
+export const INITIAL_CHAT_PREPEND_SETTLE: ChatPrependSettleProgress = {
+  frames: 0,
+  stableFrames: 0,
+};
+
 export interface ChatPrependLifecycleTransaction {
   serverId: string;
   historyGeneration: number;
@@ -128,9 +153,9 @@ export function chatPhysicalMaxScrollTop(geometry: ChatScrollGeometry): number {
  * Finite physical-tail convergence used after Virtuoso finishes its semantic positioning.
  *
  * Two identical layout frames are required before a write, so the target is not taken from a
- * half-measured list. A target can be written once and retried once after another stable pair
- * (covering a delayed Virtuoso pullback); further writes require a changed physical maximum.
- * The caller also provides a hard deadline, while settled/cancelled states never write again.
+ * half-measured list. If Virtuoso pulls the viewport back while it is still measuring a newly
+ * appended row, the same exact target gets two bounded repair attempts. Per-target and total
+ * write caps plus the caller deadline keep that convergence finite and prevent a retry loop.
  */
 export function reduceChatTailSettle(
   state: ChatTailSettleState,
@@ -173,7 +198,7 @@ export function reduceChatTailSettle(
 
   const targetAlreadyWritten = observed.targetScrollTop != null
     && Math.abs(observed.targetScrollTop - physicalMax) <= CHAT_PHYSICAL_BOTTOM_EPSILON_PX;
-  if (targetAlreadyWritten && observed.targetWrites >= 2) {
+  if (targetAlreadyWritten && observed.targetWrites >= CHAT_TAIL_MAX_SAME_TARGET_WRITES) {
     return {
       state: { ...observed, phase: 'cancelled' },
       scrollTop: null,
@@ -268,6 +293,50 @@ export function canCorrectChatPrependAnchor(elapsedFrames: number, deviation: nu
   const frames = Math.max(0, Math.floor(finiteOr(elapsedFrames, 0)));
   const hasActiveDeviation = Number.isFinite(deviation) && Math.abs(deviation) > 0.5;
   return frames >= CHAT_PREPEND_WARMUP_FRAMES && !hasActiveDeviation;
+}
+
+/**
+ * Advances the finite prepend verification window. A correction always resets stability, but it
+ * never consumes a separate write budget: late ResizeObserver waves remain correctable until the
+ * geometry is truly stable or the overall frame deadline expires.
+ */
+export function advanceChatPrependSettle(
+  current: ChatPrependSettleProgress,
+  geometryStable: boolean,
+  corrected: boolean,
+): ChatPrependSettleDecision {
+  const frames = Math.max(0, Math.floor(finiteOr(current.frames, 0))) + 1;
+  const previousStable = Math.max(0, Math.floor(finiteOr(current.stableFrames, 0)));
+  const stableFrames = corrected ? 0 : geometryStable ? previousStable + 1 : 0;
+  return {
+    progress: { frames, stableFrames },
+    done: frames >= CHAT_PREPEND_MAX_FRAMES || stableFrames >= CHAT_PREPEND_STABLE_FRAMES,
+  };
+}
+
+/** Geometry is stable only when neither the list nor the visual anchor moved between frames. */
+export function isChatPrependGeometryStable(
+  previous: ChatPrependGeometry | null,
+  current: ChatPrependGeometry,
+  targetAnchorTop: number,
+): boolean {
+  if (!previous || !Number.isFinite(targetAnchorTop)) return false;
+  return Math.abs(previous.scrollHeight - current.scrollHeight) <= 0.5
+    && Math.abs(previous.clientHeight - current.clientHeight) <= 0.5
+    && Math.abs(previous.scrollTop - current.scrollTop) <= 0.5
+    && Math.abs(previous.anchorTop - current.anchorTop) <= 0.5
+    && Math.abs(current.anchorTop - targetAnchorTop) <= 0.5;
+}
+
+/** Prevents sub-pixel movement from accumulating across an otherwise stable-looking streak. */
+export function isChatPrependGeometryStreakStable(
+  previous: ChatPrependGeometry | null,
+  baseline: ChatPrependGeometry | null,
+  current: ChatPrependGeometry,
+  targetAnchorTop: number,
+): boolean {
+  return isChatPrependGeometryStable(previous, current, targetAnchorTop)
+    && isChatPrependGeometryStable(baseline, current, targetAnchorTop);
 }
 
 /**
