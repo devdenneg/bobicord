@@ -4,6 +4,8 @@ export const CHAT_PHYSICAL_BOTTOM_EPSILON_PX = 1;
 export const CHAT_TAIL_RESERVE_PX = 12;
 export const CHAT_TAIL_STABLE_FRAMES = 2;
 export const CHAT_TAIL_MAX_WRITES = 12;
+export const CHAT_PREPEND_WARMUP_FRAMES = 2;
+export const CHAT_SESSION_MESSAGE_LIMIT = 1000;
 
 export type ChatTailIndex = number | 'LAST';
 export type ChatTailBehavior = 'auto' | 'smooth';
@@ -255,6 +257,41 @@ export function classifyChatPrepend(
 export function chatPrependAnchorDelta(beforeTop: number, afterTop: number): number {
   if (!Number.isFinite(beforeTop) || !Number.isFinite(afterTop)) return 0;
   return afterTop - beforeTop;
+}
+
+/**
+ * Virtuoso applies its own prepend compensation over two animation frames. A custom residual
+ * correction must wait for both frames and for the temporary numeric deviation to disappear;
+ * `auto`/NaN is the normal align-to-bottom value and does not block the correction.
+ */
+export function canCorrectChatPrependAnchor(elapsedFrames: number, deviation: number): boolean {
+  const frames = Math.max(0, Math.floor(finiteOr(elapsedFrames, 0)));
+  const hasActiveDeviation = Number.isFinite(deviation) && Math.abs(deviation) > 0.5;
+  return frames >= CHAT_PREPEND_WARMUP_FRAMES && !hasActiveDeviation;
+}
+
+/**
+ * A protected history/reconnect insertion grows capacity monotonically. The caller may grant one
+ * future live window without repeatedly resetting that reserve on every later history page.
+ */
+export function chatRetentionLimitAfterProtectedInsert(
+  currentLimit: number,
+  loadedCount: number,
+  insertedCount: number,
+  liveReserve = 0,
+): number {
+  const limit = Math.max(0, Math.floor(finiteOr(currentLimit, CHAT_SESSION_MESSAGE_LIMIT)));
+  const count = Math.max(0, Math.floor(finiteOr(loadedCount, 0)));
+  const inserted = Math.max(0, Math.floor(finiteOr(insertedCount, 0)));
+  const reserve = Math.max(0, Math.floor(finiteOr(liveReserve, 0)));
+  return Math.max(limit + inserted, count + reserve);
+}
+
+/** Number of oldest messages that may be dropped by one append under the current limit. */
+export function chatAppendFrontTrim(nextCount: number, retentionLimit: number): number {
+  const count = Math.max(0, Math.floor(finiteOr(nextCount, 0)));
+  const limit = Math.max(0, Math.floor(finiteOr(retentionLimit, CHAT_SESSION_MESSAGE_LIMIT)));
+  return Math.max(0, count - limit);
 }
 
 /**

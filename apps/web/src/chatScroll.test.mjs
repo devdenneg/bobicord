@@ -15,12 +15,17 @@ const {
   INITIAL_CHAT_TAIL_SETTLE,
   CHAT_TAIL_RESERVE_PX,
   CHAT_TAIL_MAX_WRITES,
+  CHAT_PREPEND_WARMUP_FRAMES,
+  CHAT_SESSION_MESSAGE_LIMIT,
   canStartChatPrepend,
+  canCorrectChatPrependAnchor,
+  chatAppendFrontTrim,
   chatBottomDistance,
   classifyChatPrepend,
   classifyChatPrependLifecycle,
   chatPhysicalMaxScrollTop,
   chatPrependAnchorDelta,
+  chatRetentionLimitAfterProtectedInsert,
   chatTailIndexLocation,
   chatVirtualFirstItemIndex,
   reduceChatScrollState,
@@ -379,6 +384,65 @@ equal('prepend anchor correction preserves the viewport pixel',
   chatPrependAnchorDelta(84.5, 101.25), 16.75);
 equal('invalid anchor measurements never write scroll position',
   chatPrependAnchorDelta(Number.NaN, 101.25), 0);
+
+equal('custom prepend correction waits through both Virtuoso frames', [
+  canCorrectChatPrependAnchor(0, Number.NaN),
+  canCorrectChatPrependAnchor(1, Number.NaN),
+  canCorrectChatPrependAnchor(CHAT_PREPEND_WARMUP_FRAMES, Number.NaN),
+], [false, false, true]);
+equal('an active Virtuoso deviation keeps custom correction fenced', [
+  canCorrectChatPrependAnchor(CHAT_PREPEND_WARMUP_FRAMES, 18.5),
+  canCorrectChatPrependAnchor(CHAT_PREPEND_WARMUP_FRAMES + 1, -0.75),
+  canCorrectChatPrependAnchor(CHAT_PREPEND_WARMUP_FRAMES, 0.5001),
+  canCorrectChatPrependAnchor(CHAT_PREPEND_WARMUP_FRAMES, 0.5),
+  canCorrectChatPrependAnchor(CHAT_PREPEND_WARMUP_FRAMES + 1, 0),
+], [false, false, false, true, true]);
+
+equal('ordinary live history keeps the normal bounded session window', [
+  chatAppendFrontTrim(CHAT_SESSION_MESSAGE_LIMIT, CHAT_SESSION_MESSAGE_LIMIT),
+  chatAppendFrontTrim(CHAT_SESSION_MESSAGE_LIMIT + 1, CHAT_SESSION_MESSAGE_LIMIT),
+], [0, 1]);
+const retainedAfterPrepend = chatRetentionLimitAfterProtectedInsert(
+  CHAT_SESSION_MESSAGE_LIMIT,
+  CHAT_SESSION_MESSAGE_LIMIT + 30,
+  30,
+  CHAT_SESSION_MESSAGE_LIMIT,
+);
+equal('a loaded history page reserves a full live window before any front trim', {
+  limit: retainedAfterPrepend,
+  firstAppendTrim: chatAppendFrontTrim(CHAT_SESSION_MESSAGE_LIMIT + 31, retainedAfterPrepend),
+  lastReservedAppendTrim: chatAppendFrontTrim(CHAT_SESSION_MESSAGE_LIMIT * 2 + 30, retainedAfterPrepend),
+  firstOverflowTrim: chatAppendFrontTrim(CHAT_SESSION_MESSAGE_LIMIT * 2 + 31, retainedAfterPrepend),
+}, {
+  limit: CHAT_SESSION_MESSAGE_LIMIT * 2 + 30,
+  firstAppendTrim: 0,
+  lastReservedAppendTrim: 0,
+  firstOverflowTrim: 1,
+});
+equal('later history pages add only their own rows and keep the remaining reserve bounded',
+  chatRetentionLimitAfterProtectedInsert(
+    retainedAfterPrepend,
+    CHAT_SESSION_MESSAGE_LIMIT + 560,
+    30,
+    0,
+  ), CHAT_SESSION_MESSAGE_LIMIT * 2 + 60);
+const reconnectRetention = chatRetentionLimitAfterProtectedInsert(
+  CHAT_SESSION_MESSAGE_LIMIT,
+  1040,
+  0,
+  CHAT_SESSION_MESSAGE_LIMIT,
+);
+equal('a reconnect suffix batch preserves the current anchor and receives one bounded reserve', {
+  limit: reconnectRetention,
+  batchTrim: chatAppendFrontTrim(1040, reconnectRetention),
+  nextAppendTrim: chatAppendFrontTrim(1041, reconnectRetention),
+  invalidLimitFallback: chatAppendFrontTrim(CHAT_SESSION_MESSAGE_LIMIT + 1, Number.NaN),
+}, {
+  limit: 2040,
+  batchTrim: 0,
+  nextAppendTrim: 0,
+  invalidLimitFallback: 1,
+});
 
 equal('a prepend starts only when neither request nor viewport guard is active', [
   canStartChatPrepend(false, false),

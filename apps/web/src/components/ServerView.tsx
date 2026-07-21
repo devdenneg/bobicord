@@ -29,6 +29,7 @@ import {
   CHAT_TAIL_RESERVE_PX,
   INITIAL_CHAT_TAIL_SETTLE,
   canStartChatPrepend,
+  canCorrectChatPrependAnchor,
   chatBottomDistance,
   classifyChatPrepend,
   classifyChatPrependLifecycle,
@@ -851,7 +852,7 @@ function ReleasePatchCard({ release, ts }: { release: ReleaseNote; ts?: number }
   const dateTime = safeIsoTime(ts);
   return (
     <div className="virt-row release-row">
-      <article className="release-card" aria-label={`Обновление: ${release.title}`}>
+      <article className="release-card" data-chat-visual-anchor="" aria-label={`Обновление: ${release.title}`}>
         <span className="release-announcer" role="status" aria-live="polite" aria-atomic="true">
           {`${release.title}. ${release.notes.join('. ')}`}
         </span>
@@ -1022,7 +1023,14 @@ interface ChatPrependTransaction {
   targetPrepended: number | null;
   anchorAbsoluteIndex: number | null;
   anchorTop: number;
+  anchorVisualOffset: number;
+  visualOffsetRemaining: number | null;
+  visualOffsetCorrected: boolean;
   restoreTail: boolean;
+}
+
+function chatVisualAnchor(row: HTMLElement): HTMLElement {
+  return row.querySelector<HTMLElement>('[data-chat-visual-anchor]') || row;
 }
 
 // Шапка списка чата: спиннер во время догрузки старых сообщений / метка начала истории.
@@ -1120,18 +1128,16 @@ function Chat() {
   }, [actionsFor]);
   const markReadStore = useStore((s) => s.markRead);
   const bumpUnreadStore = useStore((s) => s.bumpUnread);
-  // базовая линия «прочитано до» (id) — замораживается при входе на сервер; дивайдер «новые» рисуется
-  // перед первым сообщением НОВЕЕ неё (чужим). При повторном входе lastRead уже сдвинут → дивайдера нет.
-  const baseline = useMemo(() => useStore.getState().lastRead[activeId || ''] || 0, [activeId]);
-  // Сервер (read_state) — источник правды по «есть ли непрочитанное». baseline (lastRead) может ОТСТАВАТЬ
-  // от него и давать ложный firstUnread у верха истории: (1) свежевступивший в сессии сервер —
-  // refreshServers/mergeUnread сеют unread, но НЕ lastRead → baseline=0 → sid>0 у первого чужого сообщения;
-  // (2) baseline — снимок useMemo по [activeId], не обновляется после долёта /me. Когда сервер говорит
-  // «0 непрочитанных» — дивайдера нет и вход СТРОГО в низ (иначе чат открывается у верха истории при
-  // отсутствии новых). При unread>0 позиционируем по baseline как раньше.
   const unreadServer = useStore((s) => s.unread[activeId || ''] || 0);
-  const firstUnread = unreadServer > 0 ? messages.findIndex((m) => m.sid != null && m.sid > baseline && !m.mine && !m.sys) : -1;
-  const firstUnreadId = firstUnread >= 0 ? messages[firstUnread].id : null;
+  const lastRead = useStore((s) => s.lastRead[activeId || ''] || 0);
+  const historyUnreadCandidate = unreadServer > 0
+    ? messages.findIndex((m) => m.sid != null && m.sid > lastRead && !m.mine && !m.sys)
+    : -1;
+  const historyUnreadCandidateId = historyUnreadCandidate >= 0 ? messages[historyUnreadCandidate].id : null;
+  // Граница фиксируется на конкретном сообщении на всё время просмотра сервера. markRead больше
+  // не удаляет divider из уже измеренной строки, а новый append не может вставить его перед старым
+  // сообщением из-за устаревшего baseline.
+  const [unreadBoundary, setUnreadBoundary] = useState<{ serverId?: string; id: number | null }>({ id: null });
   // Разделители дней: id первого сообщения каждой календарной даты (сравниваем локальный день с предыдущим).
   const dayFirst = useMemo(() => {
     const s = new Map<number, number>(); // msg.id -> ts начала дня
@@ -1168,6 +1174,7 @@ function Chat() {
   const userDirectionRef = useRef<ChatScrollDirection>('none');
   const userDirectionTimerRef = useRef<number | null>(null);
   const ownSendPendingRef = useRef(false);
+  const ownSendNeedsSemanticRef = useRef(false);
   const initialBottomPendingRef = useRef(unreadServer === 0);
   const initialSemanticIssuedRef = useRef(false);
   const initialGeometryPendingRef = useRef(true);
@@ -1188,7 +1195,7 @@ function Chat() {
   const bottomFollowServerRef = useRef(activeId);
   const appendCursorRef = useRef<{ serverId?: string; historyGeneration: number | null; tailId: number | null; count: number }>({ historyGeneration: null, tailId: null, count: 0 });
   const loadOlderRef = useRef<(() => Promise<void>) | null>(null);
-  const [dividerFade, setDividerFade] = useState(false); // дивайдер «Новые сообщения» гаснет, когда юзер увидел границу
+  const [dividerFade, setDividerFade] = useState(false);
   const [focusTick, setFocusTick] = useState(0); // тикает на focus/blur/visibility — «увидел глазами» зависит от фокуса окна
   // Якорь virtuoso DERIVED из engine-стейта (prepend/срез) — меняется ВМЕСТЕ с messages (один emit),
   // поэтому Virtuoso всегда видит согласованные data+firstItemIndex → чат НЕ прыгает при пагинации.
@@ -1239,9 +1246,33 @@ function Chat() {
   const shouldFollowAppend = isSuffixAppend
     && bottomFollowIntentRef.current
     && prependKeepsTailIntent;
+  // У realtime-сообщения sid появится позже. Если пользователь читает историю, ставим границу
+  // сразу на первый фактически добавленный row в том же render, а не отдельным кадром после bumpUnread.
+  const liveUnreadCandidateId = isSuffixAppend && !shouldFollowAppend
+    ? appendedMessages.find((message) => !message.mine && !message.sys)?.id ?? null
+    : null;
+  const storedUnreadId = unreadBoundary.serverId === activeId
+    && unreadBoundary.id != null
+    && messages.some((message) => message.id === unreadBoundary.id)
+    ? unreadBoundary.id
+    : null;
+  const firstUnreadId = storedUnreadId ?? liveUnreadCandidateId ?? historyUnreadCandidateId;
+  const firstUnread = firstUnreadId == null
+    ? -1
+    : messages.findIndex((message) => message.id === firstUnreadId);
+  useLayoutEffect(() => {
+    setUnreadBoundary((current) => current.serverId === activeId && current.id === firstUnreadId
+      ? current
+      : { serverId: activeId, id: firstUnreadId });
+  }, [activeId, firstUnreadId]);
   const followOutputEnabled = !prependGuardActive && (bottomFollowServerRef.current !== activeId
     ? unreadServer === 0
     : followingTail);
+  // Собственный optimistic append должен закрепиться в том же commit: откладывание единственного
+  // semantic scroll до следующего RAF само создаёт видимый кадр со старым scrollTop.
+  const nativeFollowOutputEnabled = !prependGuardActive
+    && (followOutputEnabled || ownExplicitAppend)
+    && !initialPinnedHydration;
 
   const setFollowIntent = useCallback((next: boolean) => {
     bottomFollowServerRef.current = activeId;
@@ -1498,9 +1529,9 @@ function Chat() {
     releaseOlderRequest(requestSeq);
     scheduleGeometrySample();
     if (restoreTail && bottomFollowIntentRef.current && !bottomRearmBlockedRef.current) {
-      armTailSettle();
+      scheduleBottomSnap('auto');
     }
-  }, [armTailSettle, releaseOlderRequest, scheduleGeometrySample]);
+  }, [releaseOlderRequest, scheduleBottomSnap, scheduleGeometrySample]);
 
   const beginPrependGuard = useCallback((
     requestSeq: number,
@@ -1527,6 +1558,9 @@ function Chat() {
       targetPrepended: null,
       anchorAbsoluteIndex: null,
       anchorTop: 0,
+      anchorVisualOffset: 0,
+      visualOffsetRemaining: null,
+      visualOffsetCorrected: false,
       restoreTail,
     };
     if (!restoreTail) {
@@ -1547,14 +1581,25 @@ function Chat() {
     const rows = Array.from(scroller.querySelectorAll<HTMLElement>(
       '[data-testid="virtuoso-item-list"] > [data-item-index]',
     ));
-    const anchor = rows.find((row) => row.getBoundingClientRect().bottom > viewport.top + 0.5)
+    const visibleRows = rows.filter((row) => {
+      const bounds = chatVisualAnchor(row).getBoundingClientRect();
+      return bounds.bottom > viewport.top + 0.5 && bounds.top < viewport.bottom - 0.5;
+    });
+    // The old first item is the only ordinary seam row whose day/group decoration can change.
+    // Prefer the next visible row; a giant single row still uses the partial-correction fallback.
+    const anchor = visibleRows.find((row) => Number(row.dataset.itemIndex) !== firstItemIndex)
+      || visibleRows[0]
+      || rows.find((row) => row.getBoundingClientRect().bottom > viewport.top + 0.5)
       || rows[0];
+    const visualAnchor = anchor ? chatVisualAnchor(anchor) : null;
     const anchorIndex = Number(anchor?.dataset.itemIndex);
     transaction.anchorAbsoluteIndex = Number.isFinite(anchorIndex) ? anchorIndex : null;
-    transaction.anchorTop = anchor ? anchor.getBoundingClientRect().top - viewport.top : 0;
+    const rowTop = anchor ? anchor.getBoundingClientRect().top - viewport.top : 0;
+    transaction.anchorTop = visualAnchor ? visualAnchor.getBoundingClientRect().top - viewport.top : rowTop;
+    transaction.anchorVisualOffset = transaction.anchorTop - rowTop;
     transaction.restoreTail = transaction.restoreTail && bottomFollowIntentRef.current;
     return true;
-  }, []);
+  }, [firstItemIndex]);
 
   const settlePrependAnchor = useCallback((requestSeq: number) => {
     const transaction = prependTransactionRef.current;
@@ -1570,6 +1615,35 @@ function Chat() {
     let stableFrames = 0;
     let corrections = 0;
     let previousGeometry: { scrollHeight: number; clientHeight: number; scrollTop: number; anchorTop: number } | null = null;
+    const correctVisualOffset = () => {
+      const current = prependTransactionRef.current;
+      const scroller = scrollerElementRef.current;
+      if (!current || current.requestSeq !== requestSeq || current.visualOffsetCorrected || !scroller) return;
+      const row = scroller.querySelector<HTMLElement>(
+        `[data-testid="virtuoso-item-list"] > [data-item-index="${current.anchorAbsoluteIndex}"]`,
+      );
+      if (!row) return;
+      const visualAnchor = chatVisualAnchor(row);
+      const rowTop = row.getBoundingClientRect().top;
+      const visualOffset = visualAnchor.getBoundingClientRect().top - rowTop;
+      if (current.visualOffsetRemaining == null) {
+        current.visualOffsetRemaining = chatPrependAnchorDelta(current.anchorVisualOffset, visualOffset);
+      }
+      const offsetDelta = current.visualOffsetRemaining;
+      // This write compensates only decoration that changed *inside* the stable item (day/group
+      // header). Virtuoso remains the sole owner of the outer prepend distance.
+      if (Math.abs(offsetDelta) <= 0.5) {
+        current.visualOffsetCorrected = true;
+        return;
+      }
+      const before = scroller.scrollTop;
+      scroller.scrollTop += offsetDelta;
+      current.visualOffsetRemaining -= scroller.scrollTop - before;
+      current.visualOffsetCorrected = Math.abs(current.visualOffsetRemaining) <= 0.5;
+    };
+    // React has committed the new seam geometry, so the internal offset can be restored before
+    // paint without touching Virtuoso's still-running outer deviation.
+    correctVisualOffset();
     const tick = () => {
       if (token !== prependSettleTokenRef.current) return;
       // The scheduled callback owns no pending frame once it starts. Clearing here prevents a
@@ -1590,14 +1664,25 @@ function Chat() {
         finishPrependGuard(requestSeq, false);
         return;
       }
-      const anchor = scroller.querySelector<HTMLElement>(
+      correctVisualOffset();
+      const itemList = scroller.querySelector<HTMLElement>('[data-testid="virtuoso-item-list"]');
+      const deviation = Number.parseFloat(itemList?.style.marginTop || '');
+      if (!canCorrectChatPrependAnchor(frames, deviation)) {
+        frames += 1;
+        if (frames >= 54) finishPrependGuard(requestSeq, current.restoreTail);
+        else prependSettleFrameRef.current = window.requestAnimationFrame(tick);
+        return;
+      }
+
+      const row = scroller.querySelector<HTMLElement>(
         `[data-testid="virtuoso-item-list"] > [data-item-index="${current.anchorAbsoluteIndex}"]`,
       );
-      if (!anchor) {
+      if (!row) {
         if (++frames >= 54) finishPrependGuard(requestSeq, current.restoreTail);
         else prependSettleFrameRef.current = window.requestAnimationFrame(tick);
         return;
       }
+      const anchor = chatVisualAnchor(row);
 
       const viewportTop = scroller.getBoundingClientRect().top;
       let anchorTop = anchor.getBoundingClientRect().top - viewportTop;
@@ -1607,8 +1692,8 @@ function Chat() {
           finishPrependGuard(requestSeq, current.restoreTail);
           return;
         }
-        // Boundary rows can change height when their date/group predecessor arrives. Restore the
-        // same absolute item to the same viewport pixel while the transaction is isolated.
+        // Date/group decoration of the seam row can change after prepend. Restore the stable
+        // message content marker only after Virtuoso has completed its own two-frame deviation.
         scroller.scrollTop += delta;
         corrections += 1;
         anchorTop = anchor.getBoundingClientRect().top - viewportTop;
@@ -1637,9 +1722,9 @@ function Chat() {
       }
       prependSettleFrameRef.current = window.requestAnimationFrame(tick);
     };
-    // First correction runs in layout effect before paint; later ResizeObserver compensation is
-    // absorbed by the bounded RAF verification window.
-    tick();
+    // Virtuoso owns the first two prepend frames. Starting asynchronously prevents the custom
+    // residual correction from fighting its deviation/scrollBy transaction.
+    prependSettleFrameRef.current = window.requestAnimationFrame(tick);
   }, [E, finishPrependGuard]);
 
   const cancelPrependRestoreForInput = useCallback(() => {
@@ -1779,19 +1864,27 @@ function Chat() {
     if (initialPinnedHydration) {
       initialSemanticIssuedRef.current = true;
       ownSendPendingRef.current = false;
+      ownSendNeedsSemanticRef.current = false;
       scheduleBottomSnap('auto', true);
     } else if (ownExplicitAppend) {
       ownSendPendingRef.current = false;
-      scheduleBottomSnap('auto');
+      const needsSemantic = ownSendNeedsSemanticRef.current;
+      ownSendNeedsSemanticRef.current = false;
+      // followOutput владеет semantic scroll в data commit; здесь остаётся только конечная
+      // проверка физического хвоста. Если send начался из истории, даём один sync fallback.
+      if (needsSemantic && !prependGuardRef.current) {
+        virtuosoRef.current?.scrollToIndex(chatTailIndexLocation('LAST'));
+      }
+      armTailSettle(true);
     }
-  }, [activeId, historyGeneration, messages, initialPinnedHydration, ownExplicitAppend, scheduleBottomSnap]);
+  }, [activeId, historyGeneration, messages, armTailSettle, initialPinnedHydration, ownExplicitAppend, scheduleBottomSnap]);
 
   // смена сервера: сброс состояния виртуального списка (Virtuoso ремонтится по key={activeId})
   useLayoutEffect(() => {
     // firstItemIndex теперь DERIVED (сбрасывается engine.loadHistory: chatPrepended/Trimmed=0) — руками не трогаем.
     // на входе: если есть непрочитанные — сеем счётчик jump-кнопки и стартуем НЕ внизу (позиция у
     // дивайдера, см. initialTopMostItemIndex), иначе внизу
-    const unreadHere = unreadServer > 0 ? messages.filter((m) => m.sid != null && m.sid > baseline && !m.mine && !m.sys).length : 0;
+    const unreadHere = unreadServer > 0 ? messages.filter((m) => m.sid != null && m.sid > lastRead && !m.mine && !m.sys).length : 0;
     // История может приехать уже ПОСЛЕ activeId. Решение о pin принимаем по серверному unread,
     // а не по пока ещё пустому messages, иначе первый history batch ошибочно утащит чат вниз.
     const startPinned = unreadServer === 0;
@@ -1807,6 +1900,7 @@ function Chat() {
     geometryFrameRef.current = null;
     clearUserDirection();
     ownSendPendingRef.current = false;
+    ownSendNeedsSemanticRef.current = false;
     initialBottomPendingRef.current = startPinned;
     initialSemanticIssuedRef.current = false;
     initialGeometryPendingRef.current = true;
@@ -1895,13 +1989,33 @@ function Chat() {
       if (now - lastTagAt.current > 900) { lastTagAt.current = now; playSound('tag'); }
     }
   }, [messages, activeId, bumpUnreadStore, isSuffixAppend, shouldFollowAppend]);
-  // Дивайдер «Новые сообщения» не висит вечно: как юзер добрался до низа и увидел границу (окно видимо),
-  // через ~4.5с плавно гасим его (CSS-transition). Сброс — в entry-эффекте при смене сервера.
+  // Сначала гасим только opacity — высота измеренной строки не меняется во время transition.
+  // Физически убираем divider уже в закреплённом хвосте и повторно подтверждаем настоящий bottom.
   useEffect(() => {
-    if (dividerFade || !atBottom || document.visibilityState !== 'visible') return;
-    const t = window.setTimeout(() => setDividerFade(true), 4500);
-    return () => clearTimeout(t);
-  }, [atBottom, dividerFade, focusTick]);
+    if (firstUnreadId == null) { setDividerFade(false); return; }
+    setDividerFade(false);
+  }, [activeId, firstUnreadId]);
+  useEffect(() => {
+    if (!atBottom && dividerFade) setDividerFade(false);
+  }, [atBottom, dividerFade]);
+  useEffect(() => {
+    if (dividerFade || firstUnreadId == null || unreadServer > 0 || !atBottom
+      || document.visibilityState !== 'visible' || !document.hasFocus()) return;
+    const timer = window.setTimeout(() => setDividerFade(true), 4500);
+    return () => window.clearTimeout(timer);
+  }, [atBottom, dividerFade, firstUnreadId, focusTick, unreadServer]);
+  useEffect(() => {
+    if (!dividerFade || firstUnreadId == null || !atBottom) return;
+    const boundaryId = firstUnreadId;
+    const timer = window.setTimeout(() => {
+      setUnreadBoundary((current) => current.serverId === activeId && current.id === boundaryId
+        ? { serverId: activeId, id: null }
+        : current);
+      setDividerFade(false);
+      if (bottomFollowIntentRef.current) scheduleBottomSnap('auto');
+    }, 360);
+    return () => window.clearTimeout(timer);
+  }, [activeId, atBottom, dividerFade, firstUnreadId, scheduleBottomSnap]);
   // Внизу чата + окно В ФОКУСЕ/видимо → «прочитать всё» (реально увидел). Не в фокусе — НЕ читаем:
   // непрочитанное копится, пока не вернёшься в окно (focusTick пере-триггерит). Живые сообщения не имеют
   // серверного sid (узнаются лишь через refetch) → шлём all:true, сервер выставит last_read=MAX id.
@@ -2087,7 +2201,11 @@ function Chat() {
     // Ставим intent ДО синхронного optimistic push в engine: собственный append обязан дойти
     // до true bottom, даже если пользователь перед отправкой читал историю.
     bottomRearmBlockedRef.current = false;
+    ownSendNeedsSemanticRef.current = !bottomFollowIntentRef.current || !atBottomRef.current;
+    clearUserDirection();
     setFollowIntent(true);
+    const prependTransaction = prependTransactionRef.current;
+    if (prependTransaction) prependTransaction.restoreTail = true;
     ownSendPendingRef.current = true;
     smoothJumpPendingRef.current = false;
     const em: Record<string, string> = {};
@@ -2166,14 +2284,13 @@ function Chat() {
   const byUid = new Map(members.map((mm) => [mm.id, mm] as const)); // стабильный резолв автора реплая по user id (не по нику)
 
   // начало группы (Telegram-style): шапка/аватар только у первого сообщения серии одного автора.
-  // Группа ограничена 10 сообщениями — после этого начинается заново даже у того же автора.
+  // Граница зависит только от соседних сообщений. Лимит по количеству делал оформление старых
+  // строк зависимым от размера догруженной страницы и сдвигал их после короткого prepend.
   const groupStart = useMemo(() => {
     const map = new Map<number, boolean>();
-    let count = 0;
     for (let i = 0; i < messages.length; i++) {
-      const start = isGroupStart(messages[i], messages[i - 1]) || count >= 10;
+      const start = isGroupStart(messages[i], messages[i - 1]);
       map.set(messages[i].id, start);
-      count = start ? 1 : count + 1;
     }
     return map;
   }, [messages]);
@@ -2191,7 +2308,7 @@ function Chat() {
       const lvAuthor = m.who ? byName.get(m.who) : undefined;
       return (
         <div className="virt-row">
-          <div className="lvlup-card">
+          <div className="lvlup-card" data-chat-visual-anchor="">
             <span className="lvlup-badge">{m.level ?? '?'}</span>
             <Avatar name={m.who || ''} ci={m.color ?? 0} url={lvAuthor?.avatarUrl} size={30} />
             <div className="lvlup-txt"><b>{m.who}</b><span>{m.level}-й уровень! 🎉</span></div>
@@ -2251,7 +2368,7 @@ function Chat() {
             {replyQuote}
             {!m.sys && !cont ? <div className="who" style={{ color: nameColor }}>{m.who}{aRoles.length ? <span className="who-roles">{aRoles.map((r) => <span key={r.id} className="who-role" style={{ background: (r.color || 'var(--panel3)') + '22', color: r.color || 'var(--muted)', borderColor: (r.color || 'var(--line-2)') + '55' }}>{r.name}</span>)}</span> : null}{m.ts ? <span className="mtime">{fmtTime(m.ts)}</span> : null}</div> : null}
             <div className="msg-main">
-              <div className="msg-content">
+              <div className="msg-content" data-chat-visual-anchor="">
                 {editing?.id === m.id ? (
                   <div className="msg-edit">
                     <input autoFocus value={editText} onChange={(e) => setEditText(e.target.value)}
@@ -2316,7 +2433,7 @@ function Chat() {
             startReached={loadOlder}
             // Важно передавать именно false, когда читается история: Virtuoso трактует саму
             // callback-функцию как включённый follow при уменьшении viewport (reply/keyboard).
-            followOutput={followOutputEnabled ? 'auto' : false}
+            followOutput={nativeFollowOutputEnabled ? 'auto' : false}
             // Align Virtuoso's internal followOutput classifier with our hysteresis leave-zone.
             // Otherwise 33–64px became a dead zone: unread stayed suppressed while auto-follow
             // silently stopped because Virtuoso already considered the list detached.

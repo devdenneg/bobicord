@@ -15,6 +15,11 @@ import { LiveKitVideoTransport } from './transport/livekitVideo';
 import { TreeVideoTransport } from './transport/treeVideo';
 import { createDenoiseNode, destroyDenoiseNode } from './denoise';
 import { userVolumeToGain } from './volumeCurve';
+import {
+  CHAT_SESSION_MESSAGE_LIMIT,
+  chatAppendFrontTrim,
+  chatRetentionLimitAfterProtectedInsert,
+} from './chatScroll';
 import type { RnnoiseWorkletNode } from '@sapphi-red/web-noise-suppressor';
 
 export interface GameStatus { name: string; icon?: string }
@@ -231,6 +236,7 @@ export class Engine {
   private oldestSid: number | null = null; // DB-id самого старого загруженного сообщения = курсор для before
   private trimmedFront = 0; // сколько сообщений суммарно срезано с НАЧАЛА (для якоря virtuoso: срез спереди → firstItemIndex += N)
   private chatPrepended = 0; // сколько старых сообщений догружено пагинацией (для якоря: prepend → firstItemIndex -= N). Меняется ВМЕСТЕ с messages (один emit) → нет прыжка.
+  private chatRetentionLimit = CHAT_SESSION_MESSAGE_LIMIT; // после явной пагинации защищает загруженную страницу от следующего live append
   private typingUsers = new Map<string, number>(); // displayName -> expiry ts
   private lastTypingSent = 0;
 
@@ -722,7 +728,7 @@ export class Engine {
     this.clearAllWatches();
     this.liveKitT.detach(); this.treeT.detach(); this.screenAudioEls.clear();
     this.streamWatchers.clear();
-    this.perMuteByServer.clear(); this.volsByServer.clear(); this.messages = []; this.reactions.clear(); this.reactionWrites.clear(); this.reactionWriteSeq.clear(); this.reactionWriteDesired.clear(); this.pendingSend.clear(); this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0; this.chatPrepended = 0; ++this.chatGeneration;
+    this.perMuteByServer.clear(); this.volsByServer.clear(); this.messages = []; this.reactions.clear(); this.reactionWrites.clear(); this.reactionWriteSeq.clear(); this.reactionWriteDesired.clear(); this.pendingSend.clear(); this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0; this.chatPrepended = 0; this.chatRetentionLimit = CHAT_SESSION_MESSAGE_LIMIT; ++this.chatGeneration;
     this.onlineHint.clear(); this.awayHint.clear(); this.voiceHint = {}; this.typingUsers.clear();
     this.activeVoiceSessions.clear();
     this.subscriptionRetries.clear();
@@ -740,7 +746,7 @@ export class Engine {
   detachView() {
     ++this.connectEpoch;
     this.resetStreamEdges();
-    this.messages = []; this.reactions.clear(); this.reactionWrites.clear(); this.reactionWriteSeq.clear(); this.reactionWriteDesired.clear(); this.pendingSend.clear(); this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0; this.chatPrepended = 0; ++this.chatGeneration;
+    this.messages = []; this.reactions.clear(); this.reactionWrites.clear(); this.reactionWriteSeq.clear(); this.reactionWriteDesired.clear(); this.pendingSend.clear(); this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0; this.chatPrepended = 0; this.chatRetentionLimit = CHAT_SESSION_MESSAGE_LIMIT; ++this.chatGeneration;
     this.clearAllWatches(); this.streamWatchers.clear();
     // presence-хинты и typing принадлежат ПРЕДЫДУЩЕМУ смотримому серверу
     this.onlineHint.clear(); this.awayHint.clear(); this.voiceHint = {}; this.typingUsers.clear();
@@ -2418,10 +2424,11 @@ export class Engine {
   private appendMessage(message: Omit<ChatMessage, 'id'>): number {
     const id = msgSeq++;
     const next = [...this.messages, { id, ...message }];
-    // кап на память сессии; срез идёт с НАЧАЛА, поэтому копим trimmedFront — компонент на столько же
-    // поднимет firstItemIndex virtuoso, иначе якорь скролла рассинхронится и контент прыгнет.
-    const CAP = 1000;
-    if (next.length > CAP) { this.trimmedFront += next.length - CAP; this.messages = next.slice(next.length - CAP); }
+    // Срез идёт с НАЧАЛА, поэтому копим trimmedFront — компонент на столько же поднимет
+    // firstItemIndex virtuoso. После явной пагинации лимит заранее расширен: первое live-сообщение
+    // не удаляет только что загруженную страницу и не выбивает читаемый якорь.
+    const trim = chatAppendFrontTrim(next.length, this.chatRetentionLimit);
+    if (trim > 0) { this.trimmedFront += trim; this.messages = next.slice(trim); }
     else this.messages = next;
     this.emit();
     return id;
@@ -2530,6 +2537,9 @@ export class Engine {
     this.chatMore = hasMore;
     this.oldestSid = list.length ? (list[0].id ?? null) : null; // list в ASC-порядке, [0] — самое старое
     this.trimmedFront = 0; this.chatPrepended = 0; // новая история — счётчики якоря virtuoso сбрасываются
+    this.chatRetentionLimit = this.messages.length > CHAT_SESSION_MESSAGE_LIMIT
+      ? this.messages.length + CHAT_SESSION_MESSAGE_LIMIT
+      : CHAT_SESSION_MESSAGE_LIMIT;
     this.emit();
   }
   // догрузка пропущенного после реконнекта. Дедуп двойной:
@@ -2646,6 +2656,16 @@ export class Engine {
       // timestamp sort during reconnect could move the previous tail into the middle, making old
       // rows look like a fresh suffix and invalidating Virtuoso's measured anchor. Genuinely missed
       // rows already arrive in server order and are appended once; known rows are canonicalized in place.
+      if (merged.length > this.chatRetentionLimit) {
+        // Reconnect can deliver a large suffix batch while the user is reading history. Do not
+        // delete that visible anchor in the same commit (or defer one mass trim to the next row).
+        this.chatRetentionLimit = chatRetentionLimitAfterProtectedInsert(
+          this.chatRetentionLimit,
+          merged.length,
+          0,
+          CHAT_SESSION_MESSAGE_LIMIT,
+        );
+      }
       this.messages = merged;
     }
     pendingReactionAdoptions.forEach(([localId, sid]) => {
@@ -2663,9 +2683,16 @@ export class Engine {
   prependHistory(list: HistoryMessage[], hasMore: boolean) {
     this.chatMore = hasMore;
     if (list.length) {
+      const firstPagination = this.chatPrepended === 0;
       this.messages = [...this.mapHistory(list), ...this.messages];
       this.oldestSid = list[0].id ?? this.oldestSid;
       this.chatPrepended += list.length; // якорь virtuoso сдвигается вместе с данными (один emit) — без прыжка
+      this.chatRetentionLimit = chatRetentionLimitAfterProtectedInsert(
+        this.chatRetentionLimit,
+        this.messages.length,
+        list.length,
+        firstPagination ? CHAT_SESSION_MESSAGE_LIMIT : 0,
+      );
     }
     this.emit();
   }
@@ -2678,6 +2705,7 @@ export class Engine {
     this.oldestSid = null;
     this.trimmedFront = 0;
     this.chatPrepended = 0;
+    this.chatRetentionLimit = CHAT_SESSION_MESSAGE_LIMIT;
     this.dataSend({ t: 'clear', by: byName || this.me.displayName });
     this.emit();
     this.sysMsg((byName || this.me.displayName) + ' очистил чат');
@@ -2925,6 +2953,7 @@ export class Engine {
         this.oldestSid = null;
         this.trimmedFront = 0;
         this.chatPrepended = 0;
+        this.chatRetentionLimit = CHAT_SESSION_MESSAGE_LIMIT;
         this.emit();
         this.sysMsg((d.by || 'Админ') + ' очистил чат');
       }
