@@ -8,7 +8,8 @@
     "test:links": "node src/linkify.test.mjs && node src/youtube.test.mjs",
     "test:volume": "node src/volumeCurve.test.mjs",
     "test:chat-scroll": "node src/chatScroll.test.mjs",
-    "build": "npm run test:links && npm run test:volume && npm run test:chat-scroll && tsc --noEmit && vite build",
+    "test:chat-wallpaper": "node src/chatWallpaper.test.mjs",
+    "build": "npm run test:links && npm run test:volume && npm run test:chat-scroll && npm run test:chat-wallpaper && tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

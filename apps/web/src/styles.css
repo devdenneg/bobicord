@@ -2470,6 +2470,25 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
     radial-gradient(760px 420px at 58% 108%,color-mix(in srgb,var(--accent) 4%,transparent),transparent 72%),
     var(--workspace-main);
 }
+#chat.cats-wallpaper .chat-feed::before{
+  content:'';
+  position:absolute;
+  inset:0;
+  z-index:0;
+  pointer-events:none;
+  background:color-mix(in srgb,var(--muted) 72%,var(--accent));
+  opacity:.15;
+  -webkit-mask-image:url('/assets/cat-wallpaper.png');
+  -webkit-mask-position:center top;
+  -webkit-mask-repeat:repeat;
+  -webkit-mask-size:780px auto;
+  mask-image:url('/assets/cat-wallpaper.png');
+  mask-position:center top;
+  mask-repeat:repeat;
+  mask-size:780px auto;
+}
+#chat.cats-wallpaper .virt-msgs,
+#chat.cats-wallpaper #msgs{position:relative;z-index:1}
 .chat-bottom{background:linear-gradient(180deg,transparent,var(--workspace-main) 18px)}
 .virt-row{padding:12px clamp(14px,2.2vw,28px) 0}
 .virt-row.cont{padding-top:3px}

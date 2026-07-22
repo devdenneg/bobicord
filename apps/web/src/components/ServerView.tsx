@@ -21,6 +21,7 @@ import { isTauri, saveFileDialog, openFile, pathsExist } from '../native';
 import { getDownloads, addDownload, subscribeDownloads, type DownloadItem } from '../downloads';
 import { sendActiveChat } from '../notifyws';
 import { linkifyHttpUrls } from '../linkify';
+import { readCatWallpaper, writeCatWallpaper } from '../chatWallpaper';
 import { fetchTitle, parseYouTubeVideo, type YouTubeVideoRef } from '../youtube';
 import {
   CHAT_BOTTOM_ENTER_PX,
@@ -1076,6 +1077,7 @@ function Chat() {
   const eng = useEngine();
   const E = getEngine()!;
   const [text, setText] = useState('');
+  const [catsWallpaper, setCatsWallpaper] = useState(readCatWallpaper);
   // Черновики per-server: недописанное сообщение не теряется при переходе между серверами (localStorage).
   const textRef = useRef(text); textRef.current = text;
   const prevActive = useRef<string | undefined>(undefined);
@@ -2138,6 +2140,11 @@ function Chat() {
     const canMod = !!active && (active.myRole === 'owner' || hasPerm(active.myPerms || 0, PERM.MANAGE_MESSAGES));
     if (c === 'help') {
       E.sysMsg('Команды: /clear — очистить чат (нужна модерация), /help — эта справка. Упоминание: @ник (или @all).');
+    } else if (c === 'cats') {
+      const enabled = !catsWallpaper;
+      setCatsWallpaper(enabled);
+      writeCatWallpaper(enabled);
+      toast(enabled ? 'Мяу!' : 'Котики спрятались', 'ok');
     } else if (c === 'clear') {
       if (!active || !canMod) { toast('Нет прав на очистку чата', 'warn'); return; }
       try { await api.clearChat(active.id); E.clearMessages(me.displayName); } catch (e: any) { toast(e?.message || 'Ошибка', 'err'); }
@@ -2413,7 +2420,7 @@ function Chat() {
   };
 
   return (
-    <div id="chat">
+    <div id="chat" className={catsWallpaper ? 'cats-wallpaper' : undefined}>
       <div className="chat-feed">
         {messages.length === 0 ? (
           <div id="msgs"><div className="msgs-inner"><div id="chatEmpty"><span className="chat-empty-icon"><Icon name="chat" /></span><b>Начало общего чата</b><span>Здесь можно писать, отвечать, делиться файлами и реакциями.</span></div></div></div>
