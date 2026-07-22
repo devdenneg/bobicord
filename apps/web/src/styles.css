@@ -2481,11 +2481,11 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
   -webkit-mask-image:url('/assets/cat-wallpaper.png');
   -webkit-mask-position:center top;
   -webkit-mask-repeat:repeat;
-  -webkit-mask-size:780px auto;
+  -webkit-mask-size:1560px auto;
   mask-image:url('/assets/cat-wallpaper.png');
   mask-position:center top;
   mask-repeat:repeat;
-  mask-size:780px auto;
+  mask-size:1560px auto;
 }
 #chat.cats-wallpaper .virt-msgs,
 #chat.cats-wallpaper #msgs{position:relative;z-index:1}
