@@ -1533,6 +1533,30 @@ const SAFE_ID = (s) => String(s || '').replace(/[^a-zA-Z0-9_.:-]/g, '').slice(0,
 // Клиент сдаёт сессию по окончании стрима/просмотра. Тело уже ограничено DIAG_MAX_BODY
 // (express.json выше), здесь режем ещё и по числу элементов: 413 от парсера клиент
 // увидит как сетевую ошибку и потеряет весь лог, а усечённый лог лучше пустого.
+// Профиль машины участника (diag.ts collectEnv: CPU/GPU/RAM/ОС у натива, движковые
+// характеристики в браузере). Белый список, а не «как пришло»: тело — клиентский ввод,
+// и файл сессии потом читает разбор, которому нужны предсказуемые поля. Строки режем,
+// числа приводим, всё лишнее выбрасываем.
+const DIAG_ENV_STRINGS = ['client', 'screen', 'netType', 'platform', 'cpu', 'os', 'appVersion'];
+const DIAG_ENV_NUMBERS = ['cores', 'deviceMemoryGb', 'netDownlinkMbps', 'cpuCores', 'ramMb'];
+function sanitizeDiagEnv(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const out = {};
+  for (const k of DIAG_ENV_STRINGS) {
+    if (raw[k] != null) out[k] = String(raw[k]).slice(0, 120);
+  }
+  for (const k of DIAG_ENV_NUMBERS) {
+    // null/'' НЕЛЬЗЯ гнать через Number(): оба дают 0, и «характеристика неизвестна»
+    // (deviceMemory нет в Firefox, downlink — только за Network Information API)
+    // превратилось бы в честный ноль «0 Мбит / 0 ГБ» в отчёте.
+    if (raw[k] == null || raw[k] === '') continue;
+    const n = Number(raw[k]);
+    if (Number.isFinite(n)) out[k] = n;
+  }
+  if (Array.isArray(raw.gpus)) out.gpus = raw.gpus.slice(0, 4).map((g) => String(g).slice(0, 120));
+  return Object.keys(out).length ? out : null;
+}
+
 app.post('/api/diag/session', requireAuth, (req, res) => {
   const b = req.body || {};
   const role = String(b.role || '');
@@ -1543,6 +1567,7 @@ app.post('/api/diag/session', requireAuth, (req, res) => {
 
   const lines = Array.isArray(b.lines) ? b.lines.slice(-20000).map((l) => String(l).slice(0, 2000)) : [];
   const samples = Array.isArray(b.samples) ? b.samples.slice(-2000) : [];
+  const env = sanitizeDiagEnv(b.env);
   const payload = {
     streamId, role, client,
     userId: req.user.id,
@@ -1551,6 +1576,7 @@ app.post('/api/diag/session', requireAuth, (req, res) => {
     endedAt: Number(b.endedAt) || Date.now(),
     appVersion: String(b.appVersion || '').slice(0, 32),
     userAgent: String(req.headers['user-agent'] || '').slice(0, 200),
+    env,
     lines, samples,
   };
   const name = `${payload.endedAt}-${streamId}-${role}-${SAFE_ID(req.user.username)}.json`;

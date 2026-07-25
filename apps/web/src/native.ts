@@ -95,6 +95,30 @@ export interface BroadcastStats {
   children: number;
   /** CPU-latch: fps поджат до 30 из-за перегруза захвата (бейдж «(CPU)» в статах). */
   cpuCapped: boolean;
+  /** Загрузка CPU всей системы, 0..100 (null на первом тике). Захват вытесняет игра —
+   *  «наш процесс на 12%» ничего не значит, пока не видно машину целиком. */
+  cpuSystemPercent: number | null;
+  /** Максимум за окно, байты: любой кадр и отдельно keyframe. Размер IDR = размер бёрста
+   *  (1080p на 4.5 Мбит ≈ 200-300 КБ, ~170 пакетов залпом), в среднем битрейте не виден. */
+  frameBytesMax: number;
+  keyBytesMax: number;
+}
+
+/** Профиль машины (hwinfo.rs). Пусто в браузере — там свой env-блок в diag.ts. */
+export interface NativeHwInfo {
+  cpu: string;
+  cores: number;
+  ramMb: number;
+  gpus: string[];
+  os: string;
+  appVersion: string;
+}
+
+/** Снимок железа для диага. Кэшируется в Rust, звать можно свободно. */
+export async function diagHwInfo(): Promise<NativeHwInfo | null> {
+  if (!isTauri) return null;
+  try { const { invoke } = await import('@tauri-apps/api/core'); return await invoke<NativeHwInfo>('diag_hw'); }
+  catch { return null; }
 }
 
 export async function onBroadcastStats(cb: (stats: BroadcastStats) => void): Promise<() => void> {

@@ -147,6 +147,16 @@ function parseViewer(session) {
   for (const s of session.samples || []) {
     const b = bucket(s.t);
     if (prev) {
+      // Джиттер-буфер: средняя задержка ЗА ОКНО = дельта секунд / дельта кадров. Lifetime-
+      // среднее (delay/count от начала сессии) сглаживает ровно то, что интересно — как
+      // буфер повёл себя в окне с фризами. Старые сессии полей не имеют -> null, печатаем
+      // пусто вместо нулей (ноль читался бы как «буфера нет»).
+      const dJbCount = (s.jbCount ?? 0) - (prev.jbCount ?? 0);
+      const dJbDelay = (s.jbDelayS ?? 0) - (prev.jbDelayS ?? 0);
+      const jbMs = s.jbCount != null && dJbCount > 0 ? (dJbDelay / dJbCount) * 1000 : null;
+      const dTgtCount = (s.jbCount ?? 0) - (prev.jbCount ?? 0);
+      const dTgt = (s.jbTargetS ?? 0) - (prev.jbTargetS ?? 0);
+      const jbTargetMs = s.jbTargetS != null && dTgtCount > 0 ? (dTgt / dTgtCount) * 1000 : null;
       upsert(ticks, b).v = {
         freezes: Math.max(0, (s.freezeCount ?? 0) - (prev.freezeCount ?? 0)),
         freezeMs: Math.max(0, (s.freezeMs ?? 0) - (prev.freezeMs ?? 0)),
@@ -156,11 +166,36 @@ function parseViewer(session) {
         fps: s.fps ?? 0,
         rttMs: s.rttMs,
         jitterMs: s.jitterMs ?? 0,
+        jbMs,
+        jbTargetMs,
+        // Восстановленное NACK'ом за окно. Растёт вместе с фризами = ретрансмит приходит,
+        // но опаздывает за буфер (тогда лечит JITTER_TARGET, а не борьба с потерями).
+        retrans: Math.max(0, (s.retransmittedPackets ?? 0) - (prev.retransmittedPackets ?? 0)),
+        // мс на кадр декодирования: софтверный декодер на слабой машине даёт дропы кадров
+        // без единой потери пакета — это не сеть и не вещатель.
+        decodeMs: dJbCount > 0 && s.decodeTimeS != null
+          ? ((s.decodeTimeS - (prev.decodeTimeS ?? 0)) / Math.max(1, (s.framesDecoded ?? 0) - (prev.framesDecoded ?? 0))) * 1000
+          : null,
+        pauses: Math.max(0, (s.pauseCount ?? 0) - (prev.pauseCount ?? 0)),
       };
     }
     prev = s;
   }
-  return { ticks, first, last: prev };
+  return { ticks, first, last: prev, meta: lastMeta(session) };
+}
+
+/** Статичные за сессию поля последнего семпла: декодер, тип ICE-пары. Меняются редко,
+ *  в таблицу по окнам их тащить незачем — печатаем строкой в итоге по зрителю. */
+function lastMeta(session) {
+  const s = (session.samples || []).at(-1);
+  if (!s) return null;
+  const route = [s.candLocal, s.candRemote].filter(Boolean).join('/');
+  return {
+    decoder: s.decoder ?? null,
+    powerEfficient: s.decoderPowerEfficient ?? null,
+    route: route || null,
+    proto: s.relayProto || s.candProto || null,
+  };
 }
 
 /* ---------------- сводка ---------------- */
@@ -173,6 +208,28 @@ function cmdReport(files) {
   const viewers = sessions.filter((s) => s.role === 'viewer');
   const streams = [...new Set(sessions.map((s) => s.streamId))];
   console.log(`Стримы: ${streams.join(', ')}  |  вещателей: ${broadcasters.length}, зрителей: ${viewers.length}\n`);
+
+  // Машины участников. Одни и те же тайминги на 16-ядерном десктопе и 4-ядерном ноутбуке
+  // читаются по-разному, а имя GPU объясняет выбор MFT у вещателя (encoder.rs).
+  const envLines = [];
+  for (const s of sessions) {
+    if (!s.env) continue;
+    const e = s.env;
+    const hw = [
+      e.cpu && `${e.cpu}${e.cpuCores ? ` (${e.cpuCores} потоков)` : ''}`,
+      !e.cpu && e.cores && `${e.cores} потоков`,
+      e.ramMb && `${(e.ramMb / 1024).toFixed(0)} ГБ RAM`,
+      e.deviceMemoryGb && !e.ramMb && `~${e.deviceMemoryGb} ГБ RAM`,
+      Array.isArray(e.gpus) && e.gpus.length && e.gpus.join(' + '),
+      e.os || e.platform,
+      e.screen,
+      e.netType && `сеть ${e.netType}${e.netDownlinkMbps ? ` ~${e.netDownlinkMbps} Мбит` : ''}`,
+      e.appVersion && `v${e.appVersion}`,
+    ].filter(Boolean).join(', ');
+    const line = `  ${s.username || s.file} (${s.role}, ${s.client}): ${hw}`;
+    if (!envLines.includes(line)) envLines.push(line);
+  }
+  if (envLines.length) console.log('Машины:\n' + envLines.join('\n') + '\n');
 
   const bc = broadcasters[0] ? parseBroadcaster(broadcasters[0]) : { ticks: new Map(), events: [] };
   const vw = viewers.map((v) => ({ name: v.username || v.file, client: v.client, ...parseViewer(v) }));
@@ -201,7 +258,7 @@ function cmdReport(files) {
   } else {
     console.log(`Окна с проблемами (${rows.length} из ${allBuckets.length}). t — секунды от начала.\n`);
     const head = ['t', 'drops', 'PLI', 'IDR', 'loss%', 'rtt', 'Мбит'];
-    for (const v of vw) head.push(`${short(v.name)}:фриз`, `${short(v.name)}:мс`, `${short(v.name)}:lost`);
+    for (const v of vw) head.push(`${short(v.name)}:фриз`, `${short(v.name)}:мс`, `${short(v.name)}:lost`, `${short(v.name)}:буф`);
     console.log(head.join('\t'));
     for (const b of rows) {
       const t = bc.ticks.get(b) || {};
@@ -217,7 +274,7 @@ function cmdReport(files) {
       ];
       for (const v of vw) {
         const s = v.ticks.get(b)?.v;
-        row.push(s?.freezes ?? '', s?.freezeMs ?? '', s?.lost ?? '');
+        row.push(s?.freezes ?? '', s?.freezeMs ?? '', s?.lost ?? '', s?.jbMs != null ? s.jbMs.toFixed(0) : '');
       }
       console.log(row.join('\t'));
     }
@@ -229,7 +286,12 @@ function cmdReport(files) {
   let worstViewerLoss = 0;
   for (const v of vw) {
     let freezes = 0, freezeMs = 0, lost = 0, pli = 0;
-    for (const [, x] of v.ticks) { freezes += x.v.freezes; freezeMs += x.v.freezeMs; lost += x.v.lost; pli += x.v.pliSent; }
+    const jbs = [], jbTargets = [];
+    for (const [, x] of v.ticks) {
+      freezes += x.v.freezes; freezeMs += x.v.freezeMs; lost += x.v.lost; pli += x.v.pliSent;
+      if (x.v.jbMs != null) jbs.push(x.v.jbMs);
+      if (x.v.jbTargetMs != null) jbTargets.push(x.v.jbTargetMs);
+    }
     const a = v.first, z = v.last;
     const recv = a && z ? (z.packetsReceived ?? 0) - (a.packetsReceived ?? 0) : 0;
     const lossPct = lost + recv > 0 ? (lost * 100) / (lost + recv) : 0;
@@ -239,10 +301,35 @@ function cmdReport(files) {
     console.log(
       `зритель ${v.name} (${v.client}): фризов ${freezes} / ${(freezeMs / 1000).toFixed(0)}с, потери ${lossPct.toFixed(1)}% (${lost} пакетов), декодировано ${fps.toFixed(1)} fps, PLI ${pli}`,
     );
+    // Буфер: медиана — где он стоял обычно, p95 — насколько уезжал в плохих окнах.
+    // Уехавший ВЫШЕ цели факт = adaptive-эвристика Chrome перебила наш target (то есть
+    // задержку создаёт восстановление после потерь, а не сам target).
+    if (jbs.length) {
+      const med = pct(jbs, 0.5), p95 = pct(jbs, 0.95);
+      const tgt = jbTargets.length ? `, цель ${pct(jbTargets, 0.5).toFixed(0)}мс` : '';
+      console.log(`  буфер: медиана ${med.toFixed(0)}мс, p95 ${p95.toFixed(0)}мс${tgt}`);
+    }
+    // Восстановление и декод: разделяют «потери» (сеть), «поздний ретрансмит» (буфер) и
+    // «не тянет декодер» (машина зрителя). Раньше в диаге не было ни одного из трёх.
+    let retrans = 0, pauses = 0;
+    const decodeMs = [];
+    for (const [, x] of v.ticks) {
+      retrans += x.v.retrans ?? 0;
+      pauses += x.v.pauses ?? 0;
+      if (x.v.decodeMs != null && Number.isFinite(x.v.decodeMs)) decodeMs.push(x.v.decodeMs);
+    }
+    const parts = [];
+    if (retrans) parts.push(`восстановлено NACK ${retrans} пакетов`);
+    if (decodeMs.length) parts.push(`декод ${pct(decodeMs, 0.5).toFixed(1)}/${pct(decodeMs, 0.95).toFixed(1)}мс (мед/p95)`);
+    if (pauses) parts.push(`пауз ${pauses}`);
+    if (v.meta?.decoder) parts.push(`${v.meta.decoder}${v.meta.powerEfficient === false ? ' (не энергоэффективный)' : ''}`);
+    if (v.meta?.route) parts.push(`ICE ${v.meta.route}${v.meta.proto ? `/${v.meta.proto}` : ''}`);
+    if (parts.length) console.log(`  ${parts.join(', ')}`);
   }
 
-  // Сводка вещателя. cbMax сравниваем с БЮДЖЕТОМ КАДРА (1000/fps), а не с константой.
+  // Сводка вещателя. Времена сравниваем с БЮДЖЕТОМ КАДРА (1000/fps), а не с константой.
   let drops = 0, pli = 0, idr = 0, idrForced = 0, idrForcedKnown = false, cbMax = 0, maxLoss = 0, dropWindows = 0, targetFps = 30;
+  const cbAvgs = [];
   for (const [, x] of bc.ticks) {
     drops += x.timing?.drops ?? 0;
     if ((x.timing?.drops ?? 0) > 0) dropWindows++;
@@ -250,24 +337,44 @@ function cmdReport(files) {
     idr += x.net?.idr ?? 0;
     if (x.net?.idrForced != null) { idrForced += x.net.idrForced; idrForcedKnown = true; }
     cbMax = Math.max(cbMax, x.timing?.cbMax ?? 0);
+    if (x.timing?.cbAvg != null) cbAvgs.push(x.timing.cbAvg);
     for (const l of x.net?.links ?? []) maxLoss = Math.max(maxLoss, l.loss);
   }
   if (broadcasters[0]?.samples?.length) targetFps = broadcasters[0].samples[0].targetFps || 30;
   const windows = bc.ticks.size || 1;
   const budgetMs = 1000 / targetFps;
+  // p95 окон, а не единственный выброс за сессию. cbMax — максимум ПО ОКНАМ, то есть один
+  // залипший кадр (GC, свёрнутое окно, реинит MFT) задирает его на порядок при полностью
+  // здоровом захвате: у leva 07-22 avg 3.4мс / p95 4.5мс при cbMax 118мс — прежний гейт
+  // `cbMax > budgetMs` объявлял «вещатель не успевал» на каждой такой сессии.
+  const cbP95 = cbAvgs.length ? pct(cbAvgs, 0.95) : 0;
   const idrRate = (idr / windows) / (BUCKET_MS / 1000); // IDR в секунду
   if (bc.ticks.size) {
     console.log(
-      `\nвещатель: дропов захвата ${drops} (в ${dropWindows} окнах из ${windows}), cb max ${cbMax.toFixed(1)}мс при бюджете ${budgetMs.toFixed(1)}мс,` +
+      `\nвещатель: дропов захвата ${drops} (в ${dropWindows} окнах из ${windows}), cb p95 ${cbP95.toFixed(1)}мс / max ${cbMax.toFixed(1)}мс при бюджете ${budgetMs.toFixed(1)}мс,` +
       ` PLI получено ${pli}, IDR отдано ${idr} (${idrRate.toFixed(2)}/с), худший loss линка ${maxLoss.toFixed(1)}%`,
     );
+  }
+  // CPU системы и размер бёрста — из семплов вещателя (BroadcastStats, тот же 2с-тик).
+  // Загрузка машины ЦЕЛИКОМ отвечает на «захват не успевал потому, что игра съела CPU»;
+  // размер IDR — на «фризы без потерь»: 300 КБ это ~170 пакетов залпом.
+  const bs = broadcasters[0]?.samples || [];
+  if (bs.length) {
+    const cpu = bs.map((s) => s.cpuSystemPercent).filter((n) => Number.isFinite(n));
+    const keyKb = bs.map((s) => (s.keyBytesMax || 0) / 1024).filter((n) => n > 0);
+    const frameKb = bs.map((s) => (s.frameBytesMax || 0) / 1024).filter((n) => n > 0);
+    const bits = [];
+    if (cpu.length) bits.push(`CPU системы ${pct(cpu, 0.5).toFixed(0)}/${pct(cpu, 0.95).toFixed(0)}% (мед/p95)`);
+    if (keyKb.length) bits.push(`IDR до ${Math.max(...keyKb).toFixed(0)} КБ (медиана окон ${pct(keyKb, 0.5).toFixed(0)})`);
+    if (frameKb.length) bits.push(`кадр до ${Math.max(...frameKb).toFixed(0)} КБ`);
+    if (bits.length) console.log(`  ${bits.join(', ')}`);
   }
 
   // Вердикт. Пороговые доли, не абсолюты: 55 дропов за 10 минут — шум инициализации,
   // а не перегрузка, и раньше этот вердикт ошибочно винил захват.
   const anyFreeze = vw.some((v) => [...v.ticks.values()].some((x) => x.v.freezes > 0));
   if (anyFreeze) {
-    const captureBad = dropWindows / windows > 0.1 || cbMax > budgetMs;
+    const captureBad = dropWindows / windows > 0.1 || cbP95 > budgetMs;
     if (captureBad) console.log('\n=> Вещатель не успевал (дропы в >10% окон / колбэк длиннее бюджета кадра). Смотри CPU-путь: capture.rs.');
     else if (maxLoss > 2) console.log('\n=> Захват чист, сыпется линк вещатель->прямой ребёнок. Смотри аплинк вещателя, coturn.');
     else if (worstViewerLoss > 2) console.log('\n=> Захват и аплинк вещателя чисты, а зрители теряют пакеты. Виноват узел ниже (vrelay) или линк зрителя.\n   Дальше: docker compose logs vrelay | grep ingest   и   logs token | grep health');
@@ -304,6 +411,12 @@ function cmdReport(files) {
 }
 
 const short = (n) => String(n).slice(0, 8);
+/** Перцентиль по копии массива (nearest-rank). Пустой массив -> 0. */
+const pct = (arr, q) => {
+  if (!arr.length) return 0;
+  const s = [...arr].sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.floor(s.length * q))];
+};
 const argVal = (args, k) => { const a = args.find((x) => x.startsWith(k + '=')); return a ? a.slice(k.length + 1) : null; };
 
 /* ---------------- main ---------------- */

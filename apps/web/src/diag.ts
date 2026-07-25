@@ -14,9 +14,13 @@
 // сервер режет ещё раз (express.json limit + slice в роуте).
 
 import { api, diagSessionKeepalive } from './api';
-import { diagTakeLog, isTauri, onBroadcastStats, type BroadcastStats } from './native';
+import { diagHwInfo, diagTakeLog, isTauri, onBroadcastStats, type BroadcastStats } from './native';
 
 const CLIENT: 'native' | 'web' = isTauri ? 'native' : 'web';
+
+/** Подставляется Vite (`define` в vite.config.ts). Для натива версию перекрывает hwinfo.rs. */
+declare const __APP_VERSION__: string;
+const APP_VERSION = typeof __APP_VERSION__ === 'string' ? __APP_VERSION__ : 'dev';
 
 /** 2с × 2000 ≈ 66 минут сессии. Дальше вытесняем старые семплы: интересен хвост — то,
  *  что было перед жалобой и остановкой. */
@@ -34,6 +38,45 @@ const PENDING_MAX = 3;
 const PENDING_MAX_BYTES = 250_000;
 
 type Role = 'broadcaster' | 'viewer';
+
+/* ---------- профиль машины (один раз за процесс) ---------- */
+
+/** Что за машина у участника. Те же цифры захвата (cb 15мс при бюджете 16.7) на
+ *  16-ядерном десктопе значат «запас есть», а на 4-ядерном ноутбуке — «на грани»;
+ *  без этого блока диаг заставлял угадывать. Нативная часть приходит из hwinfo.rs
+ *  (CPU/GPU/RAM/билд Windows), браузерная — из того, что отдаёт сам движок.
+ *  Собираем только технические характеристики: ни имён устройств, ни IP (последние и
+ *  так есть в ICE-строках лога, диаг доступен только админу). */
+let envCache: Record<string, unknown> | null = null;
+async function collectEnv(): Promise<Record<string, unknown>> {
+  if (envCache) return envCache;
+  const nav = navigator as any;
+  const env: Record<string, unknown> = {
+    client: CLIENT,
+    // hardwareConcurrency у Chromium — логические ядра; deviceMemory округлён до 0.5-8 ГБ
+    // и есть не везде (в Firefox нет вовсе) — отсюда ?? null, а не 0: «не знаем» ≠ «ноль».
+    cores: nav.hardwareConcurrency ?? null,
+    deviceMemoryGb: nav.deviceMemory ?? null,
+    screen: typeof screen !== 'undefined' ? `${screen.width}x${screen.height}@${window.devicePixelRatio ?? 1}x` : null,
+    // Тип сети — почему у зрителя рвётся линк: wifi/4g против ethernet.
+    netType: nav.connection?.effectiveType ?? null,
+    netDownlinkMbps: nav.connection?.downlink ?? null,
+    platform: nav.userAgentData?.platform ?? nav.platform ?? null,
+  };
+  if (CLIENT === 'native') {
+    const hw = await diagHwInfo();
+    if (hw) {
+      env.cpu = hw.cpu;
+      env.cpuCores = hw.cores;
+      env.ramMb = hw.ramMb;
+      env.gpus = hw.gpus;
+      env.os = hw.os;
+      env.appVersion = hw.appVersion;
+    }
+  }
+  envCache = env;
+  return env;
+}
 
 interface Session {
   streamId: string;
@@ -62,12 +105,19 @@ async function sampleInbound(pc: RTCPeerConnection): Promise<unknown | null> {
   try { report = await pc.getStats(); } catch { return null; }
   let v: any = null;
   let pair: any = null;
+  const byId = new Map<string, any>();
   for (const stat of report.values() as any) {
+    byId.set(stat.id, stat);
     if (stat.type === 'inbound-rtp' && stat.kind === 'video') v = stat;
     // Номинированная пара важнее просто succeeded: по ней реально идёт медиа.
     else if (stat.type === 'candidate-pair' && stat.state === 'succeeded' && (stat.nominated || !pair)) pair = stat;
   }
   if (!v) return null;
+  // Раньше в семпл писался `localCandidateId` — сырой id вида «ICWQ0zvB», по которому
+  // после выгрузки уже ничего не восстановить. Нужен ТИП пары: relay = медиа идёт через
+  // coturn (лишний хоп и полоса сервера), host/srflx = напрямую.
+  const lc = pair ? byId.get(pair.localCandidateId) : null;
+  const rc = pair ? byId.get(pair.remoteCandidateId) : null;
   return {
     t: Date.now(),
     // Прямая мера симптома: сколько раз картинка замирала и суммарно на сколько.
@@ -86,10 +136,45 @@ async function sampleInbound(pc: RTCPeerConnection): Promise<unknown | null> {
     w: v.frameWidth ?? 0,
     h: v.frameHeight ?? 0,
     bytesReceived: v.bytesReceived ?? 0,
+    // Джиттер-буфер. Кумулятивные секунды/счётчик — фактическая задержка буфера считается
+    // при разборе как дельта delay/count (lifetime-среднее врёт после смены условий сети,
+    // ср. treeVideo.getRtpStats). Без этих полей эффект адаптивного target (JITTER_MIN_MS/
+    // JITTER_MAX_MS в treeVideo.ts) виден только глазами в UI-оверлее: в сессии его не было,
+    // то есть регрессию задержки нельзя было ни поймать, ни доказать по данным.
+    jbDelayS: v.jitterBufferDelay ?? 0,
+    jbCount: v.jitterBufferEmittedCount ?? 0,
+    // Куда буфер ЦЕЛИТСЯ (наш jitterBufferTarget) против того, где он реально стоит.
+    // Расхождение target vs факт и отвечает на «фикс поднял задержку или опустил».
+    jbTargetS: v.jitterBufferTargetDelay ?? 0,
+    jbMinimumS: v.jitterBufferMinimumDelay ?? 0,
     rttMs: pair ? Math.round((pair.currentRoundTripTime ?? 0) * 1000) : null,
-    // Тип пары (host/srflx/relay) — relay значит, что медиа идёт через coturn.
-    localCandidate: pair?.localCandidateId ?? null,
+    // Тип пары (host/srflx/prflx/relay) — relay значит, что медиа идёт через coturn.
+    // Адреса НЕ пишем: тип отвечает на вопрос о маршруте, IP для этого не нужен.
+    candLocal: lc?.candidateType ?? null,
+    candRemote: rc?.candidateType ?? null,
+    candProto: lc?.protocol ?? null,
+    /** udp/tcp/tls, только когда пара relay — какой транспорт до TURN. */
+    relayProto: lc?.relayProtocol ?? null,
     availableInBps: pair?.availableIncomingBitrate ?? null,
+    /** Сколько пакетов реально восстановил NACK. Прямой ответ на «ретрансмит успевает
+     *  или опаздывает за буфер»: если растёт вместе с freezeCount — приходит, но поздно. */
+    retransmittedPackets: v.retransmittedPacketsReceived ?? 0,
+    framesReceived: v.framesReceived ?? 0,
+    /** Кумулятивные секунды декодирования: /framesDecoded даёт мс на кадр. Слабый ПК или
+     *  софтверный декодер видно здесь, а не в потерях. */
+    decodeTimeS: v.totalDecodeTime ?? 0,
+    /** Полный путь пакет→кадр на приёме (jitter-буфер + декод + рендер-очередь). */
+    processingDelayS: v.totalProcessingDelay ?? 0,
+    /** Сборка кадра из пакетов — растёт, когда пакеты приходят вразнобой. */
+    assemblyTimeS: v.totalAssemblyTime ?? 0,
+    assembledFrames: v.framesAssembledFromMultiplePackets ?? 0,
+    /** «ExternalDecoder»/«libvpx»/«FFmpeg» и флаг энергоэффективности — софтверный декод
+     *  на слабой машине сам по себе даёт framesDropped без единой потери пакета. */
+    decoder: v.decoderImplementation ?? null,
+    decoderPowerEfficient: v.powerEfficientDecoder ?? null,
+    /** Пауза ≠ фриз: трек остановлен (свёрнутое окно, скрытый таб), кадров не ждут. */
+    pauseCount: v.pauseCount ?? 0,
+    pauseMs: Math.round((v.totalPausesDuration ?? 0) * 1000),
   };
 }
 
@@ -100,6 +185,8 @@ export function startViewerSession(streamId: string, getPc: () => RTCPeerConnect
   const k = key('viewer', streamId);
   if (sessions.has(k)) return;
   hookUnload();
+  // Прогрев кэша: на `pagehide` ждать IPC нельзя, а env хочется и в keepalive-теле.
+  void collectEnv().catch(() => null);
   const timer = window.setInterval(async () => {
     const s = sessions.get(k);
     if (!s) return;
@@ -121,6 +208,8 @@ export function startBroadcasterSession(streamId: string) {
   const k = key('broadcaster', streamId);
   if (sessions.has(k)) return;
   hookUnload();
+  // Прогрев кэша: на `pagehide` ждать IPC нельзя, а env хочется и в keepalive-теле.
+  void collectEnv().catch(() => null);
   let unlisten: (() => void) | null = null;
   let disposed = false;
   const session: Session = {
@@ -165,11 +254,15 @@ function fitBody(payload: any, maxBytes: number): any {
   return payload;
 }
 
-function buildPayload(s: Session, lines: string[]) {
+function buildPayload(s: Session, lines: string[], env?: Record<string, unknown> | null) {
   return {
     streamId: s.streamId, role: s.role, client: CLIENT,
     startedAt: s.startedAt,
     endedAt: Date.now(),
+    // Сервер пишет appVersion отдельным полем и раньше получал пустую строку — клиент его
+    // просто не слал, поэтому НИ ОДНА сессия не привязывалась к версии бандла.
+    appVersion: (env?.appVersion as string | undefined) ?? APP_VERSION,
+    env: env ?? envCache ?? null,
     samples: s.samples.slice(),
     lines,
   };
@@ -248,7 +341,11 @@ async function finish(role: Role, streamId: string) {
   const lines = CLIENT === 'native' ? (await diagTakeLog()).slice(-MAX_LINES) : [];
   if (!s.samples.length && !lines.length) return; // нечего сдавать (сессия оборвалась сразу)
 
-  const payload = fitBody(buildPayload(s, lines), MAX_BODY_BYTES);
+  // Профиль машины — на выгрузке, не на старте: собирать его при каждом старте сессии
+  // незачем (значения статичны, кэш в envCache и в Rust), а на пути остановки стрима
+  // лишняя IPC-задержка не мешает — сдача и так асинхронная.
+  const env = await collectEnv().catch(() => null);
+  const payload = fitBody(buildPayload(s, lines, env), MAX_BODY_BYTES);
   // Диагностика не должна мешать остановке стрима и не должна всплывать ошибкой юзеру.
   // Но и терять её не хочется: не ушло — ляжет в очередь до следующего запуска.
   try { await api.diagSession(payload); } catch (e) { if (worthRetry(e)) savePending(payload); }

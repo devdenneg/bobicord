@@ -11,8 +11,13 @@ export default defineConfig(({ mode, command }) => {
   if (command === 'serve') {
     console.log(`[dev] API proxy → ${target}  ${useProd ? '(ПРОД)' : '(локальный бэк)'}`);
   }
+  // Версия веб-бандла для диага: без неё сессии браузерных зрителей нельзя привязать к
+  // деплою (сервер пишет appVersion, а клиент раньше слал пустую строку). Нативный
+  // клиент берёт свою версию из Rust (hwinfo.rs, CARGO_PKG_VERSION).
+  const webVersion = env.VITE_BUILD || process.env.npm_package_version || 'dev';
   return {
     plugins: [react()],
+    define: { __APP_VERSION__: JSON.stringify(webVersion) },
     build: {
       outDir: 'dist', sourcemap: false, chunkSizeWarningLimit: 1500,
       // Вторая точка входа — окно кастомного нативного уведомления (лёгкая страница, без React-бандла).
