@@ -384,8 +384,20 @@ pub async fn start(
         // (полный Activate/SetInputType/SetOutputType хардварного энкодера)
         // валило NVENC/AMF-сессию и роняло поток. Ждём, пока размер не
         // стабилизируется на RESIZE_DEBOUNCE, и только тогда пересоздаём энкодер.
-        const RESIZE_DEBOUNCE: Duration = Duration::from_millis(400);
+        // 1.5с, а не 400мс: alt-tab из игры и обратно меняет размер источника дважды за
+        // секунду-две (диаг 2026-07-25: leva 1920x1080<->1152x864 ×40, kiprol <->1920x1032 ×32
+        // за разбор), и на 400мс каждый такой чих пересоздавал MFT — а это IDR, пауза потока
+        // и шанс словить отказ драйвера. Возврат к прежнему размеру дебаунс переживёт: ниже
+        // pending сбрасывается, когда источник вернулся к размеру энкодера.
+        const RESIZE_DEBOUNCE: Duration = Duration::from_millis(1500);
         let mut pending_resize: Option<(u32, u32, Instant)> = None;
+        // Пауза между попытками создать MFT и общий срок, после которого сдаёмся и рвём
+        // вещание с внятным сообщением. 5с ≈ 16 попыток — драйверу хватает отпустить
+        // прежний инстанс; больше держать смысла нет (зритель уже без картинки).
+        const ENC_INIT_COOLDOWN: Duration = Duration::from_millis(300);
+        const ENC_INIT_GRACE: Duration = Duration::from_secs(5);
+        let mut enc_init_failing_since: Option<Instant> = None;
+        let mut enc_init_next_try: Option<Instant> = None;
         while !enc_stop2.load(Ordering::Relaxed) {
             let frame = match cap_rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(f) => f,
@@ -443,12 +455,33 @@ pub async fn start(
                 // Берём живую цель, не замороженный bitrate_bps: после ресайза окна MFT
                 // пересоздаётся и должен подхватить уже адаптированный ABR-битрейт.
                 let start_bitrate = target_bitrate_enc.load(Ordering::Relaxed);
+                // Ретрай, а не мгновенный обрыв: аппаратный MFT отказывает временно, пока
+                // драйвер не отпустил предыдущий инстанс (переиниt после ресайза окна или
+                // быстрый рестарт вещания). Раньше первый же Err рвал стрим — диаг 2026-07-25:
+                // 22 обрыва у leva/kiprol, каждая длинная сессия кончалась на этом.
+                if matches!(enc_init_next_try, Some(next) if Instant::now() < next) {
+                    buf_pool.put(frame.data);
+                    continue;
+                }
                 match encoder::H264Encoder::new(frame.width, frame.height, cur_fps, start_bitrate, force_keyframe_enc.clone()) {
-                    Ok(e) => { force_keyframe_enc.store(true, Ordering::Relaxed); enc = Some((e, frame.width, frame.height, cur_fps)); }
+                    Ok(e) => {
+                        force_keyframe_enc.store(true, Ordering::Relaxed);
+                        enc = Some((e, frame.width, frame.height, cur_fps));
+                        enc_init_failing_since = None;
+                        enc_init_next_try = None;
+                    }
                     Err(e) => {
-                        log::error!("encoder: init failed: {e}");
-                        let _ = shutdown_tx_enc.send(Some(format!("не удалось создать H264-энкодер: {e}")));
-                        break;
+                        let since = *enc_init_failing_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() >= ENC_INIT_GRACE {
+                            log::error!("encoder: init failed {}x{}@{cur_fps} окончательно ({:.1}с попыток): {e}", frame.width, frame.height, since.elapsed().as_secs_f64());
+                            let _ = shutdown_tx_enc.send(Some(format!("не удалось создать H264-энкодер: {e}")));
+                            buf_pool.put(frame.data);
+                            break;
+                        }
+                        log::warn!("encoder: init failed {}x{}@{cur_fps}: {e} — ретрай через {}мс", frame.width, frame.height, ENC_INIT_COOLDOWN.as_millis());
+                        enc_init_next_try = Some(Instant::now() + ENC_INIT_COOLDOWN);
+                        buf_pool.put(frame.data);
+                        continue;
                     }
                 }
             }
@@ -472,8 +505,10 @@ pub async fn start(
                     for c in chunks {
                         stats_enc.encoded_frames.fetch_add(1, Ordering::Relaxed);
                         stats_enc.encoded_bytes.fetch_add(c.data.len() as u64, Ordering::Relaxed);
+                        stats_enc.frame_bytes_max.fetch_max(c.data.len() as u64, Ordering::Relaxed);
                         if c.is_keyframe {
                             stats_enc.keyframes.fetch_add(1, Ordering::Relaxed);
+                            stats_enc.key_bytes_max.fetch_max(c.data.len() as u64, Ordering::Relaxed);
                             if c.forced { stats_enc.keyframes_forced.fetch_add(1, Ordering::Relaxed); }
                         }
                         let sample = Sample { data: Bytes::from(c.data), duration: real_dur, ..Default::default() };
@@ -604,6 +639,15 @@ struct DebugSnapshot {
     children: usize,
     /// CPU-latch сработал: fps поджат до 30 из-за перегруза захвата (бейдж «(CPU)» в UI).
     cpu_capped: bool,
+    /// Загрузка CPU ВСЕЙ системы, 0..100 (None на первом тике — нет предыдущего снимка).
+    /// Именно системная: захват вытесняет игра (prio.rs), и «наш процесс на 12%» ничего
+    /// не объясняет, пока не видно, что машина в целом на 100%.
+    cpu_system_percent: Option<f64>,
+    /// Максимальный размер закодированного кадра за окно и отдельно keyframe, байты.
+    /// Прямая улика IDR-бёрста: 1080p-IDR на 4.5 Мбит это ~200-300 КБ = ~170 пакетов
+    /// залпом. Раньше о размере кадров в диаге не было ничего.
+    frame_bytes_max: u64,
+    key_bytes_max: u64,
 }
 
 async fn run_signaling_loop(
@@ -709,6 +753,9 @@ async fn run_signaling_loop(
                     bitrate_actual_bps: (bytes - prev_bytes) as f64 * 8.0 / dt,
                     children: mgr.child_count(),
                     cpu_capped: ladder.targets.cpu_fps_cap.load(Ordering::Relaxed) != u32::MAX,
+                    cpu_system_percent: crate::hwinfo::cpu_load_percent(),
+                    frame_bytes_max: stats.frame_bytes_max.swap(0, Ordering::Relaxed),
+                    key_bytes_max: stats.key_bytes_max.swap(0, Ordering::Relaxed),
                 };
                 prev_at = now; prev_cap = cap; prev_enc = enc; prev_bytes = bytes;
                 if let Some(app) = &app { let _ = app.emit("relay-broadcast-stats", &snapshot); }
@@ -729,8 +776,16 @@ async fn run_signaling_loop(
                 let drops_delta = drops.saturating_sub(prev_drops);
                 prev_drops = drops;
                 if cb_n > 0 || enc_n > 0 {
+                    // cpu — вся система (см. hwinfo::cpu_load_percent), кадр/IDR — максимумы
+                    // за окно в КБ: по ним видно бёрст, которого не видно в среднем битрейте.
+                    let cpu_txt = match snapshot.cpu_system_percent {
+                        Some(p) => format!("{p:.0}%"),
+                        None => "?".to_string(),
+                    };
                     log::info!(
-                        "timing: cb {cb_avg:.1}/{cb_max:.1} мс (avg/max) = readback {readback_avg:.1} + convert {convert_avg:.1} | encode {enc_avg:.1}/{enc_max:.1} | write {write_avg:.1} | drops +{drops_delta} (всего {drops})"
+                        "timing: cb {cb_avg:.1}/{cb_max:.1} мс (avg/max) = readback {readback_avg:.1} + convert {convert_avg:.1} | encode {enc_avg:.1}/{enc_max:.1} | write {write_avg:.1} | drops +{drops_delta} (всего {drops}) | cpu {cpu_txt} | кадр max {:.0} КБ, IDR max {:.0} КБ",
+                        snapshot.frame_bytes_max as f64 / 1024.0,
+                        snapshot.key_bytes_max as f64 / 1024.0,
                     );
                 }
 

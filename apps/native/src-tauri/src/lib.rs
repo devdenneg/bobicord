@@ -4,6 +4,7 @@ pub mod broadcast;
 mod branding;
 pub mod diag;
 mod hotkeys;
+mod hwinfo;
 
 use std::collections::HashMap;
 use tokio::sync::Mutex;
@@ -402,7 +403,7 @@ pub fn run() {
       std::thread::spawn(branding::fix_shortcuts);
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![ping, open_external_url, list_monitors, list_windows, detect_game, foreground_fullscreen, set_detectable_games, start_broadcast, set_broadcast_source, stop_broadcast, set_preview_interval, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys, open_file, reveal_in_folder, paths_exist, diag::diag_take_log])
+    .invoke_handler(tauri::generate_handler![ping, open_external_url, list_monitors, list_windows, detect_game, foreground_fullscreen, set_detectable_games, start_broadcast, set_broadcast_source, stop_broadcast, set_preview_interval, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys, open_file, reveal_in_folder, paths_exist, diag::diag_take_log, hwinfo::diag_hw])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }
