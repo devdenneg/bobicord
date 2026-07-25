@@ -382,4 +382,59 @@ function candidate(sha, note, components) {
   db.close();
 })();
 
+// Валидатор политики и не-ASCII пути. Git по умолчанию отдаёт такие имена закавыченными и
+// в octal-escape («"docs/diag-\321\201..."»), из-за чего классификация путей ломалась и
+// легальный «Patch-Note: skip» для документа отклонялся как «запрещён для поставляемых
+// файлов» — релиз e088f345154c упал именно так. Тест сквозной: настоящий git-репозиторий,
+// настоящий вызов валидатора, потому что баг был не в правилах, а в чтении путей из git.
+(function validatorAcceptsSkipForNonAsciiDocs() {
+  const { execFileSync, spawnSync } = require('child_process');
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-policy-'));
+  const git = (...args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    git('init', '-q', '-b', 'main');
+    git('config', 'user.email', 'test@example.com');
+    git('config', 'user.name', 'policy test');
+    git('config', 'commit.gpgsign', 'false');
+    // Базовый коммит: от него считается диапазон релиза.
+    fs.writeFileSync(path.join(repo, 'README.md'), 'base\n');
+    git('add', 'README.md');
+    git('commit', '-q', '-m', 'chore: base\n\nПодготовка репозитория.\n\nPatch-Note: skip\n\nVerification:\n- нет поставляемых изменений\n');
+    const from = git('rev-parse', 'HEAD').trim();
+
+    fs.mkdirSync(path.join(repo, 'docs'), { recursive: true });
+    const docName = 'docs/разбор-стримов.md';
+    fs.writeFileSync(path.join(repo, docName), '# разбор\n');
+    git('add', docName);
+    git('commit', '-q', '-m', 'docs(diag): разбор стримов\n\nОтчёт по сессиям.\n\nPatch-Note: skip\n\nVerification:\n- проверка цифр отчёта против сырых сессий\n');
+    const to = git('rev-parse', 'HEAD').trim();
+
+    const validator = path.join(__dirname, '..', '..', 'scripts', 'release-notes.mjs');
+    const run = spawnSync(process.execPath, [validator, 'validate', '--from', from, '--to', to], {
+      cwd: repo, encoding: 'utf8',
+    });
+    assert.strictEqual(
+      run.status, 0,
+      `валидатор отклонил «Patch-Note: skip» для ${docName}: ${run.stderr || run.stdout}`,
+    );
+
+    // Обратная сторона: для поставляемого файла skip обязан оставаться запрещённым, иначе
+    // фикс путей превратился бы в дыру в политике.
+    fs.mkdirSync(path.join(repo, 'apps', 'web', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(repo, 'apps/web/src/фича.ts'), 'export const x = 1;\n');
+    git('add', 'apps/web/src/фича.ts');
+    git('commit', '-q', '-m', 'feat(web): фича\n\nНовое поведение.\n\nPatch-Note: skip\n\nVerification:\n- npm run typecheck\n');
+    const runtime = spawnSync(process.execPath, [validator, 'validate', '--from', to, '--to', git('rev-parse', 'HEAD').trim()], {
+      cwd: repo, encoding: 'utf8',
+    });
+    assert.notStrictEqual(runtime.status, 0, 'skip для поставляемого файла с не-ASCII именем должен быть отклонён');
+    assert.ok(
+      `${runtime.stdout}${runtime.stderr}`.includes('apps/web/src/фича.ts'),
+      `в сообщении должен быть распознанный путь, получено: ${runtime.stderr || runtime.stdout}`,
+    );
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+})();
+
 console.log('release notes tests: ok');

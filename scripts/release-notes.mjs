@@ -23,8 +23,13 @@ function fail(message) {
   throw new Error(message);
 }
 
+// core.quotepath=false ОБЯЗАТЕЛЕН: по умолчанию git отдаёт не-ASCII пути закавыченными и
+// в octal-escape («"docs/diag-\321\201\321\202..."» вместо «docs/diag-стримы-...»). Любая
+// классификация путей на такой строке ломается — isNonRuntimePath не видел ни префикса
+// docs/, ни расширения .md, и легальный «Patch-Note: skip» для документа был отклонён как
+// «запрещён для поставляемых файлов» (падение релиза e088f345154c).
 function git(args) {
-  return execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  return execFileSync('git', ['-c', 'core.quotepath=false', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 }
 
 function cleanSha(value) {
