@@ -32,7 +32,9 @@ pub struct EncodedFrame {
 
 pub struct H264Encoder {
     transform: IMFTransform,
-    event_gen: IMFMediaEventGenerator,
+    /// Только у асинхронного MFT. Синхронный (софтверный «H264 Encoder MFT») этот
+    /// интерфейс не реализует — см. комментарий в `new`.
+    event_gen: Option<IMFMediaEventGenerator>,
     is_async: bool,
     need_input: u32,
     codec_api: Option<ICodecAPI>,
@@ -73,7 +75,18 @@ impl H264Encoder {
             if is_async {
                 attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1).map_err(|e| format!("ASYNC_UNLOCK: {e}"))?;
             }
-            let event_gen: IMFMediaEventGenerator = transform.cast().map_err(|e| e.to_string())?;
+            // IMFMediaEventGenerator есть ТОЛЬКО у async-MFT. Софтверный «H264 Encoder MFT»
+            // (Microsoft, наш фолбэк, когда аппаратный не активировался) синхронный и этот
+            // интерфейс не реализует: безусловный cast возвращал E_NOINTERFACE (0x80004002) и
+            // убивал фолбэк целиком — вещание не стартовало вовсе. Диаг bebe 2026-07-26:
+            // ActivateObject «NVIDIA H.264 Encoder MFT» падает с 0x8000FFFF, софтверный
+            // подхватывается, и тут же «init failed: Интерфейс не поддерживается» по кругу
+            // все 5с ретраев. Синхронный путь (drain_sync) событий не использует вовсе.
+            let event_gen: Option<IMFMediaEventGenerator> = if is_async {
+                Some(transform.cast().map_err(|e| format!("IMFMediaEventGenerator у async-MFT «{mft_label}»: {e}"))?)
+            } else {
+                None
+            };
 
             let output_type = MFCreateMediaType().map_err(|e| e.to_string())?;
             output_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).map_err(|e| e.to_string())?;
@@ -281,8 +294,11 @@ impl H264Encoder {
     /// увеличивает кредит на вход, METransformHaveOutput тут же забирается через
     /// ProcessOutput (единственный легальный момент для этого вызова у async-MFT).
     unsafe fn pump_events(&mut self, out: &mut Vec<EncodedFrame>) -> Result<(), String> {
+        // Зовётся только из async-ветки encode(), где генератор заведомо есть; гард — чтобы
+        // будущая правка не превратила отсутствие интерфейса в панику.
+        let Some(event_gen) = self.event_gen.clone() else { return Ok(()) };
         loop {
-            let evt = match self.event_gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
+            let evt = match event_gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
                 Ok(e) => e,
                 Err(_) => break, // MF_E_NO_EVENTS_AVAILABLE — событий пока нет
             };
