@@ -8,6 +8,12 @@ import { MusicPlayer } from './MusicPlayer';
 import { getSettings, setSettings } from '../settings';
 import { isTauri, onBroadcastStopped, stopNativeBroadcast } from '../native';
 import { endAnyBroadcasterSession } from '../diag';
+import {
+  audioDeviceChoices,
+  audioOutputChoices,
+  currentAppleMobilePlatform,
+  type AudioDeviceChoice,
+} from '../audioDevices';
 
 /* Вещание — только из нативного клиента (CLAUDE.md инвариант 2). Конфиг/статистика — в BroadcastModal. */
 function NativeBroadcastButton() {
@@ -56,10 +62,12 @@ function ShareButton() {
 function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
   const E = getEngine();
   const [open, setOpen] = useState(false);
-  const [devs, setDevs] = useState<MediaDeviceInfo[]>([]);
+  const [devs, setDevs] = useState<AudioDeviceChoice[]>([]);
+  const [outputViaInput, setOutputViaInput] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
   const [position, setPosition] = useState<{ left: number; top: number; maxHeight: number; above: boolean } | null>(null);
-  const cur = kind === 'input' ? getSettings().input : getSettings().output;
+  const appleMobile = currentAppleMobilePlatform();
+  const cur = kind === 'input' || outputViaInput ? getSettings().input : getSettings().output;
   const ref = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -77,7 +85,7 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
   };
   const openMenu = (initial: 'selected' | 'first' | 'last' = 'selected') => {
     openFocusRef.current = initial;
-    const selected = cur ? devs.findIndex((device) => device.deviceId === cur) + 1 : 0;
+    const selected = cur ? devs.findIndex((device) => device.id === cur) + 1 : 0;
     const next = initial === 'first' ? 0 : initial === 'last' ? optionCount - 1 : Math.max(0, selected);
     setActiveIndex(next);
     setPosition(null);
@@ -86,16 +94,24 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
   };
   useEffect(() => {
     if (!open) return;
-    const load = () => Room.getLocalDevices(kind === 'input' ? 'audioinput' : 'audiooutput').then((devices) => {
-      const nextDevices = devices as MediaDeviceInfo[];
-      setDevs(nextDevices);
-      const selected = cur ? nextDevices.findIndex((device) => device.deviceId === cur) + 1 : 0;
-      const intent = openFocusRef.current;
-      const next = intent === 'first' ? 0 : intent === 'last' ? nextDevices.length : Math.max(0, selected);
-      openFocusRef.current = 'selected';
-      setActiveIndex(next);
-      requestAnimationFrame(() => menuRef.current?.querySelector<HTMLElement>(`[data-menu-index="${next}"]`)?.focus());
-    }).catch(() => {});
+    const load = () => {
+      const request = kind === 'output' && appleMobile
+        ? Promise.all([Room.getLocalDevices('audioinput'), Room.getLocalDevices('audiooutput')])
+          .then(([inputs, outputs]) => audioOutputChoices(true, inputs, outputs))
+        : Room.getLocalDevices(kind === 'input' ? 'audioinput' : 'audiooutput')
+          .then((devices) => ({ choices: audioDeviceChoices(devices), viaInput: false }));
+      request.then(({ choices, viaInput }) => {
+        setDevs(choices);
+        setOutputViaInput(kind === 'output' && viaInput);
+        const selectedId = kind === 'input' || viaInput ? getSettings().input : getSettings().output;
+        const selected = selectedId ? choices.findIndex((device) => device.id === selectedId) + 1 : 0;
+        const intent = openFocusRef.current;
+        const next = intent === 'first' ? 0 : intent === 'last' ? choices.length : Math.max(0, selected);
+        openFocusRef.current = 'selected';
+        setActiveIndex(next);
+        requestAnimationFrame(() => menuRef.current?.querySelector<HTMLElement>(`[data-menu-index="${next}"]`)?.focus());
+      }).catch(() => {});
+    };
     load();
     const onDoc = (e: PointerEvent) => {
       const target = e.target as Node | null;
@@ -108,7 +124,7 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
       document.removeEventListener('pointerdown', onDoc, true);
       navigator.mediaDevices?.removeEventListener?.('devicechange', load);
     };
-  }, [open, kind, cur]);
+  }, [appleMobile, open, kind, cur]);
   useLayoutEffect(() => {
     if (!open) return;
     let frame = 0;
@@ -174,8 +190,18 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
     if (open && activeIndex >= optionCount) focusOption(optionCount - 1);
   }, [activeIndex, open, optionCount]);
   const pick = (id: string) => {
-    setSettings(kind === 'input' ? { input: id } : { output: id });
-    if (kind === 'input') E?.reapplyMic(); else E?.applyOutput();
+    if (kind === 'input') {
+      setSettings({ input: id });
+      void E?.reapplyMic();
+    } else if (outputViaInput) {
+      // iOS/iPadOS связывает Speakerphone/earpiece с audioinput, хотя для пользователя это
+      // именно маршрут вывода. Переснимаем мик один раз и затем возобновляем удалённый звук.
+      setSettings({ input: id, output: '' });
+      void E?.reapplyMic('route').then(() => E.applyOutput());
+    } else {
+      setSettings({ output: id });
+      void E?.applyOutput();
+    }
     closeMenu(true);
   };
   const onTriggerKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
@@ -212,19 +238,23 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
         '--vd-menu-max-height': `${position.maxHeight}px`,
       } as React.CSSProperties : undefined}
       role="menu" aria-label={kind === 'input' ? 'Микрофоны' : 'Устройства вывода'} onKeyDown={onMenuKeyDown}>
-      <div className="vd-devh" aria-hidden="true">{kind === 'input' ? 'МИКРОФОН' : 'ВЫВОД ЗВУКА'}</div>
+      <div className="vd-devh" aria-hidden="true">{kind === 'input' ? 'МИКРОФОН' : (outputViaInput ? 'МАРШРУТ ЗВУКА' : 'ВЫВОД ЗВУКА')}</div>
       <button role="menuitemradio" aria-checked={!cur} tabIndex={activeIndex === 0 ? 0 : -1} data-menu-index="0"
-        className={'vd-devitem' + (!cur ? ' on' : '')} onFocus={() => setActiveIndex(0)} onClick={() => pick('')}>По умолчанию</button>
+        className={'vd-devitem' + (!cur ? ' on' : '')} onFocus={() => setActiveIndex(0)} onClick={() => pick('')}>{outputViaInput ? 'Автоматически' : 'По умолчанию'}</button>
       {devs.map((d, index) => (
-        <button role="menuitemradio" aria-checked={cur === d.deviceId} tabIndex={activeIndex === index + 1 ? 0 : -1}
-          data-menu-index={index + 1} key={d.deviceId} className={'vd-devitem' + (cur === d.deviceId ? ' on' : '')}
-          onFocus={() => setActiveIndex(index + 1)} onClick={() => pick(d.deviceId)}>
-          {d.label || 'Устройство ' + d.deviceId.slice(0, 6)}
+        <button role="menuitemradio" aria-checked={cur === d.id} tabIndex={activeIndex === index + 1 ? 0 : -1}
+          data-menu-index={index + 1} key={d.id} className={'vd-devitem' + (cur === d.id ? ' on' : '')}
+          onFocus={() => setActiveIndex(index + 1)} onClick={() => pick(d.id)}>
+          {d.label}
         </button>
       ))}
     </div>,
     document.body,
   ) : null;
+  // На iPhone/iPad встроенные «микрофоны» Speakerphone/earpiece на самом деле являются
+  // системными аудиомаршрутами. Показываем их только у вывода, чтобы не провоцировать
+  // бессмысленное переключение микрофона по кругу.
+  if (kind === 'input' && appleMobile) return null;
   return <>
     <div className="vd-devwrap" ref={ref}>
       <button ref={triggerRef} className={'vd-caret' + (open ? ' on' : '')} aria-expanded={open} aria-haspopup="menu" aria-controls={`vd-device-${kind}`}

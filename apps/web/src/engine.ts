@@ -160,6 +160,7 @@ export class Engine {
   private voiceConnecting = false; // оптимистично зашли в канал, но mic ещё публикуется
   private voiceEpoch = 0; // поколение пользовательского voice-intent; инвалидирует старые async join/leave/switch
   private micEpoch = 0;   // поколение mic pipeline; старый gUM/RNNoise/publish не имеет права ожить после stop/restart
+  private micReapplyEpoch = 0; // последнее ручное переключение input/мобильного аудиомаршрута
   private connectEpoch = 0; // поколение view-connect; протухший r.connect не помечает новую комнату готовой
   private voiceLeaseEpoch = 0; // серверный ownership fence текущей локальной voice-сессии
   private voiceLeaseSession = '';
@@ -1601,9 +1602,9 @@ export class Engine {
       if (vadDest) { try { vadDest.disconnect(); } catch { /**/ } }
       if (ctx) { try { await ctx.close(); } catch { /**/ } }
     };
-    // Первый вход заранее создаёт контекст непосредственно в обработчике клика (prepareVoiceAudio):
-    // после ticket/lease/attributes пользовательская активация уже потеряна. Повторные запуски
-    // (смена устройства, восстановление) создают новый контекст здесь и страхуются gesture-unlock.
+    // Первый вход и ручная смена устройства заранее создают контекст непосредственно в обработчике
+    // клика (prepareVoiceAudio/reapplyMic): после сетевых await пользовательская активация уже потеряна.
+    // Автовосстановление без пользовательского жеста создаёт новый контекст здесь и страхуется unlock.
     ctx = (!this.micRaw && this.micActx) || new AudioContext();
     if (this.micActx === ctx) this.micActx = null; // pipeline локален до успешного publish/commit
     try { await ctx.resume?.(); } catch { /**/ }
@@ -1884,30 +1885,51 @@ export class Engine {
     if (this.levelStream) { this.levelStream.getTracks().forEach((t) => t.stop()); this.levelStream = null; }
     if (this.levelCtx) { try { this.levelCtx.close(); } catch { /**/ } this.levelCtx = null; }
   }
-  async reapplyMic() {
-    if (!this.voiceRoom || !this.inVoice) { this.hooks.toast('Микрофон применится при подключении к голосовому'); return; }
+  async reapplyMic(target: 'input' | 'route' = 'input') {
+    const route = target === 'route';
+    if (!this.voiceRoom || !this.inVoice) {
+      this.hooks.toast(route ? 'Вывод звука применится при подключении к голосовому' : 'Микрофон применится при подключении к голосовому');
+      return;
+    }
+    // Создаём replacement ДО первого await, пока жив тап по пункту меню. Раньше новый AudioContext
+    // рождался только после stopMic/unpublish и оставался suspended; следующий тап будил предыдущую
+    // попытку, поэтому на iOS маршрут начинал работать лишь после нескольких переключений по кругу.
+    const reapplyEpoch = ++this.micReapplyEpoch;
+    let preparedCtx: AudioContext | null = null;
+    try {
+      preparedCtx = new AudioContext();
+      preparedCtx.resume?.().catch(() => {});
+      this.spCtx?.resume?.().catch(() => {});
+      this.outputCtx?.resume?.().catch(() => {});
+    } catch { preparedCtx = null; }
     const room = this.voiceRoom;
     const voiceEpoch = this.voiceEpoch;
     await this.stopMic(room);
-    if (!this.voiceIntentCurrent(voiceEpoch, room)) return;
+    if (reapplyEpoch !== this.micReapplyEpoch || !this.voiceIntentCurrent(voiceEpoch, room)) {
+      try { await preparedCtx?.close(); } catch { /**/ }
+      return;
+    }
+    this.micActx = preparedCtx;
+    preparedCtx = null; // startMic заберёт и закроет при любой ошибке до commit
     try {
       if (!await this.startMic(voiceEpoch) || !this.voiceIntentCurrent(voiceEpoch, room)) return;
       this.noMic = false; this.micRetryAt = 0; this.micFailureNotified = false;
-      this.hooks.toast('Микрофон переключён', 'ok');
+      this.hooks.toast(route ? 'Вывод звука переключён' : 'Микрофон переключён', 'ok');
     }
     catch {
       if (!this.voiceIntentCurrent(voiceEpoch, room)) return;
-      // выбранное устройство недоступно → откат на дефолтное
+      // На iPhone/iPad встроенный маршрут вывода WebKit предоставляет как связанный audioinput,
+      // поэтому и обычный микрофон, и мобильный аудиомаршрут откатываются одним input reset.
       setSettings({ input: '' });
       try {
         if (!await this.startMic(voiceEpoch) || !this.voiceIntentCurrent(voiceEpoch, room)) return;
         this.noMic = false; this.micRetryAt = 0; this.micFailureNotified = false;
-        this.hooks.toast('Выбранный микрофон недоступен — включён дефолтный', 'warn');
+        this.hooks.toast(route ? 'Аудиомаршрут недоступен — включён системный' : 'Выбранный микрофон недоступен — включён дефолтный', 'warn');
       }
       catch {
         if (!this.voiceIntentCurrent(voiceEpoch, room)) return;
         this.noMic = true; this.micRetryAt = Date.now() + 5000;
-        this.hooks.toast('Не удалось включить микрофон', 'err');
+        this.hooks.toast(route ? 'Не удалось переключить вывод звука' : 'Не удалось включить микрофон', 'err');
       }
     }
     this.emit();

@@ -24,6 +24,12 @@ import { normalizeProfileBanner, ProfileBannerMedia } from './ProfileBanner';
 import { isTauri, setGlobalHotkeys } from '../native';
 import { enableNotifications, notifSupported, notifPermission } from '../notify';
 import { unsubscribePush, syncPushPrefs } from '../push';
+import {
+  audioDeviceChoices,
+  audioOutputChoices,
+  currentAppleMobilePlatform,
+  type AudioDeviceChoice,
+} from '../audioDevices';
 
 function CreateModal() {
   const close = () => useStore.getState().setModal(null);
@@ -682,10 +688,19 @@ function SettingsModal() {
   const close = () => useStore.getState().setModal(null);
   const [, force] = useState(0); const rerender = () => force((n) => n + 1);
   const s = getSettings();
-  const [ins, setIns] = useState<MediaDeviceInfo[]>([]); const [outs, setOuts] = useState<MediaDeviceInfo[]>([]);
+  const appleMobile = currentAppleMobilePlatform();
+  const [ins, setIns] = useState<AudioDeviceChoice[]>([]); const [outs, setOuts] = useState<AudioDeviceChoice[]>([]);
+  const [outputViaInput, setOutputViaInput] = useState(false);
   const [binding, setBinding] = useState(false);
   const [captureAction, setCaptureAction] = useState<KeybindAction | null>(null);
-  useEffect(() => { Room.getLocalDevices('audioinput').then(setIns).catch(() => {}); Room.getLocalDevices('audiooutput').then(setOuts).catch(() => {}); }, []);
+  useEffect(() => {
+    Promise.all([Room.getLocalDevices('audioinput'), Room.getLocalDevices('audiooutput')]).then(([inputs, outputs]) => {
+      setIns(audioDeviceChoices(inputs));
+      const output = audioOutputChoices(appleMobile, inputs, outputs);
+      setOuts(output.choices);
+      setOutputViaInput(output.viaInput);
+    }).catch(() => {});
+  }, [appleMobile]);
   useEffect(() => { if (!binding) return; const k = (e: KeyboardEvent) => { e.preventDefault(); setSettings({ pttKey: e.code }); setBinding(false); rerender(); }; window.addEventListener('keydown', k, { once: true }); return () => window.removeEventListener('keydown', k); }, [binding]);
   const E = getEngine();
   const upd = (patch: Partial<AudioSettings>, act?: () => void) => { setSettings(patch); act?.(); rerender(); };
@@ -716,7 +731,8 @@ function SettingsModal() {
             <h2><Icon name="mic-sm" />Голос и звук</h2>
             <div className="grp">
               <div className="gt">Микрофон</div>
-              <div className="fld"><label>Устройство ввода</label><select value={s.input} onChange={(e) => upd({ input: e.target.value }, () => E?.reapplyMic())}><option value="">По умолчанию</option>{ins.map((d) => <option key={d.deviceId} value={d.deviceId}>{d.label || d.deviceId}</option>)}</select></div>
+              {!appleMobile ? <div className="fld"><label>Устройство ввода</label><select value={s.input} onChange={(e) => upd({ input: e.target.value }, () => E?.reapplyMic())}><option value="">По умолчанию</option>{ins.map((d) => <option key={d.id} value={d.id}>{d.label}</option>)}</select></div>
+                : <div className="mm-hint">На iPhone и iPad микрофон выбирается системой вместе с маршрутом звука.</div>}
               <div className="fld" style={{ marginTop: 10 }}><label>Шумоподавление</label>
                 <select value={s.nsMode} onChange={(e) => upd({ nsMode: e.target.value as AudioSettings['nsMode'] }, () => { E?.reapplyMic(); E?.restartLevelMeter(); })}>
                   <option value="rnnoise">RNNoise (нейросеть)</option>
@@ -732,7 +748,17 @@ function SettingsModal() {
               </div>
             </div>
             <div className="grp"><div className="gt">Звук</div>
-              <div className="fld"><label>Устройство вывода</label><select value={s.output} onChange={(e) => upd({ output: e.target.value }, () => E?.applyOutput())}><option value="">По умолчанию</option>{outs.map((d) => <option key={d.deviceId} value={d.deviceId}>{d.label || d.deviceId}</option>)}</select></div>
+              <div className="fld"><label>{outputViaInput ? 'Маршрут звука' : 'Устройство вывода'}</label>
+                <select value={outputViaInput ? s.input : s.output} onChange={(e) => {
+                  const id = e.target.value;
+                  if (outputViaInput) {
+                    upd({ input: id, output: '' }, () => { void E?.reapplyMic('route').then(() => E.applyOutput()); });
+                  } else upd({ output: id }, () => { void E?.applyOutput(); });
+                }}>
+                  <option value="">{outputViaInput ? 'Автоматически' : 'По умолчанию'}</option>
+                  {outs.map((d) => <option key={d.id} value={d.id}>{d.label}</option>)}
+                </select>
+              </div>
               <div className="fld"><label>Общая громкость: {s.master}%</label><input type="range" min={0} max={100} value={s.master} onChange={(e) => upd({ master: +e.target.value }, () => E?.applyMaster())} /></div>
               <div className="fld"><label>Громкость уведомлений: {s.notifyVolume}%</label><input type="range" min={0} max={100} value={s.notifyVolume} onChange={(e) => upd({ notifyVolume: +e.target.value })} onMouseUp={() => playSound('system')} /></div>
             </div>
