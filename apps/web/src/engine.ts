@@ -1236,6 +1236,17 @@ export class Engine {
     });
   }
 
+  // Web Audio разрешает запустить новый AudioContext только пока жив пользовательский жест. Сам вход
+  // в голос содержит несколько сетевых await (ticket/lease/attributes), поэтому к startMic активация
+  // клика уже потеряна. Подготавливаем оба контекста синхронно в начале первого входа; startMic ниже
+  // заберёт micActx и построит на нём pipeline после завершения сетевой части.
+  private prepareVoiceAudio() {
+    if (!this.micRaw && !this.micActx) this.micActx = new AudioContext();
+    this.spCtx = this.spCtx || new AudioContext();
+    this.micActx?.resume?.().catch(() => {});
+    this.spCtx.resume?.().catch(() => {});
+  }
+
   /* ---------- VOICE join/leave/switch (несколько каналов на сервер) ---------- */
   // подключиться к голосовому каналу channelId; если уже в другом — переключиться без переподнятия микрофона
   async joinVoice(channelId: string) {
@@ -1247,6 +1258,9 @@ export class Engine {
       if (this.currentVc === channelId && !this.voiceConnecting) return;
       if (!this.voiceConnecting) { await this.switchVoice(channelId); return; }
     }
+    // Важно вызвать ДО первого await и только для первого входа: текущий рабочий pipeline при переходе
+    // между серверами трогать нельзя. Для уже разблокированной голосовой сессии остаётся обычный startMic.
+    if (!this.inVoice) this.prepareVoiceAudio();
     // в голосовом на ДРУГОМ сервере → покидаем его (Discord: молча переносим голос сюда)
     const session = this.sessionId(targetRoom);
     const clientIntent = ++this.voiceClientIntent;
@@ -1284,6 +1298,7 @@ export class Engine {
       const ready = await this.waitRoomReady(targetRoom, epoch, 15000);
       if (!this.voiceIntentCurrent(epoch, targetRoom, channelId)) return;
       if (!ready) {
+        await this.stopMic(targetRoom); // закрывает заранее подготовленный AudioContext
         this.voiceClaimPending = 0; this.deferredVoiceLease = null; this.matchedVoiceLease = null;
         this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.voiceRoom = null; this.voiceServerId = null;
         this.liveKitT.setBroadcastRoom?.(null);
@@ -1586,19 +1601,15 @@ export class Engine {
       if (vadDest) { try { vadDest.disconnect(); } catch { /**/ } }
       if (ctx) { try { await ctx.close(); } catch { /**/ } }
     };
-    // Контекст ПУБЛИКАЦИИ создаём и резюмим ДО getUserMedia — пока жива user-activation от клика «войти
-    // в голосовой». Раньше он рождался ПОСЛЕ gUM: на ПЕРВОМ входе промпт разрешения съедал активацию →
-    // контекст 'suspended', а suspended MediaStreamDestination выдаёт ТИШИНУ (пиры не слышат до F5 —
-    // после перезахода разрешение уже есть, промпта нет, активация клика доживает). Уже РАБОТАЮЩИЙ
-    // контекст промпт не усыпляет. resume + gesture-unlock/watchdog (ensureVoiceAudioRunning) — подстраховка.
-    ctx = new AudioContext();
+    // Первый вход заранее создаёт контекст непосредственно в обработчике клика (prepareVoiceAudio):
+    // после ticket/lease/attributes пользовательская активация уже потеряна. Повторные запуски
+    // (смена устройства, восстановление) создают новый контекст здесь и страхуются gesture-unlock.
+    ctx = (!this.micRaw && this.micActx) || new AudioContext();
+    if (this.micActx === ctx) this.micActx = null; // pipeline локален до успешного publish/commit
     try { await ctx.resume?.(); } catch { /**/ }
     if (!current()) { await dispose(false); return false; }
-    // spCtx (контекст VAD-анализатора) резюмим тем же до-промптовым окном активации, что и micActx. Гейт
-    // «активации голосом» ставит vadOpen ИМЕННО из анализатора на spCtx (attachAnalyser/spLoop). Рождённый
-    // 'suspended' ПОСЛЕ gUM-промпта (attachAnalyser зовётся в конце startMic, уже без активации) → анализатор
-    // отдаёт константу → vadOpen залипает false → applyGate держит gain=0 → мик-трек ЖИВОЙ, но пиры слышат
-    // ТИШИНУ (чинит только F5). Watchdog его не спасал: гейтится по micActx, а тот теперь заранее running.
+    // spCtx тоже заранее подготавливается на первом входе: именно его анализатор открывает VAD-гейт.
+    // При восстановлении без подготовленного контекста resume + gesture-unlock/watchdog остаются подстраховкой.
     this.spCtx = this.spCtx || new AudioContext();
     try { await this.spCtx.resume?.(); } catch { /**/ }
     try {
