@@ -10,7 +10,8 @@
     "test:vrelay-auth": "node --test vrelay-auth-test.js",
     "test:runtime-revocation": "node --test runtime-revocation-test.js",
     "test:release-notes": "node release-notes-test.js",
-    "test:voice-lease": "node voice-lease-test.js"
+    "test:voice-lease": "node voice-lease-test.js",
+    "test:vrelay-late": "node vrelay-late-test.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

@@ -137,6 +137,10 @@ jobs:
           npm --prefix apps/server run test:runtime-revocation
           npm --prefix apps/server run test:release-notes
           npm --prefix apps/server run test:voice-lease
+          # Единственный из tree-тестов, который гоняется в CI: остальные (tree-flap, dfix-*,
+          # d6/d7) воспроизводят таймингозависимые сценарии и живут ручным запуском, а этот
+          # детерминирован — порядок джойнов задаётся явно.
+          npm --prefix apps/server run test:vrelay-late
 
       - name: Verify web authentication build
         run: |

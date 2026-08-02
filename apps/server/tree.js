@@ -1547,7 +1547,18 @@ function attachTreeServer(httpServer, opts) {
     // Агент (пере)подключился — деревья могли ждать фолбэк (сироты/ручные запросы).
     for (const [key, t] of mgr.trees) {
       if (!t.broadcasterId || findVirtual(t)) continue;
-      let needs = !!(t.vrelayPending && t.vrelayPending.size);
+      // Д8: server-first-дереву медиаузел нужен ВСЕГДА, а не только когда кому-то не к кому
+      // подключиться. Условие по сиротам ниже — Э9-семантика, где vrelay был фолбэком; при
+      // server-first зрители сиротами не становятся (спокойно цепляются к корню), поэтому
+      // needs оставалось false и ingest не поднимался НИКОГДА.
+      //
+      // Ловится это только на гонке переподключений: попытка в onJoin корня (см. `server-first:
+      // поднимаю постоянный vrelay-ingest`) делается один раз, а рестарт token рвёт все WS
+      // разом — вещатель, зрители и агент возвращаются в произвольном порядке, и агент как
+      // внешний хост обычно последний. Разбор прода 2026-08-02: два рестарта подряд оставили
+      // живой стрим вообще без vrelay, все зрители висели прямыми детьми домашнего аплинка
+      // вещателя с потерями 1.1-6.1% до конца вещания.
+      let needs = !!(t.vrelayPending && t.vrelayPending.size) || !!t.serverFirst;
       if (!needs) for (const n of t.nodes.values()) { if (n.id !== t.broadcasterId && !n.parent) { needs = true; break; } }
       if (needs) requestVrelayActivation(key); // сам откажет не-source-дереву
     }
