@@ -333,7 +333,9 @@ pub async fn start(
     };
     // reconnect=true: деплой рестартит сервер — вещание переживает обрыв WS (реджойн),
     // энкод/захват не прерываются, зрители переджойнятся сами.
-    let (cmd_tx, evt_rx) = signaling::connect(ws_url, join, true);
+    // fixed: у натива в URL session-JWT на недели — пересобирать нечего (в отличие от
+    // 5-минутного service-токена vrelay, см. signaling::WsUrl).
+    let (cmd_tx, evt_rx) = signaling::connect(signaling::WsUrl::fixed(ws_url), join, true);
 
     let mgr = peer::PeerManager::new(&stream_id, cmd_tx.clone(), force_keyframe.clone(), stats.clone())?;
     let video_track = mgr.video_track.clone();

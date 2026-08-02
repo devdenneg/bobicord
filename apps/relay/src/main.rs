@@ -22,6 +22,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use relay_core::probe::{self, ProbeSession};
 use relay_core::relay::{self, RelayConfig, RelayHandle};
+use relay_core::signaling;
 use relay_core::transcode;
 
 const VRELAY_UID: &str = "virtual-relay"; // должен совпадать с VRELAY_UID в tree.js
@@ -121,6 +122,15 @@ fn mint_token(secret: &str) -> String {
     .expect("HS256-подпись JWT не может упасть на валидном секрете")
 }
 
+/// URL сигналинга для relay-сессии: токен минтится ЗАНОВО на каждую попытку подключения.
+/// Прежде URL собирался один раз при старте сессии, и первый же реконнект позже TTL (5 минут)
+/// упирался в вечный 401 — сессия жила, но в дерево не возвращалась (инцидент 2026-07-30:
+/// DNS-блип на медиа-VPS, трое суток без vrelay).
+fn signaling_url(cfg: &Arc<Cfg>) -> signaling::WsUrl {
+    let cfg = cfg.clone();
+    signaling::WsUrl::dynamic(move || format!("{}?token={}", cfg.ws_url, mint_token(&cfg.auth_secret)))
+}
+
 type Streams = Arc<Mutex<HashMap<String, RelayHandle>>>;
 /// Д2 (dev): рендишн-корни, ключ `streamId::rendition`. Отдельная relay-сессия на каждый
 /// поднятый транскод-рендишн (реюз ingest-транскода как источника). Полноценный реестр
@@ -148,14 +158,25 @@ async fn run_control(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditions)
     // Д5: ICE-серверы из welcome — probe-answerer их использует (host-кандидат VPS предпочтётся
     // Chromium'ом → probe идёт на публичный IP host-сети, не через TURN, как требует роадмап).
     let mut ice_servers: Vec<Value> = Vec::new();
+    // Сторож тишины: tree.js пингует каждые 10с и терминирует нас без pong — значит на живом
+    // сокете входящий трафик обязан быть. Полуоткрытый TCP читателю не приходит никак,
+    // `read.next()` висит вечно: 2026-07-30 сервер зафиксировал уход агента в 20:03, а сам агент
+    // не заметил обрыва и не реконнектился трое суток. 35с = 3 пропущенных пинга.
+    const CONTROL_IDLE_TIMEOUT_SEC: u64 = 35;
+    let mut idle_deadline = tokio::time::Instant::now() + Duration::from_secs(CONTROL_IDLE_TIMEOUT_SEC);
 
     loop {
       tokio::select! {
+        _ = tokio::time::sleep_until(idle_deadline) => {
+            log::warn!("control: тишина {CONTROL_IDLE_TIMEOUT_SEC}с — сокет полуоткрыт, реконнект");
+            break;
+        }
         // Исходящие сообщения probe-сессий (ICE от нашего answerer'а) — пишем в WS.
         Some(out) = out_rx.recv() => {
             if write.send(Message::Text(out.into())).await.is_err() { break; }
         }
         m = read.next() => {
+        idle_deadline = tokio::time::Instant::now() + Duration::from_secs(CONTROL_IDLE_TIMEOUT_SEC);
         let Some(m) = m else { break };
         match m {
             Ok(Message::Ping(d)) => {
@@ -253,7 +274,7 @@ async fn activate(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditions, st
     log::info!("stream {stream_id}: активация{} (серверов в работе: {})", if persistent { " (ingest, постоянная)" } else { "" }, map.len());
     let handle = relay::start(None, RelayConfig {
         stream_id: stream_id.to_string(),
-        ws_url: format!("{}?token={}", cfg.ws_url, mint_token(&cfg.auth_secret)),
+        ws_url: signaling_url(cfg),
         identity: "server".into(),
         server_id,
         max_children: cfg.max_children,
@@ -315,7 +336,7 @@ async fn rendition_start(cfg: &Arc<Cfg>, streams: &Streams, renditions: &Renditi
         // ставит корня в дерево `stream_id::rendition` (унифицировано с онлайн-зрителями рендишна).
         stream_id: stream_id.to_string(),
         quality: rendition.to_string(),
-        ws_url: format!("{}?token={}", cfg.ws_url, mint_token(&cfg.auth_secret)),
+        ws_url: signaling_url(cfg),
         identity: format!("vrelay-{rendition}"),
         server_id,
         max_children: cfg.max_children,

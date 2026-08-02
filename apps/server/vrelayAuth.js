@@ -68,7 +68,16 @@ function verifyVrelayToken(encoded, options) {
     return verifyStrictVrelayToken(encoded, authSecret);
   } catch (serviceError) {
     if (!allowLegacy) throw serviceError;
-    const result = verifyLegacyVrelayToken(encoded, sessionSecret);
+    let result;
+    try {
+      result = verifyLegacyVrelayToken(encoded, sessionSecret);
+    } catch (legacyError) {
+      // Обе попытки провалились. Раньше наверх уходила ТОЛЬКО ошибка legacy-ветки, а она у
+      // штатного агента всегда 'invalid signature' (токен подписан VRELAY_AUTH_SECRET, legacy
+      // проверяет его SESSION_SECRET'ом) — то есть реальная причина отказа маскировалась. Из-за
+      // этого «протухший токен» трое суток читался в логе как «разошлись секреты» (2026-07-30).
+      throw new Error(`${serviceError.message} (legacy: ${legacyError.message})`);
+    }
     onLegacy();
     return result;
   }

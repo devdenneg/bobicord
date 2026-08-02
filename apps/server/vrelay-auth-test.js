@@ -89,3 +89,16 @@ test('rejects weak, placeholder, whitespace and shared secrets', () => {
   assert.equal(isStrongVrelaySecret(SESSION_SECRET, SESSION_SECRET), false);
   assert.equal(isStrongVrelaySecret(AUTH_SECRET, SESSION_SECRET), true);
 });
+
+test('surfaces the strict failure reason when the legacy fallback also rejects', () => {
+  // Регрессия разбора 2026-07-30: агент слал корректно подписанный, но ПРОТУХШИЙ service-токен.
+  // Строгая проверка падала по maxAge, legacy-ветка — по подписи (другой секрет), и наружу шла
+  // только вторая: лог показывал 'invalid signature', уводя разбор в сторону «разошлись секреты».
+  const stale = Math.floor(Date.now() / 1000) - 10 * VRELAY_TOKEN_TTL_SEC;
+  const encoded = strictToken({ iat: stale, exp: stale + VRELAY_TOKEN_TTL_SEC });
+  assert.throws(() => verifyVrelayToken(encoded, {
+    authSecret: AUTH_SECRET,
+    sessionSecret: SESSION_SECRET,
+    allowLegacy: true,
+  }), (e) => /expired/i.test(e.message) && /legacy: /.test(e.message));
+});

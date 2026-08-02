@@ -257,7 +257,9 @@ pub type UiSink = Arc<dyn Fn(&str, Value) + Send + Sync>;
 /// Конфиг запуска relay-viewer.
 pub struct RelayConfig {
     pub stream_id: String,
-    pub ws_url: String,
+    /// Фабрика URL сигналинга: токен пересобирается на каждую попытку подключения
+    /// (см. `signaling::WsUrl` — статичный URL протухал у vrelay через 5 минут).
+    pub ws_url: signaling::WsUrl,
     pub identity: String,
     pub server_id: String,
     pub max_children: u32,

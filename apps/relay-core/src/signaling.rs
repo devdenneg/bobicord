@@ -4,6 +4,8 @@
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -79,6 +81,42 @@ pub struct JoinParams {
 
 const RECONNECT_BACKOFF_MAX_SEC: u64 = 15; // деплой рестартит сервер за секунды — догоняем быстро
 
+/// Нет НИ ОДНОГО сообщения от сервера столько — считаем сокет полуоткрытым и реконнектимся.
+/// tree.js пингует каждые 10с (HEARTBEAT_MS) и терминирует нас, если pong не пришёл, — то есть
+/// на живом сокете входящий трафик обязан быть. Полуоткрытый TCP (NAT выбросил маппинг, хост
+/// пропал) читателю не приходит НИКАК: `read.next()` просто висит вечно, и узел молча выпадает
+/// из дерева, считая себя подключённым. 35с = 3 пропущенных пинга.
+const READ_IDLE_TIMEOUT_SEC: u64 = 35;
+
+/// Источник URL сигналинга. Токен лежит в query, а у service-JWT vrelay TTL 5 минут —
+/// поэтому URL пересобирается на КАЖДУЮ попытку подключения, а не фиксируется на всю жизнь
+/// сессии. Иначе первый же реконнект позже TTL получает вечный 401: ровно так vrelay выпал
+/// из дерева на трое суток (2026-07-30, DNS-блип на медиа-VPS → реконнект с протухшим токеном).
+#[derive(Clone)]
+pub struct WsUrl(Arc<dyn Fn() -> String + Send + Sync>);
+
+impl WsUrl {
+    /// URL с долгоживущим токеном (натив: session-JWT на недели) — пересборка не нужна.
+    pub fn fixed(url: String) -> Self {
+        Self(Arc::new(move || url.clone()))
+    }
+
+    /// URL пересобирается на каждую попытку (короткоживущий service-токен vrelay).
+    pub fn dynamic(make: impl Fn() -> String + Send + Sync + 'static) -> Self {
+        Self(Arc::new(make))
+    }
+
+    fn get(&self) -> String {
+        (self.0)()
+    }
+}
+
+impl From<String> for WsUrl {
+    fn from(url: String) -> Self {
+        Self::fixed(url)
+    }
+}
+
 /// Ожидание перед реконнектом с дренажом команд: unbounded-канал иначе копил бы
 /// Stats/Ice (слать некуда — дропаем), а Leave/дроп консьюмера должны завершать задачу.
 /// false = пора выходить совсем.
@@ -104,7 +142,7 @@ async fn wait_backoff(cmd_rx: &mut mpsc::UnboundedReceiver<TreeCmd>, secs: u64) 
 /// уходит `TreeEvent::Rejoined`. `Closed` тогда означает только явный Leave/дроп
 /// консьюмера. `reconnect=false` — старое поведение (первый обрыв = Closed); нужен
 /// vrelay-сессиям: агент сам переактивируется по vrelay-activate.
-pub fn connect(ws_url: String, join: JoinParams, reconnect: bool) -> (mpsc::UnboundedSender<TreeCmd>, mpsc::UnboundedReceiver<TreeEvent>) {
+pub fn connect(ws_url: WsUrl, join: JoinParams, reconnect: bool) -> (mpsc::UnboundedSender<TreeCmd>, mpsc::UnboundedReceiver<TreeEvent>) {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<TreeCmd>();
     let (evt_tx, evt_rx) = mpsc::unbounded_channel::<TreeEvent>();
 
@@ -133,7 +171,7 @@ pub fn connect(ws_url: String, join: JoinParams, reconnect: bool) -> (mpsc::Unbo
         let mut connects = 0u32; // сколько раз успешно джойнились (>=1 => дальше Rejoined)
         let mut backoff = 1u64;
         'outer: loop {
-            let (ws_stream, _) = match tokio_tungstenite::connect_async(&ws_url).await {
+            let (ws_stream, _) = match tokio_tungstenite::connect_async(&ws_url.get()).await {
                 Ok(v) => v,
                 Err(e) => {
                     log::warn!("tree ws connect failed: {e}");
@@ -159,9 +197,16 @@ pub fn connect(ws_url: String, join: JoinParams, reconnect: bool) -> (mpsc::Unbo
 
             // terminal=true — уходим совсем (Leave / консьюмер пропал); false — обрыв WS.
             let mut terminal = false;
+            // Дедлайн тишины: сбрасывается ЛЮБЫМ входящим кадром (ping сервера в том числе).
+            let mut idle_deadline = tokio::time::Instant::now() + Duration::from_secs(READ_IDLE_TIMEOUT_SEC);
             loop {
                 tokio::select! {
+                    _ = tokio::time::sleep_until(idle_deadline) => {
+                        log::warn!("tree ws: тишина {READ_IDLE_TIMEOUT_SEC}с ({stream_id}) — сокет полуоткрыт, реконнект");
+                        break;
+                    }
                     incoming = read.next() => {
+                        idle_deadline = tokio::time::Instant::now() + Duration::from_secs(READ_IDLE_TIMEOUT_SEC);
                         match incoming {
                             Some(Ok(Message::Text(txt))) => {
                                 if let Ok(v) = serde_json::from_str::<Value>(&txt) {
@@ -265,5 +310,36 @@ fn parse_event(v: &Value, stream_id: &str) -> Option<TreeEvent> {
             _ => Some(TreeEvent::StreamEnd),
         },
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Регрессия инцидента 2026-07-30: URL сигналинга собирался ОДИН раз на старте сессии,
+    /// поэтому реконнект позже TTL токена (у vrelay 5 минут) вечно получал 401. `dynamic`
+    /// обязан звать фабрику на КАЖДОЕ обращение — иначе токен снова замёрзнет.
+    #[test]
+    fn dynamic_url_rebuilt_on_every_attempt() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let seen = calls.clone();
+        let url = WsUrl::dynamic(move || {
+            let n = seen.fetch_add(1, Ordering::SeqCst);
+            format!("wss://host/tree?token=tok{n}")
+        });
+        assert_eq!(url.get(), "wss://host/tree?token=tok0");
+        assert_eq!(url.get(), "wss://host/tree?token=tok1");
+        assert_eq!(url.get(), "wss://host/tree?token=tok2");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// Натив (session-JWT на недели) пересборки не требует — `fixed` отдаёт то же значение.
+    #[test]
+    fn fixed_url_is_stable() {
+        let url = WsUrl::fixed("wss://host/tree?token=session".into());
+        assert_eq!(url.get(), url.get());
+        assert_eq!(url.get(), "wss://host/tree?token=session");
     }
 }

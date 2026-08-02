@@ -253,7 +253,9 @@ async fn start_watch(
     std::sync::Arc::new(move |evt: &str, payload: serde_json::Value| { let _ = app.emit(evt, payload); })
   };
   let handle = broadcast::relay::start(Some(ui), broadcast::relay::RelayConfig {
-    stream_id, ws_url, identity, server_id,
+    stream_id, identity, server_id,
+    // fixed: session-JWT натива живёт неделями — пересобирать URL не нужно (см. signaling::WsUrl).
+    ws_url: broadcast::signaling::WsUrl::fixed(ws_url),
     max_children: max_children.unwrap_or(4).clamp(0, 10),
     virtual_relay: false,
     // Д3: рендишн, который смотрит зритель (`streamId::quality`). Дефолт "source" — старый
