@@ -452,3 +452,114 @@ jobs:
             # на отдельном VPS (deploy/vrelay-remote/). Прежний `docker compose restart coturn`
             # снят — на сервисе вне активного профиля он падает и валит весь деплой.
             docker image prune -af --filter "until=168h"
+
+  # Медиа-стек (vrelay + coturn) живёт на ОТДЕЛЬНОМ VPS: свой compose в
+  # deploy/vrelay-remote/, свой каталог /opt/vrelay, свой .env. Образ vrelay собирает job
+  # `build` выше и пушит в GHCR — но до 2026-08-02 последнее звено, «подставить тег и
+  # поднять», делалось руками, и медиаузел неделями отставал от прода (простой 20-26.07).
+  #
+  # Почему отдельный job, а не шаг в `deploy`: обновление vrelay рвёт живые relay-деревья
+  # (стримы падают), а правки веба/сервера медиаузла не касаются — гонять его на каждый push
+  # значило бы ронять стримы при каждой правке кнопки. Отсюда гейт по РЕАЛЬНО изменившимся
+  # путям. Workflow-уровневый `paths:` для этого не годится: он решает за весь workflow
+  # целиком, а прод обязан обновляться и на чисто вебовых коммитах.
+  #
+  # Порядок `needs: deploy` не косметика: vrelay — WS-КЛИЕНТ прод-сигналинга (TREE_WS_URL),
+  # он коннектится к /tree сам. Сначала прод, потом медиа — тогда узел поднимается уже в
+  # обновлённое дерево, а обрыв укладывается в одно окно вместо двух.
+  deploy_media:
+    needs: [build, deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Нужен ли медиа-хосту этот релиз
+        id: scope
+        shell: bash
+        env:
+          RANGE_FROM: ${{ github.event.before }}
+          RANGE_TO: ${{ github.sha }}
+          IS_PUSH: ${{ github.event_name == 'push' }}
+        run: |
+          set -e
+          # Ручной запуск катим всегда — он сам по себе намеренный. Недостижимая база
+          # (force push осиротил github.event.before, см. CLAUDE.md) диапазона не даёт:
+          # тоже катим, иначе правка vrelay молча не доедет.
+          if [ "$IS_PUSH" != "true" ] || ! git cat-file -e "$RANGE_FROM^{commit}" 2>/dev/null; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$RANGE_FROM" "$RANGE_TO" \
+               | grep -qE '^(apps/relay/|apps/relay-core/|deploy/vrelay-remote/)'; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "Медиа-хост пропущен: vrelay/coturn в этом push не менялись."
+          fi
+
+      # .env на медиа-хосте правится руками и сюда не едет (там VRELAY_AUTH_SECRET и
+      # TURN_SECRET). Копируем только конфиги: compose и turnserver.conf — bind-mount,
+      # без копирования правки конфига coturn молча не доезжают.
+      - name: Копировать конфиги медиа-стека
+        if: steps.scope.outputs.needed == 'true'
+        uses: appleboy/scp-action@917f8b81dfc1ccd331fef9e2d61bdc6c8be94634 # v0.1.7
+        with:
+          host: ${{ secrets.MEDIA_SSH_HOST }}
+          username: ${{ secrets.MEDIA_SSH_USER }}
+          key: ${{ secrets.MEDIA_SSH_KEY }}
+          source: "deploy/vrelay-remote/docker-compose.yml,deploy/vrelay-remote/turnserver.conf"
+          strip_components: 2
+          target: /opt/vrelay
+
+      - name: Обновить vrelay
+        if: steps.scope.outputs.needed == 'true'
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          IMAGE_TAG: ${{ github.sha }}
+        with:
+          host: ${{ secrets.MEDIA_SSH_HOST }}
+          username: ${{ secrets.MEDIA_SSH_USER }}
+          key: ${{ secrets.MEDIA_SSH_KEY }}
+          envs: GHCR_TOKEN,IMAGE_TAG
+          script: |
+            set -e
+            printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u devdenneg --password-stdin
+            cd /opt/vrelay
+            # Пин по неизменяемому SHA, не по :latest — перезагрузка хоста или ручной
+            # `docker compose up` иначе молча подняли бы другой образ. Права и владельца
+            # .env сохраняем: в нём VRELAY_AUTH_SECRET, файл под chmod 600.
+            env_tmp=".env.image-tag.$$"
+            umask 077
+            awk -v tag="$IMAGE_TAG" '
+              BEGIN { written=0 }
+              /^VRELAY_IMAGE_TAG=/ { if (!written) { print "VRELAY_IMAGE_TAG=" tag; written=1 } next }
+              { print }
+              END { if (!written) print "VRELAY_IMAGE_TAG=" tag }
+            ' .env > "$env_tmp"
+            chmod --reference=.env "$env_tmp"
+            chown --reference=.env "$env_tmp"
+            mv "$env_tmp" .env
+            docker compose config --quiet
+            docker compose up -d vrelay
+            # Контейнер может подняться и тут же упасть на битом .env или отказе /tree —
+            # `up -d` этого не заметит. Ждём, что он реально жив и представился дереву.
+            ready=0
+            for _ in $(seq 1 20); do
+              sleep 3
+              state=$(docker inspect -f '{{.State.Status}}' vrelay-vrelay-1 2>/dev/null || echo missing)
+              [ "$state" = "running" ] || continue
+              if docker logs --since 2m vrelay-vrelay-1 2>&1 | grep -qiE "welcome|подключ|connected"; then
+                ready=1
+                break
+              fi
+            done
+            docker compose ps
+            if [ "$ready" -ne 1 ]; then
+              echo "vrelay не поднялся или не подключился к дереву" >&2
+              docker logs --tail 60 vrelay-vrelay-1 2>&1 || true
+              exit 1
+            fi
+            docker image prune -af --filter "until=168h"
