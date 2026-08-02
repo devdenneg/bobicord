@@ -44,7 +44,7 @@ use webrtc::track::track_local::{TrackLocal, TrackLocalWriter};
 use webrtc::track::track_remote::TrackRemote;
 
 use crate::fanout::{DownstreamTracks, FanoutHub};
-use crate::link::{now_ms, parse_ice_server, read_link_stats, H264_FMTP};
+use crate::link::{now_ms, parse_ice_server, read_link_stats, tree_setting_engine, H264_FMTP};
 use crate::signaling::{self, JoinParams, TreeCmd, TreeEvent};
 use crate::transcode::{self, Feed, Transcode};
 
@@ -99,9 +99,14 @@ struct IngestMonitor {
 /// webrtc-rs включён по умолчанию (configure_nack), но его цикл = 100мс тик Generator + RTT,
 /// а на лоссовом леге нужен и 2-й цикл. 150мс истекали РАНЬШЕ ретрансмита → GapHealer зря
 /// дёргал IDR (0.99/с — шторм, 4× GOP-нормы; keyframe-бёрст сам добавляет потерь на аплинке).
-/// 250мс покрывают одиночный NACK-цикл: keyframe просим, только когда NACK реально провалился.
-/// Выше не задираем — при потерянном ретрансмите это лишь удлиняет фриз.
-const GAP_HEAL_GRACE: Duration = Duration::from_millis(250);
+/// 250мс покрывали одиночный NACK-цикл; 400мс покрывают два. Поднято 2026-08-02 вместе с
+/// окном anti-replay (link::SRTP_REPLAY_WINDOW): раньше ретрансмит доезжал, но браковался
+/// SRTP как «too old», дыра оставалась незалеченной в ЛЮБОМ случае — и удлинять grace было
+/// бессмысленно, он просто оттягивал единственное лечение (IDR). Теперь второй цикл реально
+/// способен закрыть дыру, и приёмный буфер зрителя (JITTER_MIN_MS = 500мс) его дожидается,
+/// так что за 400мс тишины зритель ещё не фризит. Цена промаха прежняя — на потерянном
+/// ретрансмите фриз длиннее на 150мс; выигрыш — меньше IDR-бёрстов на аплинке.
+const GAP_HEAL_GRACE: Duration = Duration::from_millis(400);
 /// Интервал nack::Generator (детект пропуска seq → отправка NACK). Дефолт webrtc-rs = 100мс —
 /// на лоссовом леге первый NACK ждёт до 100мс, ретрансмит опаздывает за приёмный буфер зрителя.
 /// 50мс вдвое режет worst-case латентность первого NACK (важнее всего на двойной потере, где
@@ -415,7 +420,13 @@ impl RelayManager {
         registry.add(Box::new(Generator::builder().with_interval(NACK_GENERATOR_INTERVAL)));
         registry = configure_rtcp_reports(registry);
         let registry = configure_twcc_receiver_only(registry, &mut m).map_err(|e| e.to_string())?;
-        let api = APIBuilder::new().with_media_engine(m).with_interceptor_registry(registry).build();
+        // SettingEngine — ради окна anti-replay SRTP (link::tree_setting_engine): с дефолтными
+        // 64 пакетами ответы Responder'а выше по дереву прилетали «too old» и выбрасывались.
+        let api = APIBuilder::new()
+            .with_media_engine(m)
+            .with_interceptor_registry(registry)
+            .with_setting_engine(tree_setting_engine())
+            .build();
 
         let source_fanout = injected.is_none();
         let (video_track, audio_track) = match injected {

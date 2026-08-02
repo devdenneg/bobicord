@@ -394,6 +394,14 @@ pub fn run() {
       app.handle().plugin(
         tauri_plugin_log::Builder::default()
           .level(log::LevelFilter::Info)
+          // webrtc_srtp::session печатает КАЖДЫЙ отбракованный пакет на INFO
+          // (`srtp ssrc=… index=…: duplicated`) — до 620 строк/с на лоссовом линке.
+          // Кольцевой буфер diag (20k строк / 2 МБ) выжирался за 20 секунд: в сессии
+          // зрителя artem161 от 2026-08-02 из 6346 строк 6302 были этим спамом, и окно
+          // лога составило 26с из 1238с просмотра — форензики по нативному зрителю не
+          // оставалось вовсе. Причину дублей чинит link::tree_setting_engine, но и после
+          // неё поштучный лог отбраковки на INFO не нужен.
+          .level_for("webrtc_srtp", log::LevelFilter::Warn)
           .max_file_size(5_000_000)
           .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
           // Дублируем те же строки в кольцевой буфер сессии (diag.rs): фронтенд сдаёт

@@ -80,18 +80,23 @@ function treeWsUrl(): string {
 // Приёмный буфер зрителя (дефолт Chrome ~50мс). NACK-ретрансмит УЖЕ работает (webrtc-rs
 // configure_nack активен на всех H.264-легах — верифицировано), но опоздавший за буфер пакет
 // декодер выбрасывает и фризит до keyframe. Буфер АДАПТИВНЫЙ по rtt апстрима: один NACK-цикл
-// ≈ NACK_GENERATOR_INTERVAL(50мс) + rtt, берём ДВА цикла (пакет может потеряться дважды подряд) →
-// target = 2×(50 + rtt) = 100 + 2·rtt, клампим в [300, 600]. Близкий зритель (rtt≈0) держит
-// минимум 300 — не наказываем задержкой; дальний (RU↔Москва 150-250мс) получает до 600, чтобы
-// ретрансмит успел до playout (плоские 300 их не покрывали — двойной цикл при rtt 180 ≈ 460мс).
-// Цена дальнему — до +0.6с (бюджет инварианта — «видео < 2с»). rtt берём из ТОПОЛОГИИ сервера
-// (TreeNode.rtt = n.linkRtt, RR-замер РОДИТЕЛЯ о линке до нас): для веба это parent↔viewer, для
-// натива — vrelay↔Rust (webview-PC лупбек, свой candidate-pair rtt≈0 тут бесполезен). Ставим на
-// ОБА приёмника (audio+video): буфер только у видео развёл бы губы со звуком.
-const JITTER_MIN_MS = 300;
-const JITTER_MAX_MS = 600;
+// ≈ NACK_GENERATOR_INTERVAL(50мс) + rtt, берём ТРИ цикла → target = 3×(50 + rtt) = 150 + 3·rtt,
+// клампим в [500, 1000]. rtt берём из ТОПОЛОГИИ сервера (TreeNode.rtt = n.linkRtt, RR-замер
+// РОДИТЕЛЯ о линке до нас): для веба это parent↔viewer, для натива — vrelay↔Rust (webview-PC
+// лупбек, свой candidate-pair rtt≈0 тут бесполезен). Ставим на ОБА приёмника (audio+video):
+// буфер только у видео развёл бы губы со звуком.
+//
+// Почему пределы подняты с [300, 600] и цикл с двух до трёх: задержка признана НЕ дорогой
+// (до секунды приемлемо, инвариант «видео < 2с» цел — сам буфер это его основная статья),
+// а фриз до GOP-IDR стоит 4с. Асимметрия платежа однозначная. До 2026-08-02 буфер был
+// единственным рычагом и его двигали в обе стороны (350 → 500 → 300 → адаптивный 300-600),
+// потому что настоящую причину — окно anti-replay SRTP в 64 пакета, выбрасывавшее пришедший
+// ретрансмит, — искали не там (см. link.rs, SRTP_REPLAY_WINDOW). Теперь буфер не затыкает
+// дыру, а честно покрывает три попытки ретрансмита.
+const JITTER_MIN_MS = 500;
+const JITTER_MAX_MS = 1000;
 function jitterTargetForRtt(rttMs: number): number {
-  const t = 100 + 2 * Math.max(0, rttMs || 0); // 2×(NACK_GENERATOR_INTERVAL + rtt)
+  const t = 150 + 3 * Math.max(0, rttMs || 0); // 3×(NACK_GENERATOR_INTERVAL + rtt)
   return Math.min(JITTER_MAX_MS, Math.max(JITTER_MIN_MS, t));
 }
 function applyJitterTarget(r: RTCRtpReceiver | null | undefined, targetMs: number) {

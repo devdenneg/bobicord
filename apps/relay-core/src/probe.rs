@@ -29,7 +29,7 @@ use webrtc::rtp_transceiver::rtp_receiver::RTCRtpReceiver;
 use webrtc::rtp_transceiver::RTCRtpTransceiver;
 use webrtc::track::track_remote::TrackRemote;
 
-use crate::link::parse_ice_server;
+use crate::link::{parse_ice_server, tree_setting_engine};
 
 /// Жёсткий потолок жизни probe-сессии: вещатель мог отвалиться, не прислав leave.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -60,7 +60,11 @@ pub async fn answer(
     let mut m = MediaEngine::default();
     m.register_default_codecs().map_err(|e| e.to_string())?;
     let registry = register_default_interceptors(Registry::new(), &mut m).map_err(|e| e.to_string())?;
-    let api = APIBuilder::new().with_media_engine(m).with_interceptor_registry(registry).build();
+    let api = APIBuilder::new()
+        .with_media_engine(m)
+        .with_interceptor_registry(registry)
+        .with_setting_engine(tree_setting_engine())
+        .build();
 
     let parsed: Vec<RTCIceServer> = ice_servers.iter().filter_map(parse_ice_server).collect();
     let config = RTCConfiguration {

@@ -31,7 +31,7 @@ use super::stats::StatsHandle;
 // Общие хелперы (read_link_stats/now_ms/parse_ice_server/H264_FMTP) вынесены в relay-core
 // (link.rs) — общий код с relay-ядром и headless-агентом. Реэкспорт сохраняет старые пути.
 pub use relay_core::link::{now_ms, read_link_stats};
-use relay_core::link::{parse_ice_server, H264_FMTP};
+use relay_core::link::{parse_ice_server, tree_setting_engine, H264_FMTP};
 
 pub struct PeerManager {
     api: API,
@@ -80,7 +80,13 @@ impl PeerManager {
         ).map_err(|e| e.to_string())?;
 
         let registry = register_default_interceptors(Registry::new(), &mut m).map_err(|e| e.to_string())?;
-        let api = APIBuilder::new().with_media_engine(m).with_interceptor_registry(registry).build();
+        // Корень send-only, окно anti-replay ему не критично — ставим тем же хелпером, чтобы
+        // не заводить PC дерева с разными настройками SRTP (см. link::tree_setting_engine).
+        let api = APIBuilder::new()
+            .with_media_engine(m)
+            .with_interceptor_registry(registry)
+            .with_setting_engine(tree_setting_engine())
+            .build();
 
         let video_track = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability { mime_type: MIME_TYPE_H264.to_owned(), clock_rate: 90000, ..Default::default() },

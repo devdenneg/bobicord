@@ -435,7 +435,20 @@ fn spawn_udp_monitor() {} // dev на Windows/macOS — /proc/net/snmp нет
 
 #[tokio::main]
 async fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // webrtc_srtp::session печатает КАЖДЫЙ отбракованный пакет на INFO
+    // (`srtp ssrc=… index=…: duplicated`) — до 620 строк/с на один лоссовый линк, а у vrelay
+    // их десятки. Это ровно тот сервис, под который в docker-compose выкручен самый жирный
+    // лимит json-file (200 МБ × 3), и заполнялся он в основном этим. Причину дублей чинит
+    // link::tree_setting_engine; поштучный лог отбраковки не нужен и после неё.
+    //
+    // Своя директива идёт ПЕРВОЙ, а не через default_filter_or: RUST_LOG=info в compose задан
+    // явно, то есть дефолт не применился бы вовсе. При равной длине имени env_filter берёт
+    // последнюю запись — значит явный `webrtc_srtp=…` в RUST_LOG по-прежнему перекроет нашу.
+    let filters = format!(
+        "webrtc_srtp=warn,{}",
+        std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string())
+    );
+    env_logger::Builder::new().parse_filters(&filters).init();
     let cfg = match Cfg::from_env() {
         Ok(c) => Arc::new(c),
         Err(e) => { eprintln!("vrelay: {e}"); std::process::exit(1); }
