@@ -2970,10 +2970,15 @@ export function ServerView() {
   // взаимоисключаются. Иначе сохранённые пользователем ширины могут полностью зажать видео.
   const toggleSplitChat = () => setShowChat((open) => { const next = !open; if (next) { setMembersOpen(false); setSupportOpen(false); } return next; });
   const toggleMembers = () => {
+    if (singlePaneWorkspace) {
+      setMtab('members');
+      requestAnimationFrame(() => document.getElementById('mtabs')?.querySelector<HTMLButtonElement>('button:last-child')?.focus());
+      return;
+    }
     if (mediumWorkspace) { setSupportOpen((open) => { const next = !open; if (next) setShowChat(false); return next; }); return; }
     setMembersOpen((open) => { const next = !open; if (next) setShowChat(false); return next; });
   };
-  const membersVisible = mediumWorkspace ? supportOpen : membersOpen;
+  const membersVisible = singlePaneWorkspace ? mtab === 'members' : mediumWorkspace ? supportOpen : membersOpen;
   // трансляция открылась → сразу прячем участников (место под видео); закрылась → возвращаем, если прятали сами
   const prevSplit = useRef(false);
   const autoHidMembers = useRef(false);
@@ -2997,7 +3002,7 @@ export function ServerView() {
             <div className="hn"><span className="channel-mark"><Icon name="hash" sm /></span><span className="channel-copy"><b>общий</b><small>{active.description || 'Общий чат сервера'}</small></span></div>
             <div className="srv-actions">
               {split ? <button className={'hbtn' + (showChat ? ' on' : '')} aria-label={showChat ? 'Скрыть чат' : 'Показать чат'} aria-pressed={showChat} data-tip={showChat ? 'Скрыть чат' : 'Показать чат'} onClick={toggleSplitChat}><Icon name="chat" sm /></button> : null}
-              <button className={'hbtn mob-hide' + (membersVisible ? ' on' : '')} aria-label={membersVisible ? 'Скрыть участников' : 'Показать участников'} aria-pressed={membersVisible} data-tip={membersVisible ? 'Скрыть участников' : 'Показать участников'} onClick={toggleMembers}><Icon name="users" sm /></button>
+              <button className={'hbtn members-toggle' + (membersVisible ? ' on' : '')} aria-label={membersVisible ? 'Скрыть участников' : 'Показать участников'} aria-pressed={membersVisible} data-tip={membersVisible ? 'Скрыть участников' : 'Показать участников'} onClick={toggleMembers}><Icon name="users" sm /></button>
               <button className="hbtn" aria-label="Пригласить на сервер" data-tip="Пригласить" onClick={() => setModal('invite')}><Icon name="link" sm /></button>
               <button className="hbtn mob-only" aria-label="Открыть настройки" data-tip="Настройки" onClick={() => setModal('settings')}><Icon name="gear" sm /></button>
             </div>

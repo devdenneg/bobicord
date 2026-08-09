@@ -43,13 +43,14 @@ function Rail() {
   return (
     <nav id="rail" aria-label="Серверы и разделы">
       <div className="rail-primary">
-        <button className={'railbtn tip-l' + (view === 'home' ? ' active' : '')} aria-label="Домой" data-tip="Домой" onClick={goHome}><Icon name="home" /></button>
+        <button className={'railbtn tip-l' + (view === 'home' ? ' active' : '')} aria-label="Домой" aria-current={view === 'home' ? 'page' : undefined} data-tip="Домой" onClick={goHome}><Icon name="home" /></button>
         <div className="rail-sep" />
         {servers.map((s) => {
           const un = activeId === s.id ? 0 : (unread[s.id] || 0); // активный не бейджим (читаем его)
           return (
           <button key={s.id} className={'railbtn tip-l' + (activeId === s.id ? ' active' : '') + (eng.voiceServerId === s.id && activeId !== s.id ? ' connected' : '') + (un ? ' unread' : '')}
             aria-label={s.name + (eng.voiceServerId === s.id && activeId !== s.id ? ' — вы в голосовом канале' : '')}
+            aria-current={activeId === s.id ? 'page' : undefined}
             data-tip={eng.voiceServerId === s.id && activeId !== s.id ? s.name + ' · в голосе' : s.name}
             style={{ background: s.iconUrl ? '#0000' : avColor(s.name, s.iconColor) }} onClick={() => openServer(s.id)}>
             {s.iconUrl ? <img className="avimg" src={resolveUploadUrl(s.iconUrl)} alt="" /> : initial(s.name)}{(s.online || []).some((m) => m.inVoice) ? <span className="dot green" /> : null}
@@ -57,11 +58,11 @@ function Rail() {
           </button>
           );
         })}
-        <button className="railbtn rail-add tip-l" aria-label="Создать сервер или войти" data-tip="Создать / войти" onClick={() => setModal('create')}><Icon name="plus" /></button>
+        <button className={'railbtn rail-add tip-l' + (modal === 'create' || modal === 'join' ? ' active' : '')} aria-label="Создать сервер или войти" aria-pressed={modal === 'create' || modal === 'join'} data-tip="Создать / войти" onClick={() => setModal('create')}><Icon name="plus" /></button>
       </div>
       <div className="rail-grow" />
       <div className="rail-tools" role="group" aria-label="Инструменты аккаунта">
-        {me.isAdmin ? <button className="railbtn rail-admin tip-l" aria-label="Админка" data-tip="Админка" onClick={goAdmin}><Icon name="users" /></button> : null}
+        {me.isAdmin ? <button className={'railbtn rail-admin tip-l' + (view === 'admin' ? ' active' : '')} aria-label="Админка" aria-current={view === 'admin' ? 'page' : undefined} data-tip="Админка" onClick={goAdmin}><Icon name="users" /></button> : null}
         <button className={'railbtn rail-updates tip-l' + (modal === 'releaseHistory' ? ' active' : '') + (releaseUnread ? ' has-unread' : '')}
           aria-label={releaseUnread ? `Что нового — непрочитанных обновлений: ${releaseUnread}` : 'Что нового'}
           aria-pressed={modal === 'releaseHistory'} data-tip={releaseUnread ? `Что нового · ${releaseUnread}` : 'Что нового'}
@@ -70,9 +71,9 @@ function Rail() {
           {releaseUnread ? <span className="rail-badge rail-release-badge" aria-hidden="true">{releaseUnread}</span> : null}
         </button>
         {/* Настройки — глобально в рейле (доступны и на главной, не только внутри сервера) */}
-        <button className="railbtn rail-set tip-l" aria-label="Настройки" data-tip="Настройки" onClick={() => setModal('settings')}><Icon name="gear" /></button>
-        <button className="railbtn rail-dl tip-l" aria-label="Загрузки" data-tip="Загрузки" onClick={() => setModal('downloads')}><Icon name="download" /></button>
-        <button className="railbtn rail-me tip-l" aria-label="Профиль" data-tip="Профиль" style={{ background: me.avatarUrl ? '#0000' : avColor(me.displayName, me.avatarColor) }} onClick={() => setModal('profile')}>{me.avatarUrl ? <img className="avimg" src={resolveUploadUrl(me.avatarUrl)} alt="" /> : initial(me.displayName)}</button>
+        <button className={'railbtn rail-set tip-l' + (modal === 'settings' ? ' active' : '')} aria-label="Настройки" aria-pressed={modal === 'settings'} data-tip="Настройки" onClick={() => setModal('settings')}><Icon name="gear" /></button>
+        <button className={'railbtn rail-dl tip-l' + (modal === 'downloads' ? ' active' : '')} aria-label="Загрузки" aria-pressed={modal === 'downloads'} data-tip="Загрузки" onClick={() => setModal('downloads')}><Icon name="download" /></button>
+        <button className={'railbtn rail-me tip-l' + (modal === 'profile' ? ' active' : '')} aria-label="Профиль" aria-pressed={modal === 'profile'} data-tip="Профиль" style={{ background: me.avatarUrl ? '#0000' : avColor(me.displayName, me.avatarColor) }} onClick={() => setModal('profile')}>{me.avatarUrl ? <img className="avimg" src={resolveUploadUrl(me.avatarUrl)} alt="" /> : initial(me.displayName)}</button>
       </div>
     </nav>
   );
@@ -304,6 +305,7 @@ function Home() {
   const totalOnline = onlineMembers.length || servers.reduce((n, s) => n + (s.onlineCount || 0), 0);
   const totalStreaming = onlineMembers.filter((m) => m.streaming).length;
   const totalInVoice = onlineMembers.filter((m) => m.inVoice).length;
+  const totalLiveServers = servers.filter((server) => (server.online || []).some((member) => member.streaming || member.inVoice)).length;
   const totalUnread = servers.reduce((n, s) => n + (unread[s.id] || 0), 0);
   const firstName = me.displayName.split(' ')[0];
   const connectedServer = connectedId ? servers.find((s) => s.id === connectedId) : null;
@@ -311,7 +313,7 @@ function Home() {
   const waiting = ranked.filter((s) => (unread[s.id] || 0) > 0);
   const heroServer = voiceServer || live[0]?.server || connectedServer || ranked[0] || null;
   const heroLive = heroServer ? live.find((item) => item.server.id === heroServer.id) : undefined;
-  const heroMembers = heroServer?.online?.length ? heroServer.online : onlineMembers;
+  const heroMembers = heroServer ? (heroServer.online || []) : onlineMembers;
   const heroWatchUser = heroLive?.streamers[0]?.username;
   const heroIsCurrentVoice = Boolean(eng.inVoice && voiceServer?.id === heroServer?.id);
   const heroIsLive = Boolean(heroLive?.streamers.length);
@@ -411,7 +413,7 @@ function Home() {
         ) : null}
 
         {live.length ? <>
-          <HomeSectionHeading eyebrow="Живое" title="Сейчас в эфире" detail={`${live.length} ${pluralRu(live.length, 'активный сервер', 'активных сервера', 'активных серверов')}`} tone="live" />
+          <HomeSectionHeading eyebrow="Живое" title="Сейчас в эфире" detail={`${totalLiveServers} ${pluralRu(totalLiveServers, 'активный сервер', 'активных сервера', 'активных серверов')}`} tone="live" />
           <div className="live-grid">{live.map((it) => <LiveCard key={it.key} item={it} onOpen={() => openServer(it.server.id, it.streamers[0]?.username)} />)}</div>
         </> : null}
 
@@ -441,7 +443,11 @@ function Home() {
           </div>
           <div className="srv-grid">
             {shown.length ? shown.map((s) => <ServerCard key={s.id} s={s} unread={unread} connected={connectedId === s.id} onOpen={() => openServer(s.id)} />)
-              : <div className="sc-none" style={{ gridColumn: '1/-1', padding: 10 }}>Ничего не найдено по фильтру.</div>}
+              : <div className="server-filter-empty">
+                <span className="sfe-icon"><Icon name="search" /></span>
+                <div role="status"><b>{filter === 'unread' ? 'Всё прочитано' : 'Своих серверов пока нет'}</b><p>{filter === 'unread' ? 'Новых сообщений сейчас нет.' : 'Создай сервер — он появится в этом разделе.'}</p></div>
+                <button type="button" onClick={() => setFilter('all')}>Показать все серверы</button>
+              </div>}
           </div>
         </> : null}
 
@@ -453,11 +459,13 @@ function Home() {
           </div>
         ) : null}
 
-        <HomeSectionHeading eyebrow="Быстрый старт" title={servers.length ? 'Собери своих' : 'Начни прямо сейчас'} detail="Все действия под рукой" />
-        <div className="home-actions quick-actions">
-          <button className="bigbtn" onClick={() => setModal('create')}><div className="bi g"><Icon name="plus" /></div><div><b>Создать сервер</b><span>Свой сервер для друзей</span></div></button>
-          <button className="bigbtn" onClick={() => setModal('join')}><div className="bi a"><Icon name="link" /></div><div><b>Присоединиться</b><span>По коду или ссылке-приглашению</span></div></button>
-        </div>
+        {servers.length ? <>
+          <HomeSectionHeading eyebrow="Быстрый старт" title="Собери своих" detail="Все действия под рукой" />
+          <div className="home-actions quick-actions">
+            <button className="bigbtn" onClick={() => setModal('create')}><div className="bi g"><Icon name="plus" /></div><div><b>Создать сервер</b><span>Свой сервер для друзей</span></div></button>
+            <button className="bigbtn" onClick={() => setModal('join')}><div className="bi a"><Icon name="link" /></div><div><b>Присоединиться</b><span>По коду или ссылке-приглашению</span></div></button>
+          </div>
+        </> : null}
       </div>
     </section>
   );
