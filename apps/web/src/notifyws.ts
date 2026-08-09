@@ -4,6 +4,7 @@
 // а натив web-push вообще не получает). Так «понимаешь, куда зайти».
 import { getToken, webOrigin } from './api';
 import { notify, type NotifKind } from './notify';
+import { rememberNotificationDestination } from './notificationDestination';
 import { useStore, getEngine } from './store';
 
 let ws: WebSocket | null = null;
@@ -97,6 +98,14 @@ export function connectNotifyWs() {
     if (d.t === 'voice-lease') { try { getEngine()?.onVoiceLease(d); } catch { /**/ } return; }
     if (d.t !== 'notify') return;
     const st = useStore.getState();
+    const tag = String(d.tag || ((d.kind || 'mention') + ':' + (d.serverId || '')));
+    const destination = d.serverId ? {
+      serverId: String(d.serverId),
+      ...(Number.isSafeInteger(Number(d.msgId)) && Number(d.msgId) > 0 ? { messageId: Number(d.msgId) } : {}),
+    } : null;
+    // Realtime chat can show the banner before POST returns its DB id. Preserve the exact target
+    // under the same replaceable tag even when the visual notification came through LiveKit.
+    rememberNotificationDestination(tag, destination);
     // текущий (подключённый) сервер обслуживает живой LiveKit-путь — тут не дублируем
     if (d.serverId && d.serverId === st.viewServerId) return;
     // force: сюда доходят ТОЛЬКО не-текущие серверы (текущий отсеян выше по viewServerId) —
@@ -104,7 +113,9 @@ export function connectNotifyWs() {
     notify((d.kind as NotifKind) || 'mention', {
       title: `${d.title || 'Рилэй'}${d.serverName ? ' · ' + d.serverName : ''}`,
       body: d.body || '',
-      tag: (d.kind || 'mention') + ':' + (d.serverId || ''),
+      sender: d.title || undefined,
+      tag,
+      destination: destination || undefined,
       force: true,
     });
     if (d.serverId) st.bumpUnread(d.serverId);

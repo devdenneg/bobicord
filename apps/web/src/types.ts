@@ -283,6 +283,8 @@ export interface Emote { id: string; name: string }
 
 export type Presence = 'voice' | 'online' | 'offline';
 
+export type NotificationPrivacy = 'full' | 'sender' | 'hidden';
+
 export interface AudioSettings {
   input: string;
   output: string;
@@ -299,6 +301,7 @@ export interface AudioSettings {
   notifMention: boolean; // уведомлять при упоминании/ответе
   notifStream: boolean; // уведомлять о старте трансляции
   notifUpdate: boolean; // уведомлять о доступном обновлении
+  notifPrivacy: NotificationPrivacy; // полный текст / только отправитель / скрытое содержимое
   shareGame: boolean; // показывать другим, в какую игру играю (натив; foreground-фуллскрин детект)
   keybinds: Keybinds; // хоткеи мута (коды KeyboardEvent.code, 1..3 клавиши)
   disableGlobalHotkeys: boolean; // чекбокс «отключить комбинацию вне приложения» (только натив)

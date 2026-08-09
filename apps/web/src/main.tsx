@@ -9,22 +9,59 @@ import { isTauri, pingNative } from './native';
 import { watchForUpdates } from './version';
 import { checkNativeUpdate, startNativeUpdatePolling } from './nativeUpdate';
 import { applyStoredTheme } from './theme';
+import {
+  NOTIFICATION_DESTINATION_EVENT,
+  TAURI_NOTIFICATION_DESTINATION_EVENT,
+  normalizeNotificationDestination,
+  queueNotificationDestination,
+  resolveNotificationDestination,
+  type NotificationDestination,
+} from './notificationDestination';
 
 applyStoredTheme(); // применить сохранённую тему до первого рендера
 loadGlobalEmotes();
+
+function openQueuedNotificationDestination(destination: NotificationDestination): void {
+  const state = useStore.getState();
+  if (state.me) {
+    void state.openServer(destination.serverId, undefined, 'main');
+  } else {
+    // acceptSession consumes this legacy key after authentication; the exact message remains in
+    // notificationDestination storage until the matching ServerView is ready.
+    try { sessionStorage.setItem('pendingOpenServer', destination.serverId); } catch { /**/ }
+  }
+}
+
+window.addEventListener(NOTIFICATION_DESTINATION_EVENT, (event) => {
+  const destination = normalizeNotificationDestination((event as CustomEvent).detail);
+  if (destination) openQueuedNotificationDestination(destination);
+});
+
+function receiveNotificationDestination(value: unknown): void {
+  const raw = value && typeof value === 'object' ? value as { tag?: unknown } : {};
+  const tag = typeof raw.tag === 'string' ? raw.tag : '';
+  const destination = resolveNotificationDestination(tag, value);
+  if (destination) queueNotificationDestination(destination);
+}
+
 // SW для установки PWA. НЕ кэширует (кэш ранее ронял прод); старые кэши чистятся внутри sw.js.
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(() => {});
-  // клик по push → SW шлёт open-server → открываем нужный сервер
+  // клик по push → SW передаёт точное назначение; legacy open-server тоже поддерживается.
   navigator.serviceWorker.addEventListener('message', (e) => {
-    const d = (e.data || {}) as { type?: string; serverId?: string };
-    if (d.type === 'open-server' && d.serverId) { try { useStore.getState().openServer(d.serverId); } catch { /**/ } }
+    const d = (e.data || {}) as { type?: string; serverId?: string; messageId?: number; tag?: string };
+    if ((d.type === 'open-destination' || d.type === 'open-server') && d.serverId) receiveNotificationDestination(d);
   });
   // вернулись в фокус → чистим показанные push-баннеры (юзер уже в приложении, непрочитанное видно в чате)
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') return;
     navigator.serviceWorker.ready.then((reg) => reg.getNotifications().then((ns) => ns.forEach((n) => n.close()))).catch(() => {});
   });
+}
+if (isTauri) {
+  void import('@tauri-apps/api/event').then(({ listen }) => (
+    listen(TAURI_NOTIFICATION_DESTINATION_EVENT, (event) => receiveNotificationDestination(event.payload))
+  )).catch(() => {});
 }
 if (isTauri) pingNative().then((r) => console.log('[native] ipc bridge:', r)).catch(() => {});
 
@@ -56,6 +93,7 @@ function cleanEntryUrl(removeHash = false) {
   const url = new URL(location.href);
   url.searchParams.delete('invite');
   url.searchParams.delete('server');
+  url.searchParams.delete('message');
   if (removeHash) url.hash = '';
   history.replaceState({}, '', url.pathname + (url.search ? url.search : '') + (url.hash || ''));
 }
@@ -75,8 +113,14 @@ function cleanEntryUrl(removeHash = false) {
   }
   const invite = new URLSearchParams(location.search).get('invite');
   const openSrv = new URLSearchParams(location.search).get('server'); // клик по push открыл /?server=<id>
+  const openMessage = Number(new URLSearchParams(location.search).get('message'));
   if (invite) sessionStorage.setItem('pendingInvite', invite);
-  else if (openSrv) sessionStorage.setItem('pendingOpenServer', openSrv);
+  else if (openSrv) {
+    receiveNotificationDestination({
+      serverId: openSrv,
+      ...(Number.isSafeInteger(openMessage) && openMessage > 0 ? { messageId: openMessage } : {}),
+    });
+  }
   if (invite || openSrv) cleanEntryUrl();
   if (getToken()) {
     try {

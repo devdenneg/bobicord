@@ -6,7 +6,15 @@ import { isTauri, foregroundFullscreen } from './native';
 import { getSettings, setSettings } from './settings';
 import { ensurePushSubscribed } from './push';
 import { playSound } from './sounds';
-import type { AudioSettings } from './types';
+import {
+  notificationDestinationFromTag,
+  notificationDestinationUrl,
+  queueNotificationDestination,
+  rememberNotificationDestination,
+  resolveNotificationDestination,
+  type NotificationDestination,
+} from './notificationDestination';
+import type { AudioSettings, NotificationPrivacy } from './types';
 
 export type NotifKind = 'mention' | 'stream' | 'update';
 const KIND_PREF: Record<NotifKind, keyof AudioSettings> = { mention: 'notifMention', stream: 'notifStream', update: 'notifUpdate' };
@@ -25,12 +33,12 @@ export function notifPermission(): 'default' | 'granted' | 'denied' {
 
 // запрос разрешения + включение мастера (вызывать по клику пользователя в настройках)
 export async function enableNotifications(): Promise<boolean> {
-  const granted = await requestPermission();
+  const granted = await requestNotificationPermission();
   setSettings({ notif: granted });
   if (granted) ensurePushSubscribed(); // подписка на фоновый web-push (PWA/браузер)
   return granted;
 }
-async function requestPermission(): Promise<boolean> {
+export async function requestNotificationPermission(): Promise<boolean> {
   if (isTauri) {
     try {
       const m = await import('@tauri-apps/plugin-notification');
@@ -43,15 +51,33 @@ async function requestPermission(): Promise<boolean> {
   try { return (await Notification.requestPermission()) === 'granted'; } catch { return false; }
 }
 
-// Стартовый запрос при запуске приложения (App.tsx). Уважает опт-аут (юзер выключил в
-// настройках). Возвращает true ровно один раз — при первом успешном включении — чтобы UI
+/** Проверка уже выданного разрешения без показа системного prompt. */
+export async function notificationPermissionGranted(): Promise<boolean> {
+  if (isTauri) {
+    try {
+      const m = await import('@tauri-apps/plugin-notification');
+      return await m.isPermissionGranted();
+    } catch { return false; }
+  }
+  return typeof Notification !== 'undefined' && Notification.permission === 'granted';
+}
+
+// Стартовая активация при запуске приложения (App.tsx) НИКОГДА не показывает permission prompt:
+// запрос допустим только из enableNotifications() после явного клика. Возвращает true ровно
+// один раз — при первом успешном включении — чтобы UI
 // показал приветственный тост «включены, отключить можно в настройках».
 export async function initNotifications(): Promise<boolean> {
   if (!notifSupported()) return false;
   if (localStorage.getItem('notifOptOut') === '1') return false; // юзер сам выключил — не пристаём
-  if (!isTauri && notifPermission() === 'denied') return false;  // веб: заблокировано в браузере — повторный запрос игнорится
-  const granted = notifPermission() === 'granted' ? true : await requestPermission();
-  if (!granted) return false;
+  if (!isTauri && notifPermission() === 'denied') {
+    if (getSettings().notif) setSettings({ notif: false });
+    return false;
+  }
+  const granted = await notificationPermissionGranted();
+  if (!granted) {
+    if (getSettings().notif) setSettings({ notif: false });
+    return false;
+  }
   setSettings({ notif: true });
   ensurePushSubscribed(); // фоновый web-push: подписываем при каждом старте (подписка могла ротироваться)
   if (localStorage.getItem('notifWelcomed') === '1') return false;
@@ -63,9 +89,22 @@ function focused(): boolean {
   try { return document.visibilityState === 'visible' && document.hasFocus(); } catch { return false; }
 }
 
+function notificationPresentation(kind: NotifKind, title: string, body: string, privacy: NotificationPrivacy, sender?: string): { title: string; body: string } {
+  if (privacy === 'full') return { title, body };
+  if (privacy === 'sender') {
+    return { title: String(sender || title.split(' · ')[0] || 'RelayApp'), body: '' };
+  }
+  const bodyByKind: Record<NotifKind, string> = {
+    mention: 'Новое упоминание',
+    stream: 'Началась трансляция',
+    update: 'Доступно обновление',
+  };
+  return { title: 'RelayApp', body: bodyByKind[kind] };
+}
+
 // Кастомное нативное уведомление: своя карточка в стиле приложения (окно Tauri notif.html),
 // вместо системного toast. Возвращает true, если окно создалось (иначе вызывающий даёт фолбэк).
-async function showNativeCard(kind: NotifKind, title: string, body: string): Promise<boolean> {
+async function showNativeCard(kind: NotifKind, title: string, body: string, tag?: string, destination?: NotificationDestination | null): Promise<boolean> {
   try {
     const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
     // одно окно за раз: закрываем прежнее, иначе конфликт по label
@@ -90,7 +129,11 @@ async function showNativeCard(kind: NotifKind, title: string, body: string): Pro
       const sh = (typeof screen !== 'undefined' && screen.availHeight) || 800;
       x = Math.max(8, sw - W - MARGIN); y = Math.max(8, sh - H - MARGIN);
     }
-    const url = `notif.html?k=${encodeURIComponent(kind)}&t=${encodeURIComponent(title)}&b=${encodeURIComponent(body)}`;
+    const query = new URLSearchParams({ k: kind, t: title, b: body });
+    if (tag) query.set('tag', tag);
+    if (destination?.serverId) query.set('server', destination.serverId);
+    if (destination?.messageId) query.set('message', String(destination.messageId));
+    const url = `notif.html?${query.toString()}`;
     return await new Promise<boolean>((resolve) => {
       let settled = false;
       const done = (ok: boolean) => { if (!settled) { settled = true; resolve(ok); } };
@@ -117,9 +160,23 @@ async function showNativeCard(kind: NotifKind, title: string, body: string): Pro
  * Не пингуем, когда пользователь выключил уведомления или смотрит чат (фокус-гейт) — как в Discord.
  * Не бросает.
  */
-export async function notify(kind: NotifKind, opts: { title: string; body: string; tag?: string; force?: boolean }): Promise<boolean> {
+export interface RelayNotificationOptions {
+  title: string;
+  body: string;
+  sender?: string;
+  tag?: string;
+  force?: boolean;
+  destination?: NotificationDestination;
+}
+
+export async function notify(kind: NotifKind, opts: RelayNotificationOptions): Promise<boolean> {
   try {
     const s = getSettings();
+    const destination = rememberNotificationDestination(
+      opts.tag,
+      opts.destination || notificationDestinationFromTag(opts.tag),
+    );
+    const shownContent = notificationPresentation(kind, opts.title, opts.body, s.notifPrivacy, opts.sender);
     if (!s.notif || !s[KIND_PREF[kind]]) return false; // мастер или тип выключены — тихо
     // Mention/@all — звук-пинг ВСЕГДА (даже когда смотришь чат): быть @упомянутым/в @all важно (как Discord).
     // Визуальную карточку ниже фокус-гейтим и не показываем поверх фуллскрин-игры — но звук уже дан.
@@ -132,18 +189,43 @@ export async function notify(kind: NotifKind, opts: { title: string; body: strin
       // exclusive-fullscreen из полного экрана). Окно НЕ создаём; звук уже сыгран, toast-фолбэк тоже не шлём.
       if (await foregroundFullscreen()) return false;
       // кастомная карточка в стиле приложения; если окно не создалось (нет прав/ошибка) — системный toast
-      const shown = await showNativeCard(kind, opts.title, opts.body);
+      const shown = await showNativeCard(kind, shownContent.title, shownContent.body, opts.tag, destination);
+      let delivered = shown;
       if (!shown) {
-        try { const m = await import('@tauri-apps/plugin-notification'); if (await m.isPermissionGranted()) await m.sendNotification({ title: opts.title, body: opts.body }); } catch { /**/ } // toast звучит сам (ОС)
+        try {
+          const m = await import('@tauri-apps/plugin-notification');
+          if (await m.isPermissionGranted()) {
+            await m.sendNotification({ title: shownContent.title, body: shownContent.body });
+            delivered = true;
+          }
+        } catch { /**/ } // toast звучит сам (ОС)
       }
-      return shown;
+      return delivered;
     }
     if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return false;
-    const data: NotificationOptions = { body: opts.body, icon: '/icon-256.png', badge: '/icon-128.png', tag: opts.tag, ...( { renotify: !!opts.tag } as any) };
+    const clickData = destination ? {
+      serverId: destination.serverId,
+      messageId: destination.messageId,
+      url: notificationDestinationUrl(destination),
+    } : undefined;
+    const data: NotificationOptions = {
+      body: shownContent.body,
+      icon: '/icon-256.png',
+      badge: '/icon-128.png',
+      tag: opts.tag,
+      data: clickData,
+      ...( { renotify: !!opts.tag } as any),
+    };
     // предпочитаем показ через service worker (переживает бэкграунд вкладки, кликабелен → фокус окна)
     const reg = await navigator.serviceWorker?.getRegistration?.();
-    if (reg && reg.showNotification) { await reg.showNotification(opts.title, data); return true; } // веб-уведомление звучит само (ОС)
-    new Notification(opts.title, data);
+    if (reg && reg.showNotification) { await reg.showNotification(shownContent.title, data); return true; } // веб-уведомление звучит само (ОС)
+    const notification = new Notification(shownContent.title, data);
+    notification.onclick = () => {
+      const target = resolveNotificationDestination(opts.tag, destination);
+      if (target) queueNotificationDestination(target);
+      try { window.focus(); } catch { /**/ }
+      notification.close();
+    };
     return true;
   } catch { return false; /* тихо: уведомления не должны ронять поток событий */ }
 }

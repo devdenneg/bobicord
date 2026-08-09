@@ -817,6 +817,9 @@
   .attach-chip .spin{position:absolute;right:7px;bottom:6px;width:14px;height:14px;margin:0}
   .attach-remove{position:absolute;right:3px;top:3px;width:20px;height:20px;padding:0;display:flex;align-items:center;justify-content:center;border-radius:6px;background:none;color:var(--muted)}
   .attach-remove:hover{background:var(--panel2);color:var(--txt-h)}
+  .attach-chip.err{padding-right:52px}
+  .attach-retry{position:absolute;right:26px;top:3px;width:20px;height:20px;padding:0;display:flex;align-items:center;justify-content:center;border-radius:6px;background:none;color:var(--accent-txt)}
+  .attach-retry:hover{background:var(--panel2);color:var(--txt-h)}
   .lightbox{position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.86);display:flex;align-items:center;justify-content:center;padding:28px;animation:lbFade .15s ease}
   .lightbox img{max-width:94vw;max-height:90vh;border-radius:10px;box-shadow:0 24px 70px rgba(0,0,0,.6);object-fit:contain;cursor:default}
   .lightbox .lb-close{position:fixed;top:16px;right:18px;width:42px;height:42px;border-radius:11px;background:rgba(0,0,0,.5);color:#fff;display:flex;align-items:center;justify-content:center;padding:0}
@@ -2113,9 +2116,9 @@ body:has(#voicedock .music.open) .admin{padding-bottom:max(132px,calc(min(68dvh,
 
 /* Композер на телефоне: поле — отдельная полноценная строка, вложения не отнимают у него ширину. */
 @media (max-width:480px){
-  .chat-in{display:grid;grid-template-columns:repeat(3,44px) minmax(0,1fr) 44px;grid-template-rows:44px 44px;gap:7px;padding:8px}
-  .chat-in #msgIn{grid-column:1 / 5;grid-row:1;width:100%;min-width:0;height:44px}
-  .chat-in #sendBtn{grid-column:5;grid-row:1;width:44px;height:44px}
+  .chat-in{display:grid;grid-template-columns:repeat(3,44px) minmax(0,1fr) 44px;grid-template-rows:minmax(44px,auto) 44px;gap:7px;padding:8px}
+  .chat-in #msgIn{grid-column:1 / 5;grid-row:1;width:100%;min-width:0;height:auto}
+  .chat-in #sendBtn{grid-column:5;grid-row:1;width:44px;height:44px;align-self:end}
   .chat-in .emo-toggle{grid-row:2;width:44px;height:44px}
   .typing-ind{padding-inline:10px}
   .reply-bar{margin-inline:8px}
@@ -2124,7 +2127,9 @@ body:has(#voicedock .music.open) .admin{padding-bottom:max(132px,calc(min(68dvh,
 /* Input modality: реальные 44px touch-targets и явное меню сообщений вместо hover-only. */
 @media (hover:none),(any-pointer:coarse){
   .hd-create,.hd-join,.hd-me,.chip,.cu-chip,.lq-cta,.hero-secondary{min-height:44px}
-  .srv-header .hbtn,.user-panel .up-btn,.rb-close,.attach-remove,.react-add{min-width:44px;min-height:44px}
+  .srv-header .hbtn,.user-panel .up-btn,.rb-close,.attach-remove,.attach-retry,.react-add{min-width:44px;min-height:44px}
+  .attach-chip.err{padding-right:98px}
+  .attach-retry{right:50px}
   .vd-btn{width:44px;height:44px}
   .vd-btn.vd-leave{width:44px;height:44px}
   .vd-caret{width:32px;min-height:44px}
@@ -2635,6 +2640,8 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .chat-in{gap:5px;padding:7px;border-top:0;background:transparent}
 .chat-in #msgIn{
   min-height:44px;
+  max-height:160px;
+  line-height:1.4;
   padding:10px 12px;
   border:0;
   border-radius:10px;
@@ -2914,9 +2921,9 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 
 @media (max-width:480px){
   .composer-shell{margin:0 8px 8px;border-radius:14px}
-  .chat-in{grid-template-columns:repeat(3,42px) minmax(0,1fr) 44px;grid-template-rows:44px 42px;gap:5px;padding:6px}
-  .chat-in #msgIn{grid-column:1 / 5;grid-row:1;height:44px;padding-inline:10px}
-  .chat-in #sendBtn{grid-column:5;grid-row:1;width:42px;height:42px}
+  .chat-in{grid-template-columns:repeat(3,42px) minmax(0,1fr) 44px;grid-template-rows:minmax(44px,auto) 42px;gap:5px;padding:6px}
+  .chat-in #msgIn{grid-column:1 / 5;grid-row:1;height:auto;padding-inline:10px}
+  .chat-in #sendBtn{grid-column:5;grid-row:1;width:42px;height:42px;align-self:end}
   .chat-in .emo-toggle{grid-row:2;width:42px;height:42px}
   .typing-ind{padding-inline:11px}
   .msg-body{max-width:calc(100% - 46px)}

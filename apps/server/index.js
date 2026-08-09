@@ -2347,6 +2347,20 @@ app.get('/api/servers/:id/leaderboard', requireAuth, (req, res) => {
 
 /* ---------- CHAT HISTORY (persist 7 days) ---------- */
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+function serializeHistoryMessage(row, reactions) {
+  let level;
+  if (row.kind === 'levelup' && row.meta) { try { level = JSON.parse(row.meta).level || undefined; } catch { /**/ } }
+  const release = parseReleaseMeta(row.kind, row.meta);
+  return {
+    id: row.id, uid: row.user_id, name: row.display_name, color: row.avatar_color, text: row.text,
+    em: JSON.parse(row.emotes || '{}'), img: row.image || '', files: JSON.parse(row.attachments || '[]'),
+    reply: row.reply_to ? JSON.parse(row.reply_to) : undefined, ts: row.created, edited: !!row.edited,
+    reactions: reactions && reactions.length ? reactions : undefined,
+    kind: row.kind || undefined, level, release,
+  };
+}
+
 app.get('/api/servers/:id/messages', requireAuth, (req, res) => {
   const sid = req.params.id;
   if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
@@ -2373,19 +2387,33 @@ app.get('/api/servers/:id/messages', requireAuth, (req, res) => {
   }
   res.json({
     hasMore,
-    messages: page.map((r) => {
-      let level;
-      if (r.kind === 'levelup' && r.meta) { try { level = JSON.parse(r.meta).level || undefined; } catch { /**/ } }
-      const release = parseReleaseMeta(r.kind, r.meta);
-      return {
-        id: r.id, uid: r.user_id, name: r.display_name, color: r.avatar_color, text: r.text,
-        em: JSON.parse(r.emotes || '{}'), img: r.image || '', files: JSON.parse(r.attachments || '[]'),
-        reply: r.reply_to ? JSON.parse(r.reply_to) : undefined, ts: r.created, edited: !!r.edited,
-        reactions: reactByMsg.has(r.id) ? [...reactByMsg.get(r.id).values()] : undefined,
-        kind: r.kind || undefined, level, release,
-      };
-    }),
+    messages: page.map((r) => serializeHistoryMessage(
+      r,
+      reactByMsg.has(r.id) ? [...reactByMsg.get(r.id).values()] : undefined,
+    )),
   });
+});
+
+// Точное назначение уведомления: не заставляем клиент пролистывать всю недельную историю.
+app.get('/api/servers/:id/messages/:mid', requireAuth, (req, res) => {
+  const sid = req.params.id;
+  if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
+  const mid = Number(req.params.mid);
+  if (!Number.isSafeInteger(mid) || mid <= 0) return res.status(400).json({ error: 'bad' });
+  const row = db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,edited,kind,meta FROM messages WHERE server_id=? AND id=? AND created>?').get(sid, mid, Date.now() - WEEK_MS);
+  if (!row) return res.status(404).json({ error: 'no msg' });
+  const reactionMap = new Map();
+  const reactionRows = db.prepare('SELECT emote_id, emote_name, user_id FROM reactions WHERE server_id=? AND msg_id=?').all(sid, mid);
+  for (const reaction of reactionRows) {
+    let item = reactionMap.get(reaction.emote_id);
+    if (!item) {
+      item = { id: reaction.emote_id, name: reaction.emote_name, count: 0, mine: false };
+      reactionMap.set(reaction.emote_id, item);
+    }
+    item.count++;
+    if (reaction.user_id === req.user.id) item.mine = true;
+  }
+  res.json({ message: serializeHistoryMessage(row, [...reactionMap.values()]) });
 });
 
 // Migration recovery: after checking the person outside RelayApp, exact denis can issue a short
@@ -2476,8 +2504,14 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
       const targets = [...ids];
       const body = text.slice(0, 140) || (image ? '🖼 изображение' : (attachments.length ? '📎 вложение' : ''));
       const nm = serverName(sid);
-      for (const uid of targets) notifyUser(uid, { t: 'notify', kind: 'mention', serverId: sid, serverName: nm, title: req.user.display_name, body, msgId: info.lastInsertRowid });
-      if (VAPID) pushToUsers('mention', targets, { kind: 'mention', title: req.user.display_name, body, serverId: sid, tag: 'mention:' + sid, url: '/?server=' + sid }).catch(() => {});
+      const notificationMsgId = Number(info.lastInsertRowid);
+      const notificationTag = 'mention:' + sid + ':' + (clientKey || notificationMsgId);
+      for (const uid of targets) notifyUser(uid, { t: 'notify', kind: 'mention', serverId: sid, serverName: nm, title: req.user.display_name, body, msgId: notificationMsgId, tag: notificationTag });
+      if (VAPID) pushToUsers('mention', targets, {
+        kind: 'mention', title: req.user.display_name, body, serverId: sid, msgId: notificationMsgId,
+        tag: notificationTag,
+        url: '/?server=' + encodeURIComponent(sid) + '&message=' + notificationMsgId,
+      }).catch(() => {});
     } catch (e) { console.error('[notify] mention:', e && e.message); }
   })();
 });

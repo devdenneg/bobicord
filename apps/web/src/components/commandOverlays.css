@@ -1,0 +1,71 @@
+.command-backdrop{
+  position:fixed;inset:0;z-index:190;display:flex;align-items:flex-start;justify-content:center;
+  padding:clamp(64px,12vh,132px) 18px 18px;background:rgba(4,6,10,.68);backdrop-filter:blur(8px);
+  animation:command-fade .12s ease-out;
+}
+.command-panel,.shortcut-panel{
+  width:min(660px,100%);max-height:min(620px,76dvh);overflow:hidden;background:color-mix(in srgb,var(--bg2) 94%,transparent);
+  border:1px solid color-mix(in srgb,var(--accent) 28%,var(--line-2));border-radius:16px;box-shadow:var(--sh-3),var(--hair);
+  animation:command-in .16s cubic-bezier(.2,.8,.4,1);
+}
+.command-input-wrap{display:flex;align-items:center;gap:11px;padding:12px 14px;border-bottom:1px solid var(--line-2)}
+.command-input-wrap>.ic{color:var(--muted);font-size:22px}
+.command-input-wrap input{height:44px;padding:8px 0;border:0;background:transparent;font-size:16px;color:var(--txt-h);box-shadow:none}
+.command-input-wrap input:focus{border:0}
+.command-input-wrap>kbd,.command-footer kbd,.shortcut-row kbd{
+  flex:0 0 auto;padding:3px 7px;border:1px solid var(--line-2);border-bottom-width:2px;border-radius:6px;background:var(--panel2);
+  color:var(--muted);font:600 11px/1.35 var(--num);
+}
+.command-results{max-height:min(462px,58dvh);overflow-y:auto;padding:8px}
+.command-result{display:flex;width:100%;align-items:center;gap:11px;padding:10px;border-radius:10px;background:transparent;text-align:left}
+.command-result:hover,.command-result.selected{background:color-mix(in srgb,var(--accent) 18%,var(--panel2));transform:none}
+.command-result-icon{display:grid;width:34px;height:34px;flex:0 0 auto;place-items:center;border-radius:9px;background:var(--panel3);color:var(--accent-txt)}
+.command-result>span:nth-child(2){min-width:0;flex:1}
+.command-result b,.command-result small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.command-result b{color:var(--txt-h);font-size:14px}.command-result small{margin-top:2px;color:var(--muted);font-size:12px;font-weight:450}
+.command-result em{color:var(--muted);font:700 13px var(--num);font-style:normal}
+.command-empty{padding:34px 16px;text-align:center;color:var(--muted)}
+.command-footer{display:flex;align-items:center;justify-content:flex-end;gap:16px;padding:9px 13px;border-top:1px solid var(--line-2);color:var(--muted);font-size:11.5px}
+.command-footer span{display:flex;align-items:center;gap:4px}
+.shortcut-panel{width:min(520px,100%)}
+.shortcut-panel header{display:flex;align-items:center;justify-content:space-between;padding:15px 16px;border-bottom:1px solid var(--line-2)}
+.shortcut-panel header>span{display:flex;align-items:center;gap:10px;color:var(--txt-h)}
+.shortcut-panel header button{display:grid;width:32px;height:32px;padding:0;place-items:center;border-radius:8px;background:transparent;color:var(--muted)}
+.shortcut-list{padding:8px 16px 16px}
+.shortcut-row{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:11px 4px;border-bottom:1px solid color-mix(in srgb,var(--line-2) 72%,transparent)}
+.shortcut-row:last-child{border-bottom:0}.shortcut-row span{color:var(--txt)}.shortcut-row kbd{color:var(--txt-h);white-space:nowrap}
+.connectivity-banner{
+  position:fixed;z-index:85;top:calc(12px + env(safe-area-inset-top));right:16px;display:flex;align-items:center;gap:10px;
+  width:min(430px,calc(100vw - 104px));min-height:52px;padding:9px 10px 9px 13px;border:1px solid color-mix(in srgb,var(--yellow) 45%,var(--line-2));
+  border-radius:12px;background:color-mix(in srgb,var(--panel) 94%,transparent);box-shadow:var(--sh-2);backdrop-filter:blur(12px);animation:command-in .18s ease-out;
+}
+.connectivity-banner>.ic{color:var(--yellow);font-size:19px}.connectivity-banner.danger>.ic{color:var(--red)}
+.connectivity-banner>span{min-width:0;flex:1}.connectivity-banner b,.connectivity-banner small{display:block}
+.connectivity-banner b{color:var(--txt-h);font-size:13.5px}.connectivity-banner small{margin-top:2px;color:var(--muted);font-size:11.5px;line-height:1.3}
+.connectivity-banner button{display:flex;align-items:center;gap:6px;flex:0 0 auto;padding:8px 10px;background:var(--accent);color:var(--accent-fg);font-size:12px;font-weight:650}
+.rail-draft-dot{position:absolute;left:-5px;bottom:4px;width:8px;height:8px;border:2px solid var(--bg);border-radius:50%;background:var(--muted);box-shadow:0 0 0 1px rgba(0,0,0,.25)}
+.notification-preprompt{
+  position:fixed;right:18px;bottom:18px;z-index:84;display:grid;grid-template-columns:42px minmax(0,1fr);gap:10px 12px;
+  width:min(420px,calc(100vw - 36px));padding:14px;border:1px solid color-mix(in srgb,var(--accent) 34%,var(--line-2));border-radius:15px;
+  background:color-mix(in srgb,var(--panel) 96%,transparent);box-shadow:var(--sh-3),var(--hair);backdrop-filter:blur(14px);animation:command-in .2s ease-out;
+}
+.notification-preprompt-icon{display:grid;width:42px;height:42px;place-items:center;border-radius:12px;background:color-mix(in srgb,var(--accent) 18%,var(--panel2));color:var(--accent-txt)}
+.notification-preprompt>div:nth-child(2){min-width:0}.notification-preprompt b{display:block;color:var(--txt-h);font-size:14px}
+.notification-preprompt p{margin:4px 0 0;color:var(--muted);font-size:12px;line-height:1.4}
+.notification-preprompt-actions{grid-column:1 / -1;display:flex;justify-content:flex-end;gap:8px}
+.notification-preprompt-actions button{margin:0;padding:8px 12px;font-size:12px}.notification-preprompt-actions .primary{width:auto}
+@keyframes command-fade{from{opacity:0}}@keyframes command-in{from{opacity:0;transform:translateY(-8px) scale(.985)}}
+@media(max-width:900px){
+  .command-backdrop{padding:calc(76px + env(safe-area-inset-top)) 10px calc(72px + env(safe-area-inset-bottom))}
+  .command-panel,.shortcut-panel{max-height:calc(100dvh - 160px)}
+  .command-results{max-height:calc(100dvh - 280px)}
+  .command-footer{display:none}
+  .connectivity-banner{top:calc(72px + env(safe-area-inset-top));left:12px;right:12px;width:auto}
+  .notification-preprompt{right:12px;bottom:calc(72px + env(safe-area-inset-bottom));width:min(420px,calc(100vw - 24px))}
+}
+@media(max-width:520px){
+  .command-input-wrap{padding:9px 11px}.command-input-wrap input{font-size:14px}.command-input-wrap>kbd{display:none}
+  .shortcut-row{align-items:flex-start}.shortcut-row span{font-size:13px}.shortcut-row kbd{font-size:10px}
+  .connectivity-banner small{display:none}
+}
+@media(prefers-reduced-motion:reduce){.command-backdrop,.command-panel,.shortcut-panel,.connectivity-banner,.notification-preprompt{animation:none}}

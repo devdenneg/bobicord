@@ -786,6 +786,19 @@ function SettingsModal() {
                 }} />
                 <span><b>Системные уведомления</b><i>Упоминания — когда окно не в фокусе; трансляции и обновления — всегда{notifPermission() === 'denied' ? ' · доступ запрещён в системе' : ''}</i></span>
               </label>
+              <div className={'fld'} style={{ margin: '2px 0 4px', opacity: s.notif ? 1 : .55 }}>
+                <label>Содержимое уведомлений</label>
+                <select
+                  disabled={!s.notif}
+                  value={s.notifPrivacy}
+                  onChange={(e) => upd({ notifPrivacy: e.target.value as AudioSettings['notifPrivacy'] })}
+                >
+                  <option value={'full'}>Отправитель и текст</option>
+                  <option value={'sender'}>Только отправитель</option>
+                  <option value={'hidden'}>Скрыть содержимое</option>
+                </select>
+                <div className={'mm-hint'}>Определяет, что видно на заблокированном экране и в системном баннере.</div>
+              </div>
               {NOTIF_KINDS.map((o) => (
                 <label key={o.key} className="perm-op" style={{ opacity: s.notif ? 1 : .45, pointerEvents: s.notif ? 'auto' : 'none' }}>
                   <input type="checkbox" disabled={!s.notif} checked={s[o.key]} onChange={(e) => { upd({ [o.key]: e.target.checked } as Partial<AudioSettings>); syncPushPrefs(); }} />

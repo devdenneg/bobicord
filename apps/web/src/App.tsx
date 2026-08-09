@@ -20,6 +20,9 @@ import type { ServerSummary, OnlineMember, KeybindAction } from './types';
 import { LogoLoader } from './components/LogoLoader';
 import { initNotifications } from './notify';
 import { TooltipLayer } from './components/TooltipLayer';
+import { ConnectivityBanner } from './components/ConnectivityBanner';
+import { NotificationPermissionPrompt } from './components/NotificationPermissionPrompt';
+import { QuickSwitcher, ShortcutHelp, rememberServerDestination } from './components/CommandOverlays';
 
 // версия принудительного сброса хоткеев на новые дефолты — см. эффект хоткеев ниже
 const HK_RESET_V = 1;
@@ -38,6 +41,34 @@ function Rail() {
   const goAdmin = useStore((s) => s.goAdmin);
   const unread = useStore((s) => s.unread);
   const releaseUnread = useStore((s) => s.releaseUnread);
+  const [draftServers, setDraftServers] = useState<Set<string>>(() => new Set());
+  useEffect(() => {
+    const scan = () => {
+      const next = new Set<string>();
+      for (const server of servers) {
+        try {
+          const hasText = (localStorage.getItem('chatDraft:' + server.id) || '').trim();
+          const hasReply = localStorage.getItem('chatDraftReply:' + server.id);
+          if (hasText || hasReply) next.add(server.id);
+        } catch { /* storage may be unavailable */ }
+      }
+      setDraftServers(next);
+    };
+    const onDraftChanged = (event: Event) => {
+      const detail = (event as CustomEvent<{ serverId?: string; hasDraft?: boolean }>).detail;
+      if (!detail?.serverId) { scan(); return; }
+      const serverId = detail.serverId;
+      setDraftServers((current) => {
+        const next = new Set(current);
+        if (detail.hasDraft) next.add(serverId); else next.delete(serverId);
+        return next;
+      });
+    };
+    scan();
+    window.addEventListener('relay:drafts-changed', onDraftChanged);
+    window.addEventListener('storage', scan);
+    return () => { window.removeEventListener('relay:drafts-changed', onDraftChanged); window.removeEventListener('storage', scan); };
+  }, [servers]);
   // подсвечиваем сервер только когда реально смотрим его (на главной — home активна)
   const activeId = view === 'server' ? (active?.id || loadingServerId) : null;
   return (
@@ -49,12 +80,13 @@ function Rail() {
           const un = activeId === s.id ? 0 : (unread[s.id] || 0); // активный не бейджим (читаем его)
           return (
           <button key={s.id} className={'railbtn tip-l' + (activeId === s.id ? ' active' : '') + (eng.voiceServerId === s.id && activeId !== s.id ? ' connected' : '') + (un ? ' unread' : '')}
-            aria-label={s.name + (eng.voiceServerId === s.id && activeId !== s.id ? ' — вы в голосовом канале' : '')}
+            aria-label={s.name + (eng.voiceServerId === s.id && activeId !== s.id ? ' — вы в голосовом канале' : '') + (draftServers.has(s.id) ? ' — есть черновик' : '')}
             aria-current={activeId === s.id ? 'page' : undefined}
             data-tip={eng.voiceServerId === s.id && activeId !== s.id ? s.name + ' · в голосе' : s.name}
             style={{ background: s.iconUrl ? '#0000' : avColor(s.name, s.iconColor) }} onClick={() => openServer(s.id)}>
             {s.iconUrl ? <img className="avimg" src={resolveUploadUrl(s.iconUrl)} alt="" /> : initial(s.name)}{(s.online || []).some((m) => m.inVoice) ? <span className="dot green" /> : null}
             {un ? <span className="rail-badge">{un > 99 ? '99+' : un}</span> : null}
+            {draftServers.has(s.id) ? <span className={'rail-draft-dot'} aria-hidden={true} /> : null}
           </button>
           );
         })}
@@ -524,10 +556,14 @@ export function App() {
   const loadingServer = useStore((s) => s.loadingServer);
   const me = useStore((s) => s.me);
   const accountGate = useStore((s) => s.accountGate);
+  const activeServerId = useStore((s) => s.active?.id || null);
+  const [quickSwitcherOpen, setQuickSwitcherOpen] = useState(false);
+  const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
 
-  // Уведомления: при первом входе (после логина) запрашиваем разрешение автоматически и
-  // включаем — отключить можно в Настройках → Уведомления (там же ставится опт-аут, чтобы
-  // не переспрашивать). initNotifications сам уважает опт-аут и не пристаёт повторно.
+  useEffect(() => { if (activeServerId) rememberServerDestination(activeServerId); }, [activeServerId]);
+
+  // При запуске лишь подхватываем уже выданное разрешение. Системный prompt открывается
+  // только после явного действия в нашем предварительном запросе или в настройках.
   useEffect(() => {
     if (!me) return;
     initNotifications().then((welcomed) => {
@@ -542,6 +578,59 @@ export function App() {
   useEffect(() => {
     if (me?.isAdmin && location.pathname.startsWith('/admin')) useStore.getState().goAdmin();
   }, [me]);
+
+  // Навигационные сочетания одинаковы в web и desktop и не зависят от голосовых биндов.
+  useEffect(() => {
+    if (!me) return;
+    const onShortcut = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      const primary = event.ctrlKey || event.metaKey;
+      if (primary && !event.altKey && event.code === 'KeyK') {
+        event.preventDefault();
+        setShortcutHelpOpen(false);
+        setQuickSwitcherOpen((open) => !open);
+        return;
+      }
+      if (primary && !event.altKey && event.code === 'Slash') {
+        event.preventDefault();
+        setQuickSwitcherOpen(false);
+        setShortcutHelpOpen((open) => !open);
+        return;
+      }
+      if (primary && !event.altKey && event.code === 'Comma') {
+        event.preventDefault();
+        setQuickSwitcherOpen(false);
+        setShortcutHelpOpen(false);
+        useStore.getState().setModal('settings');
+        return;
+      }
+      if (quickSwitcherOpen || shortcutHelpOpen) return;
+      const target = event.target as HTMLElement | null;
+      const typing = !!target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
+      if (typing || useStore.getState().modal) return;
+      if (event.altKey && !primary && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
+        const state = useStore.getState();
+        if (!state.servers.length) return;
+        event.preventDefault();
+        const current = state.active?.id;
+        const currentIndex = state.servers.findIndex((server) => server.id === current);
+        const index = currentIndex >= 0 ? currentIndex : (event.key === 'ArrowDown' ? -1 : 0);
+        const delta = event.key === 'ArrowDown' ? 1 : -1;
+        const next = state.servers[(index + delta + state.servers.length) % state.servers.length];
+        if (next) void state.openServer(next.id);
+        return;
+      }
+      if (event.key === 'Escape') {
+        const state = useStore.getState();
+        if (state.view !== 'server' || !state.active) return;
+        const lastSid = [...(getEngine()?.getSnapshot().messages || [])].reverse().find((message) => message.sid != null)?.sid || 0;
+        event.preventDefault();
+        state.markRead(state.active.id, lastSid, true);
+      }
+    };
+    window.addEventListener('keydown', onShortcut);
+    return () => window.removeEventListener('keydown', onShortcut);
+  }, [me, quickSwitcherOpen, shortcutHelpOpen]);
 
   // hotkeys (мут микрофона / заглушить звук — настраиваемые комбинации из keybinds, + PTT) —
   // active while logged in. Работает ВСЕГДА, пока окно в фокусе (keydown на window иначе и не
@@ -578,8 +667,19 @@ export function App() {
       (Object.keys(armed) as KeybindAction[]).forEach((action) => { if (s.keybinds[action].map(normKey).includes(nk)) armed[action] = false; });
       if (s.mode === 'ptt' && e.code === s.pttKey) E.pttRelease();
     };
+    const releasePtt = () => {
+      pressed.clear();
+      (Object.keys(armed) as KeybindAction[]).forEach((action) => { armed[action] = false; });
+      getEngine()?.forcePttRelease();
+    };
+    const onVisibility = () => { if (document.visibilityState !== 'visible') releasePtt(); };
     window.addEventListener('keydown', kd); window.addEventListener('keyup', ku);
-    return () => { window.removeEventListener('keydown', kd); window.removeEventListener('keyup', ku); };
+    window.addEventListener('blur', releasePtt); document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      releasePtt();
+      window.removeEventListener('keydown', kd); window.removeEventListener('keyup', ku);
+      window.removeEventListener('blur', releasePtt); document.removeEventListener('visibilitychange', onVisibility);
+    };
   }, [me]);
 
   // натив: держим Rust-хук (WH_KEYBOARD_LL) в курсе актуальных биндов/режима (чекбокс «отключить
@@ -650,6 +750,10 @@ export function App() {
       <IconSprite />
       <Toasts />
       <TooltipLayer />
+      {me ? <ConnectivityBanner /> : null}
+      {me ? <NotificationPermissionPrompt /> : null}
+      {me ? <QuickSwitcher open={quickSwitcherOpen} onClose={() => setQuickSwitcherOpen(false)} /> : null}
+      {me ? <ShortcutHelp open={shortcutHelpOpen} onClose={() => setShortcutHelpOpen(false)} /> : null}
       {accountGate ? <AccountEmailGate /> : view === 'loading' ? (
         <div className="overlay" style={{ background: 'var(--bg)' }}>
           <LogoLoader size={200} />

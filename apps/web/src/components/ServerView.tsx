@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { createPortal } from 'react-dom';
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from 'react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { useStore, getEngine } from '../store';
@@ -23,6 +24,12 @@ import { sendActiveChat } from '../notifyws';
 import { linkifyHttpUrls } from '../linkify';
 import { readCatWallpaper, writeCatWallpaper } from '../chatWallpaper';
 import { fetchTitle, parseYouTubeVideo, type YouTubeVideoRef } from '../youtube';
+import {
+  clearNotificationDestination,
+  NOTIFICATION_DESTINATION_EVENT,
+  peekNotificationDestination,
+  type NotificationDestination,
+} from '../notificationDestination';
 import {
   CHAT_BOTTOM_ENTER_PX,
   CHAT_BOTTOM_LEAVE_PX,
@@ -53,6 +60,14 @@ import { PERM, hasPerm } from '../types';
 
 const MAX_ATTACH = 5;
 const MAX_ATTACH_SIZE = 10 * 1024 * 1024;
+const DRAFT_KEY = 'chatDraft:';
+const DRAFT_REPLY_KEY = 'chatDraftReply:';
+const DRAFTS_CHANGED_EVENT = 'relay:drafts-changed';
+const DRAFT_SAVE_DELAY_MS = 350;
+const COMPOSER_MIN_HEIGHT_PX = 44;
+const COMPOSER_MAX_HEIGHT_PX = 160;
+const EXACT_JUMP_PAGE_LIMIT = 60;
+const EXACT_JUMP_MAX_PAGES = 20;
 const CHAT_VIEWPORT_INCREASE = { top: 600, bottom: 400 } as const;
 const CHAT_MIN_OVERSCAN_ITEMS = { top: CHAT_PREPEND_OVERSCAN_ITEMS, bottom: 8 } as const;
 
@@ -67,13 +82,64 @@ function fmtSize(bytes: number): string {
 interface StagedAttachment {
   key: number;
   kind: 'image' | 'file';
+  file: File;
   name: string;
   size: number;
   previewUrl?: string; // objectURL для картинок — превью до и во время аплоада
   status: 'uploading' | 'ready' | 'error';
   attachment?: Attachment;
+  error?: string;
 }
 let stageSeq = 1;
+
+function dispatchDraftChanged(serverId: string, hasDraft: boolean) {
+  window.dispatchEvent(new CustomEvent(DRAFTS_CHANGED_EVENT, { detail: { serverId, hasDraft } }));
+}
+
+function readDraftReply(serverId?: string): ReplyRef | null {
+  if (!serverId) return null;
+  try {
+    const raw = localStorage.getItem(DRAFT_REPLY_KEY + serverId);
+    if (!raw) return null;
+    const value = JSON.parse(raw) as Partial<ReplyRef>;
+    if (typeof value.author !== 'string' || typeof value.text !== 'string') return null;
+    return {
+      author: value.author,
+      text: value.text,
+      uid: typeof value.uid === 'string' ? value.uid : undefined,
+      sid: typeof value.sid === 'number' ? value.sid : undefined,
+      img: value.img === true,
+      hasFile: value.hasFile === true,
+      thumb: typeof value.thumb === 'string' ? value.thumb : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function readDraftText(serverId?: string): string {
+  if (!serverId) return '';
+  try {
+    return localStorage.getItem(DRAFT_KEY + serverId) || '';
+  } catch {
+    return '';
+  }
+}
+
+function persistDraft(serverId: string, text: string, reply: ReplyRef | null) {
+  const hasText = text.trim().length > 0;
+  try {
+    if (hasText) localStorage.setItem(DRAFT_KEY + serverId, text);
+    else localStorage.removeItem(DRAFT_KEY + serverId);
+    if (reply) localStorage.setItem(DRAFT_REPLY_KEY + serverId, JSON.stringify(reply));
+    else localStorage.removeItem(DRAFT_REPLY_KEY + serverId);
+  } catch {
+    // localStorage can be unavailable in hardened/privacy browser modes. The composer
+    // must keep working even when persistence is denied.
+  } finally {
+    dispatchDraftChanged(serverId, hasText || !!reply);
+  }
+}
 
 const profileStatsCache = new Map<string, { until: number; data: Leaderboard }>();
 const profileStatsPending = new Map<string, Promise<Leaderboard>>();
@@ -214,7 +280,10 @@ function ProfileCard({ m, rect, onEnter, onLeave }: { m: Member; rect: DOMRect; 
   const preferredLeft = onRight ? rect.right + 10 : rect.left - 306;
   const left = Math.max(8, Math.min(preferredLeft, window.innerWidth - 304));
   const style: CSSProperties = { left, top };
-  return (
+  // Портал в body: карточка position:fixed, а член-строка может лежать в предке с transform/filter
+  // (адаптив-анимации панели участников) — тогда fixed попадает в его stacking-контекст и уходит ПОД
+  // композер чата. Портал выносит её в корень, где z-index:150 реально выше всего (кроме модалок).
+  return createPortal(
     <div className={'pcard' + (streaming ? ' is-live' : '')} style={style} onMouseEnter={onEnter} onMouseLeave={onLeave}>
       <div className={'pcard-cover' + (profileBannerUrl ? ' has-media' : '')} aria-hidden="true">
         <ProfileBannerMedia value={profileBannerUrl} className="pcard-cover-banner" />
@@ -248,13 +317,14 @@ function ProfileCard({ m, rect, onEnter, onLeave }: { m: Member; rect: DOMRect; 
         <div className="pcard-stats">
           <div><Icon name="speaker" sm /><span>В голосе</span><b>{fmtDuration(statsData.voiceSec)}</b></div>
           <div><Icon name="screen" sm /><span>В эфире</span><b>{fmtDuration(statsData.streamSec)}</b></div>
-          {m.stats ? <div><Icon name="chat" sm /><span>Сообщения</span><b>{statsData.messages.toLocaleString('ru-RU')}</b></div> : null}
+          {/* «Сообщения» убрано: серверная статистика сообщений не отслеживается (всегда 0). */}
           <div><Icon name="trophy" sm /><span>Всего XP</span><b>{statsData.xp.toLocaleString('ru-RU')}</b></div>
         </div>
       </> : statsEnabled ? <div className={'pcard-stats-state' + (statsFailed ? ' failed' : '')}>{statsEmpty ? 'Активность ещё не накоплена' : statsFailed ? 'Статистика временно недоступна' : <><span className="spin" /> Загружаю активность…</>}</div> : null}
       <div className="pcard-label">О себе</div>
       <div className={'pcard-bio' + (bio ? '' : ' empty')}>{bio || 'Ничего не указано'}</div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -1081,7 +1151,7 @@ function Chat() {
   // Черновики per-server: недописанное сообщение не теряется при переходе между серверами (localStorage).
   const textRef = useRef(text); textRef.current = text;
   const prevActive = useRef<string | undefined>(undefined);
-  const DRAFT_KEY = 'chatDraft:';
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   const [lightbox, setLightbox] = useState<Attachment | null>(null);
   const [pickAnchor, setPickAnchor] = useState<DOMRect | null | undefined>(undefined);
   const emoBtnRef = useRef<HTMLButtonElement>(null);
@@ -1090,6 +1160,11 @@ function Chat() {
   const [staged, setStaged] = useState<StagedAttachment[]>([]);
   const stagedRef = useRef<StagedAttachment[]>([]);
   stagedRef.current = staged;
+  const stageGenerationRef = useRef(0);
+  const removedStageKeysRef = useRef(new Set<number>());
+  const queuedServerRef = useRef<string | null>(null);
+  const dragDepthRef = useRef(0);
+  const [dragActive, setDragActive] = useState(false);
   // юзер нажал «Отправить»/Enter, пока вложение ещё грузится — не просто тост в пустоту (выглядит
   // как «зависло»), а ставим в очередь: кнопка отправки показывает спиннер, реальная отправка уходит
   // автоматически как только все загрузки завершатся (см. эффект ниже send()).
@@ -1099,27 +1174,40 @@ function Chat() {
   const me = useStore((s) => s.me)!;
   const members = useStore((s) => s.members);
   const activeId = useStore((s) => s.active?.id);
-  // Черновики per-server: сохранить при уходе, восстановить при входе. (refs объявлены выше.)
-  useEffect(() => {
-    const prev = prevActive.current;
-    if (prev && prev !== activeId) {
-      if (textRef.current.trim()) localStorage.setItem(DRAFT_KEY + prev, textRef.current);
-      else localStorage.removeItem(DRAFT_KEY + prev);
-    }
-    prevActive.current = activeId;
-    setText((activeId && localStorage.getItem(DRAFT_KEY + activeId)) || '');
-    return () => { const a = prevActive.current; if (a) { if (textRef.current.trim()) localStorage.setItem(DRAFT_KEY + a, textRef.current); else localStorage.removeItem(DRAFT_KEY + a); } };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeId]);
   const nativeUpdate = useStore((s) => s.nativeUpdate);
   const [updating, setUpdating] = useState(false);
   const messages = eng.messages;
-  const [replyTo, setReplyTo] = useState<ChatMessage | null>(null); // на какое сообщение отвечаем
+  const [replyTo, setReplyTo] = useState<ReplyRef | null>(null); // snapshot цели ответа сохраняется вместе с черновиком
+  const replyToRef = useRef(replyTo); replyToRef.current = replyTo;
   const [flashId, setFlashId] = useState<number | null>(null);      // подсветка оригинала при переходе по цитате
   const [reactTarget, setReactTarget] = useState<{ target: { id: number; sid?: number | null }; anchor: DOMRect } | null>(null); // 7TV-пикер для реакции
   const [editing, setEditing] = useState<{ id: number; sid: number } | null>(null); // инлайн-редактирование
   const [editText, setEditText] = useState('');
   const [actionsFor, setActionsFor] = useState<number | null>(null); // touch: явное меню действий сообщения
+
+  // Сохраняем исходящий сервер синхронно при переключении, затем восстанавливаем
+  // текст и reply snapshot нового. Отдельный debounce покрывает ввод без навигации.
+  useEffect(() => {
+    const previousId = prevActive.current;
+    if (previousId && previousId !== activeId) persistDraft(previousId, textRef.current, replyToRef.current);
+    prevActive.current = activeId;
+    const nextText = readDraftText(activeId);
+    const nextReply = readDraftReply(activeId);
+    setText(nextText);
+    setReplyTo(nextReply);
+    if (activeId) dispatchDraftChanged(activeId, nextText.trim().length > 0 || !!nextReply);
+  }, [activeId]);
+
+  useEffect(() => {
+    if (!activeId) return;
+    const timer = window.setTimeout(() => persistDraft(activeId, text, replyTo), DRAFT_SAVE_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [activeId, replyTo, text]);
+
+  useEffect(() => () => {
+    const serverId = prevActive.current;
+    if (serverId) persistDraft(serverId, textRef.current, replyToRef.current);
+  }, []);
 
   useEffect(() => {
     if (actionsFor == null) return;
@@ -1164,6 +1252,7 @@ function Chat() {
 
   // --- виртуальный список чата (react-virtuoso) ---
   const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const destinationRequestRef = useRef(0);
   const scrollerElementRef = useRef<HTMLElement | null>(null);
   const detachScrollerRef = useRef<(() => void) | null>(null);
   const tailElementRef = useRef<HTMLDivElement | null>(null);
@@ -1909,8 +1998,9 @@ function Chat() {
     setPill(unreadServer > 0 ? Math.max(unreadHere, unreadServer) : 0);
     setFollowIntent(startPinned);
     commitAtBottom(startPinned);
-    setReplyTo(null);
     // сброс стейджинга вложений при смене сервера — не тащим прикреплённые файлы между чатами
+    stageGenerationRef.current += 1;
+    queuedServerRef.current = null;
     setStaged((s) => { s.forEach((it) => it.previewUrl && URL.revokeObjectURL(it.previewUrl)); return []; });
     setSendQueued(false);
     lastAckedRef.current = null; ++olderRequestSeq.current; loadingOlder.current = false; setOlderBusy(false);
@@ -2116,19 +2206,135 @@ function Chat() {
   // текстовый сниппет цитаты, когда исходное сообщение без текста (только вложения)
   const replySnippet = (r: ReplyRef): string => r.text || (r.img && r.hasFile ? '🖼📎 Вложения' : r.img ? '🖼 Изображение' : r.hasFile ? '📎 Файл' : '');
   const startReply = useCallback((m: ChatMessage) => {
-    setReplyTo(m);
+    setReplyTo(buildReplyRef(m));
     requestAnimationFrame(() => document.getElementById('msgIn')?.focus());
   }, []);
-  // переход к оригиналу по клику на цитату (если он сейчас загружен) + короткая подсветка
-  const jumpToReply = useCallback((r: ReplyRef) => {
-    if (r.sid == null) { useStore.getState().toast('Оригинал ещё синхронизируется — секунду', 'warn'); return; }
-    const idx = messages.findIndex((mm) => mm.sid === r.sid);
-    // Оригинал вне загруженного окна — не молчим (был «мёртвый клик»): подсказываем прокрутить/догрузить.
-    if (idx < 0) { useStore.getState().toast('Сообщение выше — прокрути вверх, чтобы догрузить', 'warn'); return; }
+  const focusLoadedMessage = useCallback((sid: number): boolean => {
+    const current = E.getSnapshot().messages;
+    if (!current.some((message) => message.sid === sid)) return false;
     detachBottomFollow();
-    virtuosoRef.current?.scrollToIndex({ index: idx, align: 'center', behavior: 'smooth' });
-    setFlashId(messages[idx].id);
-  }, [detachBottomFollow, messages]);
+    requestAnimationFrame(() => {
+      const latest = E.getSnapshot().messages;
+      const index = latest.findIndex((message) => message.sid === sid);
+      if (index < 0) return;
+      virtuosoRef.current?.scrollToIndex({ index, align: 'center', behavior: 'smooth' });
+      setFlashId(latest[index].id);
+    });
+    return true;
+  }, [E, detachBottomFollow]);
+
+  // Exact-jump используется и уведомлениями, и reply. Загружаем весь непрерывный
+  // диапазон между текущим окном и целью: одиночный prepend создавал бы невидимый
+  // gap, ломал cursor истории и мог поставить следующее старое сообщение в хвост.
+  const revealMessage = useCallback(async (sid: number, missingText = 'Сообщение больше недоступно'): Promise<boolean> => {
+    const requestSeq = ++destinationRequestRef.current;
+    if (focusLoadedMessage(sid)) return true;
+    const requestedServerId = activeId;
+    if (!requestedServerId) return false;
+    const initialSids = E.getSnapshot().messages
+      .map((message) => message.sid)
+      .filter((value): value is number => value != null);
+    // Начальная history ещё не приехала: pending destination остаётся и повторится
+    // после следующего изменения messages/roomReady.
+    if (!initialSids.length) return false;
+    const oldestSid = Math.min(...initialSids);
+    const newestSid = Math.max(...initialSids);
+    const requestIsCurrent = () => (
+      requestSeq === destinationRequestRef.current
+      && useStore.getState().active?.id === requestedServerId
+      && getEngine() === E
+    );
+    try {
+      if (sid < oldestSid) {
+        let cursor = oldestSid;
+        let collected: Awaited<ReturnType<typeof api.getMessages>>['messages'] = [];
+        for (let pageIndex = 0; pageIndex < EXACT_JUMP_MAX_PAGES; pageIndex++) {
+          const history = await api.getMessages(requestedServerId, cursor, EXACT_JUMP_PAGE_LIMIT);
+          if (!requestIsCurrent()) return false;
+          if (!history.messages.length) break;
+          collected = [...history.messages, ...collected];
+          const targetIndex = collected.findIndex((message) => message.id === sid);
+          if (targetIndex >= 0) {
+            if (focusLoadedMessage(sid)) return true;
+            const loadedNow = E.getSnapshot().messages
+              .map((message) => message.sid)
+              .filter((value): value is number => value != null);
+            const currentOldest = loadedNow.length ? Math.min(...loadedNow) : oldestSid;
+            const continuous = collected.slice(targetIndex).filter((message) => message.id != null && message.id < currentOldest);
+            if (continuous.length) E.prependHistory(continuous, targetIndex > 0 || history.hasMore);
+            return focusLoadedMessage(sid);
+          }
+          if (!history.hasMore) break;
+          const nextCursor = history.messages[0]?.id;
+          if (!nextCursor || nextCursor >= cursor) break;
+          cursor = nextCursor;
+        }
+      } else if (sid > newestSid) {
+        let cursor = sid + 1;
+        let collected: Awaited<ReturnType<typeof api.getMessages>>['messages'] = [];
+        for (let pageIndex = 0; pageIndex < EXACT_JUMP_MAX_PAGES; pageIndex++) {
+          const history = await api.getMessages(requestedServerId, cursor, EXACT_JUMP_PAGE_LIMIT);
+          if (!requestIsCurrent()) return false;
+          if (!history.messages.length) break;
+          collected = [...history.messages, ...collected];
+          const reachedCurrentWindow = history.messages.some((message) => message.id != null && message.id <= newestSid);
+          if (reachedCurrentWindow || !history.hasMore) {
+            const continuous = collected.filter((message) => message.id != null && message.id > newestSid && message.id <= sid);
+            if (continuous.some((message) => message.id === sid)) {
+              E.mergeRecent(continuous);
+              return focusLoadedMessage(sid);
+            }
+            break;
+          }
+          const nextCursor = history.messages[0]?.id;
+          if (!nextCursor || nextCursor >= cursor) break;
+          cursor = nextCursor;
+        }
+      } else {
+        // Внутри непрерывного загруженного диапазона отсутствие sid означает удалённое сообщение.
+        const exact = await api.getMessages(requestedServerId, sid + 1, 1);
+        if (!requestIsCurrent()) return false;
+        if (exact.messages.some((message) => message.id === sid) && focusLoadedMessage(sid)) return true;
+      }
+      if (requestIsCurrent()) toast(missingText, 'warn');
+      return false;
+    } catch (error: any) {
+      if (requestSeq === destinationRequestRef.current) toast(error?.message || 'Не удалось открыть сообщение', 'err');
+      return false;
+    }
+  }, [E, activeId, focusLoadedMessage, toast]);
+
+  const jumpToReply = useCallback((r: ReplyRef) => {
+    if (r.sid == null) { toast('Оригинал ещё синхронизируется — секунду', 'warn'); return; }
+    void revealMessage(r.sid, 'Исходное сообщение больше недоступно');
+  }, [revealMessage, toast]);
+  useEffect(() => {
+    if (!activeId) return;
+    const openDestination = async (destination: NotificationDestination) => {
+      if (destination.serverId !== activeId) return;
+      const opened = destination.messageId
+        ? await revealMessage(destination.messageId, 'Сообщение из уведомления больше недоступно')
+        : (scrollToBottom(), true);
+      if (opened) clearNotificationDestination(destination);
+    };
+    const openPendingForActiveServer = () => {
+      const destination = peekNotificationDestination(activeId);
+      if (destination) void openDestination(destination);
+    };
+    openPendingForActiveServer();
+    const onDestination = (event: Event) => {
+      const stored = peekNotificationDestination(activeId);
+      const direct = (event as CustomEvent<NotificationDestination>).detail;
+      const destination = stored || (direct?.serverId === activeId ? direct : null);
+      if (destination) void openDestination(destination);
+    };
+    window.addEventListener(NOTIFICATION_DESTINATION_EVENT, onDestination);
+    window.addEventListener('online', openPendingForActiveServer);
+    return () => {
+      window.removeEventListener(NOTIFICATION_DESTINATION_EVENT, onDestination);
+      window.removeEventListener('online', openPendingForActiveServer);
+    };
+  }, [activeId, eng.roomReady, messages.length, revealMessage, scrollToBottom]);
   useEffect(() => { if (flashId == null) return; const t = window.setTimeout(() => setFlashId(null), 1300); return () => clearTimeout(t); }, [flashId]);
   const reactTo = useCallback((target: { id: number; sid?: number | null }, emote: { id: string; name: string }) => {
     E.toggleMessageReaction(target, emote);
@@ -2156,51 +2362,120 @@ function Chat() {
   // над инпутом (стейджинг), аплоад стартует в фоне, но сообщение НЕ уходит, пока не нажат
   // «Отправить». Картинки идут через существующий /api/upload (даунскейл в WebP + инлайн-показ),
   // остальные расширения — через /api/upload-file (форс-скачивание, без сжатия). До MAX_ATTACH штук.
-  function stageFiles(files: File[], kind: 'image' | 'file') {
+  async function uploadStagedFile(key: number, file: File, kind: 'image' | 'file', generation: number) {
+    try {
+      let attachment: Attachment;
+      if (kind === 'image') {
+        const small = await downscaleImage(file);
+        const { url, width, height } = await api.uploadImage(small);
+        attachment = { url, name: small.name, size: small.size, mime: small.type, kind: 'image', width, height };
+      } else {
+        const { url, name, size } = await api.uploadFile(file);
+        attachment = { url, name, size, mime: file.type, kind: 'file' };
+      }
+      if (generation !== stageGenerationRef.current || removedStageKeysRef.current.has(key)) return;
+      setStaged((items) => items.map((item) => (
+        item.key === key ? { ...item, status: 'ready', attachment, error: undefined } : item
+      )));
+    } catch (error: any) {
+      if (generation !== stageGenerationRef.current
+        || removedStageKeysRef.current.has(key)
+        || !stagedRef.current.some((item) => item.key === key)) return;
+      const message = error?.message || `Не удалось загрузить ${file.name}`;
+      // Ошибка отменяет отложенную отправку: текст не должен тихо уйти без файла
+      // после того, как пользователь нажал Enter во время загрузки.
+      setSendQueued(false);
+      queuedServerRef.current = null;
+      setStaged((items) => items.map((item) => (
+        item.key === key ? { ...item, status: 'error', attachment: undefined, error: message } : item
+      )));
+      toast(message, 'err');
+    }
+  }
+
+  function stageFiles(files: File[], forcedKind?: 'image' | 'file') {
     const room = MAX_ATTACH - stagedRef.current.length;
     if (room <= 0) { toast(`Максимум ${MAX_ATTACH} вложений`, 'warn'); return; }
     if (files.length > room) toast(`Максимум ${MAX_ATTACH} вложений — добавлены первые ${room}`, 'warn');
     for (const f of files.slice(0, room)) {
       if (f.size > MAX_ATTACH_SIZE) { toast(`${f.name}: больше 10 МБ`, 'warn'); continue; }
+      const kind = forcedKind || (f.type.startsWith('image/') ? 'image' : 'file');
       const key = stageSeq++;
       const previewUrl = kind === 'image' ? URL.createObjectURL(f) : undefined;
-      setStaged((s) => [...s, { key, kind, name: f.name, size: f.size, previewUrl, status: 'uploading' }]);
-      (async () => {
-        try {
-          let attachment: Attachment;
-          if (kind === 'image') {
-            const small = await downscaleImage(f);
-            const { url, width, height } = await api.uploadImage(small);
-            attachment = { url, name: small.name, size: small.size, mime: small.type, kind: 'image', width, height };
-          } else {
-            const { url, name, size } = await api.uploadFile(f);
-            attachment = { url, name, size, mime: f.type, kind: 'file' };
-          }
-          setStaged((s) => s.map((it) => (it.key === key ? { ...it, status: 'ready', attachment } : it)));
-        } catch (e: any) {
-          setStaged((s) => s.map((it) => (it.key === key ? { ...it, status: 'error' } : it)));
-          toast(e?.message || `Не удалось загрузить ${f.name}`, 'err');
-        }
-      })();
+      setStaged((items) => [...items, { key, kind, file: f, name: f.name, size: f.size, previewUrl, status: 'uploading' }]);
+      void uploadStagedFile(key, f, kind, stageGenerationRef.current);
     }
   }
+  function retryStaged(key: number) {
+    const item = stagedRef.current.find((candidate) => candidate.key === key);
+    if (!item || item.status !== 'error') return;
+    setSendQueued(false);
+    queuedServerRef.current = null;
+    setStaged((items) => items.map((candidate) => (
+      candidate.key === key ? { ...candidate, status: 'uploading', error: undefined } : candidate
+    )));
+    void uploadStagedFile(item.key, item.file, item.kind, stageGenerationRef.current);
+  }
   function removeStaged(key: number) {
+    removedStageKeysRef.current.add(key);
     setStaged((s) => {
       const it = s.find((x) => x.key === key);
       if (it?.previewUrl) URL.revokeObjectURL(it.previewUrl);
       return s.filter((x) => x.key !== key);
     });
   }
-  useEffect(() => () => { stagedRef.current.forEach((it) => it.previewUrl && URL.revokeObjectURL(it.previewUrl)); }, []);
+  useEffect(() => () => {
+    stageGenerationRef.current += 1;
+    stagedRef.current.forEach((it) => it.previewUrl && URL.revokeObjectURL(it.previewUrl));
+  }, []);
+
+  function hasDraggedFiles(dataTransfer: DataTransfer): boolean {
+    return Array.from(dataTransfer.types || []).includes('Files');
+  }
+  function onChatDragEnter(event: React.DragEvent<HTMLDivElement>) {
+    if (!hasDraggedFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepthRef.current += 1;
+    setDragActive(true);
+  }
+  function onChatDragOver(event: React.DragEvent<HTMLDivElement>) {
+    if (!hasDraggedFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+  }
+  function onChatDragLeave(event: React.DragEvent<HTMLDivElement>) {
+    if (dragDepthRef.current === 0) return;
+    event.preventDefault();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setDragActive(false);
+  }
+  function onChatDrop(event: React.DragEvent<HTMLDivElement>) {
+    if (!hasDraggedFiles(event.dataTransfer) && dragDepthRef.current === 0) return;
+    event.preventDefault();
+    dragDepthRef.current = 0;
+    setDragActive(false);
+    const files = Array.from(event.dataTransfer.files || []);
+    if (files.length) stageFiles(files);
+  }
 
   function send() {
     const t = text.trim();
+    if (staged.some((s) => s.status === 'error')) {
+      setSendQueued(false);
+      queuedServerRef.current = null;
+      toast('Повтори загрузку или убери вложение перед отправкой', 'warn');
+      return;
+    }
     const pending = staged.some((s) => s.status === 'uploading');
     if (pending) {
-      if (t || staged.length) setSendQueued(true); // отправится сама, см. эффект ниже
+      if (t || staged.length) {
+        queuedServerRef.current = activeId || null;
+        setSendQueued(true);
+      } // отправится сама, см. эффект ниже
       return;
     }
     setSendQueued(false);
+    queuedServerRef.current = null;
     const ready = staged.filter((s) => s.status === 'ready' && s.attachment).map((s) => s.attachment!);
     if (!t && !ready.length) return;
     if (t.startsWith('/')) { runCommand(t); setText(''); return; }
@@ -2216,19 +2491,25 @@ function Chat() {
     smoothJumpPendingRef.current = false;
     const em: Record<string, string> = {};
     t.split(/\s+/).forEach((w) => { if (emoteMap.has(w)) em[w] = emoteMap.get(w)!; });
-    E.sendChatWithEmotes(t, em, undefined, replyTo ? buildReplyRef(replyTo) : undefined, ready.length ? ready : undefined);
+    E.sendChatWithEmotes(t, em, undefined, replyTo || undefined, ready.length ? ready : undefined);
     staged.forEach((item) => { if (item.previewUrl) URL.revokeObjectURL(item.previewUrl); });
     setText(''); setReplyTo(null); setStaged([]);
-    if (activeId) localStorage.removeItem(DRAFT_KEY + activeId); // отправлено — черновик снят
+    if (activeId) persistDraft(activeId, '', null); // отправлено — черновик и badge сняты сразу
     // Реальный доскролл выполняет suffix-append layout effect уже после появления сообщения в data.
   }
-  // очередь на отправку: как только последнее вложение долилось (успешно или с ошибкой — send()
-  // сам отфильтрует неудачные), стреляем реальной отправкой без повторного нажатия юзером.
+  // Очередь срабатывает только после успешной загрузки каждого вложения. Любая ошибка
+  // отменяет intent, чтобы текст не ушёл отдельно от ожидаемого файла.
   useEffect(() => {
     if (!sendQueued) return;
+    if (!activeId || queuedServerRef.current !== activeId) {
+      queuedServerRef.current = null;
+      setSendQueued(false);
+      return;
+    }
     if (staged.some((s) => s.status === 'uploading')) return;
+    if (staged.some((s) => s.status === 'error')) { queuedServerRef.current = null; setSendQueued(false); return; }
     send();
-  }, [staged, sendQueued]);
+  }, [activeId, staged, sendQueued]);
 
   // slash-команды (только в начале строки, пока нет пробела)
   const slashMode = /^\/[a-zа-я]*$/i.test(text);
@@ -2268,21 +2549,45 @@ function Chat() {
     setText(inserted); setMIdx(0);
     focusEnd(inserted.length);
   }
+  const resizeComposer = useCallback(() => {
+    const el = composerRef.current;
+    if (!el) return;
+    el.style.height = '0px';
+    const height = Math.min(COMPOSER_MAX_HEIGHT_PX, Math.max(COMPOSER_MIN_HEIGHT_PX, el.scrollHeight));
+    el.style.height = `${height}px`;
+    el.style.overflowY = el.scrollHeight > COMPOSER_MAX_HEIGHT_PX ? 'auto' : 'hidden';
+  }, []);
+  useLayoutEffect(() => resizeComposer(), [resizeComposer, text]);
+
   function focusEnd(pos: number) {
-    requestAnimationFrame(() => { const el = document.getElementById('msgIn') as HTMLInputElement | null; if (el) { el.focus(); el.setSelectionRange(pos, pos); } });
+    requestAnimationFrame(() => { const el = composerRef.current; if (el) { el.focus(); el.setSelectionRange(pos, pos); } });
   }
   // тегаем по Нику (displayName), а не по логину; для @everyone — служебный токен 'все'
   const mentionToken = (x: { username: string; displayName: string; everyone?: boolean }) => (x.everyone ? x.username : x.displayName);
   function acceptAc(i: number) { if (slashMode) insertCommand(cmdCands[i].name); else insertMention(mentionToken(mCands[i])); }
-  function onComposerKey(e: React.KeyboardEvent<HTMLInputElement>) {
+  function onComposerKey(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.nativeEvent.isComposing) return;
     if (acOpen) {
       if (e.key === 'ArrowDown') { e.preventDefault(); setMIdx((i) => (i + 1) % acLen); return; }
       if (e.key === 'ArrowUp') { e.preventDefault(); setMIdx((i) => (i - 1 + acLen) % acLen); return; }
-      if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); acceptAc(Math.min(mIdx, acLen - 1)); return; }
+      if ((e.key === 'Enter' && !e.shiftKey) || e.key === 'Tab') { e.preventDefault(); acceptAc(Math.min(mIdx, acLen - 1)); return; }
       if (e.key === 'Escape') { e.preventDefault(); setMention(null); setText((t) => (slashMode ? t + ' ' : t)); return; }
     }
     if (e.key === 'Escape' && replyTo) { e.preventDefault(); setReplyTo(null); return; }
-    if (e.key === 'Enter') send();
+    if (e.key === 'ArrowUp' && text.length === 0 && !replyTo && staged.length === 0) {
+      for (let index = messages.length - 1; index >= 0; index--) {
+        const message = messages[index];
+        if (!message.mine || message.sys || message.sid == null || !message.text || message.status === 'failed') continue;
+        e.preventDefault();
+        detachBottomFollow();
+        virtuosoRef.current?.scrollToIndex({ index, align: 'center', behavior: 'smooth' });
+        setEditing({ id: message.id, sid: message.sid });
+        setEditText(message.text);
+        setActionsFor(null);
+        return;
+      }
+    }
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
   }
 
   const mentionNames = (() => { const s = new Set<string>(); for (const mm of members) { s.add(mm.username.toLowerCase()); s.add(mm.displayName.toLowerCase()); } ['все', 'all', 'everyone'].forEach((w) => s.add(w)); return s; })();
@@ -2420,7 +2725,24 @@ function Chat() {
   };
 
   return (
-    <div id="chat" className={catsWallpaper ? 'cats-wallpaper' : undefined}>
+    <div
+      id="chat"
+      className={[catsWallpaper ? 'cats-wallpaper' : '', dragActive ? 'drop-active' : ''].filter(Boolean).join(' ') || undefined}
+      onDragEnter={onChatDragEnter}
+      onDragOver={onChatDragOver}
+      onDragLeave={onChatDragLeave}
+      onDrop={onChatDrop}
+    >
+      {dragActive ? (
+        <div
+          className="chat-drop-overlay"
+          role="status"
+          aria-live="polite"
+          style={{ position: 'absolute', inset: 12, zIndex: 50, display: 'grid', placeItems: 'center', pointerEvents: 'none', border: '2px dashed var(--accent)', borderRadius: 16, background: 'color-mix(in srgb, var(--workspace-main) 88%, transparent)', color: 'var(--txt-h)', fontWeight: 700 }}
+        >
+          Отпусти файлы, чтобы прикрепить
+        </div>
+      ) : null}
       <div className="chat-feed">
         {messages.length === 0 ? (
           <div id="msgs"><div className="msgs-inner"><div id="chatEmpty"><span className="chat-empty-icon"><Icon name="chat" /></span><b>Начало общего чата</b><span>Здесь можно писать, отвечать, делиться файлами и реакциями.</span></div></div></div>
@@ -2522,8 +2844,8 @@ function Chat() {
       {replyTo ? (
         <div className="reply-bar">
           <Icon name="reply" sm />
-          <span className="rb-to">Ответ <b style={{ color: (byName.get(replyTo.who || '') && roleColorOf(byName.get(replyTo.who || '')!)) || avColor(replyTo.who || '', replyTo.color) }}>{replyTo.who}</b></span>
-          <span className="rb-text">{replySnippet(buildReplyRef(replyTo))}</span>
+          <span className="rb-to">Ответ <b style={{ color: (byName.get(replyTo.author) && roleColorOf(byName.get(replyTo.author)!)) || avColor(replyTo.author, byName.get(replyTo.author)?.avatarColor ?? 0) }}>{replyTo.author}</b></span>
+          <span className="rb-text">{replySnippet(replyTo)}</span>
           <button className="rb-close" aria-label="Отменить ответ" data-tip="Отменить · Esc" onClick={() => setReplyTo(null)}><Icon name="close" sm /></button>
         </div>
       ) : null}
@@ -2534,9 +2856,10 @@ function Chat() {
               {s.kind === 'image' ? <img className="attach-thumb" src={s.previewUrl} alt="" /> : <div className="attach-file-ic"><Icon name="file" /></div>}
               <div className="attach-meta">
                 <span className="attach-name">{s.name}</span>
-                <span className="attach-size">{s.status === 'error' ? 'Ошибка загрузки' : fmtSize(s.size)}</span>
+                <span className="attach-size" title={s.error}>{s.status === 'error' ? 'Ошибка загрузки' : fmtSize(s.size)}</span>
               </div>
               {s.status === 'uploading' ? <span className="spin" /> : null}
+              {s.status === 'error' ? <button className="attach-retry" aria-label={`Повторить загрузку ${s.name}`} data-tip="Повторить загрузку" onClick={() => retryStaged(s.key)}><Icon name="refresh" sm /></button> : null}
               <button className="attach-remove" aria-label={`Убрать вложение ${s.name}`} data-tip="Убрать" onClick={() => removeStaged(s.key)}><Icon name="close" sm /></button>
             </div>
           ))}
@@ -2549,15 +2872,20 @@ function Chat() {
         <button className="emo-toggle" aria-label="Прикрепить файл" data-tip="Прикрепить файл" onClick={() => attachFileRef.current?.click()}><Icon name="attach" /></button>
         <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple style={{ display: 'none' }} onChange={(e) => { const files = Array.from(e.target.files || []); if (files.length) stageFiles(files, 'image'); e.target.value = ''; }} />
         <input ref={attachFileRef} type="file" multiple style={{ display: 'none' }} onChange={(e) => { const files = Array.from(e.target.files || []); if (files.length) stageFiles(files, 'file'); e.target.value = ''; }} />
-        <input id="msgIn" placeholder="Написать в #общий" aria-label="Сообщение в общий чат" maxLength={1000} autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false} name="chat-message" value={text}
+        <textarea ref={composerRef} id="msgIn" rows={1} style={{ resize: 'none' }} placeholder="Написать в #общий" aria-label="Сообщение в общий чат" aria-keyshortcuts="Enter Shift+Enter ArrowUp" maxLength={1000} autoComplete="off" autoCorrect="on" autoCapitalize="sentences" spellCheck name="chat-message" value={text}
           onPaste={(e) => {
-            const items = e.clipboardData?.items; if (!items) return;
-            const imgs: File[] = [];
-            for (let i = 0; i < items.length; i++) { if (items[i].type.startsWith('image/')) { const f = items[i].getAsFile(); if (f) imgs.push(f); } }
-            if (imgs.length) { e.preventDefault(); stageFiles(imgs, 'image'); }
+            const files = Array.from(e.clipboardData?.files || []);
+            if (!files.length) {
+              for (const item of Array.from(e.clipboardData?.items || [])) {
+                if (item.kind !== 'file') continue;
+                const file = item.getAsFile();
+                if (file) files.push(file);
+              }
+            }
+            if (files.length) { e.preventDefault(); stageFiles(files); }
           }}
           onChange={(e) => { const v = e.target.value; setText(v); if (v.trim()) E.sendTyping(); setMention(detectMention(v, e.target.selectionStart ?? v.length)); setMIdx(0); }} onKeyDown={onComposerKey} />
-        <button id="sendBtn" className={(text.trim() || staged.some((s) => s.status !== 'error')) ? '' : 'empty'} aria-label={sendQueued ? 'Сообщение отправится после загрузки вложений' : 'Отправить сообщение'} data-tip={sendQueued ? 'Отправится, как только вложения загрузятся' : 'Отправить · Enter'} onClick={send}>
+        <button id="sendBtn" disabled={staged.some((s) => s.status === 'error')} className={(text.trim() || staged.some((s) => s.status !== 'error')) ? '' : 'empty'} aria-label={staged.some((s) => s.status === 'error') ? 'Повторите загрузку или уберите вложение перед отправкой' : sendQueued ? 'Сообщение отправится после загрузки вложений' : 'Отправить сообщение'} data-tip={staged.some((s) => s.status === 'error') ? 'Сначала повтори загрузку или убери файл' : sendQueued ? 'Отправится, как только вложения загрузятся' : 'Отправить · Enter'} onClick={send}>
           {sendQueued ? <span className="spin" style={{ margin: 0, width: 14, height: 14 }} /> : <Icon name="send" />}
         </button>
       </div>
@@ -2961,6 +3289,19 @@ export function ServerView() {
     sync(); mq.addEventListener('change', sync);
     return () => mq.removeEventListener('change', sync);
   }, []);
+  useEffect(() => {
+    const showNotificationChat = () => {
+      if (!peekNotificationDestination(active.id)) return;
+      setMtab('main');
+      if (split) {
+        setShowChat(true);
+        setSupportOpen(false);
+      }
+    };
+    showNotificationChat();
+    window.addEventListener(NOTIFICATION_DESTINATION_EVENT, showNotificationChat);
+    return () => window.removeEventListener(NOTIFICATION_DESTINATION_EVENT, showNotificationChat);
+  }, [active.id, split]);
   const chatVisible = (!singlePaneWorkspace || mtab === 'main') && (!split || showChat);
   useEffect(() => {
     sendActiveChat(chatVisible ? active.id : null);

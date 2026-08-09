@@ -274,11 +274,16 @@ export function VoiceControls({ up }: { up?: boolean }) {
   const mode = getSettings().mode;
   const muted = eng.localMicMuted;
   const ptt = mode === 'ptt' && !eng.deafened;
-  const micClass = 'vd-btn' + (muted && !ptt ? ' danger-on' : '') + (muted && ptt && !eng.pttDown ? ' ptt-idle' : '') + (eng.pttDown ? ' ptt-live' : '');
+  const connection = eng.voiceConnection ?? (eng.reconnecting ? 'reconnecting' : (eng.voiceConnecting ? 'connecting' : (eng.inVoice ? 'connected' : 'disconnected')));
+  const pttLive = ptt && eng.pttDown && !muted && connection === 'connected';
+  const pttIdle = ptt && !pttLive;
+  const micClosed = muted || pttIdle;
+  const micClass = 'vd-btn' + (muted ? ' danger-on' : (pttLive ? ' ptt-live' : (pttIdle ? ' ptt-idle' : '')));
+  const micLabel = muted ? 'Включить микрофон' : (pttIdle ? 'PTT: микрофон закрыт' : (pttLive ? 'PTT: идёт передача' : 'Выключить микрофон'));
   return (
     <div className="vd-controls">
       <div className="vd-grp">
-        <button className={micClass} aria-pressed={muted} aria-label={muted ? 'Включить микрофон' : 'Выключить микрофон'} data-tip="Микрофон · M" onClick={() => E.toggleMic()}><Icon name={muted ? 'mic-off' : 'mic'} sm /></button>
+        <button className={micClass} aria-pressed={muted} aria-label={micLabel} data-tip={ptt ? micLabel : 'Микрофон · M'} onClick={() => E.toggleMic()}><Icon name={micClosed ? 'mic-off' : 'mic'} sm /></button>
         <DeviceMenu kind="input" up={up} />
       </div>
       <div className="vd-grp">
@@ -301,27 +306,39 @@ function VoicePanel({ controls }: { controls?: boolean }) {
   const servers = useStore((s) => s.servers);
   const active = useStore((s) => s.active);
   const openServer = useStore((s) => s.openServer);
-  const onVoiceServer = active?.id === eng.voiceServerId;
-  const srv = servers.find((s) => s.id === eng.voiceServerId);
+  const voiceServerId = eng.voiceServerId || eng.lostVoiceServerId || null;
+  const voiceChannel = eng.myVoiceChannel || eng.lostVoiceChannel || null;
+  const connection = eng.voiceConnection ?? (eng.reconnecting ? 'reconnecting' : (eng.voiceConnecting ? 'connecting' : (eng.inVoice ? 'connected' : 'disconnected')));
+  const disconnected = connection === 'disconnected';
+  const onVoiceServer = active?.id === voiceServerId;
+  const srv = servers.find((s) => s.id === voiceServerId);
   const srvName = srv?.name || (onVoiceServer ? active?.name : '') || 'Голосовой сервер';
-  const chName = onVoiceServer ? (active?.channels?.find((c) => c.id === eng.myVoiceChannel)?.name || '') : '';
-  const goToVoice = () => { if (eng.voiceServerId) openServer(eng.voiceServerId); };
-  const q = eng.voiceQuality;
-  const qLabel = q === 'excellent' ? 'отличное' : q === 'good' ? 'хорошее' : q === 'poor' ? 'слабое' : q === 'lost' ? 'потеряно' : 'соединение…';
-  const qTip = (eng.voicePing != null ? eng.voicePing + ' мс' : '—') + ' · ' + qLabel;
-  const status = eng.voiceConnecting ? 'Подключение…' : 'Голосовая связь подключена';
+  const chName = onVoiceServer ? (active?.channels?.find((c) => c.id === voiceChannel)?.name || '') : '';
+  const canReconnect = disconnected && onVoiceServer && !!voiceChannel && eng.roomReady;
+  const goToVoice = () => {
+    if (canReconnect && voiceChannel) { void E.joinVoice(voiceChannel); return; }
+    if (voiceServerId) openServer(voiceServerId);
+  };
+  const q = connection === 'connected' ? eng.voiceQuality : (connection === 'connecting' ? 'unknown' : 'lost');
+  const qLabel = connection === 'reconnecting' ? 'переподключение'
+    : disconnected ? 'нет соединения'
+      : q === 'excellent' ? 'отличное' : q === 'good' ? 'хорошее' : q === 'poor' ? 'слабое' : q === 'lost' ? 'потеряно' : 'соединение…';
+  const qTip = (connection === 'connected' && eng.voicePing != null ? eng.voicePing + ' мс' : '—') + ' · ' + qLabel;
+  const status = connection === 'reconnecting' ? 'Переподключение…'
+    : disconnected ? 'Нет соединения'
+      : connection === 'connecting' ? 'Подключение…' : 'Голосовая связь подключена';
   return (
     <div className="vd-panel">
       <div className="vd-status">
-        <button className="vd-info" onClick={goToVoice} data-tip="К голосовому серверу">
+        <button className="vd-info" onClick={goToVoice} data-tip={canReconnect ? 'Переподключиться' : 'К голосовому серверу'}>
           <span className="vd-mark"><Icon name="speaker" sm /></span>
           <div className="vd-txt"><b>{status}</b><span>{chName ? chName + ' · ' : ''}{srvName}</span></div>
         </button>
         <div className={'conn-ind q-' + q} data-tip={qTip} aria-label={'Качество связи: ' + qTip} tabIndex={0}><i /><i /><i /></div>
-        <button className="vd-btn vd-leave" aria-label="Выйти из голосового канала" data-tip="Выйти из голосового" onClick={() => E.leaveVoice()}><Icon name="leave" sm /></button>
+        <button className="vd-btn vd-leave" aria-label={disconnected ? 'Скрыть отключённый голосовой канал' : 'Выйти из голосового канала'} data-tip={disconnected ? 'Скрыть' : 'Выйти из голосового'} onClick={() => disconnected ? E.dismissLostVoice() : E.leaveVoice()}><Icon name="leave" sm /></button>
       </div>
-      {controls ? <VoiceControls up /> : null}
-      <MusicPlayer enabled={!!srv?.musicEnabled} />
+      {controls && eng.inVoice ? <VoiceControls up /> : null}
+      {eng.inVoice ? <MusicPlayer enabled={!!srv?.musicEnabled} /> : null}
     </div>
   );
 }
@@ -330,7 +347,7 @@ function VoicePanel({ controls }: { controls?: boolean }) {
 //          'floating' — компактный плавающий в левом нижнем углу (главная). Оба зовут одну VoicePanel.
 export function VoiceDock({ variant }: { variant: 'inline' | 'floating' }) {
   const eng = useEngine();
-  if (!eng.inVoice || !eng.voiceServerId) return null;
+  if ((!eng.inVoice || !eng.voiceServerId) && !eng.lostVoiceServerId) return null;
   // inline (server-view): контролы в нижней аккаунт-панели, тут только статус+выход+музыка.
   // floating (главная): аккаунт-панели нет → контролы здесь.
   if (variant === 'inline') return <div className="vd-inline"><VoicePanel controls={false} /></div>;

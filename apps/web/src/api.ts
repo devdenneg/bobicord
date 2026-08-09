@@ -273,6 +273,8 @@ export const api = {
     const q = qs.toString();
     return req<{ messages: HistoryMessage[]; hasMore: boolean }>('GET', `/servers/${id}/messages${q ? '?' + q : ''}`);
   },
+  getMessage: (id: string, messageId: number) =>
+    req<{ message: HistoryMessage }>('GET', `/servers/${id}/messages/${messageId}`),
   postMessage: (id: string, text: string, em: Record<string, string>, image?: string, reply?: import('./types').ReplyRef, key?: string, files?: Attachment[], kind?: string, level?: number) => req<{ ok: boolean; id?: number }>('POST', `/servers/${id}/messages`, { text, em, image, reply, key, files, kind, level }),
   reactMessage: (id: string, mid: number, emoteId: string, emoteName: string, add: boolean) => req<{ ok: boolean }>('POST', `/servers/${id}/messages/${mid}/react`, { emoteId, emoteName, add }),
   editMessage: (id: string, mid: number, text: string) => req<{ ok: boolean }>('PATCH', `/servers/${id}/messages/${mid}`, { text }),

@@ -27,12 +27,17 @@ export interface GameStatus { name: string; icon?: string }
 export interface PeerState { online: boolean; inVoice: boolean; micMuted: boolean; streaming: boolean; deafened: boolean; away: boolean; game?: GameStatus | null }
 export interface StreamInfo { key: string; identity: string; isLocal: boolean; appName?: string; appIcon?: string }
 export type VoiceQuality = 'excellent' | 'good' | 'poor' | 'lost' | 'unknown';
+export type VoiceConnectionState = 'connected' | 'connecting' | 'reconnecting' | 'disconnected';
 export interface Snapshot {
   connected: boolean;
   roomReady: boolean; // комната реально поднялась (после await connect), а не просто создан объект Room
   reconnecting: boolean;
   voiceQuality: VoiceQuality; // качество связи в голосовом (LiveKit ConnectionQuality)
   voicePing: number | null;   // RTT до сервера, мс (из WebRTC-статистики)
+  // Optional keeps the static pre-auth snapshot backward-compatible; a live Engine always fills these fields.
+  voiceConnection?: VoiceConnectionState;
+  lostVoiceServerId?: string | null;
+  lostVoiceChannel?: string | null;
   inVoice: boolean;
   voiceConnecting: boolean;                    // оптимистично зашли, но mic ещё не опубликован (идёт подключение)
   myVoiceChannel: string | null;              // id голосового канала, в котором я сейчас (null = не в голосовом)
@@ -186,6 +191,12 @@ export class Engine {
   private myChannelPeers = new Set<string>(); // кто в моём голосовом канале (диф → entry/exit при входе/выходе/смене канала)
   private roomReady = false; // true только после успешного await r.connect() (не просто наличие объекта Room)
   private reconnecting = false;
+  private reconnectingRooms = new Set<Room>();
+  private voiceReconnecting = false;
+  // Terminal disconnect clears the voice lease, but the dock keeps the failed target visible
+  // until the user reconnects or dismisses it instead of silently disappearing.
+  private lostVoiceServerId: string | null = null;
+  private lostVoiceChannel: string | null = null;
   private connQuality: VoiceQuality = 'unknown'; // качество связи (обновляется по событию LiveKit)
   private pingMs: number | null = null;          // RTT до сервера, мс (опрос статистики в голосовом)
   private connTimer: number | null = null;       // таймер опроса пинга (только в голосовом)
@@ -432,9 +443,19 @@ export class Engine {
     const pending: Record<string, true> = {}; this.pendingWatch.forEach((u) => (pending[u] = true));
     const watchers: Record<string, { name: string; color: number; avatarUrl?: string }[]> = {};
     this.streamWatchers.forEach((m, sid) => (watchers[sid] = [...m.values()].map((v) => ({ name: v.name, color: v.color, avatarUrl: v.avatarUrl }))));
+    const voiceConnection: VoiceConnectionState = this.lostVoiceServerId
+      ? 'disconnected'
+      : (!this.inVoice
+          ? 'disconnected'
+          : (this.voiceReconnecting
+              ? 'reconnecting'
+              : ((this.voiceConnecting || this.voiceLeaseVerifying || !this.voiceRoom || !this.readyRooms.has(this.voiceRoom))
+                  ? 'connecting'
+                  : 'connected')));
     return {
       connected: !!this.viewRoom, roomReady: this.roomReady, reconnecting: this.reconnecting,
       voiceQuality: this.inVoice ? this.connQuality : 'unknown', voicePing: this.inVoice ? this.pingMs : null,
+      voiceConnection, lostVoiceServerId: this.lostVoiceServerId, lostVoiceChannel: this.lostVoiceChannel,
       inVoice: this.inVoice, voiceConnecting: this.inVoice && (this.voiceConnecting || this.voiceLeaseVerifying), myVoiceChannel: this.currentVc, voiceServerId: this.voiceServerId, voiceChannels, channelActiveSince, deafened: this.deafened,
       localMicMuted: this.localMicMuted(), micUnavailable: this.noMic, pttDown: this.pttDown,
       presence, speaking, streams, watching, pending, watchers, messages: this.messages, chatHasMore: this.chatMore, chatTrimmed: this.trimmedFront, chatPrepended: this.chatPrepended,
@@ -537,10 +558,14 @@ export class Engine {
       .on(RoomEvent.TrackMuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.voiceRoom?.localParticipant && !this.deafToggling) playSound('mute'); this.emit(); })
       .on(RoomEvent.Reconnecting, () => {
         if (r !== this.viewRoom && r !== this.voiceRoom) return;
-        this.reconnecting = true;
+        this.reconnectingRooms.add(r);
+        this.reconnecting = this.reconnectingRooms.size > 0;
         // До серверной проверки lease держим uplink в тишине: старый ПК не должен успеть заговорить
         // после reconnect, если во время offline телефон уже стал owner.
         if (r === this.voiceRoom && this.inVoice) {
+          this.voiceReconnecting = true;
+          // Reconnect always requires a fresh PTT press; a held key must not resume after a gap.
+          this.pttDown = false;
           this.voiceLeaseVerifying = true;
           ++this.voiceLeaseVerifySeq;
           this.applyGate();
@@ -549,7 +574,9 @@ export class Engine {
       })
       .on(RoomEvent.Reconnected, () => {
         if (r !== this.viewRoom && r !== this.voiceRoom) return;
-        this.reconnecting = false;
+        this.reconnectingRooms.delete(r);
+        this.reconnecting = this.reconnectingRooms.size > 0;
+        if (r === this.voiceRoom) this.voiceReconnecting = false;
         // Reconnect восстанавливает ТЕКУЩИЙ intent, но не делает новый vclaim: старый ПК, который был
         // offline во время handoff на телефон, не имеет права самовольно отобрать голос обратно.
         if (r === this.voiceRoom && this.inVoice && this.currentVc) {
@@ -651,8 +678,12 @@ export class Engine {
     if (!wasViewing && !wasVoice) return;
     const lostChannel = wasVoice ? this.currentVc : null;
     this.readyRooms.delete(room);
-    this.reconnecting = false;
+    this.reconnectingRooms.delete(room);
+    this.reconnecting = this.reconnectingRooms.size > 0;
     if (wasVoice) {
+      this.voiceReconnecting = false;
+      this.lostVoiceServerId = lostChannel ? (this.voiceServerId || serverId) : null;
+      this.lostVoiceChannel = lostChannel;
       ++this.voiceEpoch;
       this.voiceClaimPending = 0; this.deferredVoiceLease = null; this.matchedVoiceLease = null;
       this.voiceLeaseVerifying = false; ++this.voiceLeaseVerifySeq;
@@ -742,7 +773,7 @@ export class Engine {
     this.voiceOutputRoom = null; this.voiceOutputSink = ''; this.voiceOutputPending = null;
     if (this.outputDeviceTimer) { clearTimeout(this.outputDeviceTimer); this.outputDeviceTimer = null; }
     void this.stopMic(oldVoiceRoom);
-    this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.roomReady = false; this.screenStream = null; this.noMic = false; // deafened/manualMute НЕ трогаем — персист-интент
+    this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.voiceReconnecting = false; this.lostVoiceServerId = null; this.lostVoiceChannel = null; this.roomReady = false; this.screenStream = null; this.noMic = false; // deafened/manualMute НЕ трогаем — персист-интент
     // рвём ОБЕ комнаты (при расцепе разные; при shared — одна, Set схлопнёт дубль)
     new Set([this.viewRoom, this.voiceRoom].filter(Boolean)).forEach((rm) => this.disconnectRoom(rm as Room));
     this.viewRoom = null; this.voiceRoom = null; this.viewServerId = ''; this.voiceServerId = null; this.emit();
@@ -1087,6 +1118,8 @@ export class Engine {
     };
   }
   private disconnectRoom(room: Room) {
+    this.reconnectingRooms.delete(room);
+    this.reconnecting = this.reconnectingRooms.size > 0;
     this.intentionalDisconnects.add(room);
     try { void room.disconnect(); } catch { /**/ }
   }
@@ -1260,6 +1293,7 @@ export class Engine {
     const targetRoom = this.viewRoom;
     const targetServer = this.viewServerId; // вход в голос — на СМОТРИМОМ сервере (его каналы в ServerView)
     if (!channelId || !targetRoom || !targetServer) return;
+    this.voiceReconnecting = false;
     // уже в голосовом на ЭТОМ же сервере → только смена канала (мик остаётся)
     if (this.inVoice && this.voiceServerId === targetServer) {
       if (this.currentVc === channelId && !this.voiceConnecting) return;
@@ -1378,6 +1412,7 @@ export class Engine {
     this.reconcileChannelSounds(true); // сеем состав канала БЕЗ звука (не проигрываем entry по всем, кто уже там)
     this.startConnPoll();
     this.voiceConnecting = false;
+    this.lostVoiceServerId = null; this.lostVoiceChannel = null;
     playSound('entry'); // сам зашедший тоже слышит вход (остальные в канале — через onRemotePub)
     this.emit();
   }
@@ -1465,7 +1500,7 @@ export class Engine {
     this.voiceLeaseSession = ''; this.voiceLeaseChannel = ''; this.voiceLeaseEpoch = 0;
     if (leaseSession && leaseEpoch > 0) void api.releaseVoiceLease(leaseSession, leaseEpoch).catch(() => {}); // stale release сервер безопасно отвергнет
     // оптимистично: сразу убираем себя из канала (UI не ждёт async-очистку mic/треков)
-    this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.pttDown = false; this.myVcAt = null; this.noMic = false; // deafened/manualMute НЕ сбрасываем — персист-интент до след. входа
+    this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.voiceReconnecting = false; this.pttDown = false; this.myVcAt = null; this.noMic = false; // deafened/manualMute НЕ сбрасываем — персист-интент до след. входа
     this.myChannelPeers.clear(); // вышел — состав моего канала сброшен (другие услышат мой выход по unpub мика / vc'')
     playSound('exit'); // сам вышедший тоже слышит выход (остальные в канале — через onRemoteUnpub)
     this.emit();
@@ -1490,6 +1525,13 @@ export class Engine {
     this.voiceRoom = null; this.voiceServerId = null;
     this.liveKitT.setBroadcastRoom?.(null); // вне голоса — вещание падает на смотримую комнату (fallback)
     this.screenAudioEls.forEach((a) => (a.muted = false));
+    this.emit();
+  }
+
+  dismissLostVoice() {
+    if (!this.lostVoiceServerId && !this.lostVoiceChannel) return;
+    this.lostVoiceServerId = null;
+    this.lostVoiceChannel = null;
     this.emit();
   }
 
@@ -2042,9 +2084,26 @@ export class Engine {
     this.emit();
   }
   isDeafened() { return this.deafened; }
-  pttPress() { if (getSettings().mode !== 'ptt' || !this.inVoice || this.deafened || this.pttDown) return; this.pttDown = true; this.applyGate(); this.emit(); }
-  pttRelease() { if (getSettings().mode !== 'ptt' || !this.inVoice || !this.pttDown) return; this.pttDown = false; this.applyGate(); this.emit(); }
-  onModeChanged() { if (!this.inVoice) return; this.pttDown = false; this.applyGate(); this.emit(); }
+  pttPress() {
+    if (getSettings().mode !== 'ptt' || !this.inVoice || this.deafened || this.manualMute || this.noMic
+      || this.voiceConnecting || this.voiceReconnecting || this.voiceLeaseVerifying || this.voiceClaimPending !== 0 || this.pttDown) return;
+    this.pttDown = true; this.applyGate(); this.emit();
+  }
+  // Safe for blur/visibility/network handlers: always closes the gate even if mode or voice state
+  // changed before the matching keyup was delivered.
+  forcePttRelease() {
+    const changed = this.pttDown;
+    this.pttDown = false;
+    this.applyGate();
+    if (changed) this.emit();
+  }
+  pttRelease() { this.forcePttRelease(); }
+  onModeChanged() {
+    if (!this.inVoice) return;
+    const wasDown = this.pttDown;
+    this.forcePttRelease();
+    if (!wasDown) this.emit();
+  }
 
   /* ---------- speaking ---------- */
   private attachAnalyser(username: string, mst: MediaStreamTrack) {
@@ -2761,7 +2820,14 @@ export class Engine {
     if (mentioned.length) {
       // звук тега играет само уведомление (notify) — как в Discord; на обычные сообщения не звучим
       this.hooks.toast(mentioned.length === 1 ? `${mentioned[0].who} упомянул тебя` : `Тебя упомянули · ${mentioned.length}`, 'info');
-      notify('mention', { title: mentioned.length === 1 ? String(mentioned[0].who) : 'Упоминания', body: mentioned.length === 1 ? String(mentioned[0].text || '').slice(0, 140) : `Тебя упомянули · ${mentioned.length}`, tag: 'mention:' + this.viewServerId });
+      const exactMention = mentioned.length === 1 && mentioned[0].sid != null ? mentioned[0] : null;
+      const tag = 'mention:' + this.viewServerId + (exactMention ? ':' + exactMention.sid : '');
+      notify('mention', {
+        title: mentioned.length === 1 ? String(mentioned[0].who) : 'Упоминания',
+        body: mentioned.length === 1 ? String(mentioned[0].text || '').slice(0, 140) : `Тебя упомянули · ${mentioned.length}`,
+        tag,
+        destination: exactMention ? { serverId: this.viewServerId, messageId: exactMention.sid! } : { serverId: this.viewServerId },
+      });
     }
     if (mapped.length || adopted || canonicalized || duplicateLocalIds.size || reactionsChanged) this.emit();
   }
@@ -3027,7 +3093,8 @@ export class Engine {
         if (!own && mentioned) { // тост+notify ТОЛЬКО когда тегнули/реплайнули; звук тега даёт само notify (Discord)
           this.hooks.toast(repliedToMe ? `${d.name} ответил тебе` : `${d.name} упомянул тебя`, 'info');
           const fallback = d.img ? '🖼 изображение' : (d.files && d.files.length ? '📎 вложение' : '');
-          notify('mention', { title: d.name, body: String(d.text || '').slice(0, 140) || fallback, tag: 'mention:' + this.viewServerId });
+          const tag = 'mention:' + this.viewServerId + (d.mkey ? ':' + String(d.mkey) : '');
+          notify('mention', { title: d.name, body: String(d.text || '').slice(0, 140) || fallback, tag });
         }
       }
       else if (d.t === 'clear') {

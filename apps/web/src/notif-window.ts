@@ -9,6 +9,10 @@ const p = new URLSearchParams(location.search);
 const kind = (p.get('k') as Kind) || 'mention';
 const title = p.get('t') || 'RelayApp';
 const body = p.get('b') || '';
+const tag = p.get('tag') || '';
+const serverId = p.get('server') || '';
+const parsedMessageId = Number(p.get('message'));
+const messageId = Number.isSafeInteger(parsedMessageId) && parsedMessageId > 0 ? parsedMessageId : undefined;
 const DURATION = kind === 'update' ? 9000 : 6000;
 
 // Пресеты типа: подпись, акцент, глиф. Сразу видно, ЧТО за событие.
@@ -100,6 +104,14 @@ card.querySelector('.cls')!.addEventListener('click', (e) => { e.stopPropagation
 // клик по карточке — развернуть/сфокусировать главное окно и закрыть уведомление
 card.addEventListener('click', async () => {
   try {
+    if (tag || serverId) {
+      const { emitTo } = await import('@tauri-apps/api/event');
+      await emitTo('main', 'relay-notification-destination', {
+        tag,
+        ...(serverId ? { serverId } : {}),
+        ...(messageId ? { messageId } : {}),
+      }).catch(() => {});
+    }
     const main = await Window.getByLabel('main');
     if (main) { await main.unminimize().catch(() => {}); await main.show().catch(() => {}); await main.setFocus().catch(() => {}); }
   } catch { /**/ }
