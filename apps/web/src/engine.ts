@@ -14,6 +14,7 @@ import type { VideoTransport } from './transport/videoTransport';
 import { LiveKitVideoTransport } from './transport/livekitVideo';
 import { TreeVideoTransport } from './transport/treeVideo';
 import { createDenoiseNode, destroyDenoiseNode } from './denoise';
+import { createVadNode, destroyVadNode } from './vad';
 import { userVolumeToGain } from './volumeCurve';
 import {
   CHAT_SESSION_MESSAGE_LIMIT,
@@ -63,6 +64,7 @@ type SinkableAudioContext = AudioContext & {
 };
 
 // шкала чувствительности ввода: rms(0..1) -> dB(-80..0) -> норм.уровень(0..1), сравнимый с порогом
+const VAD_HOLD_MS = 400; // «хвост» гейта активации голосом после падения ниже порога (совпадает с прежним hold=8 spLoop при 60fps)
 const WATCH_MAX = 4; // грид: сколько чужих стримов зритель смотрит разом (веб — tree-WS/PC на стрим, натив — Rust relay-слот на стрим)
 const STREAM_EDGE_GRACE_MS = 500;
 const STREAM_MESSAGE_AGGREGATE_MS = 30_000;
@@ -281,6 +283,10 @@ export class Engine {
 
   // VAD-гейт микрофона (режим "активация голосом"): передаём звук только выше порога чувствительности
   private vadOpen = false;
+  // Детектор уровня своего мика на аудио-потоке (не на rAF) — работает и в фоновой вкладке. Владеет
+  // vadOpen, пока жив; иначе фолбэк на rAF-анализатор spLoop (см. setupVadWorklet/applyLocalLevel).
+  private micVadNode: AudioWorkletNode | null = null;
+  private selfSpeakUntil = 0; // время (performance.now), до которого держим гейт открытым после речи
   private noiseFloorDb = MIN_DB + 20; // адаптивная оценка шумового фона для авто-режима
 
   // живой индикатор уровня для настроек (работает и вне звонка — временный захват микрофона)
@@ -1669,12 +1675,54 @@ export class Engine {
     this.micGain = gain;
     this.micDenoise = denoise;
     this.micVadDest = vadDest;
-    // индикатор «говорит» — с очищенного (после denoise) сигнала, ДО гейта
+    // индикатор «говорит» + VAD на rAF-анализаторе — сразу (рабочий на переднем плане и на время загрузки
+    // ворклета); как только VAD-ворклет поднимется, он перехватит vadOpen и снимет свой мик со spLoop.
     this.attachAnalyser(this.me.username, vadDest.stream.getAudioTracks()[0]);
     this.applyGate();
     this.ensureVoiceAudioRunning(); // добить, если контекст всё ещё suspended (анлок на первый жест + watchdog)
     this.noMic = false;
+    // VAD на аудио-потоке (не на rAF): гейт активации голосом должен работать и в фоновой вкладке, где
+    // requestAnimationFrame заморожен и spLoop не двигал бы vadOpen (микрофон молча гейтился в тишину).
+    void this.setupVadWorklet(ctx, preGate, op);
     return true;
+  }
+  // Поднять VAD-ворклет и передать ему владение vadOpen. Тап строго на preGate (после денойза, канал 0),
+  // не на micGain — иначе детектор слушал бы уже замолченный (gain=0) сигнал и залипал закрытым. При
+  // неудаче (нет AudioWorklet / гонка stop во время addModule) остаёмся на rAF-анализаторе spLoop.
+  private async setupVadWorklet(ctx: AudioContext, preGate: AudioNode, epoch: number) {
+    const node = await createVadNode(ctx);
+    if (!node) return; // фолбэк: spLoop уже двигает vadOpen с rAF-анализатора этого мика
+    if (this.micEpoch !== epoch || this.micActx !== ctx) { destroyVadNode(node); return; } // мик пересобран/остановлен
+    try {
+      preGate.connect(node); // тап строго на preGate (после денойза, канал 0), НЕ на micGain
+      node.port.onmessage = (e) => {
+        if (this.micVadNode !== node) return;
+        // Первое сообщение = ворклет реально обрабатывает (0-output leaf гарантированно пуллится этим
+        // движком) → передаём ему владение vadOpen и снимаем rAF-анализатор своего мика со spLoop, чтобы
+        // не дублировать расчёт. Если ворклет вдруг не заработал бы — spLoop так и остаётся драйвером
+        // (фолбэк без регрессии). spLoop продолжает вести индикаторы «говорит» у ЧУЖИХ пиров.
+        if (this.analysers.has(this.me.username)) this.detachAnalyser(this.me.username, true); // keepSpeaking: applyLocalLevel ниже ведёт индикатор дальше без лишнего edge
+        this.applyLocalLevel(typeof e.data === 'number' ? e.data : 0);
+      };
+      this.micVadNode = node;
+    } catch { destroyVadNode(node); this.micVadNode = null; }
+  }
+  // Обработка уровня своего мика из VAD-ворклета: порог/хвост/шумовой фон + гейт + индикатор «говорю».
+  // Дублирует ветку isMe в spLoop, но с хвостом по времени (такт ворклета ≠ такту rAF).
+  private applyLocalLevel(rms: number) {
+    const db = rmsToDb(rms);
+    const norm = dbToNorm(db);
+    const threshold = this.thresholdNorm();
+    const on = norm >= threshold;
+    const now = performance.now();
+    if (on) this.selfSpeakUntil = now + VAD_HOLD_MS;
+    const spk = on || now < this.selfSpeakUntil;
+    this.updateNoiseFloor(db); // подъём медленный — фраза не продавит, постоянный шум со временем перекроет
+    this.levelListeners.forEach((f) => f(norm, spk, threshold));
+    if (spk !== this.vadOpen) { this.vadOpen = spk; this.applyGate(); }
+    const me = this.me.username;
+    if (spk && !this.speakingSet.has(me)) { this.speakingSet.add(me); this.emit(); }
+    else if (!spk && this.speakingSet.has(me)) { this.speakingSet.delete(me); this.emit(); }
   }
   // Гарантирует, что контекст ПУБЛИКАЦИИ микрофона (micActx) реально запущен. Браузер держит
   // AudioContext 'suspended' до пользовательского жеста в контексте страницы; startMic создаёт
@@ -1770,13 +1818,16 @@ export class Engine {
     const raw = this.micRaw; this.micRaw = null;
     const denoise = this.micDenoise; this.micDenoise = null;
     const vadDest = this.micVadDest; this.micVadDest = null;
+    const vadNode = this.micVadNode; this.micVadNode = null;
     const ctx = this.micActx; this.micActx = null;
     this.micGain = null;
     this.detachAnalyser(this.me.username);
     this.vadOpen = false;
+    this.selfSpeakUntil = 0;
     this.clearAudioUnlock();
     raw?.getTracks().forEach((t) => t.stop());
     destroyDenoiseNode(denoise);
+    destroyVadNode(vadNode);
     if (vadDest) { try { vadDest.disconnect(); } catch { /**/ } }
     const waits: Promise<unknown>[] = [];
     if (room && publishedTrack) {
@@ -2008,10 +2059,12 @@ export class Engine {
       if (!this.spRAF) this.spRAF = requestAnimationFrame(this.spLoop);
     } catch { /**/ }
   }
-  private detachAnalyser(username: string) {
+  // keepSpeaking — снять анализатор, НЕ трогая speakingSet (передача владения VAD ворклету: индикатор
+  // «говорю» дальше ведёт applyLocalLevel; иначе тут был бы лишний edge «замолчал»→«говорит» на хендофе).
+  private detachAnalyser(username: string, keepSpeaking = false) {
     const o = this.analysers.get(username);
     if (o) { try { o.src.disconnect(); } catch { /**/ } this.analysers.delete(username); }
-    if (this.speakingSet.delete(username)) this.emit();
+    if (!keepSpeaking && this.speakingSet.delete(username)) this.emit();
   }
   private spLoop = () => {
     this.spTick++;

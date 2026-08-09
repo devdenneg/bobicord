@@ -2,7 +2,7 @@
 // меряем RMS и подгоняем усиление под общий референс — так все звуки звучат ОДИНАКОВО громко,
 // независимо от исходной громкости файла (без внешних тулов вроде ffmpeg). Пользовательская
 // громкость («Громкость уведомлений») умножается сверху.
-import { getSettings } from './settings';
+import { getSettings, subscribeSettings } from './settings';
 
 const FILES = {
   entry: '/entry.wav',        // зашёл в голосовой (слышат все в канале + сам зашедший)
@@ -24,13 +24,51 @@ const TARGET_RMS = 0.14;
 const MAX_GAIN = 6; // потолок усиления тихого файла (чтобы шум/тишина не «взрывались»)
 
 let actx: AudioContext | null = null;
+let lastSink: string | null = null; // последний применённый deviceId вывода (антиспам setSinkId)
 const buffers: Partial<Record<SoundName, AudioBuffer>> = {};
 const norm: Partial<Record<SoundName, number>> = {}; // нормировочный множитель громкости на звук
 const loading: Partial<Record<SoundName, Promise<void>>> = {};
 
+// Разрешение «по умолчанию» ('') в конкретный deviceId по groupId — как engine.normalizedContextSink:
+// сырой setSinkId('default'/'') на этом проекте вёл себя ненадёжно (для голоса ради этого и заведён
+// normalizedContextSink), поэтому default резолвим в реальное устройство. Конкретный id — как есть.
+async function resolveSink(want: string): Promise<string> {
+  if (want) return want;
+  try {
+    const devices = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'audiooutput');
+    const def = devices.find((d) => d.deviceId === 'default');
+    return devices.find((d) => d.deviceId !== 'default' && !!def?.groupId && d.groupId === def.groupId)?.deviceId || '';
+  } catch { return ''; }
+}
+
+// Звуки должны идти в ТО ЖЕ устройство вывода, что и голос (иначе «иногда не слышно вход/выход» —
+// звук уходил в системный дефолт мимо выбранных наушников). AudioContext.setSinkId есть только на
+// десктоп-Chromium; на мобилках/Firefox его нет — там вывод и так выбирает система (no-op).
+async function applySink(): Promise<void> {
+  const a = actx as (AudioContext & { setSinkId?: (id: string) => Promise<void> }) | null;
+  if (!a || typeof a.setSinkId !== 'function') return;
+  const want = getSettings().output || '';
+  if (want === lastSink) return;
+  lastSink = want;
+  try { await a.setSinkId(await resolveSink(want)); }
+  catch { lastSink = null; try { await a.setSinkId(''); } catch { /**/ } } // устройство пропало → системный дефолт (повторим при след. смене)
+}
+
+function wake(): void { actx?.resume?.().catch(() => {}); }
+
 function ctx(): AudioContext {
-  if (!actx) actx = new AudioContext();
+  if (!actx) { actx = new AudioContext(); applySink(); }
   return actx;
+}
+
+// Контекст звуков (как micActx/outputCtx в engine) держим ЖИВЫМ. Родившийся 'suspended' до жеста —
+// либо уснувший — глушит ВСЕ звуки (вход/выход, мут, уведомления) молча, без ошибки. Резюмим на первом
+// жесте и при возврате на вкладку; звуки нужны и в фоне (слышно вход/выход, пока сидишь в другой
+// вкладке) — running-контекст в фоне не усыпляется, пока страница «живая» (WebRTC-звонок её держит).
+if (typeof window !== 'undefined') {
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) wake(); });
+  (['pointerdown', 'keydown', 'touchstart'] as const).forEach((ev) => window.addEventListener(ev, wake, { passive: true }));
+  subscribeSettings(applySink); // вывод звуков следует за выбранным устройством вывода
 }
 
 async function load(name: SoundName): Promise<void> {

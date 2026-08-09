@@ -20,6 +20,11 @@ export default defineConfig(({ mode, command }) => {
     define: { __APP_VERSION__: JSON.stringify(webVersion) },
     build: {
       outDir: 'dist', sourcemap: false, chunkSizeWarningLimit: 1500,
+      // AudioWorklet-модуль (vad-worklet) ОБЯЗАН быть отдельным same-origin файлом: CSP в Caddyfile
+      // разрешает script-src/worker-src только 'self' (+blob), но НЕ data:. Маленький воркет Vite по
+      // умолчанию инлайнит как data:-URL — тогда addModule() падает на CSP и VAD молча отваливается
+      // в фоновый баг (микрофон гейтится в тишину на неактивной вкладке). Форсим отдельный файл.
+      assetsInlineLimit: (filePath: string) => (filePath.endsWith('vad-worklet.js') ? false : undefined),
       // Вторая точка входа — окно кастомного нативного уведомления (лёгкая страница, без React-бандла).
       rollupOptions: { input: { main: 'index.html', notif: 'notif.html' } },
     },

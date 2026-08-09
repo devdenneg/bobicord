@@ -13,6 +13,12 @@ const stored = JSON.parse(localStorage.getItem('audioSettings') || '{}');
 // у пустого/нового аккаунта на сервере просто нечем было перезаписать локальное значение).
 // Теперь единственный источник — код-дефолт ниже, а сервер переопределяет его после логина.
 let s: AudioSettings = { ...DEF, ...stored, keybinds: DEF.keybinds, disableGlobalHotkeys: DEF.disableGlobalHotkeys };
+// Миграция: раньше можно было выбрать enumerated-алиас 'default'/'communications' (Chrome-псевдо-
+// устройства) — теперь пикер их прячет (см. audioDevices.audioDeviceChoices). Эти значения эквивалентны
+// системному по умолчанию, нормализуем в '' — иначе после дедупа пикер покажет «ничего не выбрано».
+// Поведение звука не меняется ('' и 'default' одинаково следуют за системным устройством).
+if (s.input === 'default' || s.input === 'communications') s.input = '';
+if (s.output === 'default' || s.output === 'communications') s.output = '';
 const subs = new Set<() => void>();
 
 export const getSettings = (): AudioSettings => s;
