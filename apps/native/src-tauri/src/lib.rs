@@ -401,7 +401,7 @@ fn fit_window_to_work_area(window: &tauri::WebviewWindow) {
     let final_h = outer.height.min(max_h);
     let resized = final_w != outer.width || final_h != outer.height;
     if resized {
-      let _ = window.set_size(tauri::dpi::PhysicalSize::new(final_w, final_h));
+      let _ = window.set_size(tauri::PhysicalSize::new(final_w, final_h));
     }
     let (nx, ny) = if resized {
       // после ресайза центрируем в рабочей области
@@ -414,7 +414,7 @@ fn fit_window_to_work_area(window: &tauri::WebviewWindow) {
       )
     };
     if resized || nx != pos.x || ny != pos.y {
-      let _ = window.set_position(tauri::dpi::PhysicalPosition::new(nx, ny));
+      let _ = window.set_position(tauri::PhysicalPosition::new(nx, ny));
     }
   }
 }
