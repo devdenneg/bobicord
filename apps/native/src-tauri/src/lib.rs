@@ -368,6 +368,57 @@ fn paths_exist(paths: Vec<String>) -> Vec<bool> {
   paths.iter().map(|p| std::path::Path::new(p).exists()).collect()
 }
 
+// Первый запуск: главное окно создаётся из tauri.conf.json в ЛОГИЧЕСКИХ px (1280×800). На дисплеях
+// с масштабом 125–150% это 1600×1000+ ФИЗИЧЕСКИХ — окно не влезает в рабочую область монитора и его
+// низ уходит под панель задач («окно ниже экрана», приходится вправлять вручную). Подгоняем размер
+// под rcWork (рабочая область без панели задач) и центрируем; если размер уже помещается — лишь
+// вправляем позицию целиком внутрь рабочей области, иначе окно не трогаем. Позиция не персистится
+// (нет tauri-plugin-window-state), поэтому это безопасно на каждом запуске — своего выбора у юзера нет.
+#[cfg(windows)]
+fn fit_window_to_work_area(window: &tauri::WebviewWindow) {
+  use windows::Win32::Foundation::{HWND, RECT};
+  use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+  };
+  let Ok(hwnd_raw) = window.hwnd() else { return };
+  let Ok(outer) = window.outer_size() else { return };
+  let pos = window.outer_position().unwrap_or_default();
+  unsafe {
+    // Свой HWND из указателя (не переиспользуем tauri-шный тип — версия крейта windows может отличаться).
+    let hwnd = HWND(hwnd_raw.0 as *mut std::ffi::c_void);
+    let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    if !GetMonitorInfoW(mon, &mut mi).as_bool() {
+      return;
+    }
+    let RECT { left, top, right, bottom } = mi.rcWork; // рабочая область в ФИЗИЧЕСКИХ px, координаты экрана
+    let work_w = (right - left).max(1);
+    let work_h = (bottom - top).max(1);
+    let margin = 16; // небольшой зазор от краёв рабочей области
+    let max_w = (work_w - margin * 2).max(1) as u32;
+    let max_h = (work_h - margin * 2).max(1) as u32;
+    let final_w = outer.width.min(max_w);
+    let final_h = outer.height.min(max_h);
+    let resized = final_w != outer.width || final_h != outer.height;
+    if resized {
+      let _ = window.set_size(tauri::dpi::PhysicalSize::new(final_w, final_h));
+    }
+    let (nx, ny) = if resized {
+      // после ресайза центрируем в рабочей области
+      (left + (work_w - final_w as i32) / 2, top + (work_h - final_h as i32) / 2)
+    } else {
+      // размер помещается — только вправляем окно целиком внутрь рабочей области, если оно вылезло
+      (
+        pos.x.clamp(left, (right - final_w as i32).max(left)),
+        pos.y.clamp(top, (bottom - final_h as i32).max(top)),
+      )
+    };
+    if resized || nx != pos.x || ny != pos.y {
+      let _ = window.set_position(tauri::dpi::PhysicalPosition::new(nx, ny));
+    }
+  }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
@@ -409,6 +460,15 @@ pub fn run() {
           .target(diag::log_target())
           .build(),
       )?;
+      // Первый запуск на HiDPI: окно из конфига не влезает в рабочую область → низ под панелью задач.
+      // Подгоняем и центрируем по монитору окна (см. fit_window_to_work_area). До первой отрисовки.
+      #[cfg(windows)]
+      {
+        use tauri::Manager;
+        if let Some(win) = app.get_webview_window("main") {
+          fit_window_to_work_area(&win);
+        }
+      }
       // Самолечение ярлыков (см. branding.rs) — на отдельном потоке, не блокируя старт окна.
       std::thread::spawn(branding::fix_shortcuts);
       Ok(())
