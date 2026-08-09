@@ -1,0 +1,212 @@
+/* Главная («пультовая»), редизайн: присутствие вперёд, минимум дублей, плотно и адаптивно.
+   Новые классы с префиксом nh- (не пересекаются со старыми home- и hero- классами в styles.css).
+   Все цвета — из токенов темы (styles.css :root), поэтому работает в светлой и тёмной. */
+
+.nh { display: flex; flex-direction: column; min-height: 0; height: 100%; background: var(--bg2); overflow: hidden; }
+
+/* ---------- Шапка (единственное место счётчика онлайн и кнопок Создать/Войти) ---------- */
+/* точка-индикатор (базовый размер; scoped-правила ниже задают лишь цвет/свечение) */
+.nh-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: var(--muted); }
+
+.nh-hd {
+  flex: 0 0 auto;
+  display: flex; align-items: center; gap: 14px;
+  padding: 12px 28px; border-bottom: 1px solid var(--line-2);
+  background: color-mix(in srgb, var(--bg2) 88%, transparent);
+  backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+}
+.nh-brand { display: flex; align-items: center; gap: 10px; font-weight: 800; font-size: 17px; color: var(--txt-h); letter-spacing: .2px; }
+.nh-online { display: inline-flex; align-items: center; gap: 7px; padding: 5px 11px; border-radius: 999px; background: var(--panel2); border: 1px solid var(--line-2); font-size: 12.5px; color: var(--muted); font-weight: 600; }
+.nh-online .nh-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.nh-online.live .nh-dot { background: var(--green); box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 28%, transparent); }
+.nh-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.nh-btn { display: inline-flex; align-items: center; gap: 7px; height: 36px; padding: 0 14px; border-radius: 9px; font-size: 13.5px; font-weight: 600; border: 1px solid var(--line-2); background: var(--panel2); color: var(--txt-h); cursor: pointer; transition: background var(--tr), border-color var(--tr), transform var(--tr); }
+.nh-btn:hover { background: var(--panel3); }
+.nh-btn:active { transform: translateY(1px); }
+.nh-btn.primary { background: var(--accent); border-color: transparent; color: var(--accent-fg, #fff); }
+.nh-btn.primary:hover { background: var(--accent-h); }
+.nh-me { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; overflow: hidden; font-weight: 700; color: #fff; border: 1px solid var(--line-2); cursor: pointer; padding: 0; }
+.nh-me .avimg { width: 100%; height: 100%; object-fit: cover; }
+
+/* ---------- Тело: центрированная колонка ---------- */
+.nh-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.nh-inner { max-width: 1120px; margin: 0 auto; padding: 22px 28px 44px; display: flex; flex-direction: column; gap: 26px; }
+@keyframes nhEnter { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.nh-enter { animation: nhEnter .22s ease-out; }
+
+/* ---------- Секция + заголовок ---------- */
+.nh-sec { display: flex; flex-direction: column; gap: 12px; }
+.nh-sec-h { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.nh-sec-h .eye { display: block; font-size: 10.5px; font-weight: 800; letter-spacing: .8px; text-transform: uppercase; color: var(--muted); margin-bottom: 3px; }
+.nh-sec-h.live .eye { color: var(--live); }
+.nh-sec-h.accent .eye { color: var(--accent); }
+.nh-sec-h h2 { font-size: 18px; font-weight: 800; color: var(--txt-h); margin: 0; }
+.nh-sec-h .detail { font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+
+/* ---------- Кластер лиц (кольца по состоянию) ---------- */
+.nh-cluster { display: flex; align-items: center; }
+.nh-cluster .nh-face { width: 26px; height: 26px; margin-left: -7px; border-radius: 50%; display: grid; place-items: center; font-size: 11px; font-weight: 700; color: #fff; overflow: hidden; box-shadow: 0 0 0 2px var(--panel); }
+.nh-cluster .nh-face:first-child { margin-left: 0; }
+.nh-cluster .nh-face.live { box-shadow: 0 0 0 2px var(--live); }
+.nh-cluster .nh-face.voice { box-shadow: 0 0 0 2px var(--green); }
+.nh-cluster .nh-face.away { box-shadow: 0 0 0 2px var(--yellow); }
+.nh-cluster .nh-face .avimg { width: 100%; height: 100%; object-fit: cover; }
+.nh-cluster .more { margin-left: 4px; font-size: 12px; color: var(--muted); font-weight: 600; }
+
+/* ---------- «Вернуться в голос» ---------- */
+.nh-resume { display: inline-flex; align-items: center; gap: 9px; align-self: flex-start; padding: 9px 15px; border-radius: 999px; border: 1px solid color-mix(in srgb, var(--green) 45%, var(--line-2)); background: color-mix(in srgb, var(--green) 14%, var(--panel)); color: var(--txt-h); font-size: 13.5px; font-weight: 600; cursor: pointer; transition: background var(--tr), transform var(--tr); }
+.nh-resume:hover { background: color-mix(in srgb, var(--green) 22%, var(--panel)); }
+.nh-resume:active { transform: translateY(1px); }
+.nh-resume .nh-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 30%, transparent); }
+
+/* ---------- «Сейчас в эфире»: карточки-эфиры ---------- */
+.nh-live { display: grid; grid-template-columns: repeat(auto-fill, minmax(258px, 1fr)); gap: 14px; }
+.nh-card { display: flex; flex-direction: column; gap: 11px; padding: 15px; text-align: left; border-radius: var(--r-md, 14px); border: 1px solid var(--line-2); background: var(--panel); box-shadow: var(--sh-1); cursor: pointer; transition: transform var(--tr), border-color var(--tr), box-shadow var(--tr); }
+.nh-card:hover { transform: translateY(-2px); border-color: color-mix(in srgb, var(--accent) 40%, var(--line-2)); box-shadow: var(--sh-2); }
+.nh-card:focus-visible { outline: 2px solid var(--focus, var(--accent)); outline-offset: 2px; }
+.nh-card.stream { border-color: color-mix(in srgb, var(--live) 35%, var(--line-2)); }
+.nh-ct { display: flex; align-items: center; gap: 9px; }
+.nh-srvic { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; font-weight: 700; color: #fff; overflow: hidden; flex: 0 0 auto; }
+.nh-srvic .avimg { width: 100%; height: 100%; object-fit: cover; }
+.nh-srvnm { font-weight: 700; font-size: 14px; color: var(--txt-h); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nh-pills { margin-left: auto; display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.nh-pill { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+.nh-pill.live { background: color-mix(in srgb, var(--live) 20%, transparent); color: var(--live); }
+.nh-pill.voice { background: color-mix(in srgb, var(--green) 18%, transparent); color: var(--green); }
+.nh-pill .live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--live); animation: nhBlink 1.6s ease-in-out infinite; }
+@keyframes nhBlink { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+.nh-lead { display: flex; align-items: center; gap: 9px; }
+.nh-lead-av { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; font-weight: 700; color: #fff; overflow: hidden; box-shadow: 0 0 0 2px var(--live); flex: 0 0 auto; }
+.nh-lead-av .avimg { width: 100%; height: 100%; object-fit: cover; }
+.nh-lead-who { min-width: 0; display: flex; flex-direction: column; }
+.nh-lead-who b { font-size: 13.5px; color: var(--txt-h); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nh-lead-who span { font-size: 12px; color: var(--muted); }
+.nh-cf { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: auto; }
+.nh-cta { display: inline-flex; align-items: center; gap: 6px; padding: 7px 14px; border-radius: 8px; font-size: 13px; font-weight: 700; border: none; cursor: pointer; background: var(--accent); color: var(--accent-fg, #fff); transition: background var(--tr); }
+.nh-card.stream .nh-cta { background: var(--live); }
+.nh-cta:hover { filter: brightness(1.08); }
+
+/* ---------- Тихое состояние ---------- */
+.nh-quiet { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 16px 18px; border-radius: var(--r-md, 14px); border: 1px dashed var(--line-2); background: var(--panel); color: var(--muted); font-size: 13.5px; }
+.nh-quiet .nh-qic { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 9px; background: var(--panel2); color: var(--muted); flex: 0 0 auto; }
+.nh-quiet b { color: var(--txt-h); font-weight: 600; }
+.nh-quiet .nh-recent { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+
+/* ---------- «Тебя ждут» ---------- */
+.nh-wait { display: flex; flex-wrap: wrap; gap: 9px; }
+.nh-chip { display: inline-flex; align-items: center; gap: 8px; padding: 7px 12px 7px 8px; border-radius: 999px; border: 1px solid var(--line-2); background: var(--panel); color: var(--txt-h); font-size: 13px; font-weight: 600; cursor: pointer; transition: background var(--tr), border-color var(--tr); }
+.nh-chip:hover { background: var(--panel2); border-color: color-mix(in srgb, var(--accent) 35%, var(--line-2)); }
+.nh-chip .nh-ci { width: 22px; height: 22px; border-radius: 6px; display: grid; place-items: center; font-size: 11px; font-weight: 700; color: #fff; overflow: hidden; }
+.nh-chip .nh-ci .avimg { width: 100%; height: 100%; object-fit: cover; }
+.nh-chip .nh-cnum { display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px; background: var(--accent); color: var(--accent-fg, #fff); font-size: 11px; font-weight: 800; }
+
+/* ---------- Серверы (плотная сетка) ---------- */
+.nh-filters { display: flex; gap: 7px; flex-wrap: wrap; }
+.nh-fchip { padding: 6px 13px; border-radius: 999px; border: 1px solid var(--line-2); background: transparent; color: var(--muted); font-size: 12.5px; font-weight: 600; cursor: pointer; transition: background var(--tr), color var(--tr), border-color var(--tr); }
+.nh-fchip.on { background: var(--accent); border-color: transparent; color: var(--accent-fg, #fff); }
+.nh-fchip:not(.on):hover { color: var(--txt-h); border-color: var(--muted); }
+.nh-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); gap: 12px; }
+.nh-srv { position: relative; display: flex; flex-direction: column; gap: 10px; padding: 13px; text-align: left; border-radius: var(--r-md, 14px); border: 1px solid var(--line-2); background: var(--panel); cursor: pointer; transition: transform var(--tr), border-color var(--tr), box-shadow var(--tr); }
+.nh-srv:hover { transform: translateY(-2px); border-color: color-mix(in srgb, var(--accent) 38%, var(--line-2)); box-shadow: var(--sh-1); }
+.nh-srv:focus-visible { outline: 2px solid var(--focus, var(--accent)); outline-offset: 2px; }
+.nh-srv.live { border-color: color-mix(in srgb, var(--live) 32%, var(--line-2)); }
+.nh-srv.connected::before { content: ''; position: absolute; left: 0; top: 12px; bottom: 12px; width: 3px; border-radius: 0 3px 3px 0; background: var(--accent); }
+.nh-sh { display: flex; align-items: center; gap: 10px; }
+.nh-sic { width: 38px; height: 38px; border-radius: 11px; display: grid; place-items: center; font-weight: 700; font-size: 16px; color: #fff; overflow: hidden; flex: 0 0 auto; }
+.nh-sic .avimg { width: 100%; height: 100%; object-fit: cover; }
+.nh-smeta { min-width: 0; flex: 1; }
+.nh-snm { font-weight: 700; font-size: 14px; color: var(--txt-h); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nh-ssub { font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nh-badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; flex: 0 0 auto; }
+.nh-badge.live { background: color-mix(in srgb, var(--live) 26%, transparent); color: var(--live); }
+.nh-badge.voice { background: color-mix(in srgb, var(--green) 24%, transparent); color: var(--green); }
+.nh-badge.unread { background: var(--accent); color: var(--accent-fg, #fff); } /* сплошной фон — читаемый счётчик (AA) */
+.nh-badge.online { background: var(--panel2); color: var(--muted); }
+.nh-badge.quiet { background: transparent; color: var(--muted); font-weight: 600; }
+.nh-badge .live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--live); }
+.nh-badge .dot-green { width: 6px; height: 6px; border-radius: 50%; background: var(--green); }
+.nh-spres { min-height: 26px; display: flex; align-items: center; }
+.nh-spres .quiet { font-size: 12px; color: var(--muted); }
+
+/* ---------- Пустой фильтр серверов ---------- */
+.nh-empty { grid-column: 1 / -1; display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 30px 16px; text-align: center; color: var(--muted); }
+.nh-empty .nh-eic { display: grid; place-items: center; width: 40px; height: 40px; border-radius: 12px; background: var(--panel2); }
+.nh-empty b { color: var(--txt-h); font-size: 14px; }
+.nh-empty p { font-size: 12.5px; margin: 0; }
+.nh-empty button { margin-top: 4px; padding: 7px 14px; border-radius: 8px; border: 1px solid var(--line-2); background: var(--panel2); color: var(--txt-h); font-size: 12.5px; font-weight: 600; cursor: pointer; }
+
+/* ---------- «Играют сейчас» (свёрнуто) ---------- */
+.nh-games { border: 1px solid var(--line-2); border-radius: var(--r-md, 14px); background: var(--panel); overflow: hidden; }
+.nh-games > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 8px; padding: 13px 16px; font-size: 13.5px; font-weight: 700; color: var(--txt-h); }
+.nh-games > summary::-webkit-details-marker { display: none; }
+.nh-games > summary .chev { margin-left: auto; color: var(--muted); transition: transform var(--tr); }
+.nh-games[open] > summary .chev { transform: rotate(180deg); }
+.nh-games > summary .gcount { color: var(--muted); font-weight: 600; }
+.nh-gamesgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; padding: 0 14px 14px; }
+.nh-game { display: flex; align-items: center; gap: 10px; padding: 9px; border-radius: 10px; background: var(--panel2); }
+.nh-game .gi { width: 32px; height: 32px; border-radius: 8px; overflow: hidden; display: grid; place-items: center; background: var(--panel3); flex: 0 0 auto; }
+.nh-game .gi img { width: 100%; height: 100%; object-fit: cover; }
+.nh-game .gb { min-width: 0; flex: 1; }
+.nh-game .gn { font-size: 13px; font-weight: 600; color: var(--txt-h); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nh-game .gp { display: flex; align-items: center; gap: 6px; margin-top: 3px; }
+.nh-game .gp .gcnt { font-size: 11.5px; color: var(--muted); }
+
+/* ---------- Первый запуск ---------- */
+.nh-first { display: flex; flex-direction: column; gap: 22px; padding: 24px 4px; }
+.nh-first h1 { font-size: 30px; font-weight: 800; color: var(--txt-h); line-height: 1.15; margin: 0; }
+.nh-first h1 em { color: var(--accent); font-style: normal; }
+.nh-first .sub { font-size: 15px; color: var(--muted); margin: -8px 0 0; max-width: 560px; }
+.nh-steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.nh-step { display: flex; flex-direction: column; gap: 8px; padding: 16px; border-radius: var(--r-md, 14px); border: 1px solid var(--line-2); background: var(--panel); }
+.nh-step .snum { font-size: 12px; font-weight: 800; color: var(--accent); }
+.nh-step .sic { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 10px; background: var(--panel2); color: var(--txt-h); }
+.nh-step b { color: var(--txt-h); font-size: 14.5px; }
+.nh-step p { font-size: 12.5px; color: var(--muted); margin: 0; }
+.nh-first .cta-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.nh-first .cta-row .nh-btn { height: 42px; padding: 0 20px; font-size: 14px; }
+
+/* ---------- Обновление / загрузка десктопа ---------- */
+.nh-update { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-radius: var(--r-md, 14px); border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--line-2)); background: color-mix(in srgb, var(--accent) 12%, var(--panel)); }
+.nh-update .ui { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 10px; background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--accent); flex: 0 0 auto; }
+.nh-update .ut { min-width: 0; flex: 1; }
+.nh-update .ut b { display: block; color: var(--txt-h); font-size: 13.5px; }
+.nh-update .ut span { font-size: 12px; color: var(--muted); }
+.nh-update .ub { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border-radius: 8px; border: none; background: var(--accent); color: var(--accent-fg, #fff); font-size: 13px; font-weight: 700; cursor: pointer; }
+.nh-update kbd { background: var(--panel2); border: 1px solid var(--line-2); border-radius: 4px; padding: 0 4px; font-size: 11px; }
+
+/* Промо-карточка десктопа на главной — без декоративного шума (glow/sweep/bob): цель редизайна — спокойно. */
+.nh-body .dl-card { animation: none; }
+.nh-body .dl-card::before { display: none; animation: none; }
+.nh-body .dl-card .dl-ic { animation: none; }
+
+/* ---------- Адаптив ---------- */
+@media (max-width: 900px) {
+  .nh-hd { padding: 10px 16px; gap: 10px; }
+  .nh-btn span { display: none; } /* иконочные кнопки на узком */
+  .nh-btn { padding: 0 11px; }
+  .nh-inner { padding: 16px 16px 36px; gap: 22px; }
+  .nh-steps { grid-template-columns: 1fr; }
+  .nh-first h1 { font-size: 25px; }
+}
+@media (max-width: 620px) {
+  .nh-online { display: none; } /* счётчик прячем на очень узком — не критичен */
+  .nh-sec-h .detail { display: none; }
+  /* «Сейчас в эфире» и «Тебя ждут» — горизонтальный скролл со снапом */
+  .nh-live { grid-template-columns: none; grid-auto-flow: column; grid-auto-columns: 80%; overflow-x: auto; scroll-snap-type: x mandatory; padding-bottom: 6px; margin: 0 -16px; padding-left: 16px; padding-right: 16px; }
+  .nh-live > .nh-card { scroll-snap-align: start; }
+  .nh-wait { flex-wrap: nowrap; overflow-x: auto; margin: 0 -16px; padding: 2px 16px; }
+  .nh-wait > .nh-chip { flex: 0 0 auto; }
+  .nh-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
+  .nh-gamesgrid { grid-template-columns: 1fr; }
+  .nh-quiet .nh-recent { margin-left: 0; width: 100%; }
+}
+@media (max-width: 420px) {
+  .nh-grid { grid-template-columns: 1fr; }
+  .nh-live { grid-auto-columns: 86%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nh-enter { animation: none; }
+  .nh-pill .live-dot { animation: none; }
+  .nh-card:hover, .nh-srv:hover { transform: none; }
+}
