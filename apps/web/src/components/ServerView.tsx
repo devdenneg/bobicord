@@ -66,6 +66,7 @@ const DRAFTS_CHANGED_EVENT = 'relay:drafts-changed';
 const DRAFT_SAVE_DELAY_MS = 350;
 const COMPOSER_MIN_HEIGHT_PX = 44;
 const COMPOSER_MAX_HEIGHT_PX = 160;
+const COMPOSER_MAX_VIEWPORT_RATIO = 0.3;
 const EXACT_JUMP_PAGE_LIMIT = 60;
 const EXACT_JUMP_MAX_PAGES = 20;
 const CHAT_VIEWPORT_INCREASE = { top: 600, bottom: 400 } as const;
@@ -1152,6 +1153,9 @@ function Chat() {
   const textRef = useRef(text); textRef.current = text;
   const prevActive = useRef<string | undefined>(undefined);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  const composerMaxHeightRef = useRef(COMPOSER_MAX_HEIGHT_PX);
+  const composerMeasuredTextRef = useRef('');
+  const composerMeasuredServerRef = useRef<string | undefined>(undefined);
   const [lightbox, setLightbox] = useState<Attachment | null>(null);
   const [pickAnchor, setPickAnchor] = useState<DOMRect | null | undefined>(undefined);
   const emoBtnRef = useRef<HTMLButtonElement>(null);
@@ -2549,15 +2553,65 @@ function Chat() {
     setText(inserted); setMIdx(0);
     focusEnd(inserted.length);
   }
-  const resizeComposer = useCallback(() => {
+  const resizeComposer = useCallback((measureShrink = false) => {
     const el = composerRef.current;
     if (!el) return;
-    el.style.height = '0px';
-    const height = Math.min(COMPOSER_MAX_HEIGHT_PX, Math.max(COMPOSER_MIN_HEIGHT_PX, el.scrollHeight));
-    el.style.height = `${height}px`;
-    el.style.overflowY = el.scrollHeight > COMPOSER_MAX_HEIGHT_PX ? 'auto' : 'hidden';
+    const maxHeight = composerMaxHeightRef.current;
+    const shell = measureShrink ? el.closest<HTMLElement>('.composer-shell') : null;
+    const previousShellHeight = shell?.style.height ?? '';
+
+    // scrollHeight растёт поверх текущей высоты, поэтому обычный ввод можно измерить без
+    // collapse. Для удаления/смены черновика временно фиксируем внешний shell: forced layout
+    // textarea больше не меняет viewport Virtuoso между двумя синхронными измерениями.
+    if (shell) shell.style.height = `${shell.offsetHeight}px`;
+    try {
+      if (measureShrink) el.style.height = '0px';
+      const contentHeight = el.scrollHeight;
+      const height = Math.min(maxHeight, Math.max(COMPOSER_MIN_HEIGHT_PX, contentHeight));
+      el.style.maxHeight = `${maxHeight}px`;
+      el.style.height = `${height}px`;
+      el.style.overflowY = contentHeight > maxHeight ? 'auto' : 'hidden';
+    } finally {
+      if (shell) shell.style.height = previousShellHeight;
+    }
   }, []);
-  useLayoutEffect(() => resizeComposer(), [resizeComposer, text]);
+  useLayoutEffect(() => {
+    const serverChanged = composerMeasuredServerRef.current !== activeId;
+    const measureShrink = serverChanged || text.length <= composerMeasuredTextRef.current.length;
+    composerMeasuredServerRef.current = activeId;
+    composerMeasuredTextRef.current = text;
+    resizeComposer(measureShrink);
+  }, [activeId, resizeComposer, text]);
+
+  useLayoutEffect(() => {
+    const el = composerRef.current;
+    const chat = el?.closest<HTMLElement>('#chat');
+    if (!el || !chat) return;
+
+    let previousWidth = chat.clientWidth;
+    const fitComposerToViewport = () => {
+      const width = chat.clientWidth;
+      const viewportWidened = width > previousWidth;
+      const widthChanged = width !== previousWidth;
+      previousWidth = width;
+      const nextMaxHeight = Math.max(
+        COMPOSER_MIN_HEIGHT_PX,
+        Math.min(COMPOSER_MAX_HEIGHT_PX, Math.floor(chat.clientHeight * COMPOSER_MAX_VIEWPORT_RATIO)),
+      );
+      const maxHeightShrank = nextMaxHeight < composerMaxHeightRef.current;
+      if (nextMaxHeight === composerMaxHeightRef.current && !widthChanged) return;
+      composerMaxHeightRef.current = nextMaxHeight;
+      // Сужение само увеличивает scrollHeight. При расширении или снижении cap нужен
+      // точный shrink-measure, но внешний shell остаётся зафиксированным до конца замера.
+      resizeComposer(maxHeightShrank || viewportWidened);
+    };
+
+    fitComposerToViewport();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(fitComposerToViewport);
+    observer.observe(chat);
+    return () => observer.disconnect();
+  }, [resizeComposer]);
 
   function focusEnd(pos: number) {
     requestAnimationFrame(() => { const el = composerRef.current; if (el) { el.focus(); el.setSelectionRange(pos, pos); } });
@@ -2570,10 +2624,17 @@ function Chat() {
     if (acOpen) {
       if (e.key === 'ArrowDown') { e.preventDefault(); setMIdx((i) => (i + 1) % acLen); return; }
       if (e.key === 'ArrowUp') { e.preventDefault(); setMIdx((i) => (i - 1 + acLen) % acLen); return; }
-      if ((e.key === 'Enter' && !e.shiftKey) || e.key === 'Tab') { e.preventDefault(); acceptAc(Math.min(mIdx, acLen - 1)); return; }
+      if ((e.key === 'Enter' && !e.shiftKey) || (e.key === 'Tab' && !e.shiftKey)) { e.preventDefault(); acceptAc(Math.min(mIdx, acLen - 1)); return; }
       if (e.key === 'Escape') { e.preventDefault(); setMention(null); setText((t) => (slashMode ? t + ' ' : t)); return; }
     }
     if (e.key === 'Escape' && replyTo) { e.preventDefault(); setReplyTo(null); return; }
+    if (e.key === 'Enter' && e.shiftKey && !text.trim()) {
+      e.preventDefault();
+      if (text) setText('');
+      setMention(null);
+      setMIdx(0);
+      return;
+    }
     if (e.key === 'ArrowUp' && text.length === 0 && !replyTo && staged.length === 0) {
       for (let index = messages.length - 1; index >= 0; index--) {
         const message = messages[index];
