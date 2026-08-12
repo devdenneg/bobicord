@@ -134,6 +134,10 @@ export class TreeVideoTransport implements VideoTransport {
   /** Живые стримы гильдии + метаданные приложения из stream-live (иконка/имя — Э-icon). */
   private liveStreams = new Map<string, StreamMeta>();
   private watches = new Map<string, WatchState>();
+  // Намерение смотреть стрим — отдельно от живого WatchState. WatchState исчезает и при обрыве
+  // сокета (перед ре-watch), поэтому «нет записи в watches» не отличало «переподключаемся» от
+  // «пользователь закрыл». Ре-watch сверяется именно с этим набором.
+  private intended = new Set<string>();
   private iceServers: RTCIceServer[] = DEFAULT_ICE_SERVERS;
   private natProbe: Promise<boolean> = Promise.resolve(false);
 
@@ -198,6 +202,7 @@ export class TreeVideoTransport implements VideoTransport {
     this.watches.clear();
     this.nativeWatches.forEach((st, streamId) => this.nativeUnwatch(streamId, st));
     this.nativeWatches.clear();
+    this.intended.clear();
     this.liveStreams.clear();
     this.videoTracks.clear();
     this.containers.clear();
@@ -289,6 +294,7 @@ export class TreeVideoTransport implements VideoTransport {
   // качества = unwatch()+watch() (Д4 добавит меню).
   watch(streamId: string, quality: string = 'source', pinned: boolean = false) {
     if (this.watches.has(streamId) || this.nativeWatches.has(streamId)) return;
+    this.intended.add(streamId); // намерение смотреть живёт ОТДЕЛЬНО от сокета (см. intended)
     // Диагностика просмотра (diag.ts): freezeCount/потери раз в 2с, сдаётся на сервер в
     // unwatch. PC берём лениво — он появится позже (после assign-parent / offer от Rust),
     // и у нативного зрителя это другой объект (лупбек webview↔Rust).
@@ -321,7 +327,7 @@ export class TreeVideoTransport implements VideoTransport {
       if (live) {
         this.armVideoFailsafe(streamId, 15000); // реконнект (сеть) медленнее смены качества
         setTimeout(() => {
-          if (!this.closed && !this.watches.has(streamId) && !this.nativeWatches.has(streamId) && this.liveStreams.has(streamId)) this.watch(streamId, st.quality, st.pinned);
+          if (!this.closed && this.intended.has(streamId) && !this.watches.has(streamId) && !this.nativeWatches.has(streamId) && this.liveStreams.has(streamId)) this.watch(streamId, st.quality, st.pinned);
         }, 3000);
       }
     };
@@ -346,6 +352,12 @@ export class TreeVideoTransport implements VideoTransport {
   // замёрзнет навсегда.
   unwatch(streamId: string, opts?: { keepVideo?: boolean }) {
     const keep = !!opts?.keepVideo;
+    // Снятие намерения — ДО любых ранних выходов. Иначе отмена, пришедшая в окно между обрывом
+    // сокета (teardownWatch уже убрал запись из watches) и срабатыванием таймера ре-watch, терялась:
+    // unwatch выходил на `if (!st) return`, а ретрай видел «меня нет в watches» и воскрешал просмотр —
+    // видео грузилось навсегда и невидимо. keepVideo — бесшовный путь (смена качества/реконнект),
+    // там намерение как раз сохраняется.
+    if (!keep) this.intended.delete(streamId);
     const nst = this.nativeWatches.get(streamId);
     if (nst) { this.nativeUnwatch(streamId, nst, keep); return; }
     const st = this.watches.get(streamId);
@@ -666,7 +678,7 @@ export class TreeVideoTransport implements VideoTransport {
       this.unwatch(streamId, { keepVideo: live });
       if (live) this.armVideoFailsafe(streamId);
       setTimeout(() => {
-        if (!this.closed && this.liveStreams.has(streamId) && !this.nativeWatches.has(streamId) && !this.watches.has(streamId)) this.watch(streamId, st.quality, st.pinned);
+        if (!this.closed && this.intended.has(streamId) && this.liveStreams.has(streamId) && !this.nativeWatches.has(streamId) && !this.watches.has(streamId)) this.watch(streamId, st.quality, st.pinned);
       }, 1500);
     };
     try {

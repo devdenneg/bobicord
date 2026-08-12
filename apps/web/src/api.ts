@@ -111,6 +111,34 @@ function retryAfterSeconds(response: Response, data: any): number | undefined {
   return Number.isFinite(at) ? Math.max(0, Math.ceil((at - Date.now()) / 1000)) : undefined;
 }
 
+// Загрузки идут сырым fetch мимо req (тело — байты файла, не JSON), и таймаута у них не было вовсе:
+// мёртвый TCP оставлял промис висеть навсегда, а пользователь — бесконечное «загружается» без ошибки
+// и без возможности повторить. Лимит щедрый (файл до 10 МБ на медленном канале), но конечный.
+const UPLOAD_TIMEOUT_MS = 120_000;
+
+async function uploadFetch<T>(path: string, file: Blob, extraHeaders: Record<string, string>, signal?: AbortSignal): Promise<T> {
+  const headers: Record<string, string> = { 'Content-Type': file.type || 'application/octet-stream', ...extraHeaders };
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const relayAbort = () => ctrl?.abort();
+  if (signal?.aborted) ctrl?.abort();
+  else signal?.addEventListener('abort', relayAbort, { once: true });
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), UPLOAD_TIMEOUT_MS) : null;
+  let r: Response;
+  try { r = await fetch(API_BASE + path, { method: 'POST', headers, body: file, ...(ctrl ? { signal: ctrl.signal } : {}) }); }
+  catch {
+    throw new Error(signal?.aborted ? 'Загрузка отменена' : ctrl?.signal.aborted ? 'Сервер не ответил вовремя' : 'Не удалось связаться с сервером');
+  }
+  finally {
+    if (timer !== null) clearTimeout(timer);
+    signal?.removeEventListener('abort', relayAbort);
+  }
+  let d: any = {};
+  try { d = await r.json(); } catch { /* ignore */ }
+  if (!r.ok) throw new Error(d?.error || 'Ошибка ' + r.status);
+  return d as T;
+}
+
 async function req<T>(method: string, path: string, body?: unknown, options: RequestOptions = {}): Promise<T> {
   const headers: Record<string, string> = {};
   if (options.auth !== false && token) headers['Authorization'] = 'Bearer ' + token;
@@ -193,36 +221,12 @@ export const api = {
   releaseHistory: (signal?: AbortSignal) => req<ReleaseHistoryResponse>('GET', '/releases/history', undefined, { signal }),
   updateMe: (patch: { displayName?: string; bio?: string; avatarColor?: number; avatarUrl?: string; profileBannerUrl?: string }) =>
     req<{ user: User }>('PATCH', '/me', patch),
-  uploadImage: async (file: Blob): Promise<{ url: string; width: number; height: number }> => {
-    const headers: Record<string, string> = { 'Content-Type': file.type || 'application/octet-stream' };
-    if (token) headers['Authorization'] = 'Bearer ' + token;
-    const r = await fetch(API_BASE + '/api/upload', { method: 'POST', headers, body: file });
-    let d: any = {};
-    try { d = await r.json(); } catch { /* ignore */ }
-    if (!r.ok) throw new Error(d?.error || 'Ошибка ' + r.status);
-    return d as { url: string; width: number; height: number };
-  },
-  uploadProfileBanner: async (file: Blob, signal?: AbortSignal): Promise<{ url: string }> => {
-    const headers: Record<string, string> = { 'Content-Type': file.type || 'application/octet-stream' };
-    if (token) headers['Authorization'] = 'Bearer ' + token;
-    const r = await fetch(API_BASE + '/api/upload/profile-banner', { method: 'POST', headers, body: file, signal });
-    let d: any = {};
-    try { d = await r.json(); } catch { /* ignore */ }
-    if (!r.ok) throw new Error(d?.error || 'Ошибка ' + r.status);
-    return d as { url: string };
-  },
+  uploadImage: (file: Blob) => uploadFetch<{ url: string; width: number; height: number }>('/api/upload', file, {}),
+  uploadProfileBanner: (file: Blob, signal?: AbortSignal) => uploadFetch<{ url: string }>('/api/upload/profile-banner', file, {}, signal),
   deleteProfileBannerUpload: (url: string) => req<{ ok: boolean; removed: boolean }>('DELETE', '/upload/profile-banner', { url }),
   // произвольный файл-вложение (любое расширение, <=10MB) — раздаётся форс-скачиванием, не инлайн.
   // Имя передаём отдельным заголовком (raw body = сами байты файла, без multipart).
-  uploadFile: async (file: File): Promise<{ url: string; name: string; size: number }> => {
-    const headers: Record<string, string> = { 'Content-Type': file.type || 'application/octet-stream', 'X-Attachment-Name': encodeURIComponent(file.name) };
-    if (token) headers['Authorization'] = 'Bearer ' + token;
-    const r = await fetch(API_BASE + '/api/upload-file', { method: 'POST', headers, body: file });
-    let d: any = {};
-    try { d = await r.json(); } catch { /* ignore */ }
-    if (!r.ok) throw new Error(d?.error || 'Ошибка ' + r.status);
-    return d as { url: string; name: string; size: number };
-  },
+  uploadFile: (file: File) => uploadFetch<{ url: string; name: string; size: number }>('/api/upload-file', file, { 'X-Attachment-Name': encodeURIComponent(file.name) }),
   createServer: (name: string) =>
     req<{ server: ServerSummary; invite: string; inviteExpires: number }>('POST', '/servers', { name }),
   getServer: (id: string) =>

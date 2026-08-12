@@ -348,7 +348,13 @@ export const useStore = create<AppState>((set, get) => ({
         // Во время ротации JWT сервер намеренно закрывает старые realtime-сессии до выдачи
         // нового токена. Автоматический retry здесь успел бы запросить LiveKit-token со старым
         // JWT. Handoff сам восстановит нужные комнаты после setToken(newJwt).
-        if (!authSessionHandoffActive() && wasViewing && get().viewServerId === serverId && get().view === 'server') void get().connectServer(serverId);
+        if (authSessionHandoffActive() || !wasViewing || get().viewServerId !== serverId) return;
+        if (get().view === 'server') { void get().connectServer(serverId); return; }
+        // Мы ушли на главную (goHome намеренно не рвёт соединение), и оно умерло уже там. Реконнект в
+        // фоне не нужен, но и мёртвый viewServerId оставлять нельзя: повторный клик по серверу уходит
+        // в showConnectedServer (store.ts:500) — «показать без реконнекта», — и сервер открывается с
+        // мёртвым realtime до перезагрузки страницы. Сбрасываем, тогда клик = полноценный вход.
+        set({ viewServerId: null });
       },
       connectionLossExpected: authSessionHandoffActive,
     });
