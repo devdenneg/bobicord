@@ -279,11 +279,15 @@ export function VoiceControls({ up }: { up?: boolean }) {
   const pttIdle = ptt && !pttLive;
   const micClosed = muted || pttIdle;
   const micClass = 'vd-btn' + (muted ? ' danger-on' : (pttLive ? ' ptt-live' : (pttIdle ? ' ptt-idle' : '')));
-  const micLabel = muted ? 'Включить микрофон' : (pttIdle ? 'PTT: микрофон закрыт' : (pttLive ? 'PTT: идёт передача' : 'Выключить микрофон'));
+  // «Недоступен» и «я себя замутил» — разные состояния: раньше оба выглядели как обычный мут, и когда
+  // микрофон пропадал и возвращался сам, это читалось как «кнопка переключается сама по себе».
+  const micLabel = eng.micUnavailable
+    ? 'Микрофон недоступен — нажми, чтобы подключить'
+    : (muted ? 'Включить микрофон' : (pttIdle ? 'PTT: микрофон закрыт' : (pttLive ? 'PTT: идёт передача' : 'Выключить микрофон')));
   return (
     <div className="vd-controls">
       <div className="vd-grp">
-        <button className={micClass} aria-pressed={muted} aria-label={micLabel} data-tip={ptt ? micLabel : 'Микрофон · M'} onClick={() => E.toggleMic()}><Icon name={micClosed ? 'mic-off' : 'mic'} sm /></button>
+        <button className={micClass} aria-pressed={muted} aria-label={micLabel} data-tip={ptt || eng.micUnavailable ? micLabel : 'Микрофон · M'} onClick={() => E.toggleMic()}><Icon name={micClosed ? 'mic-off' : 'mic'} sm /></button>
         <DeviceMenu kind="input" up={up} />
       </div>
       <div className="vd-grp">

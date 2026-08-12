@@ -442,7 +442,14 @@ export class Engine {
       // Игра показывается ТОЛЬКО из detect_game (атрибут/локальный myGame), НЕ из меты стрима: захваченное
       // окно ≠ «во что играет» (по решению пользователя). Стример без игры — просто LIVE, без «играет в X».
       const away = !inV && !streaming && this.awayHint.has(m.username); // idle-онлайн («нет на месте», жёлтый)
-      presence[m.username] = { online, inVoice: inV, micMuted: (!!mp && mp.isMuted) || deaf, streaming, deafened: deaf, away, game };
+      // Свой бейдж мута берём из ЛОКАЛЬНОГО состояния, а не из LiveKit-публикации. Публикации может не
+      // быть вовсе (мик недоступен, идёт рестарт watchdog-ом, ещё не опубликован) — а «нет публикации»
+      // здесь читается как «мик включён», и человек видел красную кнопку мута рядом с бейджем «говорю».
+      // Для чужих правило прежнее: !mp = «пока не знаем», иначе у всех мигал бы ложный бейдж мута.
+      const micMuted = m.username === this.me.username
+        ? (this.localMicMuted() || deaf)
+        : ((!!mp && mp.isMuted) || (p as any)?.attributes?.mic === '0' || deaf);
+      presence[m.username] = { online, inVoice: inV, micMuted, streaming, deafened: deaf, away, game };
     }
     const speaking: Record<string, boolean> = {};
     this.speakingSet.forEach((u) => (speaking[u] = true));
@@ -565,7 +572,9 @@ export class Engine {
         this.emit();
       })
       // звук мута слышен только самому мутящемуся — играем при локальном событии МОЕГО голосового трека
-      .on(RoomEvent.TrackMuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.voiceRoom?.localParticipant && !this.deafToggling) playSound('mute'); this.emit(); })
+      // micRestarting — пересъём мика watchdog-ом: пере-публикация в муте не должна щёлкать пользователю
+      // «мут/размут», он ничего не нажимал (симптом «микрофон сам включается и выключается»).
+      .on(RoomEvent.TrackMuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.voiceRoom?.localParticipant && !this.deafToggling && !this.micRestarting) playSound('mute'); this.emit(); })
       .on(RoomEvent.Reconnecting, () => {
         if (r !== this.viewRoom && r !== this.voiceRoom) return;
         this.reconnectingRooms.add(r);
@@ -602,7 +611,7 @@ export class Engine {
       })
       .on(RoomEvent.Disconnected, () => this.handleRoomDisconnected(r, serverId))
       // размут мика слышен только самому; при оглушении звук даёт toggleDeaf, тут глушим
-      .on(RoomEvent.TrackUnmuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.voiceRoom?.localParticipant && !this.deafToggling) playSound('unmute'); this.emit(); })
+      .on(RoomEvent.TrackUnmuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.voiceRoom?.localParticipant && !this.deafToggling && !this.micRestarting) playSound('unmute'); this.emit(); })
       // качество/пинг — метрика ГОЛОСОВОГО соединения (voiceRoom)
       .on(RoomEvent.ConnectionQualityChanged, (q, p) => { if (r === this.voiceRoom && p === r.localParticipant) { this.connQuality = mapQuality(q); this.emit(); } })
       .on(RoomEvent.AudioPlaybackStatusChanged, () => { if (r === this.voiceRoom) this.ensureVoiceAudioRunning(); })
@@ -1122,6 +1131,10 @@ export class Engine {
     return {
       vc: active ? this.currentVc! : '',
       deaf: active && this.deafened ? '1' : '',
+      // Интент мута транслируем пирам отдельным атрибутом, как deaf. Бейдж мута у пиров считается по
+      // публикации мик-трека, а её нет вовсе, когда микрофон недоступен (listen-only) или пересобирается
+      // watchdog-ом — и такой участник бессрочно выглядел у всех как «мик включён».
+      mic: active && this.localMicMuted() ? '0' : '',
       vcAt: active && this.myVcAt ? String(this.myVcAt) : '',
       voiceSession: active ? this.voiceLeaseSession : '',
       voiceEpoch: active && this.voiceLeaseEpoch > 0 ? String(this.voiceLeaseEpoch) : '',
@@ -1143,8 +1156,9 @@ export class Engine {
     // voiceRoom: держим мой vc=currentVc + deaf, пока в войсе (гонка/rate-limit могли не долить setAttributes).
     if (this.voiceRoom && this.inVoice) {
       const wantDeaf = this.deafened ? '1' : '';
+      const wantMic = this.localMicMuted() ? '0' : '';
       const a = this.voiceRoom.localParticipant.attributes || {};
-      if ((a.vc || '') !== (this.currentVc || '') || (a.deaf || '') !== wantDeaf
+      if ((a.vc || '') !== (this.currentVc || '') || (a.deaf || '') !== wantDeaf || (a.mic || '') !== wantMic
         || (a.voiceSession || '') !== this.voiceLeaseSession || (a.voiceEpoch || '') !== (this.voiceLeaseEpoch > 0 ? String(this.voiceLeaseEpoch) : '')) {
         if (this.currentVc && !this.myVcAt) this.myVcAt = this.channelStartFor(this.currentVc); // не долетел исходный setAttributes — досчитываем сейчас
         void this.setVoiceAttributes(this.voiceRoom, this.wantedVoiceAttributes(this.voiceRoom));
@@ -1154,7 +1168,7 @@ export class Engine {
     // (иначе после leaveVoice/браузинга «залипну» в канале у других на этом сервере — vc:'' мог не долететь).
     if (this.viewRoom && this.viewRoom !== this.voiceRoom) {
       const a = this.viewRoom.localParticipant.attributes || {};
-      if ((a.vc || '') !== '' || (a.deaf || '') !== '' || (a.voiceSession || '') !== '' || (a.voiceEpoch || '') !== '')
+      if ((a.vc || '') !== '' || (a.deaf || '') !== '' || (a.mic || '') !== '' || (a.voiceSession || '') !== '' || (a.voiceEpoch || '') !== '')
         void this.setVoiceAttributes(this.viewRoom, this.wantedVoiceAttributes(this.viewRoom));
     }
   }
@@ -1707,6 +1721,11 @@ export class Engine {
     vadDest = ctx.createMediaStreamDestination();
     preGate.connect(vadDest);
     lat = new LocalAudioTrack(dest.stream.getAudioTracks()[0]);
+    // Мьютим ДО publish (обязательно await — LocalAudioTrack.mute асинхронный, берёт свой lock):
+    // AddTrackRequest несёт muted, поэтому SFU и все пиры сразу видят мут. Раньше трек публиковался
+    // незамьюченным и глушился отдельным запросом следом — на каждом рестарте мика watchdog-ом у пиров
+    // мигал бейдж «мик включился», а сам пользователь слышал щелчок мута, ничего не нажимая.
+    if (this.manualMute || this.deafened) { try { await lat.mute(); } catch { /**/ } }
     if (!current()) { await dispose(false); return false; }
     try {
       await room.localParticipant.publishTrack(lat, { source: Track.Source.Microphone, dtx: true, red: true, audioPreset: AudioPresets.musicHighQuality });
@@ -1716,10 +1735,8 @@ export class Engine {
       throw error;
     }
     if (!current()) { await dispose(true); return false; }
-    // свежий трек публикуется НЕмьютнутым на уровне LiveKit — если сейчас ручной мут/оглушение,
-    // домьютить сразу (иначе после reapplyMic в муте пиры читают mp.isMuted=false → бейдж мута
-    // пропадает у всех, хотя мы молчим через gain=0). applyGate решает лишь громкость, не LiveKit-mute.
-    if (this.manualMute || this.deafened) { try { lat.mute(); } catch { /**/ } }
+    // Состояние мута могло смениться, пока шёл publish (пользователь кликнул мик) — досводим.
+    if ((this.manualMute || this.deafened) !== lat.isMuted) { try { (this.manualMute || this.deafened) ? lat.mute() : lat.unmute(); } catch { /**/ } }
     // Коммитим pipeline только после успешного publish и последней проверки generation. Старый async
     // хвост никогда не перезапишет ресурсы более свежего микрофона.
     this.micRaw = raw;
@@ -1844,6 +1861,9 @@ export class Engine {
         started = await this.startMic(voiceEpoch);
         if (started && this.voiceIntentCurrent(voiceEpoch, room)) this.hooks.toast('Выбранный микрофон отключён — включён системный', 'warn');
       }
+      // started===false при живом voice-intent значит одно: pipeline перехватила более свежая операция
+      // (reapplyMic/toggleMic) — она и владеет состоянием. Писать сюда noMic нельзя, это протухшая
+      // запись поверх нового владельца (ложное «микрофон недоступен» на каждой смене устройства).
       if (!started || !this.voiceIntentCurrent(voiceEpoch, room)) return;
       this.noMic = false; this.micRetryAt = 0; this.micFailureNotified = false;
       this.emit();
@@ -2073,15 +2093,16 @@ export class Engine {
   async toggleMic() {
     // Зашёл в голосовой БЕЗ мика → клик = попытка получить доступ (дал разрешение позже / воткнул микрофон).
     if (this.inVoice && this.noMic) {
+      const prevMute = this.manualMute; // не удалось поднять мик — интент мута обязан вернуться как был
       this.manualMute = false; // клик по мику = «хочу говорить»
       const room = this.voiceRoom;
       const voiceEpoch = this.voiceEpoch;
       try {
-        if (!room || !await this.startMic(voiceEpoch) || !this.voiceIntentCurrent(voiceEpoch, room)) return;
+        if (!room || !await this.startMic(voiceEpoch) || !this.voiceIntentCurrent(voiceEpoch, room)) { this.manualMute = prevMute; this.emit(); return; }
         this.noMic = false; this.micRetryAt = 0; this.micFailureNotified = false;
         this.saveVoicePrefs(); this.hooks.toast('Микрофон подключён');
       }
-      catch { this.hooks.toast('Микрофон всё ещё недоступен', 'warn'); }
+      catch { this.manualMute = prevMute; this.hooks.toast('Микрофон всё ещё недоступен', 'warn'); }
       this.emit(); return;
     }
     // Работает и ВНЕ голоса: пред-установка мута (Discord-стиль) — применится на входе (startMic мьютит
@@ -2095,6 +2116,8 @@ export class Engine {
       // размучивает трек (звук всё равно молчит через applyGate/gain=0, но у пиров и у себя
       // пропадает бейдж мута, будто фулл-мута больше нет).
       if (p && p.track) { (this.manualMute || this.deafened) ? p.track.mute() : p.track.unmute(); } // ручной мут виден другим
+      // Публикации может не быть (listen-only/рестарт мика) — тогда пиры узнают о муте только атрибутом.
+      void this.setVoiceAttributes(this.voiceRoom, this.wantedVoiceAttributes(this.voiceRoom));
       this.applyGate();
     }
     this.emit();
