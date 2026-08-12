@@ -382,6 +382,13 @@ export class Engine {
   setMembers(m: Member[]) { this.members = m; this.emit(); }
   setOnlineHint(ids: string[]) { this.onlineHint = new Set(ids); this.emit(); }
   setAwayHint(ids: string[]) { this.awayHint = new Set(ids); this.emit(); }
+  // Обслуживает ли живой LiveKit-путь чат ИМЕННО этого сервера. Нужен notify-WS: он гасит свою копию
+  // уведомления для «текущего» сервера, а «текущий» в сторе выставляется оптимистично (до подъёма
+  // комнаты) и переживает обрыв с реконнектом — в этих окнах LiveKit ничего не доставляет.
+  realtimeServes(serverId: string): boolean {
+    const room = this.viewRoom;
+    return !!room && this.viewServerId === serverId && this.roomReady && this.readyRooms.has(room) && !this.reconnectingRooms.has(room);
+  }
   setVoiceHint(v: Record<string, string>) { this.voiceHint = v || {}; this.emit(); }
   setVols(serverId: string, v: { users?: Record<string, number>; streams?: Record<string, number> }) {
     if (!serverId) return;
@@ -556,7 +563,11 @@ export class Engine {
     // A не запустит view-логику (чат/presence), а view-only комнаты B — voice-логику (mic/vc/vclaim).
     r.on(RoomEvent.TrackSubscribed, (track, pub, p) => this.onSub(track, pub, p, r))
       .on(RoomEvent.TrackUnsubscribed, (track, pub, p) => this.onUnsub(track, pub, p, r))
-      .on(RoomEvent.ParticipantConnected, (p) => { const u = baseUid(p.identity); if (r === this.voiceRoom) { this.observeVoiceSession(p); this.reconcileUserAudio(u); } if (r === this.viewRoom) { if (u !== this.me.username && !this.hasOtherSession(u, p.identity)) this.hooks.toast((p.name || u) + ' в сети', 'ok'); this.hooks.peerJoined(u); } this.emit(); })
+      // reconcileChannelSounds на подключении участника: пир, приехавший УЖЕ с vc-атрибутом (зашёл в
+      // голосовой на другом сервере/вкладке и только потом подключился к комнате), не даёт события
+      // ParticipantAttributesChanged — его вход раньше озвучивался только 3-секундным таймером, а в
+      // фоновой вкладке таймер троттлится, и «кто-то зашёл» было слышно с большой задержкой или никогда.
+      .on(RoomEvent.ParticipantConnected, (p) => { const u = baseUid(p.identity); if (r === this.voiceRoom) { this.observeVoiceSession(p); this.reconcileUserAudio(u); this.reconcileChannelSounds(); } if (r === this.viewRoom) { if (u !== this.me.username && !this.hasOtherSession(u, p.identity)) this.hooks.toast((p.name || u) + ' в сети', 'ok'); this.hooks.peerJoined(u); } this.emit(); })
       // u !== this.me.username — иначе отключение СВОЕЙ же зомби-сессии (неудачный первый коннект,
       // сеть/деплой) чистит АНАЛИЗАТОР ТЕКУЩЕЙ живой сессии (detachAnalyser(me) внутри cleanupPeer):
       // полоска чувствительности замирает, гейт «активация голосом» может замереть закрытым — мик
@@ -1064,6 +1075,9 @@ export class Engine {
   // (первичный вход / смена своего канала: не проигрывать entry по всем, кто уже был там).
   private reconcileChannelSounds(seedOnly = false) {
     const cur = this.currentChannelPeers();
+    // Реконнект LiveKit «отключает» всех участников и подключает заново: без этого гейта канал получал
+    // залп exit по всем, а следом залп entry, хотя никто никуда не выходил. Состав пере-сеиваем молча.
+    if (this.reconnecting || this.voiceReconnecting || this.voiceLeaseVerifying) seedOnly = true;
     if (!seedOnly) {
       cur.forEach((u) => { if (!this.myChannelPeers.has(u)) playSound('entry'); });
       this.myChannelPeers.forEach((u) => { if (!cur.has(u)) playSound('exit'); });
@@ -1350,6 +1364,11 @@ export class Engine {
     this.voiceServerId = targetServer;
     targetRoom.remoteParticipants.forEach((p) => this.observeVoiceSession(p));
     this.liveKitT.setBroadcastRoom?.(this.voiceRoom); // браузер вещает в ГОЛОСОВУЮ комнату (не в смотримую при браузинге)
+    // Состав канала сеем СРАЗУ, а не после всей сетевой части входа: между установкой currentVc и
+    // концом join проходят секунды (ticket, lease, gUM, RNNoise, publish), и любой reconcile в этом
+    // окне (таймер 3с, смена атрибутов пира) сравнивал новый канал с ПУСТЫМ составом — заходящий
+    // слышал залп entry по всем, кто уже сидел. А вход соседа именно в этом окне, наоборот, глох.
+    this.reconcileChannelSounds(true);
     this.emit(); // ОПТИМИСТИЧНО: сразу рисуем себя в канале + статус «подключение» (mic ещё публикуется)
     // Быстрый A→B во время gUM/публикации инвалидирует старый pipeline прежде, чем создаём новый.
     if (replacingPendingJoin) {
@@ -1433,7 +1452,7 @@ export class Engine {
       this.hooks.toast('Микрофон недоступен — ты в канале, но тебя не слышно', 'warn');
     }
     this.reconcileAllAudio(); // подписываемся на пиров этого же канала (bootstrap мик-подписок)
-    this.reconcileChannelSounds(true); // сеем состав канала БЕЗ звука (не проигрываем entry по всем, кто уже там)
+    this.reconcileChannelSounds(); // состав уже посеян в начале join — тут озвучиваем тех, кто зашёл ПОКА я входил
     this.startConnPoll();
     this.voiceConnecting = false;
     this.lostVoiceServerId = null; this.lostVoiceChannel = null;
@@ -1456,6 +1475,7 @@ export class Engine {
       : Promise.resolve(null);
     this.currentVc = channelId;
     this.myVcAt = this.channelStartFor(channelId);
+    this.reconcileChannelSounds(true); // состав НОВОГО канала — молча и сразу (иначе reconcile в окне свитча даст залп entry)
     // Пока сервер решает, кому принадлежит аккаунт, старый uplink молчит и старый vc снимается.
     // Это делает A→B атомарным для слушателей: никто не услышит речь в уже покинутом канале.
     this.applyGate();
@@ -1509,7 +1529,7 @@ export class Engine {
     this.lastVclaim = Date.now();
     this.dataSend({ t: 'vclaim', uid: this.me.id, session, epoch: this.voiceLeaseEpoch });
     this.reconcileAllAudio();
-    this.reconcileChannelSounds(true); // пере-сеем состав НОВОГО канала БЕЗ звука (мне не нужен бурст entry; другие услышат МЕНЯ через смену vc-атрибута)
+    this.reconcileChannelSounds(); // состав посеян в начале свитча — тут озвучиваем зашедших за время переключения
     playSound('entry');
     this.emit();
   }

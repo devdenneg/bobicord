@@ -6,6 +6,7 @@ import { isTauri, foregroundFullscreen } from './native';
 import { getSettings, setSettings } from './settings';
 import { ensurePushSubscribed } from './push';
 import { playSound } from './sounds';
+import { visibleChatServer } from './chatVisibility';
 import {
   notificationDestinationFromTag,
   notificationDestinationUrl,
@@ -104,7 +105,20 @@ function notificationPresentation(kind: NotifKind, title: string, body: string, 
 
 // Кастомное нативное уведомление: своя карточка в стиле приложения (окно Tauri notif.html),
 // вместо системного toast. Возвращает true, если окно создалось (иначе вызывающий даёт фолбэк).
+// Создание карточек строго по очереди. Метка окна одна ('notif'), а notify() зовут параллельно
+// (упоминание + старт трансляции, два упоминания подряд): оба успевали пройти проверку getByLabel
+// до того, как соперник создал окно, второй получал конфликт метки → 'tauri://error' → фолбэк на
+// системный toast, который срабатывает только при выданном разрешении. То есть одно из двух
+// уведомлений просто пропадало. Очередь как voiceAttrWrites в engine.
+let nativeCardQueue: Promise<unknown> = Promise.resolve();
+
 async function showNativeCard(kind: NotifKind, title: string, body: string, tag?: string, destination?: NotificationDestination | null): Promise<boolean> {
+  const run = nativeCardQueue.catch(() => {}).then(() => showNativeCardNow(kind, title, body, tag, destination));
+  nativeCardQueue = run.catch(() => {});
+  return run;
+}
+
+async function showNativeCardNow(kind: NotifKind, title: string, body: string, tag?: string, destination?: NotificationDestination | null): Promise<boolean> {
   try {
     const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
     // одно окно за раз: закрываем прежнее, иначе конфликт по label
@@ -134,7 +148,7 @@ async function showNativeCard(kind: NotifKind, title: string, body: string, tag?
     if (destination?.serverId) query.set('server', destination.serverId);
     if (destination?.messageId) query.set('message', String(destination.messageId));
     const url = `notif.html?${query.toString()}`;
-    return await new Promise<boolean>((resolve) => {
+    const create = () => new Promise<boolean>((resolve) => {
       let settled = false;
       const done = (ok: boolean) => { if (!settled) { settled = true; resolve(ok); } };
       try {
@@ -144,11 +158,17 @@ async function showNativeCard(kind: NotifKind, title: string, body: string, tag?
           skipTaskbar: true, focus: false, focusable: false, resizable: false, shadow: false, title: 'RelayApp',
         });
         win.once('tauri://created', () => done(true));
-        win.once('tauri://error', () => done(false)); // нет прав / ошибка → фолбэк на OS-toast
+        win.once('tauri://error', () => done(false)); // нет прав / конфликт метки → решаем ниже
       } catch { done(false); }
       // события не пришли — считаем показанным (лучше пропустить фолбэк, чем задвоить уведомление)
       setTimeout(() => done(true), 2000);
     });
+    if (await create()) return true;
+    // Предыдущая карточка закрывается с анимацией (~330мс в notif-window.ts), поэтому метка могла быть
+    // ещё занята. Даём ей уйти и пробуем ещё раз, прежде чем падать в системный toast.
+    await new Promise((r) => setTimeout(r, 400));
+    try { const ex = await WebviewWindow.getByLabel('notif'); if (ex) await ex.close(); } catch { /**/ }
+    return await create();
   } catch { return false; }
 }
 
@@ -181,9 +201,13 @@ export async function notify(kind: NotifKind, opts: RelayNotificationOptions): P
     // Mention/@all — звук-пинг ВСЕГДА (даже когда смотришь чат): быть @упомянутым/в @all важно (как Discord).
     // Визуальную карточку ниже фокус-гейтим и не показываем поверх фуллскрин-игры — но звук уже дан.
     if (kind === 'mention') playSound('tag');
-    // Фокус-гейт — только для ВИЗУАЛЬНОЙ карточки mention (в фокусе баннер не нужен, звук уже сыгран).
-    // force:true (notify-WS из другого сервера) — чат не виден, показываем даже в фокусе.
-    if (FOCUS_GATED[kind] && focused() && !opts.force) return false;
+    // Фокус-гейт — только для ВИЗУАЛЬНОЙ карточки mention. Гасим её, лишь когда человек РЕАЛЬНО видит
+    // тот чат, где его упомянули: «окно в фокусе» этого не означает — можно сидеть на главной, в другом
+    // сервере или в раскладке со скрытой чат-панелью, и тогда карточка исчезала, а упоминание пропадало.
+    // force:true (notify-WS) — путь заведомо не обслуживается живым чатом, показываем всегда.
+    const mentionServerId = opts.destination?.serverId || notificationDestinationFromTag(opts.tag)?.serverId || null;
+    const chatOnScreen = !!mentionServerId && visibleChatServer() === mentionServerId;
+    if (FOCUS_GATED[kind] && focused() && chatOnScreen && !opts.force) return false;
     if (isTauri) {
       // Фуллскрин-приложение (игра) на переднем плане → окно-карточка свернёт его (Windows выкидывает
       // exclusive-fullscreen из полного экрана). Окно НЕ создаём; звук уже сыгран, toast-фолбэк тоже не шлём.

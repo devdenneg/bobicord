@@ -69,6 +69,12 @@ if (typeof window !== 'undefined') {
   document.addEventListener('visibilitychange', () => { if (!document.hidden) wake(); });
   (['pointerdown', 'keydown', 'touchstart'] as const).forEach((ev) => window.addEventListener(ev, wake, { passive: true }));
   subscribeSettings(applySink); // вывод звуков следует за выбранным устройством вывода
+  // Переподключение наушников меняет РЕАЛЬНОЕ устройство за тем же '' (системное по умолчанию):
+  // resolveSink отдаст уже другой deviceId, но applySink без этого хука не позвался бы — звуки
+  // остались бы в прежнем (отключённом) устройстве, и «вход/выход» переставало быть слышно.
+  try {
+    navigator.mediaDevices?.addEventListener?.('devicechange', () => { lastSink = null; void applySink(); });
+  } catch { /** устройство вывода выберет система */ }
 }
 
 async function load(name: SoundName): Promise<void> {
@@ -98,19 +104,32 @@ export function preloadSounds(): void {
   (Object.keys(FILES) as SoundName[]).forEach((n) => { load(n).catch(() => {}); });
 }
 
+// Насколько звук события ещё актуален. Suspended-контекст НЕ отбрасывает start() — он копит источники
+// и вываливает их залпом при первом резюме: пользователь, кликнувший через минуту, слышал очередь из
+// десятка «зашёл/вышел» разом. Просроченное событие лучше молча потерять, чем сыграть не вовремя.
+const SOUND_STALE_MS = 1500;
+
+function emitSound(name: SoundName, vol: number): void {
+  const buf = buffers[name];
+  const c = actx;
+  if (!buf || !c) return;
+  const src = c.createBufferSource();
+  src.buffer = buf;
+  const g = c.createGain();
+  g.gain.value = vol * (norm[name] ?? 1);
+  src.connect(g); g.connect(c.destination);
+  src.start();
+}
+
 export function playSound(name: SoundName): void {
   try {
     const vol = Math.max(0, Math.min(1, (getSettings().notifyVolume ?? 60) / 100));
     if (vol <= 0) return;
-    const buf = buffers[name];
-    if (!buf) { load(name).then(() => playSound(name)).catch(() => {}); return; } // ленивая загрузка, затем играем
+    const at = Date.now();
+    if (!buffers[name]) { load(name).then(() => { if (Date.now() - at < SOUND_STALE_MS) playSound(name); }).catch(() => {}); return; }
     const c = ctx();
-    c.resume?.().catch(() => {}); // контекст мог родиться suspended (без жеста) — будим
-    const src = c.createBufferSource();
-    src.buffer = buf;
-    const g = c.createGain();
-    g.gain.value = vol * (norm[name] ?? 1);
-    src.connect(g); g.connect(c.destination);
-    src.start();
+    if (c.state === 'running') { emitSound(name, vol); return; }
+    // контекст мог родиться suspended (без жеста) или уснуть — будим и играем ТОЛЬКО если успели
+    void c.resume?.().then(() => { if (Date.now() - at < SOUND_STALE_MS) emitSound(name, vol); }).catch(() => {});
   } catch { /* ignore */ }
 }

@@ -5,12 +5,15 @@
 import { getToken, webOrigin } from './api';
 import { notify, type NotifKind } from './notify';
 import { rememberNotificationDestination } from './notificationDestination';
+import { setVisibleChatServer } from './chatVisibility';
 import { useStore, getEngine } from './store';
 
 let ws: WebSocket | null = null;
 let reconnectTimer: number | null = null;
 let closed = false;
 let reconnectPaused = false;
+let reconnectAttempt = 0; // экспоненциальный бэкофф: фиксированные 4с всей аудиторией лупили сервер синхронно после рестарта
+let revokedToken: string | null = null; // токен, по которому сервер вернул 4001 (сессия отозвана) — им сокет уже не откроется
 let presenceAway = false; // последнее заявленное idle-состояние (шлём серверу для away/жёлтого статуса)
 let activeChatServerId: string | null = null; // сервер, чей чат реально открыт в UI (не просто живая LiveKit-комната)
 
@@ -26,13 +29,34 @@ function sendPresenceFrame(): void {
 
 function onVisibilityChange(): void {
   sendPresenceFrame();
+  if (document.visibilityState === 'visible') kickReconnect(); // вернулись на вкладку — не ждём троттлящийся таймер
 }
 
 document.addEventListener('visibilitychange', onVisibilityChange);
+// Сеть вернулась/окно снова в фокусе — пробуем сразу, а не через бэкофф: уведомления по НЕ подключённым
+// серверам ходят только этим сокетом, и лишняя минута молчания = молча пропущенное упоминание.
+window.addEventListener('online', () => kickReconnect());
+window.addEventListener('focus', () => kickReconnect());
 
+// Сессия отозвана ИМЕННО этим токеном. Свежий логин выдаёт другой — тогда запрет снимается сам.
+function revoked(): boolean { return !!revokedToken && revokedToken === getToken(); }
+
+// Немедленная попытка вне расписания бэкоффа (счётчик при этом не сбрасываем — успех сбросит его сам).
+function kickReconnect(): void {
+  if (closed || reconnectPaused || revoked()) return;
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  connectNotifyWs();
+}
+
+// Бэкофф 1→30с с джиттером ±25%: без него весь онлайн ломился обратно ровно через 4с после каждого
+// рестарта сервера (thundering herd), а «вечный» цикл с мёртвым токеном крутился бесконечно.
 function scheduleReconnect() {
-  if (reconnectTimer || closed || reconnectPaused) return;
-  reconnectTimer = window.setTimeout(() => { reconnectTimer = null; connectNotifyWs(); }, 4000);
+  if (reconnectTimer || closed || reconnectPaused || revoked()) return;
+  const base = Math.min(30000, 1000 * 2 ** Math.min(reconnectAttempt, 5));
+  const delay = Math.round(base * (0.75 + Math.random() * 0.5));
+  reconnectAttempt++;
+  reconnectTimer = window.setTimeout(() => { reconnectTimer = null; connectNotifyWs(); }, delay);
 }
 
 // Away-статус (см. idle.ts): апп давно не трогали → away:true (жёлтый). Шлём по глобальному notify-WS,
@@ -46,6 +70,7 @@ export function sendPresence(away: boolean): void {
 // чат прямо сейчас. ServerView сообщает точную видимость панели; null явно снимает аудиторию.
 export function sendActiveChat(serverId: string | null): void {
   const next = typeof serverId === 'string' && serverId.trim() ? serverId.trim() : null;
+  setVisibleChatServer(next); // тем же значением пользуется локальный фокус-гейт уведомлений
   if (next === activeChatServerId) return;
   activeChatServerId = next;
   sendPresenceFrame();
@@ -65,7 +90,7 @@ export function connectNotifyWs() {
   const url = webOrigin().replace(/^http/, 'ws') + '/ws?token=' + encodeURIComponent(token);
   let current: WebSocket;
   try { current = new WebSocket(url); ws = current; } catch { scheduleReconnect(); return; }
-  current.onopen = () => { if (ws !== current) { try { current.close(); } catch { /**/ } return; } sendPresenceFrame(); }; // переотправляем idle + реально открытый чат
+  current.onopen = () => { if (ws !== current) { try { current.close(); } catch { /**/ } return; } reconnectAttempt = 0; sendPresenceFrame(); }; // переотправляем idle + реально открытый чат
   current.onmessage = (ev) => {
     if (ws !== current) return;
     let d: any; try { d = JSON.parse(ev.data); } catch { return; }
@@ -106,10 +131,12 @@ export function connectNotifyWs() {
     // Realtime chat can show the banner before POST returns its DB id. Preserve the exact target
     // under the same replaceable tag even when the visual notification came through LiveKit.
     rememberNotificationDestination(tag, destination);
-    // текущий (подключённый) сервер обслуживает живой LiveKit-путь — тут не дублируем
-    if (d.serverId && d.serverId === st.viewServerId) return;
-    // force: сюда доходят ТОЛЬКО не-текущие серверы (текущий отсеян выше по viewServerId) —
-    // их чат не виден, поэтому упоминание уведомляем даже в фокусе (обходим FOCUS_GATED).
+    // Текущий сервер гасим ТОЛЬКО если его realtime-путь реально жив: viewServerId выставляется
+    // оптимистично (до подъёма комнаты) и переживает терминальный обрыв с реконнектом, поэтому
+    // прежний дедуп «по id сервера» выбрасывал упоминание в окне, когда LiveKit его и не доставил.
+    if (d.serverId && d.serverId === st.viewServerId && getEngine()?.realtimeServes(d.serverId)) return;
+    // force: сюда доходят серверы, чей чат сейчас НЕ обслуживается живым LiveKit-путём, поэтому
+    // упоминание уведомляем даже в фокусе (обходим FOCUS_GATED).
     notify((d.kind as NotifKind) || 'mention', {
       title: `${d.title || 'Рилэй'}${d.serverName ? ' · ' + d.serverName : ''}`,
       body: d.body || '',
@@ -120,7 +147,19 @@ export function connectNotifyWs() {
     });
     if (d.serverId) st.bumpUnread(d.serverId);
   };
-  current.onclose = () => { if (ws !== current) return; ws = null; if (!closed) scheduleReconnect(); };
+  current.onclose = (ev) => {
+    if (ws !== current) return;
+    ws = null;
+    // 4001 = сервер отозвал сессию (смена пароля, подтверждение почты, удаление аккаунта на другом
+    // устройстве). Этим токеном сокет уже никогда не откроется — раньше клиент бесконечно долбился
+    // мёртвым JWT и молча оставался без уведомлений, ничего не сказав пользователю.
+    if (ev && ev.code === 4001) {
+      revokedToken = getToken() || null;
+      try { useStore.getState().toast('Сеанс завершён на другом устройстве — войди заново', 'warn'); } catch { /**/ }
+      return;
+    }
+    if (!closed) scheduleReconnect();
+  };
   current.onerror = () => { try { current.close(); } catch { /**/ } };
 }
 
