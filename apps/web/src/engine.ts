@@ -14,7 +14,7 @@ import type { VideoTransport } from './transport/videoTransport';
 import { LiveKitVideoTransport } from './transport/livekitVideo';
 import { TreeVideoTransport } from './transport/treeVideo';
 import { createDenoiseNode, destroyDenoiseNode } from './denoise';
-import { createVadNode, destroyVadNode } from './vad';
+import { createVadNode, destroyVadNode, type VadNode } from './vad';
 import { userVolumeToGain } from './volumeCurve';
 import {
   CHAT_SESSION_MESSAGE_LIMIT,
@@ -70,6 +70,12 @@ type SinkableAudioContext = AudioContext & {
 
 // шкала чувствительности ввода: rms(0..1) -> dB(-80..0) -> норм.уровень(0..1), сравнимый с порогом
 const VAD_HOLD_MS = 400; // «хвост» гейта активации голосом после падения ниже порога (совпадает с прежним hold=8 spLoop при 60fps)
+// Насколько может «протухнуть» замер уровня своего мика, прежде чем гейт активации голосом сдастся и
+// откроется. Оба драйвера (ворклет и spLoop) тикают ~48мс, так что 1с — 20-кратный запас: обычная
+// загрузка главного потока сюда не попадает. Смысл фейл-опена: неизмеренный уровень НЕ равен «молчит»,
+// а цена ошибки несимметрична — лишний фоновый шум против «человека вообще никто не слышит».
+const VAD_STALE_MS = 1000;
+const VAD_WATCHDOG_MS = 700; // как часто перепроверяем протухание (в фоне таймер троттлится — страхуемся ещё и visibilitychange)
 const WATCH_MAX = 4; // грид: сколько чужих стримов зритель смотрит разом (веб — tree-WS/PC на стрим, натив — Rust relay-слот на стрим)
 const STREAM_EDGE_GRACE_MS = 500;
 const STREAM_MESSAGE_AGGREGATE_MS = 30_000;
@@ -296,8 +302,12 @@ export class Engine {
   private vadOpen = false;
   // Детектор уровня своего мика на аудио-потоке (не на rAF) — работает и в фоновой вкладке. Владеет
   // vadOpen, пока жив; иначе фолбэк на rAF-анализатор spLoop (см. setupVadWorklet/applyLocalLevel).
-  private micVadNode: AudioWorkletNode | null = null;
+  private micVadNode: VadNode | null = null;
   private selfSpeakUntil = 0; // время (performance.now), до которого держим гейт открытым после речи
+  // Когда в последний раз приходил замер уровня своего мика (ворклет ИЛИ spLoop). Замер устарел =
+  // мы БОЛЬШЕ НЕ ЗНАЕМ, говорит человек или нет → гейт обязан открыться (см. applyGate/vadStale).
+  private micLevelAt = 0;
+  private vadWatchdog: number | null = null;
   private noiseFloorDb = MIN_DB + 20; // адаптивная оценка шумового фона для авто-режима
 
   // живой индикатор уровня для настроек (работает и вне звонка — временный захват микрофона)
@@ -1717,6 +1727,8 @@ export class Engine {
     this.micGain = gain;
     this.micDenoise = denoise;
     this.micVadDest = vadDest;
+    this.micLevelAt = performance.now(); // отсчёт протухания стартует с момента запуска мика, а не с нуля
+    this.startVadWatchdog();
     // индикатор «говорит» + VAD на rAF-анализаторе — сразу (рабочий на переднем плане и на время загрузки
     // ворклета); как только VAD-ворклет поднимется, он перехватит vadOpen и снимет свой мик со spLoop.
     this.attachAnalyser(this.me.username, vadDest.stream.getAudioTracks()[0]);
@@ -1732,13 +1744,14 @@ export class Engine {
   // не на micGain — иначе детектор слушал бы уже замолченный (gain=0) сигнал и залипал закрытым. При
   // неудаче (нет AudioWorklet / гонка stop во время addModule) остаёмся на rAF-анализаторе spLoop.
   private async setupVadWorklet(ctx: AudioContext, preGate: AudioNode, epoch: number) {
-    const node = await createVadNode(ctx);
-    if (!node) return; // фолбэк: spLoop уже двигает vadOpen с rAF-анализатора этого мика
-    if (this.micEpoch !== epoch || this.micActx !== ctx) { destroyVadNode(node); return; } // мик пересобран/остановлен
+    const vad = await createVadNode(ctx);
+    if (!vad) return; // фолбэк: spLoop двигает vadOpen с rAF-анализатора + фейл-опен по vadStale
+    if (this.micEpoch !== epoch || this.micActx !== ctx) { destroyVadNode(vad); return; } // мик пересобран/остановлен
+    const node = vad.node;
     try {
       preGate.connect(node); // тап строго на preGate (после денойза, канал 0), НЕ на micGain
       node.port.onmessage = (e) => {
-        if (this.micVadNode !== node) return;
+        if (this.micVadNode !== vad) return;
         // Первое сообщение = ворклет реально обрабатывает (0-output leaf гарантированно пуллится этим
         // движком) → передаём ему владение vadOpen и снимаем rAF-анализатор своего мика со spLoop, чтобы
         // не дублировать расчёт. Если ворклет вдруг не заработал бы — spLoop так и остаётся драйвером
@@ -1746,8 +1759,8 @@ export class Engine {
         if (this.analysers.has(this.me.username)) this.detachAnalyser(this.me.username, true); // keepSpeaking: applyLocalLevel ниже ведёт индикатор дальше без лишнего edge
         this.applyLocalLevel(typeof e.data === 'number' ? e.data : 0);
       };
-      this.micVadNode = node;
-    } catch { destroyVadNode(node); this.micVadNode = null; }
+      this.micVadNode = vad;
+    } catch { destroyVadNode(vad); this.micVadNode = null; }
   }
   // Обработка уровня своего мика из VAD-ворклета: порог/хвост/шумовой фон + гейт + индикатор «говорю».
   // Дублирует ветку isMe в spLoop, но с хвостом по времени (такт ворклета ≠ такту rAF).
@@ -1757,11 +1770,13 @@ export class Engine {
     const threshold = this.thresholdNorm();
     const on = norm >= threshold;
     const now = performance.now();
+    const wasStale = this.vadStale(); // гейт мог стоять в фейл-опене — после свежего замера пересчитать обязательно
+    this.micLevelAt = now; // замер свежий → гейт снова верит своему решению (см. vadStale)
     if (on) this.selfSpeakUntil = now + VAD_HOLD_MS;
     const spk = on || now < this.selfSpeakUntil;
     this.updateNoiseFloor(db); // подъём медленный — фраза не продавит, постоянный шум со временем перекроет
     this.levelListeners.forEach((f) => f(norm, spk, threshold));
-    if (spk !== this.vadOpen) { this.vadOpen = spk; this.applyGate(); }
+    if (spk !== this.vadOpen || wasStale) { this.vadOpen = spk; this.applyGate(); }
     const me = this.me.username;
     if (spk && !this.speakingSet.has(me)) { this.speakingSet.add(me); this.emit(); }
     else if (!spk && this.speakingSet.has(me)) { this.speakingSet.delete(me); this.emit(); }
@@ -1847,9 +1862,14 @@ export class Engine {
   // Возврат PWA на передний план: мгновенно резюмим контексты + проверяем живость источника
   // (не ждём до 2.5с следующего watchdog-тика). muted-рестарт тут не делаем — только ended.
   private onVisible = () => {
-    if (document.hidden || !this.inVoice) return;
+    if (!this.inVoice) return;
+    // Уход в фон — момент, когда замирает requestAnimationFrame. Если гейт держится на spLoop
+    // (ворклет не поднялся), замер протухнет именно сейчас, поэтому пересчитываем гейт сразу, не
+    // дожидаясь троттлящегося таймера-сторожа. Возврат на вкладку пересчитает его тем же путём.
+    if (document.hidden) { window.setTimeout(() => this.applyGate(), VAD_STALE_MS + 50); return; }
     this.micActx?.resume?.().catch(() => {});
     this.spCtx?.resume?.().catch(() => {});
+    this.applyGate();
     void this.checkMicAlive(false);
     this.ensureVoiceAudioRunning();
   };
@@ -1866,6 +1886,8 @@ export class Engine {
     this.detachAnalyser(this.me.username);
     this.vadOpen = false;
     this.selfSpeakUntil = 0;
+    this.micLevelAt = 0;
+    this.stopVadWatchdog();
     this.clearAudioUnlock();
     raw?.getTracks().forEach((t) => t.stop());
     destroyDenoiseNode(denoise);
@@ -1878,6 +1900,12 @@ export class Engine {
     if (ctx) { try { waits.push(ctx.close()); } catch { /**/ } }
     await Promise.allSettled(waits);
   }
+  // Замер уровня своего мика протух: ни ворклет, ни spLoop давно не присылали значение. Такое бывает,
+  // когда ворклет не поднялся (нет AudioWorklet / модуль не догрузился) И вкладка ушла в фон — там
+  // requestAnimationFrame заморожен, spLoop не тикает, и vadOpen застывает в последнем значении.
+  // Застыть он может на «закрыто», и тогда человека НИКТО не слышит, пока он не вернётся на вкладку.
+  // Поэтому протухший замер = «не знаю» = открываем гейт: лучше лишний фоновый шум, чем немой микрофон.
+  private vadStale(): boolean { return performance.now() - this.micLevelAt > VAD_STALE_MS; }
   // gain = 1 (передаём) либо 0 (мут/оглушение/PTT-не-нажат/ниже порога чувствительности)
   private applyGate() {
     if (!this.micGain || !this.micActx) return;
@@ -1888,8 +1916,23 @@ export class Engine {
     if (this.voiceLeaseVerifying || this.voiceClaimPending !== 0 || this.voiceLeaseEpoch <= 0 || this.voiceLeaseSession !== this.sessionId()) target = 0;
     else if (this.manualMute || this.deafened) target = 0;
     else if (s.mode === 'ptt') target = this.pttDown ? 1 : 0;
-    else if (!this.vadOpen) target = 0; // "активация голосом": ниже порога чувствительности — не передаём
+    else if (!this.vadOpen && !this.vadStale()) target = 0; // "активация голосом": ниже порога чувствительности — не передаём
     try { this.micGain.gain.setTargetAtTime(target, this.micActx.currentTime, 0.015); } catch { this.micGain.gain.value = target; }
+  }
+  // Сторож фейл-опена: сам по себе гейт пересчитывается только на событиях (замер уровня, мут, PTT),
+  // а протухание — состояние без события. В фоне таймер троттлится, поэтому visibilitychange (onVisible
+  // и уход в фон) дёргает applyGate отдельно — именно в этот момент rAF и замирает.
+  private startVadWatchdog() {
+    if (this.vadWatchdog != null) return;
+    this.vadWatchdog = window.setInterval(() => {
+      if (!this.micGain) return;
+      if (getSettings().mode === 'voice') this.applyGate();
+    }, VAD_WATCHDOG_MS);
+  }
+  private stopVadWatchdog() {
+    if (this.vadWatchdog == null) return;
+    clearInterval(this.vadWatchdog);
+    this.vadWatchdog = null;
   }
   // текущий порог чувствительности (0..1), с учётом авто-режима
   private thresholdNorm(): number {
@@ -2144,9 +2187,11 @@ export class Engine {
         if (on) o.hold = 8; else if (o.hold > 0) o.hold--;
         const spk = o.hold > 0 || on;
         if (isMe) {
+          const wasStale = this.vadStale(); // гейт мог стоять в фейл-опене — после свежего замера пересчитать обязательно
+          this.micLevelAt = performance.now();
           this.updateNoiseFloor(db); // подъём мед­ленный (см. updateNoiseFloor) — фраза его не продавит, а постоянный шум со временем перекроет
           this.levelListeners.forEach((f) => f(norm, spk, threshold));
-          if (spk !== this.vadOpen) { this.vadOpen = spk; this.applyGate(); }
+          if (spk !== this.vadOpen || wasStale) { this.vadOpen = spk; this.applyGate(); }
         }
         if (spk && !this.speakingSet.has(id)) {
           this.speakingSet.add(id); changed = true;
