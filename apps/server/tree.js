@@ -559,6 +559,10 @@ class TreeManager {
       const dropped = [...t.nodes.keys()];
       t.nodes.clear();
       t.broadcasterId = null;
+      // Ранний return проскакивал общую уборку внизу, а ключ дерева (`username#nonce::rendition`)
+      // уникален на сессию и никогда не переиспользуется — записи копились до перезапуска процесса
+      // и попадали в каждый ABR-тик. Узлы уже очищены, зрителям drop-peer/stream-end шлёт onLeave.
+      this.trees.delete(streamId);
       return { reparented: [], dropped, broadcasterLost: true };
     }
     const reparented = [];
@@ -1277,6 +1281,12 @@ function attachTreeServer(httpServer, opts) {
     const rendition = normRendition(msg.quality);
     const key = treeKey(streamId, rendition);
     const node = peers.get(id);
+    // Пир мог уже уйти (явный leave не закрывал сокет) — единственный хендлер без этого гарда,
+    // и разыменование undefined роняло весь процесс. Повторный join на том же сокете тоже
+    // отклоняем: он переписывал treeKey, оставляя узел-фантом в children прежнего родителя
+    // (навсегда занятый слот вещателя, а при role:'broadcaster' — цикл и переполнение стека).
+    // Легитимные клиенты (web treeVideo.ts, натив signaling.rs) шлют join ровно один раз на сокет.
+    if (!node || node.treeKey) return;
     node.streamId = streamId; node.rendition = rendition; node.treeKey = key;
     node.role = role; node.native = !!native; node.identity = identity || id;
     node.symmetricNat = !!symmetricNat;
@@ -1430,12 +1440,18 @@ function attachTreeServer(httpServer, opts) {
     if (typeof msg.framesDroppedPct === 'number') { p.framesDroppedPct = msg.framesDroppedPct; p.framesDropAt = Date.now(); }
     if (Array.isArray(msg.toChild)) {
       for (const s of msg.toChild) {
-        const c = peers.get(s.id);
-        if (c) {
+        if (!s || typeof s !== 'object') continue; // элемент null/число ронял процесс на s.id
+        const c = peers.get(String(s.id || ''));
+        // Сэмпл принимаем ТОЛЬКО за собственных детей в том же дереве: peer-id всех узлов
+        // рассылаются каждому участнику в tree-topology, поэтому без этой проверки любой зритель
+        // мог репортить чужие потери и обвалить битрейт/топологию всему дереву.
+        if (c && c.parent === id && c.treeKey === p.treeKey) {
           // EWMA-сглаживание: RTCP RR даёт мгновенный fraction_lost — один всплеск потерь
           // раньше сразу ронял битрейт всему дереву. Сглаживаем, чтобы реагировать на тренд.
-          c.linkRtt = (c.linkRtt || 0) * (1 - ABR_EWMA) + (s.rtt || 0) * ABR_EWMA;
-          c.linkLoss = (c.linkLoss || 0) * (1 - ABR_EWMA) + (s.loss || 0) * ABR_EWMA;
+          const rtt = Number.isFinite(s.rtt) ? Math.max(0, Math.min(10000, s.rtt)) : 0;
+          const loss = Number.isFinite(s.loss) ? Math.max(0, Math.min(1, s.loss)) : 0;
+          c.linkRtt = (c.linkRtt || 0) * (1 - ABR_EWMA) + rtt * ABR_EWMA;
+          c.linkLoss = (c.linkLoss || 0) * (1 - ABR_EWMA) + loss * ABR_EWMA;
           c.statsAt = Date.now(); // свежесть — см. STATS_TTL_MS (abrTick)
         }
       }
@@ -1676,17 +1692,25 @@ function attachTreeServer(httpServer, opts) {
     });
     ws.on('message', (raw) => {
       let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
-      if (msg.t === 'join') onJoin(id, msg);
-      else if (msg.t === 'sdp' || msg.t === 'ice') onSignal(id, msg);
-      else if (msg.t === 'leave') onLeave(id, 'явный leave');
-      else if (msg.t === 'hello') onHello(id, msg);
-      else if (msg.t === 'stats') onStats(id, msg);
-      else if (msg.t === 'request-reparent') onRequestReparent(id, msg);
-      else if (msg.t === 'request-keyframe') onRequestKeyframe(id);
-      else if (msg.t === 'vrelay-hello') onVrelayHello(id, msg);
-      else if (msg.t === 'set-quality') onSetQuality(id, msg);                       // Д4: ручной выбор качества
-      else if (msg.t === 'vrelay-rendition-failed') onVrelayRenditionFailed(id, msg); // Д4: агент не поднял рендишн
-      else if (msg.t === 'probe-start' || msg.t === 'probe-offer' || msg.t === 'probe-answer' || msg.t === 'probe-ice') onProbe(id, msg); // Д5: замер upload
+      if (!msg || typeof msg !== 'object') return;
+      // Диспетчер целиком под try/catch: ws зовёт слушателя СИНХРОННО, любое исключение уходит в
+      // uncaughtException, а index.js по нему делает process.exit(1) — то есть один битый кадр от
+      // одного клиента ронял весь сервер (чат, голос, деревья) для всех. Как в notify-WS.
+      try {
+        if (msg.t === 'join') onJoin(id, msg);
+        else if (msg.t === 'sdp' || msg.t === 'ice') onSignal(id, msg);
+        else if (msg.t === 'leave') onLeave(id, 'явный leave');
+        else if (msg.t === 'hello') onHello(id, msg);
+        else if (msg.t === 'stats') onStats(id, msg);
+        else if (msg.t === 'request-reparent') onRequestReparent(id, msg);
+        else if (msg.t === 'request-keyframe') onRequestKeyframe(id);
+        else if (msg.t === 'vrelay-hello') onVrelayHello(id, msg);
+        else if (msg.t === 'set-quality') onSetQuality(id, msg);                       // Д4: ручной выбор качества
+        else if (msg.t === 'vrelay-rendition-failed') onVrelayRenditionFailed(id, msg); // Д4: агент не поднял рендишн
+        else if (msg.t === 'probe-start' || msg.t === 'probe-offer' || msg.t === 'probe-answer' || msg.t === 'probe-ice') onProbe(id, msg); // Д5: замер upload
+      } catch (e) {
+        tlog(`ошибка обработки ${msg && msg.t}: ${e && e.message}`);
+      }
     });
     // code 1006 = грязный обрыв TCP (без close-фрейма): краш клиента, потеря сети,
     // heartbeat-terminate (см. hbTimer — он логирует свой terminate отдельно).

@@ -1492,10 +1492,23 @@ app.post('/api/push/unsubscribe', requireAuth, (req, res) => {
 });
 // Вещатель начал трансляцию → пуш участникам сервера, которых сейчас НЕТ в комнате (те, кто в
 // комнате, узнают через LiveKit/дерево — без дублей). Клиент дёргает это на старте шары.
+// Дебаунс объявления трансляции: роут рассылал notify-WS + web-push всем участникам сервера на
+// КАЖДЫЙ вызов, без какой-либо частоты. Реконнект вещателя, перезапуск шары или просто цикл вызовов
+// превращались в шторм баннеров у всех. Ключ — вещатель+сервер, окно 5 минут.
+const streamStartAnnouncedAt = new Map();
+const STREAM_START_COOLDOWN_MS = 5 * 60 * 1000;
+
 app.post('/api/servers/:id/stream-start', requireAuth, async (req, res) => {
   const sid = req.params.id;
   if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
   res.json({ ok: true });
+  const cooldownKey = req.user.id + '@' + sid;
+  const now = Date.now();
+  const announcedAt = streamStartAnnouncedAt.get(cooldownKey) || 0;
+  if (now - announcedAt < STREAM_START_COOLDOWN_MS) return;
+  streamStartAnnouncedAt.set(cooldownKey, now);
+  // Карта не должна расти бесконечно: чистим протухшие записи на каждом объявлении.
+  for (const [key, at] of streamStartAnnouncedAt) if (now - at > STREAM_START_COOLDOWN_MS) streamStartAnnouncedAt.delete(key);
   try {
     // ВСЕМ участникам кроме автора. Глобальный notify-WS (мгновенно онлайн, любой сервер) + web-push
     // (свёрнуто/закрыто). Дедуп с живым путём — на клиенте по connectedServerId.
@@ -2498,10 +2511,14 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
       const members = serverMembersFull(sid);
       const ids = mentionedIds(text, members);
       let rpUid = ''; try { const rp = replyTo ? JSON.parse(replyTo) : null; if (rp && rp.uid) rpUid = rp.uid; } catch (e) {}
-      if (rpUid) ids.add(rpUid);
+      // uid адресата ответа приходит из клиентского поля reply и раньше санитайзился только по длине —
+      // подставив чужой id, можно было слать уведомление и web-push любому пользователю сервиса.
+      // Фильтруем цели по фактическому составу сервера (mentionedIds уже ограничен им же).
+      const memberIds = new Set(members.map((m) => m.id));
+      if (rpUid && memberIds.has(rpUid)) ids.add(rpUid);
       ids.delete(req.user.id); // не себе
-      if (!ids.size) return;
-      const targets = [...ids];
+      const targets = [...ids].filter((uid) => memberIds.has(uid));
+      if (!targets.length) return;
       const body = text.slice(0, 140) || (image ? '🖼 изображение' : (attachments.length ? '📎 вложение' : ''));
       const nm = serverName(sid);
       const notificationMsgId = Number(info.lastInsertRowid);
@@ -2784,6 +2801,19 @@ server.on('upgrade', (req, socket, head) => {
       } catch (e) { /* ping/мусор игнорим */ }
     });
   });
+});
+// Финальный upgrade-хендлер (регистрируется ПОСЛЕ tree и notify). Node уничтожает upgrade-сокет сам
+// только когда слушателей 'upgrade' нет вовсе; при наличии слушателей сокет — целиком их забота, а оба
+// наших при чужом пути делали голый return. Такой сокет уже отцеплен от HTTP-парсера, поэтому
+// headersTimeout/requestTimeout на него не действуют — он висел вечно, и любой мог набрать файловых
+// дескрипторов простым потоком запросов с Upgrade на /api/что-угодно.
+server.on('upgrade', (req, socket) => {
+  if (socket.destroyed) return;
+  let pathname = '';
+  try { pathname = new URL(req.url, 'http://internal').pathname; } catch (e) { /* мусорный URL */ }
+  if (pathname === '/tree' || pathname === '/ws') return; // обслужен своим хендлером выше
+  try { socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); } catch (e) { /* сокет уже мёртв */ }
+  try { socket.destroy(); } catch (e) { /* ignore */ }
 });
 // heartbeat: half-open TCP может выглядеть OPEN бесконечно и «проглатывать» handoff notify.
 // На каждом тике предыдущий ping обязан иметь pong; иначе terminate запускает клиентский reconnect.
