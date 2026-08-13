@@ -10,6 +10,7 @@ const { WebSocketServer } = require('ws');
 const { attachTreeServer } = require('./tree');
 const { createVoiceLeaseStore, voiceLeaseEvent, selectVoiceState } = require('./voiceLease');
 const { installRuntimeRevocationSchema } = require('./runtimeRevocation');
+const { planUploadSweep, uploadUrlsOfMessageRows, normalizeUploadRef, UPLOAD_REF_RE } = require('./uploadsGc'); // квоты и уборка пользовательских файлов
 const {
   installReleaseSchema, listReleaseHistory, parseReleaseMeta, prepareRelease, finalizeRelease,
 } = require('./releaseNotes');
@@ -250,6 +251,20 @@ CREATE TABLE IF NOT EXISTS profile_banner_uploads(
   size INTEGER NOT NULL,
   created INTEGER NOT NULL
 );
+-- Единый реестр ВСЕХ пользовательских загрузок (картинки, вложения, фоны профиля): без него
+-- ни суточной квоты, ни уборки не построить — файлы жили на диске вечно, а том общий с БД.
+-- Файлы, загруженные до появления реестра, здесь отсутствуют; уборка их всё равно видит
+-- (обход директории), просто с бОльшим сроком «отлёжки».
+-- released=1 означает «файл уже удалён, строка живёт ради суточной квоты»: без этого пользователь
+-- снимал бы себе лимит, просто удалив собственные сообщения.
+CREATE TABLE IF NOT EXISTS uploads(
+  url TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  created INTEGER NOT NULL,
+  released INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS read_state(
   user_id TEXT NOT NULL,
   server_id TEXT NOT NULL,
@@ -273,6 +288,8 @@ CREATE TABLE IF NOT EXISTS auth_runtime_revocation_rooms(
 );
 CREATE INDEX IF NOT EXISTS idx_push_user ON push_subs(user_id);
 CREATE INDEX IF NOT EXISTS idx_profile_banner_upload_user ON profile_banner_uploads(user_id, created);
+CREATE INDEX IF NOT EXISTS idx_uploads_user ON uploads(user_id, created);
+CREATE INDEX IF NOT EXISTS idx_uploads_created ON uploads(created);
 CREATE INDEX IF NOT EXISTS idx_vc_server ON voice_channels(server_id, position);
 CREATE INDEX IF NOT EXISTS idx_msg_server ON messages(server_id, created);
 CREATE INDEX IF NOT EXISTS idx_msg_server_id ON messages(server_id, id);
@@ -305,6 +322,7 @@ for (const sql of [
   "ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT ''",           // '' обычное | 'levelup' карточка достижения
   "ALTER TABLE messages ADD COLUMN meta TEXT NOT NULL DEFAULT ''",           // JSON доп-данных сообщения (для levelup: {level})
   "ALTER TABLE auth_runtime_revocations ADD COLUMN revoked_before_version INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE uploads ADD COLUMN released INTEGER NOT NULL DEFAULT 0",      // строка живёт после удаления файла — по ней считается суточная квота
 ]) { try { db.exec(sql); } catch (e) { /* column already exists */ } }
 
 // Старые версии могли хранить внешний provider-id вместо локального upload URL.
@@ -730,8 +748,17 @@ function memberCount(sid) { return db.prepare('SELECT COUNT(*) c FROM membership
 function purgeServer(sid) {
   invalidateVoiceLeasesForServer(sid, 'server-deleted');
   evictRoomParticipants(sid);
-  for (const t of ['memberships', 'invites', 'server_settings', 'roles', 'member_roles', 'messages', 'voice_channels', 'read_state', 'deploy_release_targets']) db.prepare(`DELETE FROM ${t} WHERE server_id=?`).run(sid);
+  // Ссылки на файлы снимаем ДО удаления сообщений — потом их уже негде взять. Сама уборка идёт
+  // после сноса записей: пока сообщения живы, файл считается используемым.
+  const orphaned = uploadUrlsOfMessageRows(selectMessageUploadRows('server_id=?', sid));
+  const icon = db.prepare('SELECT icon_url FROM servers WHERE id=?').get(sid)?.icon_url;
+  if (icon) orphaned.push(icon);
+  // reactions и user_stats раньше не чистились вовсе — записи удалённого сервера копились навсегда.
+  for (const t of ['memberships', 'invites', 'server_settings', 'roles', 'member_roles', 'messages', 'voice_channels', 'read_state', 'deploy_release_targets', 'reactions', 'user_stats']) {
+    try { db.prepare(`DELETE FROM ${t} WHERE server_id=?`).run(sid); } catch (e) { /* таблицы-миграции могло не быть */ }
+  }
   db.prepare('DELETE FROM servers WHERE id=?').run(sid);
+  queueUploadRelease(orphaned);
 }
 // Полный снос юзера: сначала его сервера-владения (иначе осиротеют), потом все его записи.
 function purgeUser(uid) {
@@ -745,13 +772,27 @@ function purgeUser(uid) {
   invalidateVoiceLease(uid, () => true, 'account-deleted');
   if (account) for (const serverId of joinedServers) evictUserFromRoom(serverId, account.username);
   for (const s of db.prepare('SELECT id FROM servers WHERE owner_id=?').all(uid)) purgeServer(s.id);
+  // Файлы аккаунта: его сообщения, аватар, фон профиля и всё, что он успел загрузить, но не
+  // отправить. Реальное удаление — отложенное (queueUploadRelease): часть может быть процитирована
+  // в чужих сообщениях, такие файлы остаются.
+  const orphaned = uploadUrlsOfMessageRows(selectMessageUploadRows('user_id=?', uid));
+  const profile = db.prepare('SELECT avatar_url, profile_banner_url FROM users WHERE id=?').get(uid);
+  if (profile) { if (profile.avatar_url) orphaned.push(profile.avatar_url); if (profile.profile_banner_url) orphaned.push(profile.profile_banner_url); }
+  try { for (const row of db.prepare('SELECT url FROM uploads WHERE user_id=?').all(uid)) orphaned.push(row.url); } catch (e) { /**/ }
   for (const t of ['memberships', 'member_roles', 'server_settings', 'messages', 'read_state']) db.prepare(`DELETE FROM ${t} WHERE user_id=?`).run(uid);
-  for (const t of ['user_settings', 'push_subs', 'push_prefs']) db.prepare(`DELETE FROM ${t} WHERE user_id=?`).run(uid);
+  // reactions, user_stats и profile_banner_uploads раньше переживали удаление аккаунта.
+  for (const t of ['user_settings', 'push_subs', 'push_prefs', 'reactions', 'user_stats', 'profile_banner_uploads']) {
+    try { db.prepare(`DELETE FROM ${t} WHERE user_id=?`).run(uid); } catch (e) { /* таблицы-миграции могло не быть */ }
+  }
   if (authManager) authManager.purgeUser(uid);
   db.prepare('DELETE FROM voice_session_intents WHERE user_id=?').run(uid);
   db.prepare('DELETE FROM voice_user_intents WHERE user_id=?').run(uid);
   db.prepare('DELETE FROM voice_leases WHERE user_id=?').run(uid);
   db.prepare('DELETE FROM users WHERE id=?').run(uid);
+  // Строки реестра удалённого аккаунта больше не нужны (квоту считать некому), но сами файлы
+  // сносит очередь ниже — и только те, на которые уже никто не ссылается.
+  try { db.prepare('DELETE FROM uploads WHERE user_id=?').run(uid); } catch (e) { /**/ }
+  queueUploadRelease(orphaned);
 }
 
 function closeLocalRuntimeSessions(userId, username, reason) {
@@ -1775,21 +1816,24 @@ function inspectImage(body, ext) {
   return null;
 }
 
-function profileBannerIsReferenced(url) {
-  if (db.prepare('SELECT 1 FROM users WHERE avatar_url=? OR profile_banner_url=? LIMIT 1').get(url, url)) return true;
-  if (db.prepare('SELECT 1 FROM servers WHERE icon_url=? LIMIT 1').get(url)) return true;
-  const contains = `%${url}%`; // strict generated URL has no SQL LIKE wildcard characters
-  return !!db.prepare('SELECT 1 FROM messages WHERE image=? OR attachments LIKE ? OR reply_to LIKE ? LIMIT 1').get(url, contains, contains);
-}
+// Один источник правды о ссылках на файл — uploadIsReferenced (см. блок квот и уборки ниже).
+// Отдельная копия этой проверки для баннеров разъехалась бы с общей уборкой при первой же правке.
+function profileBannerIsReferenced(url) { return uploadIsReferenced(url); }
 
 function deleteOwnedProfileBannerIfUnused(userId, url) {
   if (!UPLOAD_RE.test(url) || profileBannerIsReferenced(url)) return false;
   const tracked = db.prepare('SELECT user_id FROM profile_banner_uploads WHERE url=?').get(url);
   if (!tracked || tracked.user_id !== userId) return false; // legacy/chat files are never deleted here
   const name = url.slice('/api/uploads/'.length);
+  let size = 0;
+  try { size = fs.statSync(path.join(UPLOADS_DIR, name)).size; } catch (e) { size = 0; }
   try { fs.unlinkSync(path.join(UPLOADS_DIR, name)); }
   catch (e) { if (e?.code !== 'ENOENT') return false; }
   db.prepare('DELETE FROM profile_banner_uploads WHERE url=?').run(url);
+  // Строку общего реестра НЕ удаляем, а помечаем released: она ещё нужна суточной квоте. Заодно
+  // держим в актуальном состоянии счётчик занятого места (иначе он дрейфует только вверх).
+  try { upStmt.markReleased.run(url); } catch (e) { /**/ }
+  try { uploadsBytesCached = Math.max(0, uploadsBytesCached - size); } catch (e) { /**/ }
   return true;
 }
 
@@ -1814,11 +1858,14 @@ function saveImageUpload(req, res, profileBanner = false) {
     const used = Number(db.prepare('SELECT COALESCE(SUM(size),0) total FROM profile_banner_uploads WHERE user_id=?').get(req.user.id)?.total || 0);
     if (used + req.body.length > PROFILE_BANNER_QUOTA_BYTES) return res.status(413).json({ error: 'Лимит фонов профиля исчерпан — сохрани или замени текущий фон' });
   }
+  const rejection = uploadRejectReason(req.user.id, req.body.length); // суточная квота + потолок хранилища
+  if (rejection) return res.status(413).json({ error: rejection });
   const name = crypto.randomBytes(12).toString('hex') + '.' + ext;
   const url = '/api/uploads/' + name;
   try {
     fs.writeFileSync(path.join(UPLOADS_DIR, name), req.body, { flag: 'wx' });
     if (profileBanner) db.prepare('INSERT INTO profile_banner_uploads(url,user_id,size,created) VALUES(?,?,?,?)').run(url, req.user.id, req.body.length, Date.now());
+    recordUpload(url, req.user.id, profileBanner ? 'banner' : 'image', req.body.length);
   } catch (e) {
     try { fs.unlinkSync(path.join(UPLOADS_DIR, name)); } catch (_) { /**/ }
     return res.status(500).json({ error: 'Не удалось сохранить файл' });
@@ -2021,12 +2068,219 @@ app.post('/api/upload-file', requireAuth, express.raw({ type: () => true, limit:
   const rawName = String(req.headers['x-attachment-name'] || '');
   let origName = 'file';
   try { origName = decodeURIComponent(rawName).slice(0, 255) || 'file'; } catch (e) { /* мусор в заголовке — дефолт */ }
+  const rejection = uploadRejectReason(req.user.id, req.body.length); // суточная квота + потолок хранилища
+  if (rejection) return res.status(413).json({ error: rejection });
   const ext = (origName.match(/\.[a-zA-Z0-9]{1,10}$/) || [''])[0].toLowerCase();
   const name = crypto.randomBytes(12).toString('hex') + ext;
-  try { fs.writeFileSync(path.join(FILES_DIR, name), req.body); }
+  const url = '/api/files/' + name;
+  try { fs.writeFileSync(path.join(FILES_DIR, name), req.body, { flag: 'wx' }); }
   catch (e) { return res.status(500).json({ error: 'Не удалось сохранить файл' }); }
-  res.json({ url: '/api/files/' + name, name: origName, size: req.body.length });
+  recordUpload(url, req.user.id, 'file', req.body.length);
+  res.json({ url, name: origName, size: req.body.length });
 });
+/* ---------------- КВОТЫ И УБОРКА ЗАГРУЗОК ----------------
+ * Раньше файлы не удалялись НИКОГДА: ни при удалении сообщения, ни при очистке чата, ни при сносе
+ * сервера или аккаунта, и никакой квоты, кроме фонов профиля, не было. Том общий с БД, так что
+ * переполнение унесло бы весь сервис. Схема защиты:
+ *   1) суточная квота на пользователя — от заливки диска за один заход;
+ *   2) общий потолок обеих директорий — новые загрузки отклоняются, пока уборка не освободит место;
+ *   3) уборка по ССЫЛКАМ: удаляется только то, на что никто не ссылается (аватар, иконка сервера,
+ *      картинка/вложение сообщения, превью в цитате). Ссылочный файл не удаляется никогда, даже под
+ *      потолком — испортить историю хуже, чем занять диск;
+ *   4) отлёжка: свежий файл не трогаем — его могли загрузить, но ещё не отправить сообщением.
+ * Уборка НЕОБРАТИМА, поэтому: рубильник UPLOADS_GC=0, подробный лог каждого прохода, работа
+ * порциями с возвратом управления в event loop и одна транзакция на порцию (иначе тысячи fsync
+ * подряд замораживают однопоточный процесс вместе с сигналингом дерева и раздачей токенов). */
+const UPLOAD_DAILY_QUOTA_BYTES = Math.max(10, Number(process.env.UPLOAD_DAILY_QUOTA_MB) || 300) * 1024 * 1024;
+const UPLOADS_CAP_BYTES = Math.max(256, Number(process.env.UPLOADS_CAP_MB) || 3072) * 1024 * 1024;
+const UPLOADS_GC_ENABLED = process.env.UPLOADS_GC !== '0'; // рубильник: выключает удаление, квоты остаются
+const UPLOAD_GC_GRACE_MS = 24 * 60 * 60 * 1000;          // учтённый файл: сутки на «загрузил, но ещё не отправил»
+const UPLOAD_LEGACY_GRACE_MS = 7 * 24 * 60 * 60 * 1000;  // файл вне реестра (до появления учёта): неделя
+const UPLOAD_LEDGER_TTL_MS = 3 * 24 * 60 * 60 * 1000;    // сколько держим строку уже удалённого файла (см. released)
+const UPLOAD_RELEASE_DEBOUNCE_MS = 20_000;               // склейка отложенной уборки после удалений
+const UPLOAD_SWEEP_CHUNK = 200;                          // файлов на одну транзакцию/тик
+let uploadsBytesCached = 0;   // пересчитывается уборкой; между проходами корректируется приходом/уходом
+let uploadsSweepKnown = false; // до первого прохода реальный объём неизвестен — потолок не применяем
+
+// Реестр держит строку и ПОСЛЕ удаления файла (released=1): суточная квота считается по нему, и без
+// этого пользователь снимал бы себе лимит, просто удалив свои же сообщения.
+const upStmt = {
+  insert: db.prepare('INSERT OR REPLACE INTO uploads(url,user_id,kind,size,created,released) VALUES(?,?,?,?,?,0)'),
+  dailyUsed: db.prepare('SELECT COALESCE(SUM(size),0) total FROM uploads WHERE user_id=? AND created>?'),
+  byUrl: db.prepare('SELECT created,released FROM uploads WHERE url=?'),
+  markReleased: db.prepare('UPDATE uploads SET released=1 WHERE url=?'),
+  dropBanner: db.prepare('DELETE FROM profile_banner_uploads WHERE url=?'),
+  dropOld: db.prepare('DELETE FROM uploads WHERE released=1 AND created<?'),
+};
+
+function recordUpload(url, userId, kind, size) {
+  try {
+    upStmt.insert.run(url, userId, kind, size, Date.now());
+    uploadsBytesCached += size;
+  } catch (e) { console.error('[uploads] учёт загрузки:', e && e.message); } // учёт не должен ронять саму загрузку
+}
+
+// Суточное потребление: строки за последние сутки, включая уже удалённые файлы (см. released).
+function uploadDailyUsed(userId) {
+  try { return Number(upStmt.dailyUsed.get(userId, Date.now() - UPLOAD_GC_GRACE_MS)?.total || 0); }
+  catch (e) { return 0; }
+}
+
+// Общая для всех загрузок проверка: суточная квота пользователя + потолок хранилища. Возвращает
+// текст ошибки или null. Вызывается ДО записи файла на диск.
+function uploadRejectReason(userId, size) {
+  if (uploadsSweepKnown && uploadsBytesCached + size > UPLOADS_CAP_BYTES) return 'Хранилище файлов заполнено — попробуй позже';
+  if (uploadDailyUsed(userId) + size > UPLOAD_DAILY_QUOTA_BYTES) return 'Дневной лимит загрузок исчерпан — попробуй завтра';
+  return null;
+}
+
+function uploadPathFor(url) {
+  if (UPLOAD_RE.test(url)) return path.join(UPLOADS_DIR, url.slice('/api/uploads/'.length));
+  if (FILE_URL_RE.test(url)) return path.join(FILES_DIR, url.slice('/api/files/'.length));
+  return null;
+}
+
+// Ссылается ли хоть что-то на этот файл (точечная проверка для одиночных случаев).
+function uploadIsReferenced(url) {
+  if (db.prepare('SELECT 1 FROM users WHERE avatar_url=? OR profile_banner_url=? LIMIT 1').get(url, url)) return true;
+  if (db.prepare('SELECT 1 FROM servers WHERE icon_url=? LIMIT 1').get(url)) return true;
+  const contains = `%${url}%`; // имена файлов — hex, символов LIKE в них нет
+  return !!db.prepare('SELECT 1 FROM messages WHERE image=? OR attachments LIKE ? OR reply_to LIKE ? LIMIT 1').get(url, contains, contains);
+}
+
+// Все живые ссылки одним проходом. null = собрать не удалось: удалять по неполному списку нельзя.
+function collectReferencedUploadUrls() {
+  const refs = new Set();
+  const add = (v) => {
+    if (typeof v !== 'string' || !v) return;
+    refs.add(v);
+    const rel = normalizeUploadRef(v); // абсолютную форму сводим к относительной (см. normalizeUploadRef)
+    if (rel) refs.add(rel);
+  };
+  try {
+    for (const r of db.prepare('SELECT avatar_url, profile_banner_url FROM users').all()) { add(r.avatar_url); add(r.profile_banner_url); }
+    for (const r of db.prepare('SELECT icon_url FROM servers').all()) add(r.icon_url);
+    for (const r of db.prepare("SELECT image FROM messages WHERE image<>''").all()) add(r.image);
+    for (const r of db.prepare("SELECT attachments FROM messages WHERE attachments<>'' AND attachments<>'[]'").all()) {
+      try { for (const a of JSON.parse(r.attachments) || []) if (a && a.url) add(a.url); }
+      catch (e) { for (const m of String(r.attachments).match(new RegExp(UPLOAD_REF_RE.source, 'g')) || []) refs.add(m); } // битый JSON: вытаскиваем ссылки как есть, лишь бы не удалить лишнее
+    }
+    for (const r of db.prepare("SELECT reply_to FROM messages WHERE reply_to<>''").all()) {
+      try { const rp = JSON.parse(r.reply_to); if (rp && rp.thumb) add(rp.thumb); }
+      catch (e) { for (const m of String(r.reply_to).match(new RegExp(UPLOAD_REF_RE.source, 'g')) || []) refs.add(m); } // обрезанный по лимиту JSON тоже обязан сохранить ссылку
+    }
+  } catch (e) {
+    console.error('[uploads] сбор ссылок не удался, уборка пропущена:', e && e.message);
+    return null;
+  }
+  return refs;
+}
+
+// Пакетное удаление: файлы порциями, каждая порция — одна транзакция, между порциями отдаём
+// управление event loop. Иначе первый же проход по накопленному бэклогу замораживал бы процесс
+// (тысячи одиночных коммитов с fsync + unlink) вместе с сигналингом дерева и выдачей токенов.
+const purgeLedgerRows = db.transaction((urls) => {
+  for (const url of urls) { upStmt.markReleased.run(url); upStmt.dropBanner.run(url); }
+});
+
+async function removeUploads(urls, sizeByUrl) {
+  let removed = 0, freed = 0;
+  for (let i = 0; i < urls.length; i += UPLOAD_SWEEP_CHUNK) {
+    const chunk = urls.slice(i, i + UPLOAD_SWEEP_CHUNK);
+    const done = [];
+    for (const url of chunk) {
+      const p = uploadPathFor(url);
+      if (!p) continue; // имя вне наших схем — ни файл, ни строку не трогаем (иначе учёт разъедется с диском)
+      let size = sizeByUrl ? sizeByUrl.get(url) : undefined;
+      if (size === undefined) { try { size = fs.statSync(p).size; } catch (e) { size = 0; } }
+      try { fs.unlinkSync(p); }
+      catch (e) { if (e && e.code !== 'ENOENT') { console.error('[uploads] не удалось удалить', url, e.message); continue; } }
+      done.push(url);
+      removed++; freed += size || 0;
+    }
+    if (done.length) { try { purgeLedgerRows(done); } catch (e) { console.error('[uploads] обновление реестра:', e && e.message); } }
+    if (i + UPLOAD_SWEEP_CHUNK < urls.length) await new Promise((r) => setImmediate(r));
+  }
+  uploadsBytesCached = Math.max(0, uploadsBytesCached - freed);
+  return { removed, freed };
+}
+
+// Отложенная уборка после удаления сообщений/сервера/аккаунта. Синхронно в обработчике этого делать
+// нельзя: проверка ссылок — полный скан messages (LIKE по подстроке индекс не использует), и снос
+// пары сообщений с вложениями замораживал бы процесс на сотни миллисекунд. Копим URL и разбираем
+// пачкой одним проходом. Потеря очереди при рестарте безопасна — периодическая уборка подберёт.
+const pendingRelease = new Set();
+let releaseTimer = null;
+function queueUploadRelease(urls) {
+  if (!UPLOADS_GC_ENABLED) return;
+  for (const url of urls || []) if (url && uploadPathFor(url)) pendingRelease.add(url);
+  if (!pendingRelease.size || releaseTimer) return;
+  releaseTimer = setTimeout(() => { releaseTimer = null; void flushUploadRelease(); }, UPLOAD_RELEASE_DEBOUNCE_MS);
+  releaseTimer.unref?.();
+}
+
+async function flushUploadRelease() {
+  if (!pendingRelease.size) return;
+  const urls = [...pendingRelease];
+  pendingRelease.clear();
+  const refs = collectReferencedUploadUrls();
+  if (!refs) return; // список ссылок не собрался — удалять вслепую нельзя
+  const doomed = urls.filter((url) => !refs.has(url) && !refs.has(normalizeUploadRef(url) || url));
+  if (!doomed.length) return;
+  const { removed, freed } = await removeUploads(doomed, null);
+  if (removed) console.log(`[uploads] после удалений убрано ${removed} файлов, освобождено ${Math.round(freed / 1048576)} МБ`);
+}
+
+function selectMessageUploadRows(where, ...params) {
+  try { return db.prepare(`SELECT image,attachments,reply_to FROM messages WHERE ${where}`).all(...params); }
+  catch (e) { return []; }
+}
+
+// Полная уборка: один проход по БД собирает ВСЕ живые ссылки, затем обходим обе директории.
+async function sweepUploads() {
+  if (!UPLOADS_GC_ENABLED) return;
+  const refs = collectReferencedUploadUrls();
+  if (!refs) return;
+  const now = Date.now();
+  const files = [];
+  const onDisk = new Set();
+  let listedAll = true; // не прочитали каталог — сверять реестр с диском нельзя (всё показалось бы пропавшим)
+  for (const [dir, prefix] of [[UPLOADS_DIR, '/api/uploads/'], [FILES_DIR, '/api/files/']]) {
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch (e) { listedAll = false; console.error('[uploads] не читается каталог', dir, e && e.message); continue; }
+    for (const name of names) {
+      let st;
+      try { st = fs.statSync(path.join(dir, name)); } catch (e) { continue; }
+      if (!st.isFile()) continue;
+      const url = prefix + name;
+      onDisk.add(url);
+      const tracked = upStmt.byUrl.get(url);
+      files.push({ url, size: st.size, createdAt: tracked ? Number(tracked.created) : null, mtimeMs: st.mtimeMs });
+    }
+  }
+  // Решение «что удалять» — в uploadsGc.js: оно чистое и покрыто тестами (uploads-gc-test.js).
+  const { remove, keepBytes } = planUploadSweep({ files, referenced: refs, now, graceMs: UPLOAD_GC_GRACE_MS, legacyGraceMs: UPLOAD_LEGACY_GRACE_MS });
+  const sizeByUrl = new Map(files.map((f) => [f.url, f.size]));
+  const { removed, freed } = await removeUploads(remove, sizeByUrl);
+  uploadsBytesCached = keepBytes;
+  uploadsSweepKnown = true;
+  // Строки реестра без файла на диске (ручное удаление, сбой записи) помечаем удалёнными, иначе они
+  // вечно висят в суточной квоте пользователя. Каталоги уже прочитаны — повторно диск не трогаем.
+  try {
+    const stale = listedAll ? db.prepare('SELECT url FROM uploads WHERE released=0').all().filter((r) => !onDisk.has(r.url)) : [];
+    if (stale.length) purgeLedgerRows(stale.map((r) => r.url));
+    upStmt.dropOld.run(now - UPLOAD_LEDGER_TTL_MS); // строки давно удалённых файлов больше не нужны даже квоте
+  } catch (e) { console.error('[uploads] сверка реестра:', e && e.message); }
+  console.log(`[uploads] проход: файлов ${files.length}, убрано ${removed}, освобождено ${Math.round(freed / 1048576)} МБ, занято ${Math.round(keepBytes / 1048576)} МБ из ${Math.round(UPLOADS_CAP_BYTES / 1048576)} МБ`);
+  if (keepBytes > UPLOADS_CAP_BYTES) console.warn('[uploads] хранилище выше потолка — новые загрузки отклоняются; подними UPLOADS_CAP_MB или удали старые сообщения');
+}
+
+const uploadSweepTimer = setInterval(() => { sweepUploads().catch((e) => console.error('[uploads] уборка:', e && e.message)); }, 6 * 60 * 60 * 1000);
+uploadSweepTimer.unref?.();
+// Первый проход при старте, но не в момент запуска: даём подняться остальному, а заодно сразу
+// получаем реальный объём хранилища (до этого потолок не применяем — uploadsSweepKnown).
+const uploadSweepBoot = setTimeout(() => { sweepUploads().catch((e) => console.error('[uploads] уборка:', e && e.message)); }, 60_000);
+uploadSweepBoot.unref?.();
 app.get('/api/files/:name', (req, res) => {
   const name = req.params.name;
   if (!/^[a-zA-Z0-9._-]+$/.test(name)) return res.status(400).end();
@@ -2286,8 +2540,11 @@ app.delete('/api/servers/:id/channels/:cid', requireAuth, (req, res) => {
 app.post('/api/servers/:id/clear', requireAuth, (req, res) => {
   const sid = req.params.id;
   if (!can(req.user.id, sid, PERM.MANAGE_MESSAGES)) return res.status(403).json({ error: 'Нет прав' });
+  const orphaned = uploadUrlsOfMessageRows(selectMessageUploadRows('server_id=?', sid));
   db.prepare('DELETE FROM messages WHERE server_id=?').run(sid);
+  db.prepare('DELETE FROM reactions WHERE server_id=?').run(sid);
   res.json({ ok: true });
+  queueUploadRelease(orphaned);
 });
 
 /* ---------------- LIVEKIT TOKEN (per server) ---------------- */
@@ -2475,7 +2732,10 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
     const clean = { author, text: String(rp.text || '').slice(0, 160), img: !!rp.img };
     if (rp.uid) clean.uid = String(rp.uid).slice(0, 64);
     if (Number.isFinite(rp.sid)) clean.sid = rp.sid;
-    if (rp.thumb) clean.thumb = String(rp.thumb).slice(0, 300); // R3: превью картинки оригинала в цитате
+    // Превью картинки оригинала в цитате. Нормализуем к относительному пути: старые нативные
+    // клиенты присылают абсолютный URL, а уборка сверяет ссылки точным совпадением (см.
+    // normalizeUploadRef) — иначе показанная в цитате картинка считалась бы мусором.
+    if (rp.thumb) clean.thumb = normalizeUploadRef(String(rp.thumb)) || String(rp.thumb).slice(0, 300);
     return JSON.stringify(clean).slice(0, 600);
   })();
   const now = Date.now();
@@ -2567,9 +2827,13 @@ app.delete('/api/servers/:id/messages/:mid', requireAuth, (req, res) => {
   if (!msg) return res.status(404).json({ error: 'no msg' });
   const owner = (db.prepare('SELECT owner_id FROM servers WHERE id=?').get(sid) || {}).owner_id === req.user.id;
   if (msg.user_id !== req.user.id && !owner) return res.status(403).json({ error: 'нельзя' });
+  const orphaned = uploadUrlsOfMessageRows(selectMessageUploadRows('id=?', mid));
   db.prepare('DELETE FROM messages WHERE id=?').run(mid);
   db.prepare('DELETE FROM reactions WHERE server_id=? AND msg_id=?').run(sid, mid);
   res.json({ ok: true });
+  // Файлы удалённого сообщения больше никому не нужны — если на них не ссылается ничто другое
+  // (цитата в чужом сообщении, аватар). Разбор отложенный: см. queueUploadRelease.
+  queueUploadRelease(orphaned);
 });
 
 app.get('/healthz', (req, res) => res.send('ok'));

@@ -79,6 +79,12 @@ services:
       # выключена (resolve → 503, плеер показывает «релей недоступен»). Значения — в .env на хосте.
       - MEDIA_RELAY_URL=${MEDIA_RELAY_URL:-}
       - MEDIA_RELAY_SECRET=${MEDIA_RELAY_SECRET:-}
+      # Квоты и уборка пользовательских файлов. UPLOADS_GC=0 — аварийный рубильник: удаление
+      # выключается целиком, квоты продолжают работать. Потолок обязан быть меньше свободного
+      # места тома ./data — он общий с БД.
+      - UPLOAD_DAILY_QUOTA_MB=${UPLOAD_DAILY_QUOTA_MB:-300}
+      - UPLOADS_CAP_MB=${UPLOADS_CAP_MB:-3072}
+      - UPLOADS_GC=${UPLOADS_GC:-1}
     volumes:
       - ./data:/app/data
     secrets:

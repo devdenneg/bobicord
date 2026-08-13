@@ -2204,7 +2204,10 @@ function Chat() {
     return {
       author: m.who || '', text: (m.text || '').slice(0, 160), uid: m.uid, sid: m.sid,
       img: !!imgUrl, hasFile: !!m.files?.some((f) => f.kind === 'file'),
-      thumb: imgUrl ? resolveUploadUrl(imgUrl) : undefined,
+      // Храним ОТНОСИТЕЛЬНЫЙ путь, резолвим только на рендере (как avatarUrl/iconUrl). Нативная
+      // сборка собрана с абсолютным API_BASE, и абсолютный thumb уезжал в базу: серверная уборка
+      // сверяет ссылки точным совпадением и считала такую картинку мусором, хотя цитата её показывает.
+      thumb: imgUrl || undefined,
     };
   };
   // текстовый сниппет цитаты, когда исходное сообщение без текста (только вложения)
@@ -2721,7 +2724,7 @@ function Chat() {
           <span className="rq-hook" style={{ borderColor: rColor }} />
           <Avatar name={rep.author} ci={rAuthor?.avatarColor ?? 0} url={rAuthor?.avatarUrl} size={16} />
           <span className="rq-author" style={{ color: rColor }}>{rep.author}</span>
-          {rep.thumb ? <img className="rq-thumb" src={rep.thumb} alt="" loading="lazy" /> : null}
+          {rep.thumb ? <img className="rq-thumb" src={resolveUploadUrl(rep.thumb)} alt="" loading="lazy" /> : null}
           <span className="rq-text">{replySnippet(rep)}</span>
         </button>
       );

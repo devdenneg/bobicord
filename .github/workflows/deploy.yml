@@ -137,6 +137,7 @@ jobs:
           npm --prefix apps/server run test:runtime-revocation
           npm --prefix apps/server run test:release-notes
           npm --prefix apps/server run test:voice-lease
+          npm --prefix apps/server run test:uploads-gc
 
       - name: Verify web authentication build
         run: |
