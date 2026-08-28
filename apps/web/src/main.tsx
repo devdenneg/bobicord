@@ -9,6 +9,7 @@ import { isTauri, pingNative } from './native';
 import { watchForUpdates } from './version';
 import { checkNativeUpdate, startNativeUpdatePolling } from './nativeUpdate';
 import { applyStoredTheme } from './theme';
+import { startWindowIdleWatch } from './windowIdle';
 import {
   NOTIFICATION_DESTINATION_EVENT,
   TAURI_NOTIFICATION_DESTINATION_EVENT,
@@ -65,6 +66,7 @@ if (isTauri) {
 }
 if (isTauri) pingNative().then((r) => console.log('[native] ipc bridge:', r)).catch(() => {});
 
+startWindowIdleWatch(); // до первой отрисовки: если окно открыто в фоне, анимации не должны стартовать вовсе
 createRoot(document.getElementById('root')!).render(<StrictMode><App /></StrictMode>);
 watchForUpdates();
 checkNativeUpdate(); // разовая проверка на старте

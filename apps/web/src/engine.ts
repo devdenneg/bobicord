@@ -2,6 +2,7 @@ import {
   Room, RoomEvent, Track, LocalAudioTrack, AudioPresets, ConnectionQuality,
   type RemoteParticipant, type Participant, type TrackPublication, type RemoteTrack,
 } from 'livekit-client';
+import { isWindowIdle, onWindowIdle } from './windowIdle';
 import type { User, Member, ChatMessage, Emote, HistoryMessage, ReplyRef, Attachment, Reaction, ReleaseNote } from './types';
 import { baseUid } from './util';
 import { notify } from './notify';
@@ -268,6 +269,7 @@ export class Engine {
   private analysers = new Map<string, { an: AnalyserNode; buf: Uint8Array; hold: number; src: MediaStreamAudioSourceNode }>();
   private spCtx: AudioContext | null = null;
   private spRAF: number | null = null;
+  private stopIdleWatch: (() => void) | null = null; // отписка от признака «на окно не смотрят»
   private audioUnlock: (() => void) | null = null; // снятие разового gesture-анлока micActx (см. ensureVoiceAudioRunning)
   private spTick = 0;
   private speakingSet = new Set<string>();
@@ -330,6 +332,12 @@ export class Engine {
   constructor(me: User, hooks: EngineHooks) {
     this.me = me;
     this.hooks = hooks;
+    // Индикаторы «говорит» считаются только когда на окно смотрят: под полноэкранной игрой этот
+    // rAF-цикл крутился 60 раз в секунду впустую и не давал заснуть кадровому конвейеру целиком.
+    this.stopIdleWatch = onWindowIdle((idle) => {
+      if (idle) { if (this.spRAF) { cancelAnimationFrame(this.spRAF); this.spRAF = null; } return; }
+      if (!this.spRAF && this.analysers.size) this.spRAF = requestAnimationFrame(this.spLoop);
+    });
     const onVideoTrack = (_key: string, _track: unknown, identity: string, isLocal: boolean) => {
       if (!isLocal) this.completeWatch(baseUid(identity));
       this.emit();
@@ -779,6 +787,7 @@ export class Engine {
 
   // Полный teardown (logout / выход с сервера, где я в голосе): рвём ОБЕ комнаты + всё состояние.
   disconnect() {
+    this.stopIdleWatch?.(); this.stopIdleWatch = null; // движок выбрасывается — подписка не должна его удерживать
     ++this.voiceEpoch; ++this.connectEpoch;
     this.resetStreamEdges();
     this.voiceClaimPending = 0; this.deferredVoiceLease = null; this.matchedVoiceLease = null;
@@ -2228,7 +2237,7 @@ export class Engine {
       const src = this.spCtx.createMediaStreamSource(new MediaStream([mst]));
       const an = this.spCtx.createAnalyser(); an.fftSize = 512; an.smoothingTimeConstant = 0.5; src.connect(an);
       this.analysers.set(username, { an, buf: new Uint8Array(an.fftSize), hold: 0, src });
-      if (!this.spRAF) this.spRAF = requestAnimationFrame(this.spLoop);
+      if (!this.spRAF && !isWindowIdle()) this.spRAF = requestAnimationFrame(this.spLoop);
     } catch { /**/ }
   }
   // keepSpeaking — снять анализатор, НЕ трогая speakingSet (передача владения VAD ворклету: индикатор
@@ -2273,7 +2282,11 @@ export class Engine {
       });
       if (changed) this.emit();
     }
-    this.spRAF = this.analysers.size ? requestAnimationFrame(this.spLoop) : null;
+    // Пока окно не видно, индикаторы «говорит» рисовать некому, а живой rAF-цикл заставляет движок
+    // планировать кадр каждый vsync — из-за чего и CSS-анимации рядом никогда не засыпают. Цикл
+    // возобновляет onWindowIdle-подписка (см. конструктор), speakingSet при этом не трогаем: он
+    // пересчитается на первом же кадре после возврата.
+    this.spRAF = this.analysers.size && !isWindowIdle() ? requestAnimationFrame(this.spLoop) : null;
   };
 
   /* ---------- track events (mic/chat only — video-domain events live in VideoTransport) ---------- */
@@ -2565,7 +2578,11 @@ export class Engine {
       const m = this.wset(sid); m.set(id, { name: this.me.displayName, color: this.me.avatarColor, avatarUrl: this.me.avatarUrl, ts: Date.now() });
       this.dataSend({ t: 'watch', s: sid, id, n: this.me.displayName, c: this.me.avatarColor, a: this.me.avatarUrl, on: true });
     });
-    this.emit();
+    // Раньше emit стоял безусловно, поэтому раз в 3 секунды пересобирался весь снапшот и будились
+    // все подписчики useSyncExternalStore — то есть полный ре-рендер интерфейса на пустом месте,
+    // даже когда пользователь ничего не смотрит и вообще свернул окно. Обновились только записи
+    // watchers, значит эмитим ровно тогда, когда они есть (как рядом делает cleanupWatchers).
+    if (this.watching.size) this.emit();
   }
   private wset(sid: string) { let m = this.streamWatchers.get(sid); if (!m) { m = new Map(); this.streamWatchers.set(sid, m); } return m; }
   private cleanupWatchers() { const now = Date.now(); let ch = false; this.streamWatchers.forEach((m) => m.forEach((v, wid) => { if (now - v.ts > 9000) { m.delete(wid); ch = true; } })); if (ch) this.emit(); }

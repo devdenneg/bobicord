@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { api, setToken } from './api';
+import { isWindowIdle } from './windowIdle';
 import { Engine } from './engine';
 import { emoteMap } from './emotes';
 import { setSettings } from './settings';
@@ -174,7 +175,20 @@ function startMemberPoll(id: string) {
       engine?.setMembers(srv.members); engine?.setOnlineHint(prs.online); engine?.setAwayHint(prs.away || []); engine?.setVoiceHint(prs.voice || {});
     } catch { /**/ }
   };
-  memberTimer = window.setInterval(poll, 5000);
+  // Пока на окно не смотрят, состав сервера незачем тянуть каждые 5с: это два HTTP-запроса и
+  // четыре подряд emit (по одному на setMembers/setOnlineHint/setAwayHint/setVoiceHint), то есть
+  // четыре полных пересборки снапшота и ре-рендера — на данные, которых никто не видит. Возврат в
+  // окно обновляет состав немедленно, поэтому свежесть не страдает.
+  const IDLE_POLL_MS = 30000;
+  let lastPollAt = 0;
+  const pollIfDue = () => {
+    if (isWindowIdle() && Date.now() - lastPollAt < IDLE_POLL_MS) return;
+    lastPollAt = Date.now();
+    void poll();
+  };
+  // Без отдельной подписки на возврат: тик и так раз в 5с, а вне простоя гейт его не задерживает —
+  // значит состав обновится не позже пяти секунд после того, как пользователь вернулся в окно.
+  memberTimer = window.setInterval(pollIfDue, 5000);
 }
 
 // Бейдж на иконке приложения (таскбар PWA / dock) — сумма непрочитанных + флаг обновления.

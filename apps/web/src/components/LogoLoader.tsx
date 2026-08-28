@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import { isWindowIdle, onWindowIdle } from '../windowIdle';
 
 // центровая линия логотипа «P» (замкнутый контур в системе 512×512; узлы cyan/magenta/pink — станции)
 const PTS: [number, number][] = [
@@ -133,8 +134,16 @@ export function LogoLoader({ size = 180, speedMs = 3000 }: { size?: number; spee
       }
       raf = requestAnimationFrame(frame);
     };
-    raf = requestAnimationFrame(frame);
-    return () => cancelAnimationFrame(raf);
+    // Кадр этой анимации стоит ~700 команд рисования (посегментные градиенты потока, радиальные
+    // градиенты комет, полноэкранный blur через ctx.filter и два композита 'lighter'). Пока окно не
+    // видно, всё это считается впустую и отбирает кадры у игры на переднем плане, поэтому цикл
+    // останавливаем и поднимаем обратно при возврате, сбросив t0 — иначе анимация прыгнет вперёд на
+    // всё время простоя.
+    const stop = () => { if (raf) { cancelAnimationFrame(raf); raf = 0; } };
+    const resume = () => { if (!raf) { t0 = null; raf = requestAnimationFrame(frame); } };
+    if (!isWindowIdle()) resume();
+    const unsubscribe = onWindowIdle((idle) => (idle ? stop() : resume()));
+    return () => { unsubscribe(); stop(); };
   }, [size, speedMs]);
   return <canvas ref={ref} style={{ width: size, height: size, display: 'block' }} aria-label="Загрузка" role="img" />;
 }
