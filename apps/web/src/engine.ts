@@ -272,6 +272,7 @@ export class Engine {
   private stopIdleWatch: (() => void) | null = null; // отписка от признака «на окно не смотрят»
   private audioUnlock: (() => void) | null = null; // снятие разового gesture-анлока micActx (см. ensureVoiceAudioRunning)
   private spTick = 0;
+  private spIdleTimer: number | null = null; // индикаторы речи вне фокуса: редкий таймер вместо rAF
   private speakingSet = new Set<string>();
 
   private keepCtx: AudioContext | null = null;
@@ -335,8 +336,17 @@ export class Engine {
     // Индикаторы «говорит» считаются только когда на окно смотрят: под полноэкранной игрой этот
     // rAF-цикл крутился 60 раз в секунду впустую и не давал заснуть кадровому конвейеру целиком.
     this.stopIdleWatch = onWindowIdle((idle) => {
-      if (idle) { if (this.spRAF) { cancelAnimationFrame(this.spRAF); this.spRAF = null; } return; }
-      if (!this.spRAF && this.analysers.size) this.spRAF = requestAnimationFrame(this.spLoop);
+      if (idle) {
+        // Полностью гасить индикаторы «говорит» нельзя: окно без фокуса ещё не значит, что его не
+        // видно — типовой случай это приложение на втором мониторе, пока человек играет. Уходим с
+        // rAF (живой кадровый цикл заставляет движок планировать кадр каждый vsync и не даёт заснуть
+        // соседним анимациям) на редкий таймер: вчетверо реже и без участия в отрисовке кадра.
+        if (this.spRAF) { cancelAnimationFrame(this.spRAF); this.spRAF = null; }
+        if (!this.spIdleTimer) this.spIdleTimer = window.setInterval(() => { if (this.analysers.size) this.spLoop(true); }, 150);
+        return;
+      }
+      if (this.spIdleTimer) { clearInterval(this.spIdleTimer); this.spIdleTimer = null; }
+      if (!this.spRAF && this.analysers.size) this.spRAF = requestAnimationFrame(() => this.spLoop());
     });
     const onVideoTrack = (_key: string, _track: unknown, identity: string, isLocal: boolean) => {
       if (!isLocal) this.completeWatch(baseUid(identity));
@@ -788,6 +798,7 @@ export class Engine {
   // Полный teardown (logout / выход с сервера, где я в голосе): рвём ОБЕ комнаты + всё состояние.
   disconnect() {
     this.stopIdleWatch?.(); this.stopIdleWatch = null; // движок выбрасывается — подписка не должна его удерживать
+    if (this.spIdleTimer) { clearInterval(this.spIdleTimer); this.spIdleTimer = null; }
     ++this.voiceEpoch; ++this.connectEpoch;
     this.resetStreamEdges();
     this.voiceClaimPending = 0; this.deferredVoiceLease = null; this.matchedVoiceLease = null;
@@ -2237,7 +2248,9 @@ export class Engine {
       const src = this.spCtx.createMediaStreamSource(new MediaStream([mst]));
       const an = this.spCtx.createAnalyser(); an.fftSize = 512; an.smoothingTimeConstant = 0.5; src.connect(an);
       this.analysers.set(username, { an, buf: new Uint8Array(an.fftSize), hold: 0, src });
-      if (!this.spRAF && !isWindowIdle()) this.spRAF = requestAnimationFrame(this.spLoop);
+      if (isWindowIdle()) {
+        if (!this.spIdleTimer) this.spIdleTimer = window.setInterval(() => { if (this.analysers.size) this.spLoop(true); }, 150);
+      } else if (!this.spRAF) this.spRAF = requestAnimationFrame(() => this.spLoop());
     } catch { /**/ }
   }
   // keepSpeaking — снять анализатор, НЕ трогая speakingSet (передача владения VAD ворклету: индикатор
@@ -2247,9 +2260,12 @@ export class Engine {
     if (o) { try { o.src.disconnect(); } catch { /**/ } this.analysers.delete(username); }
     if (!keepSpeaking && this.speakingSet.delete(username)) this.emit();
   }
-  private spLoop = () => {
+  // Вызывается и из rAF (окно перед глазами), и из редкого таймера (окно без фокуса — например
+  // приложение на втором мониторе, пока человек играет). Во втором случае считаем на каждом тике:
+  // тик и так раз в 150мс.
+  private spLoop = (fromTimer = false) => {
     this.spTick++;
-    if (this.spTick % 3 === 0) {
+    if (fromTimer || this.spTick % 3 === 0) {
       let changed = false;
       this.analysers.forEach((o, id) => {
         o.an.getByteTimeDomainData(o.buf as any);
@@ -2286,7 +2302,7 @@ export class Engine {
     // планировать кадр каждый vsync — из-за чего и CSS-анимации рядом никогда не засыпают. Цикл
     // возобновляет onWindowIdle-подписка (см. конструктор), speakingSet при этом не трогаем: он
     // пересчитается на первом же кадре после возврата.
-    this.spRAF = this.analysers.size && !isWindowIdle() ? requestAnimationFrame(this.spLoop) : null;
+    this.spRAF = this.analysers.size && !isWindowIdle() ? requestAnimationFrame(() => this.spLoop()) : null;
   };
 
   /* ---------- track events (mic/chat only — video-domain events live in VideoTransport) ---------- */
