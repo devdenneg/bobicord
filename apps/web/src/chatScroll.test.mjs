@@ -32,6 +32,7 @@ const {
   chatPhysicalMaxScrollTop,
   isChatPrependGeometryQuiet,
   chatRetentionLimitAfterProtectedInsert,
+  chatRetentionHardCap,
   chatTailIndexLocation,
   chatVirtualFirstItemIndex,
   reduceChatScrollState,
@@ -519,6 +520,31 @@ equal('later history pages add only their own rows and keep the remaining reserv
     30,
     0,
   ), CHAT_SESSION_MESSAGE_LIMIT * 2 + 60);
+// Reconnect merges used to raise the retention limit forever: each one added another live window and
+// nothing lowered it, so after a few reconnects the front trim never fired again and the chat array
+// grew with traffic for the rest of the session. The cap bounds that ratchet without punishing a
+// reader who paginated history in themselves.
+const ratchet = (rounds, prepended = 0) => {
+  let limit = CHAT_SESSION_MESSAGE_LIMIT;
+  for (let round = 0; round < rounds; round++) {
+    limit = Math.min(
+      chatRetentionLimitAfterProtectedInsert(limit, limit + 40, 0, CHAT_SESSION_MESSAGE_LIMIT),
+      chatRetentionHardCap(prepended),
+    );
+  }
+  return limit;
+};
+equal('repeated reconnect merges stop raising the retention limit at the hard cap', {
+  onceWithoutPagination: ratchet(1),
+  manyWithoutPagination: ratchet(25),
+  manyAfterPaginating: ratchet(25, 600),
+  trimResumesAtTheCap: chatAppendFrontTrim(ratchet(25) + 1, ratchet(25)),
+}, {
+  onceWithoutPagination: CHAT_SESSION_MESSAGE_LIMIT * 2,
+  manyWithoutPagination: CHAT_SESSION_MESSAGE_LIMIT * 2,
+  manyAfterPaginating: CHAT_SESSION_MESSAGE_LIMIT * 2 + 600,
+  trimResumesAtTheCap: 1,
+});
 const reconnectRetention = chatRetentionLimitAfterProtectedInsert(
   CHAT_SESSION_MESSAGE_LIMIT,
   1040,

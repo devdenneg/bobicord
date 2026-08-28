@@ -20,6 +20,7 @@ import {
   CHAT_SESSION_MESSAGE_LIMIT,
   chatAppendFrontTrim,
   chatRetentionLimitAfterProtectedInsert,
+  chatRetentionHardCap,
 } from './chatScroll';
 import type { RnnoiseWorkletNode } from '@sapphi-red/web-noise-suppressor';
 
@@ -2918,11 +2919,18 @@ export class Engine {
       if (merged.length > this.chatRetentionLimit) {
         // Reconnect can deliver a large suffix batch while the user is reading history. Do not
         // delete that visible anchor in the same commit (or defer one mass trim to the next row).
-        this.chatRetentionLimit = chatRetentionLimitAfterProtectedInsert(
-          this.chatRetentionLimit,
-          merged.length,
-          0,
-          CHAT_SESSION_MESSAGE_LIMIT,
+        // ...но подъём обязан быть ограничен сверху. Иначе это храповик: mergeRecent дёргается
+        // автоматически (RoomEvent.Reconnected → refetchChat), каждый раз добавляет ещё одно живое
+        // окно и никогда не опускает потолок обратно — после нескольких реконнектов обрезка головы
+        // выключена насовсем, и массив сообщений растёт со скоростью чата всю сессию.
+        this.chatRetentionLimit = Math.min(
+          chatRetentionLimitAfterProtectedInsert(
+            this.chatRetentionLimit,
+            merged.length,
+            0,
+            CHAT_SESSION_MESSAGE_LIMIT,
+          ),
+          chatRetentionHardCap(this.chatPrepended),
         );
       }
       this.messages = merged;
@@ -2953,11 +2961,16 @@ export class Engine {
       this.messages = [...this.mapHistory(list), ...this.messages];
       this.oldestSid = list[0].id ?? this.oldestSid;
       this.chatPrepended += list.length; // якорь virtuoso сдвигается вместе с данными (один emit) — без прыжка
-      this.chatRetentionLimit = chatRetentionLimitAfterProtectedInsert(
-        this.chatRetentionLimit,
-        this.messages.length,
-        list.length,
-        firstPagination ? CHAT_SESSION_MESSAGE_LIMIT : 0,
+      this.chatRetentionLimit = Math.min(
+        chatRetentionLimitAfterProtectedInsert(
+          this.chatRetentionLimit,
+          this.messages.length,
+          list.length,
+          firstPagination ? CHAT_SESSION_MESSAGE_LIMIT : 0,
+        ),
+        // Страницы, которые читатель пролистал сам, входят в потолок через chatPrepended — легитимный
+        // рост окна пагинация не теряет, ограничивается только накопленный реконнектами запас.
+        chatRetentionHardCap(this.chatPrepended),
       );
     }
     this.emit();

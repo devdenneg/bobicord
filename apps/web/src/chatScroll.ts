@@ -348,6 +348,19 @@ export function chatRetentionLimitAfterProtectedInsert(
   return Math.max(limit + inserted, count + reserve);
 }
 
+/**
+ * Absolute ceiling for the retention limit. Without it the limit is a one-way ratchet: every
+ * reconnect merge raises it by another live window and nothing ever lowers it again, so after a few
+ * reconnects the front trim is effectively disabled and the chat array grows with traffic for the
+ * whole session. The ceiling still covers what the reader legitimately holds: the base window, every
+ * page they paginated in themselves, and one live reserve on top.
+ */
+export function chatRetentionHardCap(prependedCount: number, base = CHAT_SESSION_MESSAGE_LIMIT): number {
+  const prepended = Math.max(0, Math.floor(finiteOr(prependedCount, 0)));
+  const window = Math.max(0, Math.floor(finiteOr(base, CHAT_SESSION_MESSAGE_LIMIT)));
+  return window * 2 + prepended;
+}
+
 /** Number of oldest messages that may be dropped by one append under the current limit. */
 export function chatAppendFrontTrim(nextCount: number, retentionLimit: number): number {
   const count = Math.max(0, Math.floor(finiteOr(nextCount, 0)));
