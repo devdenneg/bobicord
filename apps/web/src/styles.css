@@ -1618,67 +1618,7 @@
   .admin-invite-meta b,.admin-invite-meta small{white-space:normal}
 }
 
-/* ── Совместное прослушивание YouTube (мини-плеер в VoiceDock) ── */
-.music{margin-top:8px;background:var(--panel);border:1px solid var(--line-2);border-radius:11px;overflow:hidden}
-.mus-bar{display:flex;align-items:center;gap:8px;padding:7px 8px;min-width:0}
-.mus-thumb{width:64px;height:36px;flex:0 0 auto;border-radius:6px;overflow:hidden;background:#000;position:relative}
-.mus-thumb #yt-music-player,.mus-thumb iframe{position:absolute;top:0;left:0;width:256px;height:144px;transform:scale(.25);transform-origin:top left;pointer-events:none;border:0}
-/* аудио-режим (медиа-релей): вместо видео — иконка, центрированная на акцентном фоне */
-.mus-thumb-audio{display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,color-mix(in srgb,var(--accent) 55%,#000),#111)}
-.mus-thumb-audio svg{width:18px;height:18px;opacity:.9}
-.mus-meta{flex:1;min-width:0;cursor:pointer;overflow:hidden}
-.mus-title{font-size:12.5px;font-weight:600;color:var(--txt-h);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.mus-sub{font-size:10.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:1px}
-.mus-ctrls{display:flex;align-items:center;gap:2px;flex:0 0 auto}
-.mus-b{width:26px;height:26px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;border-radius:7px;background:transparent;color:var(--muted);font-size:12px;line-height:1}
-.mus-b:hover:not(:disabled){background:var(--panel2);color:var(--txt-h)}
-.mus-b:disabled{opacity:.28;cursor:not-allowed}
-.mus-b.play{background:var(--accent);color:#fff;width:28px;height:28px;font-size:11px}
-.mus-b.play:hover:not(:disabled){background:var(--accent-h)}
-.mus-caret{width:24px;height:26px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;border-radius:7px;background:transparent;color:var(--muted)}
-.mus-caret:hover{background:var(--panel2);color:var(--txt-h)}
-.mus-caret .ic{transition:transform .3s cubic-bezier(.2,.7,.3,1);transform:rotate(180deg)}  /* закрыто → стрелка вверх (раскрыть) */
-.mus-caret.on .ic{transform:rotate(0deg)}                                                   /* открыто → стрелка вниз (скрыть) */
-.mus-gesture{display:block;width:calc(100% - 16px);margin:0 8px 8px;padding:7px;border-radius:8px;background:var(--yellow);color:#1a1a1a;font-size:11.5px;font-weight:700}
-.mus-note{display:flex;align-items:center;gap:7px;margin:0 8px 8px;padding:7px 9px;border-radius:8px;background:color-mix(in srgb,var(--red) 16%,var(--panel2));border:1px solid color-mix(in srgb,var(--red) 40%,transparent);font-size:11px;color:var(--txt)}
-.mus-note .ic{color:var(--red);flex:0 0 auto}
-.mus-note span{flex:1;min-width:0;line-height:1.25}
-.mus-note button{flex:0 0 auto;padding:4px 8px;border-radius:6px;background:var(--red);color:#fff;font-size:10.5px;font-weight:700}
-.mus-note button:hover{filter:brightness(1.1)}
 /* плавное раскрытие/скрытие: grid 0fr→1fr скользит к высоте контента, без фикс-max-height (best-practice) */
-.mus-panel-wrap{display:grid;grid-template-rows:0fr;transition:grid-template-rows .3s cubic-bezier(.2,.7,.3,1)}
-.music.open .mus-panel-wrap{grid-template-rows:1fr}
-.mus-panel{overflow:hidden;min-height:0}
-.mus-panel-in{padding:8px;border-top:1px solid var(--line-2)}
-.mus-prog,.mus-vol{display:flex;align-items:center;gap:8px}
-.mus-vol{margin-top:7px}
-.mus-prog input,.mus-vol input{flex:1;min-width:0;accent-color:var(--accent);height:4px}
-.mus-vol .ic{color:var(--muted);font-size:15px;flex:0 0 auto}
-.mus-t{font-size:10px;color:var(--muted);font-family:var(--num);flex:0 0 auto;min-width:30px;text-align:center}
-.mus-add{display:flex;gap:6px;margin-top:9px}
-.mus-add input{flex:1;min-width:0;background:var(--panel2);border:1px solid var(--line-2);border-radius:8px;padding:7px 10px;font-size:12px;color:var(--txt)}
-.mus-add input:focus{border-color:var(--accent);outline:none}
-.mus-add button{width:34px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;border-radius:8px;background:var(--accent);color:#fff}
-.mus-add button:hover:not(:disabled){background:var(--accent-h)}
-.mus-add button:disabled{opacity:.5;cursor:not-allowed}
-.mus-add input:disabled{opacity:.6;cursor:not-allowed}
-.mus-spin{width:14px;height:14px;border-radius:50%;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;animation:musSpin .6s linear infinite}
-@keyframes musSpin{to{transform:rotate(360deg)}}
-.mus-err{font-size:11px;color:var(--red);margin-top:5px}
-.mus-queue{margin-top:9px;max-height:180px;overflow-y:auto;overflow-x:hidden;display:flex;flex-direction:column;gap:1px}
-.mus-empty{font-size:11.5px;color:var(--muted);padding:10px 4px;text-align:center}
-.mus-q{display:flex;align-items:center;gap:8px;padding:4px 5px;border-radius:7px;min-width:0}
-.mus-q:hover{background:var(--panel2)}
-.mus-q.cur{background:color-mix(in srgb,var(--accent) 13%,transparent)}
-.mus-q-i{width:20px;height:20px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;font-size:10.5px;color:var(--muted);font-family:var(--num);border-radius:5px;background:transparent}
-.mus-q-i:hover{background:var(--accent);color:#fff}
-.mus-q.cur .mus-q-i{color:var(--accent-txt)}
-.mus-q-t{flex:1;min-width:0;font-size:12px;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.mus-q-x{width:20px;height:20px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;border-radius:5px;color:var(--muted);font-size:15px;line-height:1}
-.mus-q-x:hover{background:var(--red-fill);color:#fff}
-.mus-clear{width:100%;margin-top:8px;padding:7px;border-radius:8px;background:var(--panel2);color:var(--muted);font-size:11.5px}
-.mus-clear:hover{background:var(--panel3);color:var(--txt)}
-@media (prefers-reduced-motion:reduce){.mus-panel-wrap{transition:none}.mus-caret .ic{transition:none}}
 
 /* ---- Рейтинг / уровни (экспериментальная фича) ---- */
 .m-trophy{margin-left:auto;background:none;color:var(--muted);padding:5px;border-radius:7px;display:flex}
@@ -1801,10 +1741,6 @@ html,body,#root{width:100%;min-width:0;height:100%;height:100dvh}
 /* Плавающий голосовой док не перекрывает последние действия, даже с высокой очередью музыки. */
 body:has(#voicedock) #home .home-body,
 body:has(#voicedock) .admin{padding-bottom:max(132px,calc(118px + env(safe-area-inset-bottom)))}
-body:has(#voicedock .music) #home .home-body,
-body:has(#voicedock .music) .admin{padding-bottom:max(190px,calc(176px + env(safe-area-inset-bottom)))}
-body:has(#voicedock .music.open) #home .home-body,
-body:has(#voicedock .music.open) .admin{padding-bottom:max(132px,calc(min(68dvh,520px) + 24px + env(safe-area-inset-bottom)))}
 #voicedock .vd-panel{max-height:min(68dvh,520px);overflow-y:auto;overscroll-behavior:contain}
 
 .home-hero{
@@ -2004,10 +1940,6 @@ body:has(#voicedock .music.open) .admin{padding-bottom:max(132px,calc(min(68dvh,
   .home-body{padding:18px 16px calc(82px + env(safe-area-inset-bottom))}
   body:has(#voicedock) #home .home-body{padding-bottom:calc(158px + env(safe-area-inset-bottom))}
   body:has(#voicedock) .admin{padding-bottom:calc(158px + env(safe-area-inset-bottom))}
-  body:has(#voicedock .music) #home .home-body{padding-bottom:calc(270px + env(safe-area-inset-bottom))}
-  body:has(#voicedock .music) .admin{padding-bottom:calc(270px + env(safe-area-inset-bottom))}
-  body:has(#voicedock .music.open) #home .home-body{padding-bottom:max(158px,calc(min(68dvh,520px) + 24px + env(safe-area-inset-bottom)))}
-  body:has(#voicedock .music.open) .admin{padding-bottom:max(158px,calc(min(68dvh,520px) + 24px + env(safe-area-inset-bottom)))}
   #voicedock{left:max(10px,env(safe-area-inset-left));right:max(10px,env(safe-area-inset-right));bottom:calc(10px + env(safe-area-inset-bottom));width:auto;max-width:430px;margin-inline:auto}
   #voicedock .vd-panel{max-height:min(68dvh,520px);overflow-y:auto;overscroll-behavior:contain}
   #members{padding-bottom:calc(58px + env(safe-area-inset-bottom))}
@@ -2164,8 +2096,6 @@ body:has(#voicedock .music.open) .admin{padding-bottom:max(132px,calc(min(68dvh,
   .vd-caret{width:32px;min-height:44px}
   .vd-info{min-height:44px}
   .vd-controls{flex-wrap:wrap;gap:8px}
-  .mus-b,.mus-b.play,.mus-caret,.mus-add button,.mus-q-i,.mus-q-x{min-width:44px;min-height:44px}
-  .mus-ctrls{gap:3px}.mus-bar{flex-wrap:wrap}.mus-meta{flex:1 1 120px}.mus-ctrls{margin-left:auto}
   .react-add{opacity:1}
 
   .msg-main{position:static;align-items:flex-start}
@@ -3204,8 +3134,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .cu-chip b,.chip.on,.dominant.unread,#content.split .mob-chat-toggle,
 .vbar .vb-btn.active,.update-bar .ub-ic,.update-bar .ub-btn,#scrollbtn .sb-badge,.chat-in #sendBtn,
 .pi .watchbtn:not(.on):hover,.modal .close,.seg button.active,.invite-box button,.settings-nav button.active,
-.pm-av-edit,.sm-act.accent,#epick .epick-size button.active,.admin-tabs button.on,.mus-b.play,.mus-add button,
-.mus-q-i:hover{color:var(--accent-fg,#fff)}
+.pm-av-edit,.sm-act.accent,#epick .epick-size button.active,.admin-tabs button.on{color:var(--accent-fg,#fff)}
 .theme-grid{grid-template-columns:repeat(auto-fit,minmax(205px,1fr));gap:9px}
 .theme-op{min-width:0;min-height:62px;gap:11px;padding:9px 10px;border-color:var(--workspace-stroke);border-radius:11px;background:color-mix(in srgb,var(--workspace-raised) 74%,transparent)}
 .theme-op:hover{border-color:var(--workspace-stroke-hi);background:var(--workspace-hover)}

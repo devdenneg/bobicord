@@ -316,7 +316,6 @@ for (const sql of [
   "ALTER TABLE messages ADD COLUMN client_key TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
   "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0",
-  "ALTER TABLE servers ADD COLUMN music_enabled INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE messages ADD COLUMN edited INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE servers ADD COLUMN stats_enabled INTEGER NOT NULL DEFAULT 0", // рейтинг+уровни (эксперимент, off по умолчанию)
   "ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT ''",           // '' обычное | 'levelup' карточка достижения
@@ -699,7 +698,7 @@ function sessionPayload(user, state = authManager.sessionState(user)) {
 // Имена всегда выпускает наш upload route: 12 random bytes + расширение из проверенного MIME.
 // Узкий regexp не пропускает `..`, произвольные имена и не-image расширения в профили/чат.
 const UPLOAD_RE = /^\/api\/uploads\/[a-f0-9]{24}\.(?:png|jpg|gif|webp)$/;
-const pubServer = s => ({ id: s.id, name: s.name, ownerId: s.owner_id, iconColor: s.icon_color, iconUrl: s.icon_url || '', description: s.description || '', musicEnabled: !!s.music_enabled, statsEnabled: !!s.stats_enabled });
+const pubServer = s => ({ id: s.id, name: s.name, ownerId: s.owner_id, iconColor: s.icon_color, iconUrl: s.icon_url || '', description: s.description || '', statsEnabled: !!s.stats_enabled });
 
 /* ---------------- Рейтинг + уровни (экспериментальная фича) ---------------- */
 function statsEnabled(sid) { const s = db.prepare('SELECT stats_enabled FROM servers WHERE id=?').get(sid); return !!(s && s.stats_enabled); }
@@ -2027,35 +2026,6 @@ app.get('/api/7tv/search', requireAuth, async (req, res) => {
   } catch (e) { if (!res.headersSent) res.sendStatus(502); }
 });
 
-/* ---------------- MUSIC RELAY (совместное прослушивание YouTube через отдельный медиа-релей) ----------
- * Официальный IFrame-плеер тянет аудио с googlevideo.com напрямую в браузер — у заблокированных
- * провайдером юзеров не играет. Отдельный бокс (deploy/media-relay) извлекает аудио через yt-dlp и
- * проксирует браузеру. Этот (основной) сервер лишь ПОДПИСЫВАЕТ HMAC-токен: сами аудио-байты идут
- * браузер↔релей, мимо ЭТОГО VPS (egress-инвариант держится). Фича включается заданием MEDIA_RELAY_URL/
- * MEDIA_RELAY_SECRET в env; без них роут отдаёт 503 и клиент остаётся на старом IFrame-плеере. */
-const MEDIA_RELAY_URL = (process.env.MEDIA_RELAY_URL || '').replace(/\/+$/, '');
-const MEDIA_RELAY_SECRET = process.env.MEDIA_RELAY_SECRET || '';
-function signRelayToken(videoId) {
-  // exp с запасом > длины трека (googlevideo-URL релей кэширует ~4ч); формат сверяется в relay.js
-  const exp = Date.now() + 6 * 3600 * 1000;
-  const sig = crypto.createHmac('sha256', MEDIA_RELAY_SECRET).update(videoId + '.' + exp).digest('hex');
-  return exp + '.' + sig;
-}
-app.get('/api/music/resolve/:id', requireAuth, async (req, res) => {
-  if (!MEDIA_RELAY_URL || !MEDIA_RELAY_SECRET) return res.status(503).json({ error: 'relay off' });
-  const id = String(req.params.id || '');
-  if (!/^[a-zA-Z0-9_-]{11}$/.test(id)) return res.status(400).json({ error: 'bad id' });
-  const t = signRelayToken(id);
-  const url = `${MEDIA_RELAY_URL}/audio/${id}?t=${t}`;
-  // title/duration — best-effort с релея (не блокируем воспроизведение, если /meta не ответил)
-  let title = '', duration = 0;
-  try {
-    const r = await fetch(`${MEDIA_RELAY_URL}/meta/${id}?t=${t}`, { signal: AbortSignal.timeout(8000) });
-    if (r.ok) { const d = await r.json(); title = String(d.title || '').slice(0, 200); duration = parseInt(d.duration, 10) || 0; }
-  } catch (e) { /* релей мог не ответить — вернём только url */ }
-  res.json({ url, title, duration });
-});
-
 /* ---------------- FILE ATTACHMENTS (любые расширения, <=10MB) ----------------
  * Отдельная директория от IMAGE UPLOADS выше и НЕ отдаётся через express.static —
  * иначе загруженный .html/.svg исполнился бы на нашем origin (XSS). Раздача только
@@ -2403,10 +2373,9 @@ app.patch('/api/servers/:id', requireAuth, (req, res) => {
   let iu = null;
   if (req.body.iconUrl != null) { const v = String(req.body.iconUrl); if (v === '' || UPLOAD_RE.test(v)) iu = v; else return res.status(400).json({ error: 'Неверная обложка' }); }
   if (name !== null && name.length < 2) return res.status(400).json({ error: 'Название минимум 2 символа' });
-  const music = req.body.musicEnabled != null ? (req.body.musicEnabled ? 1 : 0) : null;
   const statsOn = req.body.statsEnabled != null ? (req.body.statsEnabled ? 1 : 0) : null;
-  db.prepare('UPDATE servers SET name=COALESCE(?,name), description=COALESCE(?,description), icon_color=COALESCE(?,icon_color), icon_url=COALESCE(?,icon_url), music_enabled=COALESCE(?,music_enabled), stats_enabled=COALESCE(?,stats_enabled) WHERE id=?')
-    .run(name, desc, ic, iu, music, statsOn, s.id);
+  db.prepare('UPDATE servers SET name=COALESCE(?,name), description=COALESCE(?,description), icon_color=COALESCE(?,icon_color), icon_url=COALESCE(?,icon_url), stats_enabled=COALESCE(?,stats_enabled) WHERE id=?')
+    .run(name, desc, ic, iu, statsOn, s.id);
   const ns = db.prepare('SELECT * FROM servers WHERE id=?').get(s.id);
   res.json({ server: { ...pubServer(ns), memberCount: memberCount(s.id) } });
 });

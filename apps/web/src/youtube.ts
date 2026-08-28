@@ -1,8 +1,5 @@
-// YouTube IFrame API — для совместного прослушивания в голосовом канале (Watch Together, ToS-ок:
-// официальный плеер, реклама/подсчёт просмотров сохраняются, без ре-стриминга). Каждый участник
-// голосового канала играет один и тот же трек синхронно у себя; синхронизация — через data-канал.
-
-let apiReady: Promise<void> | null = null;
+// Разбор ссылок на YouTube и заголовки видео — для карточки предпросмотра ссылки в чате.
+// Заголовок берётся у публичного oembed самого YouTube, наш сервер в этом не участвует.
 
 const VIDEO_ID_RE = /^[a-zA-Z0-9_-]{11}$/;
 const YOUTUBE_HOSTS = new Set(['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com']);
@@ -58,31 +55,8 @@ export function parseYouTubeVideo(input: string): YouTubeVideoRef | null {
   };
 }
 
-/** Ленивая загрузка IFrame API (один раз). Резолвится, когда window.YT.Player готов. */
-export function loadYT(): Promise<void> {
-  if (apiReady) return apiReady;
-  apiReady = new Promise<void>((resolve) => {
-    const w = window as any;
-    if (w.YT && w.YT.Player) { resolve(); return; }
-    const prev = w.onYouTubeIframeAPIReady;
-    w.onYouTubeIframeAPIReady = () => { try { prev?.(); } catch { /**/ } resolve(); };
-    if (!document.getElementById('yt-iframe-api')) {
-      const s = document.createElement('script');
-      s.id = 'yt-iframe-api';
-      s.src = 'https://www.youtube.com/iframe_api';
-      document.head.appendChild(s);
-    }
-  });
-  return apiReady;
-}
-
-/** videoId (11 симв.) из ссылки youtube/youtu.be/shorts/embed/live или голого id. null — не распознано. */
-export function parseVideoId(input: string): string | null {
-  return parseYouTubeVideo(input)?.videoId || null;
-}
-
-/** Название трека без API-ключа (oEmbed, CORS-разрешён). Фолбэк — сам id. Таймаут 6с — иначе зависший
- *  запрос держал бы лоадер добавления вечно. */
+/** Название видео без API-ключа (oEmbed, CORS-разрешён). Фолбэк — сам id. Таймаут 6с — иначе
+ *  зависший запрос держал бы карточку предпросмотра без заголовка неопределённо долго. */
 const TITLE_CACHE_LIMIT = 100;
 const titleRequests = new Map<string, Promise<string>>();
 

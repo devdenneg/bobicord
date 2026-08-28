@@ -14,7 +14,6 @@ import {
   resumeNotifyWsReconnect,
 } from './notifyws';
 import { startIdleWatch } from './idle';
-import { initMusic } from './music';
 import { preloadSounds } from './sounds';
 import { isTauri, stopNativeBroadcast } from './native';
 import { endAnyBroadcasterSession, flushPendingDiag } from './diag';
@@ -386,7 +385,6 @@ export const useStore = create<AppState>((set, get) => ({
     if (notifPermission() === 'granted') { setSettings({ notif: true }); localStorage.removeItem('notifOptOut'); ensurePushSubscribed(); }
     connectNotifyWs(); // глобальный live-канал уведомлений (любой сервер, даже не подключённый)
     startIdleWatch();  // away-детект: апп давно не трогали → жёлтый статус (шлётся по notify-WS)
-    initMusic();       // совместное прослушивание: подписка на music-синк по data-каналу голосовой
     preloadSounds(); // прогреть звуки (fetch+decode+нормализация громкости) — первый проигрыш без задержки
     const pend = sessionStorage.getItem('pendingInvite');
     const pendingOpenServer = sessionStorage.getItem('pendingOpenServer');

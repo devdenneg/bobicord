@@ -535,7 +535,6 @@ function ServerProfileTab({ active }: { active: import('../types').ServerDetail 
   const [name, setName] = useState(active.name); const [desc, setDesc] = useState(active.description || '');
   const [color, setColor] = useState(active.iconColor); const [iconUrl, setIconUrl] = useState(active.iconUrl || '');
   const [busy, setBusy] = useState(false); const [uploading, setUploading] = useState(false); const [err, setErr] = useState('');
-  const [music, setMusic] = useState(!!active.musicEnabled);
   const [statsOn, setStatsOn] = useState(!!active.statsEnabled);
   const fileRef = useRef<HTMLInputElement>(null);
   async function pick(file: File) {
@@ -546,7 +545,7 @@ function ServerProfileTab({ active }: { active: import('../types').ServerDetail 
   }
   async function save() {
     setBusy(true); setErr('');
-    try { await api.patchServer(active.id, { name: name.trim(), description: desc, iconColor: color, iconUrl, musicEnabled: music, statsEnabled: statsOn }); await useStore.getState().refreshServer(); useStore.getState().refreshServers(); useStore.getState().toast('Сохранено', 'ok'); }
+    try { await api.patchServer(active.id, { name: name.trim(), description: desc, iconColor: color, iconUrl, statsEnabled: statsOn }); await useStore.getState().refreshServer(); useStore.getState().refreshServers(); useStore.getState().toast('Сохранено', 'ok'); }
     catch (e: any) { setErr(e.message); } finally { setBusy(false); }
   }
   return <>
@@ -561,10 +560,6 @@ function ServerProfileTab({ active }: { active: import('../types').ServerDetail 
     <div className="fld"><label>Название</label><input value={name} maxLength={40} onChange={(e) => setName(e.target.value)} /></div>
     <div className="fld"><label>Описание</label><textarea value={desc} maxLength={300} rows={2} placeholder="о чём этот сервер" onChange={(e) => setDesc(e.target.value)} /></div>
     <div className="fld"><label>Цвет иконки{iconUrl ? ' (когда без обложки)' : ''}</label><div className="colorpick">{AV_COLORS.map((c, i) => <div key={i} className={'cp' + (i === color ? ' sel' : '')} style={{ background: c }} onClick={() => setColor(i)} />)}</div></div>
-    <div className="fld"><label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
-      <input type="checkbox" checked={music} onChange={(e) => setMusic(e.target.checked)} style={{ marginTop: 3, width: 16, height: 16, accentColor: 'var(--accent)', flex: '0 0 auto' }} />
-      <span style={{ display: 'flex', flexDirection: 'column', gap: 2 }}><b style={{ fontSize: 13.5, color: 'var(--txt-h)' }}>Совместное прослушивание (YouTube)</b><span style={{ fontSize: 12, color: 'var(--muted)' }}>Мини-плеер в голосовом канале: общая очередь, синхронно у всех. По умолчанию выключено.</span></span>
-    </label></div>
     <div className="fld"><label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
       <input type="checkbox" checked={statsOn} onChange={(e) => setStatsOn(e.target.checked)} style={{ marginTop: 3, width: 16, height: 16, accentColor: 'var(--accent)', flex: '0 0 auto' }} />
       <span style={{ display: 'flex', flexDirection: 'column', gap: 2 }}><b style={{ fontSize: 13.5, color: 'var(--txt-h)' }}>Рейтинг и уровни <span style={{ fontSize: 10.5, fontWeight: 700, color: 'var(--accent)', border: '1px solid color-mix(in srgb,var(--accent) 45%,transparent)', borderRadius: 5, padding: '0 5px', marginLeft: 4 }}>ЭКСПЕРИМЕНТ</span></b><span style={{ fontSize: 12, color: 'var(--muted)' }}>Кнопка 🏆 в шапке канала: рейтинг по времени в голосовом и эфире + бесконечные уровни. Считается с момента включения. По умолчанию выключено.</span></span>

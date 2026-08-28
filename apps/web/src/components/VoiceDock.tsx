@@ -4,7 +4,6 @@ import { Room } from 'livekit-client';
 import { useStore, getEngine } from '../store';
 import { useEngine } from '../hooks';
 import { Icon } from '../Icon';
-import { MusicPlayer } from './MusicPlayer';
 import { getSettings, setSettings } from '../settings';
 import { isTauri, onBroadcastStopped, stopNativeBroadcast } from '../native';
 import { endAnyBroadcasterSession } from '../diag';
@@ -342,7 +341,6 @@ function VoicePanel({ controls }: { controls?: boolean }) {
         <button className="vd-btn vd-leave" aria-label={disconnected ? 'Скрыть отключённый голосовой канал' : 'Выйти из голосового канала'} data-tip={disconnected ? 'Скрыть' : 'Выйти из голосового'} onClick={() => disconnected ? E.dismissLostVoice() : E.leaveVoice()}><Icon name="leave" sm /></button>
       </div>
       {controls && eng.inVoice ? <VoiceControls up /> : null}
-      {eng.inVoice ? <MusicPlayer enabled={!!srv?.musicEnabled} /> : null}
     </div>
   );
 }

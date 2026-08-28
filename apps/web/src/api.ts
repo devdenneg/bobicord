@@ -231,7 +231,7 @@ export const api = {
     req<{ server: ServerSummary; invite: string; inviteExpires: number }>('POST', '/servers', { name }),
   getServer: (id: string) =>
     req<{ server: ServerDetail; members: Member[]; myRole: string; myPerms: number }>('GET', '/servers/' + id),
-  patchServer: (id: string, patch: { name?: string; description?: string; iconColor?: number; iconUrl?: string; musicEnabled?: boolean; statsEnabled?: boolean }) =>
+  patchServer: (id: string, patch: { name?: string; description?: string; iconColor?: number; iconUrl?: string; statsEnabled?: boolean }) =>
     req<{ server: ServerDetail }>('PATCH', '/servers/' + id, patch),
   getLeaderboard: (id: string) => req<import('./types').Leaderboard>('GET', `/servers/${id}/leaderboard`),
   leaveServer: (id: string) => req<{ ok: boolean }>('POST', `/servers/${id}/leave`),
@@ -333,7 +333,6 @@ export const api = {
   },
   // Резолв аудио-URL совместного прослушивания через медиа-релей (обход блокировки YouTube).
   // Возвращает готовый URL для <audio> (аудио идёт браузер↔релей, мимо основного VPS). 503 = релей выкл.
-  musicResolve: (id: string) => req<{ url: string; title?: string; duration?: number }>('GET', `/music/resolve/${id}`),
 };
 
 /** Отправка на выгрузке страницы (`pagehide`): обычный fetch браузер убьёт вместе с
