@@ -16,6 +16,48 @@ let reconnectAttempt = 0; // экспоненциальный бэкофф: фи
 let revokedToken: string | null = null; // токен, по которому сервер вернул 4001 (сессия отозвана) — им сокет уже не откроется
 let presenceAway = false; // последнее заявленное idle-состояние (шлём серверу для away/жёлтого статуса)
 let activeChatServerId: string | null = null; // сервер, чей чат реально открыт в UI (не просто живая LiveKit-комната)
+// Живость сокета. Полуоткрытый TCP (сон ноутбука, ребайнд NAT, Wi-Fi→LTE) держит readyState === OPEN
+// сколько угодно: FIN/RST по мёртвому пути не доходит, onclose не срабатывает, и kickReconnect на
+// visibilitychange/online/focus молча выходил по «уже OPEN». Уведомления по НЕ подключённым серверам
+// ходят только этим сокетом, значит клиент оставался без них до перезапуска приложения.
+// Транспортный ws.ping() сервера в JS не виден (движок отвечает pong сам), поэтому живость меряем
+// СВОИМ ping-фреймом: сервер отвечает {t:'pong'}, любой входящий фрейм обновляет lastRxAt.
+const HEARTBEAT_MS = 30000;
+const DEAD_AFTER_MS = 90000; // три пропущенных ответа подряд
+let lastRxAt = 0;
+let heartbeatTimer: number | null = null;
+
+function socketLooksDead(): boolean {
+  return !!lastRxAt && Date.now() - lastRxAt > DEAD_AFTER_MS;
+}
+
+// Рвём сокет принудительно: close() по мёртвому пути тоже не долетит до сервера, но локально
+// переводит объект в CLOSING/CLOSED и освобождает kickReconnect/scheduleReconnect.
+function dropDeadSocket(): void {
+  const current = ws;
+  ws = null;
+  lastRxAt = 0;
+  stopHeartbeat();
+  if (current) { try { current.close(); } catch { /**/ } }
+}
+
+function stopHeartbeat(): void {
+  if (heartbeatTimer) { clearTimeout(heartbeatTimer); heartbeatTimer = null; }
+}
+
+// setTimeout-цепочка вместо setInterval: в фоне таймер троттлится, и накопленные тики setInterval
+// выстрелили бы пачкой при возврате на вкладку. Троттлинг здесь безвреден — проверка просто реже,
+// а мгновенную проверку по возвращении делает kickReconnect.
+function scheduleHeartbeat(): void {
+  stopHeartbeat();
+  heartbeatTimer = window.setTimeout(() => {
+    heartbeatTimer = null;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (socketLooksDead()) { dropDeadSocket(); scheduleReconnect(); return; }
+    try { ws.send(JSON.stringify({ t: 'ping' })); } catch { /**/ }
+    scheduleHeartbeat();
+  }, HEARTBEAT_MS);
+}
 
 function sendPresenceFrame(): void {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -44,6 +86,8 @@ function revoked(): boolean { return !!revokedToken && revokedToken === getToken
 // Немедленная попытка вне расписания бэкоффа (счётчик при этом не сбрасываем — успех сбросит его сам).
 function kickReconnect(): void {
   if (closed || reconnectPaused || revoked()) return;
+  // Вернулись на вкладку/в сеть — это ровно тот момент, когда сокет мог протухнуть незаметно.
+  if (ws && ws.readyState === WebSocket.OPEN && socketLooksDead()) dropDeadSocket();
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   connectNotifyWs();
@@ -90,10 +134,12 @@ export function connectNotifyWs() {
   const url = webOrigin().replace(/^http/, 'ws') + '/ws?token=' + encodeURIComponent(token);
   let current: WebSocket;
   try { current = new WebSocket(url); ws = current; } catch { scheduleReconnect(); return; }
-  current.onopen = () => { if (ws !== current) { try { current.close(); } catch { /**/ } return; } reconnectAttempt = 0; sendPresenceFrame(); }; // переотправляем idle + реально открытый чат
+  current.onopen = () => { if (ws !== current) { try { current.close(); } catch { /**/ } return; } reconnectAttempt = 0; lastRxAt = Date.now(); scheduleHeartbeat(); sendPresenceFrame(); }; // переотправляем idle + реально открытый чат
   current.onmessage = (ev) => {
     if (ws !== current) return;
+    lastRxAt = Date.now(); // любой входящий фрейм = сокет жив
     let d: any; try { d = JSON.parse(ev.data); } catch { return; }
+    if (d && d.t === 'pong') return; // ответ на наш heartbeat, больше ничего не значит
     // кросс-девайс: прочитано на другом устройстве этого юзера → сбрасываем unread локально (и для
     // ПОДКЛЮЧЁННОГО сервера — тут дедуп по viewServerId НЕ применяем, чтение общее по БД).
     if (d.t === 'read') { if (d.serverId) useStore.getState().applyRemoteRead(d.serverId, d.lastRead || 0); return; }
@@ -150,6 +196,8 @@ export function connectNotifyWs() {
   current.onclose = (ev) => {
     if (ws !== current) return;
     ws = null;
+    lastRxAt = 0;
+    stopHeartbeat();
     // 4001 = сервер отозвал сессию (смена пароля, подтверждение почты, удаление аккаунта на другом
     // устройстве). Этим токеном сокет уже никогда не откроется — раньше клиент бесконечно долбился
     // мёртвым JWT и молча оставался без уведомлений, ничего не сказав пользователю.
@@ -169,6 +217,7 @@ export function connectNotifyWs() {
 // сразу снова получит точный presence открытого чата.
 export function pauseNotifyWsReconnect() {
   reconnectPaused = true;
+  stopHeartbeat();
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   if (ws) { const current = ws; ws = null; try { current.close(); } catch { /**/ } }
 }
@@ -181,6 +230,7 @@ export function resumeNotifyWsReconnect() {
 export function disconnectNotifyWs() {
   closed = true;
   reconnectPaused = false;
+  stopHeartbeat();
   activeChatServerId = null;
   sendPresenceFrame();
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }

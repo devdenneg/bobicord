@@ -732,7 +732,11 @@ function attachTreeServer(httpServer, opts) {
     turnTtlSec = 600,          // короткий TTL временных TURN-креды
   } = opts;
 
-  const wss = new WebSocketServer({ noServer: true });
+  // maxPayload: дефолт ws — 100 МиБ на кадр. Легитимные кадры дерева (SDP/ICE/stats) — единицы КБ;
+  // потолок отсекает мусорный кадр до буферизации. Превышение = штатное закрытие 1009, а не 'error'.
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 });
+  // 'error' на самом сервере (сбой апгрейда/сокета) иначе уходит в uncaughtException → process.exit(1).
+  wss.on('error', (e) => tlog(`wss error: ${e && e.message}`));
   const mgr = new TreeManager(!!(turnSecret && turnUrls.length));
   const peers = new Map(); // peerId -> node {id, ws, streamId, role, native, identity, parent, children, depth, maxChildren, stats...}
   tlog(`режим видео-дерева: ${SERVER_FIRST ? 'server-first (ДЕФОЛТ, Д8) — vrelay постоянный медиаузел для стримов с serverIngest; стримы старых клиентов (без serverIngest) — LEGACY-fallback' : 'legacy (TREE_SERVER_FIRST=0) — vrelay = fallback с дренажом'}; vrelay children cap=${VIRTUAL_CHILDREN_CAP}`);
@@ -1711,6 +1715,14 @@ function attachTreeServer(httpServer, opts) {
       } catch (e) {
         tlog(`ошибка обработки ${msg && msg.t}: ${e && e.message}`);
       }
+    });
+    // 'error' ws эмитит НА САМОМ сокете (битый кадр, RSV-биты, невалидный UTF-8, превышение maxPayload).
+    // EventEmitter без слушателя 'error' бросает асинхронно — мимо try/catch диспетчера и мимо try{ws.send}catch —
+    // и уходит в uncaughtException, по которому index.js делает process.exit(1): один кривой кадр одного клиента
+    // ронял весь API (чат, голос, все деревья). У notify-WS такой слушатель есть, у tree-WS не было.
+    ws.on('error', (e) => {
+      tlog(`ws error ${id}: ${e && e.message}`);
+      try { ws.terminate(); } catch (err) { /* сокет уже мёртв */ }
     });
     // code 1006 = грязный обрыв TCP (без close-фрейма): краш клиента, потеря сети,
     // heartbeat-terminate (см. hbTimer — он логирует свой terminate отдельно).

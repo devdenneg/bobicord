@@ -3017,7 +3017,9 @@ const treeSrv = attachTreeServer(server, {
 });
 
 /* ---------- Глобальный notify-WS (/ws): уведомления по любому серверу, вкл. не подключённый ---------- */
-const notifyWss = new WebSocketServer({ noServer: true });
+// maxPayload: дефолт ws — 100 МиБ. Клиент шлёт сюда только presence/ack-фреймы в сотни байт.
+const notifyWss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
+notifyWss.on('error', (e) => console.error('[notify-ws] server error:', e && e.message));
 server.on('upgrade', (req, socket, head) => {
   let url; try { url = new URL(req.url, 'http://internal'); } catch { return; }
   if (url.pathname !== '/ws') return; // не наш путь — оставляем tree-хендлеру
@@ -3046,7 +3048,12 @@ server.on('upgrade', (req, socket, head) => {
     ws.on('message', (data) => {
       try {
         const d = JSON.parse(data);
-        if (!d || d.t !== 'presence') return;
+        if (!d) return;
+        // Прикладной ping/pong. Транспортный ws.ping() браузеру не виден из JS (pong шлёт сам движок),
+        // поэтому клиент не может отличить живой сокет от полуоткрытого и никогда не переподключался.
+        // Этот ответ — единственный регулярный входящий фрейм, по которому клиент судит о живости.
+        if (d.t === 'ping') { try { ws.send(JSON.stringify({ t: 'pong' })); } catch (e) { /**/ } return; }
+        if (d.t !== 'presence') return;
         ws._away = !!d.away;
         const requested = typeof d.activeServerId === 'string' ? d.activeServerId.trim().slice(0, 80) : '';
         const activeServerId = requested && isMember(uid, requested) ? requested : '';
