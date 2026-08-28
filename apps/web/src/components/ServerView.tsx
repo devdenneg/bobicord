@@ -69,6 +69,12 @@ const COMPOSER_MAX_HEIGHT_PX = 160;
 const COMPOSER_MAX_VIEWPORT_RATIO = 0.3;
 const EXACT_JUMP_PAGE_LIMIT = 60;
 const EXACT_JUMP_MAX_PAGES = 20;
+// Исход попытки открыть сообщение по ссылке из уведомления/ответа.
+type RevealOutcome = 'opened' | 'missing' | 'pending';
+// Потолок повторов для 'pending' (история ещё не приехала, запрос устарел, сетевой сбой): эффект
+// перезапускается на каждое входящее сообщение, поэтому без потолка «вечно ожидающий» destination
+// дёргал бы /messages до самого закрытия сервера.
+const MAX_DESTINATION_ATTEMPTS = 8;
 const CHAT_VIEWPORT_INCREASE = { top: 600, bottom: 400 } as const;
 const CHAT_MIN_OVERSCAN_ITEMS = { top: CHAT_PREPEND_OVERSCAN_ITEMS, bottom: 8 } as const;
 
@@ -1257,6 +1263,7 @@ function Chat() {
   // --- виртуальный список чата (react-virtuoso) ---
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const destinationRequestRef = useRef(0);
+  const destinationAttemptsRef = useRef(0); // попытки открыть один и тот же pending-destination
   const scrollerElementRef = useRef<HTMLElement | null>(null);
   const detachScrollerRef = useRef<(() => void) | null>(null);
   const tailElementRef = useRef<HTMLDivElement | null>(null);
@@ -2233,17 +2240,22 @@ function Chat() {
   // Exact-jump используется и уведомлениями, и reply. Загружаем весь непрерывный
   // диапазон между текущим окном и целью: одиночный prepend создавал бы невидимый
   // gap, ломал cursor истории и мог поставить следующее старое сообщение в хвост.
-  const revealMessage = useCallback(async (sid: number, missingText = 'Сообщение больше недоступно'): Promise<boolean> => {
+  // Исход важнее факта успеха: 'pending' — «ещё рано, повторить» (история не приехала, запрос устарел),
+  // 'missing' — «сообщения нет и не будет» (удалено, /clear, чужой сервер). Раньше обе ветки возвращали
+  // false, поэтому pending-destination из уведомления не вычищался НИКОГДА: он лежит в sessionStorage
+  // (переживает reload), а эффект перезапускается на каждое входящее сообщение — и на каждое сообщение
+  // клиент заново дёргал /messages и показывал тост «Сообщение из уведомления больше недоступно».
+  const revealMessage = useCallback(async (sid: number, missingText = 'Сообщение больше недоступно'): Promise<RevealOutcome> => {
     const requestSeq = ++destinationRequestRef.current;
-    if (focusLoadedMessage(sid)) return true;
+    if (focusLoadedMessage(sid)) return 'opened';
     const requestedServerId = activeId;
-    if (!requestedServerId) return false;
+    if (!requestedServerId) return 'pending';
     const initialSids = E.getSnapshot().messages
       .map((message) => message.sid)
       .filter((value): value is number => value != null);
     // Начальная history ещё не приехала: pending destination остаётся и повторится
     // после следующего изменения messages/roomReady.
-    if (!initialSids.length) return false;
+    if (!initialSids.length) return 'pending';
     const oldestSid = Math.min(...initialSids);
     const newestSid = Math.max(...initialSids);
     const requestIsCurrent = () => (
@@ -2257,19 +2269,19 @@ function Chat() {
         let collected: Awaited<ReturnType<typeof api.getMessages>>['messages'] = [];
         for (let pageIndex = 0; pageIndex < EXACT_JUMP_MAX_PAGES; pageIndex++) {
           const history = await api.getMessages(requestedServerId, cursor, EXACT_JUMP_PAGE_LIMIT);
-          if (!requestIsCurrent()) return false;
+          if (!requestIsCurrent()) return 'pending';
           if (!history.messages.length) break;
           collected = [...history.messages, ...collected];
           const targetIndex = collected.findIndex((message) => message.id === sid);
           if (targetIndex >= 0) {
-            if (focusLoadedMessage(sid)) return true;
+            if (focusLoadedMessage(sid)) return 'opened';
             const loadedNow = E.getSnapshot().messages
               .map((message) => message.sid)
               .filter((value): value is number => value != null);
             const currentOldest = loadedNow.length ? Math.min(...loadedNow) : oldestSid;
             const continuous = collected.slice(targetIndex).filter((message) => message.id != null && message.id < currentOldest);
             if (continuous.length) E.prependHistory(continuous, targetIndex > 0 || history.hasMore);
-            return focusLoadedMessage(sid);
+            return focusLoadedMessage(sid) ? 'opened' : 'missing';
           }
           if (!history.hasMore) break;
           const nextCursor = history.messages[0]?.id;
@@ -2281,7 +2293,7 @@ function Chat() {
         let collected: Awaited<ReturnType<typeof api.getMessages>>['messages'] = [];
         for (let pageIndex = 0; pageIndex < EXACT_JUMP_MAX_PAGES; pageIndex++) {
           const history = await api.getMessages(requestedServerId, cursor, EXACT_JUMP_PAGE_LIMIT);
-          if (!requestIsCurrent()) return false;
+          if (!requestIsCurrent()) return 'pending';
           if (!history.messages.length) break;
           collected = [...history.messages, ...collected];
           const reachedCurrentWindow = history.messages.some((message) => message.id != null && message.id <= newestSid);
@@ -2289,7 +2301,7 @@ function Chat() {
             const continuous = collected.filter((message) => message.id != null && message.id > newestSid && message.id <= sid);
             if (continuous.some((message) => message.id === sid)) {
               E.mergeRecent(continuous);
-              return focusLoadedMessage(sid);
+              return focusLoadedMessage(sid) ? 'opened' : 'missing';
             }
             break;
           }
@@ -2300,14 +2312,15 @@ function Chat() {
       } else {
         // Внутри непрерывного загруженного диапазона отсутствие sid означает удалённое сообщение.
         const exact = await api.getMessages(requestedServerId, sid + 1, 1);
-        if (!requestIsCurrent()) return false;
-        if (exact.messages.some((message) => message.id === sid) && focusLoadedMessage(sid)) return true;
+        if (!requestIsCurrent()) return 'pending';
+        if (exact.messages.some((message) => message.id === sid) && focusLoadedMessage(sid)) return 'opened';
       }
-      if (requestIsCurrent()) toast(missingText, 'warn');
-      return false;
+      if (!requestIsCurrent()) return 'pending';
+      toast(missingText, 'warn');
+      return 'missing';
     } catch (error: any) {
       if (requestSeq === destinationRequestRef.current) toast(error?.message || 'Не удалось открыть сообщение', 'err');
-      return false;
+      return 'pending'; // сетевой сбой — повторим, но число попыток ограничено вызывающим
     }
   }, [E, activeId, focusLoadedMessage, toast]);
 
@@ -2319,10 +2332,16 @@ function Chat() {
     if (!activeId) return;
     const openDestination = async (destination: NotificationDestination) => {
       if (destination.serverId !== activeId) return;
-      const opened = destination.messageId
+      const outcome: RevealOutcome = destination.messageId
         ? await revealMessage(destination.messageId, 'Сообщение из уведомления больше недоступно')
-        : (scrollToBottom(), true);
-      if (opened) clearNotificationDestination(destination);
+        : (scrollToBottom(), 'opened');
+      // Чистим и при 'missing': сообщение удалено — повторять нечего. Оставался только 'pending',
+      // и тот с ограниченным числом попыток, иначе застрявший destination дёргает /messages вечно.
+      if (outcome !== 'pending') { destinationAttemptsRef.current = 0; clearNotificationDestination(destination); return; }
+      if (++destinationAttemptsRef.current >= MAX_DESTINATION_ATTEMPTS) {
+        destinationAttemptsRef.current = 0;
+        clearNotificationDestination(destination);
+      }
     };
     const openPendingForActiveServer = () => {
       const destination = peekNotificationDestination(activeId);

@@ -308,7 +308,7 @@ export const useStore = create<AppState>((set, get) => ({
           .then((r) => engine?.markSendResult(localId, true, r?.id))
           .catch(() => engine?.markSendResult(localId, false));
       },
-      refetchChat: (sid, expectedServerId) => {
+      refetchChat: (sid, expectedServerId, awaitRelease) => {
         const a = get().active; if (!a) return;
         const id = expectedServerId || a.id;
         if (a.id !== id) return;
@@ -320,7 +320,10 @@ export const useStore = create<AppState>((set, get) => ({
             && current.viewServerId === id && engine === targetEngine;
         };
         const scheduleRetry = (attempt: number) => {
-          if (exactCursor == null || !stillCurrent() || Date.now() - startedAt >= 15 * 60_000) return;
+          // Ретрай-цикл существует ради release-записи, которую сервер мог ещё не записать. Для любого
+          // другого sid условие «дождаться kind === 'release'» не выполнится никогда, поэтому цикл
+          // крутился все 15 минут (~90 запросов на одну неудачную реакцию), а merge не применялся.
+          if (!awaitRelease || exactCursor == null || !stillCurrent() || Date.now() - startedAt >= 15 * 60_000) return;
           const delay = Math.min(10_000, 600 * (2 ** Math.min(attempt, 5)));
           window.setTimeout(() => { if (stillCurrent()) fetchRecent(attempt + 1); }, delay);
         };
@@ -328,7 +331,7 @@ export const useStore = create<AppState>((set, get) => ({
           api.getMessages(id, exactCursor, exactCursor == null ? 30 : 1).then((d) => {
             if (!stillCurrent()) return;
             const exactRelease = sid != null && d.messages.some((message) => message.id === sid && message.kind === 'release');
-            if (sid != null && !exactRelease) { scheduleRetry(attempt); return; }
+            if (awaitRelease && sid != null && !exactRelease) { scheduleRetry(attempt); return; }
             targetEngine?.mergeRecent(d.messages);
             if (exactRelease) acknowledgeReleaseMerge();
           }).catch(() => scheduleRetry(attempt));

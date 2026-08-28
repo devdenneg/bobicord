@@ -1,7 +1,11 @@
 import { RnnoiseWorkletNode, loadRnnoise } from '@sapphi-red/web-noise-suppressor';
-import rnnoiseWorkletPath from '@sapphi-red/web-noise-suppressor/rnnoiseWorklet.js?url';
-import rnnoiseWasmPath from '@sapphi-red/web-noise-suppressor/rnnoise.wasm?url';
-import rnnoiseSimdWasmPath from '@sapphi-red/web-noise-suppressor/rnnoise_simd.wasm?url';
+
+// Стабильные имена вместо `?url` (хешированный ассет). Файлы кладёт плагин rnnoiseStableAssets
+// в vite.config.ts — и в dev, и в сборку. Причина та же, что у /vad-worklet.js: догрузка ленивая,
+// а деплой меняет хеш, поэтому вкладка, открытая до выкатки, получала 404 и теряла шумодав.
+const rnnoiseWorkletPath = '/rnnoise-worklet.js';
+const rnnoiseWasmPath = '/rnnoise.wasm';
+const rnnoiseSimdWasmPath = '/rnnoise_simd.wasm';
 
 // Единственная точка контакта с RNNoise (изоляция third-party). WASM-бинарь общий на процесс
 // (фетчится/подбирает SIMD-вариант один раз); addModule — per-AudioContext, т.к. воркет-глобалка
@@ -12,7 +16,13 @@ const moduleLoaded = new WeakMap<BaseAudioContext, Promise<void>>();
 
 function ensureWorkletModule(ctx: AudioContext): Promise<void> {
   let p = moduleLoaded.get(ctx);
-  if (!p) { p = ctx.audioWorklet.addModule(rnnoiseWorkletPath); moduleLoaded.set(ctx, p); }
+  if (!p) {
+    p = ctx.audioWorklet.addModule(rnnoiseWorkletPath);
+    moduleLoaded.set(ctx, p);
+    // Реджекнутый промис — валидное закешированное значение, и следующая попытка мгновенно падала бы
+    // в тот же отказ. Одна сетевая осечка иначе выключала шумодав на всю сессию (сутки). Как в vad.ts.
+    p.catch(() => { if (moduleLoaded.get(ctx) === p) moduleLoaded.delete(ctx); });
+  }
   return p;
 }
 
@@ -21,7 +31,13 @@ function ensureWorkletModule(ctx: AudioContext): Promise<void> {
 // соединение графа. Шумодав — усиление тракта, не обязательное звено: голос не должен падать.
 export async function createDenoiseNode(ctx: AudioContext, maxChannels = 1): Promise<RnnoiseWorkletNode | null> {
   try {
-    wasmBinaryPromise ??= loadRnnoise({ url: rnnoiseWasmPath, simdUrl: rnnoiseSimdWasmPath });
+    if (!wasmBinaryPromise) {
+      const pending = loadRnnoise({ url: rnnoiseWasmPath, simdUrl: rnnoiseSimdWasmPath });
+      wasmBinaryPromise = pending;
+      // `??=` не перезаписал бы отклонённый промис: блип сети на единственном фетче wasm убивал
+      // шумодав до перезапуска приложения. Сбрасываем кэш, чтобы следующий startMic попробовал снова.
+      pending.catch(() => { if (wasmBinaryPromise === pending) wasmBinaryPromise = null; });
+    }
     const [binary] = await Promise.all([wasmBinaryPromise, ensureWorkletModule(ctx)]);
     return new RnnoiseWorkletNode(ctx, { wasmBinary: binary, maxChannels });
   } catch {

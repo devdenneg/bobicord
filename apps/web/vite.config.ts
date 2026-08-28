@@ -1,5 +1,42 @@
-import { defineConfig, loadEnv } from 'vite';
+import { defineConfig, loadEnv, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
+import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
+
+// Ассеты RNNoise обязаны лежать под СТАБИЛЬНЫМИ именами — по той же причине, что и vad-worklet.js
+// (см. комментарий в build ниже): они догружаются лениво, при первом включении микрофона, то есть
+// возможно через сутки после загрузки страницы. Импорт через `?url` давал имя с хешем, и деплой
+// превращал его в 404: addModule/loadRnnoise реджектили, шумодав молча отключался до перезагрузки.
+// Копируем из node_modules сами, а не кладём копию третьей стороны в public/ — иначе она разъедется
+// с версией пакета при первом же обновлении.
+const RNNOISE_ASSETS: Record<string, string> = {
+  'rnnoise-worklet.js': '@sapphi-red/web-noise-suppressor/rnnoiseWorklet.js',
+  'rnnoise.wasm': '@sapphi-red/web-noise-suppressor/rnnoise.wasm',
+  'rnnoise_simd.wasm': '@sapphi-red/web-noise-suppressor/rnnoise_simd.wasm',
+};
+
+function rnnoiseStableAssets(): Plugin {
+  const require = createRequire(import.meta.url);
+  const read = (spec: string) => readFileSync(require.resolve(spec));
+  return {
+    name: 'rnnoise-stable-assets',
+    // dev-сервер отдаёт те же пути, что и прод — иначе шумодав в dev тихо не поднимался бы
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        const name = (req.url || '').split('?')[0].replace(/^\//, '');
+        const spec = RNNOISE_ASSETS[name];
+        if (!spec) return next();
+        res.setHeader('Content-Type', name.endsWith('.wasm') ? 'application/wasm' : 'text/javascript');
+        res.end(read(spec));
+      });
+    },
+    generateBundle() {
+      for (const [fileName, spec] of Object.entries(RNNOISE_ASSETS)) {
+        this.emitFile({ type: 'asset', fileName, source: read(spec) });
+      }
+    },
+  };
+}
 
 // USE_PROD_BACKEND=true в apps/web/.env.local → dev-фронт ходит на прод-бэк (локальный бэк не нужен)
 export default defineConfig(({ mode, command }) => {
@@ -16,7 +53,7 @@ export default defineConfig(({ mode, command }) => {
   // клиент берёт свою версию из Rust (hwinfo.rs, CARGO_PKG_VERSION).
   const webVersion = env.VITE_BUILD || process.env.npm_package_version || 'dev';
   return {
-    plugins: [react()],
+    plugins: [react(), rnnoiseStableAssets()],
     define: { __APP_VERSION__: JSON.stringify(webVersion) },
     build: {
       outDir: 'dist', sourcemap: false, chunkSizeWarningLimit: 1500,

@@ -88,7 +88,11 @@ interface EngineHooks {
   saveSettings: (serverId: string, vols: { users: Record<string, number>; streams: Record<string, number> }) => void;
   peerJoined: (identity: string) => void;
   persistMessage: (text: string, em: Record<string, string>, image: string | undefined, reply: ReplyRef | undefined, localId: number, key: string, files?: Attachment[], kind?: string, level?: number) => void;
-  refetchChat?: (sid?: number, serverId?: string) => void; // sid адресно сверяет строку; serverId отделяет history recovery от готовности LiveKit
+  // sid адресно сверяет строку; serverId отделяет history recovery от готовности LiveKit.
+  // awaitRelease=true — ждём ИМЕННО release-запись (её могло ещё не быть в БД), значит допустимы ретраи;
+  // для любого другого sid ретраи бессмысленны: сообщение уже существует, а ожидание kind==='release'
+  // никогда не выполнится и превращается в 15-минутный поллинг с потерянным merge.
+  refetchChat?: (sid?: number, serverId?: string, awaitRelease?: boolean) => void;
   endBroadcast?: () => void; // остановить нативную трансляцию (Rust) при выходе из голосового — browser-share гасит stopShare
   reactMessage?: (serverId: string, sid: number, emoteId: string, emoteName: string, add: boolean) => Promise<void>; // персист реакции
   editMessage?: (serverId: string, sid: number, text: string) => void;   // персист редактирования
@@ -320,6 +324,7 @@ export class Engine {
   private levelRAF: number | null = null;
   private levelHold = 0;
   private levelDenoise: RnnoiseWorkletNode | null = null;
+  private levelEpoch = 0; // поколение запуска превью-метра: гасит ресурсы копии, проигравшей гонку
 
   constructor(me: User, hooks: EngineHooks) {
     this.me = me;
@@ -2007,36 +2012,56 @@ export class Engine {
   // звонке — иначе маркер порога чувствительности в настройках не совпадал бы с тем, что
   // реально видит гейт во время разговора.
   private async startLevelMeter() {
+    // Поколение запуска. Два старта накладываются буднично: restartLevelMeter (смена устройства или
+    // режима шумодава) и re-mount MicMeter зовут stopLevelMeter, пока предыдущий старт ещё висит в
+    // await getUserMedia — останавливать тогда нечего, и обе копии доходят до конца. Раньше
+    // проигравшая просто делала `return`, не погасив СВОЙ gUM-поток: устройство захвата оставалось
+    // открытым до перезагрузки (индикатор «микрофон используется» вне звонка), а её RnnoiseWorkletNode
+    // и MediaStreamSource оставались висеть, потому что поля объекта уже перезаписал победитель.
+    const op = ++this.levelEpoch;
     let stream: MediaStream;
     try { stream = await navigator.mediaDevices.getUserMedia({ audio: this.micCapture() }); }
     catch { this.hooks.toast('Нет доступа к микрофону', 'err'); return; }
-    if (this.levelListeners.size === 0 || this.inVoice) { stream.getTracks().forEach((t) => t.stop()); return; }
+    const stale = () => op !== this.levelEpoch || this.levelListeners.size === 0 || this.inVoice;
+    if (stale()) { stream.getTracks().forEach((t) => t.stop()); return; }
     this.levelStream = stream;
+    // Узлы держим локально и переносим в поля одним куском только после последнего гарда — иначе
+    // проигравшая копия затирает поля победителя своими, и живой граф становится недостижимым.
+    let src: MediaStreamAudioSourceNode | null = null;
+    let denoise: RnnoiseWorkletNode | null = null;
+    const release = () => {
+      if (src) { try { src.disconnect(); } catch { /**/ } }
+      destroyDenoiseNode(denoise);
+      stream.getTracks().forEach((t) => t.stop());
+      if (this.levelStream === stream) this.levelStream = null;
+    };
     try {
-      this.levelCtx = this.levelCtx || new AudioContext();
-      this.levelCtx.resume?.().catch(() => {});
-      this.levelSrc = this.levelCtx.createMediaStreamSource(stream);
-      let preAnalyser: AudioNode = this.levelSrc;
+      const ctx = this.levelCtx = this.levelCtx || new AudioContext();
+      ctx.resume?.().catch(() => {});
+      src = ctx.createMediaStreamSource(stream);
+      let preAnalyser: AudioNode = src;
       if (getSettings().nsMode === 'rnnoise') {
-        this.levelDenoise = await createDenoiseNode(this.levelCtx);
-        if (this.levelDenoise) {
-          this.levelSrc.connect(this.levelDenoise);
+        denoise = await createDenoiseNode(ctx);
+        if (denoise) {
+          src.connect(denoise);
           // см. startMic() — RnnoiseWorkletNode пишет только в канал 0, канал 1 тишина; без
           // сплита анализатор усреднял бы вдвое заниженный уровень (0.5*(L+0)).
-          const split = this.levelCtx.createChannelSplitter(2);
-          this.levelDenoise.connect(split);
+          const split = ctx.createChannelSplitter(2);
+          denoise.connect(split);
           preAnalyser = split;
         }
         else this.hooks.toast('Шумодав недоступен — звук без обработки', 'warn');
       }
       // застали остановку/переключение режима, пока грузился denoise — не подключаем осиротевший граф
-      if (this.levelListeners.size === 0 || this.inVoice || this.levelStream !== stream) return;
-      this.levelAnalyser = this.levelCtx.createAnalyser();
+      if (stale() || this.levelStream !== stream || this.levelCtx !== ctx) { release(); return; }
+      this.levelSrc = src;
+      this.levelDenoise = denoise;
+      this.levelAnalyser = ctx.createAnalyser();
       this.levelAnalyser.fftSize = 512; this.levelAnalyser.smoothingTimeConstant = 0.5;
       this.levelBuf = new Uint8Array(this.levelAnalyser.fftSize);
       preAnalyser.connect(this.levelAnalyser);
       this.levelRAF = requestAnimationFrame(this.levelLoop);
-    } catch { /**/ }
+    } catch { release(); }
   }
   private levelLoop = () => {
     if (!this.levelAnalyser || !this.levelBuf) return;
@@ -2054,6 +2079,7 @@ export class Engine {
     this.levelRAF = requestAnimationFrame(this.levelLoop);
   };
   private stopLevelMeter() {
+    this.levelEpoch++; // старт, ещё висящий в await, увидит смену поколения и освободит свой поток
     if (this.levelRAF) cancelAnimationFrame(this.levelRAF); this.levelRAF = null;
     if (this.levelSrc) { try { this.levelSrc.disconnect(); } catch { /**/ } this.levelSrc = null; }
     destroyDenoiseNode(this.levelDenoise); this.levelDenoise = null;
@@ -2724,7 +2750,7 @@ export class Engine {
       this.chatRefreshTimers.delete(key);
       if (serverId && (exactSid != null || this.viewServerId === serverId)) {
         this.lastChatRefresh.set(key, Date.now());
-        this.hooks.refetchChat?.(exactSid, serverId);
+        this.hooks.refetchChat?.(exactSid, serverId, exactSid != null);
       }
     }, 50);
     this.chatRefreshTimers.set(key, timer);
@@ -3022,7 +3048,7 @@ export class Engine {
       if (this.viewServerId !== serverId || this.reactionWriteSeq.get(key) !== seq) return;
       if (this.setOwnReaction(sid, emote, !add)) this.emit();
       this.hooks.toast('Не удалось сохранить реакцию — изменение отменено', 'warn');
-      this.hooks.refetchChat?.(sid);
+      this.hooks.refetchChat?.(sid, serverId, false); // обычное сообщение: одна сверка реакций, без ожидания release
     });
     let tracked: Promise<void>;
     tracked = run.finally(() => {
