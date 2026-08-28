@@ -2993,7 +2993,9 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
   const vidRef = useRef<HTMLVideoElement>(null);
   const [floats, setFloats] = useState<{ id: number; emoteId: string; by: string; x: number; size?: string }[]>([]);
   const [stats, setStats] = useState('');
-  const [statsOn, setStatsOn] = useState(true);
+  // Отладочный оверлей поверх видео: по умолчанию выключен. Он не нужен обычному зрителю, а как
+  // постоянный слой над видеокадром стоит композитору лишней работы на каждом кадре.
+  const [statsOn, setStatsOn] = useState(false);
   const [wOpen, setWOpen] = useState(false); // тач: «кто смотрит» по тапу
   const [treeOpen, setTreeOpen] = useState(false);
   const [qualOpen, setQualOpen] = useState(false); // Д4: меню качества

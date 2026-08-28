@@ -1654,7 +1654,14 @@ export class Engine {
       });
       const v = rtt ?? cand;
       let changed = false;
-      if (v != null && this.pingMs !== Math.round(v * 1000)) { this.pingMs = Math.round(v * 1000); changed = true; }
+      // Гистерезис: раньше ЛЮБОЕ изменение округлённого пинга поднимало флаг, а значит каждые 2.5с
+      // пересобирался весь снапшот и перерисовывался интерфейс ради колебания 41→42 мс. Показываем
+      // число всё равно приблизительно, поэтому будим подписчиков только на заметный сдвиг.
+      if (v != null) {
+        const next = Math.round(v * 1000);
+        if (this.pingMs == null || Math.abs(next - this.pingMs) >= 5) { this.pingMs = next; changed = true; }
+        else this.pingMs = next; // значение обновляем всегда, ре-рендер не заказываем
+      }
       // Качество читаем НАПРЯМУЮ из localParticipant.connectionQuality, а не ждём событие
       // ConnectionQualityChanged: оно приходит лишь при СМЕНЕ качества, поэтому при стабильной
       // связи с самого старта метка залипала на «соединение…» (unknown), хотя пинг уже шёл.

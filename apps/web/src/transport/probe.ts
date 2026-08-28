@@ -122,7 +122,24 @@ async function readAvailableOutgoing(pc: RTCPeerConnection): Promise<number | nu
  * Замер upload. Порядок: probe-start → offer(canvas-трек) → answer → ICE → 4с чтения BWE.
  * Медиана BWE последних 2с (кбит/с). Фолбэк на DataChannel-throughput, если BWE недоступен/ноль.
  */
+// Один замер на процесс. Замер поднимает canvas 720p и энкодит поток до 15 Мбит на 8-15 секунд —
+// параллельные копии (открыл вторую плитку грида, пере-watch после self-heal) множили эту нагрузку
+// ровно в тот момент, когда пользователь и так начинает смотреть видео. Неудачу тоже помним: без
+// этого каждый быстрый отказ (нет vrelay-агента, обрыв ws) запускал полный замер заново.
+let inflight: Promise<ProbeResult> | null = null;
+let lastFailureAt = 0;
+const FAILURE_COOLDOWN_MS = 10 * 60 * 1000;
+
 export async function measureUpload(opts?: { onPhase?: (p: string) => void }): Promise<ProbeResult> {
+  if (inflight) return inflight;
+  if (Date.now() - lastFailureAt < FAILURE_COOLDOWN_MS) throw new Error('probe: недавняя неудача, ждём');
+  const run = measureUploadOnce(opts);
+  inflight = run;
+  run.catch(() => { lastFailureAt = Date.now(); }).finally(() => { if (inflight === run) inflight = null; });
+  return run;
+}
+
+async function measureUploadOnce(opts?: { onPhase?: (p: string) => void }): Promise<ProbeResult> {
   const onPhase = opts?.onPhase || (() => {});
   const symmetricNat = await detectSymmetricNat().catch(() => false);
   onPhase('connect');

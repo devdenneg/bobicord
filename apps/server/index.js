@@ -610,7 +610,9 @@ async function pushToUsers(kind, userIds, payload) {
   // мобильном) → симптом «приходят не сразу». high → FCM high priority / APNs apns-priority:10.
   // TTL 1 день — переживёт короткий оффлайн (доставится при реконнекте устройства), но не копится
   // вечно. topic НЕ ставим: он схлопнул бы разные упоминания (два тега оффлайн → видно только последний).
-  const opts = { TTL: 86400, urgency: 'high' };
+  // timeout обязателен: без него web-push вешает запрос на дефолтный сокет-таймаут Node (его нет),
+  // и зависший push-endpoint держал бы сокет и промис неограниченно долго.
+  const opts = { TTL: 86400, urgency: 'high', timeout: 10000 };
   await Promise.all(rows.map(async (r) => {
     try { await VAPID.webpush.sendNotification({ endpoint: r.endpoint, keys: { p256dh: r.p256dh, auth: r.auth } }, body, opts); }
     catch (e) { if (e && (e.statusCode === 404 || e.statusCode === 410)) db.prepare('DELETE FROM push_subs WHERE endpoint=?').run(r.endpoint); }

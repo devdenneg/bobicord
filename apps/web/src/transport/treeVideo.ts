@@ -156,6 +156,7 @@ export class TreeVideoTransport implements VideoTransport {
   /** Прошлые кумулятивные jitterBufferDelay/Count по стриму — для дельты в getRtpStats. */
   private lastJb = new Map<string, { delay: number; count: number }>();
   private topologyByStream = new Map<string, TreeTopology>();
+  private reWatchAttempts = new Map<string, number>(); // неудачные круги переустановки просмотра подряд
   private topologyCbs = new Set<(streamId: string) => void>();
   private reparentDeniedCbs = new Set<(streamId: string, reason: string) => void>();
   private renditionUnavailableCbs = new Set<(streamId: string, rendition: string, reason: string) => void>();
@@ -210,6 +211,7 @@ export class TreeVideoTransport implements VideoTransport {
     this.videoFailsafe.clear();
     this.streamInfoByKey.clear();
     this.topologyByStream.clear();
+    this.reWatchAttempts.clear();
   }
 
   private openDiscovery() {
@@ -361,7 +363,13 @@ export class TreeVideoTransport implements VideoTransport {
     const nst = this.nativeWatches.get(streamId);
     if (nst) { this.nativeUnwatch(streamId, nst, keep); return; }
     const st = this.watches.get(streamId);
-    if (!st) return;
+    if (!st) {
+      // Записи уже нет (снёс teardownWatch при обрыве ws, а ре-watch не состоялся) — но диаг-сессия
+      // зрителя живёт отдельно и осталась бы висеть до закрытия вкладки вместе со своим тиком.
+      endViewerSession(streamId);
+      this.topologyByStream.delete(streamId);
+      return;
+    }
     // Сессия закрывается ЗДЕСЬ, а не в teardownWatch: тот зовётся и при обрыве ws с
     // последующим ре-watch — сдавали бы огрызок на каждый реконнект.
     endViewerSession(streamId);
@@ -371,6 +379,7 @@ export class TreeVideoTransport implements VideoTransport {
     if (st.pc) { try { st.pc.close(); } catch { /**/ } }
     this.watches.delete(streamId);
     this.treeInfoByStream.delete(streamId);
+    this.topologyByStream.delete(streamId); // как в nativeUnwatch: устаревшая топология правит jitter-буфер
     this.lastJb.delete(streamId);
     this.clearDropState(streamId);
     if (!keep) this.dropVideo(streamId);
@@ -379,6 +388,7 @@ export class TreeVideoTransport implements VideoTransport {
     if (st.pc) { try { st.pc.close(); } catch { /**/ } st.pc = null; }
     this.watches.delete(streamId);
     this.treeInfoByStream.delete(streamId);
+    if (!keepVideo) this.topologyByStream.delete(streamId);
     this.lastJb.delete(streamId);
     this.clearDropState(streamId);
     if (!keepVideo) this.dropVideo(streamId);
@@ -386,6 +396,7 @@ export class TreeVideoTransport implements VideoTransport {
   // Полный снос видео-стороны: плитка, контейнер, failsafe. Единственный путь удаления
   // контейнера — иначе застрявший failsafe/повторный teardown работают по мусору.
   private dropVideo(streamId: string) {
+    this.reWatchAttempts.delete(streamId);
     this.clearVideoFailsafe(streamId);
     this.containers.delete(streamId);
     this.delVideo(streamId);
@@ -677,9 +688,16 @@ export class TreeVideoTransport implements VideoTransport {
       const live = !this.closed && this.liveStreams.has(streamId);
       this.unwatch(streamId, { keepVideo: live });
       if (live) this.armVideoFailsafe(streamId);
+      // Бэкофф вместо фиксированных 1.5с. Если стрим на самом деле кончился, а запись в liveStreams
+      // залипла (полуоткрытый discovery-сокет), круг «watch → сразу ended → watch» повторялся бы
+      // бесконечно с постоянной частотой, каждый раз поднимая нативный watch-слот и сессию заново.
+      // Счётчик сбрасывается, как только приезжает трек, то есть успешный просмотр историю обнуляет.
+      const attempt = this.reWatchAttempts.get(streamId) || 0;
+      this.reWatchAttempts.set(streamId, attempt + 1);
+      const delay = Math.min(30_000, 1500 * 2 ** Math.min(attempt, 5));
       setTimeout(() => {
         if (!this.closed && this.intended.has(streamId) && this.liveStreams.has(streamId) && !this.nativeWatches.has(streamId) && !this.watches.has(streamId)) this.watch(streamId, st.quality, st.pinned);
-      }, 1500);
+      }, delay);
     };
     try {
       st.unlisten.push(await onNativeWatchOffer(offCb));
@@ -723,6 +741,7 @@ export class TreeVideoTransport implements VideoTransport {
     st.pc = pc;
     pc.onicecandidate = (e) => { if (e.candidate) nativeWatchIce(streamId, e.candidate).catch(() => {}); };
     pc.ontrack = (e) => {
+      this.reWatchAttempts.delete(streamId); // картинка пошла — прошлые неудачные круги не в счёт
       this.applyJitter(streamId);
       this.upsertTrack(streamId, e.track);
     };

@@ -14,12 +14,24 @@ type IdleListener = (idle: boolean) => void;
 
 const listeners = new Set<IdleListener>();
 let idle = false;
+let hidden = false;
 let started = false;
 
+// Два РАЗНЫХ состояния, их нельзя путать:
+//  data-idle   — на окно не смотрят (нет фокуса). Окно при этом может быть прекрасно видно: типовой
+//                случай — приложение на втором мониторе, пока человек играет. Здесь можно гасить
+//                декоративные анимации, но нельзя прятать содержимое и останавливать индикаторы.
+//  data-hidden — окно действительно не видно (свёрнуто, другой рабочий стол, вкладка в фоне). Здесь
+//                можно снимать с рендера и целые куски интерфейса.
 function sync(): void {
-  const next = compute();
-  if (next === idle) return;
-  idle = next;
+  const nextIdle = compute();
+  const nextHidden = (() => { try { return document.hidden; } catch { return false; } })();
+  if (nextHidden !== hidden) {
+    hidden = nextHidden;
+    document.documentElement.toggleAttribute('data-hidden', hidden);
+  }
+  if (nextIdle === idle) return;
+  idle = nextIdle;
   document.documentElement.toggleAttribute('data-idle', idle);
   listeners.forEach((cb) => { try { cb(idle); } catch { /* подписчик не должен ломать остальных */ } });
 }
@@ -52,6 +64,9 @@ export function startWindowIdleWatch(): void {
 }
 
 export function isWindowIdle(): boolean { return idle; }
+
+/** Окно действительно не видно (свёрнуто/скрыто), а не просто без фокуса. */
+export function isWindowHidden(): boolean { return hidden; }
 
 /** Подписка на смену состояния. Возвращает функцию отписки. */
 export function onWindowIdle(cb: IdleListener): () => void {
