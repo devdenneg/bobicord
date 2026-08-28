@@ -427,6 +427,16 @@ pub fn run() {
     .plugin(tauri_plugin_notification::init())
     .plugin(tauri_plugin_dialog::init())
     .plugin(tauri_plugin_fs::init())
+    // Полноэкранная игра НЕ сворачивает наше окно, поэтому document.hidden в webview остаётся false и
+    // visibilitychange не приходит вовсе: фронт продолжал крутить анимации и rAF-циклы, отбирая кадры
+    // у игры на переднем плане. Единственный надёжный сигнал в этой ситуации — потеря фокуса окна;
+    // на window.blur внутри WebView2 полагаться нельзя, поэтому сообщаем о нём явно.
+    .on_window_event(|window, event| {
+      if let tauri::WindowEvent::Focused(focused) = event {
+        use tauri::Emitter;
+        let _ = window.emit("relay-window-focus", *focused);
+      }
+    })
     .manage(BroadcastState(Mutex::new(None)))
     .manage(WatchState(Mutex::new(HashMap::new())))
     .setup(|app| {

@@ -565,11 +565,16 @@
   #grid.n3,#grid.n4{grid-template-columns:1fr 1fr}
   #grid.n3 .vwrap:first-child{grid-column:1 / -1}
   @media(max-width:640px){#grid.n2,#grid.n3,#grid.n4{grid-template-columns:1fr}#grid.n3 .vwrap:first-child{grid-column:auto}}
+  /* Слои поверх видео намеренно БЕЗ backdrop-filter. Размытие задника пересчитывается при каждом
+     изменении этого задника, а задник здесь — живой видеокадр: 30-60 пересчётов в секунду на каждый
+     такой слой, на каждой плитке грида. Фон у всех и так почти непрозрачный (alpha ≈ 0.8), то есть
+     блюра под ним практически не видно — платили за невидимое. Плавающий бар .vbar блюр сохраняет:
+     он появляется только по наведению, когда пользователь и так смотрит на плитку. */
   .vwrap{position:relative;background:#000;border-radius:var(--r-md);overflow:hidden;display:flex;border:1px solid var(--line-2);transition:opacity .15s,transform .15s}
   .vwrap.leaving{opacity:0;transform:scale(.96)}
   .vwrap video{width:100%;height:100%;object-fit:contain;background:#000;opacity:0;transition:opacity .22s ease-out}
   .vwrap video.ready{opacity:1}
-  .vwrap .lbl{position:absolute;left:56px;bottom:10px;background:#000c;backdrop-filter:blur(8px);padding:4px 10px;border-radius:8px;font-size:12.5px;font-weight:500;z-index:2;transition:opacity var(--tr)}
+  .vwrap .lbl{position:absolute;left:56px;bottom:10px;background:#000d;padding:4px 10px;border-radius:8px;font-size:12.5px;font-weight:500;z-index:2;transition:opacity var(--tr)}
   .vwrap:hover:not(.idle) .lbl,.vwrap:focus-within .lbl{opacity:0}
   /* hover control bar — центрированная плавающая пилюля (Discord-стиль), всплывает по наведению */
   .vbar{position:absolute;left:50%;bottom:14px;z-index:6;display:flex;align-items:center;gap:3px;padding:6px 8px;max-width:calc(100% - 24px);background:rgba(18,19,22,.72);backdrop-filter:blur(16px) saturate(1.4);-webkit-backdrop-filter:blur(16px) saturate(1.4);border:1px solid #ffffff20;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.5);opacity:0;transform:translate(-50%,10px) scale(.97);transform-origin:bottom center;transition:opacity .16s ease,transform .16s ease;pointer-events:none}
@@ -585,7 +590,7 @@
   .vbar .vb-btn:active{transform:scale(.92)}
   .vbar .vb-btn.active{background:var(--accent);color:#fff}
   .vbar .vb-btn.danger:hover{background:var(--red-fill)}
-  .vwrap .watchers{position:absolute;top:10px;left:10px;display:flex;align-items:center;background:#000b;backdrop-filter:blur(8px);padding:4px 11px 4px 8px;border-radius:9999px;font-size:12px;z-index:7;cursor:default}
+  .vwrap .watchers{position:absolute;top:10px;left:10px;display:flex;align-items:center;background:#000d;padding:4px 11px 4px 8px;border-radius:9999px;font-size:12px;z-index:7;cursor:default}
   .vwrap .watchers .wa{width:22px;height:22px;border-radius:50%;overflow:hidden;font-size:10.5px;font-weight:700;color:#fff;display:flex;align-items:center;justify-content:center;border:2px solid #050505;margin-right:-7px}
   .vwrap .watchers .wc{margin-left:12px;color:#fff;font-weight:600;display:flex;align-items:center;gap:4px}
   .vwrap .watchers .wc .ic{font-size:14px}
@@ -594,7 +599,7 @@
   .vwrap .watchers .wtip-h{font-size:10.5px;font-weight:700;letter-spacing:.3px;text-transform:uppercase;color:var(--muted);padding:2px 4px 6px}
   .vwrap .watchers .wtip-row{display:flex;align-items:center;gap:7px;padding:3px 4px;font-size:12.5px;color:var(--txt);white-space:nowrap}
   .vwrap .watchers .wtip-av{width:20px;height:20px;border-radius:50%;overflow:hidden;font-size:9.5px;font-weight:700;color:#fff;display:flex;align-items:center;justify-content:center;flex:0 0 auto}
-  .vwrap .spray{position:absolute;left:10px;bottom:10px;background:#000b;backdrop-filter:blur(8px);width:36px;height:36px;border-radius:9px;display:flex;align-items:center;justify-content:center;padding:0;z-index:8;color:#fff}
+  .vwrap .spray{position:absolute;left:10px;bottom:10px;background:#000d;width:36px;height:36px;border-radius:9px;display:flex;align-items:center;justify-content:center;padding:0;z-index:8;color:#fff}
   .vwrap .spray:hover{background:var(--accent)}
   .emolayer{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:3}
   .floatEmo{position:absolute;bottom:6%;width:54px;height:54px;animation:floatUp 2.7s cubic-bezier(.2,.6,.3,1) forwards;will-change:transform,opacity}
@@ -603,10 +608,10 @@
   @media (prefers-reduced-motion:reduce){.floatEmo{animation:none;opacity:.9}}
   .floatEmo .ftag{position:absolute;top:100%;left:50%;transform:translateX(-50%);margin-top:3px;font-size:10.5px;font-weight:600;background:#000b;color:#fff;padding:1px 6px;border-radius:6px;white-space:nowrap}
   .vwrap .statsbox{position:absolute;top:10px;right:10px;z-index:7;display:flex;align-items:center;gap:6px}
-  .vwrap .stats-toggle{background:#000b;backdrop-filter:blur(8px);width:30px;height:30px;flex:0 0 auto;border-radius:9px;display:flex;align-items:center;justify-content:center;padding:0;color:#fff;transition:background var(--tr)}
+  .vwrap .stats-toggle{background:#000d;width:30px;height:30px;flex:0 0 auto;border-radius:9px;display:flex;align-items:center;justify-content:center;padding:0;color:#fff;transition:background var(--tr)}
   .vwrap .stats-toggle:hover{background:var(--accent)}
-  .vwrap .stats{background:#05070bcc;backdrop-filter:blur(8px);color:#8fe3b0;font:11.5px/1.5 ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums;padding:7px 10px;border-radius:9px;border:1px solid var(--line-2);pointer-events:none;white-space:nowrap;text-align:right}
-  #stageMin{position:absolute;top:12px;left:50%;transform:translateX(-50%);z-index:7;background:#05070bd9;backdrop-filter:blur(8px);border:1px solid var(--line-2);border-radius:9px;font-size:12.5px;padding:7px 12px;display:flex;align-items:center;gap:6px;opacity:.5;transition:opacity var(--tr)}
+  .vwrap .stats{background:#05070bf0;color:#8fe3b0;font:11.5px/1.5 ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums;padding:7px 10px;border-radius:9px;border:1px solid var(--line-2);pointer-events:none;white-space:nowrap;text-align:right}
+  #stageMin{position:absolute;top:12px;left:50%;transform:translateX(-50%);z-index:7;background:#05070bf0;border:1px solid var(--line-2);border-radius:9px;font-size:12.5px;padding:7px 12px;display:flex;align-items:center;gap:6px;opacity:.5;transition:opacity var(--tr)}
   #stage:hover #stageMin,#stage:focus-within #stageMin{opacity:1}
   #mini{position:fixed;right:16px;bottom:16px;width:300px;z-index:25;display:none;flex-direction:column;gap:8px}
   #mini.show{display:flex}
