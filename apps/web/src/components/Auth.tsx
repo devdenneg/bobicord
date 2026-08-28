@@ -519,7 +519,7 @@ export function Auth() {
     <main id="auth" className="overlay auth-overlay">
       <section className="card auth-card" aria-labelledby="auth-title" aria-busy={busy || undefined}>
         <div className="brand auth-brand" aria-label="Рилэй">
-          <LogoLoader size={56} speedMs={8000} />
+          <LogoLoader size={56} animate={false} />
           <div><span className="wordmark">Рилэй</span><small>Голос, чат и трансляции для своих</small></div>
         </div>
 

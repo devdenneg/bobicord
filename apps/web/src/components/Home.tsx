@@ -181,7 +181,7 @@ export function Home() {
 
   const header = (
     <header className="nh-hd">
-      <div className="nh-brand"><LogoLoader size={36} speedMs={8000} /><span>Рилэй</span></div>
+      <div className="nh-brand"><LogoLoader size={36} animate={false} /><span>Рилэй</span></div>
       <div className={'nh-online' + (totalOnline ? ' live' : '')} aria-live="polite"><i className="nh-dot" />{totalOnline ? `${totalOnline} онлайн` : 'готов к связи'}</div>
       <div className="nh-actions">
         <button className="nh-btn primary" aria-label="Создать сервер" onClick={() => setModal('create')}><Icon name="plus" sm /><span>Создать</span></button>

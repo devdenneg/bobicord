@@ -49,9 +49,14 @@ function palette(t: number) {
   return 'rgb(84,214,255)';
 }
 
-/** Анимированный лоадер-логотип: «P» с потоковым градиентом и тремя огоньками, едущими по букве.
- *  size — размер в CSS-px; speedMs — длительность полного обхода контура (больше = медленнее/спокойнее). */
-export function LogoLoader({ size = 180, speedMs = 3000 }: { size?: number; speedMs?: number }) {
+/** Логотип «P» с потоковым градиентом и тремя огоньками, едущими по букве.
+ *  size — размер в CSS-px; speedMs — длительность полного обхода контура (больше = медленнее/спокойнее).
+ *  animate=false рисует ОДИН кадр и не заводит цикл — для мест, где логотип просто висит на экране как
+ *  элемент оформления. Один кадр стоит ~700 команд рисования (посегментные градиенты потока, радиальные
+ *  градиенты комет, полноэкранный blur через ctx.filter, два композита 'lighter'); пока это лоадер,
+ *  который живёт секунды, цена приемлема, а в постоянной шапке она превращается в непрерывные 60 к/с
+ *  и заметно греет GPU — ровно на это жаловались пользователи, играющие с открытым приложением. */
+export function LogoLoader({ size = 180, speedMs = 3000, animate = true }: { size?: number; speedMs?: number; animate?: boolean }) {
   const ref = useRef<HTMLCanvasElement>(null);
   useEffect(() => {
     const cv = ref.current; if (!cv) return;
@@ -132,18 +137,19 @@ export function LogoLoader({ size = 180, speedMs = 3000 }: { size?: number; spee
         ctx.globalCompositeOperation = 'source-over';
         ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(p[0], p[1], 6.5, 0, 7); ctx.fill();
       }
-      raf = requestAnimationFrame(frame);
+      if (animate) raf = requestAnimationFrame(frame);
     };
     // Кадр этой анимации стоит ~700 команд рисования (посегментные градиенты потока, радиальные
     // градиенты комет, полноэкранный blur через ctx.filter и два композита 'lighter'). Пока окно не
     // видно, всё это считается впустую и отбирает кадры у игры на переднем плане, поэтому цикл
     // останавливаем и поднимаем обратно при возврате, сбросив t0 — иначе анимация прыгнет вперёд на
     // всё время простоя.
+    if (!animate) { frame(0); return; } // один кадр, без цикла и без подписок
     const stop = () => { if (raf) { cancelAnimationFrame(raf); raf = 0; } };
     const resume = () => { if (!raf) { t0 = null; raf = requestAnimationFrame(frame); } };
     if (!isWindowIdle()) resume();
     const unsubscribe = onWindowIdle((idle) => (idle ? stop() : resume()));
     return () => { unsubscribe(); stop(); };
-  }, [size, speedMs]);
-  return <canvas ref={ref} style={{ width: size, height: size, display: 'block' }} aria-label="Загрузка" role="img" />;
+  }, [size, speedMs, animate]);
+  return <canvas ref={ref} style={{ width: size, height: size, display: 'block' }} aria-label={animate ? 'Загрузка' : 'Рилэй'} role="img" />;
 }
