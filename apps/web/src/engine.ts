@@ -750,6 +750,11 @@ export class Engine {
       this.subscriptionRetries.clear();
       this.voiceOutputRoom = null; this.voiceOutputSink = ''; this.voiceOutputPending = null;
       void this.stopMic(room);
+      // Терминальный обрыв LiveKit не проходит через leaveVoice(), поэтому нативный
+      // broadcaster иначе продолжал бы жить после потери голосовой комнаты.
+      // Остановка локальной трансляции не отзывает аккаунтную сессию и не влияет на
+      // просмотр других серверов.
+      this.hooks.endBroadcast?.();
       room.remoteParticipants.forEach((p) => {
         const pub = p.getTrackPublication(Track.Source.Microphone);
         if (pub) { try { (pub as any).setSubscribed(false); } catch { /**/ } }
