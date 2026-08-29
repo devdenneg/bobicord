@@ -13,6 +13,8 @@
     "test:voice-lease": "node voice-lease-test.js",
     "test:tree-ws-error": "node tree-ws-error-test.js",
     "test:tree-auth": "node --test tree-auth-test.js",
+    "test:seventv-proxy": "node --test seventv-proxy-test.js",
+    "test:diag-store": "node --test diagStore-test.js",
     "test:uploads-gc": "node uploads-gc-test.js"
   },
   "dependencies": {

@@ -10,7 +10,14 @@ const { WebSocketServer } = require('ws');
 const { attachTreeServer } = require('./tree');
 const { createVoiceLeaseStore, voiceLeaseEvent, selectVoiceState } = require('./voiceLease');
 const { installRuntimeRevocationSchema } = require('./runtimeRevocation');
-const { planUploadSweep, uploadUrlsOfMessageRows, normalizeUploadRef, UPLOAD_REF_RE } = require('./uploadsGc'); // квоты и уборка пользовательских файлов
+const { planUploadSweep, uploadUrlsOfMessageRows, normalizeUploadRef, uploadRefsInText, isOwnedUploadRow } = require('./uploadsGc'); // квоты, владение и уборка пользовательских файлов
+const {
+  createDiagRateLimiter, createDiagStore, sanitizeDiagLines, sanitizeDiagSamples,
+} = require('./diagStore');
+const {
+  BoundedTtlCache, createFixedWindowLimiter, fetchSeventvCdn,
+  normalizeGlobalPayload, normalizeSearchPayload, readResponseLimited,
+} = require('./seventvProxy');
 const {
   installReleaseSchema, listReleaseHistory, parseReleaseMeta, prepareRelease, finalizeRelease,
 } = require('./releaseNotes');
@@ -146,6 +153,8 @@ const SEVENTV_DIR = path.join(DATA_DIR, '7tv');
 const SEVENTV_MAX_FILES = 20000;
 const SEVENTV_MAX_TOTAL_BYTES = 500 * 1024 * 1024; // ~500 МБ
 const SEVENTV_MAX_UPSTREAM = 2 * 1024 * 1024; // отсечка патологически крупной анимации (защита egress VPS)
+const SEVENTV_MAX_GLOBAL_JSON = 4 * 1024 * 1024;
+const SEVENTV_MAX_SEARCH_JSON = 512 * 1024;
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
 try { fs.mkdirSync(UPLOADS_DIR, { recursive: true }); } catch (e) {}
 try { fs.mkdirSync(RELEASES_DIR, { recursive: true }); } catch (e) {}
@@ -1576,23 +1585,14 @@ app.post('/api/servers/:id/stream-start', requireAuth, async (req, res) => {
 
 /* ---------------- диагностика стрима ---------------- */
 
-// Удаляет самые старые сессии, пока каталог не влезет в капы. Вызывается после каждой
-// записи: клиентов много, а диск на VPS общий с БД и загрузками — переполнение здесь
-// уронило бы всё остальное.
-function pruneDiag() {
-  let files;
-  try {
-    files = fs.readdirSync(DIAG_DIR)
-      .filter((n) => n.endsWith('.json'))
-      .map((n) => { const p = path.join(DIAG_DIR, n); const st = fs.statSync(p); return { p, size: st.size, mtime: st.mtimeMs }; })
-      .sort((a, b) => a.mtime - b.mtime); // старые первыми
-  } catch (e) { return; }
-  let total = files.reduce((s, f) => s + f.size, 0);
-  while (files.length && (files.length > DIAG_MAX_FILES || total > DIAG_MAX_TOTAL_BYTES)) {
-    const f = files.shift();
-    try { fs.unlinkSync(f.p); total -= f.size; } catch (e) { /* уже удалён */ }
-  }
-}
+// Запись и prune идут через async FS и одну очередь: большая диагностика больше не
+// останавливает HTTP/WebSocket event loop, а параллельные POST не обходят дисковые квоты.
+const diagStore = createDiagStore({
+  dir: DIAG_DIR,
+  maxFiles: DIAG_MAX_FILES,
+  maxTotalBytes: DIAG_MAX_TOTAL_BYTES,
+});
+const diagRateLimiter = createDiagRateLimiter();
 
 const DIAG_ROLES = new Set(['broadcaster', 'viewer']);
 const DIAG_CLIENTS = new Set(['native', 'web']);
@@ -1625,7 +1625,7 @@ function sanitizeDiagEnv(raw) {
   return Object.keys(out).length ? out : null;
 }
 
-app.post('/api/diag/session', requireAuth, (req, res) => {
+app.post('/api/diag/session', requireAuth, async (req, res) => {
   const b = req.body || {};
   const role = String(b.role || '');
   const client = String(b.client || '');
@@ -1633,29 +1633,50 @@ app.post('/api/diag/session', requireAuth, (req, res) => {
   const streamId = SAFE_ID(b.streamId);
   if (!streamId) return res.status(400).json({ error: 'bad streamId' });
 
-  const lines = Array.isArray(b.lines) ? b.lines.slice(-20000).map((l) => String(l).slice(0, 2000)) : [];
-  const samples = Array.isArray(b.samples) ? b.samples.slice(-2000) : [];
+  const rate = diagRateLimiter.consume(req.user.id);
+  if (!rate.allowed) {
+    res.setHeader('Retry-After', String(Math.max(1, Math.ceil(rate.retryAfterMs / 1000))));
+    return res.status(429).json({ error: 'Слишком много диагностических отчётов' });
+  }
+
+  const lines = sanitizeDiagLines(b.lines);
+  const samples = sanitizeDiagSamples(b.samples);
   const env = sanitizeDiagEnv(b.env);
+  const now = Date.now();
+  const rawEndedAt = Number(b.endedAt);
+  const endedAt = Number.isSafeInteger(rawEndedAt) && Math.abs(rawEndedAt - now) <= 30 * 24 * 60 * 60_000
+    ? rawEndedAt : now;
+  const rawStartedAt = Number(b.startedAt);
+  const startedAt = Number.isSafeInteger(rawStartedAt) && rawStartedAt > 0 && rawStartedAt <= endedAt
+    && endedAt - rawStartedAt <= 30 * 24 * 60 * 60_000 ? rawStartedAt : null;
+  const inputLines = Array.isArray(b.lines) ? b.lines.length : 0;
+  const inputSamples = Array.isArray(b.samples) ? b.samples.length : 0;
   const payload = {
     streamId, role, client,
     userId: req.user.id,
     username: req.user.username,
-    startedAt: Number(b.startedAt) || null,
-    endedAt: Number(b.endedAt) || Date.now(),
+    startedAt,
+    endedAt,
     appVersion: String(b.appVersion || '').slice(0, 32),
     userAgent: String(req.headers['user-agent'] || '').slice(0, 200),
     env,
     lines, samples,
   };
-  const name = `${payload.endedAt}-${streamId}-${role}-${SAFE_ID(req.user.username)}.json`;
+  if (b.truncated || lines.length < inputLines || samples.length < inputSamples) payload.truncated = true;
   try {
-    fs.writeFileSync(path.join(DIAG_DIR, name), JSON.stringify(payload));
-    pruneDiag();
+    const { name } = await diagStore.save({
+      userId: req.user.id,
+      username: req.user.username,
+      streamId,
+      role,
+      endedAt,
+      payload,
+    });
+    return res.json({ ok: true, name });
   } catch (e) {
     console.error('[diag] write:', e && e.message);
     return res.status(500).json({ error: 'write failed' });
   }
-  res.json({ ok: true, name });
 });
 
 // Разбор жалоб: список сессий (новые первыми) и выгрузка одной. Только админ —
@@ -1685,10 +1706,12 @@ app.patch('/api/me', requireAuth, (req, res) => {
   const dn = req.body.displayName != null ? String(req.body.displayName).trim().slice(0, 32) : null;
   const bio = req.body.bio != null ? String(req.body.bio).slice(0, 200) : null;
   const ac = req.body.avatarColor != null ? (parseInt(req.body.avatarColor, 10) % 8 + 8) % 8 : null;
+  const previousAvatar = String(db.prepare('SELECT avatar_url FROM users WHERE id=?').get(req.user.id)?.avatar_url || '');
   let au = null;
   if (req.body.avatarUrl != null) {
     const v = String(req.body.avatarUrl);
-    if (v === '' || UPLOAD_RE.test(v)) au = v; else return res.status(400).json({ error: 'Неверный аватар' });
+    if (v === '' || v === previousAvatar || (UPLOAD_RE.test(v) && ownsActiveUpload(req.user.id, v, 'image'))) au = v;
+    else return res.status(400).json({ error: 'Аватар нужно загрузить из своего аккаунта' });
   }
   let pbu = null;
   let previousProfileBanner = '';
@@ -1698,13 +1721,14 @@ app.patch('/api/me', requireAuth, (req, res) => {
     if (!(v === '' || UPLOAD_RE.test(v))) return res.status(400).json({ error: 'Неверный фон профиля' });
     if (UPLOAD_RE.test(v) && v !== previousProfileBanner) {
       const tracked = db.prepare('SELECT user_id FROM profile_banner_uploads WHERE url=?').get(v);
-      if (!tracked || tracked.user_id !== req.user.id) return res.status(400).json({ error: 'Фон нужно загрузить через редактор профиля' });
+      if (!tracked || tracked.user_id !== req.user.id || !ownsActiveUpload(req.user.id, v, 'banner')) return res.status(400).json({ error: 'Фон нужно загрузить через редактор профиля' });
     }
     pbu = v;
   }
   if (dn !== null && dn.length < 1) return res.status(400).json({ error: 'Имя не может быть пустым' });
   db.prepare('UPDATE users SET display_name=COALESCE(?,display_name), bio=COALESCE(?,bio), avatar_color=COALESCE(?,avatar_color), avatar_url=COALESCE(?,avatar_url), profile_banner_url=COALESCE(?,profile_banner_url) WHERE id=?')
     .run(dn, bio, ac, au, pbu, req.user.id);
+  if (au !== null && previousAvatar && previousAvatar !== au && ownsActiveUpload(req.user.id, previousAvatar, 'image')) queueUploadRelease([previousAvatar]);
   if (pbu !== null && previousProfileBanner && previousProfileBanner !== pbu) deleteOwnedProfileBannerIfUnused(req.user.id, previousProfileBanner);
   const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
   res.json({ user: ownUser(u) });
@@ -1879,9 +1903,10 @@ function saveImageUpload(req, res, profileBanner = false) {
   try {
     fs.writeFileSync(path.join(UPLOADS_DIR, name), req.body, { flag: 'wx' });
     if (profileBanner) db.prepare('INSERT INTO profile_banner_uploads(url,user_id,size,created) VALUES(?,?,?,?)').run(url, req.user.id, req.body.length, Date.now());
-    recordUpload(url, req.user.id, profileBanner ? 'banner' : 'image', req.body.length);
+    if (!recordUpload(url, req.user.id, profileBanner ? 'banner' : 'image', req.body.length)) throw new Error('upload ledger unavailable');
   } catch (e) {
     try { fs.unlinkSync(path.join(UPLOADS_DIR, name)); } catch (_) { /**/ }
+    if (profileBanner) { try { db.prepare('DELETE FROM profile_banner_uploads WHERE url=?').run(url); } catch (_) { /**/ } }
     return res.status(500).json({ error: 'Не удалось сохранить файл' });
   }
   res.json({ url, width: info.width, height: info.height });
@@ -1915,7 +1940,7 @@ function pruneSeventv() {
   let files;
   try {
     files = fs.readdirSync(SEVENTV_DIR)
-      .filter((n) => n.endsWith('.webp'))
+      .filter((n) => n.endsWith('.webp') || n.endsWith('.tmp'))
       .map((n) => { const p = path.join(SEVENTV_DIR, n); const st = fs.statSync(p); return { p, size: st.size, mtime: st.mtimeMs }; })
       .sort((a, b) => a.mtime - b.mtime); // старые первыми
   } catch (e) { return; }
@@ -1926,35 +1951,73 @@ function pruneSeventv() {
   }
 }
 
+// Полный stat+sort каталога на 20k файлов нельзя делать после КАЖДОЙ картинки: публичный miss тогда
+// превращает cache housekeeping в синхронный event-loop DoS. Склеиваем burst и запускаем не чаще
+// раза в минуту; inflight/rate/body caps ограничивают возможный overshoot между проходами.
+let _7tvPruneTimer = null;
+let _7tvLastPruneAt = 0;
+function scheduleSeventvPrune() {
+  if (_7tvPruneTimer) return;
+  const delay = Math.max(1000, 60_000 - (Date.now() - _7tvLastPruneAt));
+  _7tvPruneTimer = setTimeout(() => {
+    _7tvPruneTimer = null;
+    pruneSeventv();
+    _7tvLastPruneAt = Date.now();
+  }, delay);
+  _7tvPruneTimer.unref?.();
+}
+pruneSeventv();
+_7tvLastPruneAt = Date.now();
+
 // single-flight по ключу кэша: N зрителей одного эмоута → 1 запрос наружу (против thundering herd
 // при одновременной загрузке заблокированных клиентов). Плюс мягкий cap distinct-фетчей — бэкпрешур,
 // чтобы зависший upstream не копил сокеты в ТОМ ЖЕ процессе, что и tree-WS сигналинг дерева.
 const _7tvInflight = new Map();
 const SEVENTV_MAX_INFLIGHT = 48;
+const _7tvNegative = new BoundedTtlCache(5000, 30_000);
+const allowSeventvImageMiss = createFixedWindowLimiter({ limit: 240, windowMs: 60_000, maxKeys: 20_000 });
+const allowSeventvGlobalImageMiss = createFixedWindowLimiter({ limit: 600, windowMs: 60_000, maxKeys: 1 });
 async function fetchSeventvEmote(id, file, dest) {
   const key = id + '_' + file;
   const existing = _7tvInflight.get(key);
   if (existing) return existing;
+  if (_7tvNegative.get(key)) return null;
   if (_7tvInflight.size >= SEVENTV_MAX_INFLIGHT) return null; // бэкпрешур
+  if (!allowSeventvGlobalImageMiss('all')) return null;
   const p = (async () => {
-    // Хост ЗАХАРДКОЖЕН, id/file уже провалидированы — только конкатенация, никогда new URL(userInput).
-    // redirect:'follow' обязателен — легаси Mongo ObjectId (24 симв. из старых сообщений) отдаёт 308→ULID.
-    const r = await fetch(`https://cdn.7tv.app/emote/${id}/${file}`, { signal: AbortSignal.timeout(6000), redirect: 'follow' });
-    if (r.status !== 200) return null; // 404/редирект-петля/5xx — не кэшируем
-    if (!String(r.headers.get('content-type') || '').startsWith('image/')) return null; // HTML-заглушка провайдера с 200 → не отравляем immutable-кэш
-    const ab = await r.arrayBuffer();
-    if (ab.byteLength === 0 || ab.byteLength > SEVENTV_MAX_UPSTREAM) return null;
-    const buf = Buffer.from(ab);
+    // Хост и КАЖДЫЙ redirect фиксированы helper-ом. Легаси Mongo ObjectId всё ещё может сделать
+    // штатный 308→ULID, но Location на private/произвольный host отклоняется до второго запроса.
+    const r = await fetchSeventvCdn(`https://cdn.7tv.app/emote/${id}/${file}`, { signal: AbortSignal.timeout(6000) });
+    if (r.status !== 200) {
+      _7tvNegative.set(key, true, r.status === 404 ? 5 * 60_000 : 15_000);
+      try { await r.body?.cancel(); } catch (e) { /**/ }
+      return null;
+    }
+    const mime = String(r.headers.get('content-type') || '').split(';', 1)[0].trim().toLowerCase();
+    if (mime !== 'image/webp') {
+      _7tvNegative.set(key, true, 60_000);
+      try { await r.body?.cancel(); } catch (e) { /**/ }
+      return null; // HTML/SVG/другой тип не отравляет immutable webp-кэш
+    }
+    const buf = await readResponseLimited(r, SEVENTV_MAX_UPSTREAM);
+    if (buf.length === 0) { _7tvNegative.set(key, true, 60_000); return null; }
     // персист best-effort (клиент получит буфер в любом случае): атомарно tmp+rename — усечённый
     // при обрыве не раздастся как immutable 30д.
+    let tmp = '';
     try {
-      const tmp = dest + '.' + crypto.randomBytes(6).toString('hex') + '.tmp';
+      tmp = dest + '.' + crypto.randomBytes(6).toString('hex') + '.tmp';
       fs.writeFileSync(tmp, buf);
       fs.renameSync(tmp, dest);
-      pruneSeventv();
+      tmp = '';
+      scheduleSeventvPrune();
     } catch (e) { console.error('[7tv] cache write:', e && e.message); }
+    finally { if (tmp) { try { fs.unlinkSync(tmp); } catch (e) { /**/ } } }
     return buf;
-  })().catch((e) => { console.error('[7tv] upstream:', e && e.message); return null; }).finally(() => _7tvInflight.delete(key));
+  })().catch((e) => {
+    _7tvNegative.set(key, true, 15_000);
+    console.error('[7tv] upstream:', e && e.message);
+    return null;
+  }).finally(() => _7tvInflight.delete(key));
   _7tvInflight.set(key, p);
   return p;
 }
@@ -1973,6 +2036,10 @@ app.get('/api/7tv/emote/:id/:file', async (req, res) => {
       // заголовки задаём через опции sendFile — иначе send затрёт Cache-Control дефолтным max-age=0.
       return res.sendFile(dest, { maxAge: '30d', immutable: true, headers: { 'Content-Type': 'image/webp', 'X-Content-Type-Options': 'nosniff' } }, (err) => { if (err && !res.headersSent) res.sendStatus(500); });
     }
+    if (!allowSeventvImageMiss(req.ip)) {
+      res.setHeader('Retry-After', '60');
+      return res.sendStatus(429);
+    }
     const buf = await fetchSeventvEmote(id, file, dest);
     if (!buf) return res.sendStatus(502);
     res.setHeader('Cache-Control', 'public, max-age=2592000, immutable');
@@ -1988,25 +2055,42 @@ app.get('/api/7tv/emote/:id/:file', async (req, res) => {
 // Глобальный сет (name→id). Публичный намеренно: loadGlobalEmotes зовётся ДО логина. Абьюз
 // ограничен — это один кэш-блоб (апстрим дёргается максимум раз в TTL). Паттерн getDetectableGames:
 // TTL 1ч + диск-персист + serve-stale-on-error + single-flight.
-let _7tvGlobal = null, _7tvGlobalAt = 0, _7tvGlobalInflight = null;
+let _7tvGlobal = null, _7tvGlobalAt = 0, _7tvGlobalInflight = null, _7tvGlobalRetryAt = 0;
 const _7TV_GLOBAL_FILE = path.join(SEVENTV_DIR, 'global.json');
 function getSeventvGlobal() {
   const now = Date.now();
-  if (_7tvGlobal && now - _7tvGlobalAt < 3600 * 1000) return Promise.resolve(_7tvGlobal);
+  if (_7tvGlobal && (now - _7tvGlobalAt < 3600 * 1000 || now < _7tvGlobalRetryAt)) return Promise.resolve(_7tvGlobal);
   if (_7tvGlobalInflight) return _7tvGlobalInflight;
+  if (!_7tvGlobal && now < _7tvGlobalRetryAt) return Promise.resolve(null);
   _7tvGlobalInflight = (async () => {
     try {
-      const r = await fetch('https://7tv.io/v3/emote-sets/global', { signal: AbortSignal.timeout(10000) });
-      const d = await r.json();
-      if (d && Array.isArray(d.emotes)) {
-        _7tvGlobal = d; _7tvGlobalAt = now;
-        try { fs.writeFileSync(_7TV_GLOBAL_FILE, JSON.stringify(d)); } catch (e) {}
+      const r = await fetch('https://7tv.io/v3/emote-sets/global', { signal: AbortSignal.timeout(10000), redirect: 'error' });
+      if (r.status !== 200) { try { await r.body?.cancel(); } catch (e) { /**/ } throw new Error(`global status ${r.status}`); }
+      const d = normalizeGlobalPayload(JSON.parse((await readResponseLimited(r, SEVENTV_MAX_GLOBAL_JSON)).toString('utf8')));
+      if (d) {
+        _7tvGlobal = d; _7tvGlobalAt = now; _7tvGlobalRetryAt = 0;
+        let tmp = '';
+        try {
+          tmp = _7TV_GLOBAL_FILE + '.' + crypto.randomBytes(6).toString('hex') + '.tmp';
+          fs.writeFileSync(tmp, JSON.stringify(d));
+          fs.renameSync(tmp, _7TV_GLOBAL_FILE);
+          tmp = '';
+        } catch (e) { /** memory cache remains usable */ }
+        finally { if (tmp) { try { fs.unlinkSync(tmp); } catch (e) { /**/ } } }
         return d;
       }
+      _7tvGlobalRetryAt = Date.now() + 30_000;
       return _7tvGlobal; // мусорный ответ — держим прежнюю копию, если была
     } catch (e) {
-      if (_7tvGlobal) return _7tvGlobal; // serve-stale из памяти
-      try { _7tvGlobal = JSON.parse(fs.readFileSync(_7TV_GLOBAL_FILE, 'utf8')); _7tvGlobalAt = now; return _7tvGlobal; } catch (e2) { return null; }
+      if (_7tvGlobal) { _7tvGlobalRetryAt = Date.now() + 30_000; return _7tvGlobal; } // serve-stale + backoff
+      try {
+        const st = fs.statSync(_7TV_GLOBAL_FILE);
+        if (st.size <= 0 || st.size > SEVENTV_MAX_GLOBAL_JSON) throw new Error('global disk cache too large');
+        _7tvGlobal = normalizeGlobalPayload(JSON.parse(fs.readFileSync(_7TV_GLOBAL_FILE, 'utf8')));
+        if (!_7tvGlobal) throw new Error('invalid global disk cache');
+        _7tvGlobalAt = now;
+        return _7tvGlobal;
+      } catch (e2) { _7tvGlobalRetryAt = Date.now() + 30_000; return null; }
     } finally { _7tvGlobalInflight = null; }
   })();
   return _7tvGlobalInflight;
@@ -2022,9 +2106,23 @@ app.get('/api/7tv/global', async (req, res) => {
 
 // Поиск эмоутов. Под auth (пикер открывается после логина). GQL-строка ЗАХАРДКОЖЕНА на сервере
 // (не форвардим клиентский body → нет инъекции); q/p валидируются и капаются.
+const _7tvSearchCache = new BoundedTtlCache(512, 60_000);
+const allowSeventvSearch = createFixedWindowLimiter({ limit: 60, windowMs: 60_000, maxKeys: 20_000 });
+const allowSeventvGlobalSearch = createFixedWindowLimiter({ limit: 300, windowMs: 60_000, maxKeys: 1 });
 app.get('/api/7tv/search', requireAuth, async (req, res) => {
   const q = String(req.query.q || '').trim().slice(0, 64);
   const p = Math.min(20, Math.max(1, parseInt(req.query.p, 10) || 1));
+  const cacheKey = `${q.toLocaleLowerCase()}\u0000${p}`;
+  const cached = _7tvSearchCache.get(cacheKey);
+  if (cached !== undefined) return res.json({ items: cached });
+  if (!allowSeventvSearch(`${req.user.id}|${req.ip}`)) {
+    res.setHeader('Retry-After', '60');
+    return res.status(429).json({ error: 'Слишком много запросов к поиску эмоутов' });
+  }
+  if (!allowSeventvGlobalSearch('all')) {
+    res.setHeader('Retry-After', '60');
+    return res.status(429).json({ error: 'Поиск эмоутов временно перегружен' });
+  }
   try {
     const body = {
       query: 'query($q:String!,$p:Int){emotes(query:$q,page:$p,limit:100,sort:{value:"popularity",order:DESCENDING}){items{id name}}}',
@@ -2032,9 +2130,13 @@ app.get('/api/7tv/search', requireAuth, async (req, res) => {
     };
     const r = await fetch('https://7tv.io/v3/gql', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(8000),
+      redirect: 'error',
     });
-    const d = await r.json();
-    const items = ((d.data && d.data.emotes && d.data.emotes.items) || []).map((e) => ({ id: e.id, name: e.name }));
+    if (r.status !== 200) { try { await r.body?.cancel(); } catch (e) { /**/ } throw new Error(`search status ${r.status}`); }
+    const d = JSON.parse((await readResponseLimited(r, SEVENTV_MAX_SEARCH_JSON)).toString('utf8'));
+    const items = normalizeSearchPayload(d);
+    if (!items) throw new Error('invalid search response');
+    _7tvSearchCache.set(cacheKey, items);
     res.json({ items });
   } catch (e) { if (!res.headersSent) res.sendStatus(502); }
 });
@@ -2060,7 +2162,10 @@ app.post('/api/upload-file', requireAuth, express.raw({ type: () => true, limit:
   const url = '/api/files/' + name;
   try { fs.writeFileSync(path.join(FILES_DIR, name), req.body, { flag: 'wx' }); }
   catch (e) { return res.status(500).json({ error: 'Не удалось сохранить файл' }); }
-  recordUpload(url, req.user.id, 'file', req.body.length);
+  if (!recordUpload(url, req.user.id, 'file', req.body.length)) {
+    try { fs.unlinkSync(path.join(FILES_DIR, name)); } catch (_) { /**/ }
+    return res.status(500).json({ error: 'Не удалось сохранить файл' });
+  }
   res.json({ url, name: origName, size: req.body.length });
 });
 /* ---------------- КВОТЫ И УБОРКА ЗАГРУЗОК ----------------
@@ -2084,8 +2189,12 @@ const UPLOAD_LEGACY_GRACE_MS = 7 * 24 * 60 * 60 * 1000;  // файл вне ре
 const UPLOAD_LEDGER_TTL_MS = 3 * 24 * 60 * 60 * 1000;    // сколько держим строку уже удалённого файла (см. released)
 const UPLOAD_RELEASE_DEBOUNCE_MS = 20_000;               // склейка отложенной уборки после удалений
 const UPLOAD_SWEEP_CHUNK = 200;                          // файлов на одну транзакцию/тик
-let uploadsBytesCached = 0;   // пересчитывается уборкой; между проходами корректируется приходом/уходом
-let uploadsSweepKnown = false; // до первого прохода реальный объём неизвестен — потолок не применяем
+// На старте берём хотя бы учтённый живой объём из БД. Он может не включать legacy-файлы, зато
+// рестарт больше не открывает 60-секундное окно без общего потолка; полный sweep уточнит размер.
+let uploadsBytesCached = (() => {
+  try { return Number(db.prepare('SELECT COALESCE(SUM(size),0) total FROM uploads WHERE released=0').get()?.total || 0); }
+  catch (e) { return 0; }
+})();
 
 // Реестр держит строку и ПОСЛЕ удаления файла (released=1): суточная квота считается по нему, и без
 // этого пользователь снимал бы себе лимит, просто удалив свои же сообщения.
@@ -2093,6 +2202,7 @@ const upStmt = {
   insert: db.prepare('INSERT OR REPLACE INTO uploads(url,user_id,kind,size,created,released) VALUES(?,?,?,?,?,0)'),
   dailyUsed: db.prepare('SELECT COALESCE(SUM(size),0) total FROM uploads WHERE user_id=? AND created>?'),
   byUrl: db.prepare('SELECT created,released FROM uploads WHERE url=?'),
+  ownedByUrl: db.prepare('SELECT user_id,kind,released FROM uploads WHERE url=?'),
   markReleased: db.prepare('UPDATE uploads SET released=1 WHERE url=?'),
   dropBanner: db.prepare('DELETE FROM profile_banner_uploads WHERE url=?'),
   dropOld: db.prepare('DELETE FROM uploads WHERE released=1 AND created<?'),
@@ -2102,19 +2212,32 @@ function recordUpload(url, userId, kind, size) {
   try {
     upStmt.insert.run(url, userId, kind, size, Date.now());
     uploadsBytesCached += size;
-  } catch (e) { console.error('[uploads] учёт загрузки:', e && e.message); } // учёт не должен ронять саму загрузку
+    return true;
+  } catch (e) {
+    // Без строки владельца файл нельзя безопасно прикрепить или посчитать в квоте. Вызывающий
+    // роут удалит уже записанный файл и вернёт ошибку вместо неучтённой загрузки.
+    console.error('[uploads] учёт загрузки:', e && e.message);
+    return false;
+  }
+}
+
+function ownsActiveUpload(userId, url, kind) {
+  const filePath = uploadPathFor(url);
+  if (!filePath) return false;
+  try { return fs.existsSync(filePath) && isOwnedUploadRow(upStmt.ownedByUrl.get(url), userId, kind); }
+  catch (e) { return false; } // проверка владения всегда fail-closed
 }
 
 // Суточное потребление: строки за последние сутки, включая уже удалённые файлы (см. released).
 function uploadDailyUsed(userId) {
   try { return Number(upStmt.dailyUsed.get(userId, Date.now() - UPLOAD_GC_GRACE_MS)?.total || 0); }
-  catch (e) { return 0; }
+  catch (e) { return UPLOAD_DAILY_QUOTA_BYTES; } // недоступен реестр — не открываем квоту fail-open
 }
 
 // Общая для всех загрузок проверка: суточная квота пользователя + потолок хранилища. Возвращает
 // текст ошибки или null. Вызывается ДО записи файла на диск.
 function uploadRejectReason(userId, size) {
-  if (uploadsSweepKnown && uploadsBytesCached + size > UPLOADS_CAP_BYTES) return 'Хранилище файлов заполнено — попробуй позже';
+  if (uploadsBytesCached + size > UPLOADS_CAP_BYTES) return 'Хранилище файлов заполнено — попробуй позже';
   if (uploadDailyUsed(userId) + size > UPLOAD_DAILY_QUOTA_BYTES) return 'Дневной лимит загрузок исчерпан — попробуй завтра';
   return null;
 }
@@ -2125,12 +2248,13 @@ function uploadPathFor(url) {
   return null;
 }
 
-// Ссылается ли хоть что-то на этот файл (точечная проверка для одиночных случаев).
+// Ссылается ли хоть что-то на этот файл. Используем тот же структурный сборщик, что и GC:
+// LIKE по сырому JSON считал обычный текст/имя вложения ссылкой и позволял удерживать чужой файл.
 function uploadIsReferenced(url) {
-  if (db.prepare('SELECT 1 FROM users WHERE avatar_url=? OR profile_banner_url=? LIMIT 1').get(url, url)) return true;
-  if (db.prepare('SELECT 1 FROM servers WHERE icon_url=? LIMIT 1').get(url)) return true;
-  const contains = `%${url}%`; // имена файлов — hex, символов LIKE в них нет
-  return !!db.prepare('SELECT 1 FROM messages WHERE image=? OR attachments LIKE ? OR reply_to LIKE ? LIMIT 1').get(url, contains, contains);
+  const refs = collectReferencedUploadUrls();
+  if (!refs) return true; // не смогли доказать отсутствие ссылки — удалять нельзя
+  const normalized = normalizeUploadRef(url);
+  return refs.has(url) || !!(normalized && refs.has(normalized));
 }
 
 // Все живые ссылки одним проходом. null = собрать не удалось: удалять по неполному списку нельзя.
@@ -2148,11 +2272,11 @@ function collectReferencedUploadUrls() {
     for (const r of db.prepare("SELECT image FROM messages WHERE image<>''").all()) add(r.image);
     for (const r of db.prepare("SELECT attachments FROM messages WHERE attachments<>'' AND attachments<>'[]'").all()) {
       try { for (const a of JSON.parse(r.attachments) || []) if (a && a.url) add(a.url); }
-      catch (e) { for (const m of String(r.attachments).match(new RegExp(UPLOAD_REF_RE.source, 'g')) || []) refs.add(m); } // битый JSON: вытаскиваем ссылки как есть, лишь бы не удалить лишнее
+      catch (e) { for (const url of uploadRefsInText(r.attachments)) add(url); }
     }
     for (const r of db.prepare("SELECT reply_to FROM messages WHERE reply_to<>''").all()) {
       try { const rp = JSON.parse(r.reply_to); if (rp && rp.thumb) add(rp.thumb); }
-      catch (e) { for (const m of String(r.reply_to).match(new RegExp(UPLOAD_REF_RE.source, 'g')) || []) refs.add(m); } // обрезанный по лимиту JSON тоже обязан сохранить ссылку
+      catch (e) { for (const url of uploadRefsInText(r.reply_to)) add(url); }
     }
   } catch (e) {
     console.error('[uploads] сбор ссылок не удался, уборка пропущена:', e && e.message);
@@ -2167,8 +2291,19 @@ function collectReferencedUploadUrls() {
 const purgeLedgerRows = db.transaction((urls) => {
   for (const url of urls) { upStmt.markReleased.run(url); upStmt.dropBanner.run(url); }
 });
+const claimUploadsForRemoval = db.transaction((urls) => {
+  for (const url of urls) upStmt.markReleased.run(url);
+});
 
 async function removeUploads(urls, sizeByUrl) {
+  // Между чанками отдаём event loop, поэтому сначала атомарно закрываем владельцу возможность
+  // прикрепить запланированный к удалению URL. Иначе сообщение могло появиться после снимка ссылок,
+  // но до unlink более позднего чанка, и история получала уже удалённый файл.
+  try { claimUploadsForRemoval(urls); }
+  catch (e) {
+    console.error('[uploads] не удалось зафиксировать удаление:', e && e.message);
+    return { removed: 0, freed: 0 };
+  }
   let removed = 0, freed = 0;
   for (let i = 0; i < urls.length; i += UPLOAD_SWEEP_CHUNK) {
     const chunk = urls.slice(i, i + UPLOAD_SWEEP_CHUNK);
@@ -2178,10 +2313,14 @@ async function removeUploads(urls, sizeByUrl) {
       if (!p) continue; // имя вне наших схем — ни файл, ни строку не трогаем (иначе учёт разъедется с диском)
       let size = sizeByUrl ? sizeByUrl.get(url) : undefined;
       if (size === undefined) { try { size = fs.statSync(p).size; } catch (e) { size = 0; } }
+      let didDelete = true;
       try { fs.unlinkSync(p); }
-      catch (e) { if (e && e.code !== 'ENOENT') { console.error('[uploads] не удалось удалить', url, e.message); continue; } }
+      catch (e) {
+        if (e && e.code !== 'ENOENT') { console.error('[uploads] не удалось удалить', url, e.message); continue; }
+        didDelete = false; // другой уборщик уже удалил файл и вычел его размер
+      }
       done.push(url);
-      removed++; freed += size || 0;
+      if (didDelete) { removed++; freed += size || 0; }
     }
     if (done.length) { try { purgeLedgerRows(done); } catch (e) { console.error('[uploads] обновление реестра:', e && e.message); } }
     if (i + UPLOAD_SWEEP_CHUNK < urls.length) await new Promise((r) => setImmediate(r));
@@ -2244,11 +2383,13 @@ async function sweepUploads() {
     }
   }
   // Решение «что удалять» — в uploadsGc.js: оно чистое и покрыто тестами (uploads-gc-test.js).
-  const { remove, keepBytes } = planUploadSweep({ files, referenced: refs, now, graceMs: UPLOAD_GC_GRACE_MS, legacyGraceMs: UPLOAD_LEGACY_GRACE_MS });
+  const { remove } = planUploadSweep({ files, referenced: refs, now, graceMs: UPLOAD_GC_GRACE_MS, legacyGraceMs: UPLOAD_LEGACY_GRACE_MS });
   const sizeByUrl = new Map(files.map((f) => [f.url, f.size]));
+  // Фиксируем размер снимка ДО первого await. Новые загрузки, пришедшие во время порционного
+  // удаления, увеличат cached поверх него, а removeUploads вычтет реально удалённые байты.
+  // Присваивание keepBytes после await теряло бы такие параллельные загрузки из общего cap.
+  uploadsBytesCached = files.reduce((sum, file) => sum + file.size, 0);
   const { removed, freed } = await removeUploads(remove, sizeByUrl);
-  uploadsBytesCached = keepBytes;
-  uploadsSweepKnown = true;
   // Строки реестра без файла на диске (ручное удаление, сбой записи) помечаем удалёнными, иначе они
   // вечно висят в суточной квоте пользователя. Каталоги уже прочитаны — повторно диск не трогаем.
   try {
@@ -2256,14 +2397,13 @@ async function sweepUploads() {
     if (stale.length) purgeLedgerRows(stale.map((r) => r.url));
     upStmt.dropOld.run(now - UPLOAD_LEDGER_TTL_MS); // строки давно удалённых файлов больше не нужны даже квоте
   } catch (e) { console.error('[uploads] сверка реестра:', e && e.message); }
-  console.log(`[uploads] проход: файлов ${files.length}, убрано ${removed}, освобождено ${Math.round(freed / 1048576)} МБ, занято ${Math.round(keepBytes / 1048576)} МБ из ${Math.round(UPLOADS_CAP_BYTES / 1048576)} МБ`);
-  if (keepBytes > UPLOADS_CAP_BYTES) console.warn('[uploads] хранилище выше потолка — новые загрузки отклоняются; подними UPLOADS_CAP_MB или удали старые сообщения');
+  console.log(`[uploads] проход: файлов ${files.length}, убрано ${removed}, освобождено ${Math.round(freed / 1048576)} МБ, занято ${Math.round(uploadsBytesCached / 1048576)} МБ из ${Math.round(UPLOADS_CAP_BYTES / 1048576)} МБ`);
+  if (uploadsBytesCached > UPLOADS_CAP_BYTES) console.warn('[uploads] хранилище выше потолка — новые загрузки отклоняются; подними UPLOADS_CAP_MB или удали старые сообщения');
 }
 
 const uploadSweepTimer = setInterval(() => { sweepUploads().catch((e) => console.error('[uploads] уборка:', e && e.message)); }, 6 * 60 * 60 * 1000);
 uploadSweepTimer.unref?.();
-// Первый проход при старте, но не в момент запуска: даём подняться остальному, а заодно сразу
-// получаем реальный объём хранилища (до этого потолок не применяем — uploadsSweepKnown).
+// Первый полный проход при старте уточняет объём с учётом legacy-файлов вне реестра.
 const uploadSweepBoot = setTimeout(() => { sweepUploads().catch((e) => console.error('[uploads] уборка:', e && e.message)); }, 60_000);
 uploadSweepBoot.unref?.();
 app.get('/api/files/:name', (req, res) => {
@@ -2385,11 +2525,16 @@ app.patch('/api/servers/:id', requireAuth, (req, res) => {
   const desc = req.body.description != null ? String(req.body.description).slice(0, 300) : null;
   const ic = req.body.iconColor != null ? (parseInt(req.body.iconColor, 10) % 8 + 8) % 8 : null;
   let iu = null;
-  if (req.body.iconUrl != null) { const v = String(req.body.iconUrl); if (v === '' || UPLOAD_RE.test(v)) iu = v; else return res.status(400).json({ error: 'Неверная обложка' }); }
+  if (req.body.iconUrl != null) {
+    const v = String(req.body.iconUrl);
+    if (v === '' || v === String(s.icon_url || '') || (UPLOAD_RE.test(v) && ownsActiveUpload(req.user.id, v, 'image'))) iu = v;
+    else return res.status(400).json({ error: 'Обложку нужно загрузить из своего аккаунта' });
+  }
   if (name !== null && name.length < 2) return res.status(400).json({ error: 'Название минимум 2 символа' });
   const statsOn = req.body.statsEnabled != null ? (req.body.statsEnabled ? 1 : 0) : null;
   db.prepare('UPDATE servers SET name=COALESCE(?,name), description=COALESCE(?,description), icon_color=COALESCE(?,icon_color), icon_url=COALESCE(?,icon_url), stats_enabled=COALESCE(?,stats_enabled) WHERE id=?')
     .run(name, desc, ic, iu, statsOn, s.id);
+  if (iu !== null && s.icon_url && s.icon_url !== iu && ownsActiveUpload(req.user.id, s.icon_url, 'image')) queueUploadRelease([s.icon_url]);
   const ns = db.prepare('SELECT * FROM servers WHERE id=?').get(s.id);
   res.json({ server: { ...pubServer(ns), memberCount: memberCount(s.id) } });
 });
@@ -2686,9 +2831,9 @@ app.post('/api/admin/users/:id/email-binding-support-code', requireAdmin, authRo
   res.setHeader('Cache-Control', 'no-store');
   res.json({ ok: true, ...result });
 }));
-// вложения: до 5 на сообщение, url валиден для своего kind (картинки — /api/uploads/*, инлайн;
-// файлы — /api/files/*, форс-скачивание — см. FILE ATTACHMENTS выше), остальные поля — санитайз размера.
-function sanitizeAttachments(raw) {
+// вложения: до 5 на сообщение, URL принадлежит автору и валиден для своего kind
+// (картинки — /api/uploads/*, файлы — /api/files/*), остальные поля — санитайз размера.
+function sanitizeAttachments(raw, userId) {
   if (!Array.isArray(raw)) return [];
   const out = [];
   for (const a of raw.slice(0, 5)) {
@@ -2696,7 +2841,7 @@ function sanitizeAttachments(raw) {
     const kind = a.kind === 'file' ? 'file' : 'image';
     const url = String(a.url || '');
     const urlOk = kind === 'image' ? UPLOAD_RE.test(url) : FILE_URL_RE.test(url);
-    if (!urlOk) continue;
+    if (!urlOk || !ownsActiveUpload(userId, url, kind)) continue;
     const name = String(a.name || '').slice(0, 255);
     const size = Number.isFinite(a.size) ? Math.max(0, Math.min(10 * 1024 * 1024, a.size)) : 0;
     const mime = String(a.mime || '').slice(0, 100);
@@ -2727,29 +2872,52 @@ function boundedJsonObject(raw, maxBytes, fallback = '{}') {
   try { return JSON.stringify(out); } catch { return fallback; }
 }
 
+function buildReplySnapshot(serverId, userId, raw) {
+  if (!raw || typeof raw !== 'object') return '';
+  const sourceId = Number(raw.sid);
+  if (Number.isSafeInteger(sourceId) && sourceId > 0) {
+    const source = db.prepare('SELECT id,user_id,display_name,text,image,attachments FROM messages WHERE server_id=? AND id=?').get(serverId, sourceId);
+    if (!source) return '';
+    let files = [];
+    try { const parsed = JSON.parse(source.attachments || '[]'); files = Array.isArray(parsed) ? parsed : []; }
+    catch (e) { files = []; }
+    const image = (UPLOAD_RE.test(String(source.image || '')) && source.image)
+      || files.find((file) => file && file.kind === 'image' && UPLOAD_RE.test(String(file.url || '')))?.url
+      || '';
+    const hasFile = files.some((file) => file && file.kind === 'file' && FILE_URL_RE.test(String(file.url || '')));
+    const clean = {
+      author: String(source.display_name || '').slice(0, 80),
+      text: String(source.text || '').slice(0, 160),
+      img: !!image,
+      hasFile,
+      uid: String(source.user_id || '').slice(0, 64),
+      sid: Number(source.id),
+    };
+    if (image) clean.thumb = image;
+    return boundedJsonObject(clean, 600);
+  }
+
+  // У оптимистичного сообщения sid может ещё не быть. Сохраняем прежний UX, но превью разрешаем
+  // только из собственных активных загрузок: произвольный thumb больше не закрепляет чужой файл.
+  const author = String(raw.author || '').slice(0, 80);
+  if (!author) return '';
+  const clean = { author, text: String(raw.text || '').slice(0, 160), img: !!raw.img, hasFile: !!raw.hasFile };
+  if (raw.uid) clean.uid = String(raw.uid).slice(0, 64);
+  const thumb = normalizeUploadRef(String(raw.thumb || ''));
+  if (thumb && ownsActiveUpload(userId, thumb, 'image')) clean.thumb = thumb;
+  return boundedJsonObject(clean, 600);
+}
+
 app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
   const sid = req.params.id;
   if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
   const text = String(req.body.text || '').slice(0, 1000);
-  const image = (() => { const v = String(req.body.image || ''); return UPLOAD_RE.test(v) ? v : ''; })();
-  const attachments = sanitizeAttachments(req.body.files);
+  const image = (() => { const v = String(req.body.image || ''); return UPLOAD_RE.test(v) && ownsActiveUpload(req.user.id, v, 'image') ? v : ''; })();
+  const attachments = sanitizeAttachments(req.body.files, req.user.id);
   if (!text.trim() && !image && !attachments.length) return res.status(400).json({ error: 'пусто' });
   const em = boundedJsonObject(req.body.em || {}, 4000);
   // reply-ссылка на исходное сообщение (санитайзим, ограничиваем размер)
-  const replyTo = (() => {
-    const rp = req.body.reply;
-    if (!rp || typeof rp !== 'object') return '';
-    const author = String(rp.author || '').slice(0, 80);
-    if (!author) return '';
-    const clean = { author, text: String(rp.text || '').slice(0, 160), img: !!rp.img };
-    if (rp.uid) clean.uid = String(rp.uid).slice(0, 64);
-    if (Number.isFinite(rp.sid)) clean.sid = rp.sid;
-    // Превью картинки оригинала в цитате. Нормализуем к относительному пути: старые нативные
-    // клиенты присылают абсолютный URL, а уборка сверяет ссылки точным совпадением (см.
-    // normalizeUploadRef) — иначе показанная в цитате картинка считалась бы мусором.
-    if (rp.thumb) clean.thumb = normalizeUploadRef(String(rp.thumb)) || String(rp.thumb).slice(0, 300);
-    return boundedJsonObject(clean, 600);
-  })();
+  const replyTo = buildReplySnapshot(sid, req.user.id, req.body.reply);
   const now = Date.now();
   const clientKey = String(req.body.key || '').slice(0, 64);
   // kind/meta: пока единственный спец-тип — 'levelup' (карточка достижения). Анти-спуф: принимаем ТОЛЬКО

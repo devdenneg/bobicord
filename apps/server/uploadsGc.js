@@ -18,11 +18,17 @@
  * сервер не валидировал. Уборка сверяет ссылки точным совпадением, поэтому без нормализации такая
  * картинка считалась мусором и удалялась, пока цитата её показывает. */
 const UPLOAD_REF_RE = /\/api\/(?:uploads|files)\/[a-zA-Z0-9._-]+$/;
+const UPLOAD_REF_SCAN_RE = /\/api\/(?:uploads|files)\/[a-zA-Z0-9][a-zA-Z0-9_-]*(?:\.[a-zA-Z0-9_-]+)*(?![a-zA-Z0-9._-])/g;
 
 /** Относительный путь загрузки из любой формы ссылки, либо null. */
 function normalizeUploadRef(value) {
   const m = typeof value === 'string' ? value.match(UPLOAD_REF_RE) : null;
   return m ? m[0] : null;
+}
+
+/** Строгие локальные upload-пути из старого повреждённого JSON. */
+function uploadRefsInText(value) {
+  return typeof value === 'string' ? (value.match(UPLOAD_REF_SCAN_RE) || []) : [];
 }
 
 /** @param {{url:string,size:number,createdAt:number|null,mtimeMs:number}[]} files */
@@ -51,10 +57,23 @@ function uploadUrlsOfMessageRows(rows) {
   for (const row of rows || []) {
     if (!row) continue;
     if (row.image) urls.push(row.image);
-    try { for (const a of JSON.parse(row.attachments || '[]') || []) if (a && a.url) urls.push(a.url); } catch (e) { /* битый JSON в старой записи */ }
-    try { const rp = row.reply_to ? JSON.parse(row.reply_to) : null; if (rp && rp.thumb) urls.push(rp.thumb); } catch (e) { /* битый JSON в старой записи */ }
+    try { for (const a of JSON.parse(row.attachments || '[]') || []) if (a && a.url) urls.push(a.url); }
+    catch (e) { urls.push(...uploadRefsInText(row.attachments)); }
+    try { const rp = row.reply_to ? JSON.parse(row.reply_to) : null; if (rp && rp.thumb) urls.push(rp.thumb); }
+    catch (e) { urls.push(...uploadRefsInText(row.reply_to)); }
   }
   return urls;
 }
 
-module.exports = { planUploadSweep, uploadUrlsOfMessageRows, normalizeUploadRef, UPLOAD_REF_RE };
+/**
+ * Проверяет, что URL из пользовательского запроса принадлежит этому пользователю и всё ещё
+ * указывает на живой файл нужного типа. Сам URL намеренно не проверяется здесь: его схема
+ * валидируется роутом, а эта функция остаётся чистой и тестируемой без SQLite.
+ */
+function isOwnedUploadRow(row, userId, kind) {
+  if (!row || String(row.user_id || '') !== String(userId || '') || Number(row.released) !== 0) return false;
+  const allowed = Array.isArray(kind) ? kind : [kind];
+  return allowed.includes(String(row.kind || ''));
+}
+
+module.exports = { planUploadSweep, uploadUrlsOfMessageRows, normalizeUploadRef, uploadRefsInText, isOwnedUploadRow, UPLOAD_REF_RE };
