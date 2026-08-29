@@ -11,6 +11,7 @@
     "test:runtime-revocation": "node --test runtime-revocation-test.js",
     "test:release-notes": "node release-notes-test.js",
     "test:voice-lease": "node voice-lease-test.js",
+    "test:voice-media": "node --test voice-media-test.js",
     "test:tree-ws-error": "node tree-ws-error-test.js",
     "test:tree-auth": "node --test tree-auth-test.js",
     "test:seventv-proxy": "node --test seventv-proxy-test.js",

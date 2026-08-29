@@ -9,6 +9,10 @@ const { AccessToken, RoomServiceClient, DataPacket_Kind } = require('livekit-ser
 const { WebSocketServer } = require('ws');
 const { attachTreeServer } = require('./tree');
 const { createVoiceLeaseStore, voiceLeaseEvent, selectVoiceState } = require('./voiceLease');
+const {
+  voiceMediaRoomName, voiceHubIdentity, voiceMediaIdentity, exactVoiceLease, initialVoiceMediaGrant,
+  activateVoiceMediaParticipant, removeVoiceMediaParticipant,
+} = require('./voiceMedia');
 const { installRuntimeRevocationSchema } = require('./runtimeRevocation');
 const { planUploadSweep, uploadUrlsOfMessageRows, normalizeUploadRef, uploadRefsInText, isOwnedUploadRow } = require('./uploadsGc'); // квоты, владение и уборка пользовательских файлов
 const {
@@ -757,6 +761,11 @@ function memberCount(sid) { return db.prepare('SELECT COUNT(*) c FROM membership
 // Полный каскад-снос сервера (все связанные таблицы по server_id). Имена таблиц — литералы, не ввод.
 function purgeServer(sid) {
   invalidateVoiceLeasesForServer(sid, 'server-deleted');
+  try {
+    for (const { id } of db.prepare('SELECT id FROM voice_channels WHERE server_id=?').all(sid)) {
+      void revokeVoiceMediaChannel(sid, id).catch(() => {});
+    }
+  } catch (e) { /**/ }
   evictRoomParticipants(sid);
   treeSrv?.revokeServer(sid);
   // Ссылки на файлы снимаем ДО удаления сообщений — потом их уже негде взять. Сама уборка идёт
@@ -885,6 +894,7 @@ const VOICE_SESSION_RE = /^[A-Za-z0-9._:~-]{1,128}$/;
 const VOICE_RESOURCE_RE = /^[A-Za-z0-9_-]{1,96}$/;
 const voiceClaimQueues = new Map();
 const pendingVoiceEvictions = new Map();
+const pendingVoiceMediaEvictions = new Map();
 function leaseResponse(state, reason) {
   return { ok: true, ...voiceLeaseEvent(state, reason) };
 }
@@ -898,8 +908,13 @@ function serializeVoiceClaim(userId, task) {
 function invalidateVoiceLease(userId, predicate, reason = 'revoked') {
   const state = voiceLeases.read(userId);
   if (!state.lease || (predicate && !predicate(state.lease))) return state;
-  const released = voiceLeases.release(userId, state.lease.sessionId, state.lease.epoch);
-  if (released.released) notifyUser(userId, voiceLeaseEvent(released, reason));
+  const previousLease = state.lease;
+  const released = voiceLeases.release(userId, previousLease.sessionId, previousLease.epoch);
+  if (released.released) {
+    notifyUser(userId, voiceLeaseEvent(released, reason));
+    const username = db.prepare('SELECT username FROM users WHERE id=?').get(userId)?.username;
+    if (username) void revokeVoiceMediaLease(username, previousLease).catch(() => {});
+  }
   return released;
 }
 function invalidateVoiceLeasesForServer(serverId, reason = 'server-revoked') {
@@ -916,6 +931,60 @@ function liveKitResourceMissing(error) {
   const message = String(error && error.message || '').toLowerCase();
   return status === 404 || code === 'not_found' || code === 'not-found' || code === '5'
     || /(?:room|participant|resource).*(?:not found|does not exist)/u.test(message);
+}
+function scheduleVoiceMediaRemoval(room, identity) {
+  const key = room + '\n' + identity;
+  const existing = pendingVoiceMediaEvictions.get(key);
+  if (existing) return existing;
+  let tracked;
+  tracked = Promise.resolve(removeVoiceMediaParticipant(rsc, room, identity))
+    .catch((error) => { if (!liveKitResourceMissing(error)) throw error; })
+    .finally(() => { if (pendingVoiceMediaEvictions.get(key) === tracked) pendingVoiceMediaEvictions.delete(key); });
+  pendingVoiceMediaEvictions.set(key, tracked);
+  return tracked;
+}
+function revokeVoiceMediaLease(username, lease) {
+  if (!username || !lease) return Promise.resolve();
+  return scheduleVoiceMediaRemoval(
+    voiceMediaRoomName(lease.serverId, lease.channelId),
+    voiceMediaIdentity(username, lease.sessionId, lease.epoch),
+  );
+}
+async function evictUserFromVoiceMedia(serverId, username, revokedBeforeVersion = null) {
+  if (!serverId || !username) return;
+  const channels = db.prepare('SELECT id FROM voice_channels WHERE server_id=?').all(serverId);
+  const listed = await Promise.all(channels.map(async ({ id }) => {
+    const room = voiceMediaRoomName(serverId, id);
+    try {
+      return { room, participants: await withTimeout(rsc.listParticipants(room), 2500, 'listVoiceMediaParticipants') };
+    } catch (error) {
+      if (liveKitResourceMissing(error)) return { room, participants: [] };
+      throw error;
+    }
+  }));
+  const removals = [];
+  for (const result of listed) {
+    for (const participant of result.participants) {
+      if (baseIdentity(participant.identity) !== username) continue;
+      if (revokedBeforeVersion !== null) {
+        const version = liveKitSessionVersion(participant.identity, username);
+        if (version !== null && version >= revokedBeforeVersion) continue;
+      }
+      removals.push(scheduleVoiceMediaRemoval(result.room, participant.identity));
+    }
+  }
+  await Promise.all(removals.map((removal) => withTimeout(removal, 2500, 'removeVoiceMediaParticipant')));
+}
+async function revokeVoiceMediaChannel(serverId, channelId) {
+  const room = voiceMediaRoomName(serverId, channelId);
+  let participants = [];
+  try { participants = await withTimeout(rsc.listParticipants(room), 2500, 'listVoiceMediaParticipants'); }
+  catch (error) { if (!liveKitResourceMissing(error)) throw error; }
+  await Promise.allSettled(participants.map((participant) => withTimeout(
+    scheduleVoiceMediaRemoval(room, participant.identity), 2500, 'removeVoiceMediaParticipant',
+  )));
+  try { await withTimeout(rsc.deleteRoom(room), 2500, 'deleteVoiceMediaRoom'); }
+  catch (error) { if (!liveKitResourceMissing(error)) throw error; }
 }
 function liveKitSessionVersion(identity, username) {
   const value = String(identity || '');
@@ -950,7 +1019,10 @@ async function evictRoomParticipantsAwait(serverId, username, revokedBeforeVersi
 function evictRoomParticipants(serverId, username) {
   void evictRoomParticipantsAwait(serverId, username).catch(() => { /** room may already be gone */ });
 }
-function evictUserFromRoom(serverId, username) { evictRoomParticipants(serverId, username); }
+function evictUserFromRoom(serverId, username) {
+  evictRoomParticipants(serverId, username);
+  void evictUserFromVoiceMedia(serverId, username).catch(() => {});
+}
 let runtimeRevocationRetryRunning = false;
 async function drainRuntimeRevocation(userId) {
   const item = db.prepare('SELECT * FROM auth_runtime_revocations WHERE user_id=?').get(userId);
@@ -958,9 +1030,11 @@ async function drainRuntimeRevocation(userId) {
   const targets = db.prepare(`SELECT server_id,revoked_before_version
     FROM auth_runtime_revocation_rooms WHERE user_id=?`).all(userId);
   const results = await Promise.allSettled(targets.map(async (target) => {
-    await evictRoomParticipantsAwait(
-      target.server_id, item.username, Number(target.revoked_before_version) || 0,
-    );
+    const revokedBeforeVersion = Number(target.revoked_before_version) || 0;
+    await Promise.all([
+      evictRoomParticipantsAwait(target.server_id, item.username, revokedBeforeVersion),
+      evictUserFromVoiceMedia(target.server_id, item.username, revokedBeforeVersion),
+    ]);
     db.prepare(`DELETE FROM auth_runtime_revocation_rooms
       WHERE user_id=? AND server_id=? AND revoked_before_version=?`)
       .run(userId, target.server_id, target.revoked_before_version);
@@ -1025,6 +1099,12 @@ function scheduleVoiceEviction(serverId, identity) {
   return tracked;
 }
 async function revokeOlderVoiceParticipants(userId, username, keep, previousLease) {
+  // Media-room привязан к точному lease. Даже switch в другой канал той же hub-сессии обязан
+  // закрыть прежнюю комнату и её обновлённый LiveKit-token; account JWT при этом не меняется.
+  if (previousLease && !exactVoiceLease(previousLease, keep)) {
+    try { await withTimeout(revokeVoiceMediaLease(username, previousLease), 2500, 'removeVoiceMediaParticipant'); }
+    catch (e) { /* initial-deny + exact activate не дадут старому token снова получить аудиоправа */ }
+  }
   if (previousLease && previousLease.sessionId === keep.sessionId) return;
   const ownsKeep = () => {
     const current = voiceLeases.read(userId).lease;
@@ -1214,12 +1294,104 @@ app.post('/api/voice/lease/release', requireAuth, async (req, res, next) => {
   }
   try {
     const state = await serializeVoiceClaim(req.user.id, async () => {
+      const previousLease = voiceLeases.read(req.user.id).lease;
       const released = voiceLeases.release(req.user.id, sessionId, epoch);
-      if (released.released) notifyUser(req.user.id, voiceLeaseEvent(released, 'released'));
+      if (released.released) {
+        notifyUser(req.user.id, voiceLeaseEvent(released, 'released'));
+        if (previousLease) void revokeVoiceMediaLease(req.user.username, previousLease).catch(() => {});
+      }
       return released;
     });
     res.json({ ok: true, ...voiceLeaseEvent(state, state.reason), released: state.released });
   } catch (error) { next(error); }
+});
+
+function voiceMediaRequest(body) {
+  const sessionId = String(body?.sessionId || '');
+  const serverId = String(body?.serverId || '');
+  const channelId = String(body?.channelId || '');
+  const epoch = Number(body?.epoch);
+  if (!VOICE_SESSION_RE.test(sessionId) || !VOICE_RESOURCE_RE.test(serverId) || !VOICE_RESOURCE_RE.test(channelId)
+    || !Number.isSafeInteger(epoch) || epoch < 1) return null;
+  return { sessionId, serverId, channelId, epoch };
+}
+
+function voiceMediaStillAllowed(userId, params) {
+  return !!db.prepare('SELECT 1 FROM memberships WHERE user_id=? AND server_id=?').get(userId, params.serverId)
+    && !!db.prepare('SELECT 1 FROM voice_channels WHERE id=? AND server_id=?').get(params.channelId, params.serverId)
+    && exactVoiceLease(voiceLeases.read(userId).lease, params);
+}
+
+// Подготовительная фаза изоляции: token может только войти в точную media-room. Слушать и
+// публиковать он сможет лишь после отдельной exact-lease активации ниже.
+app.post('/api/voice/media-token', requireAuth, async (req, res, next) => {
+  const params = voiceMediaRequest(req.body);
+  if (!params) return res.status(400).json({ error: 'Invalid voice media parameters' });
+  try {
+    const result = await serializeVoiceClaim(req.user.id, async () => {
+      if (!db.prepare('SELECT 1 FROM memberships WHERE user_id=? AND server_id=?').get(req.user.id, params.serverId)) {
+        return { status: 403, error: 'Not a server member' };
+      }
+      if (!db.prepare('SELECT 1 FROM voice_channels WHERE id=? AND server_id=?').get(params.channelId, params.serverId)) {
+        return { status: 404, error: 'Voice channel not found' };
+      }
+      if (!exactVoiceLease(voiceLeases.read(req.user.id).lease, params)) return { status: 409, error: 'Voice lease is not current' };
+      const connected = await voiceSessionConnectedOnce(params.serverId, voiceHubIdentity(req.user.username, params.sessionId));
+      if (connected !== true) return { status: connected === null ? 503 : 409, error: connected === null ? 'Voice service unavailable' : 'Voice hub session is not active' };
+      if (!voiceMediaStillAllowed(req.user.id, params)) return { status: 409, error: 'Voice lease is not current' };
+      const room = voiceMediaRoomName(params.serverId, params.channelId);
+      const identity = voiceMediaIdentity(req.user.username, params.sessionId, params.epoch);
+      const at = new AccessToken(KEY, SECRET, {
+        identity,
+        name: req.user.display_name,
+        ttl: '2m',
+        attributes: {
+          voiceServer: params.serverId,
+          voiceChannel: params.channelId,
+          voiceSession: params.sessionId,
+          voiceEpoch: String(params.epoch),
+        },
+      });
+      at.addGrant(initialVoiceMediaGrant(room));
+      const token = await at.toJwt();
+      if (!voiceMediaStillAllowed(req.user.id, params)) return { status: 409, error: 'Voice lease is not current' };
+      return { token, room, identity };
+    });
+    if (result.error) return res.status(result.status).json({ error: result.error });
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json({ ok: true, url: WS_URL, token: result.token, room: result.room, identity: result.identity, epoch: params.epoch });
+  } catch (error) { return next(error); }
+});
+
+app.post('/api/voice/media/activate', requireAuth, async (req, res, next) => {
+  const params = voiceMediaRequest(req.body);
+  if (!params) return res.status(400).json({ error: 'Invalid voice media parameters' });
+  const room = voiceMediaRoomName(params.serverId, params.channelId);
+  const hubIdentity = voiceHubIdentity(req.user.username, params.sessionId);
+  const identity = voiceMediaIdentity(req.user.username, params.sessionId, params.epoch);
+  try {
+    const result = await serializeVoiceClaim(req.user.id, async () => {
+      if (!voiceMediaStillAllowed(req.user.id, params)) return { status: 409, error: 'Voice lease is not current' };
+      const connected = await voiceSessionConnectedOnce(params.serverId, hubIdentity);
+      if (connected !== true) return { status: connected === null ? 503 : 409, error: connected === null ? 'Voice service unavailable' : 'Voice hub session is not active' };
+      if (!voiceMediaStillAllowed(req.user.id, params)) return { status: 409, error: 'Voice lease is not current' };
+      try { await activateVoiceMediaParticipant(rsc, room, identity); }
+      catch (error) {
+        if (liveKitResourceMissing(error)) return { status: 409, error: 'Voice media session is not connected' };
+        throw error;
+      }
+      // Membership/channel revoke не проходит через per-user claim queue. Если он случился во
+      // время RoomService update, сразу снимаем выданные media-права и не возвращаем ложный успех.
+      if (!voiceMediaStillAllowed(req.user.id, params)) {
+        await scheduleVoiceMediaRemoval(room, identity).catch(() => {});
+        return { status: 409, error: 'Voice lease is not current' };
+      }
+      return { ok: true };
+    });
+    if (result.error) return res.status(result.status).json({ error: result.error });
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json({ ok: true, room, epoch: params.epoch });
+  } catch (error) { return next(error); }
 });
 
 /* ---------------- AUTH ---------------- */
@@ -2668,6 +2840,7 @@ app.delete('/api/servers/:id/channels/:cid', requireAuth, (req, res) => {
   // Удаление занятого канала — атомарный server-side leave для его владельцев lease. Закрытая
   // вкладка могла оставить lease без participant, поэтому вечный 409 по одной БД-строке недопустим.
   invalidateVoiceLeasesForChannel(sid, req.params.cid, 'channel-deleted');
+  void revokeVoiceMediaChannel(sid, req.params.cid).catch(() => {});
   evictLegacyVoiceChannelParticipants(sid, req.params.cid);
   db.prepare('DELETE FROM voice_channels WHERE id=? AND server_id=?').run(req.params.cid, sid);
   notifyServerMembers(sid, { t: 'server-refresh', serverId: sid, reason: 'channels' });
