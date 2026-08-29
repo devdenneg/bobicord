@@ -20,6 +20,7 @@ interface NativeWatchState {
   pc: RTCPeerConnection | null; // локальный показ: webview answerer к Rust-offerer
   unlisten: Array<() => void>;
   closed: boolean;
+  pendingIce: any[];
   quality: string;              // Д3: рендишн, который смотрим (дефолт 'source')
   pinned: boolean;              // Д4: ручной выбор качества (авто-ABR не трогает)
 }
@@ -678,10 +679,14 @@ export class TreeVideoTransport implements VideoTransport {
 
   /* ---------- native watch (Tauri: Rust держит upstream+relay, webview рендерит) ---------- */
   private async nativeWatch(streamId: string, quality: string = 'source', pinned: boolean = false) {
-    const st: NativeWatchState = { pc: null, unlisten: [], closed: false, quality, pinned };
+    const st: NativeWatchState = { pc: null, unlisten: [], closed: false, pendingIce: [], quality, pinned };
     this.nativeWatches.set(streamId, st);
     const offCb = (sid: string, sdp: string) => { if (sid === streamId && !st.closed) this.onNativeOffer(streamId, st, sdp); };
-    const iceCb = (sid: string, candidate: any) => { if (sid === streamId && st.pc && candidate) st.pc.addIceCandidate(candidate).catch(() => {}); };
+    const iceCb = (sid: string, candidate: any) => {
+      if (sid !== streamId || !candidate || st.closed) return;
+      if (st.pc && st.pc.remoteDescription) st.pc.addIceCandidate(candidate).catch(() => {});
+      else if (st.pendingIce.length < 128) st.pendingIce.push(candidate);
+    };
     const topoCb = (payload: any) => { if (payload && payload.streamId === streamId) this.setTopology(streamId, { you: payload.you ?? null, nodes: payload.nodes || [] }); };
     // onNativeWatchEnded может прийти СПУРИОЗНО: остановка СВОЕЙ трансляции (или свитч) сбрасывает
     // общий Rust relay-core и рвёт АКТИВНЫЙ watch чужого стрима. Поэтому тут НЕ удаляем стрим из
@@ -753,6 +758,8 @@ export class TreeVideoTransport implements VideoTransport {
     };
     try {
       await pc.setRemoteDescription({ type: 'offer', sdp });
+      const pendingIce = st.pendingIce.splice(0);
+      for (const candidate of pendingIce) await pc.addIceCandidate(candidate).catch(() => {});
       preferH264(pc);
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
