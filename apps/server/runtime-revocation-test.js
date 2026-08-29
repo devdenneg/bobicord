@@ -7,6 +7,7 @@ const path = require('node:path');
 const test = require('node:test');
 const Database = require('better-sqlite3');
 const { TRIGGER_NAME, installRuntimeRevocationSchema } = require('./runtimeRevocation');
+const { createVoiceMediaRevocationStore } = require('./voiceMediaRevocations');
 
 function createBaseSchema(db) {
   db.exec(`
@@ -19,6 +20,10 @@ function createBaseSchema(db) {
       user_id TEXT NOT NULL,
       server_id TEXT NOT NULL,
       PRIMARY KEY(user_id, server_id)
+    );
+    CREATE TABLE voice_channels(
+      id TEXT PRIMARY KEY,
+      server_id TEXT NOT NULL
     );
     CREATE TABLE push_subs(
       endpoint TEXT PRIMARY KEY,
@@ -54,6 +59,7 @@ function seedRuntimeState(db, options = {}) {
   db.prepare('INSERT INTO users(id,username,session_version) VALUES(?,?,?)')
     .run(userId, username, sessionVersion);
   db.prepare('INSERT INTO memberships(user_id,server_id) VALUES(?,?)').run(userId, 's1');
+  db.prepare('INSERT INTO voice_channels(id,server_id) VALUES(?,?)').run('c1', 's1');
   db.prepare('INSERT INTO push_subs(endpoint,user_id) VALUES(?,?)').run('https://push/1', userId);
   db.prepare(`INSERT INTO voice_leases(
     user_id,epoch,session_id,server_id,channel_id,claimed_at,active
@@ -81,6 +87,7 @@ test('rollback removes the outbox mutation and restores push and voice state', (
   const db = new Database(':memory:');
   createBaseSchema(db);
   seedRuntimeState(db);
+  const mediaOutbox = createVoiceMediaRevocationStore(db);
   installRuntimeRevocationSchema(db);
 
   db.exec('BEGIN IMMEDIATE');
@@ -93,6 +100,7 @@ test('rollback removes the outbox mutation and restores push and voice state', (
   assert.equal(during.lease.epoch, 8);
   assert.equal(during.sessionIntentCount, 0);
   assert.equal(during.userIntentCount, 0);
+  assert.ok(mediaOutbox.get('voice:s1:c1', 'denis#voice-session~7'));
   db.exec('ROLLBACK');
 
   const after = readRuntimeState(db);
@@ -104,6 +112,7 @@ test('rollback removes the outbox mutation and restores push and voice state', (
   assert.equal(after.lease.session_id, 'voice-session');
   assert.equal(after.sessionIntentCount, 1);
   assert.equal(after.userIntentCount, 1);
+  assert.equal(mediaOutbox.get('voice:s1:c1', 'denis#voice-session~7'), null);
   assert.equal(db.prepare('SELECT session_version FROM users WHERE id=?').get('u1').session_version, 0);
   db.close();
 });

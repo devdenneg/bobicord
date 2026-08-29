@@ -90,6 +90,6 @@ test('removal revokes previously issued media tokens without touching account au
   assert.deepEqual(calls, [[
     'voice:s:v',
     'alice#sess~4',
-    { revokeTokenTs: 1_700_000_000n },
+    { revokeTokenTs: 1_700_000_001n },
   ]]);
 });

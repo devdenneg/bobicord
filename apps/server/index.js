@@ -13,6 +13,7 @@ const {
   voiceMediaRoomName, voiceHubIdentity, voiceMediaIdentity, exactVoiceLease, initialVoiceMediaGrant,
   activateVoiceMediaParticipant, removeVoiceMediaParticipant,
 } = require('./voiceMedia');
+const { createVoiceMediaRevocationStore, createVoiceMediaRevocationWorker } = require('./voiceMediaRevocations');
 const { installRuntimeRevocationSchema } = require('./runtimeRevocation');
 const { planUploadSweep, uploadUrlsOfMessageRows, normalizeUploadRef, uploadRefsInText, isOwnedUploadRow } = require('./uploadsGc'); // квоты, владение и уборка пользовательских файлов
 const {
@@ -313,6 +314,7 @@ CREATE INDEX IF NOT EXISTS idx_roles_server ON roles(server_id);
 CREATE INDEX IF NOT EXISTS idx_mroles ON member_roles(server_id, user_id);
 `);
 const voiceLeases = createVoiceLeaseStore(db);
+const voiceMediaRevocations = createVoiceMediaRevocationStore(db);
 installReleaseSchema(db);
 installAuthSchema(db);
 installRuntimeRevocationSchema(db);
@@ -894,7 +896,6 @@ const VOICE_SESSION_RE = /^[A-Za-z0-9._:~-]{1,128}$/;
 const VOICE_RESOURCE_RE = /^[A-Za-z0-9_-]{1,96}$/;
 const voiceClaimQueues = new Map();
 const pendingVoiceEvictions = new Map();
-const pendingVoiceMediaEvictions = new Map();
 function leaseResponse(state, reason) {
   return { ok: true, ...voiceLeaseEvent(state, reason) };
 }
@@ -932,17 +933,25 @@ function liveKitResourceMissing(error) {
   return status === 404 || code === 'not_found' || code === 'not-found' || code === '5'
     || /(?:room|participant|resource).*(?:not found|does not exist)/u.test(message);
 }
+const voiceMediaRevocationWorker = createVoiceMediaRevocationWorker({
+  store: voiceMediaRevocations,
+  removeParticipant: ({ room, identity }) => withTimeout(
+    removeVoiceMediaParticipant(rsc, room, identity), 2500, 'removeVoiceMediaParticipant',
+  ),
+  // A room-delete target is enough even after channel/server rows disappear: deleteRoom ejects
+  // updated participants, while any reconnect uses the token's initial-deny grant and exact
+  // activation can no longer pass for the deleted resource.
+  deleteRoom: ({ room }) => withTimeout(rsc.deleteRoom(room), 2500, 'deleteVoiceMediaRoom'),
+  isMissing: liveKitResourceMissing,
+});
 function scheduleVoiceMediaRemoval(room, identity) {
-  const key = room + '\n' + identity;
-  const existing = pendingVoiceMediaEvictions.get(key);
-  if (existing) return existing;
-  let tracked;
-  tracked = Promise.resolve(removeVoiceMediaParticipant(rsc, room, identity))
-    .catch((error) => { if (!liveKitResourceMissing(error)) throw error; })
-    .finally(() => { if (pendingVoiceMediaEvictions.get(key) === tracked) pendingVoiceMediaEvictions.delete(key); });
-  pendingVoiceMediaEvictions.set(key, tracked);
-  return tracked;
+  return voiceMediaRevocationWorker.scheduleParticipant(room, identity);
 }
+function scheduleVoiceMediaRoomDeletion(room) {
+  return voiceMediaRevocationWorker.scheduleRoom(room);
+}
+setImmediate(() => { void voiceMediaRevocationWorker.retryDue(); });
+setInterval(() => { void voiceMediaRevocationWorker.retryDue(); }, 15_000).unref?.();
 function revokeVoiceMediaLease(username, lease) {
   if (!username || !lease) return Promise.resolve();
   return scheduleVoiceMediaRemoval(
@@ -975,16 +984,10 @@ async function evictUserFromVoiceMedia(serverId, username, revokedBeforeVersion 
   }
   await Promise.all(removals.map((removal) => withTimeout(removal, 2500, 'removeVoiceMediaParticipant')));
 }
-async function revokeVoiceMediaChannel(serverId, channelId) {
-  const room = voiceMediaRoomName(serverId, channelId);
-  let participants = [];
-  try { participants = await withTimeout(rsc.listParticipants(room), 2500, 'listVoiceMediaParticipants'); }
-  catch (error) { if (!liveKitResourceMissing(error)) throw error; }
-  await Promise.allSettled(participants.map((participant) => withTimeout(
-    scheduleVoiceMediaRemoval(room, participant.identity), 2500, 'removeVoiceMediaParticipant',
-  )));
-  try { await withTimeout(rsc.deleteRoom(room), 2500, 'deleteVoiceMediaRoom'); }
-  catch (error) { if (!liveKitResourceMissing(error)) throw error; }
+function revokeVoiceMediaChannel(serverId, channelId) {
+  // The durable room target is self-contained: channel/server rows may be deleted immediately
+  // after this synchronous enqueue, while retries still retain the exact LiveKit room name.
+  return scheduleVoiceMediaRoomDeletion(voiceMediaRoomName(serverId, channelId));
 }
 function liveKitSessionVersion(identity, username) {
   const value = String(identity || '');
@@ -1372,9 +1375,15 @@ app.post('/api/voice/media/activate', requireAuth, async (req, res, next) => {
   try {
     const result = await serializeVoiceClaim(req.user.id, async () => {
       if (!voiceMediaStillAllowed(req.user.id, params)) return { status: 409, error: 'Voice lease is not current' };
+      if (voiceMediaRevocations.hasPendingUsername(req.user.username)) {
+        return { status: 409, error: 'Previous voice media session is still closing' };
+      }
       const connected = await voiceSessionConnectedOnce(params.serverId, hubIdentity);
       if (connected !== true) return { status: connected === null ? 503 : 409, error: connected === null ? 'Voice service unavailable' : 'Voice hub session is not active' };
       if (!voiceMediaStillAllowed(req.user.id, params)) return { status: 409, error: 'Voice lease is not current' };
+      if (voiceMediaRevocations.hasPendingUsername(req.user.username)) {
+        return { status: 409, error: 'Previous voice media session is still closing' };
+      }
       try { await activateVoiceMediaParticipant(rsc, room, identity); }
       catch (error) {
         if (liveKitResourceMissing(error)) return { status: 409, error: 'Voice media session is not connected' };
@@ -1382,9 +1391,10 @@ app.post('/api/voice/media/activate', requireAuth, async (req, res, next) => {
       }
       // Membership/channel revoke не проходит через per-user claim queue. Если он случился во
       // время RoomService update, сразу снимаем выданные media-права и не возвращаем ложный успех.
-      if (!voiceMediaStillAllowed(req.user.id, params)) {
+      if (!voiceMediaStillAllowed(req.user.id, params)
+        || voiceMediaRevocations.hasPendingUsername(req.user.username)) {
         await scheduleVoiceMediaRemoval(room, identity).catch(() => {});
-        return { status: 409, error: 'Voice lease is not current' };
+        return { status: 409, error: 'Voice media authorization changed during activation' };
       }
       return { ok: true };
     });

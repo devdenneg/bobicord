@@ -51,7 +51,9 @@ async function activateVoiceMediaParticipant(roomService, room, identity) {
 }
 
 async function removeVoiceMediaParticipant(roomService, room, identity, nowMs = Date.now()) {
-  const revokeTokenTs = BigInt(Math.max(0, Math.floor(nowMs / 1000)));
+  // +1 fences a token minted during the same Unix second. Media identities are epoch-scoped,
+  // so the small future cutoff can never revoke the next valid lease identity.
+  const revokeTokenTs = BigInt(Math.max(0, Math.floor(nowMs / 1000) + 1));
   return roomService.removeParticipant(room, identity, { revokeTokenTs });
 }
 
