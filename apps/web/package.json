@@ -11,9 +11,10 @@
     "test:chat-wallpaper": "node src/chatWallpaper.test.mjs",
     "test:audio-devices": "node src/audioDevices.test.mjs",
     "test:mic-lifecycle": "node src/micLifecycle.test.mjs",
+    "test:voice-media": "node src/voiceMediaIsolation.test.mjs",
     "test:auth-handoff": "node src/authSessionHandoff.test.mjs",
     "test:version-entry": "node src/versionEntry.test.mjs",
-    "build": "npm run test:links && npm run test:volume && npm run test:chat-scroll && npm run test:chat-wallpaper && npm run test:audio-devices && npm run test:mic-lifecycle && npm run test:auth-handoff && npm run test:version-entry && tsc --noEmit && vite build",
+    "build": "npm run test:links && npm run test:volume && npm run test:chat-scroll && npm run test:chat-wallpaper && npm run test:audio-devices && npm run test:mic-lifecycle && npm run test:voice-media && npm run test:auth-handoff && npm run test:version-entry && tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

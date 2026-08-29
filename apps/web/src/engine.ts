@@ -91,6 +91,15 @@ function storedFlag(key: string): boolean {
   catch { return false; } // iOS private mode / storage policy must not prevent Engine construction
 }
 
+function voiceMediaIdentityParts(identity: string): { session: string; epoch: number } | null {
+  const hash = identity.indexOf('#');
+  const tilde = identity.lastIndexOf('~');
+  if (hash < 0 || tilde <= hash + 1) return null;
+  const epoch = Number(identity.slice(tilde + 1));
+  if (!Number.isSafeInteger(epoch) || epoch < 1) return null;
+  return { session: identity.slice(hash + 1, tilde), epoch };
+}
+
 interface EngineHooks {
   toast: (text: string, kind?: 'ok' | 'warn' | 'err' | 'info') => void;
   saveSettings: (serverId: string, vols: { users: Record<string, number>; streams: Record<string, number> }) => void;
@@ -176,7 +185,13 @@ export class Engine {
   // ветви истинны. Расходятся, когда я в голосе на A и ушёл смотреть B: voiceRoom=srv:A держится,
   // viewRoom=srv:B — новый коннект. Пока (4a) держатся равными → поведение идентично.
   private viewRoom: Room | null = null;
+  // Server-wide control plane. Presence, voice ownership attributes/data and browser
+  // screen share stay here even though microphone media lives in an exact channel room.
   private voiceRoom: Room | null = null;
+  private voiceMediaRoom: Room | null = null;
+  private pendingVoiceMediaRoom: Room | null = null;
+  private voiceMediaChannelId: string | null = null;
+  private voiceMediaActivated = new WeakSet<Room>();
   private me: User;
   private members: Member[] = [];
   private hooks: EngineHooks;
@@ -185,6 +200,7 @@ export class Engine {
   private voiceConnecting = false; // оптимистично зашли в канал, но mic ещё публикуется
   private voiceEpoch = 0; // поколение пользовательского voice-intent; инвалидирует старые async join/leave/switch
   private micEpoch = 0;   // поколение mic pipeline; старый gUM/RNNoise/publish не имеет права ожить после stop/restart
+  private micStartInFlight = 0; // exact micEpoch currently owning gesture context/gUM before pipeline commit
   private micReapplyEpoch = 0; // последнее ручное переключение input/мобильного аудиомаршрута
   private connectEpoch = 0; // поколение view-connect; протухший r.connect не помечает новую комнату готовой
   private voiceLeaseEpoch = 0; // серверный ownership fence текущей локальной voice-сессии
@@ -196,6 +212,7 @@ export class Engine {
   private matchedVoiceLease: VoiceLeaseEvent | null = null; // own notify может быть единственным ack при потере HTTP response
   private voiceLeaseVerifying = false; // reconnect fence: пока snapshot не подтвердил owner, uplink всегда 0
   private voiceLeaseVerifySeq = 0;
+  private voicePermissionRecovery: { room: Room; voiceEpoch: number; deadline: number; timer: number } | null = null;
   private voiceLeaseAuditRunning = false;
   private voiceLeaseAuditTick = 0;
   private readyRooms = new WeakSet<Room>();
@@ -230,6 +247,10 @@ export class Engine {
   private micGain: GainNode | null = null;
   private micDenoise: RnnoiseWorkletNode | null = null;
   private micVadDest: MediaStreamAudioDestinationNode | null = null;
+  // Keep ownership independent of a Room publication. During A -> B channel handoff the
+  // same processed track is unpublished without stopping and published into the new room,
+  // avoiding a second getUserMedia call after the original user gesture.
+  private micLocalTrack: LocalAudioTrack | null = null;
   private micTrackCleanup: (() => void) | null = null;
   private micRecoveryTimer: number | null = null;
   private manualMute = storedFlag('voiceMute'); // персист: пред-установка «мут мика» до входа (Discord-стиль)
@@ -250,7 +271,7 @@ export class Engine {
   private streamEdgeGeneration = 0;
   private streamStateMessages = new Map<string, { messageId: number; lastAt: number; changes: number }>();
   private screenAudioEls = new Map<string, { identity: string; track: RemoteTrack; el: HTMLMediaElement }>();
-  private voiceAudioEls = new Map<string, { identity: string; track: RemoteTrack; el: HTMLMediaElement }>();
+  private voiceAudioEls = new Map<string, { room: Room; identity: string; track: RemoteTrack; el: HTMLMediaElement }>();
   private watching = new Set<string>();
   // Транспорт, которым РЕАЛЬНО открыт watch. transportFor смотрит на «кто сейчас объявлен
   // вещающим» — это состояние меняется под активным watch (напр. stream-end уже удалил
@@ -274,7 +295,7 @@ export class Engine {
   private typingUsers = new Map<string, number>(); // displayName -> expiry ts
   private lastTypingSent = 0;
 
-  private analysers = new Map<string, { an: AnalyserNode; buf: Uint8Array; hold: number; src: MediaStreamAudioSourceNode }>();
+  private analysers = new Map<string, { an: AnalyserNode; buf: Uint8Array; hold: number; src: MediaStreamAudioSourceNode; track: MediaStreamTrack }>();
   private spCtx: AudioContext | null = null;
   private spRAF: number | null = null;
   private stopIdleWatch: (() => void) | null = null; // отписка от признака «на окно не смотрят»
@@ -301,6 +322,8 @@ export class Engine {
   private voiceHint: Record<string, string> = {}; // серверный хинт {username: channelId}: состав голосовых до подъёма локальной комнаты
   private activeVoiceSessions = new Map<string, { identity: string; epoch: number }>(); // monotonic vclaim per base user
   private subscriptionRetries = new Map<string, { attempts: number; nextAt: number }>();
+  private voiceMediaRoomKeys = new WeakMap<Room, number>();
+  private voiceMediaRoomKeySeq = 0;
   private voiceOutputRoom: Room | null = null;
   private voiceOutputSink = '';
   // LiveKit 2.20 does not await WebAudio AudioContext.setSinkId inside
@@ -509,7 +532,11 @@ export class Engine {
         if (at && (!(vc in channelActiveSince) || at < channelActiveSince[vc])) channelActiveSince[vc] = at;
       }
       const inV = !!vc; // членство канала задаёт vc-атрибут, mic publication не является presence
-      const mp = p ? p.getTrackPublication(Track.Source.Microphone) : undefined;
+      // Hub deliberately has no microphone publications after media isolation. Presence and
+      // durable mute intent come from hub attributes; the instantaneous LiveKit mute edge comes
+      // from the exact channel media participant.
+      const mediaParticipant = this.viewServerId === this.voiceServerId ? this.mediaPartOf(m.username) : null;
+      const mp = mediaParticipant?.getTrackPublication(Track.Source.Microphone);
       // «оглох» (deafen) транслируется пирам participant-атрибутом deaf (как vc для голосового
       // канала) — иначе другие видят для оглохшего то же «мик выключен», что и для просто мута.
       const deaf = m.username === this.me.username ? this.deafened : !!(p as any)?.attributes?.deaf;
@@ -547,7 +574,9 @@ export class Engine {
           ? 'disconnected'
           : (this.voiceReconnecting
               ? 'reconnecting'
-              : ((this.voiceConnecting || this.voiceLeaseVerifying || !this.voiceRoom || !this.readyRooms.has(this.voiceRoom))
+              : ((this.voiceConnecting || this.voiceLeaseVerifying || !this.voiceRoom || !this.readyRooms.has(this.voiceRoom)
+                  || !this.voiceMediaRoom || !this.readyRooms.has(this.voiceMediaRoom)
+                  || !this.voiceMediaActivated.has(this.voiceMediaRoom) || this.voiceMediaChannelId !== this.currentVc)
                   ? 'connecting'
                   : 'connected')));
     return {
@@ -675,17 +704,12 @@ export class Engine {
       // строкой выше — та же защита у него уже была, тут её не хватало.
       .on(RoomEvent.ParticipantDisconnected, (p) => {
         const u = baseUid(p.identity);
-        this.clearSubscriptionRetries(p.identity);
         // Monotonic tombstone сохраняем: если после handoff новая сессия ушла, старая с меньшим
         // epoch не должна снова стать активной только потому, что всё ещё висит participant'ом.
         if (r === this.viewRoom && u !== this.me.username && !this.hasOtherSession(u, p.identity)) this.cleanupPeer(u);
         if (r === this.voiceRoom) { this.reconcileUserAudio(u); this.reconcileChannelSounds(); }
         this.emit();
       })
-      // звук мута слышен только самому мутящемуся — играем при локальном событии МОЕГО голосового трека
-      // micRestarting — пересъём мика watchdog-ом: пере-публикация в муте не должна щёлкать пользователю
-      // «мут/размут», он ничего не нажимал (симптом «микрофон сам включается и выключается»).
-      .on(RoomEvent.TrackMuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.voiceRoom?.localParticipant && !this.deafToggling && !this.micRestarting) playSound('mute'); this.emit(); })
       .on(RoomEvent.Reconnecting, () => {
         if (r !== this.viewRoom && r !== this.voiceRoom) return;
         this.reconnectingRooms.add(r);
@@ -706,7 +730,7 @@ export class Engine {
         if (r !== this.viewRoom && r !== this.voiceRoom) return;
         this.reconnectingRooms.delete(r);
         this.reconnecting = this.reconnectingRooms.size > 0;
-        if (r === this.voiceRoom) this.voiceReconnecting = false;
+        if (r === this.voiceRoom) this.voiceReconnecting = !!this.voiceMediaRoom && this.reconnectingRooms.has(this.voiceMediaRoom);
         // Reconnect восстанавливает ТЕКУЩИЙ intent, но не делает новый vclaim: старый ПК, который был
         // offline во время handoff на телефон, не имеет права самовольно отобрать голос обратно.
         if (r === this.voiceRoom && this.inVoice && this.currentVc) {
@@ -721,26 +745,8 @@ export class Engine {
         this.hooks.toast('Связь восстановлена', 'ok'); this.emit();
       })
       .on(RoomEvent.Disconnected, () => this.handleRoomDisconnected(r, serverId))
-      // размут мика слышен только самому; при оглушении звук даёт toggleDeaf, тут глушим
-      .on(RoomEvent.TrackUnmuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.voiceRoom?.localParticipant && !this.deafToggling && !this.micRestarting) playSound('unmute'); this.emit(); })
-      // качество/пинг — метрика ГОЛОСОВОГО соединения (voiceRoom)
-      .on(RoomEvent.ConnectionQualityChanged, (q, p) => { if (r === this.voiceRoom && p === r.localParticipant) { this.connQuality = mapQuality(q); this.emit(); } })
       .on(RoomEvent.AudioPlaybackStatusChanged, () => {
         if (r === this.viewRoom || r === this.voiceRoom) this.ensureRemoteAudioPlayback();
-        if (r === this.voiceRoom) this.ensureVoiceAudioRunning();
-      })
-      .on(RoomEvent.TrackPublished, (pub, p) => { if (r === this.voiceRoom) this.onRemotePub(pub, p); })
-      .on(RoomEvent.TrackUnpublished, (pub, p) => {
-        if (r !== this.voiceRoom) return;
-        this.clearSubscriptionRetries(p.identity, (pub as any).trackSid || (pub as any).sid);
-        this.onRemoteUnpub(pub, p);
-      })
-      .on(RoomEvent.TrackSubscriptionFailed, (trackSid, p) => {
-        if (r !== this.voiceRoom) return;
-        const key = `${p.identity}:${trackSid}`;
-        const retry = this.subscriptionRetries.get(key) || { attempts: 0, nextAt: 0 };
-        retry.nextAt = 0; this.subscriptionRetries.set(key, retry);
-        this.reconcilePeerAudio(p);
       })
       // пир сменил vc → пере-подписка на его микрофон, только в voiceRoom (в viewRoom чужого сервера
       // микрофоны не слушаю). Дисплей ростера обновляет emit() (build читает vc из соответствующей комнаты).
@@ -757,8 +763,8 @@ export class Engine {
     const isView = this.viewRoom === r && this.viewServerId === serverId && (connectEpoch === this.connectEpoch || isVoice);
     if (!isView && !isVoice) { this.disconnectRoom(r); return; }
     if (isView) this.roomReady = true; // только ТЕКУЩАЯ смотримая комната снимает skeleton
-    // voiceRoom: подписка на уже опубликованные микрофоны (bootstrap). viewRoom: ре-энумерация стримов.
-    if (isVoice) r.remoteParticipants.forEach((p) => { this.observeVoiceSession(p); p.trackPublications.forEach((pub) => this.onRemotePub(pub, p, true)); });
+    // Hub bootstraps ownership/roster only. Microphone publications live in voiceMediaRoom.
+    if (isVoice) r.remoteParticipants.forEach((p) => this.observeVoiceSession(p));
     if (isView) { this.liveKitT.onRoomConnected(); this.treeT.onRoomConnected(); }
     // ОДИН engine-таймер на оба соединения (методы внутри бьют в нужную комнату: announceWatch/reconcile/
     // selfHeal сами выбирают view/voice). connect зовётся на каждую смену смотримого сервера → чистим
@@ -769,18 +775,253 @@ export class Engine {
     if (isTauri) { if (this.gameTimer) clearInterval(this.gameTimer); this.pollGame(); this.gameTimer = window.setInterval(() => this.pollGame(), 10000); }
     this.emit();
   }
-  private async verifyVoiceLeaseAfterReconnect(room: Room, voiceEpoch: number, verifySeq: number) {
+  private createVoiceMediaRoom(): Room {
+    const outputCtx = this.getOutputContext();
+    return new Room({
+      adaptiveStream: true,
+      dynacast: false,
+      webAudioMix: outputCtx ? { audioContext: outputCtx } : true,
+      // Engine owns the processed microphone pipeline. Server-side lease eviction during a
+      // channel handoff must not stop its MediaStreamTrack before it can be republished.
+      stopLocalTrackOnUnpublish: false,
+      publishDefaults: { dtx: true, red: true, simulcast: false, audioPreset: AudioPresets.musicHighQuality },
+    });
+  }
+  private mediaPermissionsActive(room: Room): boolean {
+    const permissions = room.localParticipant.permissions;
+    return permissions?.canPublish === true && permissions?.canSubscribe === true;
+  }
+  private waitVoiceMediaPermissions(room: Room, current: () => boolean, timeoutMs = 5000): Promise<boolean> {
+    if (this.mediaPermissionsActive(room)) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        window.clearInterval(poll);
+        window.clearTimeout(timeout);
+        room.off(RoomEvent.ParticipantPermissionsChanged, changed);
+        resolve(ok);
+      };
+      const changed = () => {
+        if (!current()) finish(false);
+        else if (this.mediaPermissionsActive(room)) finish(true);
+      };
+      room.on(RoomEvent.ParticipantPermissionsChanged, changed);
+      const poll = window.setInterval(changed, 50);
+      const timeout = window.setTimeout(() => finish(false), timeoutMs);
+      changed();
+    });
+  }
+  private beginVoicePermissionRecovery(room: Room, voiceEpoch: number, deadline = Date.now() + 20_000): number {
+    const existing = this.voicePermissionRecovery;
+    if (existing && existing.room === room && existing.voiceEpoch === voiceEpoch) return existing.deadline;
+    this.clearVoicePermissionRecovery();
+    const recovery = { room, voiceEpoch, deadline, timer: 0 };
+    this.voicePermissionRecovery = recovery;
+    recovery.timer = window.setTimeout(() => {
+      if (this.voicePermissionRecovery !== recovery) return;
+      this.voicePermissionRecovery = null;
+      // The timer is independent from LiveKit reconnect events and verifier generations. Even if
+      // either room reconnects and replaces verifySeq, revoked permissions cannot stay pending.
+      if (this.voiceMediaRoom === room && this.voiceEpoch === voiceEpoch && this.inVoice) void this.leaveVoice();
+    }, Math.max(0, recovery.deadline - Date.now()));
+    return recovery.deadline;
+  }
+  private clearVoicePermissionRecovery(room?: Room, voiceEpoch?: number) {
+    const recovery = this.voicePermissionRecovery;
+    if (!recovery || (room && recovery.room !== room) || (voiceEpoch != null && recovery.voiceEpoch !== voiceEpoch)) return;
+    window.clearTimeout(recovery.timer);
+    this.voicePermissionRecovery = null;
+  }
+  private wireVoiceMediaRoom(room: Room, serverId: string, channelId: string) {
+    room.on(RoomEvent.TrackSubscribed, (track, pub, p) => this.onSub(track, pub, p, room))
+      .on(RoomEvent.TrackUnsubscribed, (track, pub, p) => this.onUnsub(track, pub, p, room))
+      .on(RoomEvent.ParticipantConnected, (p) => {
+        if (room === this.voiceMediaRoom && this.voiceMediaChannelId === channelId) this.reconcileUserAudio(baseUid(p.identity));
+        this.emit();
+      })
+      .on(RoomEvent.ParticipantDisconnected, (p) => {
+        this.clearSubscriptionRetries(p.identity, undefined, room);
+        this.removeVoiceAudio(baseUid(p.identity), p.identity, undefined, room);
+        if (room === this.voiceMediaRoom && this.voiceMediaChannelId === channelId) this.reconcileUserAudio(baseUid(p.identity));
+        this.emit();
+      })
+      .on(RoomEvent.TrackMuted, (pub, p) => {
+        if (room === this.voiceMediaRoom && this.inVoice && pub.source === Track.Source.Microphone
+          && p === room.localParticipant && !this.deafToggling && !this.micRestarting) playSound('mute');
+        this.emit();
+      })
+      .on(RoomEvent.TrackUnmuted, (pub, p) => {
+        if (room === this.voiceMediaRoom && this.inVoice && pub.source === Track.Source.Microphone
+          && p === room.localParticipant && !this.deafToggling && !this.micRestarting) playSound('unmute');
+        this.emit();
+      })
+      .on(RoomEvent.Reconnecting, () => {
+        if (room !== this.voiceMediaRoom || this.voiceMediaChannelId !== channelId || this.currentVc !== channelId || !this.inVoice) return;
+        this.voiceMediaActivated.delete(room);
+        this.reconnectingRooms.add(room); this.reconnecting = true;
+        this.voiceReconnecting = true; this.pttDown = false; this.voiceLeaseVerifying = true;
+        ++this.voiceLeaseVerifySeq;
+        this.applyGate();
+        this.hooks.toast('Голосовая связь потеряна — переподключаюсь…', 'warn'); this.emit();
+      })
+      .on(RoomEvent.Reconnected, () => {
+        this.reconnectingRooms.delete(room); this.reconnecting = this.reconnectingRooms.size > 0;
+        if (room !== this.voiceMediaRoom || this.voiceMediaChannelId !== channelId || this.currentVc !== channelId || !this.inVoice || !this.voiceRoom) return;
+        this.pttDown = false;
+        this.voiceReconnecting = !!this.voiceRoom && this.reconnectingRooms.has(this.voiceRoom);
+        this.voiceLeaseVerifying = true;
+        const verifySeq = ++this.voiceLeaseVerifySeq;
+        this.applyGate();
+        void this.verifyVoiceLeaseAfterReconnect(this.voiceRoom, this.voiceEpoch, verifySeq, room);
+        this.emit();
+      })
+      .on(RoomEvent.Disconnected, () => this.handleVoiceMediaDisconnected(room, serverId, channelId))
+      .on(RoomEvent.ConnectionQualityChanged, (q, p) => {
+        if (room === this.voiceMediaRoom && p === room.localParticipant) { this.connQuality = mapQuality(q); this.emit(); }
+      })
+      .on(RoomEvent.AudioPlaybackStatusChanged, () => {
+        if (room === this.voiceMediaRoom) { this.ensureRemoteAudioPlayback(); this.ensureVoiceAudioRunning(); }
+      })
+      .on(RoomEvent.TrackPublished, (pub, p) => {
+        if (room === this.voiceMediaRoom) this.onRemotePub(pub, p, room);
+      })
+      .on(RoomEvent.TrackUnpublished, (pub, p) => {
+        this.clearSubscriptionRetries(p.identity, (pub as any).trackSid || (pub as any).sid, room);
+        if (room === this.voiceMediaRoom) this.onRemoteUnpub(pub, p, room);
+      })
+      .on(RoomEvent.TrackSubscriptionFailed, (trackSid, p) => {
+        if (room !== this.voiceMediaRoom) return;
+        const key = `${this.voiceMediaRoomKey(room)}\n${p.identity}:${trackSid}`;
+        const retry = this.subscriptionRetries.get(key) || { attempts: 0, nextAt: 0 };
+        retry.nextAt = 0; this.subscriptionRetries.set(key, retry);
+        this.reconcilePeerAudio(p, room);
+      })
+      .on(RoomEvent.ParticipantAttributesChanged, (_changed, p) => {
+        if (room === this.voiceMediaRoom && p !== room.localParticipant) this.reconcileUserAudio(baseUid(p.identity));
+        this.emit();
+      })
+      .on(RoomEvent.ParticipantPermissionsChanged, (_previous, p) => {
+        if (p !== room.localParticipant || room !== this.voiceMediaRoom || this.voiceMediaChannelId !== channelId
+          || !this.inVoice || this.mediaPermissionsActive(room)) return;
+        const exactCurrentChannel = this.currentVc === channelId;
+        const hub = this.voiceRoom;
+        this.voiceMediaActivated.delete(room);
+        this.voiceLeaseVerifying = true;
+        this.pttDown = false;
+        const verifySeq = ++this.voiceLeaseVerifySeq;
+        const deadline = this.beginVoicePermissionRecovery(room, this.voiceEpoch);
+        // Permission revocation is authoritative and must fail closed before any HTTP recovery:
+        // stop receiving immediately and discard already attached audio from the revoked room.
+        this.subscriptionRetries.clear();
+        this.reconcileAllAudio();
+        this.clearVoiceAudio();
+        this.applyGate();
+        this.emit();
+        // During A -> B the active pointer still references room A while currentVc already carries
+        // B. Keep A fail-closed and retain its absolute deadline, but do not run an A verifier against
+        // B intent. Ticket rollback below will resume exact-A verification; successful switch clears it.
+        if (!exactCurrentChannel) return;
+        if (!hub) { void this.leaveVoice(); return; }
+        // A current lease is re-activated; a stale lease exits. Unlike ordinary network reconnect,
+        // permission recovery is bounded so a revoked participant cannot remain verifying forever.
+        void this.verifyVoiceLeaseAfterReconnect(hub, this.voiceEpoch, verifySeq, room, deadline);
+      });
+  }
+  private async activateVoiceMediaRoom(room: Room, hub: Room, voiceEpoch: number, serverId: string, channelId: string): Promise<boolean> {
+    const session = this.sessionId(hub);
+    const leaseEpoch = this.voiceLeaseEpoch;
+    if (!session || leaseEpoch < 1 || !this.voiceIntentCurrent(voiceEpoch, hub, channelId)) return false;
+    const current = () => this.voiceIntentCurrent(voiceEpoch, hub, channelId)
+      && (this.pendingVoiceMediaRoom === room || this.voiceMediaRoom === room);
+    const deadline = Date.now() + 10_000;
+    let attempt = 0;
+    // A previous lease participant is removed durably. During a rapid switch/takeover the server
+    // can reject activation while that removal is still closing; the join-only grant keeps this
+    // room fail-closed, so bounded retry is safe and avoids forcing an unnecessary leave.
+    while (current() && Date.now() < deadline) {
+      try {
+        const activated = await api.activateVoiceMedia(session, serverId, channelId, leaseEpoch);
+        if (!current() || activated.room !== room.name || activated.epoch !== leaseEpoch) return false;
+        if (await this.waitVoiceMediaPermissions(room, current, Math.min(2000, Math.max(250, deadline - Date.now())))) {
+          if (!current()) return false;
+          this.voiceMediaActivated.add(room);
+          return true;
+        }
+      } catch { /** bounded exact-intent retry below */ }
+      if (!current()) return false;
+      const delay = Math.min(1500, 200 * (2 ** Math.min(attempt++, 3)));
+      await new Promise((resolve) => window.setTimeout(resolve, Math.min(delay, Math.max(0, deadline - Date.now()))));
+    }
+    return false;
+  }
+  private async connectVoiceMediaRoom(hub: Room, voiceEpoch: number, serverId: string, channelId: string): Promise<Room | null> {
+    const session = this.sessionId(hub);
+    const leaseEpoch = this.voiceLeaseEpoch;
+    if (!session || leaseEpoch < 1 || !this.voiceIntentCurrent(voiceEpoch, hub, channelId)) return null;
+    let token;
+    try { token = await api.getVoiceMediaToken(session, serverId, channelId, leaseEpoch); }
+    catch { return null; }
+    if (!this.voiceIntentCurrent(voiceEpoch, hub, channelId) || token.epoch !== leaseEpoch
+      || token.identity !== `${hub.localParticipant.identity}~${leaseEpoch}` || !token.token || !token.url || !token.room) return null;
+    const room = this.createVoiceMediaRoom();
+    const previousPending = this.pendingVoiceMediaRoom;
+    if (previousPending && previousPending !== room) this.disconnectRoom(previousPending);
+    this.pendingVoiceMediaRoom = room;
+    this.wireVoiceMediaRoom(room, serverId, channelId);
+    try {
+      await room.connect(token.url, token.token, { autoSubscribe: false });
+      this.readyRooms.add(room);
+      if (this.pendingVoiceMediaRoom !== room || !this.voiceIntentCurrent(voiceEpoch, hub, channelId)) throw new Error('stale voice media connect');
+      if (!await this.activateVoiceMediaRoom(room, hub, voiceEpoch, serverId, channelId)) throw new Error('voice media activation failed');
+      return room;
+    } catch {
+      this.readyRooms.delete(room); this.voiceMediaActivated.delete(room);
+      if (this.pendingVoiceMediaRoom === room) this.pendingVoiceMediaRoom = null;
+      this.disconnectRoom(room);
+      return null;
+    }
+  }
+  private async verifyVoiceLeaseAfterReconnect(
+    room: Room,
+    voiceEpoch: number,
+    verifySeq: number,
+    mediaRoom?: Room,
+    failClosedDeadline?: number,
+  ) {
     let failures = 0;
+    const recovery = this.voicePermissionRecovery;
+    const inheritedDeadline = recovery && recovery.voiceEpoch === voiceEpoch
+      && recovery.room === (mediaRoom || this.voiceMediaRoom) ? recovery.deadline : undefined;
+    const deadline = failClosedDeadline == null
+      ? inheritedDeadline
+      : inheritedDeadline == null ? failClosedDeadline : Math.min(failClosedDeadline, inheritedDeadline);
+    const expire = async (): Promise<boolean> => {
+      if (deadline == null || Date.now() < deadline) return false;
+      if (this.voiceLeaseVerifySeq === verifySeq && this.voiceIntentCurrent(voiceEpoch, room)) await this.leaveVoice();
+      return true;
+    };
+    const retry = async (delay: number): Promise<boolean> => {
+      if (await expire()) return false;
+      const boundedDelay = deadline == null
+        ? delay
+        : Math.min(delay, Math.max(0, deadline - Date.now()));
+      await new Promise((resolve) => window.setTimeout(resolve, boundedDelay));
+      return !await expire();
+    };
     while (this.voiceLeaseVerifySeq === verifySeq && this.voiceIntentCurrent(voiceEpoch, room)) {
+      if (await expire()) return;
       let event: VoiceLeaseEvent;
       try { event = await api.getVoiceLease(); }
       catch {
         failures++;
         if (failures === 3) this.hooks.toast('Проверяю голосовую сессию — микрофон пока в тишине', 'warn');
-        await new Promise((resolve) => window.setTimeout(resolve, Math.min(5000, 500 * (2 ** Math.min(failures, 4)))));
+        if (!await retry(Math.min(5000, 500 * (2 ** Math.min(failures, 4))))) return;
         continue;
       }
       if (this.voiceLeaseVerifySeq !== verifySeq || !this.voiceIntentCurrent(voiceEpoch, room)) return;
+      if (await expire()) return;
       this.onVoiceLease(event);
       if (!this.voiceIntentCurrent(voiceEpoch, room)) return; // другой owner/release уже запустил leave
       const serverId = this.voiceServerId, channelId = this.currentVc;
@@ -788,14 +1029,34 @@ export class Engine {
         await this.leaveVoice();
         return;
       }
+      const activeMedia = this.voiceMediaRoom;
+      if (!activeMedia || this.voiceMediaChannelId !== channelId || !this.readyRooms.has(activeMedia)
+        || (mediaRoom && mediaRoom !== activeMedia)) {
+        await this.leaveVoice();
+        return;
+      }
+      if (!this.voiceMediaActivated.has(activeMedia)
+        && !await this.activateVoiceMediaRoom(activeMedia, room, voiceEpoch, serverId, channelId)) {
+        failures++;
+        if (!await retry(Math.min(5000, 400 * (2 ** Math.min(failures, 4))))) return;
+        continue;
+      }
       if (!this.myVcAt) this.myVcAt = this.channelStartFor(channelId);
       // Не открываем uplink раньше, чем сервер комнаты подтвердил актуальные voice-атрибуты.
       if (!await this.commitVoiceAttributes(room, voiceEpoch, channelId)) {
         failures++;
-        await new Promise((resolve) => window.setTimeout(resolve, Math.min(5000, 400 * (2 ** Math.min(failures, 4)))));
+        if (!await retry(Math.min(5000, 400 * (2 ** Math.min(failures, 4))))) return;
         continue;
       }
       if (this.voiceLeaseVerifySeq !== verifySeq || !this.voiceIntentCurrent(voiceEpoch, room, channelId)) return;
+      if (this.micLocalTrack && !activeMedia.localParticipant.getTrackPublication(Track.Source.Microphone)?.track
+        && !await this.publishExistingMic(activeMedia, voiceEpoch, room, channelId)) {
+        failures++;
+        if (!await retry(Math.min(3000, 300 * (2 ** Math.min(failures, 3))))) return;
+        continue;
+      }
+      if (await expire()) return;
+      this.clearVoicePermissionRecovery(activeMedia, voiceEpoch);
       this.voiceLeaseVerifying = false;
       this.reconcileAllAudio();
       this.applyGate();
@@ -803,6 +1064,47 @@ export class Engine {
       this.emit();
       return;
     }
+  }
+  private async handleVoiceMediaDisconnected(room: Room, serverId: string, channelId: string) {
+    this.readyRooms.delete(room); this.voiceMediaActivated.delete(room);
+    this.reconnectingRooms.delete(room); this.reconnecting = this.reconnectingRooms.size > 0;
+    if (this.intentionalDisconnects.has(room)) { this.intentionalDisconnects.delete(room); return; }
+    if (this.pendingVoiceMediaRoom === room) this.pendingVoiceMediaRoom = null;
+    if (room !== this.voiceMediaRoom || this.voiceMediaChannelId !== channelId || this.currentVc !== channelId) return;
+    const hub = this.voiceRoom;
+    const lostServer = this.voiceServerId || serverId;
+    const epoch = ++this.voiceEpoch;
+    const leaseSession = this.voiceLeaseSession, leaseEpoch = this.voiceLeaseEpoch;
+    this.voiceMediaRoom = null; this.voiceMediaChannelId = null;
+    this.voiceClaimPending = 0; this.deferredVoiceLease = null; this.matchedVoiceLease = null;
+    this.voiceLeaseVerifying = false; ++this.voiceLeaseVerifySeq;
+    this.clearVoicePermissionRecovery();
+    this.voiceLeaseSession = ''; this.voiceLeaseChannel = ''; this.voiceLeaseEpoch = 0;
+    this.voiceReconnecting = false; this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.pttDown = false;
+    this.myVcAt = null; this.noMic = false; this.myChannelPeers.clear();
+    this.lostVoiceServerId = lostServer; this.lostVoiceChannel = channelId;
+    this.stopConnPoll(); this.subscriptionRetries.clear();
+    this.voiceOutputRoom = null; this.voiceOutputSink = ''; this.voiceOutputPending = null;
+    this.clearVoiceAudio();
+    const micStop = this.stopMic(room);
+    const attrStop = hub ? this.commitVoiceTombstone(hub, epoch) : Promise.resolve();
+    // Keep the account and viewed hub alive. Broadcast still follows the existing product
+    // contract (voice loss ends it), but is stopped explicitly in the hub rather than by
+    // disconnecting an otherwise healthy view room.
+    const shareStop = this.stopShare().catch(() => {});
+    this.hooks.endBroadcast?.();
+    if (leaseSession && leaseEpoch > 0) void api.releaseVoiceLease(leaseSession, leaseEpoch).catch(() => {});
+    this.hooks.toast('Голосовая связь оборвалась — подключись снова', 'warn'); this.emit();
+    this.hooks.connectionLost?.(lostServer, channelId, false);
+    await Promise.allSettled([micStop, attrStop, shareStop]);
+    // A new join can start while the captured hub teardown is awaiting attributes/share. Always
+    // retire an old hub that no longer owns either role, but never clear or disconnect new pointers.
+    if (hub && hub !== this.viewRoom && hub !== this.voiceRoom) this.disconnectRoom(hub);
+    if (this.voiceEpoch !== epoch || this.inVoice || this.voiceRoom !== hub) return;
+    if (hub && hub !== this.viewRoom) this.disconnectRoom(hub);
+    this.voiceRoom = null; this.voiceServerId = null;
+    this.liveKitT.setBroadcastRoom?.(null);
+    this.emit();
   }
   private handleRoomDisconnected(room: Room, serverId: string) {
     if (this.intentionalDisconnects.has(room)) { this.intentionalDisconnects.delete(room); return; }
@@ -814,12 +1116,18 @@ export class Engine {
     this.reconnectingRooms.delete(room);
     this.reconnecting = this.reconnectingRooms.size > 0;
     if (wasVoice) {
+      const media = this.voiceMediaRoom;
+      const pendingMedia = this.pendingVoiceMediaRoom;
+      this.voiceMediaRoom = null; this.pendingVoiceMediaRoom = null; this.voiceMediaChannelId = null;
+      if (media) { this.voiceMediaActivated.delete(media); this.disconnectRoom(media); }
+      if (pendingMedia && pendingMedia !== media) this.disconnectRoom(pendingMedia);
       this.voiceReconnecting = false;
       this.lostVoiceServerId = lostChannel ? (this.voiceServerId || serverId) : null;
       this.lostVoiceChannel = lostChannel;
       ++this.voiceEpoch;
       this.voiceClaimPending = 0; this.deferredVoiceLease = null; this.matchedVoiceLease = null;
       this.voiceLeaseVerifying = false; ++this.voiceLeaseVerifySeq;
+      this.clearVoicePermissionRecovery();
       this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.pttDown = false;
       this.myVcAt = null; this.noMic = false; this.myChannelPeers.clear();
       // Terminal network loss не release'ит серверный lease (reconnect = observation only), но
@@ -828,17 +1136,12 @@ export class Engine {
       this.stopConnPoll();
       this.subscriptionRetries.clear();
       this.voiceOutputRoom = null; this.voiceOutputSink = ''; this.voiceOutputPending = null;
-      void this.stopMic(room);
+      void this.stopMic(media);
       // Терминальный обрыв LiveKit не проходит через leaveVoice(), поэтому нативный
       // broadcaster иначе продолжал бы жить после потери голосовой комнаты.
       // Остановка локальной трансляции не отзывает аккаунтную сессию и не влияет на
       // просмотр других серверов.
       this.hooks.endBroadcast?.();
-      room.remoteParticipants.forEach((p) => {
-        const pub = p.getTrackPublication(Track.Source.Microphone);
-        if (pub) { try { (pub as any).setSubscribed(false); } catch { /**/ } }
-        this.detachAnalyser(baseUid(p.identity));
-      });
       document.querySelectorAll('#audioSink audio[data-origin="voice"]').forEach((a) => a.remove());
       this.clearVoiceAudio();
       this.voiceRoom = null; this.voiceServerId = null;
@@ -901,7 +1204,10 @@ export class Engine {
     this.resetStreamEdges();
     this.voiceClaimPending = 0; this.deferredVoiceLease = null; this.matchedVoiceLease = null;
     this.voiceLeaseVerifying = false; ++this.voiceLeaseVerifySeq;
+    this.clearVoicePermissionRecovery();
     const oldVoiceRoom = this.voiceRoom;
+    const oldVoiceMediaRoom = this.voiceMediaRoom;
+    const oldPendingVoiceMediaRoom = this.pendingVoiceMediaRoom;
     const leaseSession = this.voiceLeaseSession, leaseEpoch = this.voiceLeaseEpoch;
     this.voiceLeaseSession = ''; this.voiceLeaseChannel = ''; this.voiceLeaseEpoch = 0;
     if (leaseSession && leaseEpoch > 0) void api.releaseVoiceLease(leaseSession, leaseEpoch).catch(() => {});
@@ -927,17 +1233,19 @@ export class Engine {
     this.subscriptionRetries.clear();
     this.voiceOutputRoom = null; this.voiceOutputSink = ''; this.voiceOutputPending = null;
     if (this.outputDeviceTimer) { clearTimeout(this.outputDeviceTimer); this.outputDeviceTimer = null; }
-    void this.stopMic(oldVoiceRoom);
+    void this.stopMic(oldVoiceMediaRoom);
     this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.voiceReconnecting = false; this.lostVoiceServerId = null; this.lostVoiceChannel = null; this.roomReady = false; this.screenStream = null; this.noMic = false; // deafened/manualMute НЕ трогаем — персист-интент
-    // рвём ОБЕ комнаты (при расцепе разные; при shared — одна, Set схлопнёт дубль)
-    new Set([this.viewRoom, this.voiceRoom].filter(Boolean)).forEach((rm) => this.disconnectRoom(rm as Room));
+    // Hub/view and active/pending media can all be distinct during a channel handoff.
+    new Set([this.viewRoom, this.voiceRoom, oldVoiceMediaRoom, oldPendingVoiceMediaRoom].filter(Boolean)).forEach((rm) => this.disconnectRoom(rm as Room));
     // These contexts are supplied by Engine (not owned by LiveKit), so room.disconnect() does not
     // close them. Mobile Safari has a low AudioContext limit: leaking one set per logout eventually
     // makes microphone/output creation fail until the whole PWA is killed.
     const contexts = [this.spCtx, this.outputCtx, this.keepCtx].filter(Boolean) as AudioContext[];
     this.spCtx = null; this.outputCtx = null; this.keepCtx = null; this.outputGeneration++;
     contexts.forEach((ctx) => { if (ctx.state !== 'closed') void ctx.close().catch(() => {}); });
-    this.viewRoom = null; this.voiceRoom = null; this.viewServerId = ''; this.voiceServerId = null; this.emit();
+    this.viewRoom = null; this.voiceRoom = null; this.voiceMediaRoom = null; this.pendingVoiceMediaRoom = null; this.voiceMediaChannelId = null;
+    this.liveKitT.setBroadcastRoom?.(null);
+    this.viewServerId = ''; this.voiceServerId = null; this.emit();
   }
 
   // Уйти со СМОТРИМОГО сервера (браузинг на другой / на главную-с-выходом), НЕ трогая голос: чистим
@@ -1010,6 +1318,35 @@ export class Engine {
     }
     return best;
   }
+  // Media rooms are server-authorized and contain one voice channel only. Do not reuse `partOf`:
+  // its ranking intentionally consumes hub vc/mic attributes, while media participants carry
+  // immutable token attributes and can overlap briefly during a multi-device handoff.
+  private mediaPartOf(username: string, room: Room | null = this.voiceMediaRoom): Participant | null {
+    if (!room || room !== this.voiceMediaRoom || this.voiceMediaChannelId !== this.currentVc) return null;
+    if (username === this.me.username) return room.localParticipant;
+    const claimed = this.activeVoiceSessions.get(username);
+    let best: Participant | null = null;
+    let bestEpoch = 0;
+    for (const p of room.remoteParticipants.values()) {
+      if (baseUid(p.identity) !== username) continue;
+      const attrs = (p as any).attributes || {};
+      const identity = voiceMediaIdentityParts(p.identity);
+      if (!identity) continue;
+      const epoch = Number(attrs.voiceEpoch);
+      if (String(attrs.voiceServer || '') !== this.voiceServerId || String(attrs.voiceChannel || '') !== this.currentVc
+        || String(attrs.voiceSession || '') !== identity.session || !Number.isSafeInteger(epoch) || epoch < 1
+        || epoch !== identity.epoch) continue;
+      if (claimed) {
+        const claimedHash = claimed.identity.indexOf('#');
+        const claimedSession = claimedHash < 0 ? claimed.identity : claimed.identity.slice(claimedHash + 1);
+        if (epoch < claimed.epoch || (epoch === claimed.epoch && identity.session !== claimedSession)) continue;
+      }
+      if (!best || epoch > bestEpoch || (epoch === bestEpoch && p.identity > best.identity)) {
+        best = p; bestEpoch = epoch;
+      }
+    }
+    return best;
+  }
   private observeVoiceSession(p: Participant) {
     const attrs = (p as any).attributes || {};
     const identitySession = p.identity.includes('#') ? p.identity.slice(p.identity.indexOf('#') + 1) : p.identity;
@@ -1076,7 +1413,10 @@ export class Engine {
         // завершает арбитраж: параллельное устройство способно получить следующий epoch. До finishVoiceClaim
         // держим атрибуты пустыми, а микрофон — в тишине.
         if (this.voiceClaimPending !== this.voiceEpoch) {
-          if (this.voiceRoom) void this.setVoiceAttributes(this.voiceRoom, this.wantedVoiceAttributes(this.voiceRoom));
+          if (this.voiceRoom && this.voiceMediaRoom && this.voiceMediaChannelId === this.currentVc
+            && this.voiceMediaActivated.has(this.voiceMediaRoom)) {
+            void this.setVoiceAttributes(this.voiceRoom, this.wantedVoiceAttributes(this.voiceRoom));
+          }
           this.applyGate();
         }
       } else if (this.inVoice && lease.epoch >= this.voiceLeaseEpoch) {
@@ -1104,9 +1444,8 @@ export class Engine {
     return false;
   }
   private isInVoice(username: string): boolean {
-    const p = this.partOf(username); if (!p) return false;
-    if (p === this.viewRoom!.localParticipant) return this.inVoice;
-    return !!p.getTrackPublication(Track.Source.Microphone);
+    if (username === this.me.username) return this.inVoice;
+    return !!this.voiceChannelOf(username);
   }
   // голосовой канал участника: для себя — currentVc, для пира — participant-атрибут vc
   private voiceChannelOf(username: string): string | null {
@@ -1130,20 +1469,22 @@ export class Engine {
     });
     return Number.isFinite(min) ? min : Date.now();
   }
-  // подписка на микрофон пира только когда я в голосовом и мы в ОДНОМ канале (изоляция звука по каналам)
-  private reconcilePeerAudio(p: Participant) {
-    if (!this.voiceRoom || p === this.voiceRoom.localParticipant) return;
+  // The media room itself is the authorization boundary. Client filtering remains only for
+  // deafen, own-account echo suppression and monotonic multi-device session selection.
+  private reconcilePeerAudio(p: Participant, room: Room | null = this.voiceMediaRoom) {
+    if (!room || room !== this.voiceMediaRoom || p === room.localParticipant) return;
     const username = baseUid(p.identity);
     if (username === this.me.username) return; // своя же другая сессия — не подписываемся (эхо)
     const mp = p.getTrackPublication(Track.Source.Microphone);
-    if (!mp) return;
+    if (!mp) { this.removeVoiceAudio(username, p.identity, undefined, room); return; }
     // ОГЛОХ (deafened) → НЕ подписываемся: нет трека = гарантированная тишина, независимо от громкости.
     // Иначе оглохший оставался подписан, а глушение по громкости могло не примениться (пир размутился →
     // resubscribe без re-apply громкости → слышно, хотя фулл-мут).
-    const active = this.partOf(username, this.voiceRoom);
-    const want = p === active && this.inVoice && !this.deafened && !!this.currentVc && (p as any).attributes?.vc === this.currentVc;
+    const active = this.mediaPartOf(username, room);
+    const want = p === active && this.inVoice && !this.deafened && !!this.currentVc
+      && this.voiceMediaChannelId === this.currentVc && this.voiceMediaActivated.has(room);
     const remotePub = mp as any;
-    const retryKey = `${p.identity}:${remotePub.trackSid || remotePub.sid || 'mic'}`;
+    const retryKey = `${this.voiceMediaRoomKey(room)}\n${p.identity}:${remotePub.trackSid || remotePub.sid || 'mic'}`;
     try {
       // setSubscribed всегда шлёт сигналинг update; прежний 3с reconcile флудил одинаковым true
       // по каждому mic. Меняем desired только при реальном переходе состояния.
@@ -1168,24 +1509,31 @@ export class Engine {
     if (!want) {
       const currentAudio = this.voiceAudioEls.get(username);
       // Обход inactive старой session не должен снести element/analyser активной новой session.
-      if (!currentAudio || currentAudio.identity === p.identity) {
-        this.removeVoiceAudio(username, p.identity);
-        this.detachAnalyser(username);
-      }
+      if (!currentAudio || (currentAudio.room === room && currentAudio.identity === p.identity))
+        this.removeVoiceAudio(username, p.identity, undefined, room);
     }
     else if ((mp as any).track) this.ensureRemoteVoicePlayback(username);
   }
-  private clearSubscriptionRetries(identity?: string, trackSid?: string) {
+  private clearSubscriptionRetries(identity?: string, trackSid?: string, room?: Room) {
     if (!identity) { this.subscriptionRetries.clear(); return; }
-    const exact = trackSid ? `${identity}:${trackSid}` : '';
-    const prefix = `${identity}:`;
+    const roomPrefix = room ? `${this.voiceMediaRoomKey(room)}\n` : '';
+    const exact = trackSid ? `${roomPrefix}${identity}:${trackSid}` : '';
+    const prefix = `${roomPrefix}${identity}:`;
     for (const key of this.subscriptionRetries.keys()) {
       if ((exact && key === exact) || (!exact && key.startsWith(prefix))) this.subscriptionRetries.delete(key);
     }
   }
-  private reconcileAllAudio() { this.voiceRoom?.remoteParticipants.forEach((p) => this.reconcilePeerAudio(p)); }
+  private voiceMediaRoomKey(room: Room): number {
+    const existing = this.voiceMediaRoomKeys.get(room);
+    if (existing) return existing;
+    const next = ++this.voiceMediaRoomKeySeq;
+    this.voiceMediaRoomKeys.set(room, next);
+    return next;
+  }
+  private reconcileAllAudio() { this.voiceMediaRoom?.remoteParticipants.forEach((p) => this.reconcilePeerAudio(p, this.voiceMediaRoom)); }
   private reconcileUserAudio(username: string) {
-    this.voiceRoom?.remoteParticipants.forEach((p) => { if (baseUid(p.identity) === username) this.reconcilePeerAudio(p); });
+    const room = this.voiceMediaRoom;
+    room?.remoteParticipants.forEach((p) => { if (baseUid(p.identity) === username) this.reconcilePeerAudio(p, room); });
   }
   // Кто СЕЙЧАС в МОЁМ голосовом канале (base username). Для entry/exit при их входе/выходе — в т.ч. при
   // СМЕНЕ канала: там мик не пере-публикуется (нет TrackPublished/Unpublished), меняется только vc-атрибут.
@@ -1216,6 +1564,10 @@ export class Engine {
   }
   private voiceIntentCurrent(epoch: number, room: Room, channel?: string): boolean {
     return this.voiceEpoch === epoch && this.inVoice && this.voiceRoom === room && (!channel || this.currentVc === channel);
+  }
+  private voiceMediaIntentCurrent(epoch: number, hub: Room, media: Room, channel: string): boolean {
+    return this.voiceIntentCurrent(epoch, hub, channel)
+      && this.voiceMediaRoom === media && this.voiceMediaChannelId === channel;
   }
   // Все writers vc/deaf проходят через одну очередь на комнату. Поэтому запоздалый setAttributes(vc=old)
   // физически не может завершиться ПОСЛЕ более нового leave/switch и воскресить старое состояние.
@@ -1298,7 +1650,8 @@ export class Engine {
   // который тоже строится из атрибута), а он пуст. Ретрай был только на Reconnected — теперь и в 3с-self-heal.
   private selfHealVc() {
     // voiceRoom: держим мой vc=currentVc + deaf, пока в войсе (гонка/rate-limit могли не долить setAttributes).
-    if (this.voiceRoom && this.inVoice) {
+    if (this.voiceRoom && this.inVoice && this.voiceMediaRoom && this.voiceMediaChannelId === this.currentVc
+      && this.voiceMediaActivated.has(this.voiceMediaRoom)) {
       const wantDeaf = this.deafened ? '1' : '';
       const wantMic = this.localMicMuted() ? '0' : '';
       const a = this.voiceRoom.localParticipant.attributes || {};
@@ -1429,7 +1782,7 @@ export class Engine {
   }
   private nameOf(identity: string): string { const p = this.partOf(identity); return (p && p.name) || identity; }
   private localMicMuted(): boolean { return this.manualMute || this.noMic; } // noMic (зашёл без мика) = тоже «нет звука наружу»
-  private micPub() { return this.voiceRoom && this.voiceRoom.localParticipant.getTrackPublication(Track.Source.Microphone); }
+  private micPub(room: Room | null = this.voiceMediaRoom) { return room?.localParticipant.getTrackPublication(Track.Source.Microphone); }
   // Ждём, пока комната реально ПОДКЛЮЧИТСЯ (roomReady). Нужно, когда после свитча серверов WebRTC-connect
   // ещё идёт в фоне: объект Room есть, но публиковать в него нельзя. Резолвит true при готовности, false —
   // на таймауте или если вход отменён (disconnect на свитче сбросил inVoice). Поллинг дёшев (200мс).
@@ -1457,18 +1810,48 @@ export class Engine {
     this.spCtx?.resume?.().catch(() => {});
   }
 
+  // A second tap can replace a join while its network/microphone awaits are still pending. Create
+  // the replacement context while that second gesture is live, then let stopMic atomically preserve
+  // it while retiring the old generation. spCtx is shared across generations and is never replaced.
+  private prepareReplacementMicContext(): AudioContext | null {
+    let prepared: AudioContext | null = null;
+    try {
+      prepared = new AudioContext();
+      prepared.resume?.().catch(() => {});
+    } catch { prepared = null; }
+    try { this.spCtx = this.spCtx || new AudioContext(); } catch { /** existing context stays owned */ }
+    this.spCtx?.resume?.().catch(() => {});
+    return prepared;
+  }
+  private async discardPreparedMicContext(context: AudioContext | null, clientIntent: number) {
+    // A newer join may deliberately inherit this still-gesture-bound context while an older leave
+    // tail is resolving. Only the unchanged client intent is allowed to discard unused ownership.
+    if (!context || this.voiceClientIntent !== clientIntent || this.micActx !== context || this.micRaw || this.micLocalTrack) return;
+    this.micActx = null;
+    try { await context.close(); } catch { /**/ }
+  }
+
   /* ---------- VOICE join/leave/switch (несколько каналов на сервер) ---------- */
   // подключиться к голосовому каналу channelId; если уже в другом — переключиться без переподнятия микрофона
   async joinVoice(channelId: string) {
     const targetRoom = this.viewRoom;
     const targetServer = this.viewServerId; // вход в голос — на СМОТРИМОМ сервере (его каналы в ServerView)
     if (!channelId || !targetRoom || !targetServer) return;
-    this.voiceReconnecting = false;
     // уже в голосовом на ЭТОМ же сервере → только смена канала (мик остаётся)
     if (this.inVoice && this.voiceServerId === targetServer) {
       if (this.currentVc === channelId && !this.voiceConnecting) return;
       if (!this.voiceConnecting) { await this.switchVoice(channelId); return; }
     }
+    // Only a real replacement/new join owns reconnect state. A no-op tap on the current channel
+    // must not make UI/PTT look healthy while its media room is still reconnecting.
+    this.voiceReconnecting = false;
+    // This is intentionally before ticket creation and every await: mobile WebKit only lets the
+    // replacement AudioContext inherit user activation synchronously from this tap. Cross-server
+    // teardown also closes the old pipeline, so it carries the same prepared ownership through leave.
+    const replacingVoiceJoin = this.inVoice && this.voiceConnecting;
+    const crossingVoiceServer = this.inVoice && this.voiceServerId !== targetServer;
+    const replacingPendingJoin = replacingVoiceJoin && this.voiceRoom === targetRoom;
+    const replacementMicContext = replacingVoiceJoin || crossingVoiceServer ? this.prepareReplacementMicContext() : null;
     // Важно вызвать ДО первого await и только для первого входа: текущий рабочий pipeline при переходе
     // между серверами трогать нельзя. Для уже разблокированной голосовой сессии остаётся обычный startMic.
     if (!this.inVoice) this.prepareVoiceAudio();
@@ -1481,14 +1864,19 @@ export class Engine {
       ? api.mintVoiceIntent(session, targetServer, channelId, clientIntent).catch(() => null)
       : Promise.resolve(null);
     if (this.inVoice && this.voiceServerId !== targetServer) {
-      await this.leaveVoice();
+      await this.leaveVoice(replacementMicContext);
       // Пока завершался teardown A пользователь мог уже открыть C. Не публикуем голос в случайную комнату.
-      if (this.viewRoom !== targetRoom || this.viewServerId !== targetServer || this.voiceClientIntent !== clientIntent) return;
+      if (this.viewRoom !== targetRoom || this.viewServerId !== targetServer || this.voiceClientIntent !== clientIntent) {
+        await this.discardPreparedMicContext(replacementMicContext, clientIntent);
+        return;
+      }
     }
     const epoch = ++this.voiceEpoch;
     this.voiceClaimPending = epoch; this.deferredVoiceLease = null; this.matchedVoiceLease = null;
     this.voiceLeaseVerifying = false; ++this.voiceLeaseVerifySeq;
-    const replacingPendingJoin = this.inVoice && this.voiceRoom === targetRoom && this.voiceConnecting;
+    this.clearVoicePermissionRecovery();
+    const replacedMedia = replacingPendingJoin ? this.voiceMediaRoom : null;
+    const replacedPendingMedia = replacingPendingJoin ? this.pendingVoiceMediaRoom : null;
     this.currentVc = channelId;
     this.inVoice = true; this.pttDown = false; // manualMute НЕ сбрасываем — пред-установка мута применяется на входе
     this.voiceConnecting = true;
@@ -1504,8 +1892,14 @@ export class Engine {
     this.emit(); // ОПТИМИСТИЧНО: сразу рисуем себя в канале + статус «подключение» (mic ещё публикуется)
     // Быстрый A→B во время gUM/публикации инвалидирует старый pipeline прежде, чем создаём новый.
     if (replacingPendingJoin) {
-      await this.stopMic(targetRoom);
-      if (!this.voiceIntentCurrent(epoch, targetRoom, channelId)) return;
+      this.voiceMediaRoom = null; this.pendingVoiceMediaRoom = null; this.voiceMediaChannelId = null;
+      await this.stopMic(replacedMedia, replacementMicContext);
+      if (replacedMedia) this.disconnectRoom(replacedMedia);
+      if (replacedPendingMedia && replacedPendingMedia !== replacedMedia) this.disconnectRoom(replacedPendingMedia);
+      if (!this.voiceIntentCurrent(epoch, targetRoom, channelId)) {
+        await this.discardPreparedMicContext(replacementMicContext, clientIntent);
+        return;
+      }
     }
     // viewRoom мог ещё подниматься (фоновый connect после свитча, ретраи ~9.5с): объект Room есть, но не
     // подключён (roomReady=false). Публикация mic/vc в неподнятую комнату молча провалилась бы — «зашёл»
@@ -1514,7 +1908,7 @@ export class Engine {
       const ready = await this.waitRoomReady(targetRoom, epoch, 15000);
       if (!this.voiceIntentCurrent(epoch, targetRoom, channelId)) return;
       if (!ready) {
-        await this.stopMic(targetRoom); // закрывает заранее подготовленный AudioContext
+        await this.stopMic(this.voiceMediaRoom); // закрывает заранее подготовленный AudioContext
         this.voiceClaimPending = 0; this.deferredVoiceLease = null; this.matchedVoiceLease = null;
         this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.voiceRoom = null; this.voiceServerId = null;
         this.liveKitT.setBroadcastRoom?.(null);
@@ -1558,6 +1952,16 @@ export class Engine {
       this.onVoiceLease(deferredLease);
       if (!this.voiceIntentCurrent(epoch, targetRoom, channelId)) return;
     }
+    const mediaRoom = await this.connectVoiceMediaRoom(targetRoom, epoch, targetServer, channelId);
+    if (!mediaRoom || !this.voiceIntentCurrent(epoch, targetRoom, channelId)) {
+      if (this.voiceIntentCurrent(epoch, targetRoom, channelId)) {
+        this.hooks.toast('Не удалось подключить защищённый голосовой канал — попробуй ещё раз', 'warn');
+        await this.leaveVoice();
+      }
+      return;
+    }
+    this.voiceMediaRoom = mediaRoom; this.pendingVoiceMediaRoom = null; this.voiceMediaChannelId = channelId;
+    mediaRoom.remoteParticipants.forEach((p) => p.trackPublications.forEach((pub) => this.onRemotePub(pub, p, mediaRoom, true)));
     // deaf по пред-установке — сразу заявляем пирам (иначе зашёл «оглохшим», а бейджа deaf у них нет)
     if (!await this.commitVoiceAttributes(targetRoom, epoch, channelId)) {
       if (this.voiceIntentCurrent(epoch, targetRoom, channelId)) {
@@ -1575,7 +1979,10 @@ export class Engine {
     this.noMic = false;
     try {
       const started = await this.startMicWithDefaultFallback(epoch, 'Сохранённый микрофон недоступен — включён системный');
-      if (!started || !this.voiceIntentCurrent(epoch, targetRoom, channelId)) return;
+      if (!this.voiceIntentCurrent(epoch, targetRoom, channelId)) return;
+      // false with a current voice intent means a newer mic generation won the race. Do not write
+      // noMic over its state; finish the join so the regular watchdog can observe/recover it.
+      if (!started) this.ensureVoiceAudioRunning();
     }
     catch {
       if (!this.voiceIntentCurrent(epoch, targetRoom, channelId)) return;
@@ -1585,6 +1992,8 @@ export class Engine {
     }
     this.reconcileAllAudio(); // подписываемся на пиров этого же канала (bootstrap мик-подписок)
     this.reconcileChannelSounds(); // состав уже посеян в начале join — тут озвучиваем тех, кто зашёл ПОКА я входил
+    // Install the periodic recovery while the immediate poll is still fenced by voiceConnecting:
+    // a newer reapplyMic generation may be mid-publish when this older startMic returns false.
     this.startConnPoll();
     this.voiceConnecting = false;
     this.lostVoiceServerId = null; this.lostVoiceChannel = null;
@@ -1593,12 +2002,17 @@ export class Engine {
   }
   // перейти в другой голосовой канал того же сервера: микрофон остаётся, меняются подписки и стримы
   async switchVoice(channelId: string) {
-    if (!this.voiceRoom || !this.inVoice || this.currentVc === channelId) return;
+    if (!this.voiceRoom || !this.voiceMediaRoom || !this.inVoice || this.currentVc === channelId) return;
     const previousChannel = this.currentVc;
+    const room = this.voiceRoom;
+    const previousMediaRoom = this.voiceMediaRoom;
+    const permissionRecovery = this.voicePermissionRecovery;
+    const previousPermissionDeadline = permissionRecovery?.room === previousMediaRoom
+      && permissionRecovery.voiceEpoch === this.voiceEpoch ? permissionRecovery.deadline : null;
     const epoch = ++this.voiceEpoch; // старый async voice-intent больше не может дописать прежний канал
     this.voiceClaimPending = epoch; this.deferredVoiceLease = null; this.matchedVoiceLease = null;
     this.voiceLeaseVerifying = false; ++this.voiceLeaseVerifySeq;
-    const room = this.voiceRoom;
+    this.clearVoicePermissionRecovery();
     const serverId = this.voiceServerId;
     const session = this.sessionId(room);
     const clientIntent = ++this.voiceClientIntent;
@@ -1611,16 +2025,45 @@ export class Engine {
     // Пока сервер решает, кому принадлежит аккаунт, старый uplink молчит и старый vc снимается.
     // Это делает A→B атомарным для слушателей: никто не услышит речь в уже покинутом канале.
     this.applyGate();
+    this.reconcileAllAudio();
     void this.setVoiceAttributes(room, this.wantedVoiceAttributes(room));
     this.emit();
     const ticketEvent = await ticketPromise;
     if (!this.voiceIntentCurrent(epoch, room, channelId) || this.voiceClientIntent !== clientIntent) return;
     if (!ticketEvent || ticketEvent.accepted === false || !Number.isSafeInteger(ticketEvent.ticket) || ticketEvent.ticket < 1) {
-      if (this.voiceClaimPending === epoch) this.voiceClaimPending = 0;
-      this.currentVc = this.voiceLeaseChannel || previousChannel;
+      const unfinishedClaim = this.finishVoiceClaim(epoch, null);
+      this.currentVc = previousChannel;
       this.myVcAt = this.currentVc ? this.channelStartFor(this.currentVc) : null;
+      // Notify may have arrived while the switch claim was fenced. Apply the newest authoritative
+      // event only after restoring A: a foreign/released lease synchronously starts leaveVoice,
+      // while a current local A lease safely refreshes its epoch before attributes can reopen.
+      const deferredLease = unfinishedClaim.deferred || unfinishedClaim.response;
+      if (deferredLease) {
+        this.onVoiceLease(deferredLease);
+        if (!this.voiceIntentCurrent(epoch, room, this.currentVc || undefined)) return;
+      }
+      let recoveryVerifySeq = 0;
+      let recoveryDeadline: number | null = null;
+      const lateRecovery = this.voicePermissionRecovery;
+      const latePermissionDeadline = lateRecovery?.room === previousMediaRoom && lateRecovery.voiceEpoch === epoch
+        ? lateRecovery.deadline : null;
+      if (previousPermissionDeadline != null && latePermissionDeadline != null)
+        recoveryDeadline = Math.min(previousPermissionDeadline, latePermissionDeadline);
+      else recoveryDeadline = previousPermissionDeadline ?? latePermissionDeadline;
+      const oldMediaRevoked = !this.mediaPermissionsActive(previousMediaRoom) || !this.voiceMediaActivated.has(previousMediaRoom);
+      if (this.currentVc && (oldMediaRevoked || recoveryDeadline != null)) {
+        this.voiceLeaseVerifying = true;
+        recoveryVerifySeq = ++this.voiceLeaseVerifySeq;
+        this.clearVoicePermissionRecovery();
+        recoveryDeadline = this.beginVoicePermissionRecovery(previousMediaRoom, epoch, recoveryDeadline ?? Date.now() + 20_000);
+      }
       await this.setVoiceAttributes(room, this.wantedVoiceAttributes(room)).catch(() => {});
+      if (!this.voiceIntentCurrent(epoch, room, this.currentVc || undefined)) return;
       this.applyGate();
+      this.reconcileAllAudio();
+      if (recoveryDeadline != null && this.currentVc) {
+        void this.verifyVoiceLeaseAfterReconnect(room, epoch, recoveryVerifySeq, previousMediaRoom, recoveryDeadline);
+      }
       this.hooks.toast('Не удалось согласовать переключение между устройствами — попробуй ещё раз', 'warn');
       this.emit();
       return;
@@ -1650,6 +2093,28 @@ export class Engine {
       this.onVoiceLease(deferredLease);
       if (!this.voiceIntentCurrent(epoch, room, channelId)) return;
     }
+    const nextMediaRoom = await this.connectVoiceMediaRoom(room, epoch, serverId, channelId);
+    if (!nextMediaRoom || !this.voiceIntentCurrent(epoch, room, channelId)) {
+      if (this.voiceIntentCurrent(epoch, room, channelId)) {
+        this.hooks.toast('Не удалось подключить новый голосовой канал', 'warn');
+        await this.leaveVoice();
+      }
+      return;
+    }
+    this.clearVoicePermissionRecovery(previousMediaRoom, epoch);
+    this.voiceMediaRoom = nextMediaRoom; this.pendingVoiceMediaRoom = null; this.voiceMediaChannelId = channelId;
+    this.subscriptionRetries.clear();
+    this.clearVoiceAudio();
+    const transferred = await this.transferMicPublication(previousMediaRoom, nextMediaRoom, epoch, room, channelId);
+    this.disconnectRoom(previousMediaRoom);
+    if (!transferred || !this.voiceMediaIntentCurrent(epoch, room, nextMediaRoom, channelId)) {
+      if (this.voiceIntentCurrent(epoch, room, channelId)) {
+        this.hooks.toast('Не удалось перенести микрофон в новый канал', 'warn');
+        await this.leaveVoice();
+      }
+      return;
+    }
+    nextMediaRoom.remoteParticipants.forEach((p) => p.trackPublications.forEach((pub) => this.onRemotePub(pub, p, nextMediaRoom, true)));
     if (!await this.commitVoiceAttributes(room, epoch, channelId)) {
       if (this.voiceIntentCurrent(epoch, room, channelId)) {
         this.hooks.toast('Не удалось синхронизировать канал', 'warn');
@@ -1657,6 +2122,12 @@ export class Engine {
       }
       return;
     }
+    this.voiceLeaseVerifying = false;
+    // A reconnect event from the retired media room may have set the aggregate flag during the
+    // handoff. Successful switch state is derived only from the new active media room and hub.
+    this.reconnectingRooms.delete(previousMediaRoom);
+    this.reconnecting = this.reconnectingRooms.size > 0;
+    this.voiceReconnecting = this.reconnectingRooms.has(room) || this.reconnectingRooms.has(nextMediaRoom);
     this.applyGate();
     this.lastVclaim = Date.now();
     this.dataSend({ t: 'vclaim', uid: this.me.id, session, epoch: this.voiceLeaseEpoch });
@@ -1665,12 +2136,18 @@ export class Engine {
     playSound('entry');
     this.emit();
   }
-  async leaveVoice() {
+  async leaveVoice(replacementMicContext: AudioContext | null = null) {
     if (!this.voiceRoom || !this.inVoice) return;
     const epoch = ++this.voiceEpoch;
     this.voiceClaimPending = 0; this.deferredVoiceLease = null; this.matchedVoiceLease = null;
     this.voiceLeaseVerifying = false; ++this.voiceLeaseVerifySeq;
+    this.clearVoicePermissionRecovery();
     const vr = this.voiceRoom; // фиксируем: ниже обнулим указатель (и, возможно, порвём комнату)
+    const vmr = this.voiceMediaRoom;
+    const pendingMedia = this.pendingVoiceMediaRoom;
+    this.voiceMediaRoom = null; this.pendingVoiceMediaRoom = null; this.voiceMediaChannelId = null;
+    if (vmr) this.voiceMediaActivated.delete(vmr);
+    if (pendingMedia && pendingMedia !== vmr) this.disconnectRoom(pendingMedia);
     const leaseSession = this.voiceLeaseSession;
     const leaseEpoch = this.voiceLeaseEpoch;
     this.voiceLeaseSession = ''; this.voiceLeaseChannel = ''; this.voiceLeaseEpoch = 0;
@@ -1685,16 +2162,22 @@ export class Engine {
     this.voiceOutputRoom = null; this.voiceOutputSink = ''; this.voiceOutputPending = null;
     // Трек и vc очищаем СРАЗУ, до любых медленных await. Иначе leave кратко воскресал через старый
     // self-heal/setAttributes, а быстрый новый join мог быть уничтожен поздним хвостом этого leave.
-    const micStop = this.stopMic(vr);
+    const micStop = this.stopMic(vmr, replacementMicContext);
     const attrStop = this.commitVoiceTombstone(vr, epoch);
     const shareStop = this.stopShare().catch(() => {}); // browser-share (LiveKit)
     this.hooks.endBroadcast?.();            // нативная трансляция (Rust-дерево) — тоже гасим
-    vr.remoteParticipants.forEach((p) => { const rp = p.getTrackPublication(Track.Source.Microphone); if (rp) { try { (rp as any).setSubscribed(false); } catch { /**/ } } this.detachAnalyser(baseUid(p.identity)); });
+    vmr?.remoteParticipants.forEach((p) => {
+      const rp = p.getTrackPublication(Track.Source.Microphone);
+      if (rp) { try { (rp as any).setSubscribed(false); } catch { /**/ } }
+      this.removeVoiceAudio(baseUid(p.identity), p.identity, undefined, vmr);
+    });
     // Сносим мик-аудиоэлементы сразу (origin=voice), не ждём async onUnsub. Стрим-аудио (origin=view)
     // НЕ трогаем — стрим смотрится и без голосового (и может жить в ДРУГОЙ, смотримой комнате).
     document.querySelectorAll('#audioSink audio[data-origin="voice"]').forEach((a) => a.remove());
     this.clearVoiceAudio();
     await Promise.allSettled([micStop, attrStop, shareStop]);
+    if (vmr) this.disconnectRoom(vmr);
+    if (vr !== this.viewRoom && vr !== this.voiceRoom) this.disconnectRoom(vr);
     if (this.voiceEpoch !== epoch || this.voiceRoom !== vr) return; // за teardown уже начался новый join
     // голосовая комната была voice-only (я смотрю ДРУГОЙ сервер) → рвём её; если это смотримая — оставляем как viewRoom
     if (vr !== this.viewRoom) this.disconnectRoom(vr);
@@ -1747,11 +2230,11 @@ export class Engine {
     // Watchdog: контекст публикации мика мог родиться/остаться 'suspended' (getUserMedia-промпт съел
     // user-activation) → пиры не слышат, хотя локально «всё работает». Держим его running, пока в войсе.
     if (this.inVoice && ((this.micActx && this.micActx.state !== 'running') || (this.spCtx && this.spCtx.state !== 'running')
-      || this.voiceRoom?.canPlaybackAudio === false)) this.ensureVoiceAudioRunning();
+      || this.voiceMediaRoom?.canPlaybackAudio === false)) this.ensureVoiceAudioRunning();
     if (this.inVoice) void this.checkMicAlive(true); // мобилка: пере-снять мик, если источник умер на бэкграунде
     if (this.inVoice && ++this.voiceLeaseAuditTick % 4 === 0) void this.auditVoiceLease();
     if (this.inVoice) this.ensureRemoteVoicePlayback();
-    const track = this.voiceRoom?.localParticipant.getTrackPublication(Track.Source.Microphone)?.track;
+    const track = this.voiceMediaRoom?.localParticipant.getTrackPublication(Track.Source.Microphone)?.track;
     if (!track) return;
     try {
       const rep: RTCStatsReport = await (track as any).getRTCStatsReport();
@@ -1773,7 +2256,7 @@ export class Engine {
       // Качество читаем НАПРЯМУЮ из localParticipant.connectionQuality, а не ждём событие
       // ConnectionQualityChanged: оно приходит лишь при СМЕНЕ качества, поэтому при стабильной
       // связи с самого старта метка залипала на «соединение…» (unknown), хотя пинг уже шёл.
-      const lp = this.voiceRoom?.localParticipant;
+      const lp = this.voiceMediaRoom?.localParticipant;
       let cq: VoiceQuality = lp?.connectionQuality != null ? mapQuality(lp.connectionQuality) : 'unknown';
       // Метка учитывает и потери (LiveKit), и ЗАДЕРЖКУ (RTT): берём худшее. Иначе при большом пинге
       // без потерь показывалось «отличное» (LiveKit quality латентность не видит). Цель голоса ≤250мс.
@@ -1816,16 +2299,69 @@ export class Engine {
     }
   }
 
+  private async publishExistingMic(room: Room, expectedVoiceEpoch: number, hub: Room, channel: string): Promise<boolean> {
+    const track = this.micLocalTrack;
+    if (!track) return false;
+    const micOp = this.micEpoch;
+    const current = () => this.micEpoch === micOp && this.micLocalTrack === track
+      && track.mediaStreamTrack.readyState !== 'ended'
+      && this.voiceMediaIntentCurrent(expectedVoiceEpoch, hub, room, channel) && this.voiceMediaActivated.has(room);
+    if (!current()) return false;
+    const existing = room.localParticipant.getTrackPublication(Track.Source.Microphone);
+    if (existing?.track === track) return current();
+    if (existing?.track) {
+      try { await room.localParticipant.unpublishTrack(existing.track, true); } catch { /** publish below is authoritative */ }
+      if (!current()) return false;
+    }
+    try {
+      await room.localParticipant.publishTrack(track, {
+        source: Track.Source.Microphone, dtx: true, red: true, audioPreset: AudioPresets.musicHighQuality,
+      });
+    } catch { return false; }
+    if (!current()) {
+      try { await room.localParticipant.unpublishTrack(track, false); } catch { /** stale room is torn down by its owner */ }
+      return false;
+    }
+    if ((this.manualMute || this.deafened) !== track.isMuted) {
+      try { await ((this.manualMute || this.deafened) ? track.mute() : track.unmute()); } catch { /** gate remains authoritative */ }
+    }
+    if (current()) return true;
+    try { await room.localParticipant.unpublishTrack(track, false); } catch { /** newer owner controls room teardown */ }
+    return false;
+  }
+
+  private async transferMicPublication(oldRoom: Room, newRoom: Room, voiceEpoch: number, hub: Room, channel: string): Promise<boolean> {
+    const track = this.micLocalTrack;
+    if (!track) return true; // listen-only channel switch
+    if (track.mediaStreamTrack.readyState === 'ended') return false;
+    const oldPublication = oldRoom.localParticipant.getTrackPublication(Track.Source.Microphone);
+    if (oldPublication?.track === track) {
+      try { await oldRoom.localParticipant.unpublishTrack(track, false); }
+      catch { /** server lease eviction may already have removed the old publication */ }
+    }
+    if (!this.voiceMediaIntentCurrent(voiceEpoch, hub, newRoom, channel)) return false;
+    return this.publishExistingMic(newRoom, voiceEpoch, hub, channel);
+  }
+
   // строим цепочку: устройство -> [denoise?] -> preGate -> gain (микс/мут) -> published track
   //                                                     \-> vadDest (VAD/метр, ДО гейта — иначе
   //                                                         гейт слушает уже замолченный gain=0 сигнал
   //                                                         и залипает закрытым)
   private async startMic(expectedVoiceEpoch = this.voiceEpoch): Promise<boolean> {
-    const room = this.voiceRoom;
-    if (!room || !this.voiceIntentCurrent(expectedVoiceEpoch, room)) return false;
-    if (this.micRaw && this.micActx && this.micPub()?.track) return true;
+    const room = this.voiceMediaRoom;
+    const hub = this.voiceRoom;
+    const channel = this.currentVc;
+    if (!room || !hub || !channel || !this.voiceMediaIntentCurrent(expectedVoiceEpoch, hub, room, channel)
+      || !this.voiceMediaActivated.has(room)) return false;
+    if (this.micRaw && this.micActx && this.micLocalTrack) {
+      if (this.micPub(room)?.track === this.micLocalTrack) return true;
+      return this.publishExistingMic(room, expectedVoiceEpoch, hub, channel);
+    }
     const op = ++this.micEpoch;
-    const current = () => op === this.micEpoch && this.voiceIntentCurrent(expectedVoiceEpoch, room);
+    this.micStartInFlight = op;
+    try {
+    const current = () => op === this.micEpoch && this.voiceMediaIntentCurrent(expectedVoiceEpoch, hub, room, channel)
+      && this.voiceMediaActivated.has(room);
     // Publication могла пережить сбой локального AudioContext. Перед новым pipeline обязательно ждём
     // её удаления — одновременно две mic publications дают разным слушателям разные «первые» треки.
     const stalePublication = room.localParticipant.getTrackPublication(Track.Source.Microphone)?.track;
@@ -1934,6 +2470,7 @@ export class Engine {
     this.micGain = gain;
     this.micDenoise = denoise;
     this.micVadDest = vadDest;
+    this.micLocalTrack = lat;
     this.watchMicTrack(raw.getAudioTracks()[0]);
     this.micLevelAt = performance.now(); // отсчёт протухания стартует с момента запуска мика, а не с нуля
     this.startVadWatchdog();
@@ -1947,6 +2484,9 @@ export class Engine {
     // requestAnimationFrame заморожен и spLoop не двигал бы vadOpen (микрофон молча гейтился в тишину).
     void this.setupVadWorklet(ctx, preGate, op);
     return true;
+    } finally {
+      if (this.micStartInFlight === op) this.micStartInFlight = 0;
+    }
   }
   // Поднять VAD-ворклет и передать ему владение vadOpen. Тап строго на preGate (после денойза, канал 0),
   // не на micGain — иначе детектор слушал бы уже замолченный (gain=0) сигнал и залипал закрытым. При
@@ -2000,7 +2540,7 @@ export class Engine {
   // жест; conn-watchdog (pollPing) добивает, если контекст уснул повторно.
   private resumeRemoteAudioPlayback() {
     this.outputCtx?.resume?.().catch(() => {});
-    new Set([this.viewRoom, this.voiceRoom].filter(Boolean)).forEach((room) => {
+    new Set([this.viewRoom, this.voiceRoom, this.voiceMediaRoom].filter(Boolean)).forEach((room) => {
       try { void (room as Room).startAudio().catch(() => {}); } catch { /** browser uses native autoplay */ }
     });
     [...this.voiceAudioEls.values(), ...this.screenAudioEls.values()].forEach(({ el }) => {
@@ -2011,7 +2551,7 @@ export class Engine {
   }
   private remoteAudioPlaybackBlocked() {
     return (this.screenAudioEls.size > 0 && this.viewRoom?.canPlaybackAudio === false)
-      || (this.voiceAudioEls.size > 0 && this.voiceRoom?.canPlaybackAudio === false)
+      || (this.voiceAudioEls.size > 0 && this.voiceMediaRoom?.canPlaybackAudio === false)
       || [...this.voiceAudioEls.values(), ...this.screenAudioEls.values()].some(({ el }) => el.paused);
   }
   private clearRemoteAudioUnlock() {
@@ -2045,7 +2585,7 @@ export class Engine {
     // ОБА контекста должны быть running: micActx = публикуемый звук, spCtx = VAD-гейт (без него gain залипает 0).
     // Раньше гейт стоял только на micActx → после его пред-резюма gesture-unlock не ставился, а spCtx оставался спящим.
     const running = () => (!this.micActx || this.micActx.state === 'running') && (!this.spCtx || this.spCtx.state === 'running')
-      && (!this.outputCtx || this.outputCtx.state === 'running') && this.voiceRoom?.canPlaybackAudio !== false;
+      && (!this.outputCtx || this.outputCtx.state === 'running') && this.voiceMediaRoom?.canPlaybackAudio !== false;
     if (this.audioUnlock || running()) return;
     const unlock = () => { resume(); if (running()) this.clearAudioUnlock(); };
     this.audioUnlock = () => {
@@ -2105,12 +2645,22 @@ export class Engine {
     if (track.muted) muted();
   }
   private async checkMicAlive(fromWatchdog = false) {
-    const room = this.voiceRoom;
-    if (!this.inVoice || !room || this.micRestarting || (fromWatchdog && Date.now() < this.micRetryAt)) return;
+    const hub = this.voiceRoom;
+    const room = this.voiceMediaRoom;
+    const channel = this.currentVc;
+    if (!this.inVoice || !hub || !room || !channel || this.micRestarting || this.micStartInFlight !== 0
+      || this.voiceConnecting || this.voiceLeaseVerifying
+      || this.voiceClaimPending !== 0 || !this.voiceMediaActivated.has(room)
+      || (fromWatchdog && Date.now() < this.micRetryAt)) return;
     const voiceEpoch = this.voiceEpoch;
     const t = this.micRaw?.getAudioTracks()[0];
     const publication = room.localParticipant.getTrackPublication(Track.Source.Microphone);
-    const ended = !this.micActx || !t || t.readyState === 'ended' || !publication?.track;
+    // reapplyMic can prepare a context under the user's mobile gesture while permission recovery is
+    // still fail-closed. Once the room is re-activated, consume that context directly: tearing it
+    // down first would force startMic to create a suspended non-gesture context on iOS.
+    const preparedOnly = !!this.micActx && this.micActx.state !== 'closed' && !this.micRaw && !this.micLocalTrack;
+    const ended = !this.micActx || !t || t.readyState === 'ended' || !this.micLocalTrack
+      || this.micLocalTrack.mediaStreamTrack.readyState === 'ended' || publication?.track !== this.micLocalTrack;
     if (!ended && t?.muted) {
       if (!this.micMutedAt) this.micMutedAt = Date.now();
       if (!fromWatchdog || !mutedTrackNeedsRestart(this.micMutedAt, Date.now())) return;
@@ -2120,17 +2670,17 @@ export class Engine {
     }
     this.micRestarting = true; this.micMutedAt = 0;
     try {
-      await this.stopMic(room);
-      if (!this.voiceIntentCurrent(voiceEpoch, room)) return;
+      if (!preparedOnly) await this.stopMic(room);
+      if (!this.voiceMediaIntentCurrent(voiceEpoch, hub, room, channel)) return;
       const started = await this.startMicWithDefaultFallback(voiceEpoch, 'Выбранный микрофон отключён — включён системный');
       // started===false при живом voice-intent значит одно: pipeline перехватила более свежая операция
       // (reapplyMic/toggleMic) — она и владеет состоянием. Писать сюда noMic нельзя, это протухшая
       // запись поверх нового владельца (ложное «микрофон недоступен» на каждой смене устройства).
-      if (!started || !this.voiceIntentCurrent(voiceEpoch, room)) return;
+      if (!started || !this.voiceMediaIntentCurrent(voiceEpoch, hub, room, channel)) return;
       this.noMic = false; this.micRetryAt = 0; this.micFailureNotified = false;
       this.emit();
     } catch {
-      if (!this.voiceIntentCurrent(voiceEpoch, room)) return;
+      if (!this.voiceMediaIntentCurrent(voiceEpoch, hub, room, channel)) return;
       this.noMic = true;
       this.micRetryAt = Date.now() + 5000;
       if (!this.micFailureNotified) {
@@ -2155,16 +2705,25 @@ export class Engine {
     void this.checkMicAlive(false);
     this.ensureVoiceAudioRunning();
   };
-  private async stopMic(room: Room | null = this.voiceRoom): Promise<void> {
+  private async stopMic(
+    room: Room | null = this.voiceMediaRoom,
+    replacementContext: AudioContext | null = null,
+  ): Promise<void> {
     ++this.micEpoch; // первым действием отменяем любой незавершённый gUM/RNNoise/publish
+    this.micStartInFlight = 0;
     this.clearMicTrackLifecycle();
     const p = room?.localParticipant.getTrackPublication(Track.Source.Microphone);
     const publishedTrack = p?.track;
+    const localTrack = this.micLocalTrack; this.micLocalTrack = null;
     const raw = this.micRaw; this.micRaw = null;
     const denoise = this.micDenoise; this.micDenoise = null;
     const vadDest = this.micVadDest; this.micVadDest = null;
     const vadNode = this.micVadNode; this.micVadNode = null;
-    const ctx = this.micActx; this.micActx = null;
+    const ctx = this.micActx;
+    const preservedContext = replacementContext?.state === 'closed' ? null : replacementContext;
+    // Ownership changes synchronously, before unpublish/close awaits. A third tap can therefore
+    // replace this prepared context without an older stop tail clearing the newer generation.
+    this.micActx = preservedContext;
     this.micGain = null;
     this.detachAnalyser(this.me.username);
     this.vadOpen = false;
@@ -2180,8 +2739,17 @@ export class Engine {
     if (room && publishedTrack) {
       try { waits.push(room.localParticipant.unpublishTrack(publishedTrack, true)); } catch { /**/ }
     }
-    if (ctx) { try { waits.push(ctx.close()); } catch { /**/ } }
-    await Promise.allSettled(waits);
+    // A late SDK publication event can briefly expose a different track than the pipeline we own.
+    // Retire both sides in that case; otherwise the detached processed track keeps the microphone
+    // graph alive after leave/reapply even though the room publication was already removed.
+    if (localTrack && localTrack !== publishedTrack) { try { localTrack.stop(); } catch { /**/ } }
+    if (ctx && ctx !== preservedContext) { try { waits.push(ctx.close()); } catch { /**/ } }
+    try { await Promise.allSettled(waits); }
+    finally {
+      // Explicit stop is idempotent and is still required when disconnected LiveKit rejects the
+      // unpublish promise before honoring stopOnUnpublish=true.
+      if (localTrack) { try { localTrack.stop(); } catch { /**/ } }
+    }
   }
   // Замер уровня своего мика протух: ни ворклет, ни spLoop давно не присылали значение. Такое бывает,
   // когда ворклет не поднялся (нет AudioWorklet / модуль не догрузился) И вкладка ушла в фон — там
@@ -2196,7 +2764,14 @@ export class Engine {
     let target = 1;
     // Нет подтверждённого ownership — нет звука наружу. Особенно важно во время handoff и switch:
     // notify/HTTP/LiveKit-атрибуты могут прийти в разном порядке на разных устройствах.
-    if (this.voiceLeaseVerifying || this.voiceClaimPending !== 0 || this.voiceLeaseEpoch <= 0 || this.voiceLeaseSession !== this.sessionId()) target = 0;
+    const media = this.voiceMediaRoom;
+    const activeMedia = !!media && this.voiceMediaChannelId === this.currentVc && this.readyRooms.has(media)
+      && this.voiceMediaActivated.has(media) && !!this.micLocalTrack && this.micPub(media)?.track === this.micLocalTrack;
+    const hubAttrs = this.voiceRoom?.localParticipant.attributes || {};
+    const hubAdvertised = (hubAttrs.vc || '') === (this.currentVc || '') && (hubAttrs.voiceSession || '') === this.voiceLeaseSession
+      && (hubAttrs.voiceEpoch || '') === (this.voiceLeaseEpoch > 0 ? String(this.voiceLeaseEpoch) : '');
+    if (!activeMedia || !hubAdvertised || this.voiceLeaseVerifying || this.voiceClaimPending !== 0 || this.voiceLeaseEpoch <= 0
+      || this.voiceLeaseSession !== this.sessionId()) target = 0;
     else if (this.manualMute || this.deafened) target = 0;
     else if (s.mode === 'ptt') target = this.pttDown ? 1 : 0;
     else if (!this.vadOpen && !this.vadStale()) target = 0; // "активация голосом": ниже порога чувствительности — не передаём
@@ -2379,7 +2954,7 @@ export class Engine {
   }
   async reapplyMic(target: 'input' | 'route' = 'input') {
     const route = target === 'route';
-    if (!this.voiceRoom || !this.inVoice) {
+    if (!this.voiceRoom || !this.voiceMediaRoom || !this.currentVc || !this.inVoice) {
       this.hooks.toast(route ? 'Вывод звука применится при подключении к голосовому' : 'Микрофон применится при подключении к голосовому');
       return;
     }
@@ -2394,32 +2969,34 @@ export class Engine {
       this.spCtx?.resume?.().catch(() => {});
       this.outputCtx?.resume?.().catch(() => {});
     } catch { preparedCtx = null; }
-    const room = this.voiceRoom;
+    const hub = this.voiceRoom;
+    const room = this.voiceMediaRoom;
+    const channel = this.currentVc;
     const voiceEpoch = this.voiceEpoch;
     await this.stopMic(room);
-    if (reapplyEpoch !== this.micReapplyEpoch || !this.voiceIntentCurrent(voiceEpoch, room)) {
+    if (reapplyEpoch !== this.micReapplyEpoch || !this.voiceMediaIntentCurrent(voiceEpoch, hub, room, channel)) {
       try { await preparedCtx?.close(); } catch { /**/ }
       return;
     }
     this.micActx = preparedCtx;
     preparedCtx = null; // startMic заберёт и закроет при любой ошибке до commit
     try {
-      if (!await this.startMic(voiceEpoch) || !this.voiceIntentCurrent(voiceEpoch, room)) return;
+      if (!await this.startMic(voiceEpoch) || !this.voiceMediaIntentCurrent(voiceEpoch, hub, room, channel)) return;
       this.noMic = false; this.micRetryAt = 0; this.micFailureNotified = false;
       this.hooks.toast(route ? 'Вывод звука переключён' : 'Микрофон переключён', 'ok');
     }
     catch {
-      if (!this.voiceIntentCurrent(voiceEpoch, room)) return;
+      if (!this.voiceMediaIntentCurrent(voiceEpoch, hub, room, channel)) return;
       // На iPhone/iPad встроенный маршрут вывода WebKit предоставляет как связанный audioinput,
       // поэтому и обычный микрофон, и мобильный аудиомаршрут откатываются одним input reset.
       setSettings({ input: '' });
       try {
-        if (!await this.startMic(voiceEpoch) || !this.voiceIntentCurrent(voiceEpoch, room)) return;
+        if (!await this.startMic(voiceEpoch) || !this.voiceMediaIntentCurrent(voiceEpoch, hub, room, channel)) return;
         this.noMic = false; this.micRetryAt = 0; this.micFailureNotified = false;
         this.hooks.toast(route ? 'Аудиомаршрут недоступен — включён системный' : 'Выбранный микрофон недоступен — включён дефолтный', 'warn');
       }
       catch {
-        if (!this.voiceIntentCurrent(voiceEpoch, room)) return;
+        if (!this.voiceMediaIntentCurrent(voiceEpoch, hub, room, channel)) return;
         this.noMic = true; this.micRetryAt = Date.now() + 5000;
         this.hooks.toast(route ? 'Не удалось переключить вывод звука' : 'Не удалось включить микрофон', 'err');
       }
@@ -2431,10 +3008,13 @@ export class Engine {
     if (this.inVoice && this.noMic) {
       const prevMute = this.manualMute; // не удалось поднять мик — интент мута обязан вернуться как был
       this.manualMute = false; // клик по мику = «хочу говорить»
-      const room = this.voiceRoom;
+      const hub = this.voiceRoom;
+      const room = this.voiceMediaRoom;
+      const channel = this.currentVc;
       const voiceEpoch = this.voiceEpoch;
       try {
-        if (!room || !await this.startMicWithDefaultFallback(voiceEpoch, 'Сохранённый микрофон недоступен — включён системный') || !this.voiceIntentCurrent(voiceEpoch, room)) { this.manualMute = prevMute; this.emit(); return; }
+        if (!hub || !room || !channel || !await this.startMicWithDefaultFallback(voiceEpoch, 'Сохранённый микрофон недоступен — включён системный')
+          || !this.voiceMediaIntentCurrent(voiceEpoch, hub, room, channel)) { this.manualMute = prevMute; this.emit(); return; }
         this.noMic = false; this.micRetryAt = 0; this.micFailureNotified = false;
         this.saveVoicePrefs(); this.hooks.toast('Микрофон подключён');
       }
@@ -2445,7 +3025,7 @@ export class Engine {
     // при manualMute). В голосе — сразу мьютим/размьючиваем трек. Всегда персистим.
     this.manualMute = !this.manualMute;
     this.saveVoicePrefs();
-    if (this.inVoice && this.voiceRoom) {
+    if (this.inVoice && this.voiceRoom && this.voiceMediaRoom) {
       const p = this.micPub();
       // пока фулл-мут (deafened) активен, трек должен оставаться замьюченным на уровне LiveKit
       // независимо от ручного тогла — иначе снятие ручного мута во время deafen паразитно
@@ -2516,7 +3096,7 @@ export class Engine {
       this.spCtx.resume?.().catch(() => {});
       const src = this.spCtx.createMediaStreamSource(new MediaStream([mst]));
       const an = this.spCtx.createAnalyser(); an.fftSize = 512; an.smoothingTimeConstant = 0.5; src.connect(an);
-      this.analysers.set(username, { an, buf: new Uint8Array(an.fftSize), hold: 0, src });
+      this.analysers.set(username, { an, buf: new Uint8Array(an.fftSize), hold: 0, src, track: mst });
       if (isWindowIdle()) {
         if (!this.spIdleTimer) this.spIdleTimer = window.setInterval(() => { if (this.analysers.size) this.spLoop(true); }, 150);
       } else if (!this.spRAF) this.spRAF = requestAnimationFrame(() => this.spLoop());
@@ -2524,8 +3104,9 @@ export class Engine {
   }
   // keepSpeaking — снять анализатор, НЕ трогая speakingSet (передача владения VAD ворклету: индикатор
   // «говорю» дальше ведёт applyLocalLevel; иначе тут был бы лишний edge «замолчал»→«говорит» на хендофе).
-  private detachAnalyser(username: string, keepSpeaking = false) {
+  private detachAnalyser(username: string, keepSpeaking = false, expectedTrack?: MediaStreamTrack) {
     const o = this.analysers.get(username);
+    if (expectedTrack && o?.track !== expectedTrack) return;
     if (o) { try { o.src.disconnect(); } catch { /**/ } this.analysers.delete(username); }
     if (!keepSpeaking && this.speakingSet.delete(username)) this.emit();
   }
@@ -2575,10 +3156,11 @@ export class Engine {
   };
 
   /* ---------- track events (mic/chat only — video-domain events live in VideoTransport) ---------- */
-  private removeVoiceAudio(username: string, identity?: string): boolean {
+  private removeVoiceAudio(username: string, identity?: string, track?: RemoteTrack, room?: Room): boolean {
     const entry = this.voiceAudioEls.get(username);
-    if (!entry || (identity && entry.identity !== identity)) return false;
+    if (!entry || (identity && entry.identity !== identity) || (track && entry.track !== track) || (room && entry.room !== room)) return false;
     this.voiceAudioEls.delete(username);
+    this.detachAnalyser(username, false, (entry.track as any).mediaStreamTrack);
     if (!this.voiceAudioEls.size && !this.screenAudioEls.size) this.clearRemoteAudioUnlock();
     try {
       const detached = entry.track.detach(entry.el) as unknown;
@@ -2619,7 +3201,7 @@ export class Engine {
     try { (p as any).setVolume(this.deafened ? 0 : this.streamVolOf(baseUid(p.identity)), Track.Source.ScreenShareAudio); } catch { /**/ }
     this.ensureRemoteAudioPlayback();
   }
-  private configureVoiceAudio(entry: { identity: string; track: RemoteTrack; el: HTMLMediaElement }, p: Participant) {
+  private configureVoiceAudio(entry: { room: Room; identity: string; track: RemoteTrack; el: HTMLMediaElement }, p: Participant) {
     const { el } = entry;
     el.autoplay = true;
     el.setAttribute('data-origin', 'voice');
@@ -2634,7 +3216,7 @@ export class Engine {
     this.ensureRemoteAudioPlayback();
   }
   private ensureVoiceOutput(force = false) {
-    const room = this.voiceRoom;
+    const room = this.voiceMediaRoom;
     if (!room) return;
     const sink = getSettings().output || 'default';
     if (!force && this.voiceOutputRoom === room && this.voiceOutputSink === sink) return;
@@ -2642,7 +3224,7 @@ export class Engine {
     const pending = { room, sink };
     this.voiceOutputPending = pending;
     void this.switchContextOutput(sink).then((effective) => {
-      if (this.voiceRoom !== room || this.voiceOutputPending !== pending) return;
+      if (this.voiceMediaRoom !== room || this.voiceOutputPending !== pending) return;
       if (!effective) return; // superseded by a newer output request
       const current = getSettings().output || 'default';
       this.voiceOutputRoom = room;
@@ -2652,37 +3234,39 @@ export class Engine {
     });
   }
   private ensureRemoteVoicePlayback(username?: string) {
-    const room = this.voiceRoom;
-    if (!room || !this.inVoice || this.deafened || !this.currentVc) return;
+    const room = this.voiceMediaRoom;
+    if (!room || !this.inVoice || this.deafened || !this.currentVc || this.voiceMediaChannelId !== this.currentVc
+      || !this.voiceMediaActivated.has(room)) return;
     const users = username ? [username] : [...new Set([...room.remoteParticipants.values()].map((p) => baseUid(p.identity)))];
     for (const user of users) {
       if (user === this.me.username) continue;
-      const p = this.partOf(user, room);
+      const p = this.mediaPartOf(user, room);
       const pub = p?.getTrackPublication(Track.Source.Microphone);
       const remoteTrack = pub?.track as RemoteTrack | undefined;
-      const active = !!p && (p as any).attributes?.vc === this.currentVc && !!remoteTrack;
+      const active = !!p && !!remoteTrack;
       if (!active) { this.removeVoiceAudio(user); continue; }
       let entry = this.voiceAudioEls.get(user);
-      if (!entry || entry.identity !== p!.identity || entry.track !== remoteTrack || !entry.el.isConnected) {
+      if (!entry || entry.room !== room || entry.identity !== p!.identity || entry.track !== remoteTrack || !entry.el.isConnected) {
         this.removeVoiceAudio(user);
         const el = remoteTrack.attach() as HTMLMediaElement;
-        entry = { identity: p!.identity, track: remoteTrack, el };
+        entry = { room, identity: p!.identity, track: remoteTrack, el };
         this.voiceAudioEls.set(user, entry);
         this.attachAnalyser(user, (remoteTrack as any).mediaStreamTrack);
       }
       this.configureVoiceAudio(entry, p!);
     }
   }
-  private onRemotePub = (pub: TrackPublication, p: RemoteParticipant, silent?: boolean) => {
+  private onRemotePub = (pub: TrackPublication, p: RemoteParticipant, room: Room, _silent?: boolean) => {
     if (pub.source === Track.Source.Microphone) {
       const own = baseUid(p.identity) === this.me.username; // своя же другая сессия — без звука/подписки
       if (!own) this.reconcileUserAudio(baseUid(p.identity)); // переоцениваем ВСЕ сессии пользователя атомарно
-      if (!own) this.reconcileChannelSounds(!!silent); // entry при живом входе пира в мой канал; seed на bootstrap (silent=true)
       this.emit();
     }
   };
-  private onRemoteUnpub = (pub: TrackPublication, p: RemoteParticipant) => {
-    if (pub.source === Track.Source.Microphone) this.reconcileChannelSounds(); // exit если пир был в моём канале (вышел из голоса)
+  private onRemoteUnpub = (pub: TrackPublication, p: RemoteParticipant, room: Room) => {
+    if (pub.source === Track.Source.Microphone) {
+      if (room === this.voiceMediaRoom) this.reconcileUserAudio(baseUid(p.identity));
+    }
     this.emit();
   };
   private onSub = (track: RemoteTrack, pub: TrackPublication, p: RemoteParticipant, room?: Room) => {
@@ -2700,13 +3284,19 @@ export class Engine {
         const entry = { identity: p.identity, track, el: a };
         this.screenAudioEls.set(u, entry);
         this.configureScreenAudio(entry, p);
-      } else if (isScreen || !this.inVoice || room !== this.voiceRoom || this.deafened || u === this.me.username || p !== this.partOf(u, this.voiceRoom) || !this.currentVc || (p as any).attributes?.vc !== this.currentVc) {
+      } else if (isScreen || !this.inVoice || room !== this.voiceMediaRoom || this.deafened || u === this.me.username
+        || p !== this.mediaPartOf(u, this.voiceMediaRoom) || !this.currentVc || this.voiceMediaChannelId !== this.currentVc
+        || !this.voiceMediaActivated.has(this.voiceMediaRoom)) {
         try { (pub as any).setSubscribed(false); track.detach().forEach((el) => el.remove()); } catch { /**/ }
         this.emit(); return;
       } else {
+        if (p.getTrackPublication(Track.Source.Microphone)?.track !== track) {
+          try { track.detach().forEach((el) => el.remove()); } catch { /**/ }
+          this.emit(); return;
+        }
         this.removeVoiceAudio(u);
         const a = track.attach() as HTMLMediaElement;
-        const entry = { identity: p.identity, track, el: a };
+        const entry = { room: this.voiceMediaRoom, identity: p.identity, track, el: a };
         this.voiceAudioEls.set(u, entry);
         this.configureVoiceAudio(entry, p);
         this.attachAnalyser(u, (track as any).mediaStreamTrack);
@@ -2714,9 +3304,9 @@ export class Engine {
     }
     this.emit();
   };
-  private onUnsub = (track: RemoteTrack, pub: TrackPublication, p: RemoteParticipant, _room?: Room) => {
+  private onUnsub = (track: RemoteTrack, pub: TrackPublication, p: RemoteParticipant, room?: Room) => {
     const u = baseUid(p.identity);
-    this.clearSubscriptionRetries(p.identity, (pub as any).trackSid || (pub as any).sid);
+    this.clearSubscriptionRetries(p.identity, (pub as any).trackSid || (pub as any).sid, room);
     if (pub.source === Track.Source.ScreenShareAudio) {
       // An old publication can unsubscribe after its replacement has already attached. Remove
       // only the exact entry so that the new stream audio keeps playing.
@@ -2727,10 +3317,7 @@ export class Engine {
       try { track.detach().forEach((el) => el.remove()); } catch { /**/ }
     }
     // Unsubscribe старой multi-device сессии не должен снести анализатор уже активной новой сессии.
-    if (pub.source === Track.Source.Microphone && (p === this.partOf(u, this.voiceRoom) || !this.partOf(u, this.voiceRoom))) {
-      this.removeVoiceAudio(u, p.identity);
-      this.detachAnalyser(u);
-    }
+    if (pub.source === Track.Source.Microphone) this.removeVoiceAudio(u, p.identity, track, room);
     this.emit();
   };
 
@@ -2907,7 +3494,7 @@ export class Engine {
   }
   private wset(sid: string) { let m = this.streamWatchers.get(sid); if (!m) { m = new Map(); this.streamWatchers.set(sid, m); } return m; }
   private cleanupWatchers() { const now = Date.now(); let ch = false; this.streamWatchers.forEach((m) => m.forEach((v, wid) => { if (now - v.ts > 9000) { m.delete(wid); ch = true; } })); if (ch) this.emit(); }
-  private cleanupPeer(id: string) { this.streamWatchers.delete(id); this.streamWatchers.forEach((m) => m.delete(id)); this.detachAnalyser(id); this.clearWatch(id); this.removeScreenAudio(id); } // защитно: при резком обрыве TrackUnsubscribed может не прийти → стрим-аудио залипнет
+  private cleanupPeer(id: string) { this.streamWatchers.delete(id); this.streamWatchers.forEach((m) => m.delete(id)); this.clearWatch(id); this.removeScreenAudio(id); } // voice analyser принадлежит media-room и снимается только её exact track event
 
   /* ---------- volumes ---------- */
   private volsFor(serverId: string | null | undefined) {
@@ -2942,8 +3529,8 @@ export class Engine {
   applyMaster() { this.applyAllVolumes(); }
   private applyVolumeByName(username: string) {
     if (!this.voiceServerId || this.viewServerId !== this.voiceServerId) return;
-    const p = this.partOf(username, this.voiceRoom);
-    if (!p || p === this.viewRoom?.localParticipant || !(p as any).setVolume) return;
+    const p = this.mediaPartOf(username, this.voiceMediaRoom);
+    if (!p || p === this.voiceMediaRoom?.localParticipant || !(p as any).setVolume) return;
     this.applyVolumeToParticipant(p);
   }
   // Громкость СТАВИМ на конкретную сессию (participant), а не через partOf(username): partOf
@@ -2960,7 +3547,7 @@ export class Engine {
       if ((p as any).setVolume) (p as any).setVolume(v);
     } catch { /** webAudio watchdog/reattach повторит; element остаётся muted, обход gain запрещён */ }
   }
-  private applyAllVolumes() { this.voiceRoom?.remoteParticipants.forEach((p) => this.applyVolumeToParticipant(p)); }
+  private applyAllVolumes() { this.voiceMediaRoom?.remoteParticipants.forEach((p) => this.applyVolumeToParticipant(p)); }
   private participantWithTrack(username: string, source: Track.Source, room: Room | null): Participant | null {
     if (!room) return null;
     for (const p of room.remoteParticipants.values()) {

@@ -62,6 +62,19 @@ export interface VoiceIntentTicket extends VoiceLeaseEvent {
   clientIntent: number;
   idempotent?: boolean;
 }
+export interface VoiceMediaTokenResponse {
+  ok: true;
+  token: string;
+  url: string;
+  room: string;
+  identity: string;
+  epoch: number;
+}
+export interface VoiceMediaActivationResponse {
+  ok: true;
+  room: string;
+  epoch: number;
+}
 
 export class ApiError extends Error {
   readonly status: number;
@@ -260,6 +273,10 @@ export const api = {
     req<VoiceLeaseEvent>('POST', '/voice/lease/claim', { sessionId, serverId, channelId, clientIntent, ticket }),
   releaseVoiceLease: (sessionId: string, epoch: number) =>
     req<VoiceLeaseEvent>('POST', '/voice/lease/release', { sessionId, epoch }),
+  getVoiceMediaToken: (sessionId: string, serverId: string, channelId: string, epoch: number) =>
+    req<VoiceMediaTokenResponse>('POST', '/voice/media-token', { sessionId, serverId, channelId, epoch }),
+  activateVoiceMedia: (sessionId: string, serverId: string, channelId: string, epoch: number) =>
+    req<VoiceMediaActivationResponse>('POST', '/voice/media/activate', { sessionId, serverId, channelId, epoch }),
   getSettings: (id: string) => req<{ data: any }>('GET', `/servers/${id}/settings`),
   putSettings: (id: string, data: any) => req<{ ok: boolean }>('PUT', `/servers/${id}/settings`, { data }),
   // аккаунтные настройки (хоткеи и т.п.) — следуют за юзером на любом устройстве, не за localStorage
