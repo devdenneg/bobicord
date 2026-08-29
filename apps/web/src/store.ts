@@ -674,19 +674,6 @@ export function beginAuthSessionHandoff(): AuthSessionHandoff {
   };
 }
 
-async function waitForRealtimeRoom(serverId: string, stillCurrent: () => boolean, timeoutMs = 20_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (!stillCurrent()) return false;
-    const state = useStore.getState();
-    const snapshot = engine?.getSnapshot();
-    if (state.viewServerId === serverId && snapshot?.connected && snapshot.roomReady) return true;
-    if (!state.loadingServerId && state.viewServerId !== serverId) return false;
-    await new Promise((resolve) => window.setTimeout(resolve, 100));
-  }
-  return false;
-}
-
 // Вызывать только после установки нового JWT (tokenChanged=true) либо после окончательной ошибки
 // запроса (false). Функция не бросает исключений: пароль уже мог быть изменён, поэтому сбой
 // восстановления realtime не должен превращаться в ложную ошибку смены пароля.
@@ -700,6 +687,8 @@ export async function completeAuthSessionHandoff(plan: AuthSessionHandoff, token
       || (useStore.getState().viewServerId === plan.viewedServerId && !!currentSnapshot?.connected);
     const voiceStillAlive = !plan.voiceChannelId
       || (currentSnapshot?.voiceServerId === plan.voiceServerId && currentSnapshot.myVoiceChannel === plan.voiceChannelId);
+    const reconnectView = Boolean(plan.viewedServerId) && (tokenChanged || !viewStillAlive);
+    const voiceNeedsManualReconnect = Boolean(plan.voiceChannelId) && (tokenChanged || !voiceStillAlive);
 
     if (tokenChanged) {
       if (!stillCurrent()) return;
@@ -714,28 +703,21 @@ export async function completeAuthSessionHandoff(plan: AuthSessionHandoff, token
     resumeNotifyWsReconnect();
     if (!tokenChanged && viewStillAlive && voiceStillAlive) return;
 
-    const voiceServerId = plan.voiceChannelId ? plan.voiceServerId : null;
-    if (voiceServerId && plan.voiceChannelId) {
-      if (!stillCurrent()) return;
-      await useStore.getState().connectServer(voiceServerId);
-      if (!stillCurrent()) return;
-      if (await waitForRealtimeRoom(voiceServerId, stillCurrent)) {
-        if (!stillCurrent()) return;
-        await engine?.joinVoice(plan.voiceChannelId);
-        if (!stillCurrent()) return;
-      } else if (stillCurrent()) {
-        useStore.getState().toast('Пароль изменён, но голос не восстановился — подключись к каналу снова', 'warn');
-      }
-    }
-
-    if (plan.viewedServerId && plan.viewedServerId !== voiceServerId) {
-      if (!stillCurrent()) return;
-      await useStore.getState().connectServer(plan.viewedServerId);
-    } else if (plan.viewedServerId && !voiceServerId) {
+    // Handoff восстанавливает только просматриваемую LiveKit-комнату. Новый voice claim
+    // всегда требует свежего клика: за время ротации/обрыва владельцем могло стать другое
+    // устройство, и автоматический mint/claim без жеста вытеснил бы его.
+    if (reconnectView && plan.viewedServerId) {
       if (!stillCurrent()) return;
       await useStore.getState().connectServer(plan.viewedServerId);
     }
     if (!stillCurrent()) return;
+
+    const recoveredSnapshot = engine?.getSnapshot();
+    const voiceRecoveredExplicitly = recoveredSnapshot?.voiceServerId === plan.voiceServerId
+      && recoveredSnapshot.myVoiceChannel === plan.voiceChannelId;
+    if (voiceNeedsManualReconnect && !voiceRecoveredExplicitly) {
+      useStore.getState().toast('Голосовая связь отключена — подключись к каналу снова', 'warn');
+    }
 
     if (plan.originalView === 'home') {
       if (memberTimer) clearInterval(memberTimer);
