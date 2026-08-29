@@ -25,9 +25,11 @@ import { isTauri, setGlobalHotkeys } from '../native';
 import { enableNotifications, notifSupported, notifPermission } from '../notify';
 import { unsubscribePush, syncPushPrefs } from '../push';
 import {
+  audioDeviceSelectionMissing,
   audioDeviceChoices,
   audioOutputChoices,
   currentAppleMobilePlatform,
+  directAudioOutputSelectionSupported,
   type AudioDeviceChoice,
 } from '../audioDevices';
 
@@ -686,19 +688,58 @@ function SettingsModal() {
   const appleMobile = currentAppleMobilePlatform();
   const [ins, setIns] = useState<AudioDeviceChoice[]>([]); const [outs, setOuts] = useState<AudioDeviceChoice[]>([]);
   const [outputViaInput, setOutputViaInput] = useState(false);
+  const [devicesLoading, setDevicesLoading] = useState(true);
+  const [devicesFailed, setDevicesFailed] = useState(false);
   const [binding, setBinding] = useState(false);
   const [captureAction, setCaptureAction] = useState<KeybindAction | null>(null);
   useEffect(() => {
-    Promise.all([Room.getLocalDevices('audioinput'), Room.getLocalDevices('audiooutput')]).then(([inputs, outputs]) => {
-      setIns(audioDeviceChoices(inputs));
-      const output = audioOutputChoices(appleMobile, inputs, outputs);
+    let disposed = false;
+    let requestId = 0;
+    let timer: number | null = null;
+    const load = async () => {
+      const id = ++requestId;
+      setDevicesLoading(true);
+      const [inputResult, outputResult] = await Promise.allSettled([
+        Room.getLocalDevices('audioinput'),
+        Room.getLocalDevices('audiooutput'),
+      ]);
+      if (disposed || id !== requestId) return;
+      const inputs = inputResult.status === 'fulfilled' ? inputResult.value : [];
+      const outputs = outputResult.status === 'fulfilled' ? outputResult.value : [];
+      setIns(audioDeviceChoices(inputs, 'Микрофон'));
+      const output = audioOutputChoices(
+        appleMobile,
+        inputs,
+        outputs,
+        directAudioOutputSelectionSupported(),
+      );
       setOuts(output.choices);
       setOutputViaInput(output.viaInput);
-    }).catch(() => {});
+      setDevicesFailed(inputResult.status === 'rejected' && outputResult.status === 'rejected');
+      setDevicesLoading(false);
+    };
+    const onDeviceChange = () => {
+      if (timer != null) window.clearTimeout(timer);
+      timer = window.setTimeout(() => { timer = null; void load(); }, 150);
+    };
+    void load();
+    navigator.mediaDevices?.addEventListener?.('devicechange', onDeviceChange);
+    return () => {
+      disposed = true;
+      requestId++;
+      if (timer != null) window.clearTimeout(timer);
+      navigator.mediaDevices?.removeEventListener?.('devicechange', onDeviceChange);
+    };
   }, [appleMobile]);
   useEffect(() => { if (!binding) return; const k = (e: KeyboardEvent) => { e.preventDefault(); setSettings({ pttKey: e.code }); setBinding(false); rerender(); }; window.addEventListener('keydown', k, { once: true }); return () => window.removeEventListener('keydown', k); }, [binding]);
   const E = getEngine();
   const upd = (patch: Partial<AudioSettings>, act?: () => void) => { setSettings(patch); act?.(); rerender(); };
+  const selectedOutput = outputViaInput ? s.input : s.output;
+  const inputMissing = !appleMobile && !devicesLoading && audioDeviceSelectionMissing(s.input, ins);
+  const outputMissing = !devicesLoading && audioDeviceSelectionMissing(selectedOutput, outs);
+  const deviceStatus = devicesLoading ? 'Обновляем список аудиоустройств…'
+    : devicesFailed ? 'Не удалось получить список устройств. Проверьте разрешения браузера.'
+      : (inputMissing || outputMissing) ? 'Ранее выбранное устройство отключено. До нового выбора используется системное.' : '';
   type Tab = 'voice' | 'notif' | 'appearance' | 'keys' | 'game';
   const [tab, setTab] = useState<Tab>('voice');
   const cats: { id: Tab; label: string; icon: string }[] = [
@@ -726,7 +767,9 @@ function SettingsModal() {
             <h2><Icon name="mic-sm" />Голос и звук</h2>
             <div className="grp">
               <div className="gt">Микрофон</div>
-              {!appleMobile ? <div className="fld"><label>Устройство ввода</label><select value={s.input} onChange={(e) => upd({ input: e.target.value }, () => E?.reapplyMic())}><option value="">По умолчанию</option>{ins.map((d) => <option key={d.id} value={d.id}>{d.label}</option>)}</select></div>
+              {!appleMobile ? <div className="fld"><label htmlFor="audio-input-device">Устройство ввода</label><select id="audio-input-device" value={s.input} aria-describedby="audio-device-status" onChange={(e) => upd({ input: e.target.value }, () => E?.reapplyMic())}>
+                {inputMissing ? <option value={s.input} disabled>Выбранный микрофон отключён</option> : null}
+                <option value="">По умолчанию</option>{ins.map((d) => <option key={d.id} value={d.id}>{d.label}</option>)}</select></div>
                 : <div className="mm-hint">На iPhone и iPad микрофон выбирается системой вместе с маршрутом звука.</div>}
               <div className="fld" style={{ marginTop: 10 }}><label>Шумоподавление</label>
                 <select value={s.nsMode} onChange={(e) => upd({ nsMode: e.target.value as AudioSettings['nsMode'] }, () => { E?.reapplyMic(); E?.restartLevelMeter(); })}>
@@ -743,17 +786,19 @@ function SettingsModal() {
               </div>
             </div>
             <div className="grp"><div className="gt">Звук</div>
-              <div className="fld"><label>{outputViaInput ? 'Маршрут звука' : 'Устройство вывода'}</label>
-                <select value={outputViaInput ? s.input : s.output} onChange={(e) => {
+              <div className="fld"><label htmlFor="audio-output-device">{outputViaInput ? 'Маршрут звука' : 'Устройство вывода'}</label>
+                <select id="audio-output-device" value={selectedOutput} aria-describedby="audio-device-status" onChange={(e) => {
                   const id = e.target.value;
                   if (outputViaInput) {
                     upd({ input: id, output: '' }, () => { void E?.reapplyMic('route').then(() => E.applyOutput()); });
                   } else upd({ output: id }, () => { void E?.applyOutput(); });
                 }}>
+                  {outputMissing ? <option value={selectedOutput} disabled>Выбранное устройство отключено</option> : null}
                   <option value="">{outputViaInput ? 'Автоматически' : 'По умолчанию'}</option>
                   {outs.map((d) => <option key={d.id} value={d.id}>{d.label}</option>)}
                 </select>
               </div>
+              <div id="audio-device-status" className="mm-hint audio-device-status" role="status" aria-live="polite">{deviceStatus}</div>
               <div className="fld"><label>Общая громкость: {s.master}%</label><input type="range" min={0} max={100} value={s.master} onChange={(e) => upd({ master: +e.target.value }, () => E?.applyMaster())} /></div>
               <div className="fld"><label>Громкость уведомлений: {s.notifyVolume}%</label><input type="range" min={0} max={100} value={s.notifyVolume} onChange={(e) => upd({ notifyVolume: +e.target.value })} onMouseUp={() => playSound('system')} /></div>
             </div>

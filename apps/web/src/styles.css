@@ -1004,9 +1004,13 @@
   .vd-devmenu.ready{visibility:visible}
   .vd-devmenu.up{transform-origin:left bottom}
   .vd-devh{font-size:10px;font-weight:700;letter-spacing:.5px;color:var(--muted);padding:5px 9px 3px}
+  .vd-devstatus{padding:7px 9px;color:var(--muted);font-size:11.5px;line-height:1.35}
+  .vd-devstatus.warn{color:var(--yellow)}
+  .vd-devstatus.is-error{color:var(--red)}
   .vd-devitem{display:block;width:100%;text-align:left;padding:7px 9px;border-radius:7px;background:none;color:var(--txt);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .vd-devitem:hover{background:var(--panel3)}
   .vd-devitem.on{color:var(--green);background:rgba(35,165,89,.12)}
+  .audio-device-status:empty{display:none}
   /* Виджет вещателя (StreamerWidget): ОТДЕЛЬНАЯ карточка над голосовым доком (не сливается с ним) —
      свой отступ, рамка кругом, скругление и тень; зазор показывает фон #channels под карточкой.
      Класс .strw, НЕ .sw — .sw занят тумблером-переключателем (line 82: width:42px;height:24px),
@@ -2094,6 +2098,8 @@ body:has(#voicedock) .admin{padding-bottom:max(132px,calc(118px + env(safe-area-
   .vd-btn{width:44px;height:44px}
   .vd-btn.vd-leave{width:44px;height:44px}
   .vd-caret{width:32px;min-height:44px}
+  .vd-devitem{min-height:44px;padding:11px 12px;font-size:14px}
+  .vd-devstatus{padding:9px 12px;font-size:12.5px}
   .vd-info{min-height:44px}
   .vd-controls{flex-wrap:wrap;gap:8px}
   .react-add{opacity:1}

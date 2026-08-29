@@ -4,7 +4,12 @@ import type { AudioSettings } from './types';
 // выключен по умолчанию (disableGlobalHotkeys=true) — см. HK_RESET_V в App.tsx для форс-сброса
 // уже настроивших аккаунтов.
 const DEF: AudioSettings = { input: '', output: '', nsMode: 'rnnoise', ec: true, agc: true, mode: 'voice', pttKey: 'KeyV', master: 100, sensitivity: 10, sensitivityAuto: true, notifyVolume: 60, notif: false, notifMention: true, notifStream: true, notifUpdate: true, notifPrivacy: 'full', shareGame: true, keybinds: { muteMic: [], deafen: [] }, disableGlobalHotkeys: true };
-const stored = JSON.parse(localStorage.getItem('audioSettings') || '{}');
+let stored: Partial<AudioSettings> = {};
+try {
+  const raw = localStorage.getItem('audioSettings');
+  const parsed = raw ? JSON.parse(raw) : {};
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) stored = parsed;
+} catch { /* повреждённый или недоступный mobile storage — используем безопасные defaults */ }
 // keybinds/disableGlobalHotkeys — сознательно НЕ читаем из локального кэша при старте (в
 // отличие от остальных полей). Это привязано к аккаунту (см. App.tsx: GET/PUT /api/me/settings),
 // а localStorage — только write-through кэш для мгновенной отрисовки/офлайна. Раньше кэш на
@@ -13,6 +18,18 @@ const stored = JSON.parse(localStorage.getItem('audioSettings') || '{}');
 // у пустого/нового аккаунта на сервере просто нечем было перезаписать локальное значение).
 // Теперь единственный источник — код-дефолт ниже, а сервер переопределяет его после логина.
 let s: AudioSettings = { ...DEF, ...stored, keybinds: DEF.keybinds, disableGlobalHotkeys: DEF.disableGlobalHotkeys };
+// Старые/повреждённые мобильные значения не должны попадать в WebRTC constraints.
+if (typeof s.input !== 'string') s.input = '';
+if (typeof s.output !== 'string') s.output = '';
+if (!['rnnoise', 'basic', 'off'].includes(s.nsMode)) s.nsMode = DEF.nsMode;
+if (!['voice', 'ptt'].includes(s.mode)) s.mode = DEF.mode;
+for (const key of ['master', 'sensitivity', 'notifyVolume'] as const) {
+  const value = Number(s[key]);
+  s[key] = Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : DEF[key];
+}
+if (typeof s.ec !== 'boolean') s.ec = DEF.ec;
+if (typeof s.agc !== 'boolean') s.agc = DEF.agc;
+if (typeof s.sensitivityAuto !== 'boolean') s.sensitivityAuto = DEF.sensitivityAuto;
 if (!['full', 'sender', 'hidden'].includes(s.notifPrivacy)) s.notifPrivacy = 'full';
 // Миграция: раньше можно было выбрать enumerated-алиас 'default'/'communications' (Chrome-псевдо-
 // устройства) — теперь пикер их прячет (см. audioDevices.audioDeviceChoices). Эти значения эквивалентны
@@ -39,7 +56,7 @@ try {
 export const getSettings = (): AudioSettings => s;
 export function setSettings(patch: Partial<AudioSettings>): void {
   s = { ...s, ...patch };
-  localStorage.setItem('audioSettings', JSON.stringify(s));
+  try { localStorage.setItem('audioSettings', JSON.stringify(s)); } catch { /* приватный режим/переполненное хранилище не ломает голос */ }
   if (patch.notifPrivacy !== undefined) syncNotificationPrivacyToWorker();
   subs.forEach((f) => f());
 }

@@ -25,6 +25,8 @@ const MAX_GAIN = 6; // потолок усиления тихого файла (
 
 let actx: AudioContext | null = null;
 let lastSink: string | null = null; // последний применённый deviceId вывода (антиспам setSinkId)
+let sinkGeneration = 0;
+let sinkSwitch: Promise<void> = Promise.resolve();
 const buffers: Partial<Record<SoundName, AudioBuffer>> = {};
 const norm: Partial<Record<SoundName, number>> = {}; // нормировочный множитель громкости на звук
 const loading: Partial<Record<SoundName, Promise<void>>> = {};
@@ -50,14 +52,24 @@ async function applySink(): Promise<void> {
   const want = getSettings().output || '';
   if (want === lastSink) return;
   lastSink = want;
-  try { await a.setSinkId(await resolveSink(want)); }
-  catch { lastSink = null; try { await a.setSinkId(''); } catch { /**/ } } // устройство пропало → системный дефолт (повторим при след. смене)
+  const generation = ++sinkGeneration;
+  const run = sinkSwitch.catch(() => {}).then(async () => {
+    if (generation !== sinkGeneration || actx !== a) return;
+    try { await a.setSinkId!(await resolveSink(want)); }
+    catch {
+      if (generation !== sinkGeneration || actx !== a) return;
+      lastSink = null;
+      try { await a.setSinkId!(''); } catch { /** система сама выберет доступный маршрут */ }
+    }
+  });
+  sinkSwitch = run.catch(() => {});
+  await run;
 }
 
 function wake(): void { actx?.resume?.().catch(() => {}); }
 
 function ctx(): AudioContext {
-  if (!actx) { actx = new AudioContext(); applySink(); }
+  if (!actx || actx.state === 'closed') { actx = new AudioContext(); lastSink = null; applySink(); }
   return actx;
 }
 
@@ -67,6 +79,8 @@ function ctx(): AudioContext {
 // вкладке) — running-контекст в фоне не усыпляется, пока страница «живая» (WebRTC-звонок её держит).
 if (typeof window !== 'undefined') {
   document.addEventListener('visibilitychange', () => { if (!document.hidden) wake(); });
+  // iOS может вернуть PWA из back-forward cache без нового visibilitychange.
+  window.addEventListener('pageshow', wake);
   (['pointerdown', 'keydown', 'touchstart'] as const).forEach((ev) => window.addEventListener(ev, wake, { passive: true }));
   subscribeSettings(applySink); // вывод звуков следует за выбранным устройством вывода
   // Переподключение наушников меняет РЕАЛЬНОЕ устройство за тем же '' (системное по умолчанию):

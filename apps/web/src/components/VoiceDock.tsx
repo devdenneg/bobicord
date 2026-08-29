@@ -8,9 +8,11 @@ import { getSettings, setSettings } from '../settings';
 import { isTauri, onBroadcastStopped, stopNativeBroadcast } from '../native';
 import { endAnyBroadcasterSession } from '../diag';
 import {
+  audioDeviceSelectionMissing,
   audioDeviceChoices,
   audioOutputChoices,
   currentAppleMobilePlatform,
+  directAudioOutputSelectionSupported,
   type AudioDeviceChoice,
 } from '../audioDevices';
 
@@ -63,10 +65,14 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
   const [open, setOpen] = useState(false);
   const [devs, setDevs] = useState<AudioDeviceChoice[]>([]);
   const [outputViaInput, setOutputViaInput] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [loaded, setLoaded] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
   const [position, setPosition] = useState<{ left: number; top: number; maxHeight: number; above: boolean } | null>(null);
   const appleMobile = currentAppleMobilePlatform();
   const cur = kind === 'input' || outputViaInput ? getSettings().input : getSettings().output;
+  const selectionMissing = loaded && !loading && audioDeviceSelectionMissing(cur, devs);
   const ref = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -88,42 +94,84 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
     const next = initial === 'first' ? 0 : initial === 'last' ? optionCount - 1 : Math.max(0, selected);
     setActiveIndex(next);
     setPosition(null);
+    setDevs([]);
+    setLoaded(false);
+    setLoadFailed(false);
     setOpen(true);
     requestAnimationFrame(() => menuRef.current?.querySelector<HTMLElement>(`[data-menu-index="${next}"]`)?.focus());
   };
   useEffect(() => {
     if (!open) return;
-    const load = () => {
-      const request = kind === 'output' && appleMobile
-        ? Promise.all([Room.getLocalDevices('audioinput'), Room.getLocalDevices('audiooutput')])
-          .then(([inputs, outputs]) => audioOutputChoices(true, inputs, outputs))
-        : Room.getLocalDevices(kind === 'input' ? 'audioinput' : 'audiooutput')
-          .then((devices) => ({ choices: audioDeviceChoices(devices), viaInput: false }));
-      request.then(({ choices, viaInput }) => {
+    let disposed = false;
+    let requestId = 0;
+    let timer: number | null = null;
+    const load = async () => {
+      const id = ++requestId;
+      setLoading(true);
+      setLoaded(false);
+      setLoadFailed(false);
+      let choices: AudioDeviceChoice[] = [];
+      let viaInput = false;
+      let failed = false;
+      if (kind === 'output' && appleMobile) {
+        const [inputResult, outputResult] = await Promise.allSettled([
+          Room.getLocalDevices('audioinput'),
+          Room.getLocalDevices('audiooutput'),
+        ]);
+        const inputs = inputResult.status === 'fulfilled' ? inputResult.value : [];
+        const outputs = outputResult.status === 'fulfilled' ? outputResult.value : [];
+        const output = audioOutputChoices(true, inputs, outputs, directAudioOutputSelectionSupported());
+        choices = output.choices;
+        viaInput = output.viaInput;
+        failed = inputResult.status === 'rejected' && outputResult.status === 'rejected';
+      } else {
+        try {
+          const devices = await Room.getLocalDevices(kind === 'input' ? 'audioinput' : 'audiooutput');
+          choices = kind === 'output' && !directAudioOutputSelectionSupported()
+            ? []
+            : audioDeviceChoices(devices, kind === 'input' ? 'Микрофон' : 'Устройство вывода');
+        } catch { failed = true; }
+      }
+      if (disposed || id !== requestId) return;
+      if (!failed) {
         setDevs(choices);
         setOutputViaInput(kind === 'output' && viaInput);
-        const selectedId = kind === 'input' || viaInput ? getSettings().input : getSettings().output;
-        const selected = selectedId ? choices.findIndex((device) => device.id === selectedId) + 1 : 0;
-        const intent = openFocusRef.current;
-        const next = intent === 'first' ? 0 : intent === 'last' ? choices.length : Math.max(0, selected);
-        openFocusRef.current = 'selected';
-        setActiveIndex(next);
-        requestAnimationFrame(() => menuRef.current?.querySelector<HTMLElement>(`[data-menu-index="${next}"]`)?.focus());
-      }).catch(() => {});
+      }
+      setLoadFailed(failed);
+      setLoading(false);
+      setLoaded(!failed);
+      const selectedId = kind === 'input' || viaInput ? getSettings().input : getSettings().output;
+      const selected = selectedId ? choices.findIndex((device) => device.id === selectedId) + 1 : 0;
+      const intent = openFocusRef.current;
+      const next = intent === 'first' ? 0 : intent === 'last' ? choices.length : Math.max(0, selected);
+      openFocusRef.current = 'selected';
+      setActiveIndex(next);
+      requestAnimationFrame(() => menuRef.current?.querySelector<HTMLElement>(`[data-menu-index="${next}"]`)?.focus());
     };
-    load();
+    const onDeviceChange = () => {
+      if (timer != null) window.clearTimeout(timer);
+      setDevs([]);
+      setLoaded(false);
+      setLoadFailed(false);
+      setLoading(true);
+      timer = window.setTimeout(() => { timer = null; void load(); }, 150);
+    };
+    void load();
     const onDoc = (e: PointerEvent) => {
       const target = e.target as Node | null;
       if (!target || ref.current?.contains(target) || menuRef.current?.contains(target)) return;
       closeMenu();
     };
     document.addEventListener('pointerdown', onDoc, true);
-    navigator.mediaDevices?.addEventListener?.('devicechange', load);
+    navigator.mediaDevices?.addEventListener?.('devicechange', onDeviceChange);
     return () => {
+      disposed = true;
+      requestId++;
+      if (timer != null) window.clearTimeout(timer);
       document.removeEventListener('pointerdown', onDoc, true);
-      navigator.mediaDevices?.removeEventListener?.('devicechange', load);
+      navigator.mediaDevices?.removeEventListener?.('devicechange', onDeviceChange);
     };
-  }, [appleMobile, open, kind, cur]);
+  }, [appleMobile, open, kind]);
   useLayoutEffect(() => {
     if (!open) return;
     let frame = 0;
@@ -236,10 +284,13 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
         '--vd-menu-top': `${position.top}px`,
         '--vd-menu-max-height': `${position.maxHeight}px`,
       } as React.CSSProperties : undefined}
-      role="menu" aria-label={kind === 'input' ? 'Микрофоны' : 'Устройства вывода'} onKeyDown={onMenuKeyDown}>
+      role="menu" aria-label={kind === 'input' ? 'Микрофоны' : 'Устройства вывода'} aria-busy={loading} onKeyDown={onMenuKeyDown}>
       <div className="vd-devh" aria-hidden="true">{kind === 'input' ? 'МИКРОФОН' : (outputViaInput ? 'МАРШРУТ ЗВУКА' : 'ВЫВОД ЗВУКА')}</div>
-      <button role="menuitemradio" aria-checked={!cur} tabIndex={activeIndex === 0 ? 0 : -1} data-menu-index="0"
-        className={'vd-devitem' + (!cur ? ' on' : '')} onFocus={() => setActiveIndex(0)} onClick={() => pick('')}>{outputViaInput ? 'Автоматически' : 'По умолчанию'}</button>
+      {loading ? <div className="vd-devstatus" role="status" aria-live="polite">Обновляем список…</div> : null}
+      {loadFailed ? <div className="vd-devstatus is-error" role="status">Не удалось получить устройства</div> : null}
+      {selectionMissing ? <div className="vd-devstatus warn" role="status">Выбранное устройство отключено</div> : null}
+      <button role="menuitemradio" aria-checked={!cur || selectionMissing} tabIndex={activeIndex === 0 ? 0 : -1} data-menu-index="0"
+        className={'vd-devitem' + (!cur || selectionMissing ? ' on' : '')} onFocus={() => setActiveIndex(0)} onClick={() => pick('')}>{outputViaInput ? 'Автоматически' : 'По умолчанию'}</button>
       {devs.map((d, index) => (
         <button role="menuitemradio" aria-checked={cur === d.id} tabIndex={activeIndex === index + 1 ? 0 : -1}
           data-menu-index={index + 1} key={d.id} className={'vd-devitem' + (cur === d.id ? ' on' : '')}
@@ -254,10 +305,12 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
   // системными аудиомаршрутами. Показываем их только у вывода, чтобы не провоцировать
   // бессмысленное переключение микрофона по кругу.
   if (kind === 'input' && appleMobile) return null;
+  const selectedLabel = devs.find((device) => device.id === cur)?.label;
+  const triggerLabel = kind === 'input' ? 'Выбрать микрофон' : 'Выбрать устройство вывода';
   return <>
     <div className="vd-devwrap" ref={ref}>
       <button ref={triggerRef} className={'vd-caret' + (open ? ' on' : '')} aria-expanded={open} aria-haspopup="menu" aria-controls={`vd-device-${kind}`}
-        aria-label={kind === 'input' ? 'Выбрать микрофон' : 'Выбрать устройство вывода'}
+        aria-label={`${triggerLabel}: ${selectionMissing ? 'выбранное устройство отключено' : (selectedLabel || (cur ? 'выбранное устройство' : (outputViaInput ? 'автоматически' : 'по умолчанию')))}`}
         data-tip={open ? undefined : (kind === 'input' ? 'Выбрать микрофон' : 'Выбрать устройство вывода')}
         onKeyDown={onTriggerKeyDown}
         onClick={() => open ? closeMenu() : openMenu()}><Icon name="chevron" sm /></button>
