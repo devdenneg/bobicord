@@ -159,6 +159,7 @@ export class TreeVideoTransport implements VideoTransport {
   private lastJb = new Map<string, { delay: number; count: number }>();
   private topologyByStream = new Map<string, TreeTopology>();
   private reWatchAttempts = new Map<string, number>(); // неудачные круги переустановки просмотра подряд
+  private webReconnectAttempts = new Map<string, number>();
   private topologyCbs = new Set<(streamId: string) => void>();
   private reparentDeniedCbs = new Set<(streamId: string, reason: string) => void>();
   private renditionUnavailableCbs = new Set<(streamId: string, rendition: string, reason: string) => void>();
@@ -330,9 +331,12 @@ export class TreeVideoTransport implements VideoTransport {
       // сам заглохнет (guard). Не дублируем, если watch уже пересоздан.
       if (live) {
         this.armVideoFailsafe(streamId, 15000); // реконнект (сеть) медленнее смены качества
+        const attempt = this.webReconnectAttempts.get(streamId) || 0;
+        this.webReconnectAttempts.set(streamId, attempt + 1);
+        const delay = Math.min(30_000, 1500 * 2 ** Math.min(attempt, 5));
         setTimeout(() => {
           if (!this.closed && this.intended.has(streamId) && !this.watches.has(streamId) && !this.nativeWatches.has(streamId) && this.liveStreams.has(streamId)) this.watch(streamId, st.quality, st.pinned);
-        }, 3000);
+        }, delay);
       }
     };
     ws.onerror = () => { try { ws.close(); } catch { /**/ } };
@@ -399,6 +403,7 @@ export class TreeVideoTransport implements VideoTransport {
   // контейнера — иначе застрявший failsafe/повторный teardown работают по мусору.
   private dropVideo(streamId: string) {
     this.reWatchAttempts.delete(streamId);
+    this.webReconnectAttempts.delete(streamId);
     this.clearVideoFailsafe(streamId);
     this.containers.delete(streamId);
     this.delVideo(streamId);
@@ -662,6 +667,7 @@ export class TreeVideoTransport implements VideoTransport {
       }
     };
     pc.ontrack = (e) => {
+      this.webReconnectAttempts.delete(streamId);
       this.applyJitter(streamId);
       // Оба kind в контейнер: аудио стрима едет тем же <video> (см. upsertTrack).
       this.upsertTrack(streamId, e.track);
