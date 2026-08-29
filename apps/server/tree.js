@@ -1450,7 +1450,11 @@ function attachTreeServer(httpServer, opts) {
   function onSignal(id, msg) {
     const p = peers.get(id);
     if (!p || !p.streamId || !msg.to) return;
-    send(msg.to, { t: msg.t, streamId: p.streamId, from: id, type: msg.type, sdp: msg.sdp, candidate: msg.candidate });
+    const target = peers.get(String(msg.to));
+    // Нельзя использовать tree-сокет как произвольный межсерверный прокси:
+    // адресат обязан находиться в том же конкретном дереве, что и отправитель.
+    if (!target || !target.streamId || target.treeKey !== p.treeKey) return;
+    send(target.id, { t: msg.t, streamId: p.streamId, from: id, type: msg.type, sdp: msg.sdp, candidate: msg.candidate });
   }
 
   // Roadmap-flow-стриминга Д5: релей preflight-probe замера upload. Как onSignal, но адресация:
