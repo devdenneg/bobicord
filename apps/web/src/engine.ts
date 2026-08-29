@@ -301,6 +301,7 @@ export class Engine {
   private outputGeneration = 0;
   private voiceOutputPending: { room: Room; sink: string } | null = null;
   private outputDeviceTimer: number | null = null;
+  private deviceChangeHandler: (() => void) | null = null;
 
   private emoteListeners = new Set<EmoteListener>();
   private subs = new Set<() => void>();
@@ -391,14 +392,15 @@ export class Engine {
     // Headsets/Bluetooth outputs may disappear without touching the settings
     // UI. Re-verify both output routing and the captured mic immediately; the
     // regular watchdog remains the fallback for browsers without devicechange.
-    navigator.mediaDevices?.addEventListener?.('devicechange', () => {
+    this.deviceChangeHandler = () => {
       if (this.outputDeviceTimer) clearTimeout(this.outputDeviceTimer);
       this.outputDeviceTimer = window.setTimeout(() => {
         this.outputDeviceTimer = null;
         if (this.viewRoom || this.voiceRoom) void this.applyOutput();
         if (this.inVoice) void this.checkMicAlive(true);
       }, 200);
-    });
+    };
+    navigator.mediaDevices?.addEventListener?.('devicechange', this.deviceChangeHandler);
     this.snap = this.build();
   }
 
@@ -802,6 +804,10 @@ export class Engine {
 
   // Полный teardown (logout / выход с сервера, где я в голосе): рвём ОБЕ комнаты + всё состояние.
   disconnect() {
+    if (this.deviceChangeHandler) {
+      navigator.mediaDevices?.removeEventListener?.('devicechange', this.deviceChangeHandler);
+      this.deviceChangeHandler = null;
+    }
     this.stopIdleWatch?.(); this.stopIdleWatch = null; // движок выбрасывается — подписка не должна его удерживать
     if (this.spIdleTimer) { clearInterval(this.spIdleTimer); this.spIdleTimer = null; }
     ++this.voiceEpoch; ++this.connectEpoch;
