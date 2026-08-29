@@ -13,6 +13,7 @@
     "test:voice-lease": "node voice-lease-test.js",
     "test:voice-media": "node --test voice-media-test.js",
     "test:voice-media-revocations": "node --test voice-media-revocations-test.js",
+    "test:voice-token-policy": "node --test voice-token-policy-test.js",
     "test:tree-ws-error": "node tree-ws-error-test.js",
     "test:tree-auth": "node --test tree-auth-test.js",
     "test:seventv-proxy": "node --test seventv-proxy-test.js",

@@ -14,6 +14,9 @@ const {
   activateVoiceMediaParticipant, removeVoiceMediaParticipant,
 } = require('./voiceMedia');
 const { createVoiceMediaRevocationStore, createVoiceMediaRevocationWorker } = require('./voiceMediaRevocations');
+const {
+  hubTokenGrant, createVoiceTokenMintLimiter, noStoreVoiceTokenResponse,
+} = require('./voiceTokenPolicy');
 const { installRuntimeRevocationSchema } = require('./runtimeRevocation');
 const { planUploadSweep, uploadUrlsOfMessageRows, normalizeUploadRef, uploadRefsInText, isOwnedUploadRow } = require('./uploadsGc'); // квоты, владение и уборка пользовательских файлов
 const {
@@ -896,6 +899,7 @@ const VOICE_SESSION_RE = /^[A-Za-z0-9._:~-]{1,128}$/;
 const VOICE_RESOURCE_RE = /^[A-Za-z0-9_-]{1,96}$/;
 const voiceClaimQueues = new Map();
 const pendingVoiceEvictions = new Map();
+const voiceTokenMintLimiter = createVoiceTokenMintLimiter();
 function leaseResponse(state, reason) {
   return { ok: true, ...voiceLeaseEvent(state, reason) };
 }
@@ -1327,7 +1331,7 @@ function voiceMediaStillAllowed(userId, params) {
 
 // Подготовительная фаза изоляции: token может только войти в точную media-room. Слушать и
 // публиковать он сможет лишь после отдельной exact-lease активации ниже.
-app.post('/api/voice/media-token', requireAuth, async (req, res, next) => {
+app.post('/api/voice/media-token', noStoreVoiceTokenResponse, requireAuth, async (req, res, next) => {
   const params = voiceMediaRequest(req.body);
   if (!params) return res.status(400).json({ error: 'Invalid voice media parameters' });
   try {
@@ -1339,6 +1343,10 @@ app.post('/api/voice/media-token', requireAuth, async (req, res, next) => {
         return { status: 404, error: 'Voice channel not found' };
       }
       if (!exactVoiceLease(voiceLeases.read(req.user.id).lease, params)) return { status: 409, error: 'Voice lease is not current' };
+      const mintRate = voiceTokenMintLimiter.consume(req.user.id);
+      if (!mintRate.allowed) {
+        return { status: 429, error: 'Too many voice token requests', retryAfterSeconds: mintRate.retryAfterSeconds };
+      }
       const connected = await voiceSessionConnectedOnce(params.serverId, voiceHubIdentity(req.user.username, params.sessionId));
       if (connected !== true) return { status: connected === null ? 503 : 409, error: connected === null ? 'Voice service unavailable' : 'Voice hub session is not active' };
       if (!voiceMediaStillAllowed(req.user.id, params)) return { status: 409, error: 'Voice lease is not current' };
@@ -1360,8 +1368,10 @@ app.post('/api/voice/media-token', requireAuth, async (req, res, next) => {
       if (!voiceMediaStillAllowed(req.user.id, params)) return { status: 409, error: 'Voice lease is not current' };
       return { token, room, identity };
     });
-    if (result.error) return res.status(result.status).json({ error: result.error });
-    res.setHeader('Cache-Control', 'no-store');
+    if (result.error) {
+      if (result.retryAfterSeconds) res.setHeader('Retry-After', String(result.retryAfterSeconds));
+      return res.status(result.status).json({ error: result.error, ...(result.retryAfterSeconds ? { retryAfter: result.retryAfterSeconds } : {}) });
+    }
     return res.json({ ok: true, url: WS_URL, token: result.token, room: result.room, identity: result.identity, epoch: params.epoch });
   } catch (error) { return next(error); }
 });
@@ -2869,10 +2879,15 @@ app.post('/api/servers/:id/clear', requireAuth, (req, res) => {
 });
 
 /* ---------------- LIVEKIT TOKEN (per server) ---------------- */
-app.get('/api/servers/:id/token', requireAuth, async (req, res) => {
+app.get('/api/servers/:id/token', noStoreVoiceTokenResponse, requireAuth, async (req, res) => {
   const s = db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id);
   if (!s) return res.status(404).json({ error: 'нет' });
   if (!isMember(req.user.id, s.id)) return res.status(403).json({ error: 'Ты не участник' });
+  const mintRate = voiceTokenMintLimiter.consume(req.user.id);
+  if (!mintRate.allowed) {
+    res.setHeader('Retry-After', String(mintRate.retryAfterSeconds));
+    return res.status(429).json({ error: 'Слишком много запросов голосового токена', retryAfter: mintRate.retryAfterSeconds });
+  }
   try {
     // Connected clients refresh LiveKit grants automatically. Keep the initial
     // grant short-lived so a token copied from an evicted device cannot be
@@ -2880,7 +2895,7 @@ app.get('/api/servers/:id/token', requireAuth, async (req, res) => {
     const sessionVersion = Math.max(0, Number(req.user.session_version) || 0);
     const voiceSession = `v${sessionVersion}.${crypto.randomBytes(4).toString('hex')}`;
     const at = new AccessToken(KEY, SECRET, { identity: req.user.username + '#' + voiceSession, name: req.user.display_name, ttl: '10m' });
-    at.addGrant({ roomJoin: true, room: 'srv:' + s.id, canPublish: true, canSubscribe: true, canPublishData: true, canUpdateOwnMetadata: true });
+    at.addGrant(hubTokenGrant('srv:' + s.id));
     res.json({ token: await at.toJwt(), url: WS_URL, room: 'srv:' + s.id, sessionId: voiceSession });
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
