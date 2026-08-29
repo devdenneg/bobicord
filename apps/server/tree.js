@@ -1466,7 +1466,9 @@ function attachTreeServer(httpServer, opts) {
     const p = peers.get(id);
     if (!p) return;
     if (p.isVrelayAgent) { // агент → вещатель (по явному to)
-      if (msg.to) send(msg.to, { t: msg.t, from: id, sdp: msg.sdp, candidate: msg.candidate });
+      const target = msg.to && peers.get(String(msg.to));
+      if (target && (!target.serverId || !p.serverId || target.serverId === p.serverId))
+        send(target.id, { t: msg.t, from: id, sdp: msg.sdp, candidate: msg.candidate });
       return;
     }
     const agent = findVrelayAgent(); // вещатель → агент
