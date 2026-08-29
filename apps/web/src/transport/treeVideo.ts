@@ -63,6 +63,7 @@ interface WatchState {
   joined: boolean;                // join уже отправлен (шлём после welcome — см. sendWatchJoin)
   quality: string;                // Д3: рендишн-дерево, в которое джойнимся (дефолт 'source')
   pinned: boolean;                // Д4: ручной выбор качества (авто-ABR не трогает)
+  pendingIce: any[];              // ICE может прийти раньше SDP/создания upstream-PC
 }
 
 
@@ -307,7 +308,7 @@ export class TreeVideoTransport implements VideoTransport {
     let ws: WebSocket;
     try { ws = new WebSocket(treeWsUrl()); } catch { return; }
     const st: WatchState = {
-      ws, pc: null, parentId: null, closed: false, iceServers: this.iceServers,
+      ws, pc: null, parentId: null, closed: false, iceServers: this.iceServers, pendingIce: [],
       maxChildren: 0, joined: false, quality, pinned,
     };
     this.watches.set(streamId, st);
@@ -541,6 +542,7 @@ export class TreeVideoTransport implements VideoTransport {
         // каждый reparent (чёрный пропад, вылет из фуллскрина).
         if (st.pc) { try { st.pc.close(); } catch { /**/ } st.pc = null; this.armVideoFailsafe(streamId); }
         st.parentId = msg.parentId || null;
+        st.pendingIce.length = 0;
         break;
       }
       case 'assign-child': {
@@ -557,7 +559,9 @@ export class TreeVideoTransport implements VideoTransport {
       }
       case 'ice': {
         if (!msg.candidate) return;
-        if (msg.from === st.parentId && st.pc) st.pc.addIceCandidate(msg.candidate).catch(() => {});
+        if (msg.from !== st.parentId) return;
+        if (st.pc && st.pc.remoteDescription) st.pc.addIceCandidate(msg.candidate).catch(() => {});
+        else if (st.pendingIce.length < 128) st.pendingIce.push(msg.candidate);
         break;
       }
       case 'drop-peer': {
@@ -663,6 +667,8 @@ export class TreeVideoTransport implements VideoTransport {
     };
     try {
       await pc.setRemoteDescription({ type: 'offer', sdp });
+      const pendingIce = st.pendingIce.splice(0);
+      for (const candidate of pendingIce) await pc.addIceCandidate(candidate).catch(() => {});
       preferH264(pc);
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
