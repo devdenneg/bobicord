@@ -2759,11 +2759,12 @@ export class Engine {
       if (sid != null && pend?.key && this.viewRoom) this.dataSend({ t: 'sid', mkey: pend.key, sid });
     } else this.setMsgStatus(localId, 'failed');
   }
-  private applySidAdopt(d: any) {
+  private applySidAdopt(d: any, senderUid?: string) {
     if (typeof d.sid !== 'number' || !d.mkey) return;
-    const ids = this.messages.filter((m) => m.mkey === d.mkey && m.sid == null).map((m) => m.id);
+    if (!senderUid) return;
+    const ids = this.messages.filter((m) => m.mkey === d.mkey && m.sid == null && m.uid === senderUid).map((m) => m.id);
     let ch = false;
-    this.messages = this.messages.map((m) => (m.mkey === d.mkey && m.sid == null ? (ch = true, { ...m, sid: d.sid }) : m));
+    this.messages = this.messages.map((m) => (m.mkey === d.mkey && m.sid == null && m.uid === senderUid ? (ch = true, { ...m, sid: d.sid }) : m));
     ids.forEach((id) => { if (this.adoptPendingReactions(id, d.sid)) ch = true; });
     if (ch) this.emit();
   }
@@ -3177,16 +3178,18 @@ export class Engine {
     this.dataSend({ t: 'del', sid });
     this.hooks.deleteMessage?.(this.viewServerId, sid);
   }
-  private applyEdit(d: any) {
+  private applyEdit(d: any, senderUid?: string) {
     if (typeof d.sid !== 'number') return;
+    if (!senderUid || !this.messages.some((m) => m.sid === d.sid && m.uid === senderUid)) return;
     let ch = false;
-    this.messages = this.messages.map((m) => (m.sid === d.sid ? (ch = true, { ...m, text: String(d.text || ''), edited: true }) : m));
+    this.messages = this.messages.map((m) => (m.sid === d.sid && m.uid === senderUid ? (ch = true, { ...m, text: String(d.text || ''), edited: true }) : m));
     if (ch) this.emit();
   }
-  private applyDelete(d: any) {
+  private applyDelete(d: any, senderUid?: string) {
     if (typeof d.sid !== 'number') return;
+    if (!senderUid || !this.messages.some((m) => m.sid === d.sid && m.uid === senderUid)) return;
     const before = this.messages.length;
-    this.messages = this.messages.filter((m) => m.sid !== d.sid);
+    this.messages = this.messages.filter((m) => !(m.sid === d.sid && m.uid === senderUid));
     if (this.messages.length !== before) { this.reactions.delete(d.sid); this.emit(); }
   }
   sendTyping() {
@@ -3242,6 +3245,13 @@ export class Engine {
       // music (совместное прослушивание YouTube) — по voiceRoom; scoped по vc уже внутри music-store
       // чат/clear/emote/watch/typing — данные ПРОСМАТРИВАЕМОГО сервера, приходят по viewRoom
       if (room !== this.viewRoom) return;
+      const senderUsername = sender ? baseUid(sender.identity) : '';
+      const senderMember = senderUsername ? this.members.find((m) => m.username === senderUsername) : undefined;
+      const senderUid = senderMember?.id;
+      // Realtime payload не является авторитетом для личности отправителя. Не принимаем
+      // uid, который не совпадает с LiveKit identity; иначе участник мог подделать имя,
+      // uid и изменить локальный чат от имени другого человека.
+      if (sender && (!senderMember || (d.uid != null && String(d.uid) !== senderUid))) return;
       // Release-пакет из RoomService не имеет participant-sender. Не доверяем его
       // payload: он лишь просит сверить авторитетную HTTP-историю. Пакет от обычного
       // участника с kind=release игнорируем, чтобы нельзя было подделать карточку RelayApp.
@@ -3252,37 +3262,30 @@ export class Engine {
       if (d.t === 'chat') {
         if (d.em) for (const k in d.em) this.onEmoteResolve?.(k, d.em[k]);
         this.typingUsers.delete(d.name);
-        const own = d.uid === this.me.id; // моё же сообщение с другой сессии — показываем как своё, без звука/меншена
+        const authorName = sender ? (sender.name || senderMember?.displayName || senderUsername) : String(d.name || '');
+        const authorColor = senderMember?.avatarColor ?? d.color;
+        const authorUid = senderUid || d.uid;
+        const own = authorUid === this.me.id; // моё же сообщение с другой сессии — показываем как своё, без звука/меншена
         const repliedToMe = !own && this.replyToMe(d.reply);
         const mentioned = !own && (this.textMentionsMe(d.text) || repliedToMe);
-        this.pushMsg(d.name, d.text, false, d.color, own, d.img, undefined, d.uid, d.reply, d.files, d.mkey, d.kind, d.level);
+        this.pushMsg(authorName, d.text, false, authorColor, own, d.img, undefined, authorUid, d.reply, d.files, d.mkey, d.kind, d.level);
         if (!own && mentioned) { // тост+notify ТОЛЬКО когда тегнули/реплайнули; звук тега даёт само notify (Discord)
-          this.hooks.toast(repliedToMe ? `${d.name} ответил тебе` : `${d.name} упомянул тебя`, 'info');
+          this.hooks.toast(repliedToMe ? `${authorName} ответил тебе` : `${authorName} упомянул тебя`, 'info');
           const fallback = d.img ? '🖼 изображение' : (d.files && d.files.length ? '📎 вложение' : '');
           const tag = 'mention:' + this.viewServerId + (d.mkey ? ':' + String(d.mkey) : '');
-          notify('mention', { title: d.name, body: String(d.text || '').slice(0, 140) || fallback, tag });
+          notify('mention', { title: authorName, body: String(d.text || '').slice(0, 140) || fallback, tag });
         }
       }
       else if (d.t === 'clear') {
-        ++this.chatGeneration;
-        this.streamStateMessages.clear();
-        this.messages = [];
-        this.reactions.clear();
-        this.chatMore = false;
-        this.oldestSid = null;
-        this.trimmedFront = 0;
-        this.chatPrepended = 0;
-        this.chatRetentionLimit = CHAT_SESSION_MESSAGE_LIMIT;
-        this.emit();
-        this.sysMsg((d.by || 'Админ') + ' очистил чат');
+        if (sender) this.refreshChat(undefined, this.viewServerId);
       }
       else if (d.t === 'emote') this.emoteListeners.forEach((f) => f(d.s, d.e, d.by, d.x, d.sz));
-      else if (d.t === 'watch') { const m = this.wset(d.s); if (d.on) m.set(d.id, { name: d.n, color: d.c ?? 0, avatarUrl: d.a, ts: Date.now() }); else m.delete(d.id); this.emit(); }
-      else if (d.t === 'typing') { if (d.name && d.name !== this.me.displayName) { this.typingUsers.set(d.name, Date.now() + 3500); this.emit(); setTimeout(() => this.pruneTyping(), 3600); } }
-      else if (d.t === 'react') this.applyReaction(d);
-      else if (d.t === 'edit') this.applyEdit(d);
-      else if (d.t === 'del') this.applyDelete(d);
-      else if (d.t === 'sid') this.applySidAdopt(d);
+      else if (d.t === 'watch' && senderUsername) { const m = this.wset(d.s); if (d.on) m.set(senderUsername, { name: sender?.name || senderMember?.displayName || senderUsername, color: senderMember?.avatarColor ?? 0, avatarUrl: senderMember?.avatarUrl, ts: Date.now() }); else m.delete(senderUsername); this.emit(); }
+      else if (d.t === 'typing' && senderMember) { const name = sender?.name || senderMember.displayName; if (name !== this.me.displayName) { this.typingUsers.set(name, Date.now() + 3500); this.emit(); setTimeout(() => this.pruneTyping(), 3600); } }
+      else if (d.t === 'react' && senderUid && d.uid === senderUid) this.applyReaction(d);
+      else if (d.t === 'edit') this.applyEdit(d, senderUid);
+      else if (d.t === 'del') this.applyDelete(d, senderUid);
+      else if (d.t === 'sid') this.applySidAdopt(d, senderUid);
     } catch { /**/ }
   };
   onEmoteResolve: ((name: string, id: string) => void) | null = null;

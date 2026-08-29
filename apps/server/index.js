@@ -749,6 +749,7 @@ function memberCount(sid) { return db.prepare('SELECT COUNT(*) c FROM membership
 function purgeServer(sid) {
   invalidateVoiceLeasesForServer(sid, 'server-deleted');
   evictRoomParticipants(sid);
+  treeSrv?.revokeServer(sid);
   // Ссылки на файлы снимаем ДО удаления сообщений — потом их уже негде взять. Сама уборка идёт
   // после сноса записей: пока сообщения живы, файл считается используемым.
   const orphaned = uploadUrlsOfMessageRows(selectMessageUploadRows('server_id=?', sid));
@@ -780,6 +781,9 @@ function purgeUser(uid) {
   const profile = db.prepare('SELECT avatar_url, profile_banner_url FROM users WHERE id=?').get(uid);
   if (profile) { if (profile.avatar_url) orphaned.push(profile.avatar_url); if (profile.profile_banner_url) orphaned.push(profile.profile_banner_url); }
   try { for (const row of db.prepare('SELECT url FROM uploads WHERE user_id=?').all(uid)) orphaned.push(row.url); } catch (e) { /**/ }
+  // Сначала снимаем реакции всех пользователей с сообщений удаляемого аккаунта,
+  // иначе после удаления сообщений останутся недостижимые строки в reactions.
+  db.prepare('DELETE FROM reactions WHERE msg_id IN (SELECT id FROM messages WHERE user_id=?)').run(uid);
   for (const t of ['memberships', 'member_roles', 'server_settings', 'messages', 'read_state']) db.prepare(`DELETE FROM ${t} WHERE user_id=?`).run(uid);
   // reactions, user_stats и profile_banner_uploads раньше переживали удаление аккаунта.
   for (const t of ['user_settings', 'push_subs', 'push_prefs', 'reactions', 'user_stats', 'profile_banner_uploads']) {
@@ -850,6 +854,10 @@ function permsOf(uid, sid) {
   return rows.reduce((a, r) => a | (r.p || 0), 0);
 }
 const can = (uid, sid, perm) => (permsOf(uid, sid) & perm) === perm;
+// Управляющий ролями не может выдать себе или другому участнику права,
+// которых нет у него самого. Владелец сервера остаётся единственным полным
+// администратором и может настраивать весь набор разрешений.
+const canGrantPerms = (uid, sid, permissions) => isOwner(uid, sid) || (permsOf(uid, sid) & permissions) === permissions;
 const pubRole = r => ({ id: r.id, name: r.name, color: r.color || '', permissions: r.permissions || 0, position: r.position || 0 });
 function rolesOfServer(sid) { return db.prepare('SELECT * FROM roles WHERE server_id=? ORDER BY position DESC, created ASC').all(sid).map(pubRole); }
 function rolesOfMember(sid, uid) { return db.prepare('SELECT r.* FROM member_roles mr JOIN roles r ON r.id=mr.role_id WHERE mr.server_id=? AND mr.user_id=? ORDER BY r.position DESC').all(sid, uid).map(pubRole); }
@@ -1423,9 +1431,14 @@ app.post('/api/servers/:id/read', requireAuth, (req, res) => {
   // all:true — «прочитать всё» (last_read = максимальный id сервера). Нужно, т.к. ЖИВЫЕ сообщения на
   // клиенте не имеют серверного sid (узнаются лишь через refetch) → клиент не может назвать актуальный
   // lastId, last_read отставал бы, и прочитанное считалось бы непрочитанным (на главной / др. устройстве).
-  const lastId = req.body.all
-    ? (db.prepare('SELECT MAX(id) m FROM messages WHERE server_id=?').get(req.params.id).m || 0)
-    : req.body.lastId;
+  const maxId = db.prepare('SELECT MAX(id) m FROM messages WHERE server_id=?').get(req.params.id).m || 0;
+  let lastId;
+  if (req.body.all) lastId = maxId;
+  else {
+    const parsed = Number(req.body.lastId);
+    if (!Number.isSafeInteger(parsed) || parsed < 0) return res.status(400).json({ error: 'bad lastId' });
+    lastId = Math.min(parsed, maxId);
+  }
   markRead(req.user.id, req.params.id, lastId);
   const lr = _lastReadStmt.get(req.user.id, req.params.id);
   const lastRead = lr ? lr.last_read : 0;
@@ -1484,7 +1497,7 @@ app.delete('/api/admin/servers/:id/members/:userId', requireAdmin, (req, res) =>
   db.prepare('DELETE FROM server_settings WHERE user_id=? AND server_id=?').run(uid, s.id);
   invalidateVoiceLease(uid, lease => lease.serverId === s.id, 'membership-revoked');
   const ku = db.prepare('SELECT username FROM users WHERE id=?').get(uid);
-  if (ku) evictUserFromRoom(s.id, ku.username);
+  if (ku) { evictUserFromRoom(s.id, ku.username); treeSrv?.revokeUser(uid, s.id); }
   res.json({ ok: true });
 });
 
@@ -2338,7 +2351,7 @@ app.post('/api/servers/:id/kick', requireAuth, (req, res) => {
   invalidateVoiceLease(uid, lease => lease.serverId === s.id, 'membership-revoked');
   const ku = db.prepare('SELECT username FROM users WHERE id=?').get(uid);
   // выгоняем ВСЕ live-сессии юзера из комнаты (identity = username#nonce)
-  if (ku) evictUserFromRoom(s.id, ku.username);
+  if (ku) { evictUserFromRoom(s.id, ku.username); treeSrv?.revokeUser(uid, s.id); }
   res.json({ ok: true });
 });
 
@@ -2351,6 +2364,7 @@ app.post('/api/servers/:id/leave', requireAuth, (req, res) => {
   db.prepare('DELETE FROM server_settings WHERE user_id=? AND server_id=?').run(req.user.id, s.id);
   invalidateVoiceLease(req.user.id, lease => lease.serverId === s.id, 'membership-revoked');
   evictUserFromRoom(s.id, req.user.username);
+  treeSrv?.revokeUser(req.user.id, s.id);
   res.json({ ok: true });
 });
 
@@ -2423,6 +2437,7 @@ app.post('/api/servers/:id/roles', requireAuth, (req, res) => {
   if (name.length < 1) return res.status(400).json({ error: 'Название роли не может быть пустым' });
   const color = validColor(req.body.color);
   const perms = (parseInt(req.body.permissions, 10) || 0) & ALL_PERMS;
+  if (!canGrantPerms(req.user.id, sid, perms)) return res.status(403).json({ error: 'Нельзя выдать права выше своих' });
   const maxPos = db.prepare('SELECT COALESCE(MAX(position),0) p FROM roles WHERE server_id=?').get(sid).p;
   const id = newId('r');
   db.prepare('INSERT INTO roles(id,server_id,name,color,permissions,position,created) VALUES(?,?,?,?,?,?,?)').run(id, sid, name, color, perms, maxPos + 1, Date.now());
@@ -2437,6 +2452,7 @@ app.patch('/api/servers/:id/roles/:rid', requireAuth, (req, res) => {
   if (name !== null && name.length < 1) return res.status(400).json({ error: 'Название роли не может быть пустым' });
   const color = req.body.color != null ? validColor(req.body.color) : null;
   const perms = req.body.permissions != null ? ((parseInt(req.body.permissions, 10) || 0) & ALL_PERMS) : null;
+  if (perms !== null && !canGrantPerms(req.user.id, sid, perms)) return res.status(403).json({ error: 'Нельзя выдать права выше своих' });
   const pos = req.body.position != null ? (parseInt(req.body.position, 10) || 0) : null;
   db.prepare('UPDATE roles SET name=COALESCE(?,name), color=COALESCE(?,color), permissions=COALESCE(?,permissions), position=COALESCE(?,position) WHERE id=?')
     .run(name, color, perms, pos, r.id);
@@ -2455,7 +2471,13 @@ app.put('/api/servers/:id/members/:uid/roles', requireAuth, (req, res) => {
   const uid = req.params.uid;
   if (!isMember(uid, sid)) return res.status(404).json({ error: 'Не участник' });
   const ids = Array.isArray(req.body.roleIds) ? req.body.roleIds.map(String) : [];
-  const valid = new Set(db.prepare('SELECT id FROM roles WHERE server_id=?').all(sid).map(r => r.id));
+  const available = db.prepare('SELECT id,permissions FROM roles WHERE server_id=?').all(sid);
+  const valid = new Set(available.map(r => r.id));
+  const granted = ids.reduce((mask, rid) => {
+    const role = available.find((item) => item.id === rid);
+    return role ? (mask | (Number(role.permissions) || 0)) : mask;
+  }, 0);
+  if (!canGrantPerms(req.user.id, sid, granted)) return res.status(403).json({ error: 'Нельзя назначить права выше своих' });
   db.prepare('DELETE FROM member_roles WHERE server_id=? AND user_id=?').run(sid, uid);
   const ins = db.prepare('INSERT OR IGNORE INTO member_roles(server_id,user_id,role_id) VALUES(?,?,?)');
   for (const rid of ids) if (valid.has(rid)) ins.run(sid, uid, rid);
@@ -2541,7 +2563,7 @@ app.get('/api/me/settings', requireAuth, (req, res) => {
   res.json({ data: row ? JSON.parse(row.data) : {} });
 });
 app.put('/api/me/settings', requireAuth, (req, res) => {
-  const data = JSON.stringify(req.body.data || {}).slice(0, 20000);
+  const data = boundedJsonObject(req.body.data || {}, 20000);
   db.prepare(`INSERT INTO user_settings(user_id,data) VALUES(?,?)
     ON CONFLICT(user_id) DO UPDATE SET data=excluded.data`).run(req.user.id, data);
   res.json({ ok: true });
@@ -2554,7 +2576,7 @@ app.get('/api/servers/:id/settings', requireAuth, (req, res) => {
 });
 app.put('/api/servers/:id/settings', requireAuth, (req, res) => {
   if (!isMember(req.user.id, req.params.id)) return res.status(403).json({ error: 'нет' });
-  const data = JSON.stringify(req.body.data || {}).slice(0, 20000);
+  const data = boundedJsonObject(req.body.data || {}, 20000);
   db.prepare(`INSERT INTO server_settings(user_id,server_id,data) VALUES(?,?,?)
     ON CONFLICT(user_id,server_id) DO UPDATE SET data=excluded.data`).run(req.user.id, req.params.id, data);
   res.json({ ok: true });
@@ -2686,6 +2708,25 @@ function sanitizeAttachments(raw) {
   }
   return out;
 }
+
+// Не обрезаем уже сериализованный JSON: срез строки после stringify мог сохранить
+// невалидный JSON и сделать всю историю сервера нечитаемой. Для пользовательских
+// объектов оставляем только целые поля, пока сериализованный результат помещается
+// в лимит; при переполнении лишние поля/записи безопасно отбрасываются.
+function boundedJsonObject(raw, maxBytes, fallback = '{}') {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return fallback;
+  const out = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (typeof key !== 'string' || (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean' && value !== null)) continue;
+    const candidate = { ...out, [key]: value };
+    let encoded;
+    try { encoded = JSON.stringify(candidate); } catch { continue; }
+    if (Buffer.byteLength(encoded, 'utf8') > maxBytes) continue;
+    Object.assign(out, { [key]: value });
+  }
+  try { return JSON.stringify(out); } catch { return fallback; }
+}
+
 app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
   const sid = req.params.id;
   if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
@@ -2693,7 +2734,7 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
   const image = (() => { const v = String(req.body.image || ''); return UPLOAD_RE.test(v) ? v : ''; })();
   const attachments = sanitizeAttachments(req.body.files);
   if (!text.trim() && !image && !attachments.length) return res.status(400).json({ error: 'пусто' });
-  const em = JSON.stringify(req.body.em || {}).slice(0, 4000);
+  const em = boundedJsonObject(req.body.em || {}, 4000);
   // reply-ссылка на исходное сообщение (санитайзим, ограничиваем размер)
   const replyTo = (() => {
     const rp = req.body.reply;
@@ -2707,7 +2748,7 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
     // клиенты присылают абсолютный URL, а уборка сверяет ссылки точным совпадением (см.
     // normalizeUploadRef) — иначе показанная в цитате картинка считалась бы мусором.
     if (rp.thumb) clean.thumb = normalizeUploadRef(String(rp.thumb)) || String(rp.thumb).slice(0, 300);
-    return JSON.stringify(clean).slice(0, 600);
+    return boundedJsonObject(clean, 600);
   })();
   const now = Date.now();
   const clientKey = String(req.body.key || '').slice(0, 64);
@@ -2773,7 +2814,11 @@ app.post('/api/servers/:id/messages/:mid/react', requireAuth, (req, res) => {
   if (!mid || !emoteId || !emoteName) return res.status(400).json({ error: 'bad' });
   const msg = db.prepare('SELECT id FROM messages WHERE id=? AND server_id=?').get(mid, sid);
   if (!msg) return res.status(404).json({ error: 'no msg' });
-  if (req.body.add) db.prepare('INSERT OR IGNORE INTO reactions(server_id,msg_id,emote_id,emote_name,user_id,created) VALUES(?,?,?,?,?,?)').run(sid, mid, emoteId, emoteName, req.user.id, Date.now());
+  if (req.body.add) {
+    const count = db.prepare('SELECT COUNT(*) c FROM reactions WHERE server_id=? AND msg_id=?').get(sid, mid).c;
+    if (count >= 1000) return res.status(429).json({ error: 'Слишком много реакций' });
+    db.prepare('INSERT OR IGNORE INTO reactions(server_id,msg_id,emote_id,emote_name,user_id,created) VALUES(?,?,?,?,?,?)').run(sid, mid, emoteId, emoteName, req.user.id, Date.now());
+  }
   else db.prepare('DELETE FROM reactions WHERE server_id=? AND msg_id=? AND emote_id=? AND user_id=?').run(sid, mid, emoteId, req.user.id);
   res.json({ ok: true });
 });
@@ -2979,6 +3024,17 @@ const treeSrv = attachTreeServer(server, {
     if (!authManager) throw new Error('auth is starting');
     const context = authManager.verifySession(encoded, { requireVerified: true });
     return { id: context.user.id, u: context.user.username };
+  },
+  authorizePeer: (uid, params) => {
+    if (uid === 'virtual-relay' && params.virtual) return true;
+    const sid = String(params.serverId || '');
+    if (!sid || !isMember(uid, sid)) return false;
+    if (params.role === 'discovery') return true;
+    const user = db.prepare('SELECT username FROM users WHERE id=?').get(uid);
+    if (!user) return false;
+    const identity = String(params.identity || '');
+    const base = identity.split('#', 1)[0];
+    return base === user.username;
   },
   path: '/tree',
   stunServers: STUN_URLS.map((urls) => ({ urls })),

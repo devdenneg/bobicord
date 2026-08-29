@@ -69,6 +69,14 @@ const VRELAY_ACTIVATE_TIMEOUT_MS = 15_000; // активация «в полёт
 const VRELAY_UID = 'virtual-relay'; // JWT-uid агента: флагу virtual в join верим только при нём
 const VRELAY_TARGET = 'vrelay';    // сентинел targetParentId в request-reparent = «хочу через сервер»
 
+function rejectPeer(ws, code, reason) {
+  try {
+    ws.close(code, reason);
+    const timer = setTimeout(() => { if (ws.readyState !== ws.CLOSED) { try { ws.terminate(); } catch { /**/ } } }, 1000);
+    timer.unref?.();
+  } catch { try { ws.terminate(); } catch { /**/ } }
+}
+
 // Roadmap-flow-стриминга Д1/Д8: инверсия топологии «стример → сервер → зрители». Под флагом
 // TREE_SERVER_FIRST vrelay становится постоянным pinned медиаузлом (не fallback с дренажом):
 // вещатель шлёт serverIngest:true, сервер шлёт агенту vrelay-ingest (постоянная сессия),
@@ -730,6 +738,7 @@ function attachTreeServer(httpServer, opts) {
     turnSecret = '',           // Evolution-TZ Э3: пусто = TURN отключён (только STUN, как раньше)
     turnUrls = [],             // ['turn:host:3478', 'turn:host:3478?transport=tcp']
     turnTtlSec = 600,          // короткий TTL временных TURN-креды
+    authorizePeer = null,      // (uid, params) => boolean для membership/identity guard
   } = opts;
 
   // maxPayload: дефолт ws — 100 МиБ на кадр. Легитимные кадры дерева (SDP/ICE/stats) — единицы КБ;
@@ -759,6 +768,7 @@ function attachTreeServer(httpServer, opts) {
     catch (e) { tlog(`ws 401 (${e.message}) from ${req.socket.remoteAddress}`); socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
     wss.handleUpgrade(req, socket, head, (ws) => {
       ws.__uid = payload.id || payload.u || 'anon';
+      ws.__username = payload.u || '';
       wss.emit('connection', ws, req);
     });
   });
@@ -1263,6 +1273,15 @@ function attachTreeServer(httpServer, opts) {
   function onHello(id, msg) {
     const node = peers.get(id);
     if (!node) return;
+    if (typeof authorizePeer === 'function' && !authorizePeer(node.ws.__uid, {
+      serverId: msg.serverId || null,
+      identity: null,
+      role: 'discovery',
+      streamId: null,
+    })) {
+      rejectPeer(node.ws, 4003, 'server membership required');
+      return;
+    }
     node.serverId = msg.serverId || null;
     // Discovery агрегирует по БАЗОВОМУ streamId: объявляем только source-деревья (рендишн-деревья —
     // деталь транспорта, свой broadcaster=рендишн-корень, в discovery не светятся). renditions[] —
@@ -1291,6 +1310,25 @@ function attachTreeServer(httpServer, opts) {
     // (навсегда занятый слот вещателя, а при role:'broadcaster' — цикл и переполнение стека).
     // Легитимные клиенты (web treeVideo.ts, натив signaling.rs) шлют join ровно один раз на сокет.
     if (!node || node.treeKey) return;
+    if (typeof authorizePeer === 'function' && !authorizePeer(node.ws.__uid, {
+      serverId: serverId || node.serverId || null,
+      identity: identity || '',
+      role,
+      streamId,
+      virtual: !!msg.virtual,
+    })) {
+      send(id, { t: 'error', code: 'FORBIDDEN', message: 'server membership or identity rejected' });
+      rejectPeer(node.ws, 4003, 'server membership required');
+      return;
+    }
+    if (role === 'broadcaster') {
+      const existing = mgr.trees.get(key);
+      if (existing && existing.broadcasterId) {
+        send(id, { t: 'error', code: 'DUPLICATE_BROADCASTER', message: 'stream already has a broadcaster' });
+        rejectPeer(node.ws, 4009, 'duplicate broadcaster');
+        return;
+      }
+    }
     node.streamId = streamId; node.rendition = rendition; node.treeKey = key;
     node.role = role; node.native = !!native; node.identity = identity || id;
     node.symmetricNat = !!symmetricNat;
@@ -1860,7 +1898,21 @@ function attachTreeServer(httpServer, opts) {
     return out;
   }
 
-  return { mgr, peers, wss, abrTimer, hbTimer, drainTimer, renditionTimer, liveBroadcastersIn, arbitrateServerSlots, frameDropReparent };
+  function revokeUser(uid, serverId = null) {
+    for (const p of [...peers.values()]) {
+      if (p.ws.__uid !== uid || (serverId && p.serverId !== serverId)) continue;
+      rejectPeer(p.ws, 4003, 'server membership revoked');
+    }
+  }
+
+  function revokeServer(serverId) {
+    for (const p of [...peers.values()]) {
+      if (p.serverId !== serverId) continue;
+      rejectPeer(p.ws, 4003, 'server deleted');
+    }
+  }
+
+  return { mgr, peers, wss, abrTimer, hbTimer, drainTimer, renditionTimer, liveBroadcastersIn, arbitrateServerSlots, frameDropReparent, revokeUser, revokeServer };
 }
 
 module.exports = { attachTreeServer, TreeManager, MAX_DEPTH, NATIVE_CAPACITY, BROWSER_CAPACITY, treeKey, parseTreeKey };
