@@ -26,7 +26,8 @@
     "test:pwa-offline": "node src/pwaOffline.test.mjs",
     "test:mobile-push-pwa": "node src/mobilePushPwa.test.mjs",
     "test:version-entry": "node src/versionEntry.test.mjs",
-    "build": "npm run test:links && npm run test:volume && npm run test:chat-scroll && npm run test:chat-wallpaper && npm run test:chat-realtime && npm run test:audio-devices && npm run test:mobile-controls && npm run test:mic-lifecycle && npm run test:voice-media && npm run test:livekit-lifecycle && npm run test:rtc-stats && npm run test:auth-handoff && npm run test:auth-session && npm run test:native-auth && npm run test:mobile-network && npm run test:stream-playback && npm run test:transport && npm run test:pwa-offline && npm run test:mobile-push-pwa && npm run test:version-entry && tsc --noEmit && vite build",
+    "build": "npm run test:links && npm run test:volume && npm run test:chat-scroll && npm run test:chat-wallpaper && npm run test:chat-realtime && npm run test:audio-devices && npm run test:mobile-controls && npm run test:mic-lifecycle && npm run test:voice-media && npm run test:livekit-lifecycle && npm run test:rtc-stats && npm run test:auth-handoff && npm run test:auth-session && npm run test:native-auth && npm run test:mobile-network && npm run test:stream-playback && npm run test:transport && npm run test:pwa-offline && npm run test:mobile-push-pwa && npm run test:version-entry && npm run build:bundle",
+    "build:bundle": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
