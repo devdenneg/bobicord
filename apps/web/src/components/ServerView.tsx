@@ -3104,10 +3104,8 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
     const v = vidRef.current;
     v.autoplay = true;
     v.playsInline = true;
-    v.muted = true;
     v.classList.remove('ready');
     setPlaybackBlocked(false);
-    (track as any).attach(v);
 
     const streamHandle = track as unknown as { getMediaStream?: () => MediaStream };
     const mediaStream = typeof streamHandle.getMediaStream === 'function'
@@ -3133,7 +3131,13 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
       });
       controller.setGain(desiredStreamGainRef.current);
       audioControllerRef.current = controller;
-    }
+    } else v.muted = true; // local preview and LiveKit video use a separate screen-audio track
+
+    // Establish the exact audio owner before attach. WebKit can start autoplay synchronously when
+    // srcObject is assigned; muting every stream first made an ordinary desktop/tree stream stay
+    // silent even though its audio track and saved non-zero gain were already available. The tree
+    // controller keeps iOS volume-locked media muted and owns WebAudio before this same boundary.
+    (track as any).attach(v);
 
     const visible = () => { if (document.visibilityState === 'visible') retry(); };
     const playable = () => {

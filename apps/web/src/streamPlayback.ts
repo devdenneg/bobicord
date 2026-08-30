@@ -632,11 +632,12 @@ export class TreeStreamAudioController {
     if (next === this.currentTrack) return;
     this.disconnectSource();
     if (!next) {
-      // Keep the element muted while waiting for a late P2P audio track. That
-      // lets video autoplay immediately; addtrack will then retry the audible
-      // path and expose the explicit unlock button if policy blocks it.
+      // Preserve the ordinary desktop tree contract before attach: a video-first MediaStream has
+      // no sound yet, and leaving its direct path unmuted lets a later audio track become audible
+      // at the same srcObject boundary. Apple volume-locked media must stay muted because WebAudio
+      // is its only scaled path; addtrack will build and unlock that graph.
       this.video.volume = Math.max(0, Math.min(1, this.gainValue));
-      this.video.muted = true;
+      this.video.muted = this.preferWebAudio || this.gainValue <= 0;
       return;
     }
     this.currentTrack = next;
@@ -664,7 +665,7 @@ export class TreeStreamAudioController {
     this.gainValue = Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 1;
     if (!this.preferWebAudio) {
       if (this.currentTrack) this.applyElementGain();
-      else { this.video.volume = this.gainValue; this.video.muted = true; }
+      else { this.video.volume = this.gainValue; this.video.muted = this.gainValue <= 0; }
       return;
     }
     this.video.muted = true;

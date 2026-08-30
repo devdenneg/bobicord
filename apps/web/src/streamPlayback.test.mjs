@@ -337,6 +337,29 @@ fallback.setGain(0);
 assert.equal(fallbackVideo.muted, true);
 fallback.dispose();
 
+const lateAudioVideo = { muted: true, volume: 1, matches: () => false };
+const lateAudioStream = new FakeStream();
+const lateAudio = new TreeStreamAudioController(lateAudioVideo, lateAudioStream, {
+  preferWebAudio: false,
+});
+lateAudio.setGain(0.45);
+assert.equal(lateAudioVideo.muted, false,
+  'a video-first desktop tree stream enters attach already audible for a later bundled audio track');
+lateAudioStream.replace(new FakeTrack('late-audio'));
+assert.equal(lateAudioVideo.muted, false,
+  'a late tree audio track immediately restores the direct desktop playback path');
+assert.equal(lateAudioVideo.volume, 0.45, 'the late direct path receives the saved stream gain');
+lateAudio.dispose();
+
+const lateLockedVideo = { muted: false, volume: 1, matches: () => true };
+const lateLocked = new TreeStreamAudioController(lateLockedVideo, new FakeStream(), {
+  audioContextFactory: () => { throw new Error('must wait for audio'); },
+});
+lateLocked.setGain(0.45);
+assert.equal(lateLockedVideo.muted, true,
+  'volume-locked media stays muted while its late audio waits for the scaled WebAudio path');
+lateLocked.dispose();
+
 const sinkCalls = [];
 let releaseOldSink;
 const routedVideo = {
@@ -744,6 +767,15 @@ const sounds = readSource('sounds.ts');
 assert.match(engine, /const WATCH_VIDEO_DEADLINE_MS = 20_000/,
   'a first mobile watch has a bounded 20 second video deadline');
 const serverView = readSource('components', 'ServerView.tsx');
+const streamTileSetup = serverView.match(/useEffect\(\(\) => \{\n    const track = E\.getVideoTrack\(streamKey\)[\s\S]*?\n    const visible =/)?.[0] || '';
+assert.ok(streamTileSetup.indexOf('const mediaStream =') < streamTileSetup.indexOf('(track as any).attach(v)'),
+  'StreamTile identifies the combined tree MediaStream before the autoplay attach boundary');
+assert.ok(streamTileSetup.indexOf('new TreeStreamAudioController') < streamTileSetup.indexOf('(track as any).attach(v)'),
+  'a tree stream establishes direct/WebAudio ownership before WebKit can autoplay it');
+assert.doesNotMatch(streamTileSetup.slice(0, streamTileSetup.indexOf('const mediaStream =')), /v\.muted = true/,
+  'remote tree streams are not unconditionally muted before their transport is known');
+assert.match(serverView, /mediaStream\?\.addEventListener\('addtrack', retry\)/,
+  'a tree audio track arriving after video immediately retries the exact media playback path');
 assert.match(serverView, /setPlaybackBlocked\(!audioReady \|\| outcome !== 'playing'\)/,
   'a hanging WebKit play promise exposes the gesture retry instead of silently timing out');
 assert.match(engine, /remoteAudioPlays\.request\(el,[\s\S]*explicitGesture/,
