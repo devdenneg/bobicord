@@ -14,6 +14,9 @@ const {
   validatePassword,
   verifiedEmailForOwner,
 } = require('./auth');
+const { createPersistentSessionManager } = require('./authSessions');
+const { createVoiceMediaRevocationStore } = require('./voiceMediaRevocations');
+const { createVoiceAuthSubjectCodec, createVoiceAuthTargetRegistry } = require('./voiceAuthRegistry');
 
 const STRONG_PASSWORD = 'Верный длинный пароль 2026!';
 
@@ -63,11 +66,22 @@ function setup(options = {}) {
   createUsersTable(db);
   const mailer = options.mailer || fakeMailer();
   let timestamp = options.timestamp || Date.parse('2026-07-19T12:00:00.000Z');
+  const persistentSessions = createPersistentSessionManager({
+    db,
+    sessionSecret: 'test-session-secret',
+    now: () => timestamp,
+    accessTtlSeconds: 900,
+  });
   const manager = createAuthManager({
     db,
     mailer,
     codePepper: options.codePepper === undefined ? 'p'.repeat(64) : options.codePepper,
     sessionSecret: 'test-session-secret',
+    verifyAccessSession: (payload, user) => persistentSessions.verifyAccessPayload(payload, user),
+    verifyLegacySession: (token, user) => persistentSessions.verifyLegacyToken(token, user),
+    preserveSecuritySession: ({ sessionId, user, reason, clientKind }) => (
+      persistentSessions.preserveAfterSecurityChange(sessionId, user, reason, clientKind)
+    ),
     now: () => timestamp,
     config: {
       bcryptRounds: 4,
@@ -84,6 +98,7 @@ function setup(options = {}) {
     db,
     mailer,
     manager,
+    persistentSessions,
     now: () => timestamp,
     advance(ms) { timestamp += ms; },
     close() { db.close(); },
@@ -356,6 +371,10 @@ test('legacy binding requires the current password, resumes active challenge and
   const { manager, db, mailer } = fixture;
   const legacy = insertLegacy(db);
   const oldToken = manager.issueSession(legacy.id);
+  const persistent = fixture.persistentSessions.create(
+    db.prepare('SELECT * FROM users WHERE id=?').get(legacy.id),
+    { clientKind: 'web' },
+  );
   const oldIdOnlyToken = jwt.sign({ id: legacy.id }, 'test-session-secret', { expiresIn: '1h' });
   const oldUsernameToken = jwt.sign({ u: legacy.username }, 'test-session-secret', { expiresIn: '1h' });
   assert.equal(manager.verifySession(oldIdOnlyToken).user.id, legacy.id);
@@ -378,8 +397,11 @@ test('legacy binding requires the current password, resumes active challenge and
   assert.equal(duplicate.idempotent, true);
   const result = manager.verifyEmailBinding({
     userId: legacy.id, flowId: challenge.flowId, code: latest(mailer.messages, 'code').code, ip: '203.0.113.20',
+    preserveSessionId: persistent.sessionId, preserveClientKind: 'web',
   });
   assert.equal(result.user.sessionVersion, 1);
+  assert.equal(result.persistentSession.sessionId, persistent.sessionId);
+  assert.equal(manager.verifySession(result.persistentSession.accessToken, { requireVerified: true }).user.id, legacy.id);
   assert.equal(manager.sessionState(legacy.id).ready, true);
   assert.throws(() => manager.verifySession(oldToken), errorCode('SESSION_REVOKED'));
   assert.throws(() => manager.verifySession(oldIdOnlyToken), errorCode('SESSION_REVOKED'));
@@ -388,6 +410,73 @@ test('legacy binding requires the current password, resumes active challenge and
   assert.equal(manager.verifySession(fresh, { requireVerified: true }).user.id, legacy.id);
   await immediate();
   assert.equal(mailer.messages.some((message) => message.kind === 'bound'), true);
+});
+
+test('short access JWTs require a live device session and report expiry separately from revocation', (t) => {
+  const fixture = setup();
+  t.after(() => fixture.close());
+  const legacy = insertLegacy(fixture.db, 'accessowner', 'старый пароль');
+  const user = fixture.db.prepare('SELECT * FROM users WHERE id=?').get(legacy.id);
+  const bundle = fixture.persistentSessions.create(user, { clientKind: 'native' });
+  assert.equal(fixture.manager.verifySession(bundle.accessToken).user.id, user.id);
+
+  const expired = jwt.sign({
+    id: user.id, sub: user.id, sv: 0, sid: bundle.sessionId, sg: 0, typ: 'session',
+  }, 'test-session-secret', { algorithm: 'HS256', expiresIn: -1 });
+  assert.throws(() => fixture.manager.verifySession(expired), errorCode('ACCESS_EXPIRED'));
+
+  fixture.persistentSessions.logoutRefresh(bundle.refreshToken, { clientKind: 'native' });
+  assert.throws(() => fixture.manager.verifySession(bundle.accessToken), errorCode('SESSION_REVOKED'));
+});
+
+test('security changes preserve the selected durable device atomically and roll back if it cannot be preserved', async (t) => {
+  const fixture = setup();
+  t.after(() => fixture.close());
+  const originalPassword = 'Исходный надёжный пароль устройства 2026!';
+  const nextPassword = 'Новый надёжный пароль устройства 2026!';
+  const legacy = insertLegacy(fixture.db, 'durablechange', originalPassword);
+  let user = fixture.db.prepare('SELECT * FROM users WHERE id=?').get(legacy.id);
+  const current = fixture.persistentSessions.create(user, { clientKind: 'web' });
+  const other = fixture.persistentSessions.create(user, { clientKind: 'native' });
+
+  const changed = await fixture.manager.changePassword({
+    userId: user.id,
+    currentPassword: originalPassword,
+    newPassword: nextPassword,
+    ip: '203.0.113.91',
+    preserveSessionId: current.sessionId,
+    preserveClientKind: 'web',
+  });
+  assert.equal(changed.sessionVersion, 1);
+  assert.equal(changed.persistentSession.sessionId, current.sessionId);
+  assert.equal(fixture.manager.verifySession(changed.persistentSession.accessToken).user.id, user.id);
+  assert.throws(() => fixture.manager.verifySession(other.accessToken), errorCode('SESSION_REVOKED'));
+  const recovered = fixture.persistentSessions.refresh(current.refreshToken, {
+    csrfToken: current.csrfToken,
+    clientKind: 'web',
+  });
+  assert.equal(recovered.sessionId, current.sessionId,
+    'the pre-change cookie remains a recoverable previous generation until the response arrives');
+
+  user = fixture.db.prepare('SELECT * FROM users WHERE id=?').get(user.id);
+  assert.equal(fixture.persistentSessions.currentAccess(current.sessionId, user, 'web').sessionId, current.sessionId);
+  const revokedCurrent = fixture.persistentSessions.create(user, { clientKind: 'web' });
+  fixture.persistentSessions.logoutRefresh(revokedCurrent.refreshToken, {
+    csrfToken: revokedCurrent.csrfToken,
+    clientKind: 'web',
+  });
+  const before = fixture.db.prepare('SELECT passhash,session_version FROM users WHERE id=?').get(user.id);
+  await assert.rejects(fixture.manager.changePassword({
+    userId: user.id,
+    currentPassword: nextPassword,
+    newPassword: 'Третий надёжный пароль устройства 2026!',
+    ip: '203.0.113.92',
+    preserveSessionId: revokedCurrent.sessionId,
+    preserveClientKind: 'web',
+  }), errorCode('SESSION_REVOKED'));
+  const after = fixture.db.prepare('SELECT passhash,session_version FROM users WHERE id=?').get(user.id);
+  assert.deepEqual(after, before, 'failed preservation rolls the password and version bump back together');
+  assert.equal(await fixture.manager.comparePassword(after.passhash, nextPassword), true);
 });
 
 test('new binding intent supersedes the old flow and support recovery is one-use', async (t) => {
@@ -472,6 +561,33 @@ test('forgot-password response is neutral; a 256-bit one-use token resets the pa
   const user = manager.verifyRegistration({
     flowId: challenge.flowId, code: latest(mailer.messages, 'code').code, ip: '203.0.113.30',
   }).user;
+  db.exec(`
+    CREATE TABLE memberships(user_id TEXT NOT NULL,server_id TEXT NOT NULL);
+    CREATE TABLE voice_channels(id TEXT PRIMARY KEY,server_id TEXT NOT NULL);
+    CREATE TABLE voice_leases(
+      user_id TEXT PRIMARY KEY,epoch INTEGER NOT NULL DEFAULT 0,
+      session_id TEXT NOT NULL DEFAULT '',server_id TEXT NOT NULL DEFAULT '',
+      channel_id TEXT NOT NULL DEFAULT '',claimed_at INTEGER NOT NULL DEFAULT 0,
+      active INTEGER NOT NULL DEFAULT 0
+    );
+  `);
+  const voiceRevocations = createVoiceMediaRevocationStore(db);
+  const voiceTargets = createVoiceAuthTargetRegistry(db, voiceRevocations);
+  const durableSession = fixture.persistentSessions.create(user.id, { clientKind: 'native' });
+  const voiceSubject = createVoiceAuthSubjectCodec('test-session-secret')
+    .persistent(user.id, durableSession.sessionId);
+  const preConnectIssued = Date.now();
+  const preConnectTokenExpires = preConnectIssued + 10 * 60_000;
+  voiceTargets.register({
+    authSubject: voiceSubject,
+    authKind: 'persistent',
+    authKey: durableSession.sessionId,
+    userId: user.id,
+    room: 'srv:password-reset-test',
+    identity: 'recover#pre-connect-token',
+    issued: preConnectIssued,
+    tokenExpires: preConnectTokenExpires,
+  }, () => true);
   const oldToken = manager.issueSession(user.id);
   const response = await manager.startPasswordReset({ email: 'recover@example.com', ip: '203.0.113.30' });
   assert.deepEqual(response, { accepted: true });
@@ -500,6 +616,13 @@ test('forgot-password response is neutral; a 256-bit one-use token resets the pa
   assert.match(storedHash, /^prehash-v1\$/u);
   assert.equal(await manager.comparePassword(storedHash, newPassword), true);
   assert.throws(() => manager.verifySession(oldToken), errorCode('SESSION_REVOKED'));
+  const preConnectRevocation = voiceRevocations.get(
+    'srv:password-reset-test', 'recover#pre-connect-token',
+  );
+  assert.ok(preConnectRevocation, 'password reset must durably fence a token that has not connected yet');
+  assert.equal(preConnectRevocation.retryUntil, preConnectTokenExpires);
+  assert.ok(preConnectRevocation.revokeTokenTs > Math.floor(preConnectIssued / 1000));
+  assert.equal(voiceTargets.list(voiceSubject).length, 0);
   await assert.rejects(manager.completePasswordReset({ token: resetMail.token, newPassword, ip: '203.0.113.30' }), errorCode('RESET_INVALID'));
   await immediate();
   const changed = latest(mailer.messages, 'changed');

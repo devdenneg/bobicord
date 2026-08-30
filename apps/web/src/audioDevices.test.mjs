@@ -14,8 +14,10 @@ const {
   audioDeviceSelectionMissing,
   audioDeviceChoices,
   audioOutputChoices,
+  automaticMicrophoneCaptureAllowed,
   directAudioOutputSelectionSupported,
   isAppleMobilePlatform,
+  loadAudioDevices,
 } = await import('data:text/javascript,' + encodeURIComponent(js));
 
 const device = (deviceId, label, groupId = '') => ({ deviceId, label, groupId });
@@ -134,5 +136,173 @@ assert.deepEqual(audioOutputChoices(false, [], [device('usb-output', 'USB Audio'
   choices: [],
   viaInput: false,
 });
+
+// A menu opened just before an iPhone browser tab/PWA is hidden must not create a permission sheet
+// after its first asynchronous enumeration completes.
+{
+  const originalDocument = globalThis.document;
+  globalThis.document = { hidden: true };
+  let hiddenPermissionProbes = 0;
+  const hiddenGetter = async (kind, requestPermissions) => {
+    if (requestPermissions) hiddenPermissionProbes++;
+    return kind === 'audioinput' ? [device('hidden-mic', '')] : [device('hidden-output', '')];
+  };
+  assert.equal(automaticMicrophoneCaptureAllowed(), false);
+  const hiddenResult = await loadAudioDevices(hiddenGetter, { forcePermission: true, timeoutMs: 100 }).settled;
+  assert.equal(hiddenPermissionProbes, 0, 'a hidden page never starts getUserMedia from device discovery');
+  assert.equal(hiddenResult.partial, true, 'the foreground Retry remains available after hidden discovery is fenced');
+  if (originalDocument === undefined) delete globalThis.document;
+  else globalThis.document = originalDocument;
+  assert.equal(automaticMicrophoneCaptureAllowed(), true);
+}
+
+// Enumeration never requests permission on its first pass. One permission probe follows, and both
+// kinds are enumerated again only after it resolves so labels/routes cannot stay stale.
+{
+  const calls = [];
+  let permissionGranted = false;
+  const getter = async (kind, requestPermissions) => {
+    calls.push(`${kind}:${requestPermissions}`);
+    if (requestPermissions) {
+      permissionGranted = true;
+      return [device('mic-1', 'Phone mic')];
+    }
+    if (kind === 'audioinput') return [device('mic-1', permissionGranted ? 'Phone mic' : '')];
+    return [device('out-1', permissionGranted ? 'Phone speaker' : '')];
+  };
+  const result = await loadAudioDevices(getter, { timeoutMs: 100 }).settled;
+  assert.deepEqual(calls, [
+    'audioinput:false',
+    'audiooutput:false',
+    'audioinput:true',
+    'audioinput:false',
+    'audiooutput:false',
+  ]);
+  assert.equal(result.partial, false);
+  assert.equal(result.inputs[0].label, 'Phone mic');
+  assert.equal(result.outputs[0].label, 'Phone speaker');
+}
+
+// A hanging mobile permission sheet cannot leave the menu spinner infinite. The bounded result is
+// partial/retryable, while the same generation still accepts the late permission result.
+{
+  let grant;
+  let granted = false;
+  const getter = async (kind, requestPermissions) => {
+    if (requestPermissions) {
+      await new Promise((resolve) => { grant = () => { granted = true; resolve(); }; });
+    }
+    return kind === 'audioinput'
+      ? [device('mic-late', granted ? 'Late mic' : '')]
+      : [device('out-late', granted ? 'Late speaker' : '')];
+  };
+  const request = loadAudioDevices(getter, { timeoutMs: 5 });
+  const bounded = await request.bounded;
+  assert.equal(bounded.partial, true);
+  assert.equal(bounded.retryable, true);
+  assert.equal(typeof grant, 'function');
+  grant();
+  const settled = await request.settled;
+  assert.equal(settled.partial, false);
+  assert.equal(settled.inputs[0].label, 'Late mic');
+}
+
+// Two menus opening together share one permission capture; neither can create a second WebKit
+// sheet while the first getUserMedia call is unresolved.
+{
+  let grant;
+  let granted = false;
+  let probes = 0;
+  const getter = async (kind, requestPermissions) => {
+    if (requestPermissions) {
+      probes++;
+      await new Promise((resolve) => { grant = () => { granted = true; resolve(); }; });
+    }
+    return kind === 'audioinput'
+      ? [device('mic-shared', granted ? 'Shared mic' : '')]
+      : [device('out-shared', granted ? 'Shared speaker' : '')];
+  };
+  const first = loadAudioDevices(getter, { timeoutMs: 100 });
+  const second = loadAudioDevices(getter, { timeoutMs: 100 });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(probes, 1);
+  assert.equal(typeof grant, 'function');
+  grant();
+  const [firstResult, secondResult] = await Promise.all([first.settled, second.settled]);
+  assert.equal(firstResult.partial, false);
+  assert.equal(secondResult.partial, false);
+  assert.equal(probes, 1, 'the permission probe remains single-flight');
+}
+
+// NotAllowed is remembered for automatic reloads. Only an explicit Retry may issue another probe.
+{
+  let deniedProbes = 0;
+  const deniedGetter = async (kind, requestPermissions) => {
+    if (requestPermissions) {
+      deniedProbes++;
+      throw Object.assign(new Error('denied'), { name: 'NotAllowedError' });
+    }
+    return kind === 'audioinput' ? [device('mic-denied', '')] : [device('out-denied', '')];
+  };
+  const denied = await loadAudioDevices(deniedGetter, { timeoutMs: 100 }).settled;
+  assert.equal(denied.permissionDenied, true);
+  assert.equal(automaticMicrophoneCaptureAllowed(), false);
+  assert.equal(deniedProbes, 1);
+  await loadAudioDevices(deniedGetter, { timeoutMs: 100 }).settled;
+  assert.equal(deniedProbes, 1, 'automatic reload must not repeat a denied permission request');
+
+  let forcedProbe = 0;
+  let granted = false;
+  const retryGetter = async (kind, requestPermissions) => {
+    if (requestPermissions) { forcedProbe++; granted = true; }
+    return kind === 'audioinput'
+      ? [device('mic-retry', granted ? 'Restored mic' : '')]
+      : [device('out-retry', granted ? 'Restored speaker' : '')];
+  };
+  const retried = await loadAudioDevices(retryGetter, { forcePermission: true, timeoutMs: 100 }).settled;
+  assert.equal(forcedProbe, 1);
+  assert.equal(retried.permissionDenied, false);
+  assert.equal(retried.partial, false);
+  assert.equal(automaticMicrophoneCaptureAllowed(), true);
+}
+
+// A getUserMedia promise can stay pending forever after an iOS PWA was backgrounded. Its
+// coordination lease must expire so an explicit Retry can create a newer single-flight probe;
+// a late denial from the abandoned generation cannot overwrite the successful retry.
+{
+  let rejectAbandoned;
+  let probes = 0;
+  let granted = false;
+  const getter = async (kind, requestPermissions) => {
+    if (requestPermissions) {
+      probes++;
+      if (probes === 1) {
+        await new Promise((_resolve, reject) => { rejectAbandoned = reject; });
+      } else {
+        granted = true;
+      }
+    }
+    return kind === 'audioinput'
+      ? [device('mic-hang', granted ? 'Recovered mic' : '')]
+      : [device('out-hang', granted ? 'Recovered speaker' : '')];
+  };
+  const abandoned = loadAudioDevices(getter, { timeoutMs: 2, coordinationTimeoutMs: 8 });
+  const partial = await abandoned.bounded;
+  assert.equal(partial.partial, true);
+  assert.equal(typeof rejectAbandoned, 'function');
+  await new Promise((resolve) => setTimeout(resolve, 12));
+  const recovered = await loadAudioDevices(getter, {
+    forcePermission: true,
+    timeoutMs: 100,
+    coordinationTimeoutMs: 8,
+  }).settled;
+  assert.equal(probes, 2, 'explicit Retry supersedes the expired WebKit permission promise');
+  assert.equal(recovered.partial, false);
+  assert.equal(recovered.inputs[0].label, 'Recovered mic');
+  rejectAbandoned(Object.assign(new Error('late denial'), { name: 'NotAllowedError' }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(automaticMicrophoneCaptureAllowed(), true,
+    'an older late denial cannot overwrite the newer successful generation');
+}
 
 console.log('audio devices: ok');

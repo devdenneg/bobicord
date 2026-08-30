@@ -5,6 +5,13 @@ import {
 import type { VideoTransport } from './videoTransport';
 import type { StreamInfo } from '../engine';
 import { baseUid } from '../util';
+import { ExactPeerStatsSampler } from '../rtcStatsSampler';
+
+interface LocalScreenStatsTrack {
+  getRTCStatsReport(): PromiseLike<RTCStatsReport>;
+}
+
+const localScreenStatsSampler = new ExactPeerStatsSampler<LocalScreenStatsTrack, RTCStatsReport>(2);
 
 /**
  * LiveKit SFU implementation of VideoTransport — behavior identical to pre-Э0 engine.ts.
@@ -151,10 +158,16 @@ export class LiveKitVideoTransport implements VideoTransport {
   }
 
   async getScreenStats(_streamId: string): Promise<string | null> {
-    const pub = this.bcRoom()?.localParticipant.getTrackPublication(Track.Source.ScreenShare);
-    if (!pub || !pub.track) return null;
+    const room = this.bcRoom();
+    const pub = room?.localParticipant.getTrackPublication(Track.Source.ScreenShare);
+    const rawTrack = pub?.track;
+    if (!room || !pub || !rawTrack) return null;
+    const track = rawTrack as unknown as LocalScreenStatsTrack;
     try {
-      const rep = await (pub.track as any).getRTCStatsReport();
+      const rep = await localScreenStatsSampler.sample(track, (current) => current.getRTCStatsReport());
+      const currentRoom = this.bcRoom();
+      const currentPub = currentRoom?.localParticipant.getTrackPublication(Track.Source.ScreenShare);
+      if (!rep || currentRoom !== room || currentPub !== pub || currentPub.track !== rawTrack) return null;
       let o: any = null, rem: any = null, src: any = null;
       rep.forEach((s: any) => { if (s.type === 'outbound-rtp' && s.kind === 'video') o = s; if (s.type === 'remote-inbound-rtp' && s.kind === 'video') rem = s; if (s.type === 'media-source' && s.kind === 'video') src = s; });
       if (!o) return null;

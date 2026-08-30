@@ -249,6 +249,28 @@ Verification:
   }
 });
 
+test('commit hook validates a staged diff larger than the Node default buffer', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'relay-release-large-diff-'));
+  try {
+    git(repo, ['init', '--quiet']);
+    git(repo, ['config', 'user.name', 'Relay CI Test']);
+    git(repo, ['config', 'user.email', 'relay-ci@example.invalid']);
+    git(repo, ['config', 'commit.gpgsign', 'false']);
+    git(repo, ['config', 'core.autocrlf', 'false']);
+    git(repo, ['config', 'core.hooksPath', '.no-hooks']);
+
+    writeFileSync(join(repo, 'large-runtime.js'), 'const relayValue = "safe";\n'.repeat(70_000), 'utf8');
+    git(repo, ['add', '--', 'large-runtime.js']);
+    const message = join(repo, 'COMMIT_MESSAGE');
+    writeFileSync(message, validMessage, 'utf8');
+
+    const validation = run(repo, process.execPath, [scriptPath, 'validate-message', '--file', message]);
+    assert.match(validation, /Commit message принят/u);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 test('rejects formal Verification placeholders but accepts an explicit reason', () => {
   for (const placeholder of ['TODO', 'done', 'ok', 'Проверено']) {
     assert.throws(() => parseCommitMessage(`fix(chat): тест

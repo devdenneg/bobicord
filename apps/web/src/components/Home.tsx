@@ -15,6 +15,7 @@ import './home.css';
 // затем плотный список серверов, второстепенное свёрнуто. Большое приветствие — только в first-run.
 // Каждый живой объект показан РОВНО один раз, действие живёт на его карточке (см. ресёрч-синтез).
 
+const FILTER_MIN = 6;
 const faceBg = (url: string | undefined, name: string, color: number) => (url ? '#0000' : avColor(name, color));
 const pluralRu = (n: number, one: string, few: string, many: string) => {
   const mod100 = Math.abs(n) % 100; const mod10 = mod100 % 10;
@@ -52,7 +53,7 @@ function DominantBadge({ s, unread }: { s: ServerSummary; unread: Record<string,
   if (d.kind === 'voice') return <span className="nh-badge voice"><Icon name="mic-sm" sm />{d.n}</span>;
   if (d.kind === 'unread') return <span className="nh-badge unread" title={d.n + ' непрочитанных'}><Icon name="chat" sm />{d.n}</span>;
   if (d.kind === 'online') return <span className="nh-badge online"><i className="dot-green" />{d.n}</span>;
-  return <span className="nh-badge quiet">тихо</span>;
+  return null;   // «тихо» уже написано в строке присутствия ниже — дважды не нужно
 }
 
 // живая карточка эфира: одно действие (Смотреть/Зайти) прямо на карточке
@@ -132,10 +133,10 @@ function UpdateBanner() {
   return null;
 }
 
-function SectionHead({ eyebrow, title, detail, tone }: { eyebrow: string; title: string; detail?: string; tone?: 'live' | 'accent' }) {
+function SectionHead({ title, detail, tone }: { title: string; detail?: string; tone?: 'live' | 'accent' }) {
   return (
     <div className={'nh-sec-h' + (tone ? ' ' + tone : '')}>
-      <div><span className="eye">{eyebrow}</span><h2>{title}</h2></div>
+      <h2>{title}</h2>
       {detail ? <span className="detail">{detail}</span> : null}
     </div>
   );
@@ -154,11 +155,12 @@ export function Home() {
 
   // Поллинг присутствия (мы не в комнате): держим «эфир» свежим, пока вкладка видима; мгновенно на фокус.
   useEffect(() => {
-    const tick = () => { if (!document.hidden) refreshServers(); };
+    const controller = new AbortController();
+    const tick = () => { if (!document.hidden) void refreshServers(controller.signal); };
     const id = window.setInterval(tick, 12000);
     document.addEventListener('visibilitychange', tick);
     window.addEventListener('focus', tick);
-    return () => { clearInterval(id); document.removeEventListener('visibilitychange', tick); window.removeEventListener('focus', tick); };
+    return () => { controller.abort(); clearInterval(id); document.removeEventListener('visibilitychange', tick); window.removeEventListener('focus', tick); };
   }, [refreshServers]);
 
   const live = useMemo(() => deriveLiveItems(servers, unread, connectedId), [servers, unread, connectedId]);
@@ -180,15 +182,15 @@ export function Home() {
   const firstName = me.displayName.split(' ')[0];
 
   const header = (
-    <header className="nh-hd">
+    <header className="nh-hd"><div className="nh-hd-inner">
       <div className="nh-brand"><LogoLoader size={36} animate={false} /><span>Рилэй</span></div>
-      <div className={'nh-online' + (totalOnline ? ' live' : '')} aria-live="polite"><i className="nh-dot" />{totalOnline ? `${totalOnline} онлайн` : 'готов к связи'}</div>
+      <div className={'nh-online' + (totalOnline ? ' live' : '')} aria-live="polite"><i className="nh-dot" />{totalOnline ? `${totalOnline} ${pluralRu(totalOnline, 'человек', 'человека', 'человек')} в сети` : 'никого в сети'}</div>
       <div className="nh-actions">
         <button className="nh-btn primary" aria-label="Создать сервер" onClick={() => setModal('create')}><Icon name="plus" sm /><span>Создать</span></button>
         <button className="nh-btn" aria-label="Войти по приглашению" onClick={() => setModal('join')}><Icon name="link" sm /><span>Войти</span></button>
         <button className="nh-me" aria-label="Профиль" onClick={() => setModal('profile')} style={{ background: faceBg(me.avatarUrl, me.displayName, me.avatarColor) }}><Face url={me.avatarUrl} name={me.displayName} color={me.avatarColor} /></button>
       </div>
-    </header>
+    </div></header>
   );
 
   // ---------- Первый запуск: единственное место, где уместно большое приветствие ----------
@@ -234,7 +236,7 @@ export function Home() {
 
         {live.length ? (
           <section className="nh-sec">
-            <SectionHead eyebrow="Живое" title="Сейчас в эфире" tone="live" detail={`${totalLiveServers} ${pluralRu(totalLiveServers, 'активный сервер', 'активных сервера', 'активных серверов')}`} />
+            <SectionHead title="Сейчас в эфире" tone="live" detail={`${totalLiveServers} ${pluralRu(totalLiveServers, 'активный сервер', 'активных сервера', 'активных серверов')}`} />
             <div className="nh-live">{live.map((it) => <LiveCard key={it.key} item={it} onOpen={() => openServer(it.server.id, it.streamers[0]?.username)} />)}</div>
           </section>
         ) : (
@@ -248,7 +250,7 @@ export function Home() {
 
         {waiting.length ? (
           <section className="nh-sec">
-            <SectionHead eyebrow="Непрочитанное" title="Тебя ждут" tone="accent" detail={`${totalUnread} ${pluralRu(totalUnread, 'новое сообщение', 'новых сообщения', 'новых сообщений')}`} />
+            <SectionHead title="Тебя ждут" tone="accent" detail={`${totalUnread} ${pluralRu(totalUnread, 'новое сообщение', 'новых сообщения', 'новых сообщений')}`} />
             <div className="nh-wait">
               {waiting.map((s) => (
                 <button key={s.id} className="nh-chip" onClick={() => openServer(s.id, undefined, 'main')}>
@@ -261,8 +263,10 @@ export function Home() {
         ) : null}
 
         <section className="nh-sec">
-          <SectionHead eyebrow="Пространства" title="Твои серверы" detail={`${shown.length} из ${servers.length}`} />
-          <div className="nh-filters">
+          <SectionHead title="Твои серверы" detail={servers.length > FILTER_MIN ? `${shown.length} из ${servers.length}` : undefined} />
+          {/* Фильтр появляется, когда серверов столько, что их правда надо отсеивать.
+              На четырёх он занимает строку и не решает никакой задачи. */}
+          <div className="nh-filters" hidden={servers.length <= FILTER_MIN}>
             {(['all', 'unread', 'mine'] as const).map((f) => (
               <button key={f} className={'nh-fchip' + (filter === f ? ' on' : '')} aria-pressed={filter === f} onClick={() => setFilter(f)}>{f === 'all' ? 'Все' : f === 'unread' ? 'Непрочитанное' : 'Мои'}</button>
             ))}

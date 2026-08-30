@@ -92,4 +92,12 @@ test('removal revokes previously issued media tokens without touching account au
     'alice#sess~4',
     { revokeTokenTs: 1_700_000_001n },
   ]]);
+
+  calls.length = 0;
+  await removeVoiceMediaParticipant(service, 'srv:s', 'alice#exact-device', 1_800_000_000_000, 1_700_000_007);
+  assert.deepEqual(calls, [[
+    'srv:s',
+    'alice#exact-device',
+    { revokeTokenTs: 1_700_000_007n },
+  ]], 'durable logout retry must retain its original token cutoff');
 });

@@ -769,6 +769,8 @@ function attachTreeServer(httpServer, opts) {
     wss.handleUpgrade(req, socket, head, (ws) => {
       ws.__uid = payload.id || payload.u || 'anon';
       ws.__username = payload.u || '';
+      ws.__authSessionId = typeof payload.sid === 'string' ? payload.sid : '';
+      ws.__authLegacyTokenHash = typeof payload.legacyTokenHash === 'string' ? payload.legacyTokenHash : '';
       wss.emit('connection', ws, req);
     });
   });
@@ -1283,6 +1285,9 @@ function attachTreeServer(httpServer, opts) {
       return;
     }
     node.serverId = msg.serverId || null;
+    // Browser JS cannot observe transport-level pong. An application ACK lets a quiet discovery
+    // socket distinguish a live connection from a half-open mobile NAT path after sleep/network swap.
+    send(id, { t: 'hello-ack', serverId: node.serverId });
     // Discovery агрегирует по БАЗОВОМУ streamId: объявляем только source-деревья (рендишн-деревья —
     // деталь транспорта, свой broadcaster=рендишн-корень, в discovery не светятся). renditions[] —
     // задел Д4 (пока всегда ['source']).
@@ -1918,7 +1923,34 @@ function attachTreeServer(httpServer, opts) {
     }
   }
 
-  return { mgr, peers, wss, abrTimer, hbTimer, drainTimer, renditionTimer, liveBroadcastersIn, arbitrateServerSlots, frameDropReparent, revokeUser, revokeServer };
+  function revokeAuthSession(sessionId) {
+    const wanted = String(sessionId || '');
+    if (!wanted) return 0;
+    let revoked = 0;
+    for (const p of [...peers.values()]) {
+      if (p.ws.__authSessionId !== wanted) continue;
+      revoked++;
+      rejectPeer(p.ws, 4001, 'session revoked');
+    }
+    return revoked;
+  }
+
+  function revokeLegacySession(tokenHash) {
+    const wanted = String(tokenHash || '');
+    if (!wanted) return 0;
+    let revoked = 0;
+    for (const p of [...peers.values()]) {
+      if (p.ws.__authLegacyTokenHash !== wanted) continue;
+      revoked++;
+      rejectPeer(p.ws, 4001, 'session revoked');
+    }
+    return revoked;
+  }
+
+  return {
+    mgr, peers, wss, abrTimer, hbTimer, drainTimer, renditionTimer, liveBroadcastersIn,
+    arbitrateServerSlots, frameDropReparent, revokeUser, revokeServer, revokeAuthSession, revokeLegacySession,
+  };
 }
 
 module.exports = { attachTreeServer, TreeManager, MAX_DEPTH, NATIVE_CAPACITY, BROWSER_CAPACITY, treeKey, parseTreeKey };

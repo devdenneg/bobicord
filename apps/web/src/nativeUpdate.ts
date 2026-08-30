@@ -4,34 +4,30 @@ import { isTauri } from './native';
 import { useStore } from './store';
 import { playSound } from './sounds';
 import { notify } from './notify';
+import { NativeUpdateOperations, type NativeUpdateResource, type StoredNativeUpdate } from './nativeUpdateOperations';
+
+type TauriUpdate = NativeUpdateResource;
+
+const nativeUpdates = new NativeUpdateOperations<TauriUpdate>({
+  getCurrent: () => useStore.getState().nativeUpdate as StoredNativeUpdate<TauriUpdate> | null,
+  setCurrent: (update) => { useStore.setState({ nativeUpdate: update }); },
+  checkForUpdate: async () => {
+    const { check } = await import('@tauri-apps/plugin-updater');
+    return await check() as TauriUpdate | null;
+  },
+  onNewVersion: (update) => {
+    playSound('system');
+    notify('update', { title: 'Вышло обновление', body: `Версия ${update.version} готова к установке`, tag: 'update' });
+  },
+  relaunch: async () => {
+    const { relaunch } = await import('@tauri-apps/plugin-process');
+    await relaunch();
+  },
+});
 
 export async function checkNativeUpdate(): Promise<boolean> {
   if (!isTauri) return false;
-  const shown = useStore.getState().nativeUpdate;
-  try {
-    const { check } = await import('@tauri-apps/plugin-updater');
-    const upd = await check();
-    if (upd) {
-      // Пока баннер висел, мог выйти ещё релиз — всегда перезаписываем obj свежим
-      // (иначе кнопка ставила бы стейл-версию). Звук — только на новую версию.
-      if (!shown || shown.version !== upd.version) {
-        // Update — Resource на стороне Rust: у него есть дескриптор, который освобождается только
-        // явным close(). Поллинг зовёт check() бессрочно, поэтому каждый неосвобождённый объект
-        // копился бы в процессе на всю сессию. Закрываем тот, который перестаём держать.
-        const previous = shown?.obj as { close?: () => Promise<void> } | undefined;
-        useStore.setState({ nativeUpdate: { version: upd.version, obj: upd } });
-        if (previous?.close) void previous.close().catch(() => {});
-        playSound('system');
-        notify('update', { title: 'Вышло обновление', body: `Версия ${upd.version} готова к установке`, tag: 'update' });
-      } else {
-        void upd.close().catch(() => {}); // ту же версию уже держим — этот дескриптор не нужен
-      }
-      return true;
-    }
-  } catch {
-    /* оффлайн / манифеста ещё нет — тихо пропускаем */
-  }
-  return !!shown;
+  return nativeUpdates.check();
 }
 
 // Поллинг обновлений натива: проверка раз в intervalMs (по умолчанию 30с). Не
@@ -48,20 +44,6 @@ export function startNativeUpdatePolling(intervalMs = 5 * 60_000): void {
 // Перед установкой — свежий check(): в сохранённом obj запечён URL/подпись на момент
 // первой проверки, между показом баннера и кликом мог выйти новый релиз.
 export async function applyNativeUpdate(): Promise<void> {
-  const stored = useStore.getState().nativeUpdate;
-  let target = stored?.obj ?? null;
-  try {
-    const { check } = await import('@tauri-apps/plugin-updater');
-    const fresh = await check();
-    if (fresh) {
-      target = fresh;
-      useStore.setState({ nativeUpdate: { version: fresh.version, obj: fresh } });
-    }
-  } catch {
-    /* манифест недоступен — ставим то, что уже нашли */
-  }
-  if (!target) return;
-  await target.downloadAndInstall();
-  const { relaunch } = await import('@tauri-apps/plugin-process');
-  await relaunch();
+  if (!isTauri) return;
+  return nativeUpdates.apply();
 }

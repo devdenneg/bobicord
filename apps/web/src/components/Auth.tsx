@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { api, ApiError, getToken, isApiError, setToken } from '../api';
+import { api, ApiError, getToken, isApiError, isTerminalSessionError, setToken } from '../api';
+import { authSessionMode } from '../authSession';
 import { useStore } from '../store';
 import type { AccountStatus, AuthResponse, ChallengeResponse, EmailChallenge } from '../types';
 import { Icon } from '../Icon';
@@ -260,6 +261,18 @@ export function Auth() {
     setScreen(next);
   }
 
+  async function switchToLoginAfterLogout() {
+    setBusy(true); setFailure(null);
+    try {
+      await api.logoutSession();
+      useStore.setState({ sessionError: '' });
+      switchScreen('login');
+    } catch (error) {
+      setFailure(failureFrom(error, 'Не удалось безопасно завершить сохранённую сессию'));
+      setBusy(false);
+    }
+  }
+
   function clearRegistrationFlow() {
     registerRequestId.current = '';
     setRegistrationChallenge(null);
@@ -300,7 +313,8 @@ export function Auth() {
         await acceptSession(legacy.user, { state: 'ready' });
       }
     } catch (error) {
-      if (isApiError(error) && error.status === 401) {
+      if (isTerminalSessionError(error)
+        || (isApiError(error) && error.status === 401 && authSessionMode() === 'legacy')) {
         setToken(null);
         useStore.setState({ sessionError: '' });
         switchScreen('login');
@@ -359,7 +373,7 @@ export function Auth() {
     if (registrationCode.length !== 4) { setFailure({ message: 'Введите четыре цифры', field: 'code' }); focusById('auth-register-code'); return; }
     setBusy(true); setFailure(null);
     try {
-      const response = await api.registerVerify(registrationChallenge.id, registrationCode);
+      const response = await api.registerVerify(registrationChallenge.id, registrationCode, registerUser.trim());
       clearRegistrationFlow();
       setRegisterPassword('');
       await finishSession(response);
@@ -451,7 +465,7 @@ export function Auth() {
     try {
       const response = await api.resetPassword(resetToken, normalizedPassword);
       if (response.username) setResetUsername(response.username);
-      setToken(null);
+      await api.logoutSession();
       setPasswordResetToken(null);
       setResetPassword(''); setResetPasswordAgain('');
       setScreen('reset-done');
@@ -461,7 +475,7 @@ export function Auth() {
         if (resetUsername) {
           try {
             await api.login(resetUsername, normalizedPassword);
-            setToken(null);
+            await api.logoutSession();
             setPasswordResetToken(null);
             setResetPassword(''); setResetPasswordAgain('');
             setScreen('reset-done');
@@ -494,7 +508,8 @@ export function Auth() {
         await acceptSession(legacy.user, { state: 'ready' });
       }
     } catch (error) {
-      if (isApiError(error) && error.status === 401) {
+      if (isTerminalSessionError(error)
+        || (isApiError(error) && error.status === 401 && authSessionMode() === 'legacy')) {
         setToken(null); setPasswordResetToken(null); switchScreen('login');
       } else setFailure(failureFrom(error, 'Не удалось вернуться в приложение'));
     } finally { setBusy(false); }
@@ -540,7 +555,7 @@ export function Auth() {
             <span className="auth-state-icon"><Icon name="refresh" /></span>
             <p>Сохранённый вход не потерян. Проверьте интернет и попробуйте ещё раз.</p>
             <button type="button" className="primary" disabled={busy} onClick={retrySession}>{busy ? <span className="spin" /> : null}Повторить</button>
-            <button type="button" className="link" onClick={() => { setToken(null); useStore.setState({ sessionError: '' }); switchScreen('login'); }}>Войти в другой аккаунт</button>
+            <button type="button" className="link" disabled={busy} onClick={() => { void switchToLoginAfterLogout(); }}>Войти в другой аккаунт</button>
           </div>
         ) : null}
 

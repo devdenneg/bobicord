@@ -33,6 +33,7 @@ services:
       - LK_KEY=${LK_KEY}
       - LK_SECRET=${LK_SECRET}
       - SESSION_SECRET=${SESSION_SECRET:?SESSION_SECRET_is_required}
+      - AUTH_ACCESS_TTL_SEC=${AUTH_ACCESS_TTL_SEC:-900}
       # Отдельный service-JWT secret медиарелея. Никогда не совпадает с SESSION_SECRET:
       # удалённый media VPS не должен уметь выпускать пользовательские/admin-сессии.
       - VRELAY_AUTH_SECRET=${VRELAY_AUTH_SECRET:?VRELAY_AUTH_SECRET_is_required}
@@ -45,6 +46,7 @@ services:
       - APP_PUBLIC_URL=${APP_PUBLIC_URL:-https://reelay.online}
       - AUTH_EMAIL_ENFORCEMENT=${AUTH_EMAIL_ENFORCEMENT:-disabled}
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
+      - PERSISTENT_WEB_ORIGINS=${PERSISTENT_WEB_ORIGINS:-}
       - MAIL_FROM_NAME=${MAIL_FROM_NAME:-RelayApp}
       - MAIL_FROM_ADDRESS=${MAIL_FROM_ADDRESS:-}
       - SMTP_HOST=${SMTP_HOST:-}

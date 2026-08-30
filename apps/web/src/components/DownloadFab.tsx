@@ -7,7 +7,15 @@ import { Icon } from '../Icon';
 // только если на сервере есть билд. Не закрывается — всегда на виду.
 export function DownloadCard() {
   const [dl, setDl] = useState<{ version: string; url: string } | null>(null);
-  useEffect(() => { if (!isTauri) api.appLatest().then(setDl).catch(() => {}); }, []);
+  useEffect(() => {
+    if (isTauri) return;
+    const controller = new AbortController();
+    let generationCurrent = true;
+    api.appLatest(controller.signal).then((value) => {
+      if (generationCurrent && !controller.signal.aborted) setDl(value);
+    }).catch(() => {});
+    return () => { generationCurrent = false; controller.abort(); };
+  }, []);
   if (isTauri || !dl) return null;
   return (
     <div className="dl-card">

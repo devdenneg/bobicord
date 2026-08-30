@@ -331,6 +331,15 @@ function createAuthManager(options) {
     ? Buffer.from(options.codePepper)
     : Buffer.from(String(options.codePepper || ''), 'utf8');
   const sessionSecret = String(options.sessionSecret || '');
+  const verifyAccessSession = typeof options.verifyAccessSession === 'function'
+    ? options.verifyAccessSession
+    : null;
+  const verifyLegacySession = typeof options.verifyLegacySession === 'function'
+    ? options.verifyLegacySession
+    : null;
+  const preserveSecuritySession = typeof options.preserveSecuritySession === 'function'
+    ? options.preserveSecuritySession
+    : null;
   if (pepper.length > 0 && sessionSecret && safeEqual(pepper, Buffer.from(sessionSecret, 'utf8'))) {
     throw new Error('AUTH_CODE_PEPPER must differ from SESSION_SECRET');
   }
@@ -858,13 +867,27 @@ function createAuthManager(options) {
       const changed = db.prepare(`UPDATE users SET email=?,email_key=?,email_verified_at=?,session_version=session_version+1
         WHERE id=? AND email_verified_at=0`).run(row.email, row.email_key, at, row.user_id);
       if (changed.changes !== 1) fail(409, 'EMAIL_ALREADY_VERIFIED', 'Почта уже подтверждена.');
-      return db.prepare('SELECT * FROM users WHERE id=?').get(row.user_id);
+      const fresh = db.prepare('SELECT * FROM users WHERE id=?').get(row.user_id);
+      if (input.preserveSessionId) {
+        if (!preserveSecuritySession) fail(503, 'AUTH_SESSION_UNAVAILABLE', 'Не удалось сохранить текущую сессию.');
+        fresh._persistentSession = preserveSecuritySession({
+          sessionId: String(input.preserveSessionId),
+          clientKind: String(input.preserveClientKind || ''),
+          reason: 'email-verified',
+          user: fresh,
+        });
+        if (!fresh._persistentSession) fail(401, 'SESSION_REVOKED', 'Сессия завершена другим защитным действием. Войдите снова.');
+      }
+      return fresh;
     });
     if (typeof mailer.sendEmailBound === 'function') {
       Promise.resolve().then(() => mailer.sendEmailBound({ to: result.email, username: result.username }))
         .catch(() => logger.warn?.('[auth] email-bound notification failed'));
     }
-    return { user: publicUser(result) };
+    return {
+      user: publicUser(result),
+      ...(result._persistentSession ? { persistentSession: result._persistentSession } : {}),
+    };
   }
 
   async function resendFlow(input, purpose, userId) {
@@ -1074,11 +1097,23 @@ function createAuthManager(options) {
       }
       db.prepare('UPDATE auth_password_resets SET used=1 WHERE user_id=? AND used=0').run(user.id);
       const fresh = db.prepare('SELECT * FROM users WHERE id=?').get(user.id);
+      let persistentSession = null;
+      if (input.preserveSessionId) {
+        if (!preserveSecuritySession) fail(503, 'AUTH_SESSION_UNAVAILABLE', 'Не удалось сохранить текущую сессию.');
+        persistentSession = preserveSecuritySession({
+          sessionId: String(input.preserveSessionId),
+          clientKind: String(input.preserveClientKind || ''),
+          reason: 'password-changed',
+          user: fresh,
+        });
+        if (!persistentSession) fail(401, 'SESSION_REVOKED', 'Сессия завершена другим защитным действием. Войдите снова.');
+      }
       return {
         to: fresh.email_verified_at ? fresh.email : '',
         userId: fresh.id,
         username: fresh.username,
         sessionVersion: Number(fresh.session_version) || 0,
+        persistentSession,
         changedAt: at,
       };
     });
@@ -1089,6 +1124,7 @@ function createAuthManager(options) {
       userId: changed.userId,
       username: changed.username,
       sessionVersion: changed.sessionVersion,
+      ...(changed.persistentSession ? { persistentSession: changed.persistentSession } : {}),
     };
   }
 
@@ -1180,8 +1216,16 @@ function createAuthManager(options) {
     if (!sessionSecret) throw new Error('sessionSecret is required to verify sessions');
     let payload;
     try { payload = jwt.verify(String(token || ''), sessionSecret, { algorithms: ['HS256'] }); }
-    catch { fail(401, 'UNAUTHORIZED', 'Не авторизован.'); }
-    if (payload.typ && payload.typ !== 'session') fail(401, 'UNAUTHORIZED', 'Не авторизован.');
+    catch (error) {
+      const unverified = jwt.decode(String(token || ''));
+      if (error && error.name === 'TokenExpiredError' && unverified && unverified.sid) {
+        fail(401, 'ACCESS_EXPIRED', 'Срок действия доступа истёк. Обновите сессию.');
+      }
+      fail(401, 'UNAUTHORIZED', 'Не авторизован.');
+    }
+    if (payload.typ && payload.typ !== 'session') {
+      fail(401, 'UNAUTHORIZED', 'Не авторизован.');
+    }
     let user = null;
     const id = payload.sub || payload.id;
     if (id) user = db.prepare('SELECT * FROM users WHERE id=?').get(id);
@@ -1189,6 +1233,18 @@ function createAuthManager(options) {
     if (!user) fail(401, 'UNAUTHORIZED', 'Не авторизован.');
     const version = Number(user.session_version) || 0;
     if (payload.sv == null ? version !== 0 : (!Number.isSafeInteger(payload.sv) || payload.sv !== version)) {
+      fail(401, 'SESSION_REVOKED', 'Сессия завершена. Войдите снова.');
+    }
+    if (payload.sid != null || payload.sg != null) {
+      // Short-lived access JWTs are bound to one durable per-device refresh session. Checking the
+      // row on every authenticated request makes an explicit logout immediate instead of waiting
+      // for the access token's small expiry window.
+      if (!verifyAccessSession || !verifyAccessSession(payload, user)) {
+        fail(401, 'SESSION_REVOKED', 'Сессия завершена. Войдите снова.');
+      }
+    } else if (verifyLegacySession && !verifyLegacySession(String(token || ''), user, payload)) {
+      // Legacy JWTs remain valid during rollout. Once one is upgraded and explicitly logged out,
+      // its hash-only tombstone prevents that same old bearer from resurrecting the device.
       fail(401, 'SESSION_REVOKED', 'Сессия завершена. Войдите снова.');
     }
     const state = sessionState(user);

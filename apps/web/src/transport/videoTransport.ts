@@ -17,6 +17,7 @@ import type { StreamInfo } from '../engine';
  *  calls `.attach(el)` / `.detach(el)`, cast through `as any`). */
 export class MediaStreamVideoHandle {
   constructor(private stream: MediaStream) {}
+  getMediaStream(): MediaStream { return this.stream; }
   attach(el?: HTMLMediaElement): HTMLMediaElement {
     const v = el || document.createElement('video');
     v.srcObject = this.stream;

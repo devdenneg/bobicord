@@ -35,8 +35,23 @@ export interface SessionResponse {
   account: AccountStatus;
 }
 
-export interface AuthResponse extends SessionResponse {
+export interface PersistentAuthFields {
+  protocol?: 'persistent-v1';
+  accessToken?: string;
+  accessExpiresAt?: number;
+  sessionId?: string;
+}
+
+export interface AuthResponse extends SessionResponse, PersistentAuthFields {
   token: string;
+}
+
+export interface PersistentSessionResponse extends SessionResponse {
+  protocol: 'persistent-v1';
+  token: string;
+  accessToken: string;
+  accessExpiresAt: number;
+  sessionId: string;
 }
 
 export interface ChallengeResponse {
@@ -261,6 +276,9 @@ export interface HistoryMessage {
   kind?: string; // 'levelup' — карточка достижения
   level?: number; // достигнутый уровень (для kind='levelup')
   release?: ReleaseNote; // metadata системного kind='release'
+  // Канонический client key из HTTP-истории/realtime created-event: позволяет
+  // ровно своему optimistic-сообщению усыновить sid без дедупа по одинаковому тексту.
+  mkey?: string;
 }
 
 // Рейтинг сервера (экспериментальная фича, off по умолчанию). Категории: уровень (overall), голос, эфир.

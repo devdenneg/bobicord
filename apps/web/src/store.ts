@@ -1,29 +1,71 @@
 import { create } from 'zustand';
-import { api, setToken } from './api';
-import { isWindowIdle } from './windowIdle';
+import { api } from './api';
+import { isWindowIdle, onWindowIdle } from './windowIdle';
 import { Engine } from './engine';
+import { ServerVolumePreferences } from './volumePreferences';
 import { emoteMap } from './emotes';
 import { setSettings } from './settings';
-import { notifPermission } from './notify';
-import { ensurePushSubscribed, unsubscribePush } from './push';
+import { setPushNotificationSessionActive, unsubscribePush } from './push';
+import { preparePushLogout } from './pushCleanup';
+import { suspendNotificationPushRecovery } from './notify';
+import { closeShownPushNotifications } from './notificationBanners';
 import {
   acknowledgeReleaseMerge,
   connectNotifyWs,
   disconnectNotifyWs,
   pauseNotifyWsReconnect,
   resumeNotifyWsReconnect,
+  sendConnectedChatPresence,
 } from './notifyws';
 import { startIdleWatch } from './idle';
 import { preloadSounds } from './sounds';
-import { isTauri, stopNativeBroadcast } from './native';
+import { isTauri, stopNativeBroadcastBounded } from './native';
 import { endAnyBroadcasterSession, flushPendingDiag } from './diag';
+import { OwnedLatestRefresh } from './serverListRefresh';
 import type { User, ServerSummary, Member, ServerDetail, Toast, ToastKind, AccountStatus, ReleaseHistoryItem } from './types';
 
 let engine: Engine | null = null;
+let volumePreferences: ServerVolumePreferences | null = null;
 export const getEngine = () => engine;
 export const PASSWORD_RESET_STORAGE_KEY = 'relay.auth.password-reset.v1';
 const RELEASE_HISTORY_SEEN_PREFIX = 'relay.release-history.seen.v1:';
 const RELEASE_SHA_RE = /^[0-9a-f]{40}$/u;
+
+function safeLocalGet(key: string): string | null {
+  try { return localStorage.getItem(key); } catch { return null; }
+}
+function safeLocalSet(key: string, value: string): boolean {
+  try { localStorage.setItem(key, value); return true; } catch { return false; }
+}
+function safeSessionGet(key: string): string | null {
+  try { return sessionStorage.getItem(key); } catch { return null; }
+}
+function safeSessionRemove(key: string): void {
+  try { sessionStorage.removeItem(key); } catch { /** unavailable storage is optional */ }
+}
+let pendingInviteMemory = '';
+let pendingOpenServerMemory = '';
+export function rememberPendingInvite(value: string): void {
+  pendingInviteMemory = value;
+  try { sessionStorage.setItem('pendingInvite', value); } catch { /** in-memory intent stays live */ }
+}
+export function rememberPendingOpenServer(value: string): void {
+  pendingOpenServerMemory = value;
+  try { sessionStorage.setItem('pendingOpenServer', value); } catch { /** in-memory intent stays live */ }
+}
+function takePendingEntryIntent(): { invite: string; openServer: string } {
+  const invite = pendingInviteMemory || safeSessionGet('pendingInvite') || '';
+  const openServer = pendingOpenServerMemory || safeSessionGet('pendingOpenServer') || '';
+  pendingInviteMemory = '';
+  pendingOpenServerMemory = '';
+  safeSessionRemove('pendingInvite');
+  safeSessionRemove('pendingOpenServer');
+  return { invite, openServer };
+}
+function storedEmoteSize(): 'sm' | 'md' | 'lg' {
+  const value = safeLocalGet('emoteSize');
+  return value === 'sm' || value === 'lg' ? value : 'md';
+}
 
 function releaseHistorySeenKey(userId: string) {
   return RELEASE_HISTORY_SEEN_PREFIX + encodeURIComponent(userId);
@@ -58,8 +100,6 @@ function countUnreadReleases(userId: string, releases: ReleaseHistoryItem[]) {
   // все доступные записи честно считаются непрочитанными.
   return markerIndex < 0 ? shas.length : markerIndex;
 }
-
-let saveTimer: number | null = null;
 
 interface AppState {
   view: 'loading' | 'auth' | 'home' | 'server' | 'admin';
@@ -111,7 +151,7 @@ interface AppState {
   exitServer: () => void;                              // полное отключение от сервера + на главную (leave/delete/ошибка)
   goHome: () => void;
   goAdmin: () => void;                                 // открыть админ-панель (/admin, только для админов)
-  refreshServers: () => Promise<void>;
+  refreshServers: (signal?: AbortSignal) => Promise<void>;
   markRead: (serverId: string, lastId: number, all?: boolean) => void;   // отметить прочитанным (в самом низу чата); all — «прочитать всё» (сервер last_read=MAX)
   bumpUnread: (serverId: string, n?: number) => void;     // +новое (чат/системное) когда не читаем сервер
   applyRemoteRead: (serverId: string, lastRead: number) => void; // прочитано на ДРУГОМ устройстве (notify-WS)
@@ -127,6 +167,8 @@ interface AppState {
 }
 
 let memberTimer: number | null = null;
+let memberPollGeneration = 0;
+let memberPollKick: (() => void) | null = null;
 let authSessionHandoffGeneration = 0;
 let activeAuthSessionHandoffGeneration: number | null = null;
 
@@ -148,47 +190,76 @@ function invalidateAuthSessionHandoff(resumeNotify = true) {
 // эпоху на старте и сверяют перед записью в стор/engine — иначе протухший хвост прошлого сервера
 // пишет своё состояние поверх текущего или рвёт живую комнату. goHome НЕ бампит (соединение живёт).
 let viewEpoch = 0;
-// Каждый новый presence-poll делает все более ранние ответы неактуальными. Одного viewEpoch
-// недостаточно: два запроса одного и того же сервера могут завершиться в обратном порядке.
-let memberPollRequestSeq = 0;
+const MEMBER_POLL_MS = 5000;
+const IDLE_MEMBER_POLL_MS = 30000;
 
-// поллинг состава/пресенса активного сервера (5с). Работает только пока смотрим этот сервер.
+function stopMemberPoll() {
+  memberPollGeneration += 1;
+  memberPollKick = null;
+  if (memberTimer !== null) clearTimeout(memberTimer);
+  memberTimer = null;
+}
+
+function kickMemberPoll() {
+  memberPollKick?.();
+}
+
+// Поллинг состава/пресенса активного сервера. Следующий запрос ставится только в finally
+// предыдущего: медленный мобильный ответ не обесценивается новым 5-секундным тиком и всё равно
+// применяется, если пользователь остаётся на том же сервере и в той же view-эпохе.
 function startMemberPoll(id: string) {
-  if (memberTimer) clearInterval(memberTimer);
-  memberPollRequestSeq++; // инвалидировать уже летящий poll, даже если сервер и epoch не сменились
+  stopMemberPoll();
+  const generation = memberPollGeneration;
   const epoch = viewEpoch;
-  const poll = async () => {
+  let inFlight = false;
+  let kickAfterFlight = false;
+  const isCurrent = () => {
     const st = useStore.getState();
-    if (st.view !== 'server' || st.viewServerId !== id || viewEpoch !== epoch) return;
-    const requestSeq = ++memberPollRequestSeq;
+    return memberPollGeneration === generation && viewEpoch === epoch
+      && st.view === 'server' && st.viewServerId === id;
+  };
+  const schedule = (delay: number) => {
+    if (!isCurrent()) return;
+    if (memberTimer !== null) clearTimeout(memberTimer);
+    memberTimer = window.setTimeout(() => { memberTimer = null; void poll(); }, delay);
+  };
+  const poll = async () => {
+    if (!isCurrent()) return;
+    if (inFlight) { kickAfterFlight = true; return; }
+    inFlight = true;
     try {
       const [srv, prs] = await Promise.all([api.getServer(id), api.presence(id)]);
-      // повторный гард ПОСЛЕ await: за время сети юзер мог переключить/покинуть сервер — иначе
-      // протухший ответ пишет состав/пресенс чужого сервера в стор и engine (чинилось только 5с спустя)
+      // Медленный ответ остаётся валидным, пока generation/epoch/server те же. Смена сервера или
+      // stopMemberPoll инвалидируют поколение и не дают старому HTTP-хвосту переписать новый UI.
+      if (!isCurrent()) return;
       const st2 = useStore.getState();
-      if (st2.view !== 'server' || st2.viewServerId !== id || viewEpoch !== epoch || requestSeq !== memberPollRequestSeq) return;
-      // Обновляем и СВОИ роль/права (myRole/myPerms), не только channels: раньше спред ...st2.active
-      // сохранял старые myRole/myPerms → выданные владельцем роль/права не появлялись до F5/реконнекта
-      // (getServer их отдаёт, но поллер выбрасывал). Плюс имя/роли сервера — на случай их правки.
       useStore.setState({ members: srv.members, active: st2.active && st2.active.id === id ? { ...st2.active, ...srv.server, myRole: srv.myRole, myPerms: srv.myPerms } : st2.active });
       engine?.setMembers(srv.members); engine?.setOnlineHint(prs.online); engine?.setAwayHint(prs.away || []); engine?.setVoiceHint(prs.voice || {});
-    } catch { /**/ }
+    } catch { /** Следующий рекурсивный тик повторит transient failure. */ }
+    finally {
+      inFlight = false;
+      if (!isCurrent()) return;
+      const delay = kickAfterFlight ? 0 : (isWindowIdle() ? IDLE_MEMBER_POLL_MS : MEMBER_POLL_MS);
+      kickAfterFlight = false;
+      schedule(delay);
+    }
   };
-  // Пока на окно не смотрят, состав сервера незачем тянуть каждые 5с: это два HTTP-запроса и
-  // четыре подряд emit (по одному на setMembers/setOnlineHint/setAwayHint/setVoiceHint), то есть
-  // четыре полных пересборки снапшота и ре-рендера — на данные, которых никто не видит. Возврат в
-  // окно обновляет состав немедленно, поэтому свежесть не страдает.
-  const IDLE_POLL_MS = 30000;
-  let lastPollAt = 0;
-  const pollIfDue = () => {
-    if (isWindowIdle() && Date.now() - lastPollAt < IDLE_POLL_MS) return;
-    lastPollAt = Date.now();
-    void poll();
+  memberPollKick = () => {
+    if (!isCurrent()) return;
+    if (inFlight) { kickAfterFlight = true; return; }
+    schedule(0);
   };
-  // Без отдельной подписки на возврат: тик и так раз в 5с, а вне простоя гейт его не задерживает —
-  // значит состав обновится не позже пяти секунд после того, как пользователь вернулся в окно.
-  memberTimer = window.setInterval(pollIfDue, 5000);
+  schedule(isWindowIdle() ? IDLE_MEMBER_POLL_MS : MEMBER_POLL_MS);
 }
+
+// Возврат PWA из background и восстановление сети должны обновлять состав немедленно, не ждать
+// ни throttled timeout, ни следующего 30-секундного idle-цикла.
+onWindowIdle((idle) => { if (!idle) kickMemberPoll(); });
+window.addEventListener('online', kickMemberPoll);
+window.addEventListener('pageshow', kickMemberPoll);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') kickMemberPoll();
+});
 
 // Бейдж на иконке приложения (таскбар PWA / dock) — сумма непрочитанных + флаг обновления.
 // App Badging API: в установленной PWA на Windows рисует бейдж на иконке в таскбаре.
@@ -253,11 +324,14 @@ function mergeUnread(map: Record<string, number>) {
 let unreadTimer: number | null = null;
 let releaseHistoryTimer: number | null = null;
 let releaseHistoryRequest = 0;
+let onboardedServerInMemory = false;
+type MeSnapshot = { user: User; servers: ServerSummary[] };
+const serverListRefresh = new OwnedLatestRefresh<MeSnapshot>();
 
 let toastSeq = 1;
 
 export const useStore = create<AppState>((set, get) => ({
-  view: 'loading', me: null, pendingUser: null, accountGate: null, passwordResetToken: null, sessionError: '', servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, viewServerId: null, serverEntryTab: 'channels', pendingSwitchId: null, updateReady: false, nativeUpdate: null, emoteSize: (localStorage.getItem('emoteSize') as 'sm' | 'md' | 'lg') || 'md', toasts: [], modal: null, joinPrefill: '', broadcastLive: false, unread: {}, lastRead: {}, releaseUnread: 0,
+  view: 'loading', me: null, pendingUser: null, accountGate: null, passwordResetToken: null, sessionError: '', servers: [], active: null, members: [], loadingServer: false, loadingServerId: null, viewServerId: null, serverEntryTab: 'channels', pendingSwitchId: null, updateReady: false, nativeUpdate: null, emoteSize: storedEmoteSize(), toasts: [], modal: null, joinPrefill: '', broadcastLive: false, unread: {}, lastRead: {}, releaseUnread: 0,
 
   toast: (text, kind) => {
     const id = toastSeq++;
@@ -277,7 +351,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   setMe: (u) => { engine?.setMe(u); set({ me: u }); },
-  setEmoteSize: (s) => { localStorage.setItem('emoteSize', s); set({ emoteSize: s }); },
+  setEmoteSize: (s) => { safeLocalSet('emoteSize', s); set({ emoteSize: s }); },
 
   acceptSession: async (user, account = { state: 'ready' }) => {
     if (account.state !== 'ready') {
@@ -292,6 +366,7 @@ export const useStore = create<AppState>((set, get) => ({
     try { await get().afterAuth(user); }
     catch (error) {
       engine?.disconnect(); engine = null;
+      volumePreferences?.dispose(); volumePreferences = null;
       set({
         view: 'auth', me: null, pendingUser: null, accountGate: null,
         sessionError: error instanceof Error ? error.message : 'Не удалось загрузить аккаунт', releaseUnread: 0,
@@ -305,22 +380,31 @@ export const useStore = create<AppState>((set, get) => ({
     // остановке стрима). Именно здесь: токен уже есть, иначе сервер вернул бы 401 и
     // очередь очистилась бы впустую. Фоном — стартовать приложение это не задерживает.
     flushPendingDiag().catch(() => {});
+    volumePreferences?.dispose();
+    const accountVolumePreferences = new ServerVolumePreferences(
+      user.id,
+      async (serverId, mutations) => {
+        // Field-level server mutations are atomic across tabs and physical devices. A whole-map PUT
+        // would let the last device silently erase every person changed by another one.
+        for (const mutation of mutations) await api.patchSettings(serverId, mutation);
+      },
+    );
+    volumePreferences = accountVolumePreferences;
     engine = new Engine(user, {
       toast: (t, k) => get().toast(t, k),
-      saveSettings: (serverId, vols) => {
+      saveSettings: (serverId, vols, mutation) => {
         if (!serverId) return;
-        localStorage.setItem('srvset:' + serverId, JSON.stringify(vols));
-        if (saveTimer) clearTimeout(saveTimer);
-        saveTimer = window.setTimeout(() => { api.putSettings(serverId, vols).catch(() => {}); }, 800);
+        accountVolumePreferences.update(serverId, vols, mutation);
       },
       peerJoined: (id) => { if (!get().members.some((m) => m.username === id)) get().refreshMembers(); },
-      persistMessage: (text, em, image, reply, localId, key, files, kind, level) => {
+      persistMessage: (text, em, image, reply, localId, key, files, kind, level, canonicalTransport = false) => {
         const a = get().active;
         if (!a) { engine?.markSendResult(localId, false); return; }
-        api.postMessage(a.id, text, em, image, reply, key, files, kind, level)
-          .then((r) => engine?.markSendResult(localId, true, r?.id))
+        api.postMessage(a.id, text, em, image, reply, key, files, kind, level, canonicalTransport)
+          .then((r) => engine?.markSendResult(localId, true, r?.id, r?.revision))
           .catch(() => engine?.markSendResult(localId, false));
       },
+      fetchChatSnapshot: (serverId) => api.getMessages(serverId, undefined, 30),
       refetchChat: (sid, expectedServerId, awaitRelease) => {
         const a = get().active; if (!a) return;
         const id = expectedServerId || a.id;
@@ -329,8 +413,8 @@ export const useStore = create<AppState>((set, get) => ({
         const exactCursor = sid != null && Number.isSafeInteger(sid) ? sid + 1 : undefined;
         const stillCurrent = () => {
           const current = get();
-          return viewEpoch === epoch && current.view === 'server' && current.active?.id === id
-            && current.viewServerId === id && engine === targetEngine;
+          return viewEpoch === epoch && current.active?.id === id
+            && targetEngine?.connectedChatServerId() === id && engine === targetEngine;
         };
         const scheduleRetry = (attempt: number) => {
           // Ретрай-цикл существует ради release-записи, которую сервер мог ещё не записать. Для любого
@@ -352,11 +436,17 @@ export const useStore = create<AppState>((set, get) => ({
         fetchRecent();
       },
       // Let the engine observe failures so it can roll optimistic state back.
-      reactMessage: (serverId, sid, emoteId, emoteName, add) => api.reactMessage(serverId, sid, emoteId, emoteName, add).then(() => undefined),
-      editMessage: (serverId, sid, text) => { api.editMessage(serverId, sid, text).catch(() => {}); },
-      deleteMessage: (serverId, sid) => { api.deleteMessage(serverId, sid).catch(() => {}); },
+      reactMessage: (serverId, sid, emoteId, emoteName, add, canonicalTransport) => api.reactMessage(serverId, sid, emoteId, emoteName, add, canonicalTransport).then((result) => ({
+        // Old servers did not return changed; they still rely on the confirmed
+        // participant packet. A marked canonical mutation fails closed and lets
+        // the Engine snapshot reconcile if the new field is unexpectedly absent.
+        changed: typeof result.changed === 'boolean' ? result.changed : !canonicalTransport,
+      })),
+      editMessage: (serverId, sid, text, canonicalTransport) => api.editMessage(serverId, sid, text, canonicalTransport).then(() => undefined),
+      deleteMessage: (serverId, sid, canonicalTransport) => api.deleteMessage(serverId, sid, canonicalTransport).then(() => undefined),
+      chatConnectionChanged: sendConnectedChatPresence,
       // выход из голосового → гасим нативную трансляцию (Rust-дерево) + сбрасываем флаг (browser-share гасит engine.stopShare)
-      endBroadcast: () => { if (isTauri) stopNativeBroadcast().catch(() => {}).finally(() => endAnyBroadcasterSession()); get().setBroadcastLive(false); },
+      endBroadcast: () => { if (isTauri) void stopNativeBroadcastBounded().finally(() => endAnyBroadcasterSession()); get().setBroadcastLive(false); },
       connectionLost: (serverId, _voiceChannel, wasViewing) => {
         // Terminal LiveKit disconnect уже не восстановится внутренним reconnect. Если это открытый
         // сервер — получаем свежий token через штатный retry connectServer; голос не захватываем
@@ -375,33 +465,40 @@ export const useStore = create<AppState>((set, get) => ({
       connectionLossExpected: authSessionHandoffActive,
     });
     engine.onEmoteResolve = (name, id) => emoteMap.set(name, id);
+    // Publish the account only after the browser master is fail-closed. Otherwise App's `me` effect
+    // can confirm push while loadMe is pending, then this handoff would overwrite true back to false.
+    if (!isTauri) setSettings({ notif: false });
     set({ me: user, pendingUser: null, accountGate: null, sessionError: '', releaseUnread: 0 });
     await get().loadMe();
     set({ view: 'home' });
-    // Web-push: перепривязываем подписку к ТЕКУЩЕМУ аккаунту (endpoint переживает смену юзера/reload,
-    // на сервере ON CONFLICT перезапишет user_id). Зовём НАПРЯМУЮ, минуя глобальный notifOptOut-гейт
-    // initNotifications — иначе опт-аут прошлого юзера навсегда лишал бы нового push. Только при уже
-    // выданном разрешении; master включаем, т.к. на этом устройстве уведомления уже разрешены.
-    if (notifPermission() === 'granted') { setSettings({ notif: true }); localStorage.removeItem('notifOptOut'); ensurePushSubscribed(); }
     connectNotifyWs(); // глобальный live-канал уведомлений (любой сервер, даже не подключённый)
     startIdleWatch();  // away-детект: апп давно не трогали → жёлтый статус (шлётся по notify-WS)
     preloadSounds(); // прогреть звуки (fetch+decode+нормализация громкости) — первый проигрыш без задержки
-    const pend = sessionStorage.getItem('pendingInvite');
-    const pendingOpenServer = sessionStorage.getItem('pendingOpenServer');
+    const { invite: pend, openServer: pendingOpenServer } = takePendingEntryIntent();
     if (pend) {
-      sessionStorage.removeItem('pendingInvite'); sessionStorage.removeItem('pendingOpenServer');
       set({ modal: 'join', joinPrefill: pend });
     } else if (pendingOpenServer) {
-      sessionStorage.removeItem('pendingOpenServer');
       void get().openServer(pendingOpenServer);
     }
   },
 
   loadMe: async () => {
-    const d = await api.me();
-    engine?.setMe(d.user);
-    set((st) => { const lr = { ...st.lastRead }; for (const s of d.servers) if (lr[s.id] === undefined) lr[s.id] = s.lastRead || 0; return { me: d.user, servers: d.servers, lastRead: lr }; });
-    mergeUnread(Object.fromEntries(d.servers.map((s) => [s.id, s.unread || 0])));
+    const userId = get().me?.id || '';
+    const targetEngine = engine;
+    // Creating/joining/leaving is an authoritative server-list boundary. Any Home request that
+    // started before it must be aborted and, even if fetch ignores abort, fenced by this revision.
+    serverListRefresh.invalidate();
+    await serverListRefresh.run({
+      owner: userId,
+      load: (signal) => api.me(signal),
+      isOwnerCurrent: (owner) => get().me?.id === owner && engine === targetEngine,
+      commit: (d) => {
+        if (d.user.id !== userId) return;
+        targetEngine?.setMe(d.user);
+        set((st) => { const lr = { ...st.lastRead }; for (const s of d.servers) if (lr[s.id] === undefined) lr[s.id] = s.lastRead || 0; return { me: d.user, servers: d.servers, lastRead: lr }; });
+        mergeUnread(Object.fromEntries(d.servers.map((s) => [s.id, s.unread || 0])));
+      },
+    });
     // лёгкий поллинг непрочитанного по всем серверам (для НЕ активных — активный ведёт клиент)
     if (unreadTimer) clearInterval(unreadTimer);
     unreadTimer = window.setInterval(async () => { try { mergeUnread(await api.getUnread()); } catch { /**/ } }, 30000);
@@ -409,7 +506,23 @@ export const useStore = create<AppState>((set, get) => ({
     void get().refreshReleaseHistoryUnread().catch(() => {});
     releaseHistoryTimer = window.setInterval(() => { void get().refreshReleaseHistoryUnread().catch(() => {}); }, 60000);
   },
-  refreshServers: async () => { try { const d = await api.me(); set({ servers: d.servers }); mergeUnread(Object.fromEntries(d.servers.map((s) => [s.id, s.unread || 0]))); } catch { /**/ } },
+  refreshServers: async (signal) => {
+    const userId = get().me?.id || '';
+    if (!userId || signal?.aborted) return;
+    try {
+      await serverListRefresh.run({
+        owner: userId,
+        signal,
+        load: (requestSignal) => api.me(requestSignal),
+        isOwnerCurrent: (owner) => get().me?.id === owner,
+        commit: (d) => {
+          if (d.user.id !== userId) return;
+          set({ servers: d.servers });
+          mergeUnread(Object.fromEntries(d.servers.map((s) => [s.id, s.unread || 0])));
+        },
+      });
+    } catch { /** foreground/focus polling retries on the next bounded trigger */ }
+  },
   markRead: (serverId, lastId, all) => {
     set((s) => ({ lastRead: { ...s.lastRead, [serverId]: Math.max(s.lastRead[serverId] || 0, lastId) } }));
     const hadUnread = (get().unread[serverId] || 0) > 0;
@@ -498,14 +611,42 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   logout: async () => {
+    const logoutUserId = get().me?.id || get().pendingUser?.id || '';
+    // Capture the exact provisional endpoint first, then publish the shared logout fence before
+    // any asynchronous worker/network operation. An in-flight ensure in another tab reads this
+    // durable marker directly and therefore cannot post a later active=true after our false floor.
+    preparePushLogout(logoutUserId);
+    try { await api.beginLogout(); }
+    catch (error) {
+      get().toast(error instanceof Error ? error.message : 'Не удалось безопасно завершить сессию', 'err');
+      return;
+    }
+    // Start immediately while the page still owns its ServiceWorker. This is independent from
+    // subscription cleanup and bounded, so a broken browser API cannot hold explicit logout.
+    const closePushBanners = closeShownPushNotifications();
+    const hideFuturePush = setPushNotificationSessionActive(false);
+    const stopNativeCapture = isTauri
+      ? stopNativeBroadcastBounded().finally(() => endAnyBroadcasterSession())
+      : Promise.resolve();
+    set({ broadcastLive: false });
+    suspendNotificationPushRecovery(logoutUserId);
     invalidateAuthSessionHandoff(false);
-    viewEpoch++; engine?.disconnect();
+    viewEpoch++; stopMemberPoll(); engine?.disconnect();
+    volumePreferences?.dispose(); volumePreferences = null;
+    // A retained offline endpoint may still receive already queued account pushes. Persist the
+    // worker's logged-out floor before cleanup/reload so those mandatory banners stay generic.
+    try { await Promise.race([hideFuturePush, new Promise((r) => setTimeout(r, 1500))]); } catch { /**/ }
     // отписываем web-push ПОКА токен ещё текущего юзера (api.pushUnsubscribe шлёт Bearer) —
     // иначе endpoint остаётся привязан к нему на сервере и его push летели бы следующему юзеру.
     // cap 2с, чтобы разлогин не подвисал на мёртвой сети.
-    try { await Promise.race([unsubscribePush(), new Promise((r) => setTimeout(r, 2000))]); } catch { /**/ }
+    try { await Promise.race([unsubscribePush(logoutUserId), new Promise((r) => setTimeout(r, 2000))]); } catch { /**/ }
     disconnectNotifyWs();
-    setToken(null); location.reload();
+    // The local logout fence is installed before this request. Even if the
+    // network is offline or the 2s cap wins, reload cannot restore the HttpOnly
+    // refresh cookie; online/next boot will finish server revocation.
+    try { await Promise.race([api.logoutSession(), new Promise((r) => setTimeout(r, 2000))]); } catch { /**/ }
+    await Promise.all([closePushBanners, stopNativeCapture]);
+    location.reload();
   },
 
   // Точка входа по клику на сервер. Просмотр СВОБОДНЫЙ (голос не рвём, модалки переключения больше нет):
@@ -542,7 +683,6 @@ export const useStore = create<AppState>((set, get) => ({
   showConnectedServer: async (id) => {
     // active/members уже в сторе (сохранены при уходе на главную) → показываем сразу, без скелетона
     set({ view: 'server', loadingServer: false, loadingServerId: null });
-    startMemberPoll(id);
     // подтянуть свежий состав/пресенс (соединение и история уже живые)
     try {
       const [srv, pres] = await Promise.all([api.getServer(id), api.presence(id).catch(() => null)]);
@@ -550,39 +690,50 @@ export const useStore = create<AppState>((set, get) => ({
       set({ members: srv.members, active: { ...srv.server, myRole: srv.myRole, myPerms: srv.myPerms } });
       engine?.setMembers(srv.members); if (pres) { engine?.setOnlineHint(pres.online); engine?.setAwayHint(pres.away || []); engine?.setVoiceHint(pres.voice || {}); }
     } catch { /**/ }
+    finally {
+      // Первый refresh и рекурсивный poll не должны дублировать друг друга на медленной сети.
+      if (get().viewServerId === id && get().view === 'server') startMemberPoll(id);
+    }
   },
 
   // Фактический (ре)коннект: рвём прошлое соединение и поднимаем новое.
   connectServer: async (id) => {
     const myEpoch = ++viewEpoch; // новый коннект — предыдущие async-хвосты устаревают
-    if (memberTimer) clearInterval(memberTimer);
+    stopMemberPoll();
     // Вход на СВОЙ голосовой сервер → реюз живой голосовой комнаты как смотримой (без 2-го коннекта к тому же
     // srv = без само-дубля/эха). Иначе — отцепляем прежнюю смотримую; голос НЕ трогаем (браузинг больше не рвёт голос).
     const reuse = !!engine && engine.getSnapshot().voiceServerId === id;
-    if (reuse) engine?.reuseVoiceAsView(); else engine?.detachView();
+    if (reuse) engine?.reuseVoiceAsView(); else engine?.detachView(id);
     set({ view: 'server', loadingServer: true, loadingServerId: id, active: null, members: [], viewServerId: id });
+    engine?.beginChatView(id);
+    // Fence persisted dirty values against the in-flight GET. The release in finally also covers
+    // offline/stale loads, so a failed hydration cannot block retrying those exact fields forever.
+    const hydrationOwner = volumePreferences;
+    const hydrationEngine = engine;
+    const hydration = hydrationOwner?.beginHydration(id) || { data: null, revision: 0, token: 0 };
+    if (hydration.data) hydrationEngine?.setVols(id, hydration.data);
     try {
-      // сохранённые громкости из localStorage — синхронно, до сети (иначе слайдеры = 100%)
-      const cache = JSON.parse(localStorage.getItem('srvset:' + id) || 'null');
-      if (cache) engine?.setVols(id, cache);
       // КРИТИЧНОЕ для первой отрисовки — параллельно; тяжёлый WebRTC-connect уходит в фон (ниже).
-      const [d, hist, settings, pres] = await Promise.all([
+      const [d, chatCount, settings, pres] = await Promise.all([
         api.getServer(id),
-        api.getMessages(id, undefined, 30).catch(() => ({ messages: [], hasMore: false })),
+        engine?.synchronizeChat(id).catch(() => 0) || Promise.resolve(0),
         api.getSettings(id).catch(() => null),
         api.presence(id).catch(() => null),
       ]);
       if (viewEpoch !== myEpoch || get().loadingServerId !== id) return; // юзер уже переключился/перезапустил этот же connect
       const active: ServerDetail = { ...d.server, myRole: d.myRole, myPerms: d.myPerms };
-      if (settings?.data && (settings.data.users || settings.data.streams)) engine?.setVols(id, settings.data);
+      if (settings && hydrationOwner && volumePreferences === hydrationOwner && engine === hydrationEngine) {
+        const effectiveVolumes = hydrationOwner.acceptRemote(id, settings.data, hydration.revision, hydration.token);
+        hydrationEngine?.setVols(id, effectiveVolumes);
+      }
       engine?.setMembers(d.members);
       if (pres) { engine?.setOnlineHint(pres.online); engine?.setAwayHint(pres.away || []); engine?.setVoiceHint(pres.voice || {}); }
-      engine?.loadHistory(hist.messages, hist.hasMore);
-      if (hist.messages.length === 0) engine?.sysMsg('Ты на сервере «' + active.name + '». Чат доступен сразу — голос по кнопке «Подключиться».');
+      if (chatCount === 0) engine?.sysMsg('Ты на сервере «' + active.name + '». Чат доступен сразу — голос по кнопке «Подключиться».');
       // ВСЁ критичное готово → показываем сервер немедленно (не ждём комнату)
       set({ active, members: d.members, loadingServer: false, loadingServerId: null });
-      if (!localStorage.getItem('onboardedSrv')) {
-        localStorage.setItem('onboardedSrv', '1');
+      if (!onboardedServerInMemory && safeLocalGet('onboardedSrv') !== '1') {
+        onboardedServerInMemory = true;
+        safeLocalSet('onboardedSrv', '1');
         engine?.sysMsg('👋 Ты в чате, но НЕ в голосовом. Нажми «Подключиться», чтобы говорить. Справа — кто в сети и кто в голосовом.');
       }
       // WebRTC-коннект к НОВОЙ смотримой комнате — В ФОНЕ; гард по эпохе (переживает уход на главную через
@@ -608,6 +759,7 @@ export const useStore = create<AppState>((set, get) => ({
         // все попытки провалились: сбрасываем viewServerId, иначе повторный клик уходит в
         // showConnectedServer (без реконнекта) и realtime мёртв до F5. Теперь клик = полный вход.
         if (viewEpoch === myEpoch && get().viewServerId === id) {
+          engine?.cancelPendingVoiceJoin(id);
           set({ viewServerId: null });
           get().toast('Realtime-связь не поднялась — зайди на сервер заново', 'warn');
         }
@@ -617,6 +769,8 @@ export const useStore = create<AppState>((set, get) => ({
       // Ошибка старого A-connect не имеет права закрыть уже открываемый B (или более свежий retry A).
       if (viewEpoch !== myEpoch) return;
       get().toast(e.message, 'err'); get().exitServer();
+    } finally {
+      hydrationOwner?.finishHydration(id, hydration.token);
     }
   },
 
@@ -632,7 +786,10 @@ export const useStore = create<AppState>((set, get) => ({
   exitServer: () => {
     invalidateAuthSessionHandoff();
     viewEpoch++; // in-flight connect/poll прошлого сервера устаревают
-    if (memberTimer) clearInterval(memberTimer);
+    stopMemberPoll();
+    // Exit is also the post-commit path for leave/delete. Never coalesce that authoritative refresh
+    // with a list snapshot that may have started before the membership mutation completed.
+    serverListRefresh.invalidate();
     // Покидаю СМОТРИМЫЙ сервер (leave/delete/ошибка). Если я в голосе ИМЕННО на нём — выхожу и из голоса
     // (полный teardown); иначе голос на другом сервере — оставляем, отцепляем только просмотр.
     const voiceSrv = engine?.getSnapshot().voiceServerId;
@@ -642,8 +799,8 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   // На главную БЕЗ отключения от сервера — соединение (чат/голос/пресенс) живёт, возврат мгновенный.
-  goHome: () => { invalidateAuthSessionHandoff(); if (memberTimer) clearInterval(memberTimer); if (location.pathname !== '/') history.replaceState({}, '', '/'); set({ view: 'home' }); get().refreshServers(); },
-  goAdmin: () => { invalidateAuthSessionHandoff(); if (location.pathname !== '/admin') history.pushState({}, '', '/admin'); set({ view: 'admin' }); },
+  goHome: () => { invalidateAuthSessionHandoff(); stopMemberPoll(); if (location.pathname !== '/') history.replaceState({}, '', '/'); set({ view: 'home' }); get().refreshServers(); },
+  goAdmin: () => { invalidateAuthSessionHandoff(); stopMemberPoll(); if (location.pathname !== '/admin') history.pushState({}, '', '/admin'); set({ view: 'admin' }); },
 }));
 
 export interface AuthSessionHandoff {
@@ -695,7 +852,7 @@ export async function completeAuthSessionHandoff(plan: AuthSessionHandoff, token
       // Даже если событие серверного disconnect ещё стоит в очереди, старую комнату больше не
       // переиспользуем: создаём её заново только после того, как api.ts уже видит новый JWT.
       viewEpoch++;
-      if (memberTimer) clearInterval(memberTimer);
+      stopMemberPoll();
       engine?.disconnect();
     }
 
@@ -720,13 +877,13 @@ export async function completeAuthSessionHandoff(plan: AuthSessionHandoff, token
     }
 
     if (plan.originalView === 'home') {
-      if (memberTimer) clearInterval(memberTimer);
+      stopMemberPoll();
       if (location.pathname !== '/') history.replaceState({}, '', '/');
       useStore.setState({ view: 'home' });
       void useStore.getState().refreshServers();
     }
     else if (plan.originalView === 'admin') {
-      if (memberTimer) clearInterval(memberTimer);
+      stopMemberPoll();
       useStore.setState({ view: 'admin' });
     }
   } catch {

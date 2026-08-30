@@ -13,8 +13,10 @@ import {
   audioOutputChoices,
   currentAppleMobilePlatform,
   directAudioOutputSelectionSupported,
+  loadAudioDevices,
   type AudioDeviceChoice,
 } from '../audioDevices';
+import { PrimaryPointerHold, suppressPointerToggleWhilePtt, webScreenShareSupported } from '../mobileControls';
 
 /* Вещание — только из нативного клиента (CLAUDE.md инвариант 2). Конфиг/статистика — в BroadcastModal. */
 function NativeBroadcastButton() {
@@ -49,11 +51,15 @@ function ShareButton() {
   const me = useStore((s) => s.me)!;
   if (!eng.inVoice) return null;
   const live = !!eng.presence[me.username]?.streaming;
+  const supported = webScreenShareSupported(typeof navigator === 'undefined' ? null : navigator.mediaDevices);
+  // iOS/unsupported browsers cannot satisfy this action. Do not render a dead control that only
+  // produces an error toast; if a live stream outlives capability detection, keep its Stop action.
+  if (!live && !supported) return null;
   return (
     <button className={'vd-btn' + (live ? ' danger-on' : '')} aria-pressed={live}
       aria-label={live ? 'Остановить трансляцию' : 'Транслировать экран'}
       data-tip={live ? 'Трансляция идёт' : 'Транслировать экран'}
-      onClick={() => E.share()}>
+      onClick={() => live ? E.stopShare() : E.share()}>
       <Icon name={live ? 'screen-stop' : 'screen'} sm />
     </button>
   );
@@ -67,6 +73,8 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
   const [outputViaInput, setOutputViaInput] = useState(false);
   const [loading, setLoading] = useState(false);
   const [loadFailed, setLoadFailed] = useState(false);
+  const [partial, setPartial] = useState(false);
+  const [permissionDenied, setPermissionDenied] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
   const [position, setPosition] = useState<{ left: number; top: number; maxHeight: number; above: boolean } | null>(null);
@@ -76,6 +84,7 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
   const ref = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const reloadRef = useRef<(forcePermission?: boolean) => void>(() => {});
   const openFocusRef = useRef<'selected' | 'first' | 'last'>('selected');
   const optionCount = devs.length + 1;
   const focusOption = (index: number) => {
@@ -97,6 +106,8 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
     setDevs([]);
     setLoaded(false);
     setLoadFailed(false);
+    setPartial(false);
+    setPermissionDenied(false);
     setOpen(true);
     requestAnimationFrame(() => menuRef.current?.querySelector<HTMLElement>(`[data-menu-index="${next}"]`)?.focus());
   };
@@ -105,58 +116,60 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
     let disposed = false;
     let requestId = 0;
     let timer: number | null = null;
-    const load = async () => {
+    const load = (forcePermission = false) => {
       const id = ++requestId;
       setLoading(true);
       setLoaded(false);
       setLoadFailed(false);
-      let choices: AudioDeviceChoice[] = [];
-      let viaInput = false;
-      let failed = false;
-      if (kind === 'output' && appleMobile) {
-        const [inputResult, outputResult] = await Promise.allSettled([
-          Room.getLocalDevices('audioinput'),
-          Room.getLocalDevices('audiooutput'),
-        ]);
-        const inputs = inputResult.status === 'fulfilled' ? inputResult.value : [];
-        const outputs = outputResult.status === 'fulfilled' ? outputResult.value : [];
-        const output = audioOutputChoices(true, inputs, outputs, directAudioOutputSelectionSupported());
-        choices = output.choices;
-        viaInput = output.viaInput;
-        failed = inputResult.status === 'rejected' && outputResult.status === 'rejected';
-      } else {
-        try {
-          const devices = await Room.getLocalDevices(kind === 'input' ? 'audioinput' : 'audiooutput');
-          choices = kind === 'output' && !directAudioOutputSelectionSupported()
-            ? []
-            : audioDeviceChoices(devices, kind === 'input' ? 'Микрофон' : 'Устройство вывода');
-        } catch { failed = true; }
-      }
-      if (disposed || id !== requestId) return;
-      if (!failed) {
-        setDevs(choices);
-        setOutputViaInput(kind === 'output' && viaInput);
-      }
-      setLoadFailed(failed);
-      setLoading(false);
-      setLoaded(!failed);
-      const selectedId = kind === 'input' || viaInput ? getSettings().input : getSettings().output;
-      const selected = selectedId ? choices.findIndex((device) => device.id === selectedId) + 1 : 0;
-      const intent = openFocusRef.current;
-      const next = intent === 'first' ? 0 : intent === 'last' ? choices.length : Math.max(0, selected);
-      openFocusRef.current = 'selected';
-      setActiveIndex(next);
-      requestAnimationFrame(() => menuRef.current?.querySelector<HTMLElement>(`[data-menu-index="${next}"]`)?.focus());
+      const request = loadAudioDevices(
+        (deviceKind, requestPermissions) => Room.getLocalDevices(deviceKind, requestPermissions),
+        { forcePermission },
+      );
+      const apply = (result: Awaited<typeof request.bounded>) => {
+        if (disposed || id !== requestId) return;
+        const output = audioOutputChoices(
+          appleMobile,
+          result.inputs,
+          result.outputs,
+          directAudioOutputSelectionSupported(),
+        );
+        const viaInput = kind === 'output' && output.viaInput;
+        const choices = kind === 'input'
+          ? audioDeviceChoices(result.inputs, 'Микрофон')
+          : output.choices;
+        const failed = kind === 'input'
+          ? result.inputFailed
+          : (viaInput ? result.inputFailed : result.outputFailed);
+        if (!failed) {
+          setDevs(choices);
+          setOutputViaInput(viaInput);
+        }
+        setLoadFailed(failed);
+        setPartial(result.partial);
+        setPermissionDenied(result.permissionDenied);
+        setLoading(false);
+        setLoaded(!failed && !result.partial);
+        const selectedId = kind === 'input' || viaInput ? getSettings().input : getSettings().output;
+        const selected = selectedId ? choices.findIndex((device) => device.id === selectedId) + 1 : 0;
+        const intent = openFocusRef.current;
+        const next = intent === 'first' ? 0 : intent === 'last' ? choices.length : Math.max(0, selected);
+        openFocusRef.current = 'selected';
+        setActiveIndex(next);
+        requestAnimationFrame(() => menuRef.current?.querySelector<HTMLElement>(`[data-menu-index="${next}"]`)?.focus());
+      };
+      void request.bounded.then(apply);
+      void request.settled.then(apply);
     };
+    reloadRef.current = load;
     const onDeviceChange = () => {
       if (timer != null) window.clearTimeout(timer);
       setDevs([]);
       setLoaded(false);
       setLoadFailed(false);
       setLoading(true);
-      timer = window.setTimeout(() => { timer = null; void load(); }, 150);
+      timer = window.setTimeout(() => { timer = null; load(false); }, 150);
     };
-    void load();
+    load(false);
     const onDoc = (e: PointerEvent) => {
       const target = e.target as Node | null;
       if (!target || ref.current?.contains(target) || menuRef.current?.contains(target)) return;
@@ -168,6 +181,7 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
       disposed = true;
       requestId++;
       if (timer != null) window.clearTimeout(timer);
+      if (reloadRef.current === load) reloadRef.current = () => {};
       document.removeEventListener('pointerdown', onDoc, true);
       navigator.mediaDevices?.removeEventListener?.('devicechange', onDeviceChange);
     };
@@ -239,12 +253,15 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
   const pick = (id: string) => {
     if (kind === 'input') {
       setSettings({ input: id });
-      void E?.reapplyMic();
+      if (E) void E.reapplyMic().finally(() => E.restartLevelMeter());
     } else if (outputViaInput) {
       // iOS/iPadOS связывает Speakerphone/earpiece с audioinput, хотя для пользователя это
       // именно маршрут вывода. Переснимаем мик один раз и затем возобновляем удалённый звук.
       setSettings({ input: id, output: '' });
-      void E?.reapplyMic('route').then(() => E.applyOutput());
+      if (E) void E.reapplyMic('route').finally(() => {
+        void E.applyOutput();
+        E.restartLevelMeter();
+      });
     } else {
       setSettings({ output: id });
       void E?.applyOutput();
@@ -288,6 +305,9 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
       <div className="vd-devh" aria-hidden="true">{kind === 'input' ? 'МИКРОФОН' : (outputViaInput ? 'МАРШРУТ ЗВУКА' : 'ВЫВОД ЗВУКА')}</div>
       {loading ? <div className="vd-devstatus" role="status" aria-live="polite">Обновляем список…</div> : null}
       {loadFailed ? <div className="vd-devstatus is-error" role="status">Не удалось получить устройства</div> : null}
+      {!loading && permissionDenied ? <div className="vd-devstatus is-error" role="status">Доступ к микрофону запрещён</div> : null}
+      {!loading && partial && !permissionDenied && !loadFailed ? <div className="vd-devstatus" role="status">Показан неполный список</div> : null}
+      {!loading && (partial || loadFailed) ? <button type="button" className="vd-devitem" onClick={() => reloadRef.current(true)}>Повторить поиск</button> : null}
       {selectionMissing ? <div className="vd-devstatus warn" role="status">Выбранное устройство отключено</div> : null}
       <button role="menuitemradio" aria-checked={!cur || selectionMissing} tabIndex={activeIndex === 0 ? 0 : -1} data-menu-index="0"
         className={'vd-devitem' + (!cur || selectionMissing ? ' on' : '')} onFocus={() => setActiveIndex(0)} onClick={() => pick('')}>{outputViaInput ? 'Автоматически' : 'По умолчанию'}</button>
@@ -329,8 +349,30 @@ export function VoiceControls({ up }: { up?: boolean }) {
   const connection = eng.voiceConnection ?? (eng.reconnecting ? 'reconnecting' : (eng.voiceConnecting ? 'connecting' : (eng.inVoice ? 'connected' : 'disconnected')));
   const pttLive = ptt && eng.pttDown && !muted && connection === 'connected';
   const pttIdle = ptt && !pttLive;
+  const pttHoldReady = ptt && !muted && connection === 'connected';
   const micClosed = muted || pttIdle;
-  const micClass = 'vd-btn' + (muted ? ' danger-on' : (pttLive ? ' ptt-live' : (pttIdle ? ' ptt-idle' : '')));
+  const micClass = 'vd-btn' + (muted ? ' danger-on' : (pttLive ? ' ptt-live' : (pttIdle ? ' ptt-idle' : '')))
+    + (pttHoldReady ? ' vd-ptt-hold' : '');
+  const pttPointer = useRef(new PrimaryPointerHold());
+  const suppressPttClick = useRef(false);
+  const releasePttPointer = (pointerId?: number) => {
+    const released = pointerId === undefined
+      ? pttPointer.current.cancel()
+      : pttPointer.current.end(pointerId);
+    if (released) E.pttRelease();
+  };
+  useEffect(() => {
+    if (!pttHoldReady) releasePttPointer();
+    const releaseWhenHidden = () => { if (document.hidden) releasePttPointer(); };
+    const releaseOnPageHide = () => releasePttPointer();
+    document.addEventListener('visibilitychange', releaseWhenHidden);
+    window.addEventListener('pagehide', releaseOnPageHide);
+    return () => {
+      document.removeEventListener('visibilitychange', releaseWhenHidden);
+      window.removeEventListener('pagehide', releaseOnPageHide);
+      releasePttPointer();
+    };
+  }, [pttHoldReady, E]);
   // «Недоступен» и «я себя замутил» — разные состояния: раньше оба выглядели как обычный мут, и когда
   // микрофон пропадал и возвращался сам, это читалось как «кнопка переключается сама по себе».
   const micLabel = eng.micUnavailable
@@ -339,7 +381,26 @@ export function VoiceControls({ up }: { up?: boolean }) {
   return (
     <div className="vd-controls">
       <div className="vd-grp">
-        <button className={micClass} aria-pressed={muted} aria-label={micLabel} data-tip={ptt || eng.micUnavailable ? micLabel : 'Микрофон · M'} onClick={() => E.toggleMic()}><Icon name={micClosed ? 'mic-off' : 'mic'} sm /></button>
+        <button className={micClass} aria-pressed={ptt ? pttLive : muted} aria-label={micLabel} data-tip={ptt || eng.micUnavailable ? micLabel : 'Микрофон · M'}
+          onPointerDown={(event) => {
+            if (!pttHoldReady) { suppressPttClick.current = false; return; }
+            if (!pttPointer.current.begin(event.pointerId, event.isPrimary, event.button)) return;
+            suppressPttClick.current = true;
+            try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /** implicit touch capture remains */ }
+            E.pttPress();
+          }}
+          onPointerUp={(event) => releasePttPointer(event.pointerId)}
+          onPointerCancel={(event) => releasePttPointer(event.pointerId)}
+          onLostPointerCapture={(event) => releasePttPointer(event.pointerId)}
+          onContextMenu={(event) => { if (pttHoldReady) event.preventDefault(); }}
+          onClick={(event) => {
+            if (suppressPttClick.current && suppressPointerToggleWhilePtt(true, event.detail)) {
+              suppressPttClick.current = false;
+              event.preventDefault();
+              return;
+            }
+            E.toggleMic();
+          }}><Icon name={micClosed ? 'mic-off' : 'mic'} sm /></button>
         <DeviceMenu kind="input" up={up} />
       </div>
       <div className="vd-grp">

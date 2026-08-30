@@ -7,10 +7,9 @@
 // (голос не должен падать из-за детектора речи). Имя процессора 'vad-rms' отлично от RNNoise —
 // коллизии addModule нет.
 //
-// URL стабильный (`/vad-worklet.js` из public/), а НЕ хешированный ассет: вкладка, открытая до
-// деплоя, после него получала 404 на старое имя — ворклет молча не поднимался и фоновый баг
-// возвращался. Файл в public/ переживает выкатку под тем же именем.
-const WORKLET_URL = '/vad-worklet.js';
+// Exact content hash is injected by Vite and retained in the owning Service Worker cache. This
+// avoids both old-tab 404s and a new host accidentally loading an old cached worklet protocol.
+const WORKLET_URL = __VAD_WORKLET_URL__;
 const moduleLoaded = new WeakMap<BaseAudioContext, Promise<void>>();
 
 function ensureVadModule(ctx: AudioContext): Promise<void> {

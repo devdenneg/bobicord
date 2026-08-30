@@ -1,3 +1,5 @@
+import { safeLocalStorageGet, safeLocalStorageSet } from './safeStorage';
+
 // Локальный (per-устройство) журнал скачанных вложений чата — аналог "Загрузки" в Chrome.
 // Ведётся и в вебе, и в нативе; путь на диске (path) есть только в нативе (там, где мы сами
 // пишем байты через saveFileDialog и знаем, куда). Дубли — отдельными строками (как в Chrome):
@@ -19,7 +21,7 @@ const MAX_ITEMS = 200;
 
 function load(): DownloadItem[] {
   try {
-    const raw = JSON.parse(localStorage.getItem(KEY) || '[]');
+    const raw = JSON.parse(safeLocalStorageGet(KEY) || '[]');
     return Array.isArray(raw) ? raw : [];
   } catch { return []; }
 }
@@ -28,7 +30,7 @@ let items: DownloadItem[] = load();
 const subs = new Set<() => void>();
 
 function persist() {
-  localStorage.setItem(KEY, JSON.stringify(items));
+  safeLocalStorageSet(KEY, JSON.stringify(items));
   subs.forEach((f) => f());
 }
 

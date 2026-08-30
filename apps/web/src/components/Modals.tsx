@@ -22,7 +22,7 @@ import { LeaderboardModal } from './Leaderboard';
 import { ReleaseHistoryModal } from './ReleaseHistoryModal';
 import { normalizeProfileBanner, ProfileBannerMedia } from './ProfileBanner';
 import { isTauri, setGlobalHotkeys } from '../native';
-import { enableNotifications, notifSupported, notifPermission } from '../notify';
+import { enableNotifications, notifSupported, notifPermission, setNotificationOptOut } from '../notify';
 import { unsubscribePush, syncPushPrefs } from '../push';
 import {
   audioDeviceSelectionMissing,
@@ -30,8 +30,12 @@ import {
   audioOutputChoices,
   currentAppleMobilePlatform,
   directAudioOutputSelectionSupported,
+  loadAudioDevices,
+  subscribeMicrophonePermissionSettled,
   type AudioDeviceChoice,
 } from '../audioDevices';
+import { isRangeAdjustmentKey, PrimaryPointerHold } from '../mobileControls';
+import { InvitePreviewRequest } from '../invitePreviewRequest';
 
 function CreateModal() {
   const close = () => useStore.getState().setModal(null);
@@ -57,10 +61,28 @@ function JoinModal() {
   const prefill = useStore((s) => s.joinPrefill);
   const [code, setCode] = useState(prefill || ''); const [err, setErr] = useState(''); const [busy, setBusy] = useState(false);
   const [preview, setPreview] = useState<InvitePreview | null>(null);
-  const tRef = useRef<number | null>(null);
-  async function doPreview(c: string) { const cc = extractCode(c); if (!cc) { setPreview(null); return; } try { const d = await api.invitePreview(cc); setPreview(d); setErr(''); } catch (e: any) { setPreview(null); setErr(e.message); } }
-  useEffect(() => { if (prefill) doPreview(prefill); /* eslint-disable-next-line */ }, []);
-  function onCode(v: string) { setCode(v); if (tRef.current) clearTimeout(tRef.current); tRef.current = window.setTimeout(() => doPreview(v), 400); }
+  const previewRequest = useRef<InvitePreviewRequest<InvitePreview> | null>(null);
+  if (!previewRequest.current) previewRequest.current = new InvitePreviewRequest<InvitePreview>();
+  const requestPreview = (value: string, immediate = false) => {
+    const inviteCode = extractCode(value);
+    previewRequest.current!.start(
+      inviteCode,
+      (signal) => api.invitePreview(inviteCode, signal),
+      {
+        onPending: () => { setPreview(null); setErr(''); },
+        onSuccess: (result) => { setPreview(result); setErr(''); },
+        onError: (error: any) => { setPreview(null); setErr(error?.message || 'Не удалось проверить приглашение'); },
+      },
+      immediate ? 0 : 400,
+    );
+  };
+  useEffect(() => {
+    if (prefill) requestPreview(prefill, true);
+    return () => previewRequest.current?.dispose();
+    // The request owner is mount-scoped; later prefill changes open a fresh modal instance.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  function onCode(v: string) { setCode(v); requestPreview(v); }
   async function join() {
     const cc = extractCode(code); if (!cc) { setErr('Введи код'); return; }
     setBusy(true); setErr('');
@@ -302,7 +324,7 @@ function ProfileModal() {
       useStore.getState().setMe(response.user);
       setCurrentPassword(''); setNewPassword(''); setConfirmPassword('');
       setPasswordSuccess('Пароль изменён. Остальные сеансы завершены, а это окно осталось авторизованным.');
-      void syncPushPrefs();
+      void syncPushPrefs(response.user.id).catch(() => {});
       // Ротация учётных данных уже завершена. Восстановление LiveKit может занять до 20 секунд
       // при сетевой проблеме и не должно удерживать форму в состоянии «Меняем пароль…».
       void completeAuthSessionHandoff(handoff, true);
@@ -690,56 +712,87 @@ function SettingsModal() {
   const [outputViaInput, setOutputViaInput] = useState(false);
   const [devicesLoading, setDevicesLoading] = useState(true);
   const [devicesFailed, setDevicesFailed] = useState(false);
+  const [devicesPartial, setDevicesPartial] = useState(false);
+  const [devicesPermissionDenied, setDevicesPermissionDenied] = useState(false);
+  const [notificationBusy, setNotificationBusy] = useState(false);
   const [binding, setBinding] = useState(false);
   const [captureAction, setCaptureAction] = useState<KeybindAction | null>(null);
+  const reloadDevicesRef = useRef<(forcePermission?: boolean) => void>(() => {});
+  const notifyPreviewPointer = useRef(new PrimaryPointerHold());
+  const notifyPreviewKeys = useRef(new Set<string>());
   useEffect(() => {
     let disposed = false;
     let requestId = 0;
     let timer: number | null = null;
-    const load = async () => {
+    // Retry may finish just as its permission-settled listener starts a newer enumeration.
+    // Keep this intent across generations so the newer winner still revives MicMeter.
+    let meterRestartPending = false;
+    const load = (forcePermission = false) => {
       const id = ++requestId;
+      if (forcePermission) meterRestartPending = true;
       setDevicesLoading(true);
-      const [inputResult, outputResult] = await Promise.allSettled([
-        Room.getLocalDevices('audioinput'),
-        Room.getLocalDevices('audiooutput'),
-      ]);
-      if (disposed || id !== requestId) return;
-      const inputs = inputResult.status === 'fulfilled' ? inputResult.value : [];
-      const outputs = outputResult.status === 'fulfilled' ? outputResult.value : [];
-      setIns(audioDeviceChoices(inputs, 'Микрофон'));
-      const output = audioOutputChoices(
-        appleMobile,
-        inputs,
-        outputs,
-        directAudioOutputSelectionSupported(),
+      const request = loadAudioDevices(
+        (kind, requestPermissions) => Room.getLocalDevices(kind, requestPermissions),
+        {
+          // MicMeter owns the automatic permission capture in this modal. Only an explicit Retry
+          // may start a probe after a denial; otherwise both components could race getUserMedia.
+          requestPermission: forcePermission,
+          forcePermission,
+        },
       );
-      setOuts(output.choices);
-      setOutputViaInput(output.viaInput);
-      setDevicesFailed(inputResult.status === 'rejected' && outputResult.status === 'rejected');
-      setDevicesLoading(false);
+      const apply = (result: Awaited<typeof request.bounded>) => {
+        if (disposed || id !== requestId) return;
+        setIns(audioDeviceChoices(result.inputs, 'Микрофон'));
+        const output = audioOutputChoices(
+          appleMobile,
+          result.inputs,
+          result.outputs,
+          directAudioOutputSelectionSupported(),
+        );
+        setOuts(output.choices);
+        setOutputViaInput(output.viaInput);
+        setDevicesFailed(result.inputFailed && result.outputFailed);
+        setDevicesPartial(result.partial);
+        setDevicesPermissionDenied(result.permissionDenied);
+        setDevicesLoading(false);
+        if (meterRestartPending && !result.permissionDenied && !result.partial) {
+          meterRestartPending = false;
+          getEngine()?.restartLevelMeter();
+        }
+      };
+      void request.bounded.then(apply);
+      // If a WebKit permission sheet resolves after the 4s UI deadline, refresh the same request
+      // only while this modal/generation is still alive.
+      void request.settled.then(apply);
     };
+    reloadDevicesRef.current = load;
     const onDeviceChange = () => {
       if (timer != null) window.clearTimeout(timer);
-      timer = window.setTimeout(() => { timer = null; void load(); }, 150);
+      timer = window.setTimeout(() => { timer = null; load(false); }, 150);
     };
-    void load();
+    load(false);
     navigator.mediaDevices?.addEventListener?.('devicechange', onDeviceChange);
+    const unsubscribePermission = subscribeMicrophonePermissionSettled(onDeviceChange);
     return () => {
       disposed = true;
       requestId++;
       if (timer != null) window.clearTimeout(timer);
+      if (reloadDevicesRef.current === load) reloadDevicesRef.current = () => {};
       navigator.mediaDevices?.removeEventListener?.('devicechange', onDeviceChange);
+      unsubscribePermission();
     };
   }, [appleMobile]);
   useEffect(() => { if (!binding) return; const k = (e: KeyboardEvent) => { e.preventDefault(); setSettings({ pttKey: e.code }); setBinding(false); rerender(); }; window.addEventListener('keydown', k, { once: true }); return () => window.removeEventListener('keydown', k); }, [binding]);
   const E = getEngine();
   const upd = (patch: Partial<AudioSettings>, act?: () => void) => { setSettings(patch); act?.(); rerender(); };
   const selectedOutput = outputViaInput ? s.input : s.output;
-  const inputMissing = !appleMobile && !devicesLoading && audioDeviceSelectionMissing(s.input, ins);
-  const outputMissing = !devicesLoading && audioDeviceSelectionMissing(selectedOutput, outs);
+  const inputMissing = !appleMobile && !devicesLoading && !devicesPartial && audioDeviceSelectionMissing(s.input, ins);
+  const outputMissing = !devicesLoading && !devicesPartial && audioDeviceSelectionMissing(selectedOutput, outs);
   const deviceStatus = devicesLoading ? 'Обновляем список аудиоустройств…'
     : devicesFailed ? 'Не удалось получить список устройств. Проверьте разрешения браузера.'
-      : (inputMissing || outputMissing) ? 'Ранее выбранное устройство отключено. До нового выбора используется системное.' : '';
+      : devicesPermissionDenied ? 'Доступ к микрофону запрещён. Можно повторить после изменения разрешения браузера.'
+        : (inputMissing || outputMissing) ? 'Ранее выбранное устройство отключено. До нового выбора используется системное.'
+          : devicesPartial ? 'Показаны доступные устройства; полный список ещё не получен.' : '';
   type Tab = 'voice' | 'notif' | 'appearance' | 'keys' | 'game';
   const [tab, setTab] = useState<Tab>('voice');
   const cats: { id: Tab; label: string; icon: string }[] = [
@@ -767,7 +820,10 @@ function SettingsModal() {
             <h2><Icon name="mic-sm" />Голос и звук</h2>
             <div className="grp">
               <div className="gt">Микрофон</div>
-              {!appleMobile ? <div className="fld"><label htmlFor="audio-input-device">Устройство ввода</label><select id="audio-input-device" value={s.input} aria-describedby="audio-device-status" onChange={(e) => upd({ input: e.target.value }, () => E?.reapplyMic())}>
+              {!appleMobile ? <div className="fld"><label htmlFor="audio-input-device">Устройство ввода</label><select id="audio-input-device" value={s.input} aria-describedby="audio-device-status" onChange={(e) => upd({ input: e.target.value }, () => {
+                if (!E) return;
+                void E.reapplyMic().finally(() => E.restartLevelMeter());
+              })}>
                 {inputMissing ? <option value={s.input} disabled>Выбранный микрофон отключён</option> : null}
                 <option value="">По умолчанию</option>{ins.map((d) => <option key={d.id} value={d.id}>{d.label}</option>)}</select></div>
                 : <div className="mm-hint">На iPhone и iPad микрофон выбирается системой вместе с маршрутом звука.</div>}
@@ -782,7 +838,9 @@ function SettingsModal() {
               <MicMeter />
               <div className="fld" style={{ marginTop: 10 }}><label>Режим передачи</label>
                 <div className="seg"><button className={s.mode === 'voice' ? 'active' : ''} onClick={() => upd({ mode: 'voice' }, () => E?.onModeChanged())}>Активация голосом</button><button className={s.mode === 'ptt' ? 'active' : ''} onClick={() => upd({ mode: 'ptt' }, () => E?.onModeChanged())}>Push-to-Talk</button></div>
-                {s.mode === 'ptt' ? <div className="ptt-hint">Удерживай <span className="kbd">{keyLabel(s.pttKey)}</span> · <button style={{ padding: '4px 10px', fontSize: 12 }} onClick={() => setBinding(true)}>{binding ? 'Нажми клавишу...' : 'Сменить'}</button></div> : null}
+                {s.mode === 'ptt' ? appleMobile
+                  ? <div className="ptt-hint">Удерживай кнопку микрофона, пока говоришь.</div>
+                  : <div className="ptt-hint">Удерживай <span className="kbd">{keyLabel(s.pttKey)}</span> · <button style={{ padding: '4px 10px', fontSize: 12 }} onClick={() => setBinding(true)}>{binding ? 'Нажми клавишу...' : 'Сменить'}</button></div> : null}
               </div>
             </div>
             <div className="grp"><div className="gt">Звук</div>
@@ -790,7 +848,13 @@ function SettingsModal() {
                 <select id="audio-output-device" value={selectedOutput} aria-describedby="audio-device-status" onChange={(e) => {
                   const id = e.target.value;
                   if (outputViaInput) {
-                    upd({ input: id, output: '' }, () => { void E?.reapplyMic('route').then(() => E.applyOutput()); });
+                    upd({ input: id, output: '' }, () => {
+                      if (!E) return;
+                      void E.reapplyMic('route').finally(() => {
+                        void E.applyOutput();
+                        E.restartLevelMeter();
+                      });
+                    });
                   } else upd({ output: id }, () => { void E?.applyOutput(); });
                 }}>
                   {outputMissing ? <option value={selectedOutput} disabled>Выбранное устройство отключено</option> : null}
@@ -799,8 +863,26 @@ function SettingsModal() {
                 </select>
               </div>
               <div id="audio-device-status" className="mm-hint audio-device-status" role="status" aria-live="polite">{deviceStatus}</div>
+              {!devicesLoading && (devicesPartial || devicesFailed) ? <button type="button" className="ghost" style={{ margin: '0 0 8px', alignSelf: 'flex-start' }} onClick={() => reloadDevicesRef.current(true)}>Повторить поиск устройств</button> : null}
               <div className="fld"><label>Общая громкость: {s.master}%</label><input type="range" min={0} max={100} value={s.master} onChange={(e) => upd({ master: +e.target.value }, () => E?.applyMaster())} /></div>
-              <div className="fld"><label>Громкость уведомлений: {s.notifyVolume}%</label><input type="range" min={0} max={100} value={s.notifyVolume} onChange={(e) => upd({ notifyVolume: +e.target.value })} onMouseUp={() => playSound('system')} /></div>
+              <div className="fld"><label>Громкость уведомлений: {s.notifyVolume}%</label><input type="range" min={0} max={100} value={s.notifyVolume}
+                onChange={(e) => upd({ notifyVolume: +e.target.value })}
+                onPointerDown={(e) => {
+                  if (!notifyPreviewPointer.current.begin(e.pointerId, e.isPrimary, e.button)) return;
+                  try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /** implicit capture may still apply */ }
+                }}
+                onPointerUp={(e) => { if (notifyPreviewPointer.current.end(e.pointerId)) playSound('system'); }}
+                onPointerCancel={(e) => { notifyPreviewPointer.current.end(e.pointerId); }}
+                onLostPointerCapture={(e) => { notifyPreviewPointer.current.end(e.pointerId); }}
+                onKeyDown={(e) => { if (isRangeAdjustmentKey(e.key)) notifyPreviewKeys.current.add(e.key); }}
+                onKeyUp={(e) => { if (notifyPreviewKeys.current.delete(e.key)) playSound('system'); }}
+                onBlur={() => {
+                  notifyPreviewPointer.current.cancel();
+                  if (notifyPreviewKeys.current.size > 0) {
+                    notifyPreviewKeys.current.clear();
+                    playSound('system');
+                  }
+                }} /></div>
             </div>
           </>}
 
@@ -810,19 +892,25 @@ function SettingsModal() {
               <div className="fld"><label style={{ color: 'var(--txt-dim)' }}>Системные уведомления не поддерживаются на этом устройстве</label></div>
             ) : <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               <label className="perm-op">
-                <input type="checkbox" checked={s.notif} onChange={async (e) => {
-                  if (e.target.checked) {
-                    localStorage.removeItem('notifOptOut'); // снова хотим уведомления
-                    const ok = await enableNotifications();
-                    if (!ok) useStore.getState().toast(notifPermission() === 'denied'
-                      ? 'Разрешение заблокировано — включите уведомления для приложения в настройках ОС/браузера'
-                      : 'Система не выдала разрешение на уведомления', 'err');
-                  } else {
-                    localStorage.setItem('notifOptOut', '1'); // явный опт-аут: не переспрашиваем при запуске
-                    setSettings({ notif: false });
-                    unsubscribePush(); // снимаем фоновую web-push подписку
+                <input type="checkbox" checked={s.notif} disabled={notificationBusy} onChange={async (e) => {
+                  const userId = useStore.getState().me?.id || '';
+                  setNotificationBusy(true);
+                  try {
+                    if (e.target.checked) {
+                      setNotificationOptOut(false); // снова хотим уведомления
+                      const result = await enableNotifications(userId);
+                      if (!result.enabled) useStore.getState().toast(result.error || (notifPermission() === 'denied'
+                        ? 'Разрешение заблокировано — включите уведомления для приложения в настройках ОС/браузера'
+                        : 'Система не выдала разрешение на уведомления'), 'err');
+                    } else {
+                      setNotificationOptOut(true); // явный опт-аут: не переспрашиваем при запуске
+                      const cleaned = await unsubscribePush(userId); // durable backend + proven local binding
+                      if (!cleaned) useStore.getState().toast('Уведомления выключены. Очистка подписки повторится после возврата сети.', 'warn');
+                    }
+                  } finally {
+                    setNotificationBusy(false);
+                    rerender();
                   }
-                  rerender();
                 }} />
                 <span><b>Системные уведомления</b><i>Упоминания — когда окно не в фокусе; трансляции и обновления — всегда{notifPermission() === 'denied' ? ' · доступ запрещён в системе' : ''}</i></span>
               </label>
@@ -841,7 +929,12 @@ function SettingsModal() {
               </div>
               {NOTIF_KINDS.map((o) => (
                 <label key={o.key} className="perm-op" style={{ opacity: s.notif ? 1 : .45, pointerEvents: s.notif ? 'auto' : 'none' }}>
-                  <input type="checkbox" disabled={!s.notif} checked={s[o.key]} onChange={(e) => { upd({ [o.key]: e.target.checked } as Partial<AudioSettings>); syncPushPrefs(); }} />
+                  <input type="checkbox" disabled={!s.notif} checked={s[o.key]} onChange={(e) => {
+                    upd({ [o.key]: e.target.checked } as Partial<AudioSettings>);
+                    void syncPushPrefs(useStore.getState().me?.id || '').catch(() => {
+                      useStore.getState().toast('Настройка сохранена на устройстве и отправится серверу после возврата сети.', 'warn');
+                    });
+                  }} />
                   <span><b>{o.title}</b><i>{o.desc}</i></span>
                 </label>
               ))}

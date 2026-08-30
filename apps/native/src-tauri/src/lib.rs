@@ -5,6 +5,7 @@ mod branding;
 pub mod diag;
 mod hotkeys;
 mod hwinfo;
+mod native_auth;
 
 use std::collections::HashMap;
 use tokio::sync::Mutex;
@@ -439,6 +440,7 @@ pub fn run() {
     })
     .manage(BroadcastState(Mutex::new(None)))
     .manage(WatchState(Mutex::new(HashMap::new())))
+    .manage(native_auth::NativeAuthState::new().expect("failed to initialize native auth broker"))
     .setup(|app| {
       // Раньше висело за cfg!(debug_assertions) — в релизном билде (то, что реально
       // ставят и тестируют) log::info!/warn!/error! по всему broadcast:: были
@@ -483,7 +485,7 @@ pub fn run() {
       std::thread::spawn(branding::fix_shortcuts);
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![ping, open_external_url, list_monitors, list_windows, detect_game, foreground_fullscreen, set_detectable_games, start_broadcast, set_broadcast_source, stop_broadcast, set_preview_interval, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys, open_file, reveal_in_folder, paths_exist, diag::diag_take_log, hwinfo::diag_hw])
+    .invoke_handler(tauri::generate_handler![ping, open_external_url, list_monitors, list_windows, detect_game, foreground_fullscreen, set_detectable_games, start_broadcast, set_broadcast_source, stop_broadcast, set_preview_interval, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys, open_file, reveal_in_folder, paths_exist, diag::diag_take_log, hwinfo::diag_hw, native_auth::native_auth_resume, native_auth::native_auth_refresh, native_auth::native_auth_login, native_auth::native_auth_register_verify, native_auth::native_auth_email_verify, native_auth::native_auth_password_change, native_auth::native_auth_begin_logout, native_auth::native_auth_drain_logout])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }

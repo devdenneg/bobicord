@@ -11,12 +11,24 @@ export function MicMeter() {
   const rerender = () => force((n) => n + 1);
   const s = getSettings();
 
+  // Колбэк уровня приходит 20-60 раз в секунду. Писать сюда `width` и `left` — значит
+  // заказывать пересчёт раскладки на каждом кадре, пока микрофон открыт; на машине, которая
+  // делит кадры с полноэкранной игрой, это заметная плата за декоративную шкалу.
+  // Заливка едет transform'ом (композитор, без раскладки), а порог переставляется только
+  // когда реально изменился — он двигается лишь при перетаскивании ползунка.
+  const lastThreshold = useRef(-1);
   useEffect(() => {
     const E = getEngine();
     if (!E) return;
     return E.onInputLevel((level, open, threshold) => {
-      if (fillRef.current) { fillRef.current.style.width = level * 100 + '%'; fillRef.current.classList.toggle('open', open); }
-      if (markerRef.current) markerRef.current.style.left = threshold * 100 + '%';
+      if (fillRef.current) {
+        fillRef.current.style.transform = 'scaleX(' + Math.max(0, Math.min(1, level)) + ')';
+        fillRef.current.classList.toggle('open', open);
+      }
+      if (markerRef.current && threshold !== lastThreshold.current) {
+        lastThreshold.current = threshold;
+        markerRef.current.style.left = threshold * 100 + '%';
+      }
     });
   }, []);
 

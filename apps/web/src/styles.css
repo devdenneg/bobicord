@@ -1,96 +1,128 @@
+  /* ═══════════════════════════════════════════════════════════════════════════
+     ТОКЕНЫ · канон категории, планка ремесла — Discord (см. PRODUCT.md).
+     У Discord взята расстановка и плотность, но НЕ палитра: --accent здесь азур,
+     а не блюрпл #5865f2. Цвет несёт только состояние: голос, эфир, непрочитанное,
+     выбор. Ничего не светится, кроме живого сигнала.
+     Тем две — тёмная (по умолчанию) и светлая; ЛЮБОЙ цвет обязан быть осмыслен
+     в обеих, поэтому захардкоженные значения вне этого блока — ошибка.
+     ═══════════════════════════════════════════════════════════════════════════ */
   :root{
-    --bg:#0b0c0f; --bg2:#111214; --panel:#1e1f22; --panel2:#2b2d31; --panel3:#383a40; --panel4:#404249;
-    --line:#101113; --line-2:#2a2c31;
-    --txt:#dbdee1; --txt-h:#f2f3f5; --muted:#949ba4;
-    --accent:#5865f2; --accent-h:#4752c4; --accent-txt:#8b93ff; --accent-fg:#fff; --focus:var(--accent-txt);
-    --green:#23a559; --green-2:#3ba55d; --red:#f23f43; --red-fill:#da373c; --yellow:#f0b232; --blue:#3b9dff;
-    /* live = ФИКС hue (не --accent): стрим не сливается с акцентом даже в crimson-теме. num = табличные цифры. */
-    --live:#ff5a6a; --live-glow:rgba(255,90,106,.22); --num:ui-monospace,'Cascadia Code','Segoe UI Mono',Consolas,monospace;
-    --r-lg:16px; --r-md:12px; --r-sm:8px; --r-xs:6px;
-    --tr:150ms cubic-bezier(0,0,.2,1);
-    --sh-1:0 1px 2px rgba(0,0,0,.4);
-    --sh-2:0 4px 14px -2px rgba(0,0,0,.5);
-    --sh-3:0 16px 48px -12px rgba(0,0,0,.7),0 4px 12px rgba(0,0,0,.4);
-    --hair:inset 0 1px 0 rgba(255,255,255,.05);
+    /* — поверхности: от самой глубокой к самой поднятой — */
+    --bg:#0d0f12;            /* окно и поле эфира */
+    --bg2:#131619;           /* рабочая область центра */
+    --panel:#191d21;         /* колонки: каналы, чат, участники */
+    --panel2:#212630;        /* вложенное: поля ввода, невыбранное */
+    --panel3:#2a313b;        /* наведение */
+    --panel4:#353d48;        /* нажатие и активное */
+    --line:#0a0c0e;          /* тонкая: тень-разделитель на границе поверхностей */
+    --line-2:#262d35;        /* средняя: границы блоков и колонок */
+    --line-3:#3c4552;        /* толстая: активная граница, фокус-кольцо в покое */
+
+    /* — текст: три уровня, не пять — */
+    --txt:#c5ccd4;           /* основной */
+    --txt-h:#f3f6f9;         /* выделенный: имена, заголовки, значения */
+    --muted:#7b8794;         /* служебный: подписи, время, счётчики */
+
+    /* — акцент: выбор и интерактивность. Не блюрпл. — */
+    --accent:#3d84f5;
+    --accent-h:#5798ff;
+    --accent-txt:#7fb2ff;    /* акцент на тёмном фоне: ссылки, ники */
+    --accent-fg:#04101f;     /* текст ПОВЕРХ акцента */
+    --focus:#7fb2ff;
+
+    /* — состояния. Единственные цвета, кроме акцента. — */
+    --green:#2ea55c;         /* в голосе */
+    --green-2:#38bd6b;
+    --red:#e5484d;           /* ошибка и разрыв */
+    --red-fill:#d13438;
+    --yellow:#e5a53d;        /* внимание, непрочитанное */
+    --blue:#3d84f5;
+    /* live = ФИКС hue, не --accent: стрим не сливается с выделением */
+    --live:#ff4757; --live-glow:rgba(255,71,87,.20);
+    --badge-fill:#c9282e;   /* заливка счётчиков: белым по --red выходило 3.91 */
+    --num:ui-monospace,'SF Mono','Cascadia Mono','Segoe UI Mono',Consolas,monospace;
+
+    /* — форма: ОДНА шкала радиусов на весь интерфейс — */
+    --r-lg:12px; --r-md:8px; --r-sm:6px; --r-xs:4px;
+
+    /* — движение: экспоненциальное затухание, без пружин — */
+    --tr:140ms cubic-bezier(.16,1,.3,1);
+    --tr-fast:90ms cubic-bezier(.16,1,.3,1);
+
+    /* — тени: только высота, без цвета — */
+    --sh-1:0 1px 2px rgba(0,0,0,.34);
+    --sh-2:0 4px 14px -3px rgba(0,0,0,.46);
+    --sh-3:0 18px 48px -14px rgba(0,0,0,.64),0 4px 12px rgba(0,0,0,.34);
+    --hair:inset 0 1px 0 rgba(255,255,255,.045);
+
+    /* Подложки, которые остаются тёмными в ОБЕИХ темах: всё, что лежит поверх видео,
+       и тултипы. Текст на них обязан браться отсюда, а не из --txt: иначе в светлой
+       теме получается тёмный текст на чёрном (замерено: 2.06 при норме 4.5). */
+    --scrim:rgba(6,8,11,.86);
+    --scrim-solid:#06080b;
+    --on-scrim:#f2f5f8;
+    --on-scrim-dim:#aab4bf;
+
+    /* Партнёры смешивания для производного слоя --workspace-*.
+       --sink: куда уходит «утопленная» поверхность. --lift: чем подсвечивается кромка.
+       --hi: куда тянется фокус. В светлой теме все три инвертируются. */
+    /* Полюс темы: куда смещать текст состояния, лежащий на подложке из своего же тона.
+       Без этого «LIVE» янтарём по янтарю даёт 3.1-4.4 при норме 4.5. */
+    --state-ink:var(--txt-h);
+    --sink:#05070c;
+    --lift:rgba(255,255,255,.08);
+    --lift-soft:rgba(255,255,255,.04);
+    --lift-faint:rgba(255,255,255,.02);
+    --hi:#fff;
   }
-  /* --- тёмные вариации палитры (см. theme.ts). Переопределяют только цвета, не радиусы/тени. --- */
-  :root[data-theme="midnight"]{
-    --bg:#0a0e17; --bg2:#0f141f; --panel:#161c2b; --panel2:#1f2637; --panel3:#2a3350; --panel4:#354064;
-    --line:#070a12; --line-2:#232c40;
-    --txt:#d5dbe6; --txt-h:#f0f4fa; --muted:#8794ad;
-    --accent:#3b82f6; --accent-h:#4b8df7; --accent-txt:#84b4ff; --accent-fg:#0a0e17; --blue:#60a5fa;
-  }
-  :root[data-theme="graphite"]{
-    --bg:#0c0d0f; --bg2:#141517; --panel:#191a1d; --panel2:#242529; --panel3:#313338; --panel4:#3c3e44;
-    --line:#0a0b0d; --line-2:#2b2d33;
-    --txt:#dcdde0; --txt-h:#f4f5f6; --muted:#9a9ca2;
-    --accent:#14b8a6; --accent-h:#0d9488; --accent-txt:#4fd6c6; --accent-fg:#071210;
-  }
-  :root[data-theme="plum"]{
-    --bg:#100a14; --bg2:#17101d; --panel:#201827; --panel2:#2b2035; --panel3:#392a46; --panel4:#453454;
-    --line:#0c0710; --line-2:#2f2339;
-    --txt:#e0d8e8; --txt-h:#f5f0fa; --muted:#a091ad;
-    --accent:#a855f7; --accent-h:#ad5df5; --accent-txt:#c891ff; --accent-fg:#160820;
-  }
-  :root[data-theme="forest"]{
-    --bg:#0a0f0c; --bg2:#0f150f; --panel:#161d18; --panel2:#1f2822; --panel3:#2b362d; --panel4:#354139;
-    --line:#070b08; --line-2:#263029;
-    --txt:#d6e0d8; --txt-h:#f0f5f1; --muted:#8ba090;
-    --accent:#22c55e; --accent-h:#16a34a; --accent-txt:#5ee08a; --accent-fg:#06120a;
-  }
-  :root[data-theme="crimson"]{
-    --bg:#120b0d; --bg2:#180f11; --panel:#1f1518; --panel2:#2a1d21; --panel3:#38272c; --panel4:#443036;
-    --line:#0d0709; --line-2:#301f24;
-    --txt:#e6dadd; --txt-h:#faf0f2; --muted:#ac9599;
-    --accent:#f43f5e; --accent-h:#f6516d; --accent-txt:#ff8095; --accent-fg:#1b070b;
-  }
-  :root[data-theme="oled"]{
-    --bg:#000; --bg2:#030405; --panel:#08090b; --panel2:#111317; --panel3:#191c21; --panel4:#22262d;
-    --line:#000; --line-2:#20242a;
-    --txt:#dce0e6; --txt-h:#fff; --muted:#9199a5;
-    --accent:#7657ff; --accent-h:#6547e8; --accent-txt:#9b87ff; --accent-fg:#fff;
-  }
-  :root[data-theme="catppuccin"]{
-    --bg:#11111b; --bg2:#181825; --panel:#1e1e2e; --panel2:#313244; --panel3:#45475a; --panel4:#585b70;
-    --line:#0d0d15; --line-2:#36384a;
-    --txt:#cdd6f4; --txt-h:#f5e0dc; --muted:#a6adc8;
-    --accent:#cba6f7; --accent-h:#b4befe; --accent-txt:#cba6f7; --accent-fg:#11111b;
-  }
-  :root[data-theme="tokyo-night"]{
-    --bg:#101014; --bg2:#14141b; --panel:#16161e; --panel2:#1a1b26; --panel3:#1e202e; --panel4:#292e42;
-    --line:#0b0b10; --line-2:#292e42;
-    --txt:#a9b1d6; --txt-h:#c0caf5; --muted:#9699a8;
-    --accent:#3d59a1; --accent-h:#506fca; --accent-txt:#7aa2f7; --accent-fg:#fff;
-  }
-  :root[data-theme="nord"]{
-    --bg:#2e3440; --bg2:#323946; --panel:#3b4252; --panel2:#434c5e; --panel3:#4c566a; --panel4:#556177;
-    --line:#282e39; --line-2:#505b70;
-    --txt:#d8dee9; --txt-h:#eceff4; --muted:#bac4d0;
-    --accent:#88c0d0; --accent-h:#81a1c1; --accent-txt:#9dd2df; --accent-fg:#2e3440;
-  }
-  :root[data-theme="rose-pine"]{
-    --bg:#191724; --bg2:#21202e; --panel:#1f1d2e; --panel2:#26233a; --panel3:#403d52; --panel4:#524f67;
-    --line:#12101b; --line-2:#39364a;
-    --txt:#e0def4; --txt-h:#f4f0ff; --muted:#a19db8;
-    --accent:#c4a7e7; --accent-h:#ebbcba; --accent-txt:#d0b7ee; --accent-fg:#191724;
-  }
-  :root[data-theme="dracula"]{
-    --bg:#191a21; --bg2:#21222c; --panel:#282a36; --panel2:#343746; --panel3:#424450; --panel4:#4c4f5d;
-    --line:#13141a; --line-2:#40434f;
-    --txt:#f8f8f2; --txt-h:#fff; --muted:#aab0cf;
-    --accent:#bd93f9; --accent-h:#ff79c6; --accent-txt:#caa7fa; --accent-fg:#191a21;
-  }
-  :root[data-theme="gruvbox"]{
-    --bg:#1d2021; --bg2:#282828; --panel:#32302f; --panel2:#3c3836; --panel3:#504945; --panel4:#665c54;
-    --line:#171818; --line-2:#504945;
-    --txt:#ebdbb2; --txt-h:#fbf1c7; --muted:#b4a58e;
-    --accent:#fabd2f; --accent-h:#d79921; --accent-txt:#ffd05c; --accent-fg:#1d2021;
-  }
-  :root[data-theme="solarized"]{
-    --bg:#002b36; --bg2:#00323d; --panel:#073642; --panel2:#0b404b; --panel3:#124b55; --panel4:#1a5660;
-    --line:#00232c; --line-2:#15505a;
-    --txt:#eee8d5; --txt-h:#fdf6e3; --muted:#a1b0ae;
-    --accent:#2aa198; --accent-h:#36b4aa; --accent-txt:#4fc1b8; --accent-fg:#002b36;
+
+  /* — Светлая тема. Роли те же, значения инвертированы по светлоте.
+       Насыщенность состояний ПОВЫШЕНА: на светлом фоне те же hue читаются слабее. — */
+  :root[data-theme="light"]{
+    --bg:#e9ebef;
+    --bg2:#eff1f4;
+    --panel:#f7f8fa;
+    --panel2:#eceef2;
+    --panel3:#e0e3e9;
+    --panel4:#d3d8e0;
+    --line:#dfe2e8;
+    --line-2:#d0d5dd;
+    --line-3:#a8b1bd;
+
+    --txt:#3a424c;
+    --txt-h:#0e1216;
+    --muted:#5b646f;        /* 5.65 на --panel; прежние #6b7480 давали 4.46 */
+
+    --accent:#1663d6;
+    --accent-h:#0f54ba;
+    --accent-txt:#1257bf;
+    --accent-fg:#ffffff;
+    --focus:#1663d6;
+
+    --green:#12693a;        /* 6.36 текстом на --panel, 6.76 белым поверх заливки */
+    --green-2:#0f5c32;
+    --red:#c62a2f;
+    --red-fill:#b3242a;
+    --yellow:#8a5f00;       /* 5.4 на --panel; прежние #9a6a00 давали 4.46 */
+    --blue:#1663d6;
+    --live:#d81e2c; --live-glow:rgba(216,30,44,.16);
+    --badge-fill:#c11f26;
+
+    --sh-1:0 1px 2px rgba(16,24,40,.08);
+    --sh-2:0 4px 14px -3px rgba(16,24,40,.14);
+    --sh-3:0 18px 48px -14px rgba(16,24,40,.22),0 4px 12px rgba(16,24,40,.10);
+    --hair:inset 0 1px 0 rgba(255,255,255,.7);
+    --scrim:rgba(6,8,11,.86);
+    --scrim-solid:#06080b;
+    --on-scrim:#f2f5f8;
+    --on-scrim-dim:#aab4bf;
+
+    --state-ink:#000;
+    --sink:#aab2be;
+    --lift:rgba(16,24,40,.14);
+    --lift-soft:rgba(16,24,40,.05);
+    --lift-faint:rgba(16,24,40,.025);
+    --hi:#000;
   }
   @media (prefers-reduced-motion: reduce){*{transition-duration:.01ms!important;animation:none!important}}
   /* На окно не смотрят (свёрнуто, скрыто или потеряло фокус — в том числе под полноэкранной игрой):
@@ -99,7 +131,53 @@
      те проценты GPU, которые приложение отбирало у игры, ничего при этом не показывая.
      Атрибут ставит windowIdle.ts. paused, а не none: анимация продолжится с той же фазы при возврате,
      без визуального скачка. Переходы не трогаем — они короткие и завершатся сами. */
-  :root[data-idle] *, :root[data-idle] *::before, :root[data-idle] *::after{animation-play-state:paused!important}
+  /* Глушим ТОЛЬКО бесконечные анимации: именно они заставляют композитор рисовать кадр
+     60 раз в секунду и пересчитывать backdrop-filter, ничего при этом не показывая.
+     Прежнее правило било по `*`, то есть и по входным анимациям тоже (popIn, msgIn,
+     toastIn): окно, открытое без фокуса — например на втором мониторе рядом с игрой —
+     замирало на середине проявления и висело полупрозрачным до возврата фокуса.
+     paused, а не none: фаза сохраняется, при возврате нет скачка.
+     Список ведётся вручную: CSS не умеет выбирать по animation-iteration-count. */
+  /* Глушим ТОЛЬКО бесконечные анимации: именно они заставляют композитор рисовать кадр
+     60 раз в секунду и заново считать backdrop-filter, ничего при этом не показывая.
+     paused, а не none: фаза сохраняется, при возврате нет скачка.
+
+     Раньше правило било по `*` — то есть и по КОНЕЧНЫМ входным анимациям (popIn, msgIn,
+     toastIn, workspacePaneIn). Окно, открытое без фокуса (второй монитор рядом с игрой,
+     запуск в фоне, alt-tab во время загрузки), замирало на середине проявления и висело
+     полупрозрачным, пока в него не вернут фокус. Проверяется скриншотом headless-браузера:
+     он никогда не в фокусе, поэтому воспроизводит этот случай всегда.
+
+     Список ведётся вручную: CSS не умеет выбирать по animation-iteration-count.
+     Добавил бесконечную анимацию — допиши сюда селектор. */
+  :root[data-idle] .av.live::after,
+  :root[data-idle] .conn-ind.q-excellent i:nth-child(3)::after,
+  :root[data-idle] .conn-ind.q-lost i,
+  :root[data-idle] .dl-card,
+  :root[data-idle] .dl-card .dl-ic,
+  :root[data-idle] .dl-card::before,
+  :root[data-idle] .dominant .live-dot,
+  :root[data-idle] .lc-av.live,
+  :root[data-idle] .live-card.stream,
+  :root[data-idle] .live-card.stream::after,
+  :root[data-idle] .live-card::before,
+  :root[data-idle] .live-pill .live-dot,
+  :root[data-idle] .pi.connecting .av,
+  :root[data-idle] .release-history-skeleton-card i,
+  :root[data-idle] .release-history-skeleton-card span,
+  :root[data-idle] .release-pulse,
+  :root[data-idle] .role-badge.marquee .rb-t,
+  :root[data-idle] .sk-av,
+  :root[data-idle] .sk-bubble,
+  :root[data-idle] .sk-line,
+  :root[data-idle] .spin,
+  :root[data-idle] .srv-card.has-cover .sc-cover::before,
+  :root[data-idle] .tdots i,
+  :root[data-idle] .update-bar .ub-ic .ic,
+  :root[data-idle] .vc-controls .cbtn.ptt-live,
+  :root[data-idle] .vd-btn.ptt-live,
+  :root[data-idle] .nh-card.stream::after,
+  :root[data-idle] .nh-badge.live .live-dot{animation-play-state:paused!important}
   /* Окно РЕАЛЬНО не видно (свёрнуто/скрыто) — в отличие от data-idle, где оно может стоять на втором
      мониторе. Снимаем с рендера самое тяжёлое: чат с анимированными 7TV-эмоутами (каждый такой WebP
      декодируется непрерывно, `animation-play-state` на изображения не действует) и списки участников.
@@ -117,6 +195,9 @@
   @keyframes pttPulse{50%{box-shadow:0 0 0 5px rgba(35,165,89,.28)}}
 
   *{box-sizing:border-box;scrollbar-width:thin;scrollbar-color:var(--panel3) transparent}
+  /* Атрибут hidden обязан побеждать раскладку: у любого элемента с display:flex/grid
+     он иначе не работает вовсе, и «скрытый» блок остаётся на экране. */
+  [hidden]{display:none!important}
   *::-webkit-scrollbar{width:8px;height:8px}*::-webkit-scrollbar-thumb{background:var(--panel3);border-radius:8px}*::-webkit-scrollbar-track{background:transparent}
   html,body{margin:0;height:100%;font-family:-apple-system,'Segoe UI',Roboto,Inter,sans-serif;background:var(--bg);color:var(--txt);overflow:hidden;font-size:15px;-webkit-font-smoothing:antialiased;user-select:none;-webkit-user-select:none}
   #root{height:100%}
@@ -133,7 +214,7 @@
   .spin{display:inline-block;width:15px;height:15px;border:2px solid #fff5;border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px;margin-right:7px}
 
   [data-tip]{position:relative}
-  [data-tip]::after{content:attr(data-tip);position:absolute;bottom:calc(100% + 9px);left:50%;transform:translateX(-50%) translateY(3px);background:#05070b;color:var(--txt);font-size:12.5px;font-weight:500;padding:6px 10px;border-radius:8px;border:1px solid var(--line-2);white-space:nowrap;pointer-events:none;opacity:0;transition:opacity 120ms ease,transform 120ms ease;z-index:90}
+  [data-tip]::after{content:attr(data-tip);position:absolute;bottom:calc(100% + 9px);left:50%;transform:translateX(-50%) translateY(3px);background:var(--scrim-solid);color:var(--on-scrim);font-size:12.5px;font-weight:500;padding:6px 10px;border-radius:8px;border:1px solid var(--line-2);white-space:nowrap;pointer-events:none;opacity:0;transition:opacity 120ms ease,transform 120ms ease;z-index:90}
   @media (hover:hover) and (pointer:fine){[data-tip]:hover::after{opacity:1;transform:translateX(-50%) translateY(0);transition-delay:300ms}}
   .tip-b[data-tip]::after{bottom:auto;top:calc(100% + 9px)}
   .tip-l[data-tip]::after{bottom:auto;left:auto;right:calc(100% + 9px);top:50%;transform:translateY(-50%) translateX(3px)}
@@ -262,6 +343,9 @@
   .railbtn{width:48px;height:48px;border-radius:24px;background:var(--panel2);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:17px;color:var(--txt);position:relative;flex:0 0 auto;transition:border-radius var(--tr),background var(--tr);padding:0}
   .railbtn:hover{border-radius:16px;background:var(--accent)}
   .railbtn.active{border-radius:16px}
+  /* Плитка с цветной заливкой (нет загруженной иконки) — инициал белый, как у .av.
+     С --txt он давал 1.02 в светлой теме и 1.68 в тёмной: буква сливалась с фоном. */
+  .railbtn.av-fill{color:#fff}
   .railbtn.active::before{content:'';position:absolute;left:-12px;top:50%;transform:translateY(-50%);width:4px;height:34px;background:#fff;border-radius:0 4px 4px 0}
   /* подключён к серверу, но сейчас не смотрим его (напр. на главной) — короткий акцентный пилл */
   .railbtn.connected{border-radius:16px}
@@ -288,7 +372,7 @@
   /* бейдж непрочитанных на иконке сервера в рейле */
   /* flex-центрирование, а НЕ line-height: при box-sizing:border-box + border 2px контент-высота 14px,
      а line-height:18px съезжал цифру. tabular-nums — чтобы 1/2/9 не гуляли по ширине. */
-  .railbtn .rail-badge{position:absolute;right:-3px;top:-3px;min-width:19px;height:19px;padding:0 5px;border-radius:10px;background:var(--red,#f23f43);color:#fff;font-size:11px;font-weight:800;display:flex;align-items:center;justify-content:center;font-variant-numeric:tabular-nums;border:2px solid var(--bg);box-shadow:0 1px 4px rgba(0,0,0,.4)}
+  .railbtn .rail-badge{position:absolute;right:-3px;top:-3px;min-width:19px;height:19px;padding:0 5px;border-radius:10px;background:var(--badge-fill);color:#fff;font-size:11px;font-weight:800;display:flex;align-items:center;justify-content:center;font-variant-numeric:tabular-nums;border:2px solid var(--bg);box-shadow:0 1px 4px rgba(0,0,0,.4)}
   .railbtn.unread:not(.active){border-radius:16px}
 
   /* ---------- HOME ---------- */
@@ -510,9 +594,9 @@
   #server.on{display:grid}
   .rz{position:absolute;top:0;bottom:0;width:11px;z-index:30;cursor:col-resize;touch-action:none}
   .rz::after{content:'';position:absolute;top:0;bottom:0;left:50%;transform:translateX(-50%);width:2px;background:transparent;transition:background .15s}
-  .rz::before{content:'';position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:5px;height:38px;border-radius:4px;background:var(--panel4);box-shadow:inset 0 0 0 1px var(--line-2),0 1px 3px rgba(0,0,0,.4);transition:background .15s,height .15s}
+  .rz::before{content:'';position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:5px;height:46px;border-radius:4px;background:var(--panel4);box-shadow:inset 0 0 0 1px var(--line-2),0 1px 3px rgba(0,0,0,.4);transform:scaleY(.826);transition:background .15s,transform .15s}
   .rz:hover::after,body.resizing .rz::after{background:var(--accent)}
-  .rz:hover::before,body.resizing .rz::before{background:var(--accent);height:46px}
+  .rz:hover::before,body.resizing .rz::before{background:var(--accent);transform:scaleY(1)}
   .rz-ch{left:var(--ch-w,290px);transform:translateX(-50%)}
   .rz-mem{right:var(--mem-w,244px);transform:translateX(50%)}
   body.resizing{cursor:col-resize;user-select:none}
@@ -580,7 +664,9 @@
   .vwrap.leaving{opacity:0;transform:scale(.96)}
   .vwrap video{width:100%;height:100%;object-fit:contain;background:#000;opacity:0;transition:opacity .22s ease-out}
   .vwrap video.ready{opacity:1}
-  .vwrap .lbl{position:absolute;left:56px;bottom:10px;background:#000d;padding:4px 10px;border-radius:8px;font-size:12.5px;font-weight:500;z-index:2;transition:opacity var(--tr)}
+  .vwrap .stream-play-unlock{position:absolute;z-index:10;left:50%;top:50%;transform:translate(-50%,-50%);display:flex;align-items:center;justify-content:center;gap:9px;max-width:calc(100% - 32px);min-height:46px;padding:10px 16px;border:1px solid #ffffff2b;border-radius:12px;background:var(--scrim);color:var(--on-scrim);box-shadow:var(--sh-3);font-size:13px;font-weight:700;text-align:left}
+  .vwrap .stream-play-unlock:hover{background:var(--scrim-solid)}
+  .vwrap .lbl{position:absolute;left:56px;bottom:10px;background:var(--scrim);color:var(--on-scrim);padding:4px 10px;border-radius:8px;font-size:12.5px;font-weight:500;z-index:2;transition:opacity var(--tr)}
   .vwrap:hover:not(.idle) .lbl,.vwrap:focus-within .lbl{opacity:0}
   /* hover control bar — центрированная плавающая пилюля (Discord-стиль), всплывает по наведению */
   .vbar{position:absolute;left:50%;bottom:14px;z-index:6;display:flex;align-items:center;gap:3px;padding:6px 8px;max-width:calc(100% - 24px);background:rgba(18,19,22,.72);backdrop-filter:blur(16px) saturate(1.4);-webkit-backdrop-filter:blur(16px) saturate(1.4);border:1px solid #ffffff20;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.5);opacity:0;transform:translate(-50%,10px) scale(.97);transform-origin:bottom center;transition:opacity .16s ease,transform .16s ease;pointer-events:none}
@@ -596,7 +682,7 @@
   .vbar .vb-btn:active{transform:scale(.92)}
   .vbar .vb-btn.active{background:var(--accent);color:#fff}
   .vbar .vb-btn.danger:hover{background:var(--red-fill)}
-  .vwrap .watchers{position:absolute;top:10px;left:10px;display:flex;align-items:center;background:#000d;padding:4px 11px 4px 8px;border-radius:9999px;font-size:12px;z-index:7;cursor:default}
+  .vwrap .watchers{position:absolute;top:10px;left:10px;display:flex;align-items:center;background:var(--scrim);color:var(--on-scrim);padding:4px 11px 4px 8px;border-radius:9999px;font-size:12px;z-index:7;cursor:default}
   .vwrap .watchers .wa{width:22px;height:22px;border-radius:50%;overflow:hidden;font-size:10.5px;font-weight:700;color:#fff;display:flex;align-items:center;justify-content:center;border:2px solid #050505;margin-right:-7px}
   .vwrap .watchers .wc{margin-left:12px;color:#fff;font-weight:600;display:flex;align-items:center;gap:4px}
   .vwrap .watchers .wc .ic{font-size:14px}
@@ -605,19 +691,19 @@
   .vwrap .watchers .wtip-h{font-size:10.5px;font-weight:700;letter-spacing:.3px;text-transform:uppercase;color:var(--muted);padding:2px 4px 6px}
   .vwrap .watchers .wtip-row{display:flex;align-items:center;gap:7px;padding:3px 4px;font-size:12.5px;color:var(--txt);white-space:nowrap}
   .vwrap .watchers .wtip-av{width:20px;height:20px;border-radius:50%;overflow:hidden;font-size:9.5px;font-weight:700;color:#fff;display:flex;align-items:center;justify-content:center;flex:0 0 auto}
-  .vwrap .spray{position:absolute;left:10px;bottom:10px;background:#000d;width:36px;height:36px;border-radius:9px;display:flex;align-items:center;justify-content:center;padding:0;z-index:8;color:#fff}
+  .vwrap .spray{position:absolute;left:10px;bottom:10px;background:var(--scrim);width:36px;height:36px;border-radius:9px;display:flex;align-items:center;justify-content:center;padding:0;z-index:8;color:var(--on-scrim)}
   .vwrap .spray:hover{background:var(--accent)}
   .emolayer{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:3}
   .floatEmo{position:absolute;bottom:6%;width:54px;height:54px;animation:floatUp 2.7s cubic-bezier(.2,.6,.3,1) forwards;will-change:transform,opacity}
   .floatEmo.em-sm{width:38px;height:38px}.floatEmo.em-md{width:54px;height:54px}.floatEmo.em-lg{width:82px;height:82px}
   .floatEmo img{width:100%;height:100%;object-fit:contain;filter:drop-shadow(0 2px 3px #000b)}
   @media (prefers-reduced-motion:reduce){.floatEmo{animation:none;opacity:.9}}
-  .floatEmo .ftag{position:absolute;top:100%;left:50%;transform:translateX(-50%);margin-top:3px;font-size:10.5px;font-weight:600;background:#000b;color:#fff;padding:1px 6px;border-radius:6px;white-space:nowrap}
+  .floatEmo .ftag{position:absolute;top:100%;left:50%;transform:translateX(-50%);margin-top:3px;font-size:10.5px;font-weight:600;background:var(--scrim);color:var(--on-scrim);padding:1px 6px;border-radius:6px;white-space:nowrap}
   .vwrap .statsbox{position:absolute;top:10px;right:10px;z-index:7;display:flex;align-items:center;gap:6px}
-  .vwrap .stats-toggle{background:#000d;width:30px;height:30px;flex:0 0 auto;border-radius:9px;display:flex;align-items:center;justify-content:center;padding:0;color:#fff;transition:background var(--tr)}
+  .vwrap .stats-toggle{background:var(--scrim);width:30px;height:30px;flex:0 0 auto;border-radius:9px;display:flex;align-items:center;justify-content:center;padding:0;color:var(--on-scrim);transition:background var(--tr)}
   .vwrap .stats-toggle:hover{background:var(--accent)}
-  .vwrap .stats{background:#05070bf0;color:#8fe3b0;font:11.5px/1.5 ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums;padding:7px 10px;border-radius:9px;border:1px solid var(--line-2);pointer-events:none;white-space:nowrap;text-align:right}
-  #stageMin{position:absolute;top:12px;left:50%;transform:translateX(-50%);z-index:7;background:#05070bf0;border:1px solid var(--line-2);border-radius:9px;font-size:12.5px;padding:7px 12px;display:flex;align-items:center;gap:6px;opacity:.5;transition:opacity var(--tr)}
+  .vwrap .stats{background:var(--scrim);color:#8fe3b0;font:11.5px/1.5 ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums;padding:7px 10px;border-radius:9px;border:1px solid var(--line-2);pointer-events:none;white-space:nowrap;text-align:right}
+  #stageMin{position:absolute;top:12px;left:50%;transform:translateX(-50%);z-index:7;background:var(--scrim);border:1px solid var(--line-2);border-radius:9px;font-size:12.5px;padding:7px 12px;display:flex;align-items:center;gap:6px;opacity:.5;transition:opacity var(--tr)}
   #stage:hover #stageMin,#stage:focus-within #stageMin{opacity:1}
   #mini{position:fixed;right:16px;bottom:16px;width:300px;z-index:25;display:none;flex-direction:column;gap:8px}
   #mini.show{display:flex}
@@ -725,7 +811,13 @@
   .msg.sys .msg-body{max-width:100%}
   .msg-main{display:flex;align-items:center;gap:6px;max-width:100%}
   .msg-content{display:flex;flex-direction:column;align-items:flex-start;gap:4px;min-width:0;max-width:100%}
-  .msg .who{font-size:13px;font-weight:600;color:var(--accent-txt);margin-bottom:3px}
+  /* Ник красится генерируемым (avColor) или ролевым цветом. Один и тот же hex не может
+     читаться и на тёмной панели, и на светлой: замер давал 1.47–1.74 при норме 4.5.
+     Компонент отдаёт только сам цвет через --nc, а нужную светлоту под тему доводит CSS. */
+  .msg .who{font-size:13px;font-weight:600;color:color-mix(in srgb,var(--nc,var(--accent-txt)) 55%,var(--txt-h));margin-bottom:3px}
+  :root[data-theme="light"] .msg .who{color:color-mix(in srgb,var(--nc,var(--accent-txt)) 72%,#000)}
+  .pi .nm[style*="--nc"]{color:color-mix(in srgb,var(--nc) 55%,var(--txt-h))}
+  :root[data-theme="light"] .pi .nm[style*="--nc"]{color:color-mix(in srgb,var(--nc) 72%,#000)}
   /* свои: слева как все (с аватаром), различие — «· ты» у ника + акцентный тинт пузыря */
   .msg.me .who::after{content:' · ты';color:var(--muted);font-weight:400;font-size:11px}
   .msg .who .mtime{margin-left:7px;font-size:11px;font-weight:400;color:var(--muted)}
@@ -880,10 +972,12 @@
   .tdots i:nth-child(2){animation-delay:.15s}
   .tdots i:nth-child(3){animation-delay:.3s}
   @keyframes tbounce{0%,60%,100%{transform:translateY(0);opacity:.45}30%{transform:translateY(-4px);opacity:1}}
-  .av{border-radius:50%;display:flex;align-items:center;justify-content:center;flex:0 0 auto;position:relative}
+  /* Инициал поверх avColor ВСЕГДА белый: палитра в util.ts подобрана именно под белый
+     текст (≥4.5). Раньше это правило цвет не задавало, и в чате инициал брал --txt. */
+  .av{border-radius:50%;display:flex;align-items:center;justify-content:center;flex:0 0 auto;position:relative;color:#fff;font-weight:700}
   .avimg{width:100%;height:100%;object-fit:cover;border-radius:inherit;display:block}
   #chatEmpty{color:var(--muted);font-size:13px;text-align:center;margin:auto;line-height:1.6;padding:20px}
-  #scrollbtn{position:absolute;right:18px;bottom:12px;width:42px;height:42px;padding:0;border-radius:50%;background:var(--panel3);color:var(--txt);display:flex;align-items:center;justify-content:center;box-shadow:var(--sh-2);z-index:5;transform-origin:center bottom;animation:sbIn .24s cubic-bezier(.34,1.56,.64,1)}
+  #scrollbtn{position:absolute;right:18px;bottom:12px;width:42px;height:42px;padding:0;border-radius:50%;background:var(--panel3);color:var(--txt);display:flex;align-items:center;justify-content:center;box-shadow:var(--sh-2);z-index:5;transform-origin:center bottom;animation:sbIn .24s cubic-bezier(.16,1,.3,1)}
   #scrollbtn:hover{background:var(--panel4);color:var(--txt-h);transform:translateY(-1px)}
   #scrollbtn:active{transform:translateY(0)}
   #scrollbtn .ic{font-size:24px}
@@ -926,7 +1020,8 @@
   .vchan.mine .vchan-nm{color:var(--txt-h)}
   .vchan-timer{flex:0 0 auto;font-size:11.5px;font-weight:700;color:var(--green);font-variant-numeric:tabular-nums;letter-spacing:.2px}
   .vchan-n{flex:0 0 auto;font-size:11px;font-weight:700;color:var(--muted);background:var(--panel3);border-radius:9999px;min-width:20px;text-align:center;padding:1px 6px;font-variant-numeric:tabular-nums}
-  .vchan.mine .vchan-n{background:color-mix(in srgb,var(--accent) 26%,transparent);color:var(--accent-txt)}
+  /* Счётчик в активном канале: акцент по подложке из акцента давал 4.29 в светлой теме. */
+  .vchan.mine .vchan-n{background:color-mix(in srgb,var(--accent) 26%,transparent);color:color-mix(in srgb,var(--accent-txt) 66%,var(--state-ink))}
   .vchan-actions{flex:0 0 auto;display:flex;gap:2px;margin-left:2px}
   .vchan-act{width:26px;height:26px;padding:0;display:flex;align-items:center;justify-content:center;border-radius:7px;background:transparent;color:var(--muted);opacity:0;transition:opacity .15s,background .15s,color .15s}
   .vchan-act .ic{font-size:15px}
@@ -979,9 +1074,10 @@
   .vd-txt b{display:block;font-size:12px;font-weight:700;color:var(--green);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.3}
   .vd-txt span{display:block;font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .vd-controls{display:flex;align-items:center;justify-content:center;gap:8px;flex-shrink:0}
-  .vd-btn{width:38px;height:38px;flex:0 0 auto;border-radius:10px;display:flex;align-items:center;justify-content:center;background:var(--panel3);color:var(--txt);padding:0;box-shadow:var(--sh-1),inset 0 0 0 1px rgba(255,255,255,.05);transition:background .16s,color .16s,transform .16s cubic-bezier(.34,1.4,.64,1),box-shadow .16s}
+  .vd-btn{width:38px;height:38px;flex:0 0 auto;border-radius:10px;display:flex;align-items:center;justify-content:center;background:var(--panel3);color:var(--txt);padding:0;box-shadow:var(--sh-1),inset 0 0 0 1px rgba(255,255,255,.05);transition:background .16s,color .16s,transform .16s cubic-bezier(.16,1,.3,1),box-shadow .16s}
   .vd-btn:hover{background:var(--panel4);color:var(--txt-h);transform:translateY(-1px)}
   .vd-btn:active{transform:translateY(0) scale(.93)}
+  .vd-btn.vd-ptt-hold{touch-action:none;-webkit-touch-callout:none}
   .vd-btn.danger-on{background:var(--red-fill);color:#fff;box-shadow:0 0 0 1px rgba(242,63,67,.5),0 0 12px rgba(242,63,67,.4)}
   .vd-btn.danger-on:hover{background:var(--red)}
   .vd-btn.ptt-idle{background:rgba(240,178,50,.18);color:var(--yellow);box-shadow:inset 0 0 0 1.5px var(--yellow)}
@@ -1069,8 +1165,8 @@
   .sw-srcempty{padding:7px 9px;font-size:12px;color:var(--muted)}
   .sw-thumb{display:block;width:100%;max-width:100%;border-radius:9px;background:#000;object-fit:contain;aspect-ratio:16/9}
   .vc-controls{display:flex;gap:8px;justify-content:center}
-  .vc-controls .cbtn{width:42px;height:42px;flex:0 0 auto;border-radius:50%;display:flex;align-items:center;justify-content:center;background:var(--panel3);color:var(--txt);padding:0;box-shadow:var(--sh-1),inset 0 0 0 1px rgba(255,255,255,.05),inset 0 1px 0 rgba(255,255,255,.07);transition:background .18s,color .18s,transform .18s cubic-bezier(.34,1.4,.64,1),box-shadow .18s}
-  .vc-controls .cbtn .ic{transition:transform .18s cubic-bezier(.34,1.4,.64,1)}
+  .vc-controls .cbtn{width:42px;height:42px;flex:0 0 auto;border-radius:50%;display:flex;align-items:center;justify-content:center;background:var(--panel3);color:var(--txt);padding:0;box-shadow:var(--sh-1),inset 0 0 0 1px rgba(255,255,255,.05),inset 0 1px 0 rgba(255,255,255,.07);transition:background .18s,color .18s,transform .18s cubic-bezier(.16,1,.3,1),box-shadow .18s}
+  .vc-controls .cbtn .ic{transition:transform .18s cubic-bezier(.16,1,.3,1)}
   /* z-index:5 — transform на :hover создаёт stacking-context, запирающий ::after-тултип; без подъёма
      тултип РАННЕЙ кнопки уходил ПОД следующие кнопки бара. Поднимаем ховернутую кнопку над соседями. */
   .vc-controls .cbtn:hover{background:var(--panel4);color:var(--txt-h);transform:translateY(-2px);z-index:5;box-shadow:var(--sh-2),inset 0 0 0 1px rgba(255,255,255,.08),inset 0 1px 0 rgba(255,255,255,.1)}
@@ -1193,8 +1289,13 @@
   .pi .vcg .gpad{font-size:15px;line-height:1}
   .pi .chev-pad{visibility:hidden}
   /* строка громкости — плавно раскрывается/уезжает */
-  .pi .exp{display:flex;align-items:center;gap:10px;max-height:0;overflow:hidden;opacity:0;padding:0 8px 0 8px;transition:max-height .22s ease,opacity .18s ease,padding .22s ease}
-  .pi.open .exp{max-height:56px;opacity:1;padding:4px 8px 12px 8px}
+  /* Раскрытие через grid-template-rows: 0fr→1fr вместо max-height. Прежний вариант держался
+     на магическом «56px»: содержимое выше этой цифры молча обрезалось, а анимировались сразу
+     три свойства раскладки. Здесь высота считается по факту содержимого. */
+  .pi .exp-wrap{display:grid;grid-template-rows:0fr;transition:grid-template-rows .22s cubic-bezier(.16,1,.3,1)}
+  .pi.open .exp-wrap{grid-template-rows:1fr}
+  .pi .exp{display:flex;align-items:center;gap:10px;min-height:0;overflow:hidden;opacity:0;padding:0 8px;transition:opacity .18s ease}
+  .pi.open .exp{opacity:1;padding:4px 8px 12px 8px}
   .pi .exp > svg.ic{color:var(--muted);flex:0 0 auto;font-size:18px}
   .pi .exp input[type=range]{flex:1;accent-color:var(--accent);height:5px;cursor:pointer;margin:0}
   .pi .exp .mut{flex:0 0 auto;width:28px;height:28px;padding:0;background:var(--panel3);border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--muted);transition:color var(--tr),background var(--tr)}
@@ -1209,10 +1310,10 @@
   .modal h2{margin:0 0 4px;font-size:19px;color:var(--txt-h);letter-spacing:-.01em;display:flex;align-items:center;gap:9px}
   .modal .msub{color:var(--muted);font-size:13.5px;margin:0 0 18px}
   .modal .grp{margin-top:16px;border-top:1px solid var(--line-2);padding-top:14px}
-  .modal .gt{display:flex;align-items:center;gap:9px;font-size:12.5px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--txt-h);margin-bottom:13px}
+  .modal .gt{display:flex;align-items:center;gap:9px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);margin-bottom:14px}
   .modal .gt .ic{font-size:15px;color:#fff;flex:0 0 auto;padding:5px;border-radius:8px;background:linear-gradient(140deg,var(--accent),color-mix(in srgb,var(--accent) 62%,#000));box-shadow:0 2px 7px -3px color-mix(in srgb,var(--accent) 75%,transparent)}
-  .modal .fld{margin-bottom:12px}
-  .modal .fld label{display:block;font-size:12.5px;font-weight:600;color:color-mix(in srgb,var(--muted) 42%,var(--txt-h));margin-bottom:7px;text-transform:uppercase;letter-spacing:.4px}
+  .modal .fld{margin-bottom:16px}
+  .modal .fld label{display:block;font-size:13px;font-weight:550;color:var(--txt);margin-bottom:6px;letter-spacing:-.005em}
   .modal .close{width:100%;margin-top:18px;background:var(--accent);color:#fff;padding:12px;font-weight:600}
   .modal .close:hover{background:var(--accent-h)}
   .modal .rowbtns{display:flex;gap:8px;margin-top:18px}
@@ -1222,7 +1323,9 @@
   .colorpick .cp.sel{border-color:#fff}
   .kbd{display:inline-block;background:var(--panel3);border:1px solid var(--line);border-bottom-width:2px;border-radius:6px;padding:1px 7px;font-size:12px;font-weight:600}
   .seg{display:flex;gap:4px;background:var(--panel2);padding:4px;border-radius:var(--r-sm)}
-  .seg button{flex:1;background:transparent;color:var(--muted);padding:8px;font-size:13.5px}.seg button.active{background:var(--accent);color:#fff}
+  /* --muted на подложке --panel2 даёт 4.14 при норме 4.5: приподнимаем к основному тексту. */
+  .seg button{flex:1;background:transparent;color:color-mix(in srgb,var(--muted) 58%,var(--txt));padding:8px;font-size:13.5px;font-weight:550}
+  .seg button.active{background:var(--panel4);color:var(--txt-h);box-shadow:var(--sh-1)}
   /* Выбор качества: много кнопок (Авто + 1440/1080/720 × 60/30) — не влезают в один ряд .seg.
      Свой грид с авто-переносом: колонка минимум 66px (лейбл «1440p60» не клипается), заполняет ширину. */
   .seg-quality{display:grid;grid-template-columns:repeat(auto-fit,minmax(66px,1fr))}
@@ -1240,7 +1343,7 @@
   .dbgstats b{color:var(--txt-h);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1 1 auto;text-align:right}
   .ptt-hint{font-size:12.5px;color:var(--muted);margin-top:6px}
   .micmeter{position:relative;height:26px;border-radius:8px;background:var(--panel2);border:1px solid var(--line);overflow:hidden;margin-top:2px}
-  .micmeter .mm-fill{position:absolute;inset:0;width:0%;background:var(--panel4);transition:width .06s linear,background-color .15s}
+  .micmeter .mm-fill{position:absolute;inset:0;width:100%;transform:scaleX(0);transform-origin:left center;will-change:transform;background:var(--panel4);transition:transform .06s linear,background-color .15s}
   .micmeter .mm-fill.open{background:var(--green-2)}
   .micmeter .mm-marker{position:absolute;top:0;bottom:0;left:10%;width:2px;background:var(--txt-h);box-shadow:0 0 0 1px rgba(0,0,0,.35);pointer-events:none;z-index:2}
   .micmeter input[type=range]{position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;cursor:pointer;z-index:3}
@@ -1278,27 +1381,39 @@
   .box-wide{max-width:560px}
 
   /* ── Настройки: двухпанельная раскладка (Discord-style): слева категории, справа широкая область ── */
-  .modal .box-settings{width:min(940px,96vw);max-width:none;height:min(660px,86vh);padding:0;overflow:hidden;display:flex}
+  .modal .box-settings{width:min(860px,96vw);max-width:none;height:min(660px,86vh);padding:0;overflow:hidden;display:flex}
   .settings{display:flex;width:100%;min-width:0;min-height:0}
   .settings-nav{flex:0 0 212px;background:var(--bg2);border-right:1px solid var(--line-2);padding:16px 10px 14px;display:flex;flex-direction:column;gap:2px;overflow-y:auto}
   .settings-nav::-webkit-scrollbar{display:none}
   .settings-nav-h{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);padding:4px 12px 10px}
   .settings-nav button{display:flex;align-items:center;gap:11px;width:100%;padding:9px 12px;border-radius:9px;background:transparent;color:var(--muted);font-size:14px;font-weight:600;text-align:left;transition:background .14s,color .14s}
   .settings-nav button:hover{background:var(--panel2);color:var(--txt-h)}
-  .settings-nav button.active{background:var(--accent);color:#fff;box-shadow:0 4px 12px -5px color-mix(in srgb,var(--accent) 80%,transparent)}
+  /* Сплошная заливка акцентом делала «где я» самым ярким пятном экрана — ярче
+     любого управляющего элемента. Подложка плюс цвет текста говорят то же самое. */
+  .settings-nav button.active{background:color-mix(in srgb,var(--accent) 15%,transparent);color:var(--accent-txt)}
+  .settings-nav button.active .ic{color:var(--accent-txt)}
   .settings-nav button .ic{font-size:20px;flex:0 0 auto}
   .settings-nav button:not(.active) .ic{color:var(--txt)}
   .settings-main{position:relative;flex:1;min-width:0;overflow-y:auto;padding:26px 32px 34px}
   /* без max-width: контент заполняет ширину панели → одинаковый отступ слева и справа (раньше был
      прижат влево кэпом 600px, справа зияло пустое место — выглядело как больший правый паддинг) */
+  /* Меру строки задаёт ширина самой модалки (см. .box-settings), а не ограничитель
+     внутри неё: ограничитель оставлял справа мёртвую полосу, из-за которой панель
+     выглядела сломанной. Поля заполняют панель целиком. */
   .settings-main-inner{width:100%}
-  .settings-main-inner>h2{margin:0 0 20px;font-size:21px}
-  .settings-main-inner>h2 .ic{font-size:24px}
+  .settings-main-inner .fld input,.settings-main-inner .fld select,
+  .settings-main-inner .fld textarea{max-width:100%}
+  /* Заголовок раздела повторяет выбранный пункт навигации слева. Оставляем его как
+     якорь прокрутки и для мобильной раскладки (там навигации рядом нет), но снимаем
+     иконку-дубль и приглушаем вес: дважды одно и то же не должно кричать дважды. */
+  .settings-main-inner>h2{margin:0 0 22px;font-size:19px;font-weight:700;letter-spacing:-.02em;color:var(--txt-h)}
+  .settings-main-inner>h2 .ic{display:none}
   .settings-main-inner .grp:first-of-type{border-top:none;margin-top:2px;padding-top:0}
   /* подзаголовки секций — без иконок-бейджей (по просьбе), чистый акцентный текст */
-  .settings-main .gt{font-size:13px;letter-spacing:.6px;margin-bottom:15px}
-  .settings-main .fld label{font-size:13px}
-  .settings-x{position:absolute;top:16px;right:18px;width:34px;height:34px;padding:0;display:flex;align-items:center;justify-content:center;border-radius:50%;background:var(--panel2);color:var(--muted);z-index:2}
+  .settings-main .gt{font-size:11px;letter-spacing:.1em;margin-bottom:16px}
+  .settings-main .fld label{font-size:13.5px}
+  .settings-x{position:absolute;top:16px;right:18px;width:32px;height:32px;padding:0;display:flex;align-items:center;justify-content:center;border-radius:var(--r-sm);background:transparent;color:var(--muted);z-index:2}
+  .settings-x:hover{background:var(--panel3);color:var(--txt-h)}
   .settings-x:hover{background:var(--panel3);color:var(--txt-h);transform:rotate(90deg)}
   .settings-x .ic{font-size:18px}
   @media (max-width:720px){
@@ -1655,7 +1770,7 @@
 .lb-me-xp{font-size:14px;font-weight:700;color:var(--txt-h)}
 .lb-me-next{font-size:11.5px;color:var(--muted)}
 .lb-bar{height:8px;border-radius:99px;background:var(--panel3);overflow:hidden}
-.lb-bar i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--accent),var(--yellow));transition:width .4s}
+.lb-bar i{display:block;height:100%;width:100%;transform-origin:left center;border-radius:99px;background:linear-gradient(90deg,var(--accent),var(--yellow));transition:transform .4s cubic-bezier(.16,1,.3,1)}
 .lb-me-ranks{display:flex;gap:7px;flex-wrap:wrap;margin-top:2px}
 .lb-chip{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--muted);background:var(--panel3);border-radius:99px;padding:3px 9px}
 .lb-chip .ic{font-size:14px}
@@ -1770,12 +1885,8 @@ body:has(#voicedock) .admin{padding-bottom:max(132px,calc(118px + env(safe-area-
     radial-gradient(34% 32% at 84% 78%,color-mix(in srgb,#9d68ff 20%,transparent),transparent 74%);
   transform:rotate(-6deg);
 }
-.home-hero::after{
-  content:'';position:absolute;z-index:-1;inset:0;pointer-events:none;opacity:.22;
-  background-image:linear-gradient(rgba(255,255,255,.04) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.04) 1px,transparent 1px);
-  background-size:48px 48px;
-  mask-image:linear-gradient(90deg,#000,transparent 68%);
-}
+/* Декоративная сетка в шапке снята: она ничего не означала и была ещё одним слоем,
+   который композитор пересчитывает вместе с остальной шапкой. */
 .home-hero.is-live{border-color:color-mix(in srgb,var(--live) 34%,var(--line-2))}
 .home-hero.is-live::before{background:radial-gradient(36% 30% at 18% 24%,color-mix(in srgb,var(--live) 24%,transparent),transparent 74%),radial-gradient(34% 32% at 84% 78%,color-mix(in srgb,var(--accent) 22%,transparent),transparent 74%)}
 .home-hero.is-voice{border-color:color-mix(in srgb,var(--green) 25%,var(--line-2))}
@@ -1786,7 +1897,7 @@ body:has(#voicedock) .admin{padding-bottom:max(132px,calc(118px + env(safe-area-
 .is-live .hero-signal{background:var(--live);box-shadow:0 0 0 5px var(--live-glow),0 0 18px var(--live)}
 .is-voice .hero-signal{background:var(--green);box-shadow:0 0 0 5px color-mix(in srgb,var(--green) 14%,transparent),0 0 18px color-mix(in srgb,var(--green) 55%,transparent)}
 .hero-copy h1{max-width:720px;margin:0;color:var(--txt-h);font-size:clamp(36px,5.2cqi,66px);font-weight:850;line-height:.98;letter-spacing:-.055em;text-wrap:balance}
-.hero-copy h1 em{font-style:normal;background:linear-gradient(95deg,#65d8ff 0%,var(--accent-txt) 44%,#e17cf4 100%);-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero-copy h1 em{font-style:normal;color:var(--accent-txt)}
 .hero-copy>p{max-width:600px;margin:20px 0 0;color:var(--muted);font-size:clamp(14px,1.5cqi,17px);line-height:1.6;text-wrap:pretty}
 .hero-actions{display:flex;align-items:stretch;gap:10px;flex-wrap:wrap;margin-top:28px}
 .hero-primary{min-width:min(100%,330px);min-height:66px;display:grid;grid-template-columns:42px minmax(0,1fr) 20px;align-items:center;gap:11px;padding:10px 14px 10px 10px;text-align:left;color:#fff;background:linear-gradient(135deg,var(--accent),color-mix(in srgb,var(--accent-h) 82%,#111));border:1px solid rgba(255,255,255,.12);border-radius:16px;box-shadow:0 14px 30px -16px color-mix(in srgb,var(--accent) 78%,transparent)}
@@ -1875,6 +1986,17 @@ body:has(#voicedock) .admin{padding-bottom:max(132px,calc(118px + env(safe-area-
 #server{grid-template-columns:var(--ch-w,290px) minmax(0,1fr) var(--mem-w,244px)}
 #main{min-width:0}
 #content.split.show-chat{grid-template-columns:minmax(300px,1fr) min(var(--chat-w,340px),clamp(240px,28vw,480px))}
+/* На телефоне две панели рядом не помещаются. Правило выше — верхнего уровня, поэтому
+   оно перебивало мобильный сброс из @media(max-width:900px) выше по файлу, а второй сброс
+   заперт в @media(min-width:641px) и до телефонов не доходит вовсе. Результат на 390px:
+   колонки minmax(300px,1fr) + 240px = 540px в контейнере 390px, видео обрезано до 300px,
+   чат наезжает на него. Ниже 900px панель всегда одна — как и задумано переключателем. */
+@media (max-width:900px){
+  #content.split.show-chat{grid-template-columns:minmax(0,1fr)}
+  #content.split.show-chat #stage{display:none!important}
+  #content.split.show-chat #chat{display:flex;grid-column:1}
+  #content.split #chat>:not(#scrollbtn):not(.mob-chat-toggle){min-width:0}
+}
 #content.split #chat>:not(#scrollbtn):not(.mob-chat-toggle){min-width:min(var(--chat-w,340px),clamp(240px,28vw,480px))}
 .rz-chat{right:min(var(--chat-w,340px),clamp(240px,28vw,480px))}
 #channels{container:channels / inline-size}
@@ -2119,17 +2241,17 @@ body:has(#voicedock) .admin{padding-bottom:max(132px,calc(118px + env(safe-area-
    Презентационный слой: realtime/chat/voice lifecycle остаётся неизменным.
    ═══════════════════════════════════════════════════════════════════════════ */
 :root{
-  --workspace-bg:color-mix(in srgb,var(--bg) 91%,#05070c);
+  --workspace-bg:color-mix(in srgb,var(--bg) 91%,var(--sink));
   --workspace-main:color-mix(in srgb,var(--bg2) 88%,var(--bg));
   --workspace-side:color-mix(in srgb,var(--panel) 88%,var(--bg2));
   --workspace-raised:color-mix(in srgb,var(--panel2) 78%,var(--panel));
   --workspace-hover:color-mix(in srgb,var(--panel3) 72%,transparent);
-  --workspace-stroke:color-mix(in srgb,var(--line-2) 76%,rgba(255,255,255,.08));
+  --workspace-stroke:color-mix(in srgb,var(--line-2) 76%,var(--lift));
   --workspace-stroke-hi:color-mix(in srgb,var(--accent) 38%,var(--workspace-stroke));
-  --workspace-focus:color-mix(in srgb,var(--accent-txt) 88%,#fff);
+  --workspace-focus:color-mix(in srgb,var(--accent-txt) 88%,var(--hi));
   --workspace-header:64px;
   --workspace-ease:180ms cubic-bezier(.2,.7,.3,1);
-  --workspace-shadow:0 18px 44px -30px rgba(0,0,0,.9);
+  --workspace-shadow:0 18px 44px -30px color-mix(in srgb,var(--sink) 92%,transparent);
 }
 
 button{
@@ -2186,7 +2308,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
   border-radius:15px;
   background:var(--workspace-raised);
   color:var(--muted);
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.035);
+  box-shadow:inset 0 1px 0 var(--lift-soft);
 }
 .railbtn:hover{
   border-radius:13px;
@@ -2224,7 +2346,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 #main{min-width:0;background:var(--workspace-main)}
 #channels,#members{
   background:
-    linear-gradient(180deg,rgba(255,255,255,.018),transparent 150px),
+    linear-gradient(180deg,var(--lift-faint),transparent 150px),
     var(--workspace-side);
 }
 #channels{border-right:1px solid var(--workspace-stroke)}
@@ -2396,7 +2518,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .vd-info{min-height:42px;padding:5px 6px;border-radius:11px}
 .vd-info:hover{background:var(--workspace-hover)}
 .vd-mark{width:32px;height:32px;border-radius:10px;background:color-mix(in srgb,var(--green) 14%,transparent)}
-.vd-btn{border:1px solid var(--workspace-stroke);background:var(--workspace-raised);box-shadow:inset 0 1px 0 rgba(255,255,255,.035)}
+.vd-btn{border:1px solid var(--workspace-stroke);background:var(--workspace-raised);box-shadow:inset 0 1px 0 var(--lift-soft)}
 .vd-btn:hover{border-color:var(--workspace-stroke-hi);background:var(--workspace-hover);transform:translateY(-1px)}
 .vd-grp{border:1px solid var(--workspace-stroke);background:var(--workspace-raised);box-shadow:none}
 .vd-grp .vd-btn{border:0}
@@ -2498,7 +2620,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
   background:color-mix(in srgb,var(--workspace-raised) 78%,transparent);
   color:var(--txt);
   line-height:1.48;
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.018);
+  box-shadow:inset 0 1px 0 var(--lift-faint);
 }
 .msg.me .tx{border-color:color-mix(in srgb,var(--accent) 24%,var(--workspace-stroke));background:color-mix(in srgb,var(--accent) 11%,var(--workspace-raised))}
 .msg.sys .tx{border:0;background:transparent;box-shadow:none}
@@ -2519,18 +2641,13 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
   background:
     linear-gradient(115deg,color-mix(in srgb,var(--accent) 12%,var(--workspace-raised)),color-mix(in srgb,var(--workspace-raised) 94%,transparent) 58%),
     var(--workspace-raised);
-  box-shadow:0 14px 36px -30px color-mix(in srgb,var(--accent) 90%,#000),inset 0 1px 0 rgba(255,255,255,.035);
+  box-shadow:0 14px 36px -30px color-mix(in srgb,var(--accent) 90%,#000),inset 0 1px 0 var(--lift-soft);
   color:var(--txt);
   animation:msgIn .18s ease-out;
 }
-.release-card::before{
-  content:'';
-  position:absolute;
-  z-index:-1;
-  inset:0 auto 0 0;
-  width:3px;
-  background:linear-gradient(180deg,var(--accent),color-mix(in srgb,var(--accent) 18%,transparent));
-}
+/* Боковая акцент-полоска убрана: это самый узнаваемый штамп сгенерированного интерфейса,
+   и она дублировала состояние, которое уже несёт рамка карточки. */
+.release-card{border-left-color:color-mix(in srgb,var(--accent) 34%,var(--line-2))}
 .release-card::after{
   content:'';
   position:absolute;
@@ -2705,7 +2822,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
   border-color:var(--workspace-stroke);
   border-radius:20px;
   background:color-mix(in srgb,var(--workspace-side) 96%,var(--bg));
-  box-shadow:0 28px 80px -28px rgba(0,0,0,.9),inset 0 1px 0 rgba(255,255,255,.035);
+  box-shadow:0 28px 80px -28px rgba(0,0,0,.9),inset 0 1px 0 var(--lift-soft);
 }
 .modal .box:focus{outline:none}
 .modal input,.modal select,.modal textarea{border-color:var(--workspace-stroke);background:color-mix(in srgb,var(--workspace-raised) 75%,transparent)}
@@ -3003,7 +3120,10 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .pi-activity b{flex:0 0 auto;font-size:9px;letter-spacing:.035em;text-transform:uppercase}
 .pi-activity-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pi-activity.is-live{border-color:color-mix(in srgb,var(--live) 38%,var(--workspace-stroke));background:color-mix(in srgb,var(--live) 10%,var(--workspace-raised))}
-.pi-activity.is-live b{color:var(--live)}
+/* «LIVE» набран мелко и жирно поверх подложки из того же тона: в светлой теме это
+   давало 4.25 при норме 4.5. Берём тон на шаг темнее самой заливки. */
+.pi-activity.is-live b{color:color-mix(in srgb,var(--live) 82%,var(--txt-h))}
+:root[data-theme="light"] .pi-activity.is-live b{color:color-mix(in srgb,var(--live) 86%,#000)}
 .pi-activity.is-game b{color:var(--accent-txt)}
 .pi-l2 .mrow-roles{min-width:54px}
 #members .pi .head{min-height:54px}
@@ -3055,7 +3175,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
   border-color:var(--workspace-stroke);
   border-radius:18px;
   background:color-mix(in srgb,var(--workspace-side) 97%,var(--bg));
-  box-shadow:0 28px 70px -24px rgba(0,0,0,.92),inset 0 1px 0 rgba(255,255,255,.035);
+  box-shadow:0 28px 70px -24px rgba(0,0,0,.92),inset 0 1px 0 var(--lift-soft);
 }
 .pcard-cover{height:76px;margin:0 -16px;border-radius:17px 17px 12px 12px;background:radial-gradient(circle at 18% 10%,color-mix(in srgb,var(--accent-txt) 32%,transparent),transparent 55%),linear-gradient(130deg,color-mix(in srgb,var(--accent) 34%,var(--workspace-raised)),var(--workspace-bg))}
 .pcard.is-live .pcard-cover{background:radial-gradient(circle at 18% 10%,color-mix(in srgb,var(--live) 34%,transparent),transparent 55%),linear-gradient(130deg,color-mix(in srgb,var(--live) 22%,var(--workspace-raised)),var(--workspace-bg))}
@@ -3139,7 +3259,11 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .primary,.tabs2 button.active,.dl-card .dl-ic,.dl-btn,.hd-create,.cta,
 .cu-chip b,.chip.on,.dominant.unread,#content.split .mob-chat-toggle,
 .vbar .vb-btn.active,.update-bar .ub-ic,.update-bar .ub-btn,#scrollbtn .sb-badge,.chat-in #sendBtn,
-.pi .watchbtn:not(.on):hover,.modal .close,.seg button.active,.invite-box button,.settings-nav button.active,
+/* .seg button.active и .settings-nav button.active отсюда убраны: под ними больше нет
+   сплошной заливки акцентом, а --accent-fg (белый в светлой теме) поверх 15%-подложки
+   давал 1.05 контраста — надпись «где я» становилась нечитаемой. Свой цвет они задают
+   там же, где задают свой фон. */
+.pi .watchbtn:not(.on):hover,.modal .close,.invite-box button,
 .pm-av-edit,.sm-act.accent,#epick .epick-size button.active,.admin-tabs button.on{color:var(--accent-fg,#fff)}
 .theme-grid{grid-template-columns:repeat(auto-fit,minmax(205px,1fr));gap:9px}
 .theme-op{min-width:0;min-height:62px;gap:11px;padding:9px 10px;border-color:var(--workspace-stroke);border-radius:11px;background:color-mix(in srgb,var(--workspace-raised) 74%,transparent)}
@@ -3179,7 +3303,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .pi.open .exp-wrap{visibility:visible;opacity:1;pointer-events:auto;transform:none;transition-delay:0s}
 .pi.popover-up .exp-wrap{top:auto;bottom:calc(100% - 1px);transform:translateY(5px) scale(.985);transform-origin:bottom center}
 .pi.popover-up.open .exp-wrap{transform:none}
-.pi .exp-surface{margin:3px 1px 0;background:color-mix(in srgb,var(--workspace-side) 97%,var(--bg));box-shadow:0 18px 34px -15px rgba(0,0,0,.92),inset 0 1px 0 rgba(255,255,255,.035)}
+.pi .exp-surface{margin:3px 1px 0;background:color-mix(in srgb,var(--workspace-side) 97%,var(--bg));box-shadow:0 18px 34px -15px rgba(0,0,0,.92),inset 0 1px 0 var(--lift-soft)}
 @media (prefers-reduced-motion:reduce){.pi .exp-wrap{transition:none}}
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -3229,7 +3353,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
   padding:8px 13px;
   border:1px solid var(--workspace-stroke);
   border-radius:10px;
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.035);
+  box-shadow:inset 0 1px 0 var(--lift-soft);
 }
 .hd-create{border-color:color-mix(in srgb,var(--accent) 36%,var(--workspace-stroke));background:color-mix(in srgb,var(--accent) 11%,var(--workspace-raised));color:var(--accent-txt)}
 .hd-create:hover{border-color:color-mix(in srgb,var(--accent) 54%,var(--workspace-stroke));background:color-mix(in srgb,var(--accent) 17%,var(--workspace-raised));color:var(--txt-h)}
@@ -3564,7 +3688,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .pm-tabs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));flex:0 0 auto;gap:6px;padding:8px 18px;border-top:1px solid var(--workspace-stroke);border-bottom:1px solid var(--workspace-stroke);background:color-mix(in srgb,var(--workspace-side) 88%,var(--workspace-raised))}
 .pm-tabs button{display:flex;align-items:center;justify-content:center;gap:8px;min-height:40px;padding:8px 12px;border:1px solid transparent;border-radius:10px;background:transparent;color:var(--muted);font-size:13px;font-weight:700}
 .pm-tabs button:hover{background:var(--workspace-hover);color:var(--txt-h)}
-.pm-tabs button.active{border-color:color-mix(in srgb,var(--accent-txt) 32%,var(--workspace-stroke));background:color-mix(in srgb,var(--accent) 16%,var(--workspace-side));color:var(--accent-txt);box-shadow:inset 0 1px rgba(255,255,255,.035)}
+.pm-tabs button.active{border-color:color-mix(in srgb,var(--accent-txt) 32%,var(--workspace-stroke));background:color-mix(in srgb,var(--accent) 16%,var(--workspace-side));color:var(--accent-txt);box-shadow:inset 0 1px var(--lift-soft)}
 .pm-tabs button:disabled{cursor:wait;opacity:.65}
 .pm-tabs button:disabled:hover{background:transparent;color:var(--muted)}
 .pm-tabs button.active:disabled:hover{background:color-mix(in srgb,var(--accent) 16%,var(--workspace-side));color:var(--accent-txt)}
@@ -3690,7 +3814,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
   border-color:color-mix(in srgb,var(--accent) 58%,var(--workspace-stroke));
   box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 10%,transparent),inset 0 1px 0 rgba(255,255,255,.05);
 }
-.rail-updates .rail-release-badge{background:var(--red,#f23f43);border-color:var(--workspace-bg)}
+.rail-updates .rail-release-badge{background:var(--badge-fill);border-color:var(--workspace-bg)}
 .modal .box.release-history-modal{
   position:relative;
   display:flex;
@@ -3753,3 +3877,50 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
   .release-history-skeleton{padding:17px 48px 22px}
 }
 @media (prefers-reduced-motion:reduce){.release-history-skeleton-card span,.release-history-skeleton-card i{animation:none}}
+
+/* Safari on iPhone/iPad only grants dependable background Web Push to a Home Screen web app. */
+.ios-pwa-install{
+  position:fixed;
+  z-index:1210;
+  left:max(12px,env(safe-area-inset-left));
+  right:max(12px,env(safe-area-inset-right));
+  bottom:max(12px,env(safe-area-inset-bottom));
+  display:flex;
+  align-items:flex-start;
+  gap:12px;
+  max-width:520px;
+  margin:0 auto;
+  padding:14px 14px 14px 16px;
+  border:1px solid color-mix(in srgb,var(--accent-txt) 28%,var(--workspace-stroke));
+  border-radius:15px;
+  background:color-mix(in srgb,var(--workspace-raised) 96%,var(--accent) 4%);
+  box-shadow:0 18px 48px -22px #000;
+  color:var(--txt);
+}
+.ios-pwa-install>div{min-width:0;flex:1}
+.ios-pwa-install b{display:block;color:var(--txt-h);font-size:14px;line-height:1.35}
+.ios-pwa-install p{margin:5px 0 0;color:var(--muted);font-size:12.5px;line-height:1.45}
+.ios-pwa-install p span{color:var(--accent-txt);font-weight:800;white-space:nowrap}
+.ios-pwa-install button{flex:0 0 auto;min-height:36px;margin:0;padding:7px 11px;border-radius:10px;font-size:12px}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ЧИТАЕМОСТЬ ТЕКСТА СОСТОЯНИЯ
+   Замер (scratchpad/harness/contrast.js) показал системную ошибку: везде, где текст
+   набран тем же тоном, что и его подложка, контраст садится на 3.1-4.4 при норме 4.5.
+   Это не отдельные промахи, а одно и то же решение, повторённое в десяти местах.
+   Лечим смещением текста к полюсу темы (--state-ink), сохраняя сам тон узнаваемым.
+   ═══════════════════════════════════════════════════════════════════════════ */
+.mention-tag{color:color-mix(in srgb,var(--accent-txt) 74%,var(--state-ink))}
+.pi-activity{color:color-mix(in srgb,var(--muted) 52%,var(--txt))}
+.pi-activity-name,.pi-activity-icon{color:inherit}
+.vchan-n,.members-title b,.m-sec span{color:color-mix(in srgb,var(--muted) 40%,var(--txt))}
+.nh-online.live{color:color-mix(in srgb,var(--green) 72%,var(--state-ink))}
+.nh-pill.live,.nh-badge.live{color:color-mix(in srgb,var(--live) 74%,var(--state-ink))}
+.nh-pill.voice,.nh-badge.voice{color:color-mix(in srgb,var(--green) 72%,var(--state-ink))}
+.nh-badge.unread{color:color-mix(in srgb,var(--accent-txt) 74%,var(--state-ink))}
+.nh-sec-h .eye{color:color-mix(in srgb,var(--muted) 62%,var(--txt))}
+
+/* Ник красится генерируемым цветом (avColor) или цветом роли. Прежний сдвиг был слишком
+   мягким для светлой темы: замер давал 2.92-3.40. */
+:root[data-theme="light"] .msg .who{color:color-mix(in srgb,var(--nc,var(--accent-txt)) 52%,#000)}
+:root[data-theme="light"] .pi .nm[style*="--nc"]{color:color-mix(in srgb,var(--nc) 52%,#000)}

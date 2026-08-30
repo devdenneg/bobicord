@@ -5,17 +5,32 @@
   <meta name="referrer" content="no-referrer" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
   <title>Рилэй</title>
-  <meta name="theme-color" content="#0b0c0f" />
+  <meta name="theme-color" content="#0d0f12" />
   <link rel="manifest" href="/manifest.json" />
   <link rel="icon" href="/icon-256.png" type="image/png" sizes="256x256" />
   <link rel="icon" href="/icon-128.png" type="image/png" sizes="128x128" />
   <link rel="apple-touch-icon" href="/icon-512.png" />
   <style>
-    html,body{margin:0;height:100%;background:#0b0c0f}
-    /* boot = просто тёмный экран (без логотипа), чтобы не мелькала маленькая версия
-       до маунта React — сразу за ним появляется анимированный LogoLoader того же размера */
-    #boot{position:fixed;inset:0;background:#0b0c0f;z-index:9999}
+    /* Экран загрузки обязан знать тему ДО маунта React, иначе выбравший светлую
+       получает тёмную вспышку на каждом открытии. Значения дублируют --bg из
+       styles.css: на этом этапе таблица стилей ещё не загружена. */
+    html,body{margin:0;height:100%;background:#0d0f12}
+    html[data-theme="light"],html[data-theme="light"] body{background:#e9ebef}
+    /* boot = просто заливка (без логотипа), чтобы не мелькала маленькая версия
+       до маунта React — сразу за ним появляется LogoLoader того же размера */
+    #boot{position:fixed;inset:0;background:#0d0f12;z-index:9999}
+    html[data-theme="light"] #boot{background:#e9ebef}
   </style>
+  <script>
+    // до первой отрисовки: тема из localStorage + theme-color под цвет окна
+    try {
+      var t = localStorage.getItem('theme');
+      if (t !== 'light' && t !== 'dark') t = 'dark';
+      document.documentElement.setAttribute('data-theme', t);
+      var m = document.querySelector('meta[name=theme-color]');
+      if (m) m.setAttribute('content', t === 'light' ? '#e9ebef' : '#0d0f12');
+    } catch (e) { document.documentElement.setAttribute('data-theme', 'dark'); }
+  </script>
 </head>
 <body>
   <div id="root">

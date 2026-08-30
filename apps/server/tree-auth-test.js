@@ -24,6 +24,21 @@ function open(url, token) {
   });
 }
 
+function waitForMessage(ws, predicate, timeoutMs = 1000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { cleanup(); reject(new Error('tree message timeout')); }, timeoutMs);
+    const onMessage = (raw) => {
+      let message;
+      try { message = JSON.parse(raw.toString()); } catch { return; }
+      if (!predicate(message)) return;
+      cleanup();
+      resolve(message);
+    };
+    const cleanup = () => { clearTimeout(timer); ws.off('message', onMessage); };
+    ws.on('message', onMessage);
+  });
+}
+
 function closeTree(ctx) {
   for (const peer of ctx.tree.peers.values()) { try { peer.ws.terminate(); } catch { /**/ } }
   for (const t of [ctx.tree.abrTimer, ctx.tree.hbTimer, ctx.tree.drainTimer, ctx.tree.renditionTimer]) if (t) clearInterval(t);
@@ -43,6 +58,18 @@ test('tree rejects unknown server membership and mismatched identity', async () 
     const identityClose = new Promise((resolve) => badIdentity.ws.once('close', resolve));
     badIdentity.ws.send(JSON.stringify({ t: 'join', serverId: 'srv-a', streamId: 'alice', role: 'viewer', identity: 'bob' }));
     assert.equal(await identityClose, 4003);
+  } finally {
+    await closeTree(ctx);
+  }
+});
+
+test('discovery hello receives an application liveness acknowledgement', async () => {
+  const ctx = await startTree();
+  try {
+    const discovery = await open(ctx.url, 'u1');
+    const acknowledged = waitForMessage(discovery.ws, (message) => message.t === 'hello-ack');
+    discovery.ws.send(JSON.stringify({ t: 'hello', serverId: 'srv-a' }));
+    assert.deepEqual(await acknowledged, { t: 'hello-ack', serverId: 'srv-a' });
   } finally {
     await closeTree(ctx);
   }

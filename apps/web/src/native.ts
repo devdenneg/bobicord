@@ -1,6 +1,7 @@
 // IPC bridge to Tauri native shell (apps/native). No-op in browser.
 import { getToken } from './api';
 import { normalizeExternalHttpUrl } from './linkify';
+import { BoundedKeyedOperations } from './boundedAsync';
 
 export const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
@@ -193,6 +194,35 @@ export async function stopNativeBroadcast(): Promise<void> {
   await invoke('stop_broadcast');
 }
 
+// Logout/stale-start cleanup must not hang page teardown, and repeated owners must not stack native
+// stop invokes behind the same stuck Rust command. Capacity is released only when the physical IPC
+// really settles; logical callers are released after the deadline.
+let nativeBroadcastStopFlight: { actual: Promise<void>; bounded: Promise<void> } | null = null;
+export function stopNativeBroadcastBounded(timeoutMs = 2_000): Promise<void> {
+  if (!isTauri) return Promise.resolve();
+  if (nativeBroadcastStopFlight) return nativeBroadcastStopFlight.bounded;
+  const actual = Promise.resolve().then(stopNativeBroadcast);
+  let timer: ReturnType<typeof globalThis.setTimeout> | null = null;
+  let settled = false;
+  const bounded = new Promise<void>((resolve) => {
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) globalThis.clearTimeout(timer);
+      resolve();
+    };
+    timer = globalThis.setTimeout(finish, timeoutMs);
+    actual.then(finish, finish);
+  });
+  const flight = { actual, bounded };
+  nativeBroadcastStopFlight = flight;
+  void actual.then(
+    () => { if (nativeBroadcastStopFlight === flight) nativeBroadcastStopFlight = null; },
+    () => { if (nativeBroadcastStopFlight === flight) nativeBroadcastStopFlight = null; },
+  );
+  return bounded;
+}
+
 /* ---------- Э8: нативный relay-viewer (Rust держит видео, webview рендерит через IPC) ---------- */
 
 /** Стартует нативный relay-watch: Rust джойнится в дерево (viewer, native), ретранслирует
@@ -309,8 +339,12 @@ export async function revealInFolder(path: string): Promise<void> {
 }
 
 /** Батч-проверка наличия файлов на диске (по индексам, как paths). [] в браузере. */
+const pathExistChecks = new BoundedKeyedOperations<boolean[]>({ timeoutMs: 4_000, maxInFlight: 3 });
 export async function pathsExist(paths: string[]): Promise<boolean[]> {
   if (!isTauri || !paths.length) return [];
-  const { invoke } = await import('@tauri-apps/api/core');
-  return invoke<boolean[]>('paths_exist', { paths });
+  const key = JSON.stringify(paths);
+  return pathExistChecks.run(key, async () => {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke<boolean[]>('paths_exist', { paths });
+  });
 }

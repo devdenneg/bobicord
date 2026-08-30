@@ -2,8 +2,9 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
 import { App } from './App';
-import { PASSWORD_RESET_STORAGE_KEY, useStore } from './store';
-import { api, getToken, isApiError, setToken } from './api';
+import { PASSWORD_RESET_STORAGE_KEY, rememberPendingInvite, rememberPendingOpenServer, useStore } from './store';
+import { api, getToken, hasSessionCandidate, isApiError } from './api';
+import { subscribeAccessTokenChanges } from './authSession';
 import { loadGlobalEmotes } from './emotes';
 import { isTauri, pingNative } from './native';
 import { watchForUpdates } from './version';
@@ -13,14 +14,23 @@ import { startWindowIdleWatch } from './windowIdle';
 import {
   NOTIFICATION_DESTINATION_EVENT,
   TAURI_NOTIFICATION_DESTINATION_EVENT,
+  forgetNotificationDestination,
   normalizeNotificationDestination,
   queueNotificationDestination,
   resolveNotificationDestination,
   type NotificationDestination,
 } from './notificationDestination';
+import { closeShownPushNotifications } from './notificationBanners';
 
 applyStoredTheme(); // применить сохранённую тему до первого рендера
 loadGlobalEmotes();
+
+// localStorage is shared by tabs but persistent access tokens are intentionally memory-only.
+// When another tab begins explicit logout, reload this stale UI into the fenced boot path instead
+// of leaving a server/chat screen visible with an already removed credential.
+subscribeAccessTokenChanges((change) => {
+  if (change.reason === 'remote-logout' || change.reason === 'terminal-revocation') location.reload();
+});
 
 function openQueuedNotificationDestination(destination: NotificationDestination): void {
   const state = useStore.getState();
@@ -29,7 +39,7 @@ function openQueuedNotificationDestination(destination: NotificationDestination)
   } else {
     // acceptSession consumes this legacy key after authentication; the exact message remains in
     // notificationDestination storage until the matching ServerView is ready.
-    try { sessionStorage.setItem('pendingOpenServer', destination.serverId); } catch { /**/ }
+    rememberPendingOpenServer(destination.serverId);
   }
 }
 
@@ -43,21 +53,35 @@ function receiveNotificationDestination(value: unknown): void {
   const tag = typeof raw.tag === 'string' ? raw.tag : '';
   const destination = resolveNotificationDestination(tag, value);
   if (destination) queueNotificationDestination(destination);
+  if (tag) forgetNotificationDestination(tag);
 }
 
-// SW для установки PWA. НЕ кэширует (кэш ранее ронял прод); старые кэши чистятся внутри sw.js.
+// Shell PWA версионирован прямо внутри собранного worker; cache bypass дополнительно
+// не даёт iOS/Chrome смешать index и хешированные файлы разных релизов.
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js').catch(() => {});
+  navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' }).catch(() => {});
   // клик по push → SW передаёт точное назначение; legacy open-server тоже поддерживается.
   navigator.serviceWorker.addEventListener('message', (e) => {
     const d = (e.data || {}) as { type?: string; serverId?: string; messageId?: number; tag?: string };
-    if ((d.type === 'open-destination' || d.type === 'open-server') && d.serverId) receiveNotificationDestination(d);
+    let destinationAccepted = false;
+    if ((d.type === 'open-destination' || d.type === 'open-server') && d.serverId) {
+      receiveNotificationDestination(d);
+      destinationAccepted = true;
+    } else if (d.type === 'forget-notification-destination' && d.tag) {
+      forgetNotificationDestination(d.tag, false);
+    }
+    if (destinationAccepted) {
+      try { e.ports?.[0]?.postMessage({ ok: true }); } catch { /** worker falls back to navigation */ }
+    }
   });
-  // вернулись в фокус → чистим показанные push-баннеры (юзер уже в приложении, непрочитанное видно в чате)
-  document.addEventListener('visibilitychange', () => {
+  // Видимый boot тоже обязан убрать баннеры прошлого аккаунта/предыдущего запуска; ждать первого
+  // visibilitychange нельзя, потому что на уже открытой странице его может никогда не быть.
+  const closeVisiblePushBanners = () => {
     if (document.visibilityState !== 'visible') return;
-    navigator.serviceWorker.ready.then((reg) => reg.getNotifications().then((ns) => ns.forEach((n) => n.close()))).catch(() => {});
-  });
+    void closeShownPushNotifications();
+  };
+  document.addEventListener('visibilitychange', closeVisiblePushBanners);
+  closeVisiblePushBanners();
 }
 if (isTauri) {
   void import('@tauri-apps/api/event').then(({ listen }) => (
@@ -102,6 +126,9 @@ function cleanEntryUrl(removeHash = false) {
 
 // boot: resume session + handle invite/reset deep-links
 (async function boot() {
+  // Explicit offline logout leaves a non-secret local fence. Finish cookie
+  // revocation opportunistically, but never wait for network before showing auth.
+  void api.drainPendingLogout();
   const resetFragment = passwordResetTokenFromHash();
   const resetToken = PASSWORD_RESET_TOKEN_RE.test(resetFragment) ? resetFragment : storedPasswordResetToken();
   if (resetFragment) cleanEntryUrl(true);
@@ -116,7 +143,7 @@ function cleanEntryUrl(removeHash = false) {
   const invite = new URLSearchParams(location.search).get('invite');
   const openSrv = new URLSearchParams(location.search).get('server'); // клик по push открыл /?server=<id>
   const openMessage = Number(new URLSearchParams(location.search).get('message'));
-  if (invite) sessionStorage.setItem('pendingInvite', invite);
+  if (invite) rememberPendingInvite(invite);
   else if (openSrv) {
     receiveNotificationDestination({
       serverId: openSrv,
@@ -124,10 +151,19 @@ function cleanEntryUrl(removeHash = false) {
     });
   }
   if (invite || openSrv) cleanEntryUrl();
-  if (getToken()) {
+  if (hasSessionCandidate()) {
     try {
-      const d = await api.authSession();
-      await useStore.getState().acceptSession(d.user, d.account);
+      const persistent = await api.resumePersistentSession();
+      if (persistent) {
+        await useStore.getState().acceptSession(persistent.user, persistent.account);
+        return;
+      }
+      if (!getToken()) {
+        useStore.setState({ view: 'auth', sessionError: '' });
+        return;
+      }
+      const session = await api.authSession();
+      await useStore.getState().acceptSession(session.user, session.account);
     } catch (error) {
       if (isApiError(error) && (error.status === 404 || error.status === 410)) {
         // Desktop/web releases can briefly lead the API rollout. The pre-email server has no
@@ -138,8 +174,12 @@ function cleanEntryUrl(removeHash = false) {
           return;
         } catch (legacyError) {
           if (isApiError(legacyError) && legacyError.status === 401) {
-            setToken(null);
-            useStore.setState({ view: 'auth', sessionError: '', accountGate: null, pendingUser: null });
+            // Migration never destroys a saved bearer on an ambiguous/failed
+            // upgrade. The user can retry or explicitly choose another account.
+            useStore.setState({
+              view: 'auth', accountGate: null, pendingUser: null,
+              sessionError: 'Сохранённый вход не подтверждён. Повторите проверку или войдите в другой аккаунт.',
+            });
             return;
           }
           useStore.setState({
@@ -150,8 +190,16 @@ function cleanEntryUrl(removeHash = false) {
         }
       }
       if (isApiError(error) && error.status === 401) {
-        setToken(null);
-        useStore.setState({ view: 'auth', sessionError: '', accountGate: null, pendingUser: null });
+        if (getToken()) {
+          // A rejected legacy upgrade is not proof that a rolling old instance
+          // would reject the same bearer; preserve it until user action.
+          useStore.setState({
+            view: 'auth', accountGate: null, pendingUser: null,
+            sessionError: 'Не удалось подтвердить сохранённый вход. Повторите попытку.',
+          });
+        } else {
+          useStore.setState({ view: 'auth', sessionError: '', accountGate: null, pendingUser: null });
+        }
       } else {
         // A network outage is not proof that the session expired. Keep the token and offer an explicit retry.
         useStore.setState({
@@ -164,3 +212,5 @@ function cleanEntryUrl(removeHash = false) {
     useStore.setState({ view: 'auth', sessionError: '' });
   }
 })();
+
+window.addEventListener('online', () => { void api.drainPendingLogout(); });

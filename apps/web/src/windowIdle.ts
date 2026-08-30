@@ -55,6 +55,9 @@ export function startWindowIdleWatch(): void {
   document.addEventListener('visibilitychange', sync);
   window.addEventListener('blur', sync);
   window.addEventListener('focus', sync);
+  // iOS PWA can resume from the app switcher through pageshow without a matching focus or
+  // visibilitychange. Re-read both hidden and focus state before subscribers restart work.
+  window.addEventListener('pageshow', sync);
   if (isTauri) {
     void import('@tauri-apps/api/event')
       .then(({ listen }) => listen<boolean>('relay-window-focus', (e) => { nativeFocus = !!e.payload; sync(); }))

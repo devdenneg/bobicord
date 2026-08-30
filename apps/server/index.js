@@ -13,11 +13,35 @@ const {
   voiceMediaRoomName, voiceHubIdentity, voiceMediaIdentity, exactVoiceLease, initialVoiceMediaGrant,
   activateVoiceMediaParticipant, removeVoiceMediaParticipant,
 } = require('./voiceMedia');
-const { createVoiceMediaRevocationStore, createVoiceMediaRevocationWorker } = require('./voiceMediaRevocations');
+const {
+  DEFAULT_USERNAME_DRAIN_TIMEOUT_MS,
+  createVoiceMediaRevocationStore, createVoiceMediaRevocationWorker, drainDueVoiceMediaRevocations,
+} = require('./voiceMediaRevocations');
+const {
+  VoiceAuthRevokedError, createVoiceAuthSubjectCodec, createVoiceSessionId,
+  voiceSessionMatchesSubject, releaseExactVoiceLease, createVoiceAuthTargetRegistry,
+} = require('./voiceAuthRegistry');
 const {
   hubTokenGrant, createVoiceTokenMintLimiter, noStoreVoiceTokenResponse,
 } = require('./voiceTokenPolicy');
+const {
+  admitBoundedNotifySocket, canonicalReactionIdentity, chatClearedEvent, chatReadyEvent,
+  cleanupInvalidLegacyReactions, createChatRateLimiter, createChatRealtimeFanout,
+  createChatRevisionStore, createNotifyInboundGuard, hasAllMention,
+  messageCreatedEvent, messageDeletedEvent, messageUpdatedEvent, reactionsUpdatedEvent,
+  sanitizeMessageEmotes, sendBoundedNotifyFrames,
+} = require('./chatRealtime');
+const {
+  createLegacyChatRefreshBridge, isCanonicalChatRequest, legacyChatSocketEligible,
+} = require('./legacyChatBridge');
 const { installRuntimeRevocationSchema } = require('./runtimeRevocation');
+const {
+  clearRequestedPushEndpoints, clearSessionPushEndpoints, installPushSubscriptionPrivacySchema,
+  normalizedPushEndpoint, normalizedPushPrivacy, pushPayloadForSubscription, unsubscribeOwnedPushEndpoint,
+} = require('./pushSubscriptions');
+const {
+  boundedAccountSettings, createServerVolumeSettingsStore, normalizeServerVolumeMutation,
+} = require('./serverSettings');
 const { planUploadSweep, uploadUrlsOfMessageRows, normalizeUploadRef, uploadRefsInText, isOwnedUploadRow } = require('./uploadsGc'); // квоты, владение и уборка пользовательских файлов
 const {
   createDiagRateLimiter, createDiagStore, sanitizeDiagLines, sanitizeDiagSamples,
@@ -33,6 +57,12 @@ const {
   AuthError, installAuthSchema, installVerifiedRegistrationGuard, createAuthManager, readCodePepperFile,
   passwordPrehash, formatPasswordHash, verifiedEmailForOwner,
 } = require('./auth');
+const {
+  PersistentSessionError, clearWebSessionCookieHeaders, createPersistentSessionManager,
+  installPersistentSessionSchema, parseExactHttpOrigins, parseRefreshToken, persistentProtocolRequested,
+  persistentSessionRateSubject, transportRequest,
+  webSessionCookieHeaders,
+} = require('./authSessions');
 const { createSmtpMailer } = require('./mailer');
 const {
   VRELAY_UID,
@@ -53,13 +83,24 @@ const corsOrigins = new Set([
   'http://tauri.localhost',
   'https://tauri.localhost',
 ]);
+const persistentWebOrigins = new Set(['https://reelay.online', 'https://www.reelay.online']);
+const persistentNativeOrigins = new Set(['tauri://localhost', 'http://tauri.localhost', 'https://tauri.localhost']);
 if (process.env.NODE_ENV !== 'production') {
   corsOrigins.add('http://localhost:5173');
   corsOrigins.add('http://127.0.0.1:5173');
+  persistentWebOrigins.add('http://localhost:5173');
+  persistentWebOrigins.add('http://127.0.0.1:5173');
 }
 for (const origin of String(process.env.CORS_ALLOWED_ORIGINS || '').split(',')) {
   const normalized = origin.trim();
   if (normalized) corsOrigins.add(normalized);
+}
+// Cookie-auth origins are a deliberately narrower trust boundary than general CORS. An explicitly
+// trusted browser origin is also CORS-readable, but a generic API/Tauri CORS origin never gains
+// ambient HttpOnly-cookie authority by accident.
+for (const origin of parseExactHttpOrigins(process.env.PERSISTENT_WEB_ORIGINS)) {
+  persistentWebOrigins.add(origin);
+  corsOrigins.add(origin);
 }
 // Нативный Tauri-клиент обращается к prod API со своего origin. Разрешаем только
 // известные origins; запросы без Origin остаются доступны нативным сервисам и health-check.
@@ -68,14 +109,14 @@ app.use((req, res, next) => {
   const allowed = !origin || corsOrigins.has(origin);
   if (origin && allowed) {
     res.header('Access-Control-Allow-Origin', origin);
+    res.header('Access-Control-Allow-Credentials', 'true');
     res.header('Vary', 'Origin');
   }
   res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-  // X-Attachment-Name — кастомный заголовок POST /api/upload-file (имя файла для форс-скачивания).
-  // Без него в нативе (кросс-доменный запрос, tauri://localhost → прод-API) CORS-preflight не
-  // пропускал бы заголовок → реальный POST блокировался браузером ещё до отправки («ошибка загрузки»
-  // на любой файл). В вебе не всплывало — там same-origin через Caddy, CORS не участвует вовсе.
-  res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Attachment-Name');
+  // X-Attachment-Name carries the upload filename; X-Relay-Chat-Protocol marks one canonical chat
+  // mutation for the bounded rollout bridge. Both are used by cross-origin Tauri requests, so an
+  // omitted allow-list entry would make the browser reject the request during preflight.
+  res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Attachment-Name,X-Relay-Chat-Protocol,X-Relay-Auth-Protocol,X-Relay-Auth-Transport,X-Relay-CSRF');
   res.header('Access-Control-Max-Age', '600');
   if (req.method === 'OPTIONS') return allowed ? res.sendStatus(204) : res.sendStatus(403);
   next();
@@ -253,8 +294,12 @@ CREATE TABLE IF NOT EXISTS voice_channels(
 CREATE TABLE IF NOT EXISTS push_subs(
   endpoint TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
+  session_id TEXT NOT NULL DEFAULT '',
   p256dh TEXT NOT NULL,
   auth TEXT NOT NULL,
+  privacy TEXT NOT NULL DEFAULT 'hidden',
+  mention INTEGER NOT NULL DEFAULT 1,
+  stream INTEGER NOT NULL DEFAULT 1,
   created INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS push_prefs(
@@ -288,6 +333,11 @@ CREATE TABLE IF NOT EXISTS read_state(
   last_read INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(user_id, server_id)
 );
+CREATE TABLE IF NOT EXISTS chat_revisions(
+  server_id TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL DEFAULT 0,
+  last_clear_revision INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS auth_runtime_revocations(
   user_id TEXT PRIMARY KEY,
   username TEXT NOT NULL,
@@ -318,8 +368,12 @@ CREATE INDEX IF NOT EXISTS idx_mroles ON member_roles(server_id, user_id);
 `);
 const voiceLeases = createVoiceLeaseStore(db);
 const voiceMediaRevocations = createVoiceMediaRevocationStore(db);
+const serverVolumeSettings = createServerVolumeSettingsStore(db);
 installReleaseSchema(db);
 installAuthSchema(db);
+installPersistentSessionSchema(db);
+const voiceAuthSubjectCodec = createVoiceAuthSubjectCodec(SESSION_SECRET);
+const voiceAuthTargets = createVoiceAuthTargetRegistry(db, voiceMediaRevocations);
 installRuntimeRevocationSchema(db);
 
 /* add new columns to pre-existing DBs (idempotent — throws if column exists) */
@@ -340,7 +394,10 @@ for (const sql of [
   "ALTER TABLE messages ADD COLUMN meta TEXT NOT NULL DEFAULT ''",           // JSON доп-данных сообщения (для levelup: {level})
   "ALTER TABLE auth_runtime_revocations ADD COLUMN revoked_before_version INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE uploads ADD COLUMN released INTEGER NOT NULL DEFAULT 0",      // строка живёт после удаления файла — по ней считается суточная квота
+  "ALTER TABLE push_subs ADD COLUMN session_id TEXT NOT NULL DEFAULT ''",
 ]) { try { db.exec(sql); } catch (e) { /* column already exists */ } }
+installPushSubscriptionPrivacySchema(db);
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_push_session ON push_subs(user_id,session_id)'); } catch (e) { /**/ }
 
 // Старые версии могли хранить внешний provider-id вместо локального upload URL.
 // После миграции разрешены только файлы из /api/uploads; очищаем лишь этот legacy-префикс.
@@ -374,6 +431,11 @@ try { db.prepare("UPDATE users SET is_admin=1 WHERE username=?").run('denis'); }
 try { db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_ckey ON messages(server_id, user_id, client_key) WHERE client_key <> ''"); } catch (e) {}
 // memberships PK = (user_id, server_id) → выборка по server_id (appOpenMembers, memberCount — часто в /me/presence) сканировала бы; индекс по server_id ускоряет.
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_mem_server ON memberships(server_id)"); } catch (e) {}
+try { db.exec(`CREATE TABLE IF NOT EXISTS chat_revisions(
+  server_id TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL DEFAULT 0,
+  last_clear_revision INTEGER NOT NULL DEFAULT 0
+)`); } catch (e) {}
 // Реакции 7TV на сообщения: (сервер, сообщение, эмоут, юзер) — уникальны (один юзер = одна реакция этим эмоутом).
 try {
   db.exec(`CREATE TABLE IF NOT EXISTS reactions(
@@ -424,6 +486,7 @@ function hashColor(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 3
 const UNAME = /^[a-zA-Z0-9_]{3,20}$/;
 const norm = u => String(u || '').trim().toLowerCase();
 let authManager = null;
+let persistentSessions = null;
 
 function bearerToken(req) {
   const header = req.headers.authorization || '';
@@ -447,7 +510,14 @@ function sendAuthError(res, error) {
 
 function authRoute(handler) {
   return (req, res, next) => Promise.resolve().then(() => handler(req, res, next)).catch((error) => {
-    if (error instanceof AuthError) return sendAuthError(res, error);
+    if (error instanceof AuthError || error instanceof PersistentSessionError) return sendAuthError(res, error);
+    return next(error);
+  });
+}
+
+function persistentAuthRoute(handler) {
+  return (req, res, next) => Promise.resolve().then(() => handler(req, res, next)).catch((error) => {
+    if (error instanceof PersistentSessionError || error instanceof AuthError) return sendAuthError(res, error);
     return next(error);
   });
 }
@@ -469,6 +539,7 @@ function requireSession(req, res, next) {
     const context = authManager.verifySession(bearerToken(req));
     req.user = context.user;
     req.authState = context.state;
+    req.authPayload = context.payload;
     return next();
   } catch (error) {
     if (error instanceof AuthError) return sendAuthError(res, error);
@@ -482,6 +553,7 @@ function requireAuth(req, res, next) {
     const context = authManager.verifySession(bearerToken(req), { requireVerified: true });
     req.user = context.user;
     req.authState = context.state;
+    req.authPayload = context.payload;
     return next();
   } catch (error) {
     if (error instanceof AuthError) return sendAuthError(res, error);
@@ -609,8 +681,8 @@ let VAPID = null;
   } catch (e) { console.warn('Web Push отключён:', e.message); }
 })();
 
-// Разослать web-push набору user_id. kind фильтруется по push_prefs (юзер мог выключить тип);
-// отсутствие строки prefs = дефолт «всё включено». Протухшие подписки (404/410) удаляем.
+// Разослать web-push набору user_id. Тип и приватность фильтруются на каждой подписке отдельно:
+// телефон и браузер могут иметь противоположные настройки. Протухшие подписки (404/410) удаляем.
 async function pushToUsers(kind, userIds, payload) {
   if (!VAPID || !userIds || !userIds.length) return;
   const ids = [...new Set(userIds.filter(Boolean))];
@@ -619,9 +691,8 @@ async function pushToUsers(kind, userIds, payload) {
   const prefCol = kind === 'stream' ? 'stream' : 'mention';
   const rows = db.prepare(
     `SELECT s.* FROM push_subs s WHERE s.user_id IN (${ph}) ` +
-    `AND NOT EXISTS (SELECT 1 FROM push_prefs p WHERE p.user_id=s.user_id AND p.${prefCol}=0)`
+    `AND s.${prefCol}=1`
   ).all(...ids);
-  const body = JSON.stringify(payload);
   // urgency:'high' — КРИТИЧНО для мгновенной доставки: без него push-сервисы (FCM/APNs/Mozilla)
   // считают уведомление низкоприоритетным и БАТЧАТ его (доставка минутами, особенно на спящем
   // мобильном) → симптом «приходят не сразу». high → FCM high priority / APNs apns-priority:10.
@@ -631,6 +702,7 @@ async function pushToUsers(kind, userIds, payload) {
   // и зависший push-endpoint держал бы сокет и промис неограниченно долго.
   const opts = { TTL: 86400, urgency: 'high', timeout: 10000 };
   await Promise.all(rows.map(async (r) => {
+    const body = JSON.stringify(pushPayloadForSubscription(payload, r.privacy));
     try { await VAPID.webpush.sendNotification({ endpoint: r.endpoint, keys: { p256dh: r.p256dh, auth: r.auth } }, body, opts); }
     catch (e) { if (e && (e.statusCode === 404 || e.statusCode === 410)) db.prepare('DELETE FROM push_subs WHERE endpoint=?').run(r.endpoint); }
   }));
@@ -663,14 +735,42 @@ function serverMembersFull(sid) {
 // (веб-push бьёт только по свёрнутому/закрытому; натив web-push не получает вообще). Карта
 // user_id → набор живых ws-соединений (несколько устройств/вкладок). Заполняется в WS-setup внизу.
 const notifyConns = new Map();
+const MAX_NOTIFY_SOCKETS_PER_ACCOUNT = 8;
 function notifyUser(userId, payload) {
   const set = notifyConns.get(userId);
   if (!set || !set.size) return;
-  const data = JSON.stringify(payload);
-  for (const ws of set) { if (ws.readyState === 1 /* OPEN */) { try { ws.send(data); } catch (e) { /**/ } } }
+  sendBoundedNotifyFrames(set, payload);
 }
-function notifyServerMembers(serverId, payload) {
-  for (const row of db.prepare('SELECT user_id FROM memberships WHERE server_id=?').all(serverId)) notifyUser(row.user_id, payload);
+function notifyServerMembers(serverId, payload, { legacyChatOnly = false } = {}) {
+  for (const row of db.prepare('SELECT user_id FROM memberships WHERE server_id=?').all(serverId)) {
+    if (!legacyChatOnly) { notifyUser(row.user_id, payload); continue; }
+    const sockets = notifyConns.get(row.user_id);
+    if (!sockets || !sockets.size) continue;
+    sendBoundedNotifyFrames([...sockets].filter((ws) => legacyChatSocketEligible(ws, serverId)), payload);
+  }
+}
+const legacyChatRefreshBridge = createLegacyChatRefreshBridge({
+  notifyServer: (serverId, payload) => notifyServerMembers(serverId, payload, { legacyChatOnly: true }),
+});
+function scheduleLegacyChatRefresh(req, serverId) {
+  if (!isCanonicalChatRequest(req && req.headers)) return false;
+  return legacyChatRefreshBridge.enqueue(serverId);
+}
+const _chatMemberIdsStmt = db.prepare('SELECT user_id FROM memberships WHERE server_id=?');
+const chatRealtime = createChatRealtimeFanout({
+  // Resolve membership at dispatch time. A socket authenticated before a kick remains a valid
+  // account socket, but it must never receive later events from the server it left.
+  currentMemberIds: (serverId) => _chatMemberIdsStmt.all(serverId).map((row) => row.user_id),
+  socketsForUser: (userId) => notifyConns.get(userId),
+  isCurrentMember: (userId, serverId) => isMember(userId, serverId),
+});
+const chatMutationLimiter = createChatRateLimiter();
+function allowChatMutation(req, res, action, options) {
+  const result = chatMutationLimiter.consume(req.user.id, action, Date.now(), options);
+  if (result.allowed) return true;
+  res.setHeader('Retry-After', String(result.retryAfterSeconds));
+  res.status(429).json({ error: 'Слишком много действий в чате', retryAfter: result.retryAfterSeconds });
+  return false;
 }
 function serverName(sid) { const s = db.prepare('SELECT name FROM servers WHERE id=?').get(sid); return s ? s.name : 'Сервер'; }
 
@@ -712,6 +812,100 @@ function publicAccountState(state) {
 
 function sessionPayload(user, state = authManager.sessionState(user)) {
   return { user: ownUser(user), account: publicAccountState(state) };
+}
+
+function requestedPersistentTransport(req, { bootstrap = false } = {}) {
+  if (!persistentSessions) {
+    throw new PersistentSessionError(503, 'AUTH_STARTING', 'Авторизация запускается. Попробуйте ещё раз.');
+  }
+  return transportRequest(req, {
+    webOrigins: persistentWebOrigins,
+    nativeOrigins: persistentNativeOrigins,
+    bootstrap,
+  });
+}
+
+function limitPersistentSessionRequest(req, action, credential, options) {
+  persistentSessions.checkRate(`${action}-ip`, req.ip, options.ip);
+  const subject = persistentSessionRateSubject(credential, { allowOpaque: options.allowOpaqueCredential === true });
+  if (subject) persistentSessions.checkRate(`${action}-session`, subject, options.session);
+}
+
+function requireCurrentPersistentTransport(req, transport) {
+  const currentSessionId = req.authPayload && req.authPayload.sid;
+  if (!currentSessionId) {
+    throw new PersistentSessionError(409, 'SESSION_MISMATCH', 'Текущая сессия не поддерживает это защитное действие. Повторите вход.');
+  }
+  if (transport.kind === 'web') {
+    const parsed = parseRefreshToken(transport.refreshToken);
+    if (!parsed || parsed.sessionId !== currentSessionId) {
+      throw new PersistentSessionError(409, 'SESSION_MISMATCH', 'Сессия браузера изменилась. Повторите действие.');
+    }
+  }
+}
+
+function sendPersistentSession(res, transport, bundle, user, state, extra = {}) {
+  if (transport.kind === 'web') {
+    res.setHeader('Set-Cookie', webSessionCookieHeaders(bundle.refreshToken, bundle.csrfToken));
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  return res.json({
+    protocol: 'persistent-v1',
+    token: bundle.accessToken,
+    accessToken: bundle.accessToken,
+    accessExpiresAt: bundle.accessExpiresAt,
+    sessionId: bundle.sessionId,
+    csrfToken: transport.kind === 'web' ? bundle.csrfToken : undefined,
+    refreshToken: transport.kind === 'native' ? bundle.refreshToken : undefined,
+    ...sessionPayload(user, state),
+    ...extra,
+  });
+}
+
+function createPersistentLogin(req, res, transport, user, extra = {}) {
+  const bundle = persistentSessions.create(user, {
+    clientKind: transport.kind,
+    deviceName: req.body && req.body.deviceName,
+  });
+  return sendPersistentSession(res, transport, bundle, user, authManager.sessionState(user), extra);
+}
+
+function unchangedSecurityUser(userId, expectedSessionVersion) {
+  const user = db.prepare('SELECT * FROM users WHERE id=?').get(userId);
+  if (!user || (Number(user.session_version) || 0) !== Number(expectedSessionVersion)) {
+    throw new AuthError(401, 'SESSION_REVOKED', 'Сессия завершена другим защитным действием. Войдите снова.');
+  }
+  return user;
+}
+
+function closePersistentRealtimeSession(sessionId) {
+  const wanted = String(sessionId || '');
+  if (!wanted) return;
+  for (const sockets of notifyConns.values()) for (const ws of [...sockets]) {
+    if (ws._authSessionId !== wanted) continue;
+    try { ws.close(4001, 'session revoked'); }
+    catch { try { ws.terminate(); } catch { /**/ } }
+  }
+  try { treeSrv.revokeAuthSession(wanted); } catch { /** Server may still be starting. */ }
+}
+
+function closeLegacyRealtimeSession(tokenHash) {
+  const wanted = String(tokenHash || '');
+  if (!wanted) return;
+  for (const sockets of notifyConns.values()) for (const ws of [...sockets]) {
+    if (ws._authLegacyTokenHash !== wanted) continue;
+    try { ws.close(4001, 'session revoked'); }
+    catch { try { ws.terminate(); } catch { /**/ } }
+  }
+  try { treeSrv.revokeLegacySession(wanted); } catch { /** Server may still be starting. */ }
+}
+function closePersistentLogoutRealtime(logoutSubject) {
+  if (!logoutSubject) return;
+  closePersistentRealtimeSession(logoutSubject.sessionId);
+  // A rolling-upgraded device can still have an already-open socket authenticated by the exact
+  // legacy bearer that created this persistent row. Its hash is device-specific and tombstoned by
+  // the same logout transaction, so closing it cannot disconnect another device of the account.
+  if (logoutSubject.legacyTokenHash) closeLegacyRealtimeSession(logoutSubject.legacyTokenHash);
 }
 // Имена всегда выпускает наш upload route: 12 random bytes + расширение из проверенного MIME.
 // Узкий regexp не пропускает `..`, произвольные имена и не-image расширения в профили/чат.
@@ -779,7 +973,7 @@ function purgeServer(sid) {
   const icon = db.prepare('SELECT icon_url FROM servers WHERE id=?').get(sid)?.icon_url;
   if (icon) orphaned.push(icon);
   // reactions и user_stats раньше не чистились вовсе — записи удалённого сервера копились навсегда.
-  for (const t of ['memberships', 'invites', 'server_settings', 'roles', 'member_roles', 'messages', 'voice_channels', 'read_state', 'deploy_release_targets', 'reactions', 'user_stats']) {
+  for (const t of ['memberships', 'invites', 'server_settings', 'roles', 'member_roles', 'messages', 'voice_channels', 'read_state', 'deploy_release_targets', 'reactions', 'user_stats', 'chat_revisions']) {
     try { db.prepare(`DELETE FROM ${t} WHERE server_id=?`).run(sid); } catch (e) { /* таблицы-миграции могло не быть */ }
   }
   db.prepare('DELETE FROM servers WHERE id=?').run(sid);
@@ -789,6 +983,11 @@ function purgeServer(sid) {
 function purgeUser(uid) {
   const account = db.prepare('SELECT username FROM users WHERE id=?').get(uid);
   const joinedServers = db.prepare('SELECT server_id FROM memberships WHERE user_id=?').all(uid).map(row => row.server_id);
+  const ownedServerIds = new Set(db.prepare('SELECT id FROM servers WHERE owner_id=?').all(uid).map((row) => row.id));
+  const affectedChatServers = db.prepare(`SELECT server_id FROM messages WHERE user_id=?
+    UNION SELECT server_id FROM reactions WHERE user_id=?`).all(uid, uid)
+    .map((row) => row.server_id)
+    .filter((serverId) => !ownedServerIds.has(serverId));
   if (account) {
     // The version bump atomically snapshots exact LiveKit rooms and clears push/voice state.
     db.prepare('UPDATE users SET session_version=session_version+1 WHERE id=?').run(uid);
@@ -796,7 +995,7 @@ function purgeUser(uid) {
   }
   invalidateVoiceLease(uid, () => true, 'account-deleted');
   if (account) for (const serverId of joinedServers) evictUserFromRoom(serverId, account.username);
-  for (const s of db.prepare('SELECT id FROM servers WHERE owner_id=?').all(uid)) purgeServer(s.id);
+  for (const serverId of ownedServerIds) purgeServer(serverId);
   // Файлы аккаунта: его сообщения, аватар, фон профиля и всё, что он успел загрузить, но не
   // отправить. Реальное удаление — отложенное (queueUploadRelease): часть может быть процитирована
   // в чужих сообщениях, такие файлы остаются.
@@ -804,15 +1003,31 @@ function purgeUser(uid) {
   const profile = db.prepare('SELECT avatar_url, profile_banner_url FROM users WHERE id=?').get(uid);
   if (profile) { if (profile.avatar_url) orphaned.push(profile.avatar_url); if (profile.profile_banner_url) orphaned.push(profile.profile_banner_url); }
   try { for (const row of db.prepare('SELECT url FROM uploads WHERE user_id=?').all(uid)) orphaned.push(row.url); } catch (e) { /**/ }
-  // Сначала снимаем реакции всех пользователей с сообщений удаляемого аккаунта,
-  // иначе после удаления сообщений останутся недостижимые строки в reactions.
-  db.prepare('DELETE FROM reactions WHERE msg_id IN (SELECT id FROM messages WHERE user_id=?)').run(uid);
-  for (const t of ['memberships', 'member_roles', 'server_settings', 'messages', 'read_state']) db.prepare(`DELETE FROM ${t} WHERE user_id=?`).run(uid);
+  // Chat state and every affected surviving server revision change atomically. This also covers
+  // reactions the account left in servers it had already left; otherwise open clients retain
+  // ghost messages/counts without observing a revision gap.
+  const purgeAccountChat = db.transaction(() => {
+    db.prepare('DELETE FROM reactions WHERE msg_id IN (SELECT id FROM messages WHERE user_id=?)').run(uid);
+    db.prepare('DELETE FROM messages WHERE user_id=?').run(uid);
+    db.prepare('DELETE FROM reactions WHERE user_id=?').run(uid);
+    for (const table of ['memberships', 'member_roles', 'server_settings', 'read_state']) {
+      db.prepare(`DELETE FROM ${table} WHERE user_id=?`).run(uid);
+    }
+    const revised = [];
+    for (const serverId of affectedChatServers) {
+      if (!db.prepare('SELECT 1 FROM servers WHERE id=?').get(serverId)) continue;
+      revised.push({ serverId, revision: bumpChatRevision(serverId) });
+    }
+    return revised;
+  });
+  const revisedChatServers = purgeAccountChat();
+  for (const { serverId } of revisedChatServers) chatRealtime.broadcast(serverId, () => null);
   // reactions, user_stats и profile_banner_uploads раньше переживали удаление аккаунта.
-  for (const t of ['user_settings', 'push_subs', 'push_prefs', 'reactions', 'user_stats', 'profile_banner_uploads']) {
+  for (const t of ['user_settings', 'push_subs', 'push_prefs', 'user_stats', 'profile_banner_uploads']) {
     try { db.prepare(`DELETE FROM ${t} WHERE user_id=?`).run(uid); } catch (e) { /* таблицы-миграции могло не быть */ }
   }
   if (authManager) authManager.purgeUser(uid);
+  if (persistentSessions) persistentSessions.purgeUser(uid);
   db.prepare('DELETE FROM voice_session_intents WHERE user_id=?').run(uid);
   db.prepare('DELETE FROM voice_user_intents WHERE user_id=?').run(uid);
   db.prepare('DELETE FROM voice_leases WHERE user_id=?').run(uid);
@@ -823,27 +1038,29 @@ function purgeUser(uid) {
   queueUploadRelease(orphaned);
 }
 
-function closeLocalRuntimeSessions(userId, username, reason) {
+function closeLocalRuntimeSessions(userId, username, reason, preservedSessionId = '') {
   const sockets = notifyConns.get(userId);
   if (sockets) {
     for (const ws of [...sockets]) {
+      if (preservedSessionId && ws._authSessionId === preservedSessionId) continue;
       try { ws.close(4001, reason); } catch { try { ws.terminate(); } catch { /* noop */ } }
     }
   }
   if (treeSrv && treeSrv.peers) {
     for (const peer of treeSrv.peers.values()) {
       if (peer.ws && (peer.ws.__uid === userId || peer.ws.__uid === username)) {
+        if (preservedSessionId && peer.ws.__authSessionId === preservedSessionId) continue;
         try { peer.ws.close(4001, reason); } catch { try { peer.ws.terminate(); } catch { /* noop */ } }
       }
     }
   }
 }
 
-async function revokeRuntimeSessions(userId, username, reason = 'session-revoked') {
+async function revokeRuntimeSessions(userId, username, reason = 'session-revoked', preservedSessionId = '') {
   // The users.session_version trigger has already persisted exact room targets and revoked push/
   // voice state in the same transaction as the account mutation. This function only closes local
   // sockets and drains that durable queue; it must never reconstruct or bulk-delete targets.
-  closeLocalRuntimeSessions(userId, username, reason);
+  closeLocalRuntimeSessions(userId, username, reason, preservedSessionId);
   await drainRuntimeRevocation(userId);
 }
 // Непрочитанные: только пользовательские сообщения новее last_read и не свои. Release-патчноут
@@ -897,9 +1114,113 @@ function ensureDefaultChannel(sid) {
 /* ---- authoritative voice ownership (one device/session per account) ---- */
 const VOICE_SESSION_RE = /^[A-Za-z0-9._:~-]{1,128}$/;
 const VOICE_RESOURCE_RE = /^[A-Za-z0-9_-]{1,96}$/;
+const HUB_TOKEN_TTL_MS = 10 * 60 * 1000;
+const VOICE_MEDIA_TOKEN_TTL_MS = 2 * 60 * 1000;
 const voiceClaimQueues = new Map();
 const pendingVoiceEvictions = new Map();
 const voiceTokenMintLimiter = createVoiceTokenMintLimiter();
+function persistentVoiceAuthContext(userId, sessionId) {
+  const row = db.prepare(`SELECT id,user_id,legacy_token_hash,revoked_at
+    FROM auth_sessions WHERE id=?`).get(String(sessionId || ''));
+  if (!row || row.user_id !== String(userId || '')) return null;
+  const authSubject = row.legacy_token_hash
+    ? voiceAuthSubjectCodec.legacy(row.user_id, row.legacy_token_hash)
+    : voiceAuthSubjectCodec.persistent(row.user_id, row.id);
+  return {
+    authSubject,
+    authKind: 'persistent',
+    authKey: row.id,
+    userId: row.user_id,
+    revoked: Boolean(row.revoked_at),
+  };
+}
+function requestVoiceAuthContext(req, verified = null) {
+  if (!persistentSessions) return null;
+  const user = verified?.user || req.user;
+  const payload = verified?.payload || req.authPayload;
+  if (!user || !payload) return null;
+  if (payload.sid) return persistentVoiceAuthContext(user.id, payload.sid);
+  const tokenHash = persistentSessions.legacyTokenKey(bearerToken(req));
+  if (!tokenHash) return null;
+  return {
+    authSubject: voiceAuthSubjectCodec.legacy(user.id, tokenHash),
+    authKind: 'legacy',
+    authKey: tokenHash,
+    userId: user.id,
+    revoked: false,
+  };
+}
+function requestVoiceAuthStillCurrent(req, expected) {
+  if (!authManager || !expected || expected.revoked) return false;
+  try {
+    const verified = authManager.verifySession(bearerToken(req), { requireVerified: true });
+    const current = requestVoiceAuthContext(req, verified);
+    return !!current && !current.revoked
+      && current.userId === expected.userId
+      && current.authKind === expected.authKind
+      && current.authKey === expected.authKey
+      && current.authSubject === expected.authSubject;
+  } catch { return false; }
+}
+function voiceSessionOwnedByRequest(req, sessionId) {
+  const context = requestVoiceAuthContext(req);
+  return !!context && !context.revoked
+    && voiceSessionMatchesSubject(sessionId, context.authSubject);
+}
+function registerVoiceAuthTarget(req, context, room, identity, tokenTtlMs) {
+  const issued = Date.now();
+  try {
+    const result = voiceAuthTargets.register({
+      ...context,
+      room,
+      identity,
+      issued,
+      tokenExpires: issued + tokenTtlMs,
+    }, () => requestVoiceAuthStillCurrent(req, context));
+    if (result.evicted > 0) setImmediate(() => { void voiceMediaRevocationWorker.retryDue(); });
+    return true;
+  } catch (error) {
+    if (error instanceof VoiceAuthRevokedError) return false;
+    throw error;
+  }
+}
+function releaseVoiceLeaseForAuthSubject(userId, authSubject) {
+  const result = releaseExactVoiceLease(voiceLeases, userId, authSubject);
+  if (!result) return null;
+  const username = db.prepare('SELECT username FROM users WHERE id=?').get(userId)?.username;
+  if (username) {
+    voiceMediaRevocations.enqueueParticipant(
+      voiceMediaRoomName(result.previousLease.serverId, result.previousLease.channelId),
+      voiceMediaIdentity(username, result.previousLease.sessionId, result.previousLease.epoch),
+      Date.now(),
+      { authSubject },
+    );
+  }
+  return result;
+}
+function releaseVoiceLeaseForPersistentLogout(logoutSubject) {
+  if (!logoutSubject?.userId || !logoutSubject?.sessionId) return null;
+  const context = persistentVoiceAuthContext(logoutSubject.userId, logoutSubject.sessionId);
+  return context ? {
+    authSubject: context.authSubject,
+    released: releaseVoiceLeaseForAuthSubject(context.userId, context.authSubject),
+  } : null;
+}
+function finishExactVoiceLogout(userId, released, authSubject = '') {
+  if (released) notifyUser(userId, voiceLeaseEvent(released.released, 'session-logout'));
+  // The exact outbox rows were committed with auth revocation. Logout response latency never
+  // depends on LiveKit; this eager pass merely shortens the normal 15-second retry interval.
+  const username = db.prepare('SELECT username FROM users WHERE id=?').get(userId)?.username || '';
+  setImmediate(() => {
+    if (username && authSubject) {
+      void voiceMediaRevocationWorker.retryDueForVoiceSession(
+        username, authSubject, Date.now(), 1000,
+      );
+      return;
+    }
+    void voiceMediaRevocationWorker.retryDue();
+  });
+}
 function leaseResponse(state, reason) {
   return { ok: true, ...voiceLeaseEvent(state, reason) };
 }
@@ -937,15 +1258,19 @@ function liveKitResourceMissing(error) {
   return status === 404 || code === 'not_found' || code === 'not-found' || code === '5'
     || /(?:room|participant|resource).*(?:not found|does not exist)/u.test(message);
 }
+const VOICE_MEDIA_RPC_TIMEOUT_MS = 2500;
+const VOICE_MEDIA_DRAIN_TIMEOUT_MS = DEFAULT_USERNAME_DRAIN_TIMEOUT_MS;
 const voiceMediaRevocationWorker = createVoiceMediaRevocationWorker({
   store: voiceMediaRevocations,
-  removeParticipant: ({ room, identity }) => withTimeout(
-    removeVoiceMediaParticipant(rsc, room, identity), 2500, 'removeVoiceMediaParticipant',
+  removeParticipant: ({ room, identity, revokeTokenTs = 0 }) => withTimeout(
+    removeVoiceMediaParticipant(rsc, room, identity, Date.now(), revokeTokenTs),
+    VOICE_MEDIA_RPC_TIMEOUT_MS,
+    'removeVoiceMediaParticipant',
   ),
   // A room-delete target is enough even after channel/server rows disappear: deleteRoom ejects
   // updated participants, while any reconnect uses the token's initial-deny grant and exact
   // activation can no longer pass for the deleted resource.
-  deleteRoom: ({ room }) => withTimeout(rsc.deleteRoom(room), 2500, 'deleteVoiceMediaRoom'),
+  deleteRoom: ({ room }) => withTimeout(rsc.deleteRoom(room), VOICE_MEDIA_RPC_TIMEOUT_MS, 'deleteVoiceMediaRoom'),
   isMissing: liveKitResourceMissing,
 });
 function scheduleVoiceMediaRemoval(room, identity) {
@@ -1190,8 +1515,15 @@ app.post('/api/voice/lease/intent', requireAuth, async (req, res, next) => {
     || !Number.isSafeInteger(clientIntent) || clientIntent < 1) {
     return res.status(400).json({ error: 'Invalid voice intent parameters' });
   }
+  const voiceAuth = requestVoiceAuthContext(req);
+  if (!voiceAuth || voiceAuth.revoked || !voiceSessionMatchesSubject(sessionId, voiceAuth.authSubject)) {
+    return res.status(409).json({ error: 'Voice session belongs to another authorization session' });
+  }
   try {
     const state = await serializeVoiceClaim(req.user.id, async () => {
+      if (!requestVoiceAuthStillCurrent(req, voiceAuth)) {
+        return { status: 401, error: 'Authorization session was revoked' };
+      }
       if (!db.prepare('SELECT 1 FROM memberships WHERE user_id=? AND server_id=?').get(req.user.id, serverId)) {
         return { status: 403, error: 'Not a server member' };
       }
@@ -1221,6 +1553,10 @@ app.post('/api/voice/lease/claim', requireAuth, async (req, res, next) => {
     || !Number.isSafeInteger(clientIntent) || clientIntent < 1
     || (ticket !== null && (!Number.isSafeInteger(ticket) || ticket < 1))) {
     return res.status(400).json({ error: 'Invalid voice lease parameters' });
+  }
+  const voiceAuth = requestVoiceAuthContext(req);
+  if (!voiceAuth || voiceAuth.revoked || !voiceSessionMatchesSubject(sessionId, voiceAuth.authSubject)) {
+    return res.status(409).json({ error: 'Voice session belongs to another authorization session' });
   }
   let requestCanceled = false;
   const markCanceled = () => { requestCanceled = true; };
@@ -1253,6 +1589,9 @@ app.post('/api/voice/lease/claim', requireAuth, async (req, res, next) => {
         return { status: 404, error: 'Voice channel not found' };
       }
       if (canceled()) return { canceled: true };
+      if (!requestVoiceAuthStillCurrent(req, voiceAuth)) {
+        return { status: 401, error: 'Authorization session was revoked' };
+      }
       const previousLease = voiceLeases.read(req.user.id).lease;
       const claimed = ticket === null
         ? voiceLeases.claim(req.user.id, { sessionId, serverId, channelId, intent: clientIntent })
@@ -1299,6 +1638,9 @@ app.post('/api/voice/lease/release', requireAuth, async (req, res, next) => {
   if (!VOICE_SESSION_RE.test(sessionId) || !Number.isSafeInteger(epoch) || epoch < 1) {
     return res.status(400).json({ error: 'Invalid voice lease parameters' });
   }
+  if (!voiceSessionOwnedByRequest(req, sessionId)) {
+    return res.status(409).json({ error: 'Voice session belongs to another authorization session' });
+  }
   try {
     const state = await serializeVoiceClaim(req.user.id, async () => {
       const previousLease = voiceLeases.read(req.user.id).lease;
@@ -1334,6 +1676,10 @@ function voiceMediaStillAllowed(userId, params) {
 app.post('/api/voice/media-token', noStoreVoiceTokenResponse, requireAuth, async (req, res, next) => {
   const params = voiceMediaRequest(req.body);
   if (!params) return res.status(400).json({ error: 'Invalid voice media parameters' });
+  const voiceAuth = requestVoiceAuthContext(req);
+  if (!voiceAuth || voiceAuth.revoked || !voiceSessionMatchesSubject(params.sessionId, voiceAuth.authSubject)) {
+    return res.status(409).json({ error: 'Voice session belongs to another authorization session' });
+  }
   try {
     const result = await serializeVoiceClaim(req.user.id, async () => {
       if (!db.prepare('SELECT 1 FROM memberships WHERE user_id=? AND server_id=?').get(req.user.id, params.serverId)) {
@@ -1366,6 +1712,9 @@ app.post('/api/voice/media-token', noStoreVoiceTokenResponse, requireAuth, async
       at.addGrant(initialVoiceMediaGrant(room));
       const token = await at.toJwt();
       if (!voiceMediaStillAllowed(req.user.id, params)) return { status: 409, error: 'Voice lease is not current' };
+      if (!registerVoiceAuthTarget(req, voiceAuth, room, identity, VOICE_MEDIA_TOKEN_TTL_MS)) {
+        return { status: 401, error: 'Authorization session was revoked' };
+      }
       return { token, room, identity };
     });
     if (result.error) {
@@ -1379,30 +1728,54 @@ app.post('/api/voice/media-token', noStoreVoiceTokenResponse, requireAuth, async
 app.post('/api/voice/media/activate', requireAuth, async (req, res, next) => {
   const params = voiceMediaRequest(req.body);
   if (!params) return res.status(400).json({ error: 'Invalid voice media parameters' });
+  const voiceAuth = requestVoiceAuthContext(req);
+  if (!voiceAuth || voiceAuth.revoked || !voiceSessionMatchesSubject(params.sessionId, voiceAuth.authSubject)) {
+    return res.status(409).json({ error: 'Voice session belongs to another authorization session' });
+  }
   const room = voiceMediaRoomName(params.serverId, params.channelId);
   const hubIdentity = voiceHubIdentity(req.user.username, params.sessionId);
   const identity = voiceMediaIdentity(req.user.username, params.sessionId, params.epoch);
   try {
     const result = await serializeVoiceClaim(req.user.id, async () => {
       if (!voiceMediaStillAllowed(req.user.id, params)) return { status: 409, error: 'Voice lease is not current' };
-      if (voiceMediaRevocations.hasPendingUsername(req.user.username)) {
+      if (!await drainDueVoiceMediaRevocations(
+        voiceMediaRevocations,
+        voiceMediaRevocationWorker,
+        req.user.username,
+        { timeoutMs: VOICE_MEDIA_DRAIN_TIMEOUT_MS, authSubject: voiceAuth.authSubject },
+      )) {
         return { status: 409, error: 'Previous voice media session is still closing' };
       }
       const connected = await voiceSessionConnectedOnce(params.serverId, hubIdentity);
       if (connected !== true) return { status: connected === null ? 503 : 409, error: connected === null ? 'Voice service unavailable' : 'Voice hub session is not active' };
       if (!voiceMediaStillAllowed(req.user.id, params)) return { status: 409, error: 'Voice lease is not current' };
-      if (voiceMediaRevocations.hasPendingUsername(req.user.username)) {
+      if (!await drainDueVoiceMediaRevocations(
+        voiceMediaRevocations,
+        voiceMediaRevocationWorker,
+        req.user.username,
+        { timeoutMs: VOICE_MEDIA_DRAIN_TIMEOUT_MS, authSubject: voiceAuth.authSubject },
+      )) {
         return { status: 409, error: 'Previous voice media session is still closing' };
       }
-      try { await activateVoiceMediaParticipant(rsc, room, identity); }
+      if (!requestVoiceAuthStillCurrent(req, voiceAuth)) {
+        return { status: 401, error: 'Authorization session was revoked' };
+      }
+      try {
+        await withTimeout(
+          activateVoiceMediaParticipant(rsc, room, identity),
+          VOICE_MEDIA_RPC_TIMEOUT_MS,
+          'activateVoiceMediaParticipant',
+        );
+      }
       catch (error) {
         if (liveKitResourceMissing(error)) return { status: 409, error: 'Voice media session is not connected' };
         throw error;
       }
       // Membership/channel revoke не проходит через per-user claim queue. Если он случился во
       // время RoomService update, сразу снимаем выданные media-права и не возвращаем ложный успех.
-      if (!voiceMediaStillAllowed(req.user.id, params)
-        || voiceMediaRevocations.hasPendingUsername(req.user.username)) {
+      if (!requestVoiceAuthStillCurrent(req, voiceAuth)
+        || !voiceMediaStillAllowed(req.user.id, params)
+        || voiceMediaRevocations.hasPendingVoiceSession(req.user.username, voiceAuth.authSubject)) {
         await scheduleVoiceMediaRemoval(room, identity).catch(() => {});
         return { status: 409, error: 'Voice media authorization changed during activation' };
       }
@@ -1422,6 +1795,189 @@ app.get('/api/auth/session', requireSession, (req, res) => {
   res.json(sessionPayload(req.user, req.authState));
 });
 
+// Rolling upgrade for a legacy bearer already stored by an installed client. The old JWT is
+// never accepted in JSON and is never destroyed on a network failure. Retrying the same bearer
+// returns the same durable device session; after explicit logout its hash tombstone prevents
+// that legacy token from resurrecting the account.
+app.post('/api/auth/session/upgrade', requireSession, persistentAuthRoute((req, res) => {
+  const transport = requestedPersistentTransport(req, { bootstrap: true });
+  if (req.authPayload && req.authPayload.sid) {
+    throw new PersistentSessionError(409, 'SESSION_ALREADY_UPGRADED', 'Сессия уже обновлена.');
+  }
+  const legacyToken = bearerToken(req);
+  limitPersistentSessionRequest(req, 'upgrade', legacyToken, {
+    ip: { limit: 10_000, windowMs: 15 * 60 * 1000 },
+    session: { limit: 10, windowMs: 15 * 60 * 1000 },
+    allowOpaqueCredential: true,
+  });
+  const bundle = persistentSessions.create(req.user, {
+    clientKind: transport.kind,
+    deviceName: req.body && req.body.deviceName,
+    legacyToken,
+  });
+  return sendPersistentSession(res, transport, bundle, req.user, req.authState);
+}));
+
+app.post('/api/auth/session/refresh', persistentAuthRoute((req, res) => {
+  const transport = requestedPersistentTransport(req);
+  limitPersistentSessionRequest(req, 'refresh', transport.refreshToken, {
+    ip: { limit: 30_000, windowMs: 15 * 60 * 1000 },
+    session: { limit: 60, windowMs: 5 * 60 * 1000 },
+  });
+  const bundle = persistentSessions.refresh(transport.refreshToken, {
+    csrfToken: transport.csrfToken,
+    clientKind: transport.kind,
+  });
+  return sendPersistentSession(
+    res,
+    transport,
+    bundle,
+    bundle.user,
+    authManager.sessionState(bundle.user),
+  );
+}));
+
+// Exact-origin resume repair for a surviving HttpOnly refresh cookie whose readable CSRF partner
+// was lost by browser state restoration/interrupted cookie updates. It accepts only an authentic
+// current/previous refresh generation and immediately reissues the normal paired cookies; no
+// credential means an ordinary terminal 401, never account creation or ambient login replacement.
+app.post('/api/auth/session/recover', persistentAuthRoute((req, res) => {
+  const transport = requestedPersistentTransport(req, { bootstrap: true });
+  if (transport.kind !== 'web') {
+    throw new PersistentSessionError(400, 'AUTH_TRANSPORT_INVALID', 'Восстановление сессии доступно только браузеру.');
+  }
+  limitPersistentSessionRequest(req, 'recover', transport.refreshToken, {
+    ip: { limit: 30_000, windowMs: 15 * 60 * 1000 },
+    session: { limit: 20, windowMs: 5 * 60 * 1000 },
+  });
+  const bundle = persistentSessions.refresh(transport.refreshToken, {
+    clientKind: 'web',
+    allowCsrfRecovery: true,
+  });
+  return sendPersistentSession(
+    res,
+    transport,
+    bundle,
+    bundle.user,
+    authManager.sessionState(bundle.user),
+  );
+}));
+
+app.post('/api/auth/session/logout', persistentAuthRoute((req, res) => {
+  const transport = requestedPersistentTransport(req);
+  limitPersistentSessionRequest(req, 'logout', transport.refreshToken, {
+    ip: { limit: 10_000, windowMs: 15 * 60 * 1000 },
+    session: { limit: 10, windowMs: 60 * 1000 },
+  });
+  let pushCleanup = { userId: '', endpoints: [] };
+  let logoutSubject = null;
+  let voiceLogout = null;
+  const revoke = db.transaction(() => {
+    logoutSubject = persistentSessions.logoutRefreshSubject(transport.refreshToken, {
+      csrfToken: transport.csrfToken,
+      clientKind: transport.kind,
+    });
+    voiceLogout = releaseVoiceLeaseForPersistentLogout(logoutSubject);
+    const loggedOut = persistentSessions.logoutRefresh(transport.refreshToken, {
+      csrfToken: transport.csrfToken,
+      clientKind: transport.kind,
+      reason: 'logout',
+    });
+    if (logoutSubject?.userId) {
+      clearSessionPushEndpoints(db, logoutSubject.userId, logoutSubject.sessionId);
+      pushCleanup = clearRequestedPushEndpoints(db, req.body, logoutSubject.userId);
+    }
+    return loggedOut;
+  });
+  if (revoke.immediate) revoke.immediate(); else revoke();
+  // Do not discard the only HttpOnly refresh credential before rate-limit/CSRF validation and
+  // server-side revocation have completed. Otherwise a recoverable 429/403 would strand an active
+  // durable session that this browser can no longer retry revoking.
+  if (transport.kind === 'web') res.setHeader('Set-Cookie', clearWebSessionCookieHeaders());
+  closePersistentLogoutRealtime(logoutSubject);
+  if (logoutSubject) finishExactVoiceLogout(
+    logoutSubject.userId, voiceLogout?.released, voiceLogout?.authSubject,
+  );
+  res.setHeader('Cache-Control', 'no-store');
+  return res.json({ ok: true, ...(pushCleanup.userId ? { pushCleanup } : {}) });
+}));
+
+// A browser can rarely retain a valid HttpOnly refresh cookie while its readable CSRF partner is
+// stale (concurrent cookie rotation, restored WebKit state, interrupted response). Normal refresh
+// must remain CSRF-protected, but explicit logout needs a finite recovery path or the local logout
+// fence would permanently block both revocation and a new login. This endpoint is exact-origin,
+// SameSite=Strict, host-only-cookie only and performs revocation without returning any credential.
+app.post('/api/auth/session/logout-recover', persistentAuthRoute((req, res) => {
+  const transport = requestedPersistentTransport(req, { bootstrap: true });
+  if (transport.kind !== 'web') {
+    throw new PersistentSessionError(400, 'AUTH_TRANSPORT_INVALID', 'Восстановление выхода доступно только браузеру.');
+  }
+  limitPersistentSessionRequest(req, 'logout-recover', transport.refreshToken, {
+    ip: { limit: 10_000, windowMs: 15 * 60 * 1000 },
+    session: { limit: 10, windowMs: 60 * 1000 },
+  });
+  let pushCleanup = { userId: '', endpoints: [] };
+  let logoutSubject = null;
+  let voiceLogout = null;
+  const revoke = db.transaction(() => {
+    logoutSubject = persistentSessions.logoutRefreshSubject(transport.refreshToken, {
+      clientKind: 'web', allowCsrfRecovery: true,
+    });
+    voiceLogout = releaseVoiceLeaseForPersistentLogout(logoutSubject);
+    const loggedOut = persistentSessions.logoutRefresh(transport.refreshToken, {
+      clientKind: 'web',
+      reason: 'logout-csrf-recovery',
+      allowCsrfRecovery: true,
+    });
+    if (logoutSubject?.userId) {
+      clearSessionPushEndpoints(db, logoutSubject.userId, logoutSubject.sessionId);
+      pushCleanup = clearRequestedPushEndpoints(db, req.body, logoutSubject.userId);
+    }
+    return loggedOut;
+  });
+  if (revoke.immediate) revoke.immediate(); else revoke();
+  // All parsing, origin/rate checks and authentic-refresh verification completed. Clearing both
+  // cookies now makes recovery idempotent even if the session was already revoked.
+  res.setHeader('Set-Cookie', clearWebSessionCookieHeaders());
+  closePersistentLogoutRealtime(logoutSubject);
+  if (logoutSubject) finishExactVoiceLogout(
+    logoutSubject.userId, voiceLogout?.released, voiceLogout?.authSubject,
+  );
+  res.setHeader('Cache-Control', 'no-store');
+  return res.json({ ok: true, ...(pushCleanup.userId ? { pushCleanup } : {}) });
+}));
+
+// Rolling/native clients still holding a legacy bearer must be able to explicitly destroy that
+// exact credential. The client keeps a bounded pending-logout copy only until a new server has
+// persisted this hash-only tombstone; old deployments simply answer 404 and the retry survives.
+app.post('/api/auth/session/logout-legacy', requireSession, authRoute((req, res) => {
+  if (req.authPayload && req.authPayload.sid) {
+    throw new AuthError(409, 'SESSION_ALREADY_UPGRADED', 'Используйте защищённый выход текущей сессии.');
+  }
+  const token = bearerToken(req);
+  const tokenHash = persistentSessions.legacyTokenKey(token);
+  persistentSessions.checkRate('legacy-logout-ip', req.ip, { limit: 10_000, windowMs: 15 * 60 * 1000 });
+  persistentSessions.checkRate('legacy-logout-token', tokenHash, { limit: 10, windowMs: 60 * 1000 });
+  let pushCleanup = { userId: '', endpoints: [] };
+  const voiceAuth = requestVoiceAuthContext(req);
+  let voiceReleased = null;
+  let upgradedSessionId = '';
+  const revoke = db.transaction(() => {
+    upgradedSessionId = db.prepare(`SELECT id FROM auth_sessions
+      WHERE legacy_token_hash=? AND user_id=?`).get(tokenHash, req.user.id)?.id || '';
+    if (voiceAuth) voiceReleased = releaseVoiceLeaseForAuthSubject(req.user.id, voiceAuth.authSubject);
+    persistentSessions.logoutLegacy(token, req.user, 'logout');
+    if (upgradedSessionId) clearSessionPushEndpoints(db, req.user.id, upgradedSessionId);
+    pushCleanup = clearRequestedPushEndpoints(db, req.body, req.user.id);
+  });
+  if (revoke.immediate) revoke.immediate(); else revoke();
+  closeLegacyRealtimeSession(tokenHash);
+  if (upgradedSessionId) closePersistentRealtimeSession(upgradedSessionId);
+  finishExactVoiceLogout(req.user.id, voiceReleased, voiceAuth?.authSubject);
+  res.setHeader('Cache-Control', 'no-store');
+  return res.json({ ok: true, ...(pushCleanup.userId ? { pushCleanup } : {}) });
+}));
+
 // Старый прямой endpoint больше не создаёт аккаунты: регистрация атомарно завершается только
 // после проверки суточного приглашения и кода из письма.
 app.post('/api/register', (req, res) => res.status(410).json({
@@ -1432,6 +1988,9 @@ app.post('/api/register', (req, res) => res.status(410).json({
 }));
 
 app.post('/api/login', authRoute(async (req, res) => {
+  const persistentTransport = persistentProtocolRequested(req)
+    ? requestedPersistentTransport(req, { bootstrap: true })
+    : null;
   const uname = norm(req.body.username);
   const pass = String(req.body.password || '');
   authManager.checkLoginRate({ username: uname, ip: req.ip });
@@ -1452,6 +2011,9 @@ app.post('/api/login', authRoute(async (req, res) => {
     if (changed.changes === 1) u.passhash = upgraded;
   }
   const state = authManager.sessionState(u);
+  if (persistentTransport) {
+    return createPersistentLogin(req, res, persistentTransport, u, { username: u.username });
+  }
   res.setHeader('Cache-Control', 'no-store');
   res.json({ token: authManager.issueSession(u), ...sessionPayload(u, state), username: u.username });
 }));
@@ -1470,8 +2032,12 @@ app.post('/api/auth/register/start', authRoute(async (req, res) => {
 }));
 
 app.post('/api/auth/register/verify', authRoute((req, res) => {
+  const persistentTransport = persistentProtocolRequested(req)
+    ? requestedPersistentTransport(req, { bootstrap: true })
+    : null;
   const result = authManager.verifyRegistration({ flowId: req.body.flowId, code: req.body.code, ip: req.ip });
   const user = db.prepare('SELECT * FROM users WHERE id=?').get(result.user.id);
+  if (persistentTransport) return createPersistentLogin(req, res, persistentTransport, user);
   res.setHeader('Cache-Control', 'no-store');
   res.json({ token: authManager.issueSession(user), ...sessionPayload(user) });
 }));
@@ -1496,14 +2062,28 @@ app.post('/api/auth/email/start', requireSession, authRoute(async (req, res) => 
 }));
 
 app.post('/api/auth/email/verify', requireSession, authRoute(async (req, res) => {
+  const persistentTransport = persistentProtocolRequested(req)
+    ? requestedPersistentTransport(req)
+    : null;
+  if (persistentTransport) requireCurrentPersistentTransport(req, persistentTransport);
   const result = authManager.verifyEmailBinding({
     userId: req.user.id,
     flowId: req.body.flowId,
     code: req.body.code,
     ip: req.ip,
+    preserveSessionId: persistentTransport ? req.authPayload.sid : '',
+    preserveClientKind: persistentTransport ? persistentTransport.kind : '',
   });
-  const user = db.prepare('SELECT * FROM users WHERE id=?').get(result.user.id);
-  await revokeRuntimeSessions(user.id, user.username, 'email-verified');
+  let user = db.prepare('SELECT * FROM users WHERE id=?').get(result.user.id);
+  const expectedSessionVersion = Number(user.session_version) || 0;
+  const preservedSessionId = result.persistentSession?.sessionId || '';
+  await revokeRuntimeSessions(user.id, user.username, 'email-verified', preservedSessionId);
+  user = unchangedSecurityUser(user.id, expectedSessionVersion);
+  if (persistentTransport) {
+    const bundle = persistentSessions.currentAccess(preservedSessionId, user, persistentTransport.kind);
+    if (!bundle) throw new AuthError(401, 'SESSION_REVOKED', 'Сессия завершена другим защитным действием. Войдите снова.');
+    return sendPersistentSession(res, persistentTransport, bundle, user, authManager.sessionState(user));
+  }
   res.setHeader('Cache-Control', 'no-store');
   res.json({ token: authManager.issueSession(user), ...sessionPayload(user) });
 }));
@@ -1543,14 +2123,27 @@ app.post('/api/auth/password/reset', authRoute(async (req, res) => {
 }));
 
 app.post('/api/auth/password/change', requireAuth, authRoute(async (req, res) => {
+  const persistentTransport = persistentProtocolRequested(req)
+    ? requestedPersistentTransport(req)
+    : null;
+  if (persistentTransport) requireCurrentPersistentTransport(req, persistentTransport);
   const result = await authManager.changePassword({
     userId: req.user.id,
     currentPassword: req.body.currentPassword,
     newPassword: req.body.newPassword,
     ip: req.ip,
+    preserveSessionId: persistentTransport ? req.authPayload.sid : '',
+    preserveClientKind: persistentTransport ? persistentTransport.kind : '',
   });
-  const user = db.prepare('SELECT * FROM users WHERE id=?').get(result.userId);
-  await revokeRuntimeSessions(user.id, user.username, 'password-changed');
+  let user = db.prepare('SELECT * FROM users WHERE id=?').get(result.userId);
+  const preservedSessionId = result.persistentSession?.sessionId || '';
+  await revokeRuntimeSessions(user.id, user.username, 'password-changed', preservedSessionId);
+  user = unchangedSecurityUser(user.id, result.sessionVersion);
+  if (persistentTransport) {
+    const bundle = persistentSessions.currentAccess(preservedSessionId, user, persistentTransport.kind);
+    if (!bundle) throw new AuthError(401, 'SESSION_REVOKED', 'Сессия завершена другим защитным действием. Войдите снова.');
+    return sendPersistentSession(res, persistentTransport, bundle, user, authManager.sessionState(user));
+  }
   res.setHeader('Cache-Control', 'no-store');
   res.json({ token: authManager.issueSession(user), ...sessionPayload(user) });
 }));
@@ -1728,23 +2321,35 @@ app.get('/api/push/vapid', (req, res) => {
   res.json({ enabled: !!VAPID, key: VAPID ? VAPID.publicKey : '' });
 });
 // Сохранить/обновить подписку текущего юзера (+ его пер-типовые предпочтения push).
-app.post('/api/push/subscribe', requireAuth, (req, res) => {
+app.post('/api/push/subscribe', requireAuth, authRoute((req, res) => {
   const sub = req.body && req.body.sub;
   if (!sub || !sub.endpoint || !sub.keys || !sub.keys.p256dh || !sub.keys.auth) return res.status(400).json({ error: 'плохая подписка' });
-  db.prepare('INSERT INTO push_subs(endpoint,user_id,p256dh,auth,created) VALUES(?,?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth')
-    .run(String(sub.endpoint).slice(0, 512), req.user.id, String(sub.keys.p256dh).slice(0, 256), String(sub.keys.auth).slice(0, 128), Date.now());
+  const endpoint = normalizedPushEndpoint(sub.endpoint);
+  if (!endpoint) return res.status(400).json({ error: 'плохая подписка' });
   const pr = req.body && req.body.prefs;
-  if (pr && typeof pr === 'object') {
-    db.prepare('INSERT INTO push_prefs(user_id,mention,stream) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET mention=excluded.mention,stream=excluded.stream')
-      .run(req.user.id, pr.mention === false ? 0 : 1, pr.stream === false ? 0 : 1);
-  }
-  res.json({ ok: true });
-});
+  const privacy = normalizedPushPrivacy(pr && pr.privacy);
+  const mention = pr && pr.mention === false ? 0 : 1;
+  const stream = pr && pr.stream === false ? 0 : 1;
+  // Hold the SQLite write lock while revalidating the exact bearer and inserting the endpoint.
+  // Therefore a concurrent logout either revokes first (this fails) or runs second and deletes the
+  // just-inserted session/provisional endpoint; a request authenticated before logout cannot win late.
+  const persist = db.transaction(() => {
+    const current = authManager.verifySession(bearerToken(req), { requireVerified: true });
+    if (!current?.user || current.user.id !== req.user.id) {
+      throw new AuthError(401, 'SESSION_REVOKED', 'Сессия завершена. Войдите снова.');
+    }
+    const sessionId = typeof current.payload?.sid === 'string' ? current.payload.sid.slice(0, 128) : '';
+    db.prepare('INSERT INTO push_subs(endpoint,user_id,session_id,p256dh,auth,privacy,mention,stream,created) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,session_id=excluded.session_id,p256dh=excluded.p256dh,auth=excluded.auth,privacy=excluded.privacy,mention=excluded.mention,stream=excluded.stream')
+      .run(endpoint, current.user.id, sessionId, String(sub.keys.p256dh).slice(0, 256), String(sub.keys.auth).slice(0, 128), privacy, mention, stream, Date.now());
+  });
+  if (persist.immediate) persist.immediate(); else persist();
+  res.json({ ok: true, userId: req.user.id, endpoint });
+}));
 // Отписаться (юзер выключил уведомления / вышел). Удаляем по endpoint.
 app.post('/api/push/unsubscribe', requireAuth, (req, res) => {
-  const ep = req.body && req.body.endpoint;
-  if (ep) db.prepare('DELETE FROM push_subs WHERE endpoint=? AND user_id=?').run(String(ep), req.user.id);
-  res.json({ ok: true });
+  const endpoint = normalizedPushEndpoint(req.body && req.body.endpoint);
+  const result = unsubscribeOwnedPushEndpoint(db, endpoint, req.user.id);
+  res.json({ ok: true, ...result });
 });
 // Вещатель начал трансляцию → пуш участникам сервера, которых сейчас НЕТ в комнате (те, кто в
 // комнате, узнают через LiveKit/дерево — без дублей). Клиент дёргает это на старте шары.
@@ -2871,10 +3476,17 @@ app.delete('/api/servers/:id/channels/:cid', requireAuth, (req, res) => {
 app.post('/api/servers/:id/clear', requireAuth, (req, res) => {
   const sid = req.params.id;
   if (!can(req.user.id, sid, PERM.MANAGE_MESSAGES)) return res.status(403).json({ error: 'Нет прав' });
+  if (!allowChatMutation(req, res, 'clear')) return;
   const orphaned = uploadUrlsOfMessageRows(selectMessageUploadRows('server_id=?', sid));
-  db.prepare('DELETE FROM messages WHERE server_id=?').run(sid);
-  db.prepare('DELETE FROM reactions WHERE server_id=?').run(sid);
-  res.json({ ok: true });
+  const clearChat = db.transaction(() => {
+    db.prepare('DELETE FROM messages WHERE server_id=?').run(sid);
+    db.prepare('DELETE FROM reactions WHERE server_id=?').run(sid);
+    return bumpChatRevision(sid, { clear: true });
+  });
+  const revision = clearChat();
+  chatRealtime.broadcast(sid, () => chatClearedEvent(sid, revision, chatRealtime.maxEventBytes));
+  scheduleLegacyChatRefresh(req, sid);
+  res.json({ ok: true, revision });
   queueUploadRelease(orphaned);
 });
 
@@ -2889,14 +3501,24 @@ app.get('/api/servers/:id/token', noStoreVoiceTokenResponse, requireAuth, async 
     return res.status(429).json({ error: 'Слишком много запросов голосового токена', retryAfter: mintRate.retryAfterSeconds });
   }
   try {
+    const voiceAuth = requestVoiceAuthContext(req);
+    if (!voiceAuth || voiceAuth.revoked) {
+      return res.status(401).json({ error: 'Authorization session was revoked' });
+    }
     // Connected clients refresh LiveKit grants automatically. Keep the initial
     // grant short-lived so a token copied from an evicted device cannot be
     // reused hours after its voice lease was transferred or revoked.
     const sessionVersion = Math.max(0, Number(req.user.session_version) || 0);
-    const voiceSession = `v${sessionVersion}.${crypto.randomBytes(4).toString('hex')}`;
-    const at = new AccessToken(KEY, SECRET, { identity: req.user.username + '#' + voiceSession, name: req.user.display_name, ttl: '10m' });
+    const voiceSession = createVoiceSessionId(sessionVersion, voiceAuth.authSubject);
+    const identity = req.user.username + '#' + voiceSession;
+    const room = 'srv:' + s.id;
+    const at = new AccessToken(KEY, SECRET, { identity, name: req.user.display_name, ttl: '10m' });
     at.addGrant(hubTokenGrant('srv:' + s.id));
-    res.json({ token: await at.toJwt(), url: WS_URL, room: 'srv:' + s.id, sessionId: voiceSession });
+    const token = await at.toJwt();
+    if (!registerVoiceAuthTarget(req, voiceAuth, room, identity, HUB_TOKEN_TTL_MS)) {
+      return res.status(401).json({ error: 'Authorization session was revoked' });
+    }
+    res.json({ token, url: WS_URL, room, sessionId: voiceSession });
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
@@ -2906,7 +3528,7 @@ app.get('/api/me/settings', requireAuth, (req, res) => {
   res.json({ data: row ? JSON.parse(row.data) : {} });
 });
 app.put('/api/me/settings', requireAuth, (req, res) => {
-  const data = boundedJsonObject(req.body.data || {}, 20000);
+  const data = boundedAccountSettings(req.body.data || {}, 20000);
   db.prepare(`INSERT INTO user_settings(user_id,data) VALUES(?,?)
     ON CONFLICT(user_id) DO UPDATE SET data=excluded.data`).run(req.user.id, data);
   res.json({ ok: true });
@@ -2914,15 +3536,19 @@ app.put('/api/me/settings', requireAuth, (req, res) => {
 
 /* ---------------- PER-SERVER SETTINGS (volumes etc) ---------------- */
 app.get('/api/servers/:id/settings', requireAuth, (req, res) => {
-  const row = db.prepare('SELECT data FROM server_settings WHERE user_id=? AND server_id=?').get(req.user.id, req.params.id);
-  res.json({ data: row ? JSON.parse(row.data) : {} });
+  res.json({ data: serverVolumeSettings.get(req.user.id, req.params.id) });
 });
 app.put('/api/servers/:id/settings', requireAuth, (req, res) => {
   if (!isMember(req.user.id, req.params.id)) return res.status(403).json({ error: 'нет' });
-  const data = boundedJsonObject(req.body.data || {}, 20000);
-  db.prepare(`INSERT INTO server_settings(user_id,server_id,data) VALUES(?,?,?)
-    ON CONFLICT(user_id,server_id) DO UPDATE SET data=excluded.data`).run(req.user.id, req.params.id, data);
+  serverVolumeSettings.replace(req.user.id, req.params.id, req.body.data || {});
   res.json({ ok: true });
+});
+app.patch('/api/servers/:id/settings', requireAuth, (req, res) => {
+  if (!isMember(req.user.id, req.params.id)) return res.status(403).json({ error: 'нет' });
+  const mutation = normalizeServerVolumeMutation(req.body || {});
+  if (!mutation) return res.status(400).json({ error: 'Некорректная настройка громкости' });
+  const next = serverVolumeSettings.patch(req.user.id, req.params.id, mutation);
+  res.json({ ok: true, data: next });
 });
 
 /* ---------------- РЕЙТИНГ (leaderboard) ---------------- */
@@ -2953,18 +3579,61 @@ app.get('/api/servers/:id/leaderboard', requireAuth, (req, res) => {
 
 /* ---------- CHAT HISTORY (persist 7 days) ---------- */
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+const chatRevisions = createChatRevisionStore(db);
+try {
+  const cleaned = cleanupInvalidLegacyReactions(db, chatRevisions);
+  if (cleaned.removed > 0) console.warn(`[db] removed ${cleaned.removed} invalid legacy chat reaction(s)`);
+} catch (error) {
+  console.warn('[db] failed to clean invalid legacy reactions:', error?.message || error);
+}
+function currentChatRevision(serverId) {
+  return chatRevisions.current(serverId);
+}
+function bumpChatRevision(serverId, options) {
+  return chatRevisions.bump(serverId, options);
+}
+
+function parseStoredJson(raw, fallback) {
+  try { return JSON.parse(raw || JSON.stringify(fallback)); }
+  catch { return fallback; }
+}
 
 function serializeHistoryMessage(row, reactions) {
   let level;
   if (row.kind === 'levelup' && row.meta) { try { level = JSON.parse(row.meta).level || undefined; } catch { /**/ } }
   const release = parseReleaseMeta(row.kind, row.meta);
+  const attachments = parseStoredJson(row.attachments, []);
+  const reply = row.reply_to ? parseStoredJson(row.reply_to, null) : undefined;
   return {
     id: row.id, uid: row.user_id, name: row.display_name, color: row.avatar_color, text: row.text,
-    em: JSON.parse(row.emotes || '{}'), img: row.image || '', files: JSON.parse(row.attachments || '[]'),
-    reply: row.reply_to ? JSON.parse(row.reply_to) : undefined, ts: row.created, edited: !!row.edited,
+    em: sanitizeMessageEmotes(parseStoredJson(row.emotes, {})), img: row.image || '',
+    files: Array.isArray(attachments) ? attachments.slice(0, 5) : [],
+    reply: reply && typeof reply === 'object' && !Array.isArray(reply) ? reply : undefined,
+    ts: row.created, edited: !!row.edited,
     reactions: reactions && reactions.length ? reactions : undefined,
-    kind: row.kind || undefined, level, release,
+    kind: row.kind || undefined, level, release, mkey: row.client_key || undefined,
   };
+}
+
+function exactReactionSnapshot(serverId, messageId) {
+  const rows = db.prepare(`SELECT emote_id,emote_name,user_id FROM reactions
+    WHERE server_id=? AND msg_id=? ORDER BY emote_id ASC,created ASC,user_id ASC`).all(serverId, messageId);
+  const aggregate = new Map();
+  for (const row of rows) {
+    let item = aggregate.get(row.emote_id);
+    if (!item) {
+      item = { id: row.emote_id, name: row.emote_name, count: 0, users: new Set() };
+      aggregate.set(row.emote_id, item);
+    }
+    item.count++;
+    item.users.add(row.user_id);
+  }
+  return (recipientId) => [...aggregate.values()].map((item) => ({
+    id: item.id,
+    name: item.name,
+    count: item.count,
+    mine: item.users.has(recipientId),
+  }));
 }
 
 app.get('/api/servers/:id/messages', requireAuth, (req, res) => {
@@ -2972,32 +3641,38 @@ app.get('/api/servers/:id/messages', requireAuth, (req, res) => {
   if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
   const limit = Math.min(60, Math.max(1, parseInt(req.query.limit, 10) || 30));
   const before = parseInt(req.query.before, 10) || 0; // курсор: id, СТАРШЕ которого грузим (0 = последняя страница)
-  const minTs = Date.now() - WEEK_MS;
-  // берём limit+1, чтобы понять, есть ли ещё более старые сообщения (hasMore)
-  const rows = before > 0
-    ? db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,edited,kind,meta FROM messages WHERE server_id=? AND created>? AND id<? ORDER BY id DESC LIMIT ?').all(sid, minTs, before, limit + 1)
-    : db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,edited,kind,meta FROM messages WHERE server_id=? AND created>? ORDER BY id DESC LIMIT ?').all(sid, minTs, limit + 1);
-  const hasMore = rows.length > limit;
-  const page = rows.slice(0, limit).reverse(); // ASC: старые → новые (как рисуем в чате)
-  // Реакции по загруженным сообщениям: агрегируем в {id,name,count,mine} на сообщение.
-  const reactByMsg = new Map();
-  const pageIds = page.map(r => r.id);
-  if (pageIds.length) {
-    const ph = pageIds.map(() => '?').join(',');
-    const rr = db.prepare(`SELECT msg_id, emote_id, emote_name, user_id FROM reactions WHERE server_id=? AND msg_id IN (${ph})`).all(sid, ...pageIds);
-    for (const x of rr) {
-      let em = reactByMsg.get(x.msg_id); if (!em) { em = new Map(); reactByMsg.set(x.msg_id, em); }
-      let e = em.get(x.emote_id); if (!e) { e = { id: x.emote_id, name: x.emote_name, count: 0, mine: false }; em.set(x.emote_id, e); }
-      e.count++; if (x.user_id === req.user.id) e.mine = true;
+  const readSnapshot = db.transaction(() => {
+    const minTs = Date.now() - WEEK_MS;
+    // limit+1 distinguishes the final page. All rows, reactions and revision are read inside one
+    // SQLite snapshot so a client can safely buffer and replay WS events with rev > revision.
+    const rows = before > 0
+      ? db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,edited,kind,meta,client_key FROM messages WHERE server_id=? AND created>? AND id<? ORDER BY id DESC LIMIT ?').all(sid, minTs, before, limit + 1)
+      : db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,edited,kind,meta,client_key FROM messages WHERE server_id=? AND created>? ORDER BY id DESC LIMIT ?').all(sid, minTs, limit + 1);
+    const hasMore = rows.length > limit;
+    const page = rows.slice(0, limit).reverse();
+    const reactByMsg = new Map();
+    const pageIds = page.map(r => r.id);
+    if (pageIds.length) {
+      const ph = pageIds.map(() => '?').join(',');
+      const rr = db.prepare(`SELECT msg_id, emote_id, emote_name, user_id FROM reactions WHERE server_id=? AND msg_id IN (${ph})`).all(sid, ...pageIds);
+      for (const x of rr) {
+        let em = reactByMsg.get(x.msg_id); if (!em) { em = new Map(); reactByMsg.set(x.msg_id, em); }
+        let e = em.get(x.emote_id); if (!e) { e = { id: x.emote_id, name: x.emote_name, count: 0, mine: false }; em.set(x.emote_id, e); }
+        e.count++; if (x.user_id === req.user.id) e.mine = true;
+      }
     }
-  }
-  res.json({
-    hasMore,
-    messages: page.map((r) => serializeHistoryMessage(
-      r,
-      reactByMsg.has(r.id) ? [...reactByMsg.get(r.id).values()] : undefined,
-    )),
+    const chatState = chatRevisions.snapshot(sid);
+    return {
+      revision: chatState.revision,
+      lastClearRevision: chatState.lastClearRevision,
+      hasMore,
+      messages: page.map((r) => serializeHistoryMessage(
+        r,
+        reactByMsg.has(r.id) ? [...reactByMsg.get(r.id).values()] : undefined,
+      )),
+    };
   });
+  res.json(readSnapshot());
 });
 
 // Точное назначение уведомления: не заставляем клиент пролистывать всю недельную историю.
@@ -3006,7 +3681,7 @@ app.get('/api/servers/:id/messages/:mid', requireAuth, (req, res) => {
   if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
   const mid = Number(req.params.mid);
   if (!Number.isSafeInteger(mid) || mid <= 0) return res.status(400).json({ error: 'bad' });
-  const row = db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,edited,kind,meta FROM messages WHERE server_id=? AND id=? AND created>?').get(sid, mid, Date.now() - WEEK_MS);
+  const row = db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,edited,kind,meta,client_key FROM messages WHERE server_id=? AND id=? AND created>?').get(sid, mid, Date.now() - WEEK_MS);
   if (!row) return res.status(404).json({ error: 'no msg' });
   const reactionMap = new Map();
   const reactionRows = db.prepare('SELECT emote_id, emote_name, user_id FROM reactions WHERE server_id=? AND msg_id=?').all(sid, mid);
@@ -3019,7 +3694,7 @@ app.get('/api/servers/:id/messages/:mid', requireAuth, (req, res) => {
     item.count++;
     if (reaction.user_id === req.user.id) item.mine = true;
   }
-  res.json({ message: serializeHistoryMessage(row, [...reactionMap.values()]) });
+  res.json({ revision: currentChatRevision(sid), message: serializeHistoryMessage(row, [...reactionMap.values()]) });
 });
 
 // Migration recovery: after checking the person outside RelayApp, exact denis can issue a short
@@ -3041,7 +3716,9 @@ function sanitizeAttachments(raw, userId) {
     const urlOk = kind === 'image' ? UPLOAD_RE.test(url) : FILE_URL_RE.test(url);
     if (!urlOk || !ownsActiveUpload(userId, url, kind)) continue;
     const name = String(a.name || '').slice(0, 255);
-    const size = Number.isFinite(a.size) ? Math.max(0, Math.min(10 * 1024 * 1024, a.size)) : 0;
+    const size = Number.isFinite(a.size)
+      ? Math.round(Math.max(0, Math.min(10 * 1024 * 1024, a.size)))
+      : 0;
     const mime = String(a.mime || '').slice(0, 100);
     const width = kind === 'image' && Number.isFinite(a.width) ? Math.max(1, Math.min(4096, Math.round(a.width))) : 0;
     const height = kind === 'image' && Number.isFinite(a.height) ? Math.max(1, Math.min(4096, Math.round(a.height))) : 0;
@@ -3109,15 +3786,32 @@ function buildReplySnapshot(serverId, userId, raw) {
 app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
   const sid = req.params.id;
   if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
+  const clientKey = String(req.body.key || '').slice(0, 64);
+  if (clientKey) {
+    const duplicate = db.prepare('SELECT id FROM messages WHERE server_id=? AND user_id=? AND client_key=?')
+      .get(sid, req.user.id, clientKey);
+    // A lost-response retry is recovery, not a fresh mutation. It must stay available even when the
+    // sender exhausted the message rate after the first successful INSERT.
+    if (duplicate) return res.json({ ok: true, id: Number(duplicate.id), revision: currentChatRevision(sid) });
+  }
+  if (!allowChatMutation(req, res, 'message')) return;
   const text = String(req.body.text || '').slice(0, 1000);
   const image = (() => { const v = String(req.body.image || ''); return UPLOAD_RE.test(v) && ownsActiveUpload(req.user.id, v, 'image') ? v : ''; })();
   const attachments = sanitizeAttachments(req.body.files, req.user.id);
   if (!text.trim() && !image && !attachments.length) return res.status(400).json({ error: 'пусто' });
-  const em = boundedJsonObject(req.body.em || {}, 4000);
+  if (hasAllMention(text)) {
+    // A single message must not turn into an unbounded push/WS fanout. Large communities can still
+    // post normal messages; only the explicit all-member notification is rejected at this bound.
+    if (!can(req.user.id, sid, PERM.MANAGE_MESSAGES)) {
+      return res.status(403).json({ error: 'Нет права на массовое упоминание участников' });
+    }
+    if (memberCount(sid) > 2000) return res.status(413).json({ error: 'Слишком много участников для массового упоминания' });
+    if (!allowChatMutation(req, res, 'mentionAll', { includeTotal: false })) return;
+  }
+  const em = JSON.stringify(sanitizeMessageEmotes(req.body.em));
   // reply-ссылка на исходное сообщение (санитайзим, ограничиваем размер)
   const replyTo = buildReplySnapshot(sid, req.user.id, req.body.reply);
   const now = Date.now();
-  const clientKey = String(req.body.key || '').slice(0, 64);
   // kind/meta: пока единственный спец-тип — 'levelup' (карточка достижения). Анти-спуф: принимаем ТОЛЬКО
   // если фича включена И заявленный уровень ≤ реального уровня автора (сервер — источник истины).
   let kind = '', meta = '';
@@ -3129,16 +3823,38 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
   // OR IGNORE: повторный POST с тем же (server_id,user_id,client_key) схлопывается (retry после
   // потери ответа). info.changes===0 → это дубль: не чистим/не пушим повторно, но отвечаем ok
   // (сообщение уже в БД — для клиента это успех).
-  const info = db.prepare('INSERT OR IGNORE INTO messages(server_id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,client_key,kind,meta) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)')
-    .run(sid, req.user.id, req.user.display_name, req.user.avatar_color, text, em, image, JSON.stringify(attachments), replyTo, now, clientKey, kind, meta);
-  // Возвращаем DB-id сообщения → клиент усыновляет sid на оптимистичное сообщение СРАЗУ (без ожидания
-  // refetch): иначе свежеотправленное без sid нельзя удалить/реагировать, а реплай на него не кликабелен.
-  // На дубль-ретрае (changes===0) достаём уже существующий id по client_key.
-  const msgId = info.changes ? info.lastInsertRowid
-    : (clientKey ? (db.prepare('SELECT id FROM messages WHERE server_id=? AND user_id=? AND client_key=?').get(sid, req.user.id, clientKey) || {}).id : null);
-  res.json({ ok: true, id: msgId });
-  if (info.changes === 0) return; // дубль — дальше (cleanup/push) не нужно
-  db.prepare('DELETE FROM messages WHERE server_id=? AND created<?').run(sid, now - WEEK_MS);
+  const persistMessage = db.transaction(() => {
+    const info = db.prepare('INSERT OR IGNORE INTO messages(server_id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,client_key,kind,meta) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(sid, req.user.id, req.user.display_name, req.user.avatar_color, text, em, image, JSON.stringify(attachments), replyTo, now, clientKey, kind, meta);
+    // На duplicate retry mutation/revision не повторяются. Точный DB id всё равно возвращается
+    // отправителю, чтобы его optimistic message не завис без sid после потерянного HTTP-ответа.
+    const msgId = info.changes ? Number(info.lastInsertRowid)
+      : (clientKey ? Number((db.prepare('SELECT id FROM messages WHERE server_id=? AND user_id=? AND client_key=?').get(sid, req.user.id, clientKey) || {}).id || 0) : 0);
+    if (info.changes === 0) return { created: false, msgId, revision: currentChatRevision(sid), expired: 0, row: null };
+    const retentionCutoff = now - WEEK_MS;
+    db.prepare(`DELETE FROM reactions WHERE server_id=? AND msg_id IN (
+      SELECT id FROM messages WHERE server_id=? AND created<?
+    )`).run(sid, sid, retentionCutoff);
+    const expired = db.prepare('DELETE FROM messages WHERE server_id=? AND created<?').run(sid, retentionCutoff).changes;
+    const revision = bumpChatRevision(sid);
+    const row = db.prepare(`SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,
+      reply_to,created,edited,kind,meta,client_key FROM messages WHERE server_id=? AND id=?`).get(sid, msgId);
+    return { created: true, msgId, revision, expired, row };
+  });
+  const persisted = persistMessage();
+  if (!persisted.created) return res.json({ ok: true, id: persisted.msgId || null, revision: persisted.revision });
+  const canonicalMessage = persisted.row ? serializeHistoryMessage(persisted.row) : null;
+  // If weekly retention removed rows in the same revision, an incremental upsert alone would leave
+  // those old messages on already-open clients. Force an exact HTTP snapshot as the safe fallback.
+  if (persisted.expired > 0) {
+    chatRealtime.broadcast(sid, () => null);
+  } else {
+    chatRealtime.broadcast(sid, () => messageCreatedEvent(
+      sid, persisted.revision, canonicalMessage, persisted.row && persisted.row.client_key, chatRealtime.maxEventBytes,
+    ));
+  }
+  scheduleLegacyChatRefresh(req, sid);
+  res.json({ ok: true, id: persisted.msgId, revision: persisted.revision });
   // (сообщения в XP НЕ входят — рейтинг только по голосу+эфиру)
   // Уведомление упомянутым/адресату ответа. ДВА канала: (1) глобальный notify-WS — мгновенно тем,
   // кто онлайн в приложении (натив + веб), для ЛЮБОГО сервера, даже НЕ подключённого («куда зайти»);
@@ -3159,7 +3875,7 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
       if (!targets.length) return;
       const body = text.slice(0, 140) || (image ? '🖼 изображение' : (attachments.length ? '📎 вложение' : ''));
       const nm = serverName(sid);
-      const notificationMsgId = Number(info.lastInsertRowid);
+      const notificationMsgId = persisted.msgId;
       const notificationTag = 'mention:' + sid + ':' + (clientKey || notificationMsgId);
       for (const uid of targets) notifyUser(uid, { t: 'notify', kind: 'mention', serverId: sid, serverName: nm, title: req.user.display_name, body, msgId: notificationMsgId, tag: notificationTag });
       if (VAPID) pushToUsers('mention', targets, {
@@ -3170,39 +3886,80 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
     } catch (e) { console.error('[notify] mention:', e && e.message); }
   })();
 });
-// Реакция 7TV на сообщение (тогл). Realtime-раздача — через data-канал клиента (как чат), сервер персистит.
+// Реакция 7TV на сообщение (тогл). Сервер рассылает точный агрегированный snapshot после записи.
 app.post('/api/servers/:id/messages/:mid/react', requireAuth, (req, res) => {
   const sid = req.params.id;
   if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
+  if (!allowChatMutation(req, res, 'reaction')) return;
   const mid = parseInt(req.params.mid, 10);
-  const emoteId = String(req.body.emoteId || '').slice(0, 64);
-  const emoteName = String(req.body.emoteName || '').slice(0, 64);
-  if (!mid || !emoteId || !emoteName) return res.status(400).json({ error: 'bad' });
+  if (typeof req.body.add !== 'boolean') return res.status(400).json({ error: 'bad' });
+  const identity = canonicalReactionIdentity(req.body.emoteId, req.body.emoteName);
+  if (!mid || !identity) return res.status(400).json({ error: 'bad' });
+  const { id: emoteId, name: emoteName } = identity;
   const msg = db.prepare('SELECT id FROM messages WHERE id=? AND server_id=?').get(mid, sid);
   if (!msg) return res.status(404).json({ error: 'no msg' });
-  if (req.body.add) {
-    const count = db.prepare('SELECT COUNT(*) c FROM reactions WHERE server_id=? AND msg_id=?').get(sid, mid).c;
-    if (count >= 1000) return res.status(429).json({ error: 'Слишком много реакций' });
-    db.prepare('INSERT OR IGNORE INTO reactions(server_id,msg_id,emote_id,emote_name,user_id,created) VALUES(?,?,?,?,?,?)').run(sid, mid, emoteId, emoteName, req.user.id, Date.now());
+  const mutateReaction = db.transaction(() => {
+    let changes = 0;
+    if (req.body.add) {
+      const existing = db.prepare('SELECT 1 FROM reactions WHERE server_id=? AND msg_id=? AND emote_id=? AND user_id=?')
+        .get(sid, mid, emoteId, req.user.id);
+      if (!existing) {
+        const count = db.prepare('SELECT COUNT(*) c FROM reactions WHERE server_id=? AND msg_id=?').get(sid, mid).c;
+        if (count >= 1000) return { full: true, changes: 0, revision: currentChatRevision(sid) };
+      }
+      changes = db.prepare('INSERT OR IGNORE INTO reactions(server_id,msg_id,emote_id,emote_name,user_id,created) VALUES(?,?,?,?,?,?)')
+        .run(sid, mid, emoteId, emoteName, req.user.id, Date.now()).changes;
+    } else {
+      changes = db.prepare('DELETE FROM reactions WHERE server_id=? AND msg_id=? AND emote_id=? AND user_id=?')
+        .run(sid, mid, emoteId, req.user.id).changes;
+    }
+    return { full: false, changes, revision: changes > 0 ? bumpChatRevision(sid) : currentChatRevision(sid) };
+  });
+  const mutation = mutateReaction();
+  if (mutation.full) return res.status(429).json({ error: 'Слишком много реакций' });
+  const reactionsFor = exactReactionSnapshot(sid, mid);
+  if (mutation.changes > 0) {
+    chatRealtime.broadcast(sid, (recipientId) => reactionsUpdatedEvent(
+      sid, mutation.revision, mid, reactionsFor(recipientId), chatRealtime.maxEventBytes,
+    ));
+    scheduleLegacyChatRefresh(req, sid);
   }
-  else db.prepare('DELETE FROM reactions WHERE server_id=? AND msg_id=? AND emote_id=? AND user_id=?').run(sid, mid, emoteId, req.user.id);
-  res.json({ ok: true });
+  res.json({
+    ok: true,
+    changed: mutation.changes > 0,
+    revision: mutation.revision,
+    reactions: reactionsFor(req.user.id),
+  });
 });
-// Редактирование СВОЕГО сообщения (флаг edited + новый текст). Realtime — через data-канал.
+// Редактирование СВОЕГО сообщения (флаг edited + новый текст).
 app.patch('/api/servers/:id/messages/:mid', requireAuth, (req, res) => {
   const sid = req.params.id;
+  if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
+  if (!allowChatMutation(req, res, 'edit')) return;
   const mid = parseInt(req.params.mid, 10);
   const text = String(req.body.text || '').slice(0, 1000);
   if (!mid || !text.trim()) return res.status(400).json({ error: 'пусто' });
   const msg = db.prepare('SELECT user_id FROM messages WHERE id=? AND server_id=?').get(mid, sid);
   if (!msg) return res.status(404).json({ error: 'no msg' });
   if (msg.user_id !== req.user.id) return res.status(403).json({ error: 'не твоё' });
-  db.prepare('UPDATE messages SET text=?, edited=1 WHERE id=?').run(text, mid);
-  res.json({ ok: true });
+  const editMessage = db.transaction(() => {
+    const changed = db.prepare('UPDATE messages SET text=?, edited=1 WHERE id=? AND server_id=?').run(text, mid, sid).changes;
+    return { changed, revision: changed > 0 ? bumpChatRevision(sid) : currentChatRevision(sid) };
+  });
+  const edited = editMessage();
+  if (edited.changed > 0) {
+    chatRealtime.broadcast(sid, () => messageUpdatedEvent(
+      sid, edited.revision, mid, text, chatRealtime.maxEventBytes,
+    ));
+    scheduleLegacyChatRefresh(req, sid);
+  }
+  res.json({ ok: true, revision: edited.revision });
 });
 // Удаление сообщения: автор ИЛИ владелец сервера. Сносим и его реакции.
 app.delete('/api/servers/:id/messages/:mid', requireAuth, (req, res) => {
   const sid = req.params.id;
+  if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
+  if (!allowChatMutation(req, res, 'delete')) return;
   const mid = parseInt(req.params.mid, 10);
   if (!mid) return res.status(400).json({ error: 'bad' });
   const msg = db.prepare('SELECT user_id FROM messages WHERE id=? AND server_id=?').get(mid, sid);
@@ -3210,15 +3967,28 @@ app.delete('/api/servers/:id/messages/:mid', requireAuth, (req, res) => {
   const owner = (db.prepare('SELECT owner_id FROM servers WHERE id=?').get(sid) || {}).owner_id === req.user.id;
   if (msg.user_id !== req.user.id && !owner) return res.status(403).json({ error: 'нельзя' });
   const orphaned = uploadUrlsOfMessageRows(selectMessageUploadRows('id=?', mid));
-  db.prepare('DELETE FROM messages WHERE id=?').run(mid);
-  db.prepare('DELETE FROM reactions WHERE server_id=? AND msg_id=?').run(sid, mid);
-  res.json({ ok: true });
+  const removeMessage = db.transaction(() => {
+    const changed = db.prepare('DELETE FROM messages WHERE id=? AND server_id=?').run(mid, sid).changes;
+    db.prepare('DELETE FROM reactions WHERE server_id=? AND msg_id=?').run(sid, mid);
+    return { changed, revision: changed > 0 ? bumpChatRevision(sid) : currentChatRevision(sid) };
+  });
+  const removed = removeMessage();
+  if (removed.changed > 0) {
+    chatRealtime.broadcast(sid, () => messageDeletedEvent(
+      sid, removed.revision, mid, chatRealtime.maxEventBytes,
+    ));
+    scheduleLegacyChatRefresh(req, sid);
+  }
+  res.json({ ok: true, revision: removed.revision });
   // Файлы удалённого сообщения больше никому не нужны — если на них не ссылается ничто другое
   // (цитата в чужом сообщении, аватар). Разбор отложенный: см. queueUploadRelease.
   queueUploadRelease(orphaned);
 });
 
-app.get('/healthz', (req, res) => res.send('ok'));
+// Deployment treats this exact marker as a compatibility contract, not merely liveness. Never
+// expose a web image that needs durable auth/media isolation until the running API advertises both.
+const HEALTH_CAPABILITY_MARKER = 'ok persistent-v1 voice-media-v1';
+app.get('/healthz', (req, res) => res.type('text/plain').send(HEALTH_CAPABILITY_MARKER));
 
 /* ---------- INTERNAL RELEASE PATCH NOTES ----------
  * CI вызывает эти маршруты только изнутри token-контейнера. Prepare выполняется ДО замены
@@ -3253,13 +4023,15 @@ function sendReleaseRefresh(ws, serverId, messageId) {
   if (ws._releaseRefreshAckSids.has(sid)) return false;
   const now = Date.now();
   if (now - (ws._releaseRefreshSentAt.get(sid) || 0) < RELEASE_REFRESH_COOLDOWN_MS) return false;
-  try {
-    ws.send(JSON.stringify({ t: 'chat-refresh', serverId, lastReleaseSid: sid }));
-    // Sending the command is not an ACK: the following HTTP history merge may still fail.
-    // The client acknowledges lastReleaseSid in its next presence frame only after that merge.
-    ws._releaseRefreshSentAt.set(sid, now);
-    return true;
-  } catch { return false; }
+  const sent = sendBoundedNotifyFrames(new Set([ws]), { t: 'chat-refresh', serverId, lastReleaseSid: sid });
+  if (sent.delivered !== 1) return false;
+  // Sending the command is not an ACK: the following HTTP history merge may still fail.
+  // The client acknowledges lastReleaseSid in its next presence frame only after that merge.
+  if (ws._releaseRefreshSentAt.size >= 64 && !ws._releaseRefreshSentAt.has(sid)) {
+    ws._releaseRefreshSentAt.delete(ws._releaseRefreshSentAt.keys().next().value);
+  }
+  ws._releaseRefreshSentAt.set(sid, now);
+  return true;
 }
 
 function recoverRecentReleaseForSocket(ws, serverId) {
@@ -3389,7 +4161,13 @@ const treeSrv = attachTreeServer(server, {
     }
     if (!authManager) throw new Error('auth is starting');
     const context = authManager.verifySession(encoded, { requireVerified: true });
-    return { id: context.user.id, u: context.user.username };
+    const sid = context.payload.sid || '';
+    return {
+      id: context.user.id,
+      u: context.user.username,
+      sid,
+      legacyTokenHash: sid ? '' : persistentSessions.legacyTokenKey(encoded),
+    };
   },
   authorizePeer: (uid, params) => {
     if (uid === 'virtual-relay' && params.virtual) return true;
@@ -3411,15 +4189,17 @@ const treeSrv = attachTreeServer(server, {
 
 /* ---------- Глобальный notify-WS (/ws): уведомления по любому серверу, вкл. не подключённый ---------- */
 // maxPayload: дефолт ws — 100 МиБ. Клиент шлёт сюда только presence/ack-фреймы в сотни байт.
-const notifyWss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
+const notifyWss = new WebSocketServer({ noServer: true, maxPayload: 4 * 1024 });
+const notifyInboundGuard = createNotifyInboundGuard();
 notifyWss.on('error', (e) => console.error('[notify-ws] server error:', e && e.message));
 server.on('upgrade', (req, socket, head) => {
   let url; try { url = new URL(req.url, 'http://internal'); } catch { return; }
   if (url.pathname !== '/ws') return; // не наш путь — оставляем tree-хендлеру
   let context;
+  const notifyToken = url.searchParams.get('token') || '';
   try {
     if (!authManager) throw new Error('auth is starting');
-    context = authManager.verifySession(url.searchParams.get('token') || '', { requireVerified: true });
+    context = authManager.verifySession(notifyToken, { requireVerified: true });
   }
   catch (e) { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
   const uid = context.user.id;
@@ -3427,40 +4207,80 @@ server.on('upgrade', (req, socket, head) => {
   notifyWss.handleUpgrade(req, socket, head, (ws) => {
     ws._away = false; // idle-статус сессии: клиент шлёт {t:'presence',away} при бездействии. Юзер «away» (жёлтый), если ВСЕ его сокеты idle.
     ws._activeServerId = '';
+    ws._chatServerId = '';
+    ws._chatProtocolV1 = false;
     ws._userId = uid;
+    ws._authSessionId = typeof context.payload.sid === 'string' ? context.payload.sid : '';
+    ws._authLegacyTokenHash = ws._authSessionId ? '' : persistentSessions.legacyTokenKey(notifyToken);
+    ws._openedAt = Date.now();
     ws._releaseRefreshAckSids = new Set();
     ws._releaseRefreshSentAt = new Map();
+    ws._chatResyncServers = new Set();
+    ws._chatResyncReasons = new Map();
+    ws._chatResyncAll = false;
     ws._isAlive = true;
     let set = notifyConns.get(uid); if (!set) { set = new Set(); notifyConns.set(uid, set); }
-    set.add(ws);
+    // Capacity refusal affects only this extra realtime transport. It neither revokes nor shortens
+    // the account session, and existing devices stay stable instead of evicting one another.
+    if (!admitBoundedNotifySocket(set, ws, MAX_NOTIFY_SOCKETS_PER_ACCOUNT)) return;
+    // Rollout capability: clients keep the legacy LiveKit path until this authenticated frame is
+    // observed, then HTTP-resync before accepting canonical chat-event incrementals.
+    try { ws.send(JSON.stringify(chatReadyEvent())); } catch (e) { /**/ }
     // A newly opened socket only observes the lease; reconnect never claims it.
     try { ws.send(JSON.stringify(voiceLeaseEvent(voiceLeases.read(uid), 'snapshot'))); } catch (e) { /**/ }
     ws.on('close', () => { const s = notifyConns.get(uid); if (s) { s.delete(ws); if (!s.size) notifyConns.delete(uid); } });
-    ws.on('pong', () => { ws._isAlive = true; });
+    ws.on('pong', () => { ws._isAlive = true; chatRealtime.flushSocket(ws); });
     ws.on('error', () => { try { ws.close(); } catch (e) {} });
     ws.on('message', (data) => {
       try {
-        const d = JSON.parse(data);
-        if (!d) return;
+        const inspected = notifyInboundGuard.inspect(ws, data);
+        if (!inspected.allowed) {
+          try { ws.close(inspected.code, inspected.reason); } catch { try { ws.terminate(); } catch { /**/ } }
+          return;
+        }
+        const d = inspected.value;
+        chatRealtime.flushSocket(ws);
         // Прикладной ping/pong. Транспортный ws.ping() браузеру не виден из JS (pong шлёт сам движок),
         // поэтому клиент не может отличить живой сокет от полуоткрытого и никогда не переподключался.
         // Этот ответ — единственный регулярный входящий фрейм, по которому клиент судит о живости.
         if (d.t === 'ping') { try { ws.send(JSON.stringify({ t: 'pong' })); } catch (e) { /**/ } return; }
         if (d.t !== 'presence') return;
+        if (d.chatProtocol === 1) ws._chatProtocolV1 = true;
         ws._away = !!d.away;
         const requested = typeof d.activeServerId === 'string' ? d.activeServerId.trim().slice(0, 80) : '';
         const activeServerId = requested && isMember(uid, requested) ? requested : '';
-        const changed = activeServerId !== ws._activeServerId;
+        const activeChanged = activeServerId !== ws._activeServerId;
         ws._activeServerId = activeServerId;
+        const requestedConnected = typeof d.connectedServerId === 'string' ? d.connectedServerId.trim().slice(0, 80) : '';
+        const chatServerId = requestedConnected && isMember(uid, requestedConnected) ? requestedConnected : '';
+        const chatChanged = chatServerId !== ws._chatServerId;
+        ws._chatServerId = chatServerId;
         const lastReleaseSid = Number(d.lastReleaseSid);
-        if (Number.isSafeInteger(lastReleaseSid) && lastReleaseSid > 0) {
+        // Only acknowledge a refresh this exact authenticated socket was actually asked to merge.
+        // Arbitrary presence ids must not grow the ACK set or pre-ack a future release forever.
+        if (Number.isSafeInteger(lastReleaseSid) && lastReleaseSid > 0
+          && ws._releaseRefreshSentAt.has(lastReleaseSid)) {
+          if (ws._releaseRefreshAckSids.size >= 64 && !ws._releaseRefreshAckSids.has(lastReleaseSid)) {
+            ws._releaseRefreshAckSids.delete(ws._releaseRefreshAckSids.values().next().value);
+          }
           ws._releaseRefreshAckSids.add(lastReleaseSid);
           ws._releaseRefreshSentAt.delete(lastReleaseSid);
         }
         // Не refetch-им историю на каждом обычном входе. Узкая recovery-проверка нужна только
         // для недавнего release, который мог быть записан, пока API/notify-WS перезапускались.
-        if (changed && activeServerId && ws.readyState === 1) {
+        if (activeChanged && activeServerId && ws.readyState === 1) {
           recoverRecentReleaseForSocket(ws, activeServerId);
+          if (!ws._chatProtocolV1) {
+            sendBoundedNotifyFrames(new Set([ws]), {
+              t: 'chat-refresh', serverId: activeServerId, reason: 'chat-mutation',
+            });
+          }
+        }
+        // Subscription ACK comes only after membership validation and assignment. The client now
+        // fetches a revisioned HTTP snapshot while subsequent events are already routed/buffered.
+        if (chatChanged && chatServerId && ws.readyState === 1) {
+          chatRealtime.requestResync(ws, chatServerId, 'reconnect');
+          chatRealtime.flushSocket(ws);
         }
       } catch (e) { /* ping/мусор игнорим */ }
     });
@@ -3536,11 +4356,21 @@ async function startServer() {
       console.warn('[auth] email delivery is unavailable; legacy sessions remain accessible until SMTP is configured');
     }
   }
+  persistentSessions = createPersistentSessionManager({
+    db,
+    sessionSecret: SESSION_SECRET,
+    accessTtlSeconds: boundedIntegerEnv('AUTH_ACCESS_TTL_SEC', 900, 300, 3600),
+  });
   authManager = createAuthManager({
     db,
     mailer,
     codePepper,
     sessionSecret: SESSION_SECRET,
+    verifyAccessSession: (payload, user) => persistentSessions.verifyAccessPayload(payload, user),
+    verifyLegacySession: (token, user) => persistentSessions.verifyLegacyToken(token, user),
+    preserveSecuritySession: ({ sessionId, user, reason, clientKind }) => (
+      persistentSessions.preserveAfterSecurityChange(sessionId, user, reason, clientKind)
+    ),
     logger: {
       warn: (message) => console.warn(message),
       error: (message) => console.error(message),

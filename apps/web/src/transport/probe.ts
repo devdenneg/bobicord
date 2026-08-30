@@ -11,6 +11,7 @@
 
 import { getToken } from '../api';
 import { detectSymmetricNat } from './natDetect';
+import { sampleRtcStats } from '../rtcStatsSampler';
 import { isTauri } from '../native';
 
 const CACHE_KEY = 'probeUpload';
@@ -107,8 +108,8 @@ function makeCanvasTrack(): { track: MediaStreamTrack; stop: () => void } {
 
 /** Читает candidate-pair.availableOutgoingBitrate (бит/с) из активной пары; null если нет. */
 async function readAvailableOutgoing(pc: RTCPeerConnection): Promise<number | null> {
-  let report: RTCStatsReport;
-  try { report = await pc.getStats(); } catch { return null; }
+  const report = await sampleRtcStats(pc);
+  if (!report) return null;
   let aob: number | null = null;
   report.forEach((s: any) => {
     if (s.type === 'candidate-pair' && (s.nominated || s.state === 'succeeded') && typeof s.availableOutgoingBitrate === 'number') {
@@ -192,12 +193,21 @@ async function measureUploadOnce(opts?: { onPhase?: (p: string) => void }): Prom
       const runMeasurement = () => {
         const t0 = Date.now();
         const samples: Array<{ t: number; v: number }> = [];
-        const iv = window.setInterval(async () => {
-          if (!pc || settled) return;
-          const aob = await readAvailableOutgoing(pc);
+        let statsTimer: number | null = null;
+        let statsStopped = false;
+        const stopStats = () => {
+          statsStopped = true;
+          if (statsTimer !== null) window.clearTimeout(statsTimer);
+          statsTimer = null;
+        };
+        const sample = async () => {
+          const exactPc = pc;
+          if (!exactPc || settled || statsStopped) return;
+          const aob = await readAvailableOutgoing(exactPc);
+          if (pc !== exactPc || settled || statsStopped) return;
           if (aob != null && aob > 0) samples.push({ t: Date.now() - t0, v: aob });
           if (Date.now() - t0 >= MEASURE_MS) {
-            clearInterval(iv);
+            stopStats();
             // Плато (p90) хвоста после прогрева. Медиана давала середину разгона — занижение ~×2.
             const tail = samples.filter((s) => s.t >= WARMUP_MS).map((s) => s.v);
             const bwe = plateau(tail.length ? tail : samples.map((s) => s.v));
@@ -207,9 +217,14 @@ async function measureUploadOnce(opts?: { onPhase?: (p: string) => void }): Prom
               // BWE не поднялось (нет transport-cc / трек не разогнался) — фолбэк на DataChannel.
               measureDataChannel();
             }
+            return;
           }
-        }, SAMPLE_MS);
-        cleanups.push(() => clearInterval(iv));
+          // Settle-driven sampling: a browser getStats that ignores closed PC/radio cancellation
+          // can hold at most one optional probe read until the overall measurement timeout.
+          statsTimer = window.setTimeout(() => { statsTimer = null; void sample(); }, SAMPLE_MS);
+        };
+        statsTimer = window.setTimeout(() => { statsTimer = null; void sample(); }, SAMPLE_MS);
+        cleanups.push(stopStats);
       };
 
       // Фолбэк: пушим в DataChannel, держа bufferedAmount около cap, и меряем goodput.

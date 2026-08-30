@@ -1,10 +1,11 @@
-import { useEffect, useState, useSyncExternalStore } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useStore } from '../store';
 import { resolveUploadUrl } from '../api';
 import { Icon } from '../Icon';
 import { Backdrop } from './Backdrop';
 import { isTauri, openFile, revealInFolder, pathsExist } from '../native';
 import { getDownloads, removeDownload, subscribeDownloads, patchDownloads, type DownloadItem } from '../downloads';
+import { fetchDownloadBlob } from '../downloadFetch';
 
 function fmtSize(bytes: number): string {
   if (bytes < 1024) return bytes + ' Б';
@@ -24,6 +25,13 @@ export function DownloadsModal() {
   const toast = useStore((s) => s.toast);
   const items = useSyncExternalStore(subscribeDownloads, getDownloads);
   const [busy, setBusy] = useState<string | null>(null);
+  const mounted = useRef(true);
+  const activeDownload = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; activeDownload.current?.abort(); activeDownload.current = null; };
+  }, []);
 
   // При каждом открытии — проверяем натив-пути разом. Файл впервые не найден -> помечаем
   // (следующее открытие покажет "Удалено" зачёркнутым); файл СНОВА не найден при повторном
@@ -33,36 +41,45 @@ export function DownloadsModal() {
     if (!isTauri) return;
     const withPath = items.filter((d) => d.path);
     if (!withPath.length) return;
-    (async () => {
-      const exists = await pathsExist(withPath.map((d) => d.path!));
-      const toRemove: string[] = [];
-      const patch: Record<string, Partial<DownloadItem>> = {};
-      withPath.forEach((d, i) => {
-        if (exists[i]) { if (d.missingSince) patch[d.id] = { missingSince: undefined }; return; }
-        if (d.missingSince) toRemove.push(d.id); else patch[d.id] = { missingSince: Date.now() };
-      });
-      if (Object.keys(patch).length) patchDownloads(patch);
-      if (toRemove.length) toRemove.forEach(removeDownload);
+    let current = true;
+    void (async () => {
+      try {
+        const exists = await pathsExist(withPath.map((d) => d.path!));
+        if (!current || !mounted.current) return;
+        const toRemove: string[] = [];
+        const patch: Record<string, Partial<DownloadItem>> = {};
+        withPath.forEach((d, i) => {
+          if (exists[i]) { if (d.missingSince) patch[d.id] = { missingSince: undefined }; return; }
+          if (d.missingSince) toRemove.push(d.id); else patch[d.id] = { missingSince: Date.now() };
+        });
+        if (Object.keys(patch).length) patchDownloads(patch);
+        if (toRemove.length) toRemove.forEach(removeDownload);
+      } catch { /** a timed-out native check leaves the existing journal untouched */ }
     })();
+    return () => { current = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function onOpen(d: DownloadItem) {
-    if (d.missingSince || busy) return;
+    if (d.missingSince || busy || activeDownload.current) return;
     if (isTauri && d.path) { await openFile(d.path); return; }
     // веб (или натив-запись без пути, теоретически невозможно) — скачать заново по url
     setBusy(d.id);
+    const controller = new AbortController();
+    activeDownload.current = controller;
     try {
-      const r = await fetch(resolveUploadUrl(d.url));
-      if (!r.ok) throw new Error('Ошибка ' + r.status);
-      const blob = await r.blob();
+      const blob = await fetchDownloadBlob(resolveUploadUrl(d.url), controller.signal);
+      if (controller.signal.aborted || !mounted.current) return;
       const objUrl = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = objUrl; a.download = d.name;
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(objUrl), 30000);
-    } catch { toast(`Не удалось скачать ${d.name}`, 'err'); }
-    finally { setBusy(null); }
+    } catch { if (!controller.signal.aborted && mounted.current) toast(`Не удалось скачать ${d.name}`, 'err'); }
+    finally {
+      if (activeDownload.current === controller) activeDownload.current = null;
+      if (mounted.current) setBusy(null);
+    }
   }
 
   return (
