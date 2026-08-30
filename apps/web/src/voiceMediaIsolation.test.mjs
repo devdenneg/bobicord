@@ -5,9 +5,13 @@ import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const source = readFileSync(join(here, 'engine.ts'), 'utf8');
-const storeSource = readFileSync(join(here, 'store.ts'), 'utf8');
-const deploySource = readFileSync(join(here, '..', '..', '..', '.github', 'workflows', 'deploy.yml'), 'utf8');
+const normalizeSource = (value) => value.replace(/\r\n?/gu, '\n');
+const readSource = (...segments) => normalizeSource(readFileSync(join(here, ...segments), 'utf8'));
+assert.equal(normalizeSource('windows\r\nlegacy-mac\r'), 'windows\nlegacy-mac\n',
+  'source-contract checks normalize platform line endings');
+const source = readSource('engine.ts');
+const storeSource = readSource('store.ts');
+const deploySource = readSource('..', '..', '..', '.github', 'workflows', 'deploy.yml');
 const file = ts.createSourceFile('engine.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
 const engine = file.statements.find((node) => ts.isClassDeclaration(node) && node.name?.text === 'Engine');
 assert.ok(engine && ts.isClassDeclaration(engine), 'Engine class must exist');

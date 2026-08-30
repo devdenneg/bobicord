@@ -5,7 +5,11 @@ import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const source = readFileSync(join(here, 'chatRealtime.ts'), 'utf8');
+const normalizeSource = (value) => value.replace(/\r\n?/gu, '\n');
+const readSource = (...segments) => normalizeSource(readFileSync(join(here, ...segments), 'utf8'));
+assert.equal(normalizeSource('windows\r\nlegacy-mac\r'), 'windows\nlegacy-mac\n',
+  'source-contract checks normalize platform line endings');
+const source = readSource('chatRealtime.ts');
 const js = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
@@ -157,11 +161,11 @@ assert.equal(canReconcileUnchangedChatSnapshot(true, true, 12, 9, 13, 9, []), fa
 assert.equal(canReconcileUnchangedChatSnapshot(true, true, 12, 9, 12, 9, [], true), false,
   'buffer overflow always forces authoritative replacement');
 
-const engineSource = readFileSync(join(here, 'engine.ts'), 'utf8');
-const notifySource = readFileSync(join(here, 'notifyws.ts'), 'utf8');
-const storeSource = readFileSync(join(here, 'store.ts'), 'utf8');
-const apiSource = readFileSync(join(here, 'api.ts'), 'utf8');
-const serverViewSource = readFileSync(join(here, 'components', 'ServerView.tsx'), 'utf8');
+const engineSource = readSource('engine.ts');
+const notifySource = readSource('notifyws.ts');
+const storeSource = readSource('store.ts');
+const apiSource = readSource('api.ts');
+const serverViewSource = readSource('components', 'ServerView.tsx');
 
 assert.match(engineSource, /liveByMkey\.get\(`\$\{m\.uid\}\\u0000\$\{m\.mkey\}`\)/,
   'optimistic adoption is keyed by exact uid plus mkey');

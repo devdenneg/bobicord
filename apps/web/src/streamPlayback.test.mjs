@@ -5,7 +5,11 @@ import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const source = readFileSync(join(here, 'streamPlayback.ts'), 'utf8');
+const normalizeSource = (value) => value.replace(/\r\n?/gu, '\n');
+const readSource = (...segments) => normalizeSource(readFileSync(join(here, ...segments), 'utf8'));
+assert.equal(normalizeSource('windows\r\nlegacy-mac\r'), 'windows\nlegacy-mac\n',
+  'source-contract checks normalize platform line endings');
+const source = readSource('streamPlayback.ts');
 const js = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
@@ -687,12 +691,12 @@ assert.equal(await toggleStreamPictureInPicture({}), false, 'missing PiP APIs ar
 if (originalDocument === undefined) delete globalThis.document;
 else globalThis.document = originalDocument;
 
-const engine = readFileSync(join(here, 'engine.ts'), 'utf8');
-const tree = readFileSync(join(here, 'transport/treeVideo.ts'), 'utf8');
-const sounds = readFileSync(join(here, 'sounds.ts'), 'utf8');
+const engine = readSource('engine.ts');
+const tree = readSource('transport', 'treeVideo.ts');
+const sounds = readSource('sounds.ts');
 {
   const asDataModule = (code) => `data:text/javascript;base64,${Buffer.from(code).toString('base64')}`;
-  const micSource = readFileSync(join(here, 'micLifecycle.ts'), 'utf8');
+  const micSource = readSource('micLifecycle.ts');
   const micModule = asDataModule(ts.transpileModule(micSource, {
     compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
   }).outputText);
@@ -737,7 +741,7 @@ const sounds = readFileSync(join(here, 'sounds.ts'), 'utf8');
 }
 assert.match(engine, /const WATCH_VIDEO_DEADLINE_MS = 20_000/,
   'a first mobile watch has a bounded 20 second video deadline');
-const serverView = readFileSync(join(here, 'components', 'ServerView.tsx'), 'utf8');
+const serverView = readSource('components', 'ServerView.tsx');
 assert.match(serverView, /setPlaybackBlocked\(!audioReady \|\| outcome !== 'playing'\)/,
   'a hanging WebKit play promise exposes the gesture retry instead of silently timing out');
 assert.match(engine, /remoteAudioPlays\.request\(el,[\s\S]*explicitGesture/,

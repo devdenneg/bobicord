@@ -5,10 +5,14 @@ import ts from 'typescript';
 
 const origin = 'https://relay.example';
 const plain = (value) => JSON.parse(JSON.stringify(value));
-const storeSource = readFileSync(new URL('./store.ts', import.meta.url), 'utf8');
-const mainSource = readFileSync(new URL('./main.tsx', import.meta.url), 'utf8');
-const appSource = readFileSync(new URL('./App.tsx', import.meta.url), 'utf8');
-const serverViewSource = readFileSync(new URL('./components/ServerView.tsx', import.meta.url), 'utf8');
+const normalizeSource = (value) => value.replace(/\r\n?/gu, '\n');
+const readSource = (relative) => normalizeSource(readFileSync(new URL(relative, import.meta.url), 'utf8'));
+assert.equal(normalizeSource('windows\r\nlegacy-mac\r'), 'windows\nlegacy-mac\n',
+  'source-contract checks normalize platform line endings');
+const storeSource = readSource('./store.ts');
+const mainSource = readSource('./main.tsx');
+const appSource = readSource('./App.tsx');
+const serverViewSource = readSource('./components/ServerView.tsx');
 assert.match(storeSource, /if \(!isTauri\) setSettings\(\{ notif: false \}\);[\s\S]{0,300}set\(\{ me: user/,
   'browser notification UI must become fail-closed before React can run the account init effect');
 assert.match(storeSource, /emoteSize: storedEmoteSize\(\)/,
@@ -37,7 +41,7 @@ class MemoryStorage {
 }
 
 function loadTsCommonJs(relative, { requireMap = {}, globals = {} } = {}) {
-  const source = readFileSync(new URL(relative, import.meta.url), 'utf8');
+  const source = readSource(relative);
   const code = ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText;
@@ -1132,7 +1136,7 @@ function workerHarness({
   workerCaches = cacheStorage(), workerSetTimeout = setTimeout, workerClearTimeout = clearTimeout,
   workerWindowClients, workerMatchAll, workerOpenWindow, workerDate = Date,
 } = {}) {
-  const source = readFileSync(new URL('../public/sw.js', import.meta.url), 'utf8');
+  const source = readSource('../public/sw.js');
   const listeners = new Map();
   const caches = workerCaches;
   const clientMessages = [];
