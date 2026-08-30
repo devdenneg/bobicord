@@ -394,12 +394,12 @@ export async function playMediaElementCoordinated<TElement extends HTMLMediaElem
  *  the platform fallback keeps older installed PWAs on the WebAudio path too. */
 export function mediaElementVolumeLocked(
   element: Pick<Element, 'matches'>,
-  nav: NavigatorLike = navigator,
+  nav: NavigatorLike | null = typeof navigator === 'undefined' ? null : navigator,
 ): boolean {
   try { if (element.matches(':volume-locked')) return true; } catch { /** selector is newer than this WebKit */ }
-  const ua = nav.userAgent || '';
+  const ua = nav?.userAgent || '';
   return /iPhone|iPad|iPod/i.test(ua)
-    || (nav.platform === 'MacIntel' && (nav.maxTouchPoints || 0) > 1);
+    || (nav?.platform === 'MacIntel' && (nav.maxTouchPoints || 0) > 1);
 }
 
 interface StreamAudioControllerOptions {

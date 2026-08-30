@@ -261,6 +261,8 @@ assert.equal(await routeAudioSinkTarget({ setSinkId: async () => { throw new Err
 }
 
 const unlockedElement = { matches: () => false };
+assert.equal(mediaElementVolumeLocked(unlockedElement, null), false,
+  'non-browser runtimes fail open to ordinary element volume instead of reading a missing navigator');
 assert.equal(mediaElementVolumeLocked(unlockedElement, {
   userAgent: 'Mozilla/5.0 (iPhone)', platform: 'iPhone', maxTouchPoints: 5,
 }), true);
