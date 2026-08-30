@@ -21,7 +21,9 @@ const {
   isVoiceOperationTimeout,
   mutedTrackNeedsRestart,
   readStoredFlag,
+  reusableMicrophoneAudioContextState,
   resumeGestureAudioContext,
+  resumeSharedGestureAudioContext,
   selectedInputUnavailable,
   withVoiceDeadline,
   withVoiceTimeout,
@@ -141,6 +143,39 @@ assert.equal(mutedTrackNeedsRestart(0, 999_999), false);
   assert.equal(resumeGestureAudioContext(closed, () => { throw new Error('audio limit'); }), null,
     'creation failure never leaves a closed context looking usable');
 
+  for (const staleState of ['interrupted', 'future-webkit-state']) {
+    const stale = {
+      state: staleState,
+      resumes: 0,
+      closes: 0,
+      resume() { this.resumes++; return Promise.resolve(); },
+      close() { this.closes++; return Promise.resolve(); },
+    };
+    const fresh = {
+      state: 'suspended',
+      resumes: 0,
+      resume() { this.resumes++; return Promise.resolve(); },
+    };
+    const recovered = resumeGestureAudioContext(stale, () => { creates++; return fresh; });
+    assert.equal(recovered, fresh, `${staleState} gesture preparation creates a fresh context`);
+    assert.equal(stale.resumes, 0,
+      `${staleState} context never consumes the user's recovery gesture`);
+    assert.equal(stale.closes, 1, `${staleState} context is retired exactly once`);
+    assert.equal(fresh.resumes, 1, 'the same gesture resumes the fresh replacement synchronously');
+  }
+
+  const invalidFresh = {
+    state: 'interrupted',
+    resumes: 0,
+    closes: 0,
+    resume() { this.resumes++; return Promise.resolve(); },
+    close() { this.closes++; return Promise.resolve(); },
+  };
+  assert.equal(resumeGestureAudioContext(null, () => invalidFresh), null,
+    'a newly-created interrupted context fails closed');
+  assert.equal(invalidFresh.resumes, 0, 'an invalid fresh context does not spend the gesture on resume');
+  assert.equal(invalidFresh.closes, 1, 'an invalid fresh context is retired exactly once');
+
   const firstGesture = deferred();
   const secondGesture = deferred();
   const backgrounded = {
@@ -164,6 +199,45 @@ assert.equal(mutedTrackNeedsRestart(0, 999_999), false);
   await Promise.resolve();
 }
 
+// Shared speaking/VAD analyser graphs cannot be migrated to a replacement AudioContext. Preserve
+// an interrupted exact context and spend the gesture on resuming it; only closed/missing is rebuilt.
+{
+  let creates = 0;
+  const interrupted = {
+    state: 'interrupted',
+    resumes: 0,
+    closes: 0,
+    resume() { this.resumes++; return Promise.resolve(); },
+    close() { this.closes++; return Promise.resolve(); },
+  };
+  const preserved = resumeSharedGestureAudioContext(interrupted, () => {
+    creates++;
+    throw new Error('must preserve exact analyser graph');
+  });
+  assert.equal(preserved, interrupted, 'an interrupted shared analyser context keeps exact identity');
+  assert.equal(interrupted.resumes, 1, 'the gesture resumes the existing shared analyser graph');
+  assert.equal(interrupted.closes, 0, 'shared analyser recovery never closes an interrupted context');
+  assert.equal(creates, 0, 'shared analyser recovery does not create a stranded replacement graph');
+
+  const closed = {
+    state: 'closed',
+    resumes: 0,
+    closes: 0,
+    resume() { this.resumes++; return Promise.resolve(); },
+    close() { this.closes++; return Promise.resolve(); },
+  };
+  const replacement = {
+    state: 'suspended',
+    resumes: 0,
+    resume() { this.resumes++; return Promise.resolve(); },
+  };
+  const refreshed = resumeSharedGestureAudioContext(closed, () => { creates++; return replacement; });
+  assert.equal(refreshed, replacement, 'a closed shared analyser context is replaced');
+  assert.equal(closed.resumes, 0, 'a closed shared analyser context is never resumed');
+  assert.equal(closed.closes, 0, 'an already-closed shared analyser context is not closed twice');
+  assert.equal(replacement.resumes, 1, 'the fresh shared analyser context resumes in the same gesture');
+}
+
 assert.equal(foregroundMicNeedsImmediateRecovery(true, false, true), true,
   'a background-muted track must be recovered immediately on foreground');
 assert.equal(foregroundMicNeedsImmediateRecovery(true, true, false), true,
@@ -172,6 +246,17 @@ assert.equal(foregroundMicNeedsImmediateRecovery(false, false, true), false,
   'an ordinary transient mute still uses the route-change grace period');
 assert.equal(foregroundMicNeedsImmediateRecovery(true, false, false, true), true,
   'an owned iOS capture is reacquired after background even when WebKit leaves stale live flags');
+
+assert.equal(reusableMicrophoneAudioContextState('running'), true,
+  'a running gesture-created microphone context remains reusable');
+assert.equal(reusableMicrophoneAudioContextState('suspended'), true,
+  'a standard suspended context remains eligible for gesture resume');
+assert.equal(reusableMicrophoneAudioContextState('interrupted'), false,
+  'an iOS-interrupted context is rebuilt instead of publishing a silent destination');
+assert.equal(reusableMicrophoneAudioContextState('closed'), false,
+  'a closed microphone context is never reused');
+assert.equal(reusableMicrophoneAudioContextState(undefined), false,
+  'an unknown future context state fails closed to pipeline replacement');
 
 assert.equal(await withVoiceTimeout(Promise.resolve('ok'), 50, 'resolved operation'), 'ok');
 await assert.rejects(

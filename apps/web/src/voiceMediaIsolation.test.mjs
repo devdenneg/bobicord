@@ -86,8 +86,12 @@ assert.match(publishExisting, /this\.micEpoch === micOp && this\.micLocalTrack =
   'late republish completion must not overwrite a newer microphone pipeline');
 assert.match(methodText('checkMicAlive'), /publication\?\.track !== this\.micLocalTrack/,
   'watchdog must recover when the room publication differs from the owned microphone track');
-assert.match(methodText('checkMicAlive'), /const preparedOnly = !!this\.micActx[\s\S]*if \(!preparedOnly\)[\s\S]*stopMic\(room, recoveryContext\)/,
-  'mobile recovery must preserve or consume the existing AudioContext instead of closing it before reacquisition');
+assert.match(methodText('checkMicAlive'), /const preparedOnly = !!this\.micActx && reusableMicrophoneAudioContextState\(this\.micActx\.state\)[\s\S]*if \(!preparedOnly\)[\s\S]*stopMic\(room, recoveryContext\)/,
+  'mobile recovery must preserve a resumable prepared AudioContext instead of closing it before reacquisition');
+assert.match(methodText('checkMicAlive'), /const recoveryContext = reusableMicrophoneAudioContextState\(this\.micActx\?\.state\) \? this\.micActx : null/,
+  'an iOS-interrupted microphone context must be retired instead of republishing a silent destination');
+assert.match(methodText('checkMicAlive'), /micContextNeedsReplacement[\s\S]*!reusableMicrophoneAudioContextState\(this\.micActx\.state\)[\s\S]*const ended = !this\.micActx \|\| micContextNeedsReplacement/,
+  'an interrupted graph must recover even while its raw and published tracks still look live');
 assert.match(methodText('startMic'), /micStartOwnership\.begin\(op\)[\s\S]*finally[\s\S]*micStartOwnership\.finish\(op\)/,
   'microphone capture must keep exact single-flight ownership until commit or disposal');
 assert.match(methodText('checkMicAlive'), /micStartOwnership\.active/,
@@ -114,8 +118,14 @@ assert.ok(queueVoiceJoin.indexOf('existing?.serverId === serverId') < queueVoice
   'an identical queued tap must retain its original intent and absolute timeout');
 const prepareVoiceAudio = methodText('prepareVoiceAudio');
 const resumeSharedVoiceAudio = methodText('resumeSharedVoiceAudio');
+assert.match(resumeSharedVoiceAudio, /this\.spCtx = resumeSharedGestureAudioContext\(this\.spCtx, \(\) => new AudioContext\(\)\)/,
+  'an interrupted shared analyser context must retain its exact graph while resuming under the tap');
+assert.doesNotMatch(resumeSharedVoiceAudio, /resumeGestureAudioContext\(/,
+  'shared analyser recovery must not use the strict replaceable microphone-context policy');
 assert.match(resumeSharedVoiceAudio, /const output = this\.getOutputContext\(\)[\s\S]*requestExactAudioContextResume\(output, true\)/,
   'the first channel tap creates and resumes the shared playback context under user activation');
+assert.match(prepareVoiceAudio, /this\.micActx = resumeGestureAudioContext\(this\.micActx, \(\) => new AudioContext\(\)\)/,
+  'the replaceable microphone processing context must retain strict interrupted-state recovery');
 assert.match(prepareVoiceAudio, /this\.resumeSharedVoiceAudio\(\)/,
   'the first channel tap synchronously resumes every shared playback context');
 assert.match(methodText('prepareReplacementMicContext'), /this\.resumeSharedVoiceAudio\(\)/,
@@ -304,10 +314,16 @@ assert.match(replacementContext, /this\.resumeSharedVoiceAudio\(\)/,
 const stopMic = methodText('stopMic');
 assert.match(stopMic, /replacementContext: AudioContext \| null/,
   'microphone teardown must accept explicit replacement context ownership');
+assert.match(stopMic, /const preservedContext = reusableMicrophoneAudioContextState\(replacementContext\?\.state\)[\s\S]*\? replacementContext[\s\S]*: null/,
+  'no teardown caller may preserve an interrupted or unknown microphone context');
 assert.match(stopMic, /this\.micActx = preservedContext/,
   'replacement context ownership must transfer before teardown awaits');
-assert.match(stopMic, /ctx && ctx !== preservedContext/,
-  'teardown must not close the replacement microphone context');
+assert.match(stopMic, /const contextsToClose = new Set<AudioContext>\(\)[\s\S]*ctx && ctx !== preservedContext[\s\S]*contextsToClose\.add\(ctx\)/,
+  'teardown must retire the old context unless it is the exact accepted replacement');
+assert.match(stopMic, /replacementContext && replacementContext !== preservedContext[\s\S]*contextsToClose\.add\(replacementContext\)/,
+  'a distinct interrupted or unknown replacement context must also be retired');
+assert.match(stopMic, /for \(const context of contextsToClose\)[\s\S]*forgetExactAudioContextResume\(context\)[\s\S]*waits\.push\(context\.close\(\)\)/,
+  'rejected exact contexts must be forgotten, closed once, and included in bounded cleanup');
 assert.match(stopMic, /localTrack && localTrack !== publishedTrack/,
   'teardown must stop an owned microphone track even if a late room publication differs');
 assert.match(stopMic, /finally\s*\{[\s\S]*if \(localTrack\)[\s\S]*localTrack\.stop\(\)/,
@@ -337,6 +353,12 @@ assert.match(methodText('watchLateVoiceClaim'), /releaseVoiceLease\(session, lea
   'a lease claim response arriving after rollback must be released by exact epoch');
 
 const onVisible = methodText('onVisible');
+const startConnPoll = methodText('startConnPoll');
+const stopConnPoll = methodText('stopConnPoll');
+assert.match(startConnPoll, /window\.addEventListener\('focus', this\.onVisible\)/,
+  'iOS PWA focus must provide a foreground recovery fallback when pageshow is skipped');
+assert.match(stopConnPoll, /window\.removeEventListener\('focus', this\.onVisible\)/,
+  'voice teardown must remove the exact focus recovery listener');
 assert.match(methodText('onVoicePageHide'), /markVoiceHidden/,
   'pagehide must record iOS PWA backgrounding even when visibilitychange is skipped');
 assert.doesNotMatch(methodText('onVoicePageHide'), /disconnect|leaveVoice/,

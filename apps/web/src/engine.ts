@@ -35,7 +35,9 @@ import {
   mutedTrackNeedsRestart,
   readStoredFlag,
   requestExactAudioContextResume,
+  reusableMicrophoneAudioContextState,
   resumeGestureAudioContext,
+  resumeSharedGestureAudioContext,
   selectedInputUnavailable,
   withVoiceDeadline,
   withVoiceTimeout,
@@ -2500,7 +2502,10 @@ export class Engine {
   // клика уже потеряна. Подготавливаем input, analyser и shared output контексты синхронно в начале
   // первого входа; поздние Room-конструкторы получают тот же уже разблокированный outputCtx.
   private resumeSharedVoiceAudio() {
-    this.spCtx = resumeGestureAudioContext(this.spCtx, () => new AudioContext());
+    // spCtx owns every existing speaking/VAD analyser graph. WebKit's `interrupted` state can be
+    // resumed, but replacing that exact context would strand all MediaStreamSource nodes on the old
+    // graph. Only a closed/missing context is replaceable; micActx deliberately uses the strict path.
+    this.spCtx = resumeSharedGestureAudioContext(this.spCtx, () => new AudioContext());
     const output = this.getOutputContext();
     requestExactAudioContextResume(output, true);
   }
@@ -3150,6 +3155,7 @@ export class Engine {
     if (this.connTimer) return;
     document.addEventListener('visibilitychange', this.onVisible);
     window.addEventListener('pageshow', this.onVisible);
+    window.addEventListener('focus', this.onVisible);
     window.addEventListener('pagehide', this.onVoicePageHide);
     if (document.hidden) this.markVoiceHidden();
     this.pollPing();
@@ -3159,6 +3165,7 @@ export class Engine {
     ++this.voiceStatsGeneration;
     document.removeEventListener('visibilitychange', this.onVisible);
     window.removeEventListener('pageshow', this.onVisible);
+    window.removeEventListener('focus', this.onVisible);
     window.removeEventListener('pagehide', this.onVoicePageHide);
     if (this.connTimer) { clearInterval(this.connTimer); this.connTimer = null; }
     this.voiceHiddenAt = 0; this.micForegroundRecoveryPending = false;
@@ -3843,8 +3850,14 @@ export class Engine {
     // reapplyMic can prepare a context under the user's mobile gesture while permission recovery is
     // still fail-closed. Once the room is re-activated, consume that context directly: tearing it
     // down first would force startMic to create a suspended non-gesture context on iOS.
-    const preparedOnly = !!this.micActx && this.micActx.state !== 'closed' && !this.micRaw && !this.micLocalTrack;
-    const ended = !this.micActx || !t || t.readyState === 'ended' || !this.micLocalTrack
+    const preparedOnly = !!this.micActx && reusableMicrophoneAudioContextState(this.micActx.state)
+      && !this.micRaw && !this.micLocalTrack;
+    // Raw gUM and MediaStreamDestination tracks can both remain live/unmuted while WebKit leaves
+    // their producing AudioContext `interrupted`. Treat the graph itself as a capture source: an
+    // unusable/unknown context must enter the same fenced recovery as an ended hardware track.
+    const micContextNeedsReplacement = !!this.micActx
+      && !reusableMicrophoneAudioContextState(this.micActx.state);
+    const ended = !this.micActx || micContextNeedsReplacement || !t || t.readyState === 'ended' || !this.micLocalTrack
       || this.micLocalTrack.mediaStreamTrack.readyState === 'ended' || publication?.track !== this.micLocalTrack;
     const immediateForegroundRecovery = foregroundMicNeedsImmediateRecovery(
       this.micForegroundRecoveryPending,
@@ -3867,7 +3880,12 @@ export class Engine {
     this.fenceMicForCaptureRecovery(hub);
     try {
       if (!preparedOnly) {
-        const recoveryContext = this.micActx?.state === 'closed' ? null : this.micActx;
+        // iOS may return an AudioContext in WebKit's non-standard `interrupted` state while both
+        // its processed destination track and the raw gUM track still look live. Keeping that exact
+        // context would faithfully republish silence after every foreground reacquire. Preserve the
+        // gesture-created context only when it is actually resumable; stopMic closes every other
+        // state through the existing bounded cleanup before startMic builds a fresh graph.
+        const recoveryContext = reusableMicrophoneAudioContextState(this.micActx?.state) ? this.micActx : null;
         await this.stopMic(room, recoveryContext);
       }
       if (!recoveryCurrent()) return;
@@ -3987,7 +4005,9 @@ export class Engine {
     const vadDest = this.micVadDest; this.micVadDest = null;
     const vadNode = this.micVadNode; this.micVadNode = null;
     const ctx = this.micActx;
-    const preservedContext = replacementContext?.state === 'closed' ? null : replacementContext;
+    const preservedContext = reusableMicrophoneAudioContextState(replacementContext?.state)
+      ? replacementContext
+      : null;
     // Ownership changes synchronously, before unpublish/close awaits. A third tap can therefore
     // replace this prepared context without an older stop tail clearing the newer generation.
     this.micActx = preservedContext;
@@ -4010,9 +4030,15 @@ export class Engine {
     // Retire both sides in that case; otherwise the detached processed track keeps the microphone
     // graph alive after leave/reapply even though the room publication was already removed.
     if (localTrack && localTrack !== publishedTrack) { try { localTrack.stop(); } catch { /**/ } }
-    if (ctx && ctx !== preservedContext) {
-      forgetExactAudioContextResume(ctx);
-      try { waits.push(ctx.close()); } catch { /**/ }
+    // The replacement may be a distinct gesture-created context which became interrupted before
+    // teardown acquired it. Retire every rejected exact context and join each close to the same
+    // bounded cleanup; the Set prevents a rejected ctx/replacement alias from being closed twice.
+    const contextsToClose = new Set<AudioContext>();
+    if (ctx && ctx !== preservedContext) contextsToClose.add(ctx);
+    if (replacementContext && replacementContext !== preservedContext) contextsToClose.add(replacementContext);
+    for (const context of contextsToClose) {
+      forgetExactAudioContextResume(context);
+      try { waits.push(context.close()); } catch { /**/ }
     }
     try {
       await withVoiceTimeout(Promise.allSettled(waits), VOICE_CLEANUP_TIMEOUT_MS, 'microphone cleanup');

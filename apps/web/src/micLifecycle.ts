@@ -46,6 +46,7 @@ export class VoiceMicStartOwnership {
 export interface GestureAudioContextLike {
   readonly state?: string;
   resume?: () => void | PromiseLike<void>;
+  close?: () => void | PromiseLike<void>;
 }
 
 type AudioUnlockGestureEvent = Pick<Event, 'type' | 'timeStamp'> & Partial<Pick<KeyboardEvent, 'repeat'>> & {
@@ -229,6 +230,15 @@ export function forgetExactAudioContextResume(context: GestureAudioContextLike |
   if (context) exactAudioContextResumes.forget(context);
 }
 
+function retireGestureAudioContext(context: GestureAudioContextLike): void {
+  forgetExactAudioContextResume(context);
+  try {
+    // Closing must be initiated synchronously so a newly-created context can claim the same audio
+    // resources, but it cannot be awaited here without losing the caller's transient activation.
+    void Promise.resolve(context.close?.()).catch(() => { /** best-effort retirement */ });
+  } catch { /** an already-broken context is unusable either way */ }
+}
+
 /**
  * Reuses a live audio context, or creates its replacement, and invokes resume synchronously while
  * the caller still owns the browser user activation. The returned promise is deliberately not
@@ -236,6 +246,34 @@ export function forgetExactAudioContextResume(context: GestureAudioContextLike |
  * must not hold the channel-tap handler or create an unhandled rejection.
  */
 export function resumeGestureAudioContext<T extends GestureAudioContextLike>(
+  current: T | null | undefined,
+  create: () => T,
+): T | null {
+  const canReuseCurrent = !!current && reusableMicrophoneAudioContextState(current.state);
+  if (current && !canReuseCurrent) retireGestureAudioContext(current);
+  let context: T | null = canReuseCurrent ? current! : null;
+  if (!context) {
+    try { context = create(); }
+    catch { return null; }
+  }
+  // New AudioContexts normally start suspended (or running). If WebKit creates one directly in an
+  // interrupted/unknown state, fail closed and leave the gesture available to the rest of the tap
+  // handler instead of binding another native resume promise to a context that can emit silence.
+  if (!reusableMicrophoneAudioContextState(context.state)) {
+    retireGestureAudioContext(context);
+    return null;
+  }
+  requestExactAudioContextResume(context, true);
+  return context;
+}
+
+/**
+ * Shared analyser contexts own long-lived MediaStreamSource graphs. Unlike the replaceable
+ * microphone processing context, an interrupted WebKit context must retain its exact identity:
+ * replacing it would strand every analyser on the old graph. Only a terminal context is forgotten;
+ * resume is still invoked synchronously so WebKit can restore the existing graph under the tap.
+ */
+export function resumeSharedGestureAudioContext<T extends GestureAudioContextLike>(
   current: T | null | undefined,
   create: () => T,
 ): T | null {
@@ -314,6 +352,16 @@ export function foregroundMicNeedsImmediateRecovery(
   reacquireOwnedCapture = false,
 ): boolean {
   return returningFromBackground && (reacquireOwnedCapture || trackEnded || trackMuted);
+}
+
+/**
+ * WebKit exposes a non-standard `interrupted` state after some iOS background/audio-session
+ * transitions. Reusing that context can produce a live-looking MediaStreamDestination which only
+ * emits silence. Preserve the gesture-created context for the two recoverable standard states;
+ * every terminal or unknown state must be rebuilt with the microphone pipeline.
+ */
+export function reusableMicrophoneAudioContextState(state: unknown): boolean {
+  return state === 'running' || state === 'suspended';
 }
 
 export interface StorageReader {
