@@ -16,7 +16,7 @@ import {
   loadAudioDevices,
   type AudioDeviceChoice,
 } from '../audioDevices';
-import { PrimaryPointerHold, suppressPointerToggleWhilePtt, webScreenShareSupported } from '../mobileControls';
+import { latchRejectedPttHold, PrimaryPointerHold, suppressPointerToggleWhilePtt, webScreenShareSupported } from '../mobileControls';
 
 /* Вещание — только из нативного клиента (CLAUDE.md инвариант 2). Конфиг/статистика — в BroadcastModal. */
 function NativeBroadcastButton() {
@@ -345,11 +345,12 @@ export function VoiceControls({ up }: { up?: boolean }) {
   const E = getEngine()!;
   const mode = getSettings().mode;
   const muted = eng.localMicMuted;
+  const recovering = !!eng.micRecovering;
   const ptt = mode === 'ptt' && !eng.deafened;
   const connection = eng.voiceConnection ?? (eng.reconnecting ? 'reconnecting' : (eng.voiceConnecting ? 'connecting' : (eng.inVoice ? 'connected' : 'disconnected')));
   const pttLive = ptt && eng.pttDown && !muted && connection === 'connected';
   const pttIdle = ptt && !pttLive;
-  const pttHoldReady = ptt && !muted && connection === 'connected';
+  const pttHoldReady = ptt && !muted && !recovering && connection === 'connected';
   const micClosed = muted || pttIdle;
   const micClass = 'vd-btn' + (muted ? ' danger-on' : (pttLive ? ' ptt-live' : (pttIdle ? ' ptt-idle' : '')))
     + (pttHoldReady ? ' vd-ptt-hold' : '');
@@ -377,13 +378,20 @@ export function VoiceControls({ up }: { up?: boolean }) {
   // микрофон пропадал и возвращался сам, это читалось как «кнопка переключается сама по себе».
   const micLabel = eng.micUnavailable
     ? 'Микрофон недоступен — нажми, чтобы подключить'
-    : (muted ? 'Включить микрофон' : (pttIdle ? 'PTT: микрофон закрыт' : (pttLive ? 'PTT: идёт передача' : 'Выключить микрофон')));
+    : (muted ? 'Включить микрофон' : (recovering ? 'Микрофон восстанавливается'
+      : (pttIdle ? 'PTT: микрофон закрыт' : (pttLive ? 'PTT: идёт передача' : 'Выключить микрофон'))));
   return (
     <div className="vd-controls">
       <div className="vd-grp">
-        <button className={micClass} aria-pressed={ptt ? pttLive : muted} aria-label={micLabel} data-tip={ptt || eng.micUnavailable ? micLabel : 'Микрофон · M'}
+        <button className={micClass} aria-pressed={ptt ? pttLive : muted} aria-busy={recovering || undefined}
+          aria-label={micLabel} data-tip={ptt || eng.micUnavailable || recovering ? micLabel : 'Микрофон · M'}
           onPointerDown={(event) => {
-            if (!pttHoldReady) { suppressPttClick.current = false; return; }
+            if (!pttHoldReady) {
+              // Capture this decision now: recovery may finish and rerender before the browser
+              // emits click for the same pointer, but that rejected hold must still be consumed.
+              suppressPttClick.current = latchRejectedPttHold(ptt, recovering, muted);
+              return;
+            }
             if (!pttPointer.current.begin(event.pointerId, event.isPrimary, event.button)) return;
             suppressPttClick.current = true;
             try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /** implicit touch capture remains */ }
@@ -394,6 +402,12 @@ export function VoiceControls({ up }: { up?: boolean }) {
           onLostPointerCapture={(event) => releasePttPointer(event.pointerId)}
           onContextMenu={(event) => { if (pttHoldReady) event.preventDefault(); }}
           onClick={(event) => {
+            // A recovering PTT pipeline is temporarily unable to accept a hold. Do not reinterpret
+            // the synthetic click following that rejected pointer-down as a persistent mute toggle.
+            if (ptt && recovering && !muted) {
+              event.preventDefault();
+              return;
+            }
             if (suppressPttClick.current && suppressPointerToggleWhilePtt(true, event.detail)) {
               suppressPttClick.current = false;
               event.preventDefault();

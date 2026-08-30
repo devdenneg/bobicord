@@ -354,6 +354,36 @@ export function foregroundMicNeedsImmediateRecovery(
   return returningFromBackground && (reacquireOwnedCapture || trackEnded || trackMuted);
 }
 
+export interface MicrophoneTrackHealthLike {
+  readonly readyState?: string;
+  readonly muted?: boolean;
+}
+
+/**
+ * Capture has two independent browser-facing tracks: the raw gUM source and the processed
+ * MediaStreamDestination published through LiveKit. WebKit may interrupt either one, while
+ * LiveKit may already have paused the sender after a destination mute. Treat all three signals as
+ * one transport health result; a live-looking raw track alone cannot prove that peers hear audio.
+ */
+export function microphoneTransportHealth(
+  rawTrack: MicrophoneTrackHealthLike | null | undefined,
+  publishedTrack: MicrophoneTrackHealthLike | null | undefined,
+  exactPublication: boolean,
+  upstreamPaused: boolean,
+): { ended: boolean; muted: boolean; upstreamPaused: boolean } {
+  return {
+    ended: !rawTrack || rawTrack.readyState === 'ended'
+      || !publishedTrack || publishedTrack.readyState === 'ended' || !exactPublication,
+    muted: !!rawTrack?.muted || !!publishedTrack?.muted || upstreamPaused,
+    upstreamPaused,
+  };
+}
+
+/** A previously working microphone remains logically available during its bounded rebuild. */
+export function retainMicAvailabilityDuringRecovery(hadCapture: boolean, unavailable: boolean): boolean {
+  return hadCapture && !unavailable;
+}
+
 /**
  * WebKit exposes a non-standard `interrupted` state after some iOS background/audio-session
  * transitions. Reusing that context can produce a live-looking MediaStreamDestination which only

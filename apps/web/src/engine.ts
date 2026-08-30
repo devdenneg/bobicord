@@ -32,9 +32,11 @@ import {
   foregroundMicNeedsImmediateRecovery,
   forgetExactAudioContextResume,
   isVoiceOperationTimeout,
+  microphoneTransportHealth,
   mutedTrackNeedsRestart,
   readStoredFlag,
   requestExactAudioContextResume,
+  retainMicAvailabilityDuringRecovery,
   reusableMicrophoneAudioContextState,
   resumeGestureAudioContext,
   resumeSharedGestureAudioContext,
@@ -103,6 +105,7 @@ export interface Snapshot {
   deafened: boolean;
   localMicMuted: boolean;
   micUnavailable: boolean; // зашёл в голосовой без микрофона (нет доступа) — listen-only
+  micRecovering?: boolean; // временная пересборка capture после фона/смены аудиомаршрута
   pttDown: boolean;
   presence: Record<string, PeerState>;
   speaking: Record<string, boolean>;
@@ -363,7 +366,6 @@ export class Engine {
   private micBootstrapWanted = false;
   private manualMute = storedFlag('voiceMute'); // персист: пред-установка «мут мика» до входа (Discord-стиль)
   private saveVoicePrefs() { try { localStorage.setItem('voiceMute', this.manualMute ? '1' : '0'); localStorage.setItem('voiceDeaf', this.deafened ? '1' : '0'); } catch { /**/ } }
-  private deafToggling = false; // окно подавления mute/unmute-звука от track.mute()/unmute() при оглушении (deaf сам играет fullMute/unmute)
 
   // Оба транспорта живут одновременно (не выбор build-флагом): нативный вещатель
   // публикует только в дерево, браузер — только в LiveKit (старый путь, инвариант 2
@@ -772,15 +774,13 @@ export class Engine {
       }
       const inV = !!vc; // членство канала задаёт vc-атрибут, mic publication не является presence
       // Hub deliberately has no microphone publications after media isolation. Presence and
-      // durable mute intent come from hub attributes; the instantaneous LiveKit mute edge comes
-      // from the exact channel media participant.
-      const mediaParticipant = this.viewServerId === this.voiceServerId ? this.mediaPartOf(m.username) : null;
-      const mp = mediaParticipant?.getTrackPublication(Track.Source.Microphone);
+      // durable mute intent therefore come from its participant attributes.
       // «оглох» (deafen) транслируется пирам participant-атрибутом deaf (как vc для голосового
       // канала) — иначе другие видят для оглохшего то же «мик выключен», что и для просто мута.
       const deaf = m.username === this.me.username ? this.deafened : !!(p as any)?.attributes?.deaf;
-      // !mp (трек ещё не опубликован / не доехал) — это «пока не знаем», а не «замучен»: иначе
-      // на секунду мигал бы ложный бейдж «мут» всем в канале. || deaf — оглохший всегда замьючен.
+      // LiveKit publication mute is a transport signal too: iOS sets it when a hidden PWA loses
+      // capture, even though the user never pressed mute. Durable hub attributes are authoritative
+      // for the user's intent; an unavailable microphone also writes mic=0 after a real failure.
       // «играет в X»: для себя — локальный детект, для пира — participant-атрибуты game/gicon
       let game: GameStatus | null = null;
       if (m.username === this.me.username) game = this.myGame;
@@ -789,13 +789,11 @@ export class Engine {
       // Игра показывается ТОЛЬКО из detect_game (атрибут/локальный myGame), НЕ из меты стрима: захваченное
       // окно ≠ «во что играет» (по решению пользователя). Стример без игры — просто LIVE, без «играет в X».
       const away = !inV && !streaming && this.awayHint.has(m.username); // idle-онлайн («нет на месте», жёлтый)
-      // Свой бейдж мута берём из ЛОКАЛЬНОГО состояния, а не из LiveKit-публикации. Публикации может не
-      // быть вовсе (мик недоступен, идёт рестарт watchdog-ом, ещё не опубликован) — а «нет публикации»
-      // здесь читается как «мик включён», и человек видел красную кнопку мута рядом с бейджем «говорю».
-      // Для чужих правило прежнее: !mp = «пока не знаем», иначе у всех мигал бы ложный бейдж мута.
+      // Свой бейдж берём из локального интента; чужой — из того же durable hub-атрибута. Отсутствие
+      // media publication или её системный mute во время восстановления не подменяют ручной mute.
       const micMuted = m.username === this.me.username
         ? (this.localMicMuted() || deaf)
-        : ((!!mp && mp.isMuted) || (p as any)?.attributes?.mic === '0' || deaf);
+        : ((p as any)?.attributes?.mic === '0' || deaf);
       presence[m.username] = { online, inVoice: inV, micMuted, streaming, deafened: deaf, away, game };
     }
     const speaking: Record<string, boolean> = {};
@@ -823,7 +821,8 @@ export class Engine {
       voiceQuality: this.inVoice ? this.connQuality : 'unknown', voicePing: this.inVoice ? this.pingMs : null,
       voiceConnection, lostVoiceServerId: this.lostVoiceServerId, lostVoiceChannel: this.lostVoiceChannel,
       inVoice: this.inVoice, voiceConnecting: this.inVoice && (this.voiceConnecting || this.voiceLeaseVerifying || this.voiceClaimPending !== 0), myVoiceChannel: this.currentVc, voiceServerId: this.voiceServerId, voiceChannels, channelActiveSince, deafened: this.deafened,
-      localMicMuted: this.localMicMuted(), micUnavailable: this.noMic, pttDown: this.pttDown,
+      localMicMuted: this.localMicMuted(), micUnavailable: this.noMic,
+      micRecovering: this.micRecoveryOwner !== 0, pttDown: this.pttDown,
       presence, speaking, streams, watching, pending, watchers, messages: this.messages, chatHasMore: this.chatMore, chatTrimmed: this.trimmedFront, chatPrepended: this.chatPrepended,
       typing: [...this.typingUsers].filter(([n, exp]) => exp > Date.now() && n !== this.me.displayName).map(([n]) => n),
     };
@@ -1293,16 +1292,11 @@ export class Engine {
         if (room === this.voiceMediaRoom && this.voiceMediaChannelId === channelId) this.reconcileUserAudio(baseUid(p.identity));
         this.emit();
       })
-      .on(RoomEvent.TrackMuted, (pub, p) => {
-        if (room === this.voiceMediaRoom && this.inVoice && pub.source === Track.Source.Microphone
-          && p === room.localParticipant && !this.deafToggling && this.micRecoveryOwner === 0) playSound('mute');
-        this.emit();
-      })
-      .on(RoomEvent.TrackUnmuted, (pub, p) => {
-        if (room === this.voiceMediaRoom && this.inVoice && pub.source === Track.Source.Microphone
-          && p === room.localParticipant && !this.deafToggling && this.micRecoveryOwner === 0) playSound('unmute');
-        this.emit();
-      })
+      // Transport mute/unmute is not necessarily a user action: iOS emits it when a PWA is
+      // backgrounded and LiveKit may emit it again while pausing/resuming the sender. Sounds are
+      // owned by toggleMic/toggleDeaf so an OS interruption cannot impersonate a manual click.
+      .on(RoomEvent.TrackMuted, () => this.emit())
+      .on(RoomEvent.TrackUnmuted, () => this.emit())
       .on(RoomEvent.Reconnecting, () => {
         const rollbackBaseline = room === this.voiceMediaRoom && this.voiceMediaChannelId === channelId
           && this.voiceConnecting && this.inVoice;
@@ -2326,9 +2320,8 @@ export class Engine {
     return {
       vc: active ? this.currentVc! : '',
       deaf: active && this.deafened ? '1' : '',
-      // Интент мута транслируем пирам отдельным атрибутом, как deaf. Бейдж мута у пиров считается по
-      // публикации мик-трека, а её нет вовсе, когда микрофон недоступен (listen-only) или пересобирается
-      // watchdog-ом — и такой участник бессрочно выглядел у всех как «мик включён».
+      // Ручной mute и подтверждённую недоступность транслируем отдельным durable-атрибутом. Временный
+      // системный mute публикации при сворачивании iOS PWA не меняет пользовательский интент.
       mic: active && this.localMicMuted() ? '0' : '',
       vcAt: active && this.myVcAt ? String(this.myVcAt) : '',
       voiceSession: active ? this.voiceLeaseSession : '',
@@ -3153,9 +3146,9 @@ export class Engine {
   /* ---------- качество связи в голосовом (индикатор + пинг) ---------- */
   private startConnPoll() {
     if (this.connTimer) return;
-    document.addEventListener('visibilitychange', this.onVisible);
-    window.addEventListener('pageshow', this.onVisible);
-    window.addEventListener('focus', this.onVisible);
+    document.addEventListener('visibilitychange', this.onVoiceVisible);
+    window.addEventListener('pageshow', this.onVoiceVisible);
+    window.addEventListener('focus', this.onVoiceFocus);
     window.addEventListener('pagehide', this.onVoicePageHide);
     if (document.hidden) this.markVoiceHidden();
     this.pollPing();
@@ -3163,9 +3156,9 @@ export class Engine {
   }
   private stopConnPoll() {
     ++this.voiceStatsGeneration;
-    document.removeEventListener('visibilitychange', this.onVisible);
-    window.removeEventListener('pageshow', this.onVisible);
-    window.removeEventListener('focus', this.onVisible);
+    document.removeEventListener('visibilitychange', this.onVoiceVisible);
+    window.removeEventListener('pageshow', this.onVoiceVisible);
+    window.removeEventListener('focus', this.onVoiceFocus);
     window.removeEventListener('pagehide', this.onVoicePageHide);
     if (this.connTimer) { clearInterval(this.connTimer); this.connTimer = null; }
     this.voiceHiddenAt = 0; this.micForegroundRecoveryPending = false;
@@ -3270,14 +3263,31 @@ export class Engine {
   private hasExactCurrentMicPublication(): boolean {
     const room = this.voiceMediaRoom;
     const track = this.micLocalTrack;
+    const publication = room?.localParticipant.getTrackPublication(Track.Source.Microphone);
     return !!room && !!track && this.voiceMediaChannelId === this.currentVc
-      && this.voiceMediaActivated.has(room) && track.mediaStreamTrack.readyState !== 'ended'
-      && room.localParticipant.getTrackPublication(Track.Source.Microphone)?.track === track;
+      && this.voiceMediaActivated.has(room) && publication?.track === track;
   }
 
-  private fenceMicForCaptureRecovery(hub: Room | null = this.voiceRoom) {
-    const changed = !this.noMic || this.pttDown;
-    this.noMic = true;
+  private hasHealthyCurrentMicTransport(): boolean {
+    const room = this.voiceMediaRoom;
+    const track = this.micLocalTrack;
+    const publication = room?.localParticipant.getTrackPublication(Track.Source.Microphone);
+    const health = microphoneTransportHealth(
+      this.micRaw?.getAudioTracks()[0],
+      track?.mediaStreamTrack,
+      publication?.track === track,
+      publication?.isUpstreamPaused === true,
+    );
+    return !!room && !!track && this.voiceMediaChannelId === this.currentVc
+      && this.voiceMediaActivated.has(room) && !health.ended && !health.muted && !health.upstreamPaused;
+  }
+
+  private fenceMicForCaptureRecovery(
+    hub: Room | null = this.voiceRoom,
+    retainAvailability = retainMicAvailabilityDuringRecovery(this.micHadCapture, this.noMic),
+  ) {
+    const changed = retainAvailability || (!retainAvailability && !this.noMic) || this.pttDown;
+    if (!retainAvailability) this.noMic = true;
     this.pttDown = false;
     this.applyGate();
     if (hub && hub === this.voiceRoom && this.inVoice) void this.setVoiceAttributes(hub, this.wantedVoiceAttributes(hub));
@@ -3617,7 +3627,7 @@ export class Engine {
     this.micHadCapture = true;
     this.micBootstrapWanted = false;
     this.micForegroundRecoveryPending = false;
-    this.watchMicTrack(raw.getAudioTracks()[0]);
+    this.watchMicTracks(raw.getAudioTracks()[0], lat.mediaStreamTrack);
     this.micLevelAt = performance.now(); // отсчёт протухания стартует с момента запуска мика, а не с нуля
     this.startVadWatchdog();
     // индикатор «говорит» + VAD на rAF-анализаторе — сразу (рабочий на переднем плане и на время загрузки
@@ -3793,35 +3803,45 @@ export class Engine {
     this.micRecoveryTimer = null;
     this.micMutedAt = 0;
   }
-  private watchMicTrack(track: MediaStreamTrack) {
+  private watchMicTracks(rawTrack: MediaStreamTrack, publishedTrack: MediaStreamTrack) {
     this.clearMicTrackLifecycle();
-    const owned = () => this.micRaw?.getAudioTracks()[0] === track && this.inVoice;
+    const tracks = [...new Set([rawTrack, publishedTrack])];
+    const owned = () => this.micRaw?.getAudioTracks()[0] === rawTrack
+      && this.micLocalTrack?.mediaStreamTrack === publishedTrack && this.inVoice;
+    const anyMuted = () => tracks.some((track) => track.muted);
     const ended = () => { if (owned()) void this.checkMicAlive(false); };
     const muted = () => {
       if (!owned()) return;
+      if (this.voiceCaptureUnavailable()) this.micForegroundRecoveryPending = true;
       this.micMutedAt = Date.now();
       if (this.micRecoveryTimer != null) clearTimeout(this.micRecoveryTimer);
-      // devicechange is not guaranteed on WebKit. Give route swaps a grace period, then run the
-      // same fenced recovery as the regular watchdog even if background timer ticks were skipped.
+      // LiveKit listens to the processed destination track, not the raw gUM source, and pauses its
+      // sender after a sustained destination mute. Observe both tracks so a live-looking raw source
+      // cannot hide an already-paused upstream. Route swaps still receive the normal grace period.
       this.micRecoveryTimer = window.setTimeout(() => {
         this.micRecoveryTimer = null;
-        if (owned() && track.muted) void this.checkMicAlive(true);
+        if (owned() && anyMuted()) void this.checkMicAlive(true);
       }, MIC_MUTED_RESTART_MS + 50);
     };
     const unmuted = () => {
+      if (anyMuted()) return;
       this.micMutedAt = 0;
       if (this.micRecoveryTimer != null) clearTimeout(this.micRecoveryTimer);
       this.micRecoveryTimer = null;
     };
-    track.addEventListener('ended', ended);
-    track.addEventListener('mute', muted);
-    track.addEventListener('unmute', unmuted);
+    tracks.forEach((track) => {
+      track.addEventListener('ended', ended);
+      track.addEventListener('mute', muted);
+      track.addEventListener('unmute', unmuted);
+    });
     this.micTrackCleanup = () => {
-      track.removeEventListener('ended', ended);
-      track.removeEventListener('mute', muted);
-      track.removeEventListener('unmute', unmuted);
+      tracks.forEach((track) => {
+        track.removeEventListener('ended', ended);
+        track.removeEventListener('mute', muted);
+        track.removeEventListener('unmute', unmuted);
+      });
     };
-    if (track.muted) muted();
+    if (anyMuted()) muted();
   }
   private async checkMicAlive(fromWatchdog = false) {
     const hub = this.voiceRoom;
@@ -3847,6 +3867,12 @@ export class Engine {
     const voiceEpoch = this.voiceEpoch;
     const t = this.micRaw?.getAudioTracks()[0];
     const publication = room.localParticipant.getTrackPublication(Track.Source.Microphone);
+    const transportHealth = microphoneTransportHealth(
+      t,
+      this.micLocalTrack?.mediaStreamTrack,
+      publication?.track === this.micLocalTrack,
+      publication?.isUpstreamPaused === true,
+    );
     // reapplyMic can prepare a context under the user's mobile gesture while permission recovery is
     // still fail-closed. Once the room is re-activated, consume that context directly: tearing it
     // down first would force startMic to create a suspended non-gesture context on iOS.
@@ -3857,15 +3883,17 @@ export class Engine {
     // unusable/unknown context must enter the same fenced recovery as an ended hardware track.
     const micContextNeedsReplacement = !!this.micActx
       && !reusableMicrophoneAudioContextState(this.micActx.state);
-    const ended = !this.micActx || micContextNeedsReplacement || !t || t.readyState === 'ended' || !this.micLocalTrack
-      || this.micLocalTrack.mediaStreamTrack.readyState === 'ended' || publication?.track !== this.micLocalTrack;
+    // UpstreamPaused already means LiveKit replaced the RTCRtpSender track with null after its own
+    // mute debounce. It is terminal for this app-owned pipeline and must not receive another grace.
+    const ended = !this.micActx || micContextNeedsReplacement
+      || transportHealth.ended || transportHealth.upstreamPaused;
     const immediateForegroundRecovery = foregroundMicNeedsImmediateRecovery(
       this.micForegroundRecoveryPending,
       ended,
-      !!t?.muted,
+      transportHealth.muted,
       this.micHadCapture || this.micBootstrapWanted,
     );
-    if (!ended && t?.muted) {
+    if (!ended && transportHealth.muted) {
       if (!this.micMutedAt) this.micMutedAt = Date.now();
       if (!immediateForegroundRecovery && (!fromWatchdog || !mutedTrackNeedsRestart(this.micMutedAt, Date.now()))) return;
     } else if (!ended && !immediateForegroundRecovery) {
@@ -3877,7 +3905,8 @@ export class Engine {
     const recoveryCurrent = () => this.micRecoveryOwner === recoveryOwner
       && this.voiceMediaIntentCurrent(voiceEpoch, hub, room, channel);
     this.micMutedAt = 0; this.micForegroundRecoveryPending = false;
-    this.fenceMicForCaptureRecovery(hub);
+    const retainAvailability = retainMicAvailabilityDuringRecovery(this.micHadCapture, this.noMic);
+    this.fenceMicForCaptureRecovery(hub, retainAvailability);
     try {
       if (!preparedOnly) {
         // iOS may return an AudioContext in WebKit's non-standard `interrupted` state while both
@@ -3919,7 +3948,13 @@ export class Engine {
       }
       this.emit();
     }
-    finally { if (this.micRecoveryOwner === recoveryOwner) this.micRecoveryOwner = 0; }
+    finally {
+      if (this.micRecoveryOwner === recoveryOwner) {
+        this.micRecoveryOwner = 0;
+        this.applyGate();
+        this.emit();
+      }
+    }
   }
   private supersedeHiddenMicOperations() {
     let superseded = false;
@@ -3955,10 +3990,12 @@ export class Engine {
       this.micForegroundRecoveryPending = true;
   }
   private onVoicePageHide = () => { this.markVoiceHidden(); };
+  private onVoiceVisible = () => { this.onVisible(false); };
+  private onVoiceFocus = () => { this.onVisible(true); };
   // iOS/WebKit is allowed to suspend or end WebRTC capture while a PWA is hidden. We do not claim
   // background continuity: on foreground we resume playback and immediately reacquire an owned
   // source that returned muted/ended, without waiting for throttled watchdog timers.
-  private onVisible = () => {
+  private onVisible = (focusFallback = false) => {
     if (!this.inVoice) return;
     // Уход в фон — момент, когда замирает requestAnimationFrame. Если гейт держится на spLoop
     // (ворклет не поднялся), замер протухнет именно сейчас, поэтому пересчитываем гейт сразу, не
@@ -3970,20 +4007,33 @@ export class Engine {
     }
     const returningFromBackground = this.voiceHiddenAt > 0;
     this.voiceHiddenAt = 0;
-    if (returningFromBackground && this.micForegroundRecoveryPending) {
+    const track = this.micRaw?.getAudioTracks()[0];
+    const publication = this.voiceMediaRoom?.localParticipant.getTrackPublication(Track.Source.Microphone);
+    const transportHealth = microphoneTransportHealth(
+      track,
+      this.micLocalTrack?.mediaStreamTrack,
+      publication?.track === this.micLocalTrack,
+      publication?.isUpstreamPaused === true,
+    );
+    const contextUnusable = !!this.micActx && !reusableMicrophoneAudioContextState(this.micActx.state);
+    const ownsCapture = this.micHadCapture || this.micBootstrapWanted;
+    // Standalone WebKit can deliver focus without pagehide/visibilitychange. In that fallback path,
+    // arm recovery only from concrete transport/context damage so an ordinary desktop focus does
+    // not rebuild a healthy microphone.
+    if (focusFallback && ownsCapture
+      && (transportHealth.ended || transportHealth.muted || transportHealth.upstreamPaused || contextUnusable)) {
+      this.micForegroundRecoveryPending = true;
+    }
+    if ((returningFromBackground || focusFallback) && this.micForegroundRecoveryPending) {
       // A WebKit gUM promise may remain pending across the entire hidden period. Retire only the
       // exact owners observed at hide time, then let one new visible generation acquire capture.
       // The paired pageshow event sees cleared hidden-owner fields and cannot supersede that owner.
-      this.supersedeHiddenMicOperations();
-      const track = this.micRaw?.getAudioTracks()[0];
-      const publication = this.voiceMediaRoom?.localParticipant.getTrackPublication(Track.Source.Microphone);
-      const ended = !track || track.readyState === 'ended' || !this.micLocalTrack
-        || this.micLocalTrack.mediaStreamTrack.readyState === 'ended' || publication?.track !== this.micLocalTrack;
+      if (returningFromBackground) this.supersedeHiddenMicOperations();
       this.micForegroundRecoveryPending = foregroundMicNeedsImmediateRecovery(
         true,
-        ended,
-        !!track?.muted,
-        this.micHadCapture || this.micBootstrapWanted,
+        transportHealth.ended || transportHealth.upstreamPaused || contextUnusable,
+        transportHealth.muted,
+        ownsCapture,
       );
     }
     this.applyGate();
@@ -4068,7 +4118,7 @@ export class Engine {
     const hubAttrs = this.voiceRoom?.localParticipant.attributes || {};
     const hubAdvertised = (hubAttrs.vc || '') === (this.currentVc || '') && (hubAttrs.voiceSession || '') === this.voiceLeaseSession
       && (hubAttrs.voiceEpoch || '') === (this.voiceLeaseEpoch > 0 ? String(this.voiceLeaseEpoch) : '');
-    if (!activeMedia || !hubAdvertised || this.voiceConnecting || this.voiceLeaseVerifying || this.voiceClaimPending !== 0 || this.voiceLeaseEpoch <= 0
+    if (!activeMedia || !hubAdvertised || this.micRecoveryOwner !== 0 || this.voiceConnecting || this.voiceLeaseVerifying || this.voiceClaimPending !== 0 || this.voiceLeaseEpoch <= 0
       || this.voiceLeaseSession !== this.sessionId()) target = 0;
     else if (this.manualMute || this.deafened) target = 0;
     else if (s.mode === 'ptt') target = this.pttDown ? 1 : 0;
@@ -4441,6 +4491,9 @@ export class Engine {
     // при manualMute). В голосе — сразу мьютим/размьючиваем трек. Всегда персистим.
     this.manualMute = !this.manualMute;
     this.saveVoicePrefs();
+    // While deafened the physical track stays muted regardless of this preference. Keep the
+    // existing full-mute sound authoritative instead of announcing an unmute nobody can hear.
+    if (this.inVoice && !this.deafened) playSound(this.manualMute ? 'mute' : 'unmute');
     if (this.inVoice && this.voiceRoom && this.voiceMediaRoom) {
       const p = this.micPub();
       // пока фулл-мут (deafened) активен, трек должен оставаться замьюченным на уровне LiveKit
@@ -4460,10 +4513,6 @@ export class Engine {
     this.deafened = !this.deafened;
     this.saveVoicePrefs();
     if (this.inVoice) {
-      // оглушение внутри мьютит/размьютит мик-трек → RoomEvent.TrackMuted/Unmuted. Глушим их
-      // паразитный mute/unmute-звук на ~250мс: свой звук (fullMute/unmute) играем явно ниже.
-      this.deafToggling = true;
-      window.setTimeout(() => { this.deafToggling = false; }, 250);
       // транслируем пирам, чтобы у них статус-бейдж отличался от простого мута мика (см. build())
       if (this.voiceRoom) void this.setVoiceAttributes(this.voiceRoom, this.wantedVoiceAttributes(this.voiceRoom));
       const p = this.micPub();
@@ -4485,7 +4534,7 @@ export class Engine {
   pttPress() {
     if (getSettings().mode !== 'ptt' || !this.inVoice || this.deafened || this.manualMute || this.noMic
       || this.voiceConnecting || this.voiceReconnecting || this.voiceLeaseVerifying || this.voiceClaimPending !== 0
-      || this.micStartOwnership.active || this.micRecoveryOwner !== 0 || !this.hasExactCurrentMicPublication() || this.pttDown) return;
+      || this.micStartOwnership.active || this.micRecoveryOwner !== 0 || !this.hasHealthyCurrentMicTransport() || this.pttDown) return;
     this.pttDown = true; this.applyGate(); this.emit();
   }
   // Safe for blur/visibility/network handlers: always closes the gate even if mode or voice state

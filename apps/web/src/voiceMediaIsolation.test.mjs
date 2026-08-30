@@ -11,6 +11,7 @@ assert.equal(normalizeSource('windows\r\nlegacy-mac\r'), 'windows\nlegacy-mac\n'
   'source-contract checks normalize platform line endings');
 const source = readSource('engine.ts');
 const storeSource = readSource('store.ts');
+const voiceDockSource = readSource('components', 'VoiceDock.tsx');
 const deploySource = readSource('..', '..', '..', '.github', 'workflows', 'deploy.yml');
 const file = ts.createSourceFile('engine.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
 const engine = file.statements.find((node) => ts.isClassDeclaration(node) && node.name?.text === 'Engine');
@@ -84,8 +85,8 @@ assert.match(publishExisting, /const micOp = this\.micEpoch/,
   'microphone republish must capture the exact pipeline generation');
 assert.match(publishExisting, /this\.micEpoch === micOp && this\.micLocalTrack === track/,
   'late republish completion must not overwrite a newer microphone pipeline');
-assert.match(methodText('checkMicAlive'), /publication\?\.track !== this\.micLocalTrack/,
-  'watchdog must recover when the room publication differs from the owned microphone track');
+assert.match(methodText('checkMicAlive'), /microphoneTransportHealth\([\s\S]*publication\?\.track === this\.micLocalTrack[\s\S]*publication\?\.isUpstreamPaused === true/,
+  'watchdog must validate the exact publication, processed destination and paused sender');
 assert.match(methodText('checkMicAlive'), /const preparedOnly = !!this\.micActx && reusableMicrophoneAudioContextState\(this\.micActx\.state\)[\s\S]*if \(!preparedOnly\)[\s\S]*stopMic\(room, recoveryContext\)/,
   'mobile recovery must preserve a resumable prepared AudioContext instead of closing it before reacquisition');
 assert.match(methodText('checkMicAlive'), /const recoveryContext = reusableMicrophoneAudioContextState\(this\.micActx\?\.state\) \? this\.micActx : null/,
@@ -355,16 +356,20 @@ assert.match(methodText('watchLateVoiceClaim'), /releaseVoiceLease\(session, lea
 const onVisible = methodText('onVisible');
 const startConnPoll = methodText('startConnPoll');
 const stopConnPoll = methodText('stopConnPoll');
-assert.match(startConnPoll, /window\.addEventListener\('focus', this\.onVisible\)/,
+assert.match(startConnPoll, /window\.addEventListener\('focus', this\.onVoiceFocus\)/,
   'iOS PWA focus must provide a foreground recovery fallback when pageshow is skipped');
-assert.match(stopConnPoll, /window\.removeEventListener\('focus', this\.onVisible\)/,
+assert.match(stopConnPoll, /window\.removeEventListener\('focus', this\.onVoiceFocus\)/,
   'voice teardown must remove the exact focus recovery listener');
+assert.match(methodText('onVoiceFocus'), /onVisible\(true\)/,
+  'focus fallback must explicitly request damaged-transport validation');
 assert.match(methodText('onVoicePageHide'), /markVoiceHidden/,
   'pagehide must record iOS PWA backgrounding even when visibilitychange is skipped');
 assert.doesNotMatch(methodText('onVoicePageHide'), /disconnect|leaveVoice/,
   'ordinary iOS backgrounding must not be treated as explicit voice leave');
 assert.match(onVisible, /returningFromBackground[\s\S]*foregroundMicNeedsImmediateRecovery/,
   'foreground must detect an iOS-muted or ended owned capture immediately');
+assert.match(onVisible, /focusFallback[\s\S]*microphoneTransportHealth[\s\S]*micForegroundRecoveryPending = true/,
+  'focus without pagehide must arm recovery only after concrete transport damage');
 assert.match(onVisible, /checkMicAlive\(false\)/,
   'foreground must invoke fenced microphone recovery without waiting for a throttled timer');
 assert.match(methodText('checkMicAlive'), /immediateForegroundRecovery[\s\S]*!immediateForegroundRecovery/,
@@ -392,6 +397,16 @@ assert.match(micRecovery, /if \(!this\.micHadCapture\) \{[\s\S]*this\.micBootstr
   'an initial denied bootstrap must disarm periodic permission retries');
 
 const wireMedia = methodText('wireVoiceMediaRoom');
+assert.doesNotMatch(wireMedia, /RoomEvent\.TrackMuted[\s\S]{0,300}playSound\('mute'\)/,
+  'an iOS transport interruption must not impersonate a manual mute sound');
+assert.doesNotMatch(wireMedia, /RoomEvent\.TrackUnmuted[\s\S]{0,300}playSound\('unmute'\)/,
+  'an automatic transport resume must not impersonate a manual unmute sound');
+assert.match(methodText('toggleMic'), /manualMute = !this\.manualMute[\s\S]*playSound\(this\.manualMute \? 'mute' : 'unmute'\)/,
+  'microphone sounds belong to the explicit user toggle');
+assert.doesNotMatch(methodText('build'), /mp\.isMuted/,
+  'remote manual mute badges must not be derived from iOS transport mute');
+assert.match(methodText('build'), /attributes\?\.mic === '0' \|\| deaf/,
+  'durable hub intent remains authoritative for remote mute badges');
 const mediaReconnected = wireMedia.slice(wireMedia.indexOf('.on(RoomEvent.Reconnected'));
 assert.match(mediaReconnected, /this\.pttDown = false/,
   'media reconnect must always require a fresh PTT press');
@@ -500,11 +515,33 @@ assert.match(permissionRecovery, /this\.pendingVoiceMediaRoom === room/,
   'a pending-room permission deadline must terminate its exact transaction');
 
 const micFence = methodText('fenceMicForCaptureRecovery');
-assert.match(micFence, /this\.noMic = true[\s\S]*this\.pttDown = false[\s\S]*setVoiceAttributes[\s\S]*emit/,
-  'capture recovery must expose listen-only state locally and to peers before teardown');
+assert.match(micFence, /retainAvailability = retainMicAvailabilityDuringRecovery\(this\.micHadCapture, this\.noMic\)/,
+  'every non-terminal capture recovery keeps a previously working microphone logically available');
+assert.match(micFence, /if \(!retainAvailability\) this\.noMic = true[\s\S]*this\.pttDown = false[\s\S]*setVoiceAttributes[\s\S]*emit/,
+  'only an actually unavailable microphone may publish listen-only state during recovery');
+assert.match(micRecovery, /retainMicAvailabilityDuringRecovery\(this\.micHadCapture, this\.noMic\)[\s\S]*fenceMicForCaptureRecovery\(hub, retainAvailability\)/,
+  'a previously working microphone keeps its durable talk intent while transport is rebuilt');
+assert.match(micRecovery, /catch \{[\s\S]*this\.noMic = true[\s\S]*setVoiceAttributes/,
+  'a confirmed recovery failure still exposes microphone unavailability to peers');
+assert.match(methodText('applyGate'), /micRecoveryOwner !== 0/,
+  'the uplink gate stays closed while recovery no longer borrows the manual mute state');
+assert.match(methodText('watchMicTracks'), /new Set\(\[rawTrack, publishedTrack\]\)[\s\S]*track\.addEventListener\('mute'/,
+  'raw and processed microphone tracks must share one lifecycle watchdog');
+assert.match(voiceDockSource, /suppressPttClick\.current = latchRejectedPttHold\(ptt, recovering, muted\)/,
+  'a rejected recovery-time PTT hold must remain latched until its later synthetic click');
+assert.match(voiceDockSource, /if \(ptt && recovering && !muted\)[\s\S]*event\.preventDefault\(\)[\s\S]*return/,
+  'a recovery-time PTT click must not become a persistent mute toggle');
+assert.match(methodText('toggleMic'), /if \(this\.inVoice && !this\.deafened\) playSound/,
+  'manual mic preference changes while deafened must not announce a false audible unmute');
 const pttPress = methodText('pttPress');
-assert.match(pttPress, /micStartOwnership\.active[\s\S]*micRecoveryOwner !== 0[\s\S]*!this\.hasExactCurrentMicPublication\(\)/,
+assert.match(pttPress, /micStartOwnership\.active[\s\S]*micRecoveryOwner !== 0[\s\S]*!this\.hasHealthyCurrentMicTransport\(\)/,
   'PTT must reject while capture is recovering or lacks the exact current publication');
+assert.match(methodText('hasExactCurrentMicPublication'), /publication\?\.track === track/,
+  'stale-owner guards must recognize the newer publication by exact ownership');
+assert.doesNotMatch(methodText('hasExactCurrentMicPublication'), /microphoneTransportHealth|readyState|muted|upstreamPaused/,
+  'stale-owner guards must recognize a newer exact publication through any temporary iOS transport damage');
+assert.match(methodText('hasHealthyCurrentMicTransport'), /!health\.ended && !health\.muted && !health\.upstreamPaused/,
+  'PTT requires both exact identity and a healthy active sender');
 const foregroundSupersede = methodText('supersedeHiddenMicOperations');
 assert.match(foregroundSupersede, /micStartOwnership\.owner === this\.hiddenMicStartOwner[\s\S]*\+\+this\.micEpoch[\s\S]*invalidate/,
   'foreground must supersede the exact gUM owner observed at hide time');

@@ -19,8 +19,10 @@ const {
   automaticMicRecoveryAllowed,
   foregroundMicNeedsImmediateRecovery,
   isVoiceOperationTimeout,
+  microphoneTransportHealth,
   mutedTrackNeedsRestart,
   readStoredFlag,
+  retainMicAvailabilityDuringRecovery,
   reusableMicrophoneAudioContextState,
   resumeGestureAudioContext,
   resumeSharedGestureAudioContext,
@@ -246,6 +248,31 @@ assert.equal(foregroundMicNeedsImmediateRecovery(false, false, true), false,
   'an ordinary transient mute still uses the route-change grace period');
 assert.equal(foregroundMicNeedsImmediateRecovery(true, false, false, true), true,
   'an owned iOS capture is reacquired after background even when WebKit leaves stale live flags');
+
+{
+  const live = () => ({ readyState: 'live', muted: false });
+  assert.deepEqual(microphoneTransportHealth(live(), live(), true, false),
+    { ended: false, muted: false, upstreamPaused: false },
+    'raw and processed tracks plus their exact active publication form one healthy transport');
+  assert.equal(microphoneTransportHealth({ ...live(), muted: true }, live(), true, false).muted, true,
+    'a muted raw gUM source is unhealthy');
+  assert.equal(microphoneTransportHealth(live(), { ...live(), muted: true }, true, false).muted, true,
+    'a muted MediaStreamDestination is unhealthy even while raw gUM still looks live');
+  assert.equal(microphoneTransportHealth(live(), { readyState: 'ended' }, true, false).ended, true,
+    'an ended published destination requires a full pipeline rebuild');
+  assert.equal(microphoneTransportHealth(live(), live(), false, false).ended, true,
+    'a track which is no longer the exact publication is stale');
+  assert.deepEqual(microphoneTransportHealth(live(), live(), true, true),
+    { ended: false, muted: true, upstreamPaused: true },
+    'LiveKit sender=null is an immediate transport failure even when both JS tracks look live');
+}
+
+assert.equal(retainMicAvailabilityDuringRecovery(true, false), true,
+  'a previously working microphone keeps its logical unmuted intent during a bounded rebuild');
+assert.equal(retainMicAvailabilityDuringRecovery(true, true), false,
+  'a microphone already known unavailable stays unavailable while retrying');
+assert.equal(retainMicAvailabilityDuringRecovery(false, false), false,
+  'an initial bootstrap without prior capture cannot claim transient availability');
 
 assert.equal(reusableMicrophoneAudioContextState('running'), true,
   'a running gesture-created microphone context remains reusable');

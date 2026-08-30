@@ -31,6 +31,11 @@ export function suppressPointerToggleWhilePtt(ptt: boolean, clickDetail: number)
   return ptt && clickDetail > 0;
 }
 
+/** Captures a rejected recovery-time PTT hold until its later synthetic click is consumed. */
+export function latchRejectedPttHold(ptt: boolean, recovering: boolean, muted: boolean): boolean {
+  return ptt && recovering && !muted;
+}
+
 export function isRangeAdjustmentKey(key: string): boolean {
   return key === 'ArrowLeft' || key === 'ArrowRight' || key === 'ArrowUp' || key === 'ArrowDown'
     || key === 'PageUp' || key === 'PageDown' || key === 'Home' || key === 'End';

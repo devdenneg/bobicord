@@ -12,6 +12,7 @@ const js = ts.transpileModule(source, {
 const {
   PrimaryPointerHold,
   isRangeAdjustmentKey,
+  latchRejectedPttHold,
   suppressPointerToggleWhilePtt,
   webScreenShareSupported,
 } = await import('data:text/javascript,' + encodeURIComponent(js));
@@ -32,6 +33,14 @@ assert.equal(hold.cancel(), false, 'duplicate visibility release is idempotent')
 assert.equal(suppressPointerToggleWhilePtt(true, 1), true, 'touch click cannot toggle after PTT release');
 assert.equal(suppressPointerToggleWhilePtt(true, 0), false, 'keyboard activation remains available');
 assert.equal(suppressPointerToggleWhilePtt(false, 1), false, 'normal mic mode still toggles on tap');
+const rejectedRecoveryHold = latchRejectedPttHold(true, true, false);
+assert.equal(rejectedRecoveryHold, true, 'an unmuted PTT press is latched while capture is recovering');
+assert.equal(suppressPointerToggleWhilePtt(rejectedRecoveryHold, 1), true,
+  'the latched click stays suppressed even if recovery finishes before click dispatch');
+assert.equal(latchRejectedPttHold(true, true, true), false,
+  'a manually muted PTT button remains available for an explicit unmute click');
+assert.equal(latchRejectedPttHold(false, true, false), false,
+  'normal microphone mode does not borrow the PTT suppression latch');
 
 for (const key of ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End']) {
   assert.equal(isRangeAdjustmentKey(key), true, `${key} adjusts a range`);
