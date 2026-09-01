@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::ffi::c_void;
 use std::ptr::null_mut;
+use std::sync::Mutex as StdMutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use windows::core::{PCWSTR, PWSTR};
@@ -28,6 +29,10 @@ const NATIVE_ORIGIN: &str = "tauri://localhost";
 const MAX_CREDENTIAL_BYTES: usize = 2_048;
 const MAX_AUTH_RESPONSE_BYTES: usize = 1_048_576;
 const NOT_FOUND_HRESULT: i32 = 0x8007_0490u32 as i32;
+const TREE_ACCESS_REFRESH_SKEW_MS: u64 = 30_000;
+const TREE_ACCESS_HANDSHAKE_MARGIN_MS: u64 = 5_000;
+const TREE_REFRESH_RETRY_BASE_MS: u64 = 10_000;
+const TREE_REFRESH_RETRY_MAX_MS: u64 = 300_000;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,7 +71,26 @@ impl NativeAuthError {
   }
 
   fn terminal(&self) -> bool {
-    self.code == "SESSION_REVOKED" || self.code == "REFRESH_INVALID"
+    self.status == 401
+      && (self.code == "SESSION_REVOKED" || self.code == "REFRESH_INVALID")
+  }
+
+  pub(crate) fn tree_refresh_failure(&self) -> (&'static str, bool) {
+    // HTTP status is authoritative even when an upstream error body supplies its own code.
+    // Treating a named 5xx as terminal would stop an otherwise healthy long-running stream during
+    // a deploy, while retrying an arbitrary 4xx forever would hide a broken/revoked credential.
+    if self.status == 429 { return ("native-auth-rate-limit", false); }
+    if self.status >= 500 { return ("native-auth-upstream", false); }
+    if self.status == 401 { return ("native-auth-session-ended", true); }
+    if self.status >= 400 { return ("native-auth-invalid-response", true); }
+    match self.code.as_str() {
+      "NETWORK_ERROR" => ("native-auth-network", false),
+      "REQUEST_TIMEOUT" => ("native-auth-timeout", false),
+      "SESSION_REVOKED" | "REFRESH_INVALID" | "UNAUTHORIZED" => ("native-auth-session-ended", true),
+      "LOGOUT_PENDING" => ("native-auth-logout-pending", true),
+      "AUTH_SECURE_STORAGE_UNAVAILABLE" => ("native-auth-storage", true),
+      _ => ("native-auth-invalid-response", true),
+    }
   }
 }
 
@@ -156,8 +180,24 @@ trait AuthTransport: Send + Sync {
 
 pub struct NativeAuthState {
   owner: Mutex<()>,
+  access_cache: StdMutex<Option<CachedAccess>>,
+  access_retry: StdMutex<Option<CachedRefreshFailure>>,
   client: reqwest::Client,
   api_base: String,
+}
+
+#[derive(Clone)]
+struct CachedAccess {
+  token: String,
+  expires_at: u64,
+  session_id: String,
+}
+
+#[derive(Clone)]
+struct CachedRefreshFailure {
+  session_id: String,
+  retry_at: u64,
+  error: NativeAuthError,
 }
 
 impl NativeAuthState {
@@ -172,7 +212,13 @@ impl NativeAuthState {
       .user_agent("RelayApp-native-auth/1")
       .build()
       .map_err(|_| "failed to initialize native auth transport".to_string())?;
-    Ok(Self { owner: Mutex::new(()), client, api_base })
+    Ok(Self {
+      owner: Mutex::new(()),
+      access_cache: StdMutex::new(None),
+      access_retry: StdMutex::new(None),
+      client,
+      api_base,
+    })
   }
 
   async fn post_json(
@@ -242,7 +288,21 @@ impl NativeAuthState {
   }
 
   async fn refresh_locked(&self, current: &CredentialEnvelope) -> Result<Value, NativeAuthError> {
-    refresh_with(&WindowsCredentialStore, self, current).await
+    let bundle = match refresh_with(&WindowsCredentialStore, self, current).await {
+      Ok(bundle) => bundle,
+      Err(error) => {
+        if error.tree_refresh_failure().1 {
+          self.invalidate_tree_access_cache();
+        } else {
+          remember_cached_refresh_failure(
+            &self.access_retry, &current.session_id, &error, now_millis(),
+          );
+        }
+        return Err(error);
+      }
+    };
+    self.remember_access(&bundle)?;
+    Ok(bundle)
   }
 
   async fn persist_rotated_bundle(
@@ -250,7 +310,9 @@ impl NativeAuthState {
     response: Value,
     previous: Option<&CredentialEnvelope>,
   ) -> Result<Value, NativeAuthError> {
-    persist_rotated_with(&WindowsCredentialStore, self, response, previous).await
+    let bundle = persist_rotated_with(&WindowsCredentialStore, self, response, previous).await?;
+    self.remember_access(&bundle)?;
+    Ok(bundle)
   }
 
   async fn authenticated_mutation(
@@ -259,7 +321,93 @@ impl NativeAuthState {
     access_token: &str,
     body: Value,
   ) -> Result<Value, NativeAuthError> {
-    authenticated_mutation_with(&WindowsCredentialStore, self, path, access_token, body).await
+    let bundle = match authenticated_mutation_with(
+      &WindowsCredentialStore, self, path, access_token, body,
+    ).await {
+      Ok(bundle) => bundle,
+      Err(error) => {
+        if error.tree_refresh_failure().1 { self.invalidate_tree_access_cache(); }
+        return Err(error);
+      }
+    };
+    self.remember_access(&bundle)?;
+    Ok(bundle)
+  }
+
+  fn remember_access(&self, value: &Value) -> Result<(), NativeAuthError> {
+    let cached = cached_access(value)?;
+    *self.access_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cached);
+    *self.access_retry.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    Ok(())
+  }
+
+  pub(crate) fn invalidate_tree_access_cache(&self) {
+    *self.access_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    *self.access_retry.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+  }
+
+  /// Compare-and-clear for an exact rejected socket credential. A delayed 401/4001 from an older
+  /// watch must not evict a newer access token installed by another watch or renderer refresh.
+  pub(crate) fn invalidate_rejected_tree_access(&self, rejected_token: &str) {
+    if invalidate_rejected_cached_access(&self.access_cache, rejected_token) {
+      // An authoritative 401/4001 must bypass a transient auth cooldown and try a genuinely fresh
+      // access token. The CAS above prevents an old socket from clearing a newer generation.
+      *self.access_retry.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+  }
+
+  /// Internal tree-signalling renewal. It shares the exact Credential Manager lock/rotation path
+  /// used by the renderer command, but returns only the already-sanitized short-lived access JWT.
+  /// The rotating refresh credential and CSRF value never cross this boundary.
+  pub(crate) async fn refresh_tree_access_token(&self) -> Result<String, NativeAuthError> {
+    let _owner = self.owner.lock().await;
+    let current = match read_credential()? {
+      Some(current) => current,
+      None => {
+        self.invalidate_tree_access_cache();
+        return Err(NativeAuthError::new("SESSION_REVOKED", "Сохранённая сессия не найдена"));
+      }
+    };
+    if current.state != StoredState::Active {
+      self.invalidate_tree_access_cache();
+      return Err(NativeAuthError::new("LOGOUT_PENDING", "Предыдущий выход ещё не завершён"));
+    }
+    let now = now_millis();
+    // Copy the bounded access value while the synchronous cache guard is held, then drop the guard
+    // before the refresh await. This keeps NativeAuthState Send-safe and ensures every watch and
+    // broadcast shares the same outer owner instead of independently rotating the refresh token.
+    let (reusable, fallback) = {
+      let mut cache = self.access_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+      if cache.as_ref().is_some_and(|cached| cached.session_id != current.session_id) {
+        *cache = None;
+      }
+      (
+        reusable_cached_access(
+          cache.as_ref(), &current.session_id, now, TREE_ACCESS_REFRESH_SKEW_MS,
+        ),
+        reusable_cached_access(
+          cache.as_ref(), &current.session_id, now, TREE_ACCESS_HANDSHAKE_MARGIN_MS,
+        ),
+      )
+    };
+    if let Some(token) = reusable { return Ok(token); }
+    if let Some(error) = cached_refresh_failure(
+      &self.access_retry, &current.session_id, now,
+    ) {
+      return fallback.ok_or(error);
+    }
+    match self.refresh_locked(&current).await {
+      Ok(bundle) => sanitized_access_token(&bundle),
+      Err(error) => {
+        // A transient auth outage does not make an access JWT invalid. Keep the last few usable
+        // seconds as a handshake fallback; exact 401/4001 already CAS-cleared this cache, and a
+        // terminal refresh always clears it before arriving here.
+        if !error.tree_refresh_failure().1 {
+          if let Some(token) = fallback { return Ok(token); }
+        }
+        Err(error)
+      }
+    }
   }
 }
 
@@ -424,7 +572,7 @@ fn parse_persistent_bundle(mut value: Value) -> Result<ParsedBundle, NativeAuthE
     return Err(NativeAuthError::new("INVALID_AUTH_RESPONSE", "Сервер вернул разные ключи доступа"));
   }
   let expires = object.get("accessExpiresAt").and_then(Value::as_u64).unwrap_or(0);
-  let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+  let now = now_millis();
   if expires <= now.saturating_sub(5_000) {
     return Err(NativeAuthError::new("INVALID_AUTH_RESPONSE", "Сервер вернул истёкший доступ"));
   }
@@ -460,6 +608,94 @@ fn parse_persistent_bundle(mut value: Value) -> Result<ParsedBundle, NativeAuthE
     },
     sanitized: value,
   })
+}
+
+fn now_millis() -> u64 {
+  SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+fn sanitized_access_token(value: &Value) -> Result<String, NativeAuthError> {
+  // parse_persistent_bundle already removed refreshToken/csrfToken before this value was returned;
+  // validate again at the internal consumer boundary so a future refactor cannot turn tree URL
+  // renewal into a secret-exfiltration path.
+  if value.get("refreshToken").is_some() || value.get("csrfToken").is_some() {
+    return Err(NativeAuthError::new("INVALID_AUTH_RESPONSE", "Ответ содержит закрытые данные"));
+  }
+  let token = value.get("accessToken").and_then(Value::as_str).unwrap_or("");
+  validate_header_secret(token)?;
+  if value.get("token").and_then(Value::as_str) != Some(token) {
+    return Err(NativeAuthError::new("INVALID_AUTH_RESPONSE", "Сервер вернул разные ключи доступа"));
+  }
+  Ok(token.to_string())
+}
+
+fn cached_access(value: &Value) -> Result<CachedAccess, NativeAuthError> {
+  let token = sanitized_access_token(value)?;
+  let expires_at = value.get("accessExpiresAt").and_then(Value::as_u64).unwrap_or(0);
+  if expires_at <= now_millis() {
+    return Err(NativeAuthError::new("INVALID_AUTH_RESPONSE", "Сервер вернул истёкший доступ"));
+  }
+  let session_id = value.get("sessionId").and_then(Value::as_str).unwrap_or("");
+  if session_id.len() != 32 || !token_component(session_id) {
+    return Err(NativeAuthError::new("INVALID_AUTH_RESPONSE", "Некорректный идентификатор сессии"));
+  }
+  Ok(CachedAccess { token, expires_at, session_id: session_id.to_string() })
+}
+
+fn reusable_cached_access(
+  cache: Option<&CachedAccess>,
+  session_id: &str,
+  now: u64,
+  margin_ms: u64,
+) -> Option<String> {
+  cache
+    .filter(|cached| cached.session_id == session_id
+      && cached.expires_at > now.saturating_add(margin_ms))
+    .map(|cached| cached.token.clone())
+}
+
+fn tree_refresh_retry_ms(error: &NativeAuthError) -> u64 {
+  let requested = error.retry_after.unwrap_or(0).saturating_mul(1_000);
+  requested.max(TREE_REFRESH_RETRY_BASE_MS).min(TREE_REFRESH_RETRY_MAX_MS)
+}
+
+fn remember_cached_refresh_failure(
+  cache: &StdMutex<Option<CachedRefreshFailure>>,
+  session_id: &str,
+  error: &NativeAuthError,
+  now: u64,
+) {
+  if error.tree_refresh_failure().1 { return; }
+  *cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CachedRefreshFailure {
+    session_id: session_id.to_string(),
+    retry_at: now.saturating_add(tree_refresh_retry_ms(error)),
+    error: error.clone(),
+  });
+}
+
+fn cached_refresh_failure(
+  cache: &StdMutex<Option<CachedRefreshFailure>>,
+  session_id: &str,
+  now: u64,
+) -> Option<NativeAuthError> {
+  let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+  match cache.as_ref() {
+    Some(failure) if failure.session_id == session_id && failure.retry_at > now => {
+      Some(failure.error.clone())
+    }
+    Some(_) => { *cache = None; None }
+    None => None,
+  }
+}
+
+fn invalidate_rejected_cached_access(
+  cache: &StdMutex<Option<CachedAccess>>,
+  rejected_token: &str,
+) -> bool {
+  let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+  if !cache.as_ref().is_some_and(|cached| cached.token == rejected_token) { return false; }
+  *cache = None;
+  true
 }
 
 fn server_error(status: u16, data: &Value) -> NativeAuthError {
@@ -791,6 +1027,7 @@ pub async fn native_auth_begin_logout(
 ) -> Result<bool, NativeAuthError> {
   authorize_invoker(&window)?;
   let _owner = state.owner.lock().await;
+  state.invalidate_tree_access_cache();
   begin_logout_with(&WindowsCredentialStore)
 }
 
@@ -802,6 +1039,7 @@ pub async fn native_auth_drain_logout(
 ) -> Result<NativeLogoutResult, NativeAuthError> {
   authorize_invoker(&window)?;
   let _owner = state.owner.lock().await;
+  state.invalidate_tree_access_cache();
   drain_logout_with(&WindowsCredentialStore, &*state, push_cleanups).await
 }
 
@@ -944,6 +1182,67 @@ mod tests {
   }
 
   #[test]
+  fn tree_renewal_accepts_only_the_sanitized_short_access_token() {
+    let session = "T".repeat(32);
+    let refresh = refresh(&session, "0");
+    let parsed = parse_persistent_bundle(bundle(&session, &refresh)).unwrap();
+    assert_eq!(sanitized_access_token(&parsed.sanitized).unwrap(), "short-lived-access");
+
+    let mut leaked = parsed.sanitized.clone();
+    leaked["refreshToken"] = Value::String(refresh);
+    assert!(sanitized_access_token(&leaked).is_err());
+
+    let mut mismatched = parsed.sanitized;
+    mismatched["token"] = Value::String("different-access".into());
+    assert!(sanitized_access_token(&mismatched).is_err());
+  }
+
+  #[test]
+  fn delayed_tree_rejection_cannot_clear_a_newer_cached_access() {
+    let cache = StdMutex::new(Some(CachedAccess {
+      token: "access-b".into(), expires_at: u64::MAX, session_id: "S".repeat(32),
+    }));
+    invalidate_rejected_cached_access(&cache, "access-a");
+    assert_eq!(cache.lock().unwrap().as_ref().unwrap().token, "access-b");
+    invalidate_rejected_cached_access(&cache, "access-b");
+    assert!(cache.lock().unwrap().is_none());
+  }
+
+  #[test]
+  fn tree_access_cache_is_shared_until_the_expiry_skew_or_session_changes() {
+    let cache = CachedAccess {
+      token: "shared-access".into(), expires_at: 1_000_000, session_id: "S".repeat(32),
+    };
+    assert_eq!(
+      reusable_cached_access(Some(&cache), &"S".repeat(32), 900_000, 30_000).as_deref(),
+      Some("shared-access"),
+    );
+    assert!(reusable_cached_access(Some(&cache), &"S".repeat(32), 970_000, 30_000).is_none(),
+      "the exact 30-second boundary must refresh instead of starting a marginal socket");
+    assert!(reusable_cached_access(Some(&cache), &"N".repeat(32), 900_000, 30_000).is_none(),
+      "an access JWT is never reused across durable device sessions");
+  }
+
+  #[test]
+  fn rapid_transient_tree_refreshes_share_one_negative_cooldown() {
+    let failures = StdMutex::new(None);
+    let session = "Q".repeat(32);
+    let mut outage = NativeAuthError::new("AUTH_BUSY", "arbitrary upstream detail");
+    outage.status = 503;
+    remember_cached_refresh_failure(&failures, &session, &outage, 1_000);
+
+    for offset in 1..10_000 {
+      let cached = cached_refresh_failure(&failures, &session, 1_000 + offset).unwrap();
+      assert_eq!(cached.tree_refresh_failure(), ("native-auth-upstream", false));
+    }
+    assert!(cached_refresh_failure(&failures, &session, 11_000).is_none());
+
+    remember_cached_refresh_failure(&failures, &session, &outage, 20_000);
+    assert!(cached_refresh_failure(&failures, &"R".repeat(32), 20_001).is_none(),
+      "a cooldown never crosses a durable session boundary");
+  }
+
+  #[test]
   fn mismatched_session_or_nested_secret_is_rejected() {
     let first = "C".repeat(32);
     let second = "D".repeat(32);
@@ -1037,5 +1336,53 @@ mod tests {
     assert_eq!(error.code, "SESSION_REVOKED");
     assert!(store.stored().is_none());
     assert_eq!(store.deletes.load(Ordering::SeqCst), 1);
+  }
+
+  #[tokio::test]
+  async fn upstream_failure_cannot_spoof_revocation_and_delete_the_device_credential() {
+    let session = "I".repeat(32);
+    let current = envelope(&session, "0", StoredState::Active);
+    let store = MockStore::new(Some(current.clone()));
+    let transport = MockTransport::new(vec![Err(NativeAuthError {
+      code: "SESSION_REVOKED".to_string(),
+      message: "untrusted upstream payload".to_string(),
+      status: 503,
+      details: None,
+      attempts_remaining: None,
+      retry_after: None,
+    })]);
+
+    let error = refresh_with(&store, &transport, &current).await.unwrap_err();
+
+    assert!(!error.terminal());
+    assert_eq!(error.tree_refresh_failure(), ("native-auth-upstream", false));
+    assert!(store.stored().is_some());
+    assert_eq!(store.deletes.load(Ordering::SeqCst), 0);
+  }
+
+  #[test]
+  fn unauthorized_status_stops_tree_retry_even_with_a_misleading_body_code() {
+    let unauthorized = NativeAuthError {
+      code: "NETWORK_ERROR".to_string(),
+      message: "untrusted upstream payload".to_string(),
+      status: 401,
+      details: None,
+      attempts_remaining: None,
+      retry_after: None,
+    };
+    let forbidden = NativeAuthError {
+      code: "REQUEST_TIMEOUT".to_string(),
+      message: "untrusted upstream payload".to_string(),
+      status: 403,
+      details: None,
+      attempts_remaining: None,
+      retry_after: None,
+    };
+
+    assert_eq!(unauthorized.tree_refresh_failure(), ("native-auth-session-ended", true));
+    assert_eq!(forbidden.tree_refresh_failure(), ("native-auth-invalid-response", true));
+    // Only the exact authoritative revocation codes may delete the durable account credential.
+    assert!(!unauthorized.terminal());
+    assert!(!forbidden.terminal());
   }
 }

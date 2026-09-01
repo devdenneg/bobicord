@@ -9,10 +9,9 @@
 // Сигналинг probe идёт по выделенному WS к /tree: probe-start будит приёмник, probe-offer/
 // answer/ice — SDP/ICE (tree.js релеит вещатель↔сервер↔агент).
 
-import { getToken } from '../api';
 import { detectSymmetricNat } from './natDetect';
 import { sampleRtcStats } from '../rtcStatsSampler';
-import { isTauri } from '../native';
+import { freshTreeWsUrl } from '../treeAuth';
 
 const CACHE_KEY = 'probeUpload';
 const CACHE_TTL_MS = 24 * 3600 * 1000; // сутки
@@ -45,14 +44,6 @@ export function getCachedProbe(): ProbeResult | null {
 }
 export function clearCachedProbe() { try { localStorage.removeItem(CACHE_KEY); } catch { /**/ } }
 function cacheProbe(r: ProbeResult) { try { localStorage.setItem(CACHE_KEY, JSON.stringify(r)); } catch { /**/ } }
-
-function treeWsUrl(): string {
-  const override = (import.meta as any).env?.VITE_TREE_WS_URL as string | undefined;
-  const nativeDefault = isTauri ? 'wss://138-16-170-21.sslip.io/tree' : null;
-  const base = override || nativeDefault || ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/tree');
-  const token = getToken() || '';
-  return base + (base.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
-}
 
 const DEFAULT_ICE: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
 
@@ -146,7 +137,11 @@ async function measureUploadOnce(opts?: { onPhase?: (p: string) => void }): Prom
   onPhase('connect');
 
   let ws: WebSocket;
-  try { ws = new WebSocket(treeWsUrl()); } catch { throw new Error('probe: не удалось открыть сокет'); }
+  try {
+    ws = new WebSocket(await freshTreeWsUrl());
+  } catch {
+    throw new Error('probe: не удалось открыть сокет');
+  }
 
   const cleanups: Array<() => void> = [];
   const cleanup = () => { for (const c of cleanups) { try { c(); } catch { /**/ } } };

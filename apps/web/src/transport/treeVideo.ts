@@ -2,11 +2,14 @@ import type { Room } from 'livekit-client';
 import type { VideoTransport, TreeInfo, RtpStats, TreeTopology } from './videoTransport';
 import { MediaStreamVideoHandle } from './videoTransport';
 import type { StreamInfo } from '../engine';
-import { getToken } from '../api';
+import { isTerminalSessionError } from '../api';
 import {
-  isTauri, startNativeWatch, stopNativeWatch, nativeWatchAnswer, nativeWatchIce, nativeWatchReparent,
+  isTauri, isTerminalNativeTreeStartError, startNativeWatch, stopNativeWatch,
+  nativeWatchAnswer, nativeWatchIce, nativeWatchReparent,
   onNativeWatchOffer, onNativeWatchIce, onNativeTopology, onNativeWatchEnded,
 } from '../native';
+import { freshTreeWsUrl, markTreeAccessRejected } from '../treeAuth';
+import { nextNativeWatchGeneration } from '../nativeWatchGeneration';
 import { DropWindow, shouldReparentOnDrops, DROP_COOLDOWN_MS } from './dropDetector';
 import { newStallState, shouldSelfHeal, STALL_COOLDOWN_MS, STALL_MS, type StallState } from './stallDetector';
 import { startViewerSession, endViewerSession } from '../diag';
@@ -23,6 +26,7 @@ const STATS_UNAVAILABLE_BACKOFF_MAX_MS = 5 * 60_000;
 const STATS_UNAVAILABLE_GLOBAL_GAP_MS = 3_000;
 
 interface NativeWatchState {
+  generation: number;            // exact async start/stop owner; Rust rejects stale generations
   pc: RTCPeerConnection | null; // локальный показ: webview answerer к Rust-offerer
   unlisten: Array<() => void>;
   closed: boolean;
@@ -73,17 +77,6 @@ interface WatchState {
   pendingIce: any[];              // ICE может прийти раньше SDP/создания upstream-PC
 }
 
-
-function treeWsUrl(): string {
-  const override = (import.meta as any).env?.VITE_TREE_WS_URL as string | undefined;
-  // В нативе location.host = tauri.localhost (bundle без reverse-proxy) — фолбэк на прод-сервер,
-  // тот же, что nativeWsUrl в native.ts. Без него discovery/viewer-сокеты webview шли бы в
-  // tauri.localhost → liveStreams пуст → активные стримы и LIVE-бейджи не видны в натив-приложении.
-  const nativeDefault = isTauri ? 'wss://reelay.online/tree' : null;
-  const base = override || nativeDefault || ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/tree');
-  const token = getToken() || '';
-  return base + (base.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
-}
 
 // Приёмный буфер зрителя (дефолт Chrome ~50мс). NACK-ретрансмит УЖЕ работает (webrtc-rs
 // configure_nack активен на всех H.264-легах — верифицировано), но опоздавший за буфер пакет
@@ -137,6 +130,7 @@ export class TreeVideoTransport implements VideoTransport {
   private discoveryConnectStartedAt = 0;
   private discoveryLastRxAt = 0;
   private discoveryLifecycleAttached = false;
+  private discoveryOpening = false;
   private dropTimer: number | null = null;   // Д7: 1с-опрос дропов кадров (общий на все watch'и)
   private dropChecks = new Map<string, { pc: RTCPeerConnection; run: Promise<void> }>();
   private statsUnavailable = new Map<string, { pc: RTCPeerConnection; since: number }>();
@@ -153,6 +147,9 @@ export class TreeVideoTransport implements VideoTransport {
   /** Живые стримы гильдии + метаданные приложения из stream-live (иконка/имя — Э-icon). */
   private liveStreams = new Map<string, StreamMeta>();
   private watches = new Map<string, WatchState>();
+  // Browser watch has an async auth-refresh gate before WebSocket construction. The owner token
+  // prevents a late refresh from resurrecting a watch which the user already closed/replaced.
+  private browserWatchStarts = new Map<string, symbol>();
   // Намерение смотреть стрим — отдельно от живого WatchState. WatchState исчезает и при обрыве
   // сокета (перед ре-watch), поэтому «нет записи в watches» не отличало «переподключаемся» от
   // «пользователь закрыл». Ре-watch сверяется именно с этим набором.
@@ -311,6 +308,10 @@ export class TreeVideoTransport implements VideoTransport {
     if (this.discoveryWs) { try { this.discoveryWs.close(); } catch { /**/ } this.discoveryWs = null; }
     this.watches.forEach((_w, streamId) => this.unwatch(streamId));
     this.watches.clear();
+    // Pending browser starts are not in `watches` yet, but already own a diagnostic session and
+    // intent. Finish them through the same path before dropping their owner tokens.
+    for (const streamId of [...this.browserWatchStarts.keys()]) this.unwatch(streamId);
+    this.browserWatchStarts.clear();
     this.nativeWatches.forEach((st, streamId) => this.nativeUnwatch(streamId, st));
     this.nativeWatches.clear();
     this.intended.clear();
@@ -324,18 +325,33 @@ export class TreeVideoTransport implements VideoTransport {
     this.reWatchAttempts.clear();
   }
 
-  private openDiscovery() {
+  private async openDiscovery() {
     if (this.closed) return;
     if (this.discoveryRetryTimer !== null) { clearTimeout(this.discoveryRetryTimer); this.discoveryRetryTimer = null; }
     // Повторный lifecycle-kick не создаёт второй handshake поверх живого. Закрытый объект
     // снимаем адресно, чтобы его поздний onclose не мог затронуть новый сокет.
     if (this.discoveryWs?.readyState === WebSocket.OPEN
       || this.discoveryWs?.readyState === WebSocket.CONNECTING) return;
+    if (this.discoveryOpening) return;
     if (this.discoveryWs) this.retireDiscoverySocket(this.discoveryWs, null);
+    this.discoveryOpening = true;
+    let wsUrl: string;
+    try {
+      // Persistent access JWTs are short-lived. A reconnect after sleep/network loss must refresh
+      // before constructing the socket instead of looping 401 with the old in-memory token.
+      wsUrl = await freshTreeWsUrl();
+    } catch (error) {
+      this.discoveryOpening = false;
+      if (!isTerminalSessionError(error)) this.scheduleDiscoveryReconnect();
+      return;
+    }
+    this.discoveryOpening = false;
+    if (this.closed || this.discoveryWs?.readyState === WebSocket.OPEN
+      || this.discoveryWs?.readyState === WebSocket.CONNECTING) return;
     let ws: WebSocket;
     // throw конструктора (битый URL/CSP/токен на миг) раньше делал голый return без ретрая —
     // onclose не будет (сокет не создан), discovery умирал НАВСЕГДА до F5. Планируем ретрай.
-    try { ws = new WebSocket(treeWsUrl()); } catch { this.scheduleDiscoveryReconnect(); return; }
+    try { ws = new WebSocket(wsUrl); } catch { this.scheduleDiscoveryReconnect(); return; }
     this.discoveryWs = ws;
     this.discoveryConnectStartedAt = Date.now();
     this.discoveryConnectTimer = window.setTimeout(() => {
@@ -397,8 +413,9 @@ export class TreeVideoTransport implements VideoTransport {
     };
     // Реконнект планирует ТОЛЬКО текущий сокет: иначе закрытие прежнего (в начале openDiscovery)
     // или осиротевшего сокета зациклило бы переоткрытие каждые 3с.
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       if (this.discoveryWs !== ws) return;
+      if (ev.code === 4001) markTreeAccessRejected(wsUrl);
       this.discoveryWs = null;
       this.discoveryLastRxAt = 0;
       this.clearDiscoveryConnectDeadline();
@@ -421,7 +438,7 @@ export class TreeVideoTransport implements VideoTransport {
   // (`streamId::quality` на сервере). Дефолт 'source' → поведение как «до». Смена
   // качества = unwatch()+watch() (Д4 добавит меню).
   watch(streamId: string, quality: string = 'source', pinned: boolean = false) {
-    if (this.watches.has(streamId) || this.nativeWatches.has(streamId)) return;
+    if (this.watches.has(streamId) || this.nativeWatches.has(streamId) || this.browserWatchStarts.has(streamId)) return;
     this.intended.add(streamId); // намерение смотреть живёт ОТДЕЛЬНО от сокета (см. intended)
     // Диагностика просмотра (diag.ts): freezeCount/потери раз в 2с, сдаётся на сервер в
     // unwatch. PC берём лениво — он появится позже (после assign-parent / offer от Rust),
@@ -430,12 +447,39 @@ export class TreeVideoTransport implements VideoTransport {
     // В Tauri видео/relay держит Rust (native passthrough): webview не джойнится в дерево
     // сам, а получает поток от локального Rust-пира через IPC (см. nativeWatch).
     if (isTauri) { this.nativeWatch(streamId, quality, pinned); return; }
+    const owner = Symbol(streamId);
+    this.browserWatchStarts.set(streamId, owner);
+    void this.openBrowserWatch(streamId, quality, pinned, owner);
+  }
+
+  private async openBrowserWatch(streamId: string, quality: string, pinned: boolean, owner: symbol) {
+    let wsUrl: string;
+    try {
+      wsUrl = await freshTreeWsUrl();
+    } catch (error) {
+      if (isTerminalSessionError(error)) {
+        // A terminal refresh owns the same cleanup as an explicit cancellation: no orphan intent
+        // or diagnostic timer may survive after the account session is gone.
+        if (this.browserWatchStarts.get(streamId) === owner) this.unwatch(streamId);
+      } else {
+        this.scheduleBrowserWatchStartRetry(streamId, quality, pinned, owner);
+      }
+      return;
+    }
+    // unwatch/account/server teardown can win while native/browser auth refresh is in flight.
+    if (this.closed || !this.intended.has(streamId) || this.browserWatchStarts.get(streamId) !== owner) return;
     let ws: WebSocket;
-    try { ws = new WebSocket(treeWsUrl()); } catch { return; }
+    try { ws = new WebSocket(wsUrl); }
+    catch {
+      this.scheduleBrowserWatchStartRetry(streamId, quality, pinned, owner);
+      return;
+    }
     const st: WatchState = {
       ws, pc: null, parentId: null, closed: false, iceServers: this.iceServers, pendingIce: [],
       maxChildren: 0, joined: false, quality, pinned,
     };
+    if (this.browserWatchStarts.get(streamId) !== owner) { try { ws.close(); } catch { /**/ } return; }
+    this.browserWatchStarts.delete(streamId);
     this.watches.set(streamId, st);
 
     // join шлём НЕ в onopen, а после welcome (см. sendWatchJoin): welcome несёт актуальные
@@ -443,8 +487,9 @@ export class TreeVideoTransport implements VideoTransport {
     // Fallback: если welcome не пришёл за 1.5с — джойнимся всё равно (guard не даст дубль).
     ws.onopen = () => { setTimeout(() => this.sendWatchJoin(streamId, st), 1500); };
     ws.onmessage = (ev) => this.onWatchMessage(streamId, st, ev);
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       if (st.closed) return;
+      if (ev.code === 4001) markTreeAccessRejected(wsUrl);
       // Стрим ещё жив → бесшовный реконнект: плитку держим (keepVideo), взводим failsafe.
       // Стрим кончился → полный снос (discovery уже снял liveStreams).
       const live = !this.closed && this.liveStreams.has(streamId);
@@ -463,6 +508,19 @@ export class TreeVideoTransport implements VideoTransport {
       }
     };
     ws.onerror = () => { try { ws.close(); } catch { /**/ } };
+  }
+
+  private scheduleBrowserWatchStartRetry(streamId: string, quality: string, pinned: boolean, owner: symbol) {
+    if (this.closed || !this.intended.has(streamId) || this.browserWatchStarts.get(streamId) !== owner) return;
+    const attempt = this.webReconnectAttempts.get(streamId) || 0;
+    this.webReconnectAttempts.set(streamId, attempt + 1);
+    const delay = Math.min(30_000, 1500 * 2 ** Math.min(attempt, 5));
+    setTimeout(() => {
+      if (this.closed || !this.intended.has(streamId)
+        || this.browserWatchStarts.get(streamId) !== owner) return;
+      if (!this.liveStreams.has(streamId)) { this.unwatch(streamId); return; }
+      void this.openBrowserWatch(streamId, quality, pinned, owner);
+    }, delay);
   }
 
   // Отправка join после welcome (Roadmap Д0: браузер снова строго лист — maxChildren всегда 0,
@@ -491,6 +549,13 @@ export class TreeVideoTransport implements VideoTransport {
       this.intended.delete(streamId);
       this.statsUnavailable.delete(streamId);
       this.statsRecoveryBackoff.delete(streamId);
+    }
+    // Cancel a socket that is still behind the async access-refresh gate. The exact owner check in
+    // openBrowserWatch prevents its late completion from resurrecting a user-cancelled tile.
+    if (this.browserWatchStarts.delete(streamId)) {
+      endViewerSession(streamId);
+      this.topologyByStream.delete(streamId);
+      return;
     }
     const nst = this.nativeWatches.get(streamId);
     if (nst) { this.nativeUnwatch(streamId, nst, keep); return; }
@@ -892,22 +957,31 @@ export class TreeVideoTransport implements VideoTransport {
 
   /* ---------- native watch (Tauri: Rust держит upstream+relay, webview рендерит) ---------- */
   private async nativeWatch(streamId: string, quality: string = 'source', pinned: boolean = false) {
-    const st: NativeWatchState = { pc: null, unlisten: [], closed: false, pendingIce: [], quality, pinned };
+    const st: NativeWatchState = {
+      generation: nextNativeWatchGeneration(),
+      pc: null, unlisten: [], closed: false, pendingIce: [], quality, pinned,
+    };
     this.nativeWatches.set(streamId, st);
-    const offCb = (sid: string, sdp: string) => { if (sid === streamId && !st.closed) this.onNativeOffer(streamId, st, sdp); };
-    const iceCb = (sid: string, candidate: any) => {
-      if (sid !== streamId || !candidate || st.closed) return;
+    const offCb = (sid: string, generation: number, sdp: string) => {
+      if (sid === streamId && generation === st.generation && !st.closed) this.onNativeOffer(streamId, st, sdp);
+    };
+    const iceCb = (sid: string, generation: number, candidate: any) => {
+      if (sid !== streamId || generation !== st.generation || !candidate || st.closed) return;
       if (st.pc && st.pc.remoteDescription) st.pc.addIceCandidate(candidate).catch(() => {});
       else if (st.pendingIce.length < 128) st.pendingIce.push(candidate);
     };
-    const topoCb = (payload: any) => { if (payload && payload.streamId === streamId) this.setTopology(streamId, { you: payload.you ?? null, nodes: payload.nodes || [] }); };
+    const topoCb = (payload: any) => {
+      if (payload && payload.streamId === streamId && payload.generation === st.generation && !st.closed) {
+        this.setTopology(streamId, { you: payload.you ?? null, nodes: payload.nodes || [] });
+      }
+    };
     // onNativeWatchEnded может прийти СПУРИОЗНО: остановка СВОЕЙ трансляции (или свитч) сбрасывает
     // общий Rust relay-core и рвёт АКТИВНЫЙ watch чужого стрима. Поэтому тут НЕ удаляем стрим из
     // liveStreams и НЕ объявляем «конец» (иначе у зрителя пропадал чужой стрим + ложное «закончил»,
     // пока re-hello его не вернёт). Авторитет конца — discovery (stream-end) + re-hello. Рвём лишь
     // мёртвый локальный watch; если стрим по discovery ещё жив — тут же переустанавливаем (авто-recovery).
-    const endCb = (sid: string) => {
-      if (sid !== streamId || st.closed) return;
+    const endCb = (sid: string, generation: number) => {
+      if (sid !== streamId || generation !== st.generation || st.closed) return;
       // Стрим по discovery ещё жив → бесшовно (плитку держим, тут же переустановим watch).
       const live = !this.closed && this.liveStreams.has(streamId);
       this.unwatch(streamId, { keepVideo: live });
@@ -916,12 +990,7 @@ export class TreeVideoTransport implements VideoTransport {
       // залипла (полуоткрытый discovery-сокет), круг «watch → сразу ended → watch» повторялся бы
       // бесконечно с постоянной частотой, каждый раз поднимая нативный watch-слот и сессию заново.
       // Счётчик сбрасывается, как только приезжает трек, то есть успешный просмотр историю обнуляет.
-      const attempt = this.reWatchAttempts.get(streamId) || 0;
-      this.reWatchAttempts.set(streamId, attempt + 1);
-      const delay = Math.min(30_000, 1500 * 2 ** Math.min(attempt, 5));
-      setTimeout(() => {
-        if (!this.closed && this.intended.has(streamId) && this.liveStreams.has(streamId) && !this.nativeWatches.has(streamId) && !this.watches.has(streamId)) this.watch(streamId, st.quality, st.pinned);
-      }, delay);
+      this.scheduleNativeWatchRetry(streamId, st.quality, st.pinned);
     };
     try {
       st.unlisten.push(await onNativeWatchOffer(offCb));
@@ -955,16 +1024,54 @@ export class TreeVideoTransport implements VideoTransport {
       else if (!cached) void measureUpload().catch(() => {}); // прогрев кэша, fire-and-forget
     } catch { /**/ }
     try {
-      await startNativeWatch(streamId, this.me, this.serverId, NATIVE_RELAY_CAPACITY, st.quality, st.pinned, availableOutgoing);
+      await startNativeWatch(streamId, st.generation, this.me, this.serverId, NATIVE_RELAY_CAPACITY, st.quality, st.pinned, availableOutgoing);
+      // unwatch/quality switch may win at any await above. Rust's generation tombstone prevents the
+      // late command from creating a slot; this owner fence prevents stale JS continuation work.
+      if (st.closed || this.nativeWatches.get(streamId) !== st) return;
     }
-    catch { this.nativeUnwatch(streamId, st); }
+    catch (error) {
+      const ownsStream = this.nativeWatches.get(streamId) === st;
+      if (!ownsStream) {
+        // A newer quality/watch owner replaced us while auth/start was pending. Only release this
+        // exact generation; shared viewer state and retry ownership belong to the replacement.
+        this.nativeUnwatch(streamId, st, true);
+        return;
+      }
+      const terminal = isTerminalSessionError(error) || isTerminalNativeTreeStartError(error);
+      const live = !terminal && !this.closed && this.intended.has(streamId)
+        && this.liveStreams.has(streamId);
+      if (terminal) this.intended.delete(streamId);
+      this.nativeUnwatch(streamId, st, live);
+      if (live) {
+        this.armVideoFailsafe(streamId, 15_000);
+        this.scheduleNativeWatchRetry(streamId, st.quality, st.pinned);
+      }
+    }
+  }
+
+  private scheduleNativeWatchRetry(streamId: string, quality: string, pinned: boolean) {
+    const attempt = this.reWatchAttempts.get(streamId) || 0;
+    this.reWatchAttempts.set(streamId, attempt + 1);
+    const delay = Math.min(30_000, 1500 * 2 ** Math.min(attempt, 5));
+    setTimeout(() => {
+      if (!this.closed && this.intended.has(streamId) && this.liveStreams.has(streamId)
+        && !this.nativeWatches.has(streamId) && !this.watches.has(streamId)) {
+        this.watch(streamId, quality, pinned);
+      }
+    }, delay);
   }
   private async onNativeOffer(streamId: string, st: NativeWatchState, sdp: string) {
+    if (st.closed || this.nativeWatches.get(streamId) !== st) return;
     if (st.pc) { try { st.pc.close(); } catch { /**/ } }
     const pc = new RTCPeerConnection({ iceServers: this.iceServers.length ? this.iceServers : DEFAULT_ICE_SERVERS });
     st.pc = pc;
-    pc.onicecandidate = (e) => { if (e.candidate) nativeWatchIce(streamId, e.candidate).catch(() => {}); };
+    pc.onicecandidate = (e) => {
+      if (e.candidate && !st.closed && this.nativeWatches.get(streamId) === st && st.pc === pc) {
+        nativeWatchIce(streamId, st.generation, e.candidate).catch(() => {});
+      }
+    };
     pc.ontrack = (e) => {
+      if (st.closed || this.nativeWatches.get(streamId) !== st || st.pc !== pc) return;
       this.reWatchAttempts.delete(streamId); // картинка пошла — прошлые неудачные круги не в счёт
       this.applyJitter(streamId);
       this.upsertTrack(streamId, e.track);
@@ -976,14 +1083,20 @@ export class TreeVideoTransport implements VideoTransport {
       preferH264(pc);
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      await nativeWatchAnswer(streamId, pc.localDescription!.sdp);
+      if (st.closed || this.nativeWatches.get(streamId) !== st || st.pc !== pc) return;
+      await nativeWatchAnswer(streamId, st.generation, pc.localDescription!.sdp);
     } catch { /**/ }
   }
   private nativeUnwatch(streamId: string, st: NativeWatchState, keepVideo = false) {
-    endViewerSession(streamId);
+    const ownsStream = this.nativeWatches.get(streamId) === st;
     st.closed = true;
     st.unlisten.forEach((u) => { try { u(); } catch { /**/ } });
     if (st.pc) { try { st.pc.close(); } catch { /**/ } }
+    // Exact-generation stop is always safe and ensures a partially/late-started Rust command is
+    // fenced. A stale owner must not delete diagnostics/topology/video owned by its replacement.
+    stopNativeWatch(streamId, st.generation).catch(() => {});
+    if (!ownsStream) return;
+    endViewerSession(streamId);
     this.nativeWatches.delete(streamId);
     this.treeInfoByStream.delete(streamId);
     this.lastJb.delete(streamId);
@@ -991,7 +1104,6 @@ export class TreeVideoTransport implements VideoTransport {
     this.clearDropState(streamId);
     if (!keepVideo) this.dropVideo(streamId);
     // Rust-стоп адресный (по stream_id) — гасит только слот ЭТОГО стрима, прочие плитки грида целы.
-    stopNativeWatch(streamId).catch(() => {});
   }
 
   /* ---------- topology / manual peer pick ---------- */
@@ -1023,7 +1135,8 @@ export class TreeVideoTransport implements VideoTransport {
   requestReparent(streamId: string, targetId: string | null, reason?: string) {
     // Натив: reason в IPC не пробрасывается (нативную отбраковку по дропам делает сервер —
     // frameDropReparent); тут только ручной/ICE-fail reparent через Rust.
-    if (this.nativeWatches.has(streamId)) { nativeWatchReparent(streamId, targetId).catch(() => {}); return; }
+    const native = this.nativeWatches.get(streamId);
+    if (native) { nativeWatchReparent(streamId, native.generation, targetId).catch(() => {}); return; }
     const st = this.watches.get(streamId);
     if (st) { try { st.ws.send(JSON.stringify({ t: 'request-reparent', streamId, targetParentId: targetId, reason })); } catch { /**/ } }
   }

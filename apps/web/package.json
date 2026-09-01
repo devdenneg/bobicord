@@ -22,7 +22,7 @@
     "test:native-auth": "node src/nativeAuthBroker.test.mjs",
     "test:mobile-network": "node src/mobileNetworkLifecycle.test.mjs",
     "test:stream-playback": "node src/streamPlayback.test.mjs",
-    "test:transport": "node src/presets.test.mjs && node src/transport/dropDetector.test.mjs && node src/transport/probe.test.mjs && node src/transport/stallDetector.test.mjs",
+    "test:transport": "node src/presets.test.mjs && node src/transport/dropDetector.test.mjs && node src/transport/probe.test.mjs && node src/transport/stallDetector.test.mjs && node src/treeAuth.test.mjs && node src/nativeWatchGeneration.test.mjs",
     "test:pwa-offline": "node src/pwaOffline.test.mjs",
     "test:mobile-push-pwa": "node src/mobilePushPwa.test.mjs",
     "test:version-entry": "node src/versionEntry.test.mjs",

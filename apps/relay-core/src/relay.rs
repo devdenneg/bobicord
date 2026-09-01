@@ -15,7 +15,7 @@
 // выход раздаётся отдельной рендишн-сессией (start_rendition_root). Нативный клиент рендишны
 // не поднимает никогда (их дёргает только vrelay-агент через ctrl).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -58,6 +58,113 @@ use crate::transcode::{self, Feed, Transcode};
 const FANOUT_QUEUE_VIDEO: usize = 256;
 /// Аудио редкое (50 пакетов/с) — та же глубина дала бы 5 секунд буфера.
 const FANOUT_QUEUE_AUDIO: usize = 100;
+
+/// Trickle ICE может обогнать SDP offer: webrtc-rs запускает gathering внутри
+/// `set_local_description`, а `TreeCmd::Offer` отправляется только после его завершения.
+/// На принимающем relay в этот момент уже есть `assign-parent`, но upstream-PC ещё нет, и
+/// прежний код молча терял кандидат. Держим короткую очередь до установки remote SDP.
+///
+/// Ключ состоит из родителя и локальной эпохи `assign-parent`. Эпоха меняется даже при
+/// reattach к тому же peer-id, поэтому уже накопленные кандидаты старого PC не переживают
+/// пересоздание транспорта. Это локальный ownership-fence, не wire-аутентификация: сам
+/// signaling-протокол epoch не передаёт. Та же очередь закрывает зеркальную гонку
+/// ICE-before-answer у child-PC и локального WebView. 64 заметно больше обычных
+/// host/srflx/relay-кандидатов, но ограничивает память при битом или враждебном сигналинге.
+const PENDING_ICE_MAX: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueuePendingIce {
+    Queued,
+    QueuedAfterEviction,
+    StaleEpoch,
+}
+
+#[derive(Default)]
+struct PendingUpstreamIce {
+    parent_id: Option<String>,
+    epoch: u64,
+    candidates: VecDeque<RTCIceCandidateInit>,
+}
+
+impl PendingUpstreamIce {
+    fn begin_epoch(&mut self, parent_id: Option<&str>) -> u64 {
+        self.epoch = self.epoch.wrapping_add(1);
+        // Нулём помечаем состояние до первого assign-parent; при практически невозможном
+        // переполнении не возвращаемся к этому sentinel.
+        if self.epoch == 0 { self.epoch = 1; }
+        self.parent_id = parent_id.map(str::to_owned);
+        self.candidates.clear();
+        self.epoch
+    }
+
+    fn current_key(&self, parent_id: &str) -> Option<u64> {
+        (self.parent_id.as_deref() == Some(parent_id) && self.epoch != 0).then_some(self.epoch)
+    }
+
+    fn queue(&mut self, parent_id: &str, epoch: u64, candidate: RTCIceCandidateInit) -> QueuePendingIce {
+        if self.parent_id.as_deref() != Some(parent_id) || self.epoch != epoch || epoch == 0 {
+            return QueuePendingIce::StaleEpoch;
+        }
+        let evicted = if self.candidates.len() >= PENDING_ICE_MAX {
+            self.candidates.pop_front();
+            true
+        } else {
+            false
+        };
+        self.candidates.push_back(candidate);
+        if evicted { QueuePendingIce::QueuedAfterEviction } else { QueuePendingIce::Queued }
+    }
+
+    fn take(&mut self, parent_id: &str, epoch: u64) -> Vec<RTCIceCandidateInit> {
+        if self.parent_id.as_deref() != Some(parent_id) || self.epoch != epoch || epoch == 0 {
+            return Vec::new();
+        }
+        self.candidates.drain(..).collect()
+    }
+}
+
+struct PendingDownstreamIce {
+    downstream_id: String,
+    epoch: u64,
+    remote_description_set: bool,
+    candidates: VecDeque<RTCIceCandidateInit>,
+}
+
+impl PendingDownstreamIce {
+    fn new(downstream_id: String, epoch: u64) -> Self {
+        Self { downstream_id, epoch, remote_description_set: false, candidates: VecDeque::new() }
+    }
+
+    fn current_key(&self, downstream_id: &str) -> Option<u64> {
+        (self.downstream_id == downstream_id && self.epoch != 0).then_some(self.epoch)
+    }
+
+    fn remote_description_set(&self, downstream_id: &str, epoch: u64) -> bool {
+        self.downstream_id == downstream_id && self.epoch == epoch && self.remote_description_set
+    }
+
+    fn queue(&mut self, downstream_id: &str, epoch: u64, candidate: RTCIceCandidateInit) -> QueuePendingIce {
+        if self.downstream_id != downstream_id || self.epoch != epoch || epoch == 0 || self.remote_description_set {
+            return QueuePendingIce::StaleEpoch;
+        }
+        let evicted = if self.candidates.len() >= PENDING_ICE_MAX {
+            self.candidates.pop_front();
+            true
+        } else {
+            false
+        };
+        self.candidates.push_back(candidate);
+        if evicted { QueuePendingIce::QueuedAfterEviction } else { QueuePendingIce::Queued }
+    }
+
+    fn set_remote_and_take(&mut self, downstream_id: &str, epoch: u64) -> Vec<RTCIceCandidateInit> {
+        if self.downstream_id != downstream_id || self.epoch != epoch || epoch == 0 {
+            return Vec::new();
+        }
+        self.remote_description_set = true;
+        self.candidates.drain(..).collect()
+    }
+}
 
 /// Здоровье ВХОДЯЩЕГО потока и очереди фанаута.
 ///
@@ -342,8 +449,15 @@ struct RelayManager {
     fanout: Option<Arc<FanoutHub>>,
     upstream: Option<Arc<RTCPeerConnection>>,
     parent_id: Option<String>,
+    /// Кандидаты текущего upstream, пришедшие раньше его SDP offer/remoteDescription.
+    pending_upstream_ice: PendingUpstreamIce,
     children: HashMap<String, Arc<RTCPeerConnection>>,
+    /// Для каждого текущего child-PC держит его точную эпоху и ICE до SDP answer.
+    pending_child_ice: HashMap<String, PendingDownstreamIce>,
+    child_ice_epoch: u64,
     webview: Option<Arc<RTCPeerConnection>>,
+    /// Локальный WebView — такой же downstream answerer и может прислать ICE раньше answer.
+    pending_webview_ice: Option<PendingDownstreamIce>,
     cmd_tx: mpsc::UnboundedSender<TreeCmd>,
     ui: Option<UiSink>,
     stream_id: String,
@@ -469,8 +583,12 @@ impl RelayManager {
             fanout,
             upstream: None,
             parent_id: None,
+            pending_upstream_ice: PendingUpstreamIce::default(),
             children: HashMap::new(),
+            pending_child_ice: HashMap::new(),
+            child_ice_epoch: 0,
             webview: None,
+            pending_webview_ice: None,
             cmd_tx,
             ui,
             stream_id,
@@ -530,6 +648,7 @@ impl RelayManager {
     // ---- upstream (к родителю; мы answerer) ----
     async fn on_parent_offer(&mut self, from: String, sdp: String) {
         if self.parent_id.as_deref() != Some(from.as_str()) { return; }
+        let Some(upstream_epoch) = self.pending_upstream_ice.current_key(&from) else { return; };
         // старый upstream (если был reparent) закрываем
         if let Some(old) = self.upstream.take() { let _ = old.close().await; }
         let pc = match self.api.new_peer_connection(self.config()).await {
@@ -713,6 +832,14 @@ impl RelayManager {
         if let Err(e) = pc.set_remote_description(match RTCSessionDescription::offer(sdp) { Ok(d) => d, Err(e) => { log::error!("relay: bad parent offer: {e}"); return; } }).await {
             log::error!("relay: upstream set_remote: {e}"); return;
         }
+        // Кандидаты могли прийти перед offer и были привязаны к точной эпохе этого
+        // assign-parent. Применяем только после remoteDescription: webrtc-rs до неё их
+        // отклоняет. Новый reparent (включая того же parent id) очистит другую эпоху.
+        for candidate in self.pending_upstream_ice.take(&from, upstream_epoch) {
+            if let Err(e) = pc.add_ice_candidate(candidate).await {
+                log::warn!("relay: pending upstream ICE rejected for {from}: {e}");
+            }
+        }
         match pc.create_answer(None).await {
             Ok(answer) => {
                 if let Err(e) = pc.set_local_description(answer.clone()).await { log::error!("relay: upstream set_local: {e}"); return; }
@@ -817,7 +944,7 @@ impl RelayManager {
                 }
             })
         }));
-        match pc.create_offer(None).await {
+        let offer_sdp = match pc.create_offer(None).await {
             Ok(offer) => {
                 if let Err(e) = pc.set_local_description(offer.clone()).await {
                     log::error!("relay: child set_local: {e}");
@@ -830,7 +957,7 @@ impl RelayManager {
                 if let (Some(hub), Some(tracks)) = (&self.fanout, &isolated) {
                     hub.activate(tracks);
                 }
-                let _ = self.cmd_tx.send(TreeCmd::Offer { to: child_id.clone(), sdp: offer.sdp });
+                offer.sdp
             }
             Err(e) => {
                 log::error!("relay: child create_offer: {e}");
@@ -840,18 +967,37 @@ impl RelayManager {
                 let _ = pc.close().await;
                 return;
             }
-        }
-        if let Some(old) = self.children.insert(child_id, pc) {
+        };
+        self.child_ice_epoch = self.child_ice_epoch.wrapping_add(1);
+        if self.child_ice_epoch == 0 { self.child_ice_epoch = 1; }
+        self.pending_child_ice.insert(
+            child_id.clone(),
+            PendingDownstreamIce::new(child_id.clone(), self.child_ice_epoch),
+        );
+        if let Some(old) = self.children.insert(child_id.clone(), pc) {
             // Повторный assign того же id без leave — старый PC иначе утёк бы.
             tokio::spawn(async move { let _ = old.close().await; });
         }
+        // Публикуем offer только после атомарной замены PC+эпохи: быстрый answer/ICE уже
+        // попадёт либо в текущий PC, либо в его bounded pending-очередь.
+        let _ = self.cmd_tx.send(TreeCmd::Offer { to: child_id, sdp: offer_sdp });
         // Keyframe теперь просим из on_peer_connection_state_change (Connected), не здесь.
     }
 
     async fn on_child_answer(&mut self, from: String, sdp: String) {
-        if let Some(pc) = self.children.get(&from) {
-            if let Ok(desc) = RTCSessionDescription::answer(sdp) {
-                if let Err(e) = pc.set_remote_description(desc).await { log::error!("relay: child set_remote: {e}"); }
+        let Some(pc) = self.children.get(&from).cloned() else { return; };
+        let Some(child_epoch) = self.pending_child_ice.get(&from).and_then(|pending| pending.current_key(&from)) else { return; };
+        let Ok(desc) = RTCSessionDescription::answer(sdp) else { return; };
+        if let Err(e) = pc.set_remote_description(desc).await {
+            log::error!("relay: child set_remote: {e}");
+            return;
+        }
+        let pending = self.pending_child_ice.get_mut(&from)
+            .map(|state| state.set_remote_and_take(&from, child_epoch))
+            .unwrap_or_default();
+        for candidate in pending {
+            if let Err(e) = pc.add_ice_candidate(candidate).await {
+                log::warn!("relay: pending child ICE rejected for {from}: {e}");
             }
         }
     }
@@ -859,19 +1005,40 @@ impl RelayManager {
     async fn on_ice(&mut self, from: String, candidate: Value) {
         let init: RTCIceCandidateInit = match serde_json::from_value(candidate) { Ok(v) => v, Err(_) => return };
         if self.parent_id.as_deref() == Some(from.as_str()) {
-            if let Some(pc) = &self.upstream { let _ = pc.add_ice_candidate(init).await; }
-        } else if let Some(pc) = self.children.get(&from) {
-            let _ = pc.add_ice_candidate(init).await;
+            if let Some(pc) = &self.upstream {
+                if let Err(e) = pc.add_ice_candidate(init).await {
+                    log::warn!("relay: upstream ICE rejected for {from}: {e}");
+                }
+            } else if let Some(epoch) = self.pending_upstream_ice.current_key(&from) {
+                if self.pending_upstream_ice.queue(&from, epoch, init) == QueuePendingIce::QueuedAfterEviction {
+                    log::warn!("relay: pending upstream ICE overflow for {from}; oldest candidate evicted");
+                }
+            }
+        } else if let Some(pc) = self.children.get(&from).cloned() {
+            let Some(child_epoch) = self.pending_child_ice.get(&from).and_then(|pending| pending.current_key(&from)) else { return; };
+            let remote_ready = self.pending_child_ice.get(&from)
+                .is_some_and(|pending| pending.remote_description_set(&from, child_epoch));
+            if remote_ready {
+                if let Err(e) = pc.add_ice_candidate(init).await {
+                    log::warn!("relay: child ICE rejected for {from}: {e}");
+                }
+            } else if let Some(pending) = self.pending_child_ice.get_mut(&from) {
+                if pending.queue(&from, child_epoch, init) == QueuePendingIce::QueuedAfterEviction {
+                    log::warn!("relay: pending child ICE overflow for {from}; oldest candidate evicted");
+                }
+            }
         }
     }
 
     async fn on_drop_peer(&mut self, peer_id: String) {
         if let Some(hub) = &self.fanout { hub.remove(&peer_id); }
+        self.pending_child_ice.remove(&peer_id);
         if let Some(pc) = self.children.remove(&peer_id) { let _ = pc.close().await; }
         // если ушёл родитель — сервер пришлёт assign-parent с новым (или конец стрима)
     }
 
     async fn on_assign_parent(&mut self, parent_id: Option<String>) {
+        self.pending_upstream_ice.begin_epoch(parent_id.as_deref());
         self.parent_id = parent_id;
         // upstream пересоздастся, когда новый родитель пришлёт offer (on_parent_offer)
         if let Some(old) = self.upstream.take() { let _ = old.close().await; }
@@ -898,6 +1065,7 @@ impl RelayManager {
             if let Some(pc) = self.children.remove(&id) {
                 log::info!("relay: ребёнок {id} мёртв (failed/closed) — чищу PC");
                 if let Some(hub) = &self.fanout { hub.remove(&id); }
+                self.pending_child_ice.remove(&id);
                 let _ = pc.close().await;
             }
         }
@@ -935,7 +1103,7 @@ impl RelayManager {
                 }
             })
         }));
-        match pc.create_offer(None).await {
+        let offer_sdp = match pc.create_offer(None).await {
             Ok(offer) => {
                 if let Err(e) = pc.set_local_description(offer.clone()).await {
                     log::error!("relay: webview set_local: {e}");
@@ -948,9 +1116,7 @@ impl RelayManager {
                 if let (Some(hub), Some(tracks)) = (&self.fanout, &isolated) {
                     hub.activate(tracks);
                 }
-                if let Some(ui) = &self.ui {
-                    ui("relay-watch-offer", json!({ "streamId": self.stream_id, "sdp": offer.sdp }));
-                }
+                offer.sdp
             }
             Err(e) => {
                 log::error!("relay: webview create_offer: {e}");
@@ -960,31 +1126,67 @@ impl RelayManager {
                 let _ = pc.close().await;
                 return;
             }
-        }
+        };
+        self.child_ice_epoch = self.child_ice_epoch.wrapping_add(1);
+        if self.child_ice_epoch == 0 { self.child_ice_epoch = 1; }
+        self.pending_webview_ice = Some(PendingDownstreamIce::new(WEBVIEW_ID.to_owned(), self.child_ice_epoch));
         self.webview = Some(pc);
+        // Сначала публикуем exact PC+эпоху в manager, затем отдаём offer в JS: даже
+        // мгновенный invoke(answer/ice) уже попадёт в правильную bounded очередь.
+        if let Some(ui) = &self.ui {
+            ui("relay-watch-offer", json!({ "streamId": self.stream_id, "sdp": offer_sdp }));
+        }
     }
 
     async fn on_webview_answer(&mut self, sdp: String) {
-        if let Some(pc) = &self.webview {
-            if let Ok(desc) = RTCSessionDescription::answer(sdp) {
-                if let Err(e) = pc.set_remote_description(desc).await { log::error!("relay: webview set_remote: {e}"); }
+        const WEBVIEW_ID: &str = "__webview";
+        let Some(pc) = self.webview.clone() else { return; };
+        let Some(webview_epoch) = self.pending_webview_ice.as_ref()
+            .and_then(|pending| pending.current_key(WEBVIEW_ID)) else { return; };
+        let Ok(desc) = RTCSessionDescription::answer(sdp) else { return; };
+        if let Err(e) = pc.set_remote_description(desc).await {
+            log::error!("relay: webview set_remote: {e}");
+            return;
+        }
+        let pending = self.pending_webview_ice.as_mut()
+            .map(|state| state.set_remote_and_take(WEBVIEW_ID, webview_epoch))
+            .unwrap_or_default();
+        for candidate in pending {
+            if let Err(e) = pc.add_ice_candidate(candidate).await {
+                log::warn!("relay: pending webview ICE rejected: {e}");
             }
         }
     }
 
     async fn on_webview_ice(&mut self, candidate: Value) {
-        if let Some(pc) = &self.webview {
-            if let Ok(init) = serde_json::from_value::<RTCIceCandidateInit>(candidate) { let _ = pc.add_ice_candidate(init).await; }
+        const WEBVIEW_ID: &str = "__webview";
+        let Some(pc) = self.webview.clone() else { return; };
+        let Ok(init) = serde_json::from_value::<RTCIceCandidateInit>(candidate) else { return; };
+        let Some(webview_epoch) = self.pending_webview_ice.as_ref()
+            .and_then(|pending| pending.current_key(WEBVIEW_ID)) else { return; };
+        let remote_ready = self.pending_webview_ice.as_ref()
+            .is_some_and(|pending| pending.remote_description_set(WEBVIEW_ID, webview_epoch));
+        if remote_ready {
+            if let Err(e) = pc.add_ice_candidate(init).await {
+                log::warn!("relay: webview ICE rejected: {e}");
+            }
+        } else if let Some(pending) = self.pending_webview_ice.as_mut() {
+            if pending.queue(WEBVIEW_ID, webview_epoch, init) == QueuePendingIce::QueuedAfterEviction {
+                log::warn!("relay: pending webview ICE overflow; oldest candidate evicted");
+            }
         }
     }
 
     async fn close_all(&mut self) {
         if let Some(pc) = self.upstream.take() { let _ = pc.close().await; }
+        self.pending_upstream_ice.begin_epoch(None);
         // Сначала закрываем per-viewer очереди: writer-задачи перестают принимать пакеты,
         // затем закрытие PC освобождает bindings без хвоста отложенного видео.
         if let Some(hub) = &self.fanout { hub.clear(); }
         if let Some(pc) = self.webview.take() { let _ = pc.close().await; }
+        self.pending_webview_ice = None;
         for (_, pc) in self.children.drain() { let _ = pc.close().await; }
+        self.pending_child_ice.clear();
         // Д2: гасим ffmpeg-транскоды (kill), иначе зомби-процессы на VPS.
         self.video_feeds.lock().unwrap().clear();
         self.feed_count.store(0, Ordering::Relaxed);
@@ -1055,7 +1257,10 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
                         // пришлёт assign-parent (settleOrphans) — upstream пересоздастся. Старые
                         // child-PC живут, пока дети не пересоздадут соединения (sweep дочистит).
                         Some(TreeEvent::Rejoined) => log::warn!("relay: сигналинг реджойнился — жду свежий assign-parent"),
-                        Some(TreeEvent::Closed) | None => break,
+                        // The signalling task emits Closed after an unexpected terminal URL/auth
+                        // failure too. Explicit user Stop arrives through ctrl_rx below, so a close
+                        // on this branch must notify the webview and tear down its native watch.
+                        Some(TreeEvent::Closed) | None => { watch_ended = true; break; },
                     }
                 }
                 ctrl = ctrl_rx.recv() => {
@@ -1219,10 +1424,126 @@ pub fn start_rendition_root(cfg: RelayConfig, video: Arc<TrackLocalStaticRTP>, a
 
 #[cfg(test)]
 mod tests {
-    use super::{IngestMonitor, RtpContinuity};
+    use super::{
+        IngestMonitor, PendingDownstreamIce, PendingUpstreamIce, QueuePendingIce, RtpContinuity,
+        PENDING_ICE_MAX,
+    };
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
     use std::time::Duration;
+    use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
+
+    fn ice(candidate: &str) -> RTCIceCandidateInit {
+        RTCIceCandidateInit { candidate: candidate.to_owned(), ..Default::default() }
+    }
+
+    // ---- upstream trickle ICE до SDP offer ----
+
+    #[test]
+    fn pending_upstream_ice_survives_until_matching_offer_epoch() {
+        let mut pending = PendingUpstreamIce::default();
+        let epoch = pending.begin_epoch(Some("parent-a"));
+        assert_eq!(pending.queue("parent-a", epoch, ice("candidate-before-offer")), QueuePendingIce::Queued);
+
+        let drained = pending.take("parent-a", epoch);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].candidate, "candidate-before-offer");
+        assert!(pending.take("parent-a", epoch).is_empty());
+    }
+
+    #[test]
+    fn pending_upstream_ice_is_scoped_to_parent_and_reparent_epoch() {
+        let mut pending = PendingUpstreamIce::default();
+        let old_epoch = pending.begin_epoch(Some("parent-a"));
+        assert_eq!(pending.queue("parent-a", old_epoch, ice("old")), QueuePendingIce::Queued);
+
+        let new_epoch = pending.begin_epoch(Some("parent-b"));
+        assert_ne!(new_epoch, old_epoch);
+        assert_eq!(pending.queue("parent-a", old_epoch, ice("late-old")), QueuePendingIce::StaleEpoch);
+        assert!(pending.take("parent-a", old_epoch).is_empty());
+        assert_eq!(pending.queue("parent-b", new_epoch, ice("new")), QueuePendingIce::Queued);
+        assert_eq!(pending.take("parent-b", new_epoch)[0].candidate, "new");
+    }
+
+    #[test]
+    fn same_parent_reattach_starts_a_fresh_ice_epoch() {
+        let mut pending = PendingUpstreamIce::default();
+        let old_epoch = pending.begin_epoch(Some("parent-a"));
+        assert_eq!(pending.queue("parent-a", old_epoch, ice("old")), QueuePendingIce::Queued);
+
+        let new_epoch = pending.begin_epoch(Some("parent-a"));
+        assert_ne!(new_epoch, old_epoch);
+        assert!(pending.take("parent-a", old_epoch).is_empty());
+        assert_eq!(pending.queue("parent-a", old_epoch, ice("late-old")), QueuePendingIce::StaleEpoch);
+        assert_eq!(pending.queue("parent-a", new_epoch, ice("fresh")), QueuePendingIce::Queued);
+        assert_eq!(pending.take("parent-a", new_epoch)[0].candidate, "fresh");
+    }
+
+    #[test]
+    fn pending_upstream_ice_is_bounded_and_keeps_latest_candidates() {
+        let mut pending = PendingUpstreamIce::default();
+        let epoch = pending.begin_epoch(Some("parent-a"));
+        for index in 0..PENDING_ICE_MAX {
+            assert_eq!(pending.queue("parent-a", epoch, ice(&format!("candidate-{index}"))), QueuePendingIce::Queued);
+        }
+        assert_eq!(pending.queue("parent-a", epoch, ice("candidate-latest")), QueuePendingIce::QueuedAfterEviction);
+
+        let drained = pending.take("parent-a", epoch);
+        assert_eq!(drained.len(), PENDING_ICE_MAX);
+        assert_eq!(drained[0].candidate, "candidate-1");
+        assert_eq!(drained.last().unwrap().candidate, "candidate-latest");
+    }
+
+    #[test]
+    fn pending_child_ice_waits_for_matching_answer_epoch() {
+        let mut pending = PendingDownstreamIce::new("child-a".to_owned(), 7);
+        assert_eq!(pending.queue("child-a", 7, ice("candidate-before-answer")), QueuePendingIce::Queued);
+        assert!(!pending.remote_description_set("child-a", 7));
+
+        let drained = pending.set_remote_and_take("child-a", 7);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].candidate, "candidate-before-answer");
+        assert!(pending.remote_description_set("child-a", 7));
+        assert_eq!(pending.queue("child-a", 7, ice("must-go-direct")), QueuePendingIce::StaleEpoch);
+    }
+
+    #[test]
+    fn pending_child_ice_rejects_wrong_peer_or_replacement_epoch() {
+        let mut pending = PendingDownstreamIce::new("child-a".to_owned(), 9);
+        assert_eq!(pending.queue("child-b", 9, ice("wrong-peer")), QueuePendingIce::StaleEpoch);
+        assert_eq!(pending.queue("child-a", 8, ice("old-epoch")), QueuePendingIce::StaleEpoch);
+        assert!(pending.set_remote_and_take("child-b", 9).is_empty());
+        assert!(pending.set_remote_and_take("child-a", 8).is_empty());
+        assert!(!pending.remote_description_set("child-a", 9));
+    }
+
+    #[test]
+    fn replacement_webview_does_not_inherit_previous_pc_candidates() {
+        const WEBVIEW_ID: &str = "__webview";
+        let mut old = PendingDownstreamIce::new(WEBVIEW_ID.to_owned(), 20);
+        assert_eq!(old.queue(WEBVIEW_ID, 20, ice("old-webview-pc")), QueuePendingIce::Queued);
+
+        let mut replacement = PendingDownstreamIce::new(WEBVIEW_ID.to_owned(), 21);
+        assert_eq!(replacement.queue(WEBVIEW_ID, 20, ice("late-old")), QueuePendingIce::StaleEpoch);
+        assert_eq!(replacement.queue(WEBVIEW_ID, 21, ice("replacement")), QueuePendingIce::Queued);
+        let drained = replacement.set_remote_and_take(WEBVIEW_ID, 21);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].candidate, "replacement");
+    }
+
+    #[test]
+    fn pending_child_ice_is_bounded_and_keeps_latest_candidates() {
+        let mut pending = PendingDownstreamIce::new("child-a".to_owned(), 11);
+        for index in 0..PENDING_ICE_MAX {
+            assert_eq!(pending.queue("child-a", 11, ice(&format!("candidate-{index}"))), QueuePendingIce::Queued);
+        }
+        assert_eq!(pending.queue("child-a", 11, ice("candidate-latest")), QueuePendingIce::QueuedAfterEviction);
+
+        let drained = pending.set_remote_and_take("child-a", 11);
+        assert_eq!(drained.len(), PENDING_ICE_MAX);
+        assert_eq!(drained[0].candidate, "candidate-1");
+        assert_eq!(drained.last().unwrap().candidate, "candidate-latest");
+    }
 
     /// Возвращает (принято, разрывов, переупорядочено). Счётчики фанаута тесту не нужны —
     /// их пишет writer-таск, здесь проверяется только арифметика номеров.

@@ -4,6 +4,8 @@
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -88,27 +90,96 @@ const RECONNECT_BACKOFF_MAX_SEC: u64 = 15; // деплой рестартит с
 /// из дерева, считая себя подключённым. 35с = 3 пропущенных пинга.
 const READ_IDLE_TIMEOUT_SEC: u64 = 35;
 
-/// Источник URL сигналинга. Токен лежит в query, а у service-JWT vrelay TTL 5 минут —
-/// поэтому URL пересобирается на КАЖДУЮ попытку подключения, а не фиксируется на всю жизнь
-/// сессии. Иначе первый же реконнект позже TTL получает вечный 401: ровно так vrelay выпал
-/// из дерева на трое суток (2026-07-30, DNS-блип на медиа-VPS → реконнект с протухшим токеном).
+/// Источник URL сигналинга. Токен лежит в query и может потребовать асинхронного обновления перед
+/// каждой попыткой: service-JWT vrelay минтится синхронно, а нативный 15-минутный access JWT —
+/// через защищённый refresh broker. Фиксировать короткий JWT на всю медиа-сессию нельзя: первый
+/// реконнект после TTL навсегда получает 401.
+type WsUrlFuture = Pin<Box<dyn Future<Output = Result<String, WsUrlError>> + Send>>;
+
+/// Opaque, allow-listed URL-provider failure. It deliberately cannot carry a URL, JWT, upstream
+/// body or arbitrary error message into logs. Terminal credential state ends the media session;
+/// transient network/upstream state follows the normal bounded reconnect backoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WsUrlError {
+    code: &'static str,
+    terminal: bool,
+}
+
+impl WsUrlError {
+    pub fn transient(code: &'static str) -> Self {
+        Self { code: allowlisted_ws_url_error(code, false), terminal: false }
+    }
+    pub fn terminal(code: &'static str) -> Self {
+        Self { code: allowlisted_ws_url_error(code, true), terminal: true }
+    }
+    fn code(self) -> &'static str { self.code }
+    fn is_terminal(self) -> bool { self.terminal }
+}
+
+fn allowlisted_ws_url_error(code: &'static str, terminal: bool) -> &'static str {
+    match code {
+        "native-auth-network" | "native-auth-timeout" | "native-auth-rate-limit"
+        | "native-auth-upstream" | "native-auth-session-ended"
+        | "native-auth-logout-pending" | "native-auth-storage"
+        | "native-auth-invalid-response" => code,
+        _ if terminal => "tree-url-terminal",
+        _ => "tree-url-transient",
+    }
+}
+
+fn close_invalidates_access(code: u16) -> bool { code == 4001 }
+
 #[derive(Clone)]
-pub struct WsUrl(Arc<dyn Fn() -> String + Send + Sync>);
+pub struct WsUrl {
+    make: Arc<dyn Fn() -> WsUrlFuture + Send + Sync>,
+    invalidate: Arc<dyn Fn(&str) + Send + Sync>,
+}
 
 impl WsUrl {
-    /// URL с долгоживущим токеном (натив: session-JWT на недели) — пересборка не нужна.
+    /// URL whose credential is genuinely long-lived for the complete connection lifetime.
     pub fn fixed(url: String) -> Self {
-        Self(Arc::new(move || url.clone()))
+        Self {
+            make: Arc::new(move || {
+                let current = url.clone();
+                Box::pin(async move { Ok(current) })
+            }),
+            invalidate: Arc::new(|_| {}),
+        }
     }
 
     /// URL пересобирается на каждую попытку (короткоживущий service-токен vrelay).
     pub fn dynamic(make: impl Fn() -> String + Send + Sync + 'static) -> Self {
-        Self(Arc::new(make))
+        Self {
+            make: Arc::new(move || {
+                let current = make();
+                Box::pin(async move { Ok(current) })
+            }),
+            invalidate: Arc::new(|_| {}),
+        }
     }
 
-    fn get(&self) -> String {
-        (self.0)()
+    /// URL/credential renewal may perform protected I/O (native Credential Manager + auth API).
+    pub fn dynamic_async<F, Fut>(make: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<String, WsUrlError>> + Send + 'static,
+    {
+        Self { make: Arc::new(move || Box::pin(make())), invalidate: Arc::new(|_| {}) }
     }
+
+    /// Asynchronous provider with an exact cache invalidator. A 401 from tree signalling calls the
+    /// invalidator before retry so a remotely rejected access JWT is renewed immediately.
+    pub fn dynamic_async_with_invalidator<F, Fut, I>(make: F, invalidate: I) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<String, WsUrlError>> + Send + 'static,
+        I: Fn(&str) + Send + Sync + 'static,
+    {
+        Self { make: Arc::new(move || Box::pin(make())), invalidate: Arc::new(invalidate) }
+    }
+
+    async fn get(&self) -> Result<String, WsUrlError> { (self.make)().await }
+    fn invalidate(&self, rejected_url: &str) { (self.invalidate)(rejected_url); }
 }
 
 impl From<String> for WsUrl {
@@ -171,10 +242,28 @@ pub fn connect(ws_url: WsUrl, join: JoinParams, reconnect: bool) -> (mpsc::Unbou
         let mut connects = 0u32; // сколько раз успешно джойнились (>=1 => дальше Rejoined)
         let mut backoff = 1u64;
         'outer: loop {
-            let (ws_stream, _) = match tokio_tungstenite::connect_async(&ws_url.get()).await {
-                Ok(v) => v,
+            let next_url = match ws_url.get().await {
+                Ok(url) => url,
                 Err(e) => {
-                    log::warn!("tree ws connect failed: {e}");
+                    log::warn!("tree ws credential refresh failed: {}", e.code());
+                    if e.is_terminal() || !reconnect { break 'outer; }
+                    if !wait_backoff(&mut cmd_rx, backoff).await { break 'outer; }
+                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX_SEC);
+                    continue;
+                }
+            };
+            let (ws_stream, _) = match tokio_tungstenite::connect_async(&next_url).await {
+                Ok(v) => v,
+                Err(error) => {
+                    let unauthorized = matches!(&error, tokio_tungstenite::tungstenite::Error::Http(response)
+                        if response.status().as_u16() == 401)
+                    ;
+                    if unauthorized {
+                        ws_url.invalidate(&next_url);
+                    }
+                    // Never format the transport error itself: HTTP/TLS implementations may embed
+                    // the request URI, including its access JWT, or an arbitrary upstream body.
+                    log::warn!("tree ws connect failed: {}", if unauthorized { "unauthorized" } else { "transport" });
                     if !reconnect { break 'outer; }
                     if !wait_backoff(&mut cmd_rx, backoff).await { break 'outer; }
                     backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX_SEC);
@@ -221,8 +310,23 @@ pub fn connect(ws_url: WsUrl, join: JoinParams, reconnect: bool) -> (mpsc::Unbou
                                 // явно, иначе нативное вещание/relay рвалось бы каждые ~20с.
                                 let _ = write.send(Message::Pong(data)).await;
                             }
-                            Some(Ok(Message::Close(_))) | None => break,
-                            Some(Err(e)) => { log::warn!("tree ws error: {e}"); break; }
+                            Some(Ok(Message::Close(frame))) => {
+                                // 4001 is exact auth-session revocation. Invalidate only the access
+                                // used by this socket; a delayed close from token A must not erase a
+                                // newer token B already shared by another watch/broadcast. 4003 is
+                                // membership/server authorization and must not touch global auth.
+                                if frame.as_ref().is_some_and(|close| close_invalidates_access(u16::from(close.code))) {
+                                    ws_url.invalidate(&next_url);
+                                }
+                                break;
+                            }
+                            None => break,
+                            Some(Err(_)) => {
+                                // As above, transport errors are deliberately opaque because some
+                                // backend error strings include the full authenticated request URI.
+                                log::warn!("tree ws transport error");
+                                break;
+                            }
                             _ => {}
                         }
                     }
@@ -321,25 +425,72 @@ mod tests {
     /// Регрессия инцидента 2026-07-30: URL сигналинга собирался ОДИН раз на старте сессии,
     /// поэтому реконнект позже TTL токена (у vrelay 5 минут) вечно получал 401. `dynamic`
     /// обязан звать фабрику на КАЖДОЕ обращение — иначе токен снова замёрзнет.
-    #[test]
-    fn dynamic_url_rebuilt_on_every_attempt() {
+    #[tokio::test]
+    async fn dynamic_url_rebuilt_on_every_attempt() {
         let calls = Arc::new(AtomicU32::new(0));
         let seen = calls.clone();
         let url = WsUrl::dynamic(move || {
             let n = seen.fetch_add(1, Ordering::SeqCst);
             format!("wss://host/tree?token=tok{n}")
         });
-        assert_eq!(url.get(), "wss://host/tree?token=tok0");
-        assert_eq!(url.get(), "wss://host/tree?token=tok1");
-        assert_eq!(url.get(), "wss://host/tree?token=tok2");
+        assert_eq!(url.get().await.unwrap(), "wss://host/tree?token=tok0");
+        assert_eq!(url.get().await.unwrap(), "wss://host/tree?token=tok1");
+        assert_eq!(url.get().await.unwrap(), "wss://host/tree?token=tok2");
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
-    /// Натив (session-JWT на недели) пересборки не требует — `fixed` отдаёт то же значение.
+    #[tokio::test]
+    async fn async_url_renews_access_on_every_reconnect_attempt() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let seen = calls.clone();
+        let url = WsUrl::dynamic_async(move || {
+            let n = seen.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(format!("wss://host/tree?token=access{n}")) }
+        });
+        assert_eq!(url.get().await.unwrap(), "wss://host/tree?token=access0");
+        assert_eq!(url.get().await.unwrap(), "wss://host/tree?token=access1");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn async_url_invalidation_replaces_a_rejected_cached_access() {
+        let generation = Arc::new(AtomicU32::new(0));
+        let read = generation.clone();
+        let invalidate = generation.clone();
+        let url = WsUrl::dynamic_async_with_invalidator(move || {
+            let current = read.load(Ordering::SeqCst);
+            async move { Ok(format!("wss://host/tree?token=access{current}")) }
+        }, move |rejected| {
+            assert_eq!(rejected, "wss://host/tree?token=access0");
+            invalidate.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(url.get().await.unwrap(), "wss://host/tree?token=access0");
+        url.invalidate("wss://host/tree?token=access0");
+        assert_eq!(url.get().await.unwrap(), "wss://host/tree?token=access1");
+    }
+
     #[test]
-    fn fixed_url_is_stable() {
+    fn credential_errors_classify_terminal_and_transient_without_payloads() {
+        let ended = WsUrlError::terminal("native-auth-session-ended");
+        let offline = WsUrlError::transient("native-auth-network");
+        assert!(ended.is_terminal());
+        assert!(!offline.is_terminal());
+        assert_eq!(ended.code(), "native-auth-session-ended");
+        assert_eq!(WsUrlError::transient("unexpected-upstream-payload").code(), "tree-url-transient");
+        assert_eq!(WsUrlError::terminal("unexpected-upstream-payload").code(), "tree-url-terminal");
+    }
+
+    #[test]
+    fn only_session_revocation_close_invalidates_global_access() {
+        assert!(close_invalidates_access(4001));
+        assert!(!close_invalidates_access(4003));
+        assert!(!close_invalidates_access(1006));
+    }
+
+    #[tokio::test]
+    async fn fixed_url_is_stable() {
         let url = WsUrl::fixed("wss://host/tree?token=session".into());
-        assert_eq!(url.get(), url.get());
-        assert_eq!(url.get(), "wss://host/tree?token=session");
+        assert_eq!(url.get().await.unwrap(), url.get().await.unwrap());
+        assert_eq!(url.get().await.unwrap(), "wss://host/tree?token=session");
     }
 }

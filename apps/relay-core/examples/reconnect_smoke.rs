@@ -12,7 +12,7 @@ async fn main() {
     let ws_url = std::env::args().nth(1).expect("аргумент: ws-url с ?token=");
     let handle = relay::start(None, RelayConfig {
         stream_id: "st-reconnect".into(),
-        ws_url,
+        ws_url: ws_url.into(),
         identity: "rc-test".into(),
         server_id: "srv1".into(),
         max_children: 2,

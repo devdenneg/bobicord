@@ -30,7 +30,7 @@ async fn main() {
 
     println!("[smoke] starting broadcast stream_id={stream_id} ws_url={ws_url} monitor={monitor_index}");
     let server_id = "smoke".to_string();
-    let handle = broadcast::start(None, stream_id, ws_url, identity, server_id, source, config).await.expect("start broadcast");
+    let handle = broadcast::start(None, stream_id, broadcast::signaling::WsUrl::fixed(ws_url), identity, server_id, source, config).await.expect("start broadcast");
 
     println!("[smoke] broadcasting for 300s — open tree-test-viewer.html now and click Смотреть");
     tokio::time::sleep(std::time::Duration::from_secs(300)).await;
