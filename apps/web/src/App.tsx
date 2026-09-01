@@ -267,7 +267,7 @@ export function App() {
           }
         });
       }
-      if (s.mode === 'ptt' && !typing && e.code === s.pttKey) E.pttPress();
+      if (s.mode === 'ptt' && !typing && !e.repeat && e.code === s.pttKey) E.pttPress('keyboard');
     };
     const ku = (e: KeyboardEvent) => {
       const E = getEngine(); if (!E) return;
@@ -275,7 +275,7 @@ export function App() {
       const nk = normKey(e.code);
       pressed.delete(nk);
       (Object.keys(armed) as KeybindAction[]).forEach((action) => { if (s.keybinds[action].map(normKey).includes(nk)) armed[action] = false; });
-      if (s.mode === 'ptt' && e.code === s.pttKey) E.pttRelease();
+      if (s.mode === 'ptt' && e.code === s.pttKey) E.pttRelease('keyboard');
     };
     const releasePtt = () => {
       pressed.clear();

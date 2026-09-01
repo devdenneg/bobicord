@@ -32,6 +32,8 @@ import {
   foregroundMicNeedsImmediateRecovery,
   forgetExactAudioContextResume,
   isVoiceOperationTimeout,
+  manualMuteIntentIsCurrent,
+  microphoneCaptureBusy,
   microphoneTransportHealth,
   mutedTrackNeedsRestart,
   readStoredFlag,
@@ -41,6 +43,7 @@ import {
   resumeGestureAudioContext,
   resumeSharedGestureAudioContext,
   selectedInputUnavailable,
+  unavailableMicrophoneButtonAction,
   withVoiceDeadline,
   withVoiceTimeout,
   voiceWriteCommittedForCurrentIntent,
@@ -85,6 +88,7 @@ export interface PeerState { online: boolean; inVoice: boolean; micMuted: boolea
 export interface StreamInfo { key: string; identity: string; isLocal: boolean; appName?: string; appIcon?: string }
 export type VoiceQuality = 'excellent' | 'good' | 'poor' | 'lost' | 'unknown';
 export type VoiceConnectionState = 'connected' | 'connecting' | 'reconnecting' | 'disconnected';
+export type PttInputOwner = 'keyboard' | 'pointer';
 type VoiceMediaConnectFailure = 'server-updating' | 'token' | 'transport' | 'activation';
 export interface Snapshot {
   connected: boolean;
@@ -104,6 +108,7 @@ export interface Snapshot {
   channelActiveSince: Record<string, number>; // channelId -> epoch ms первого захода в ПУСТОЙ канал (таймер в списке каналов, как в Discord)
   deafened: boolean;
   localMicMuted: boolean;
+  manualMicMuted: boolean; // latest explicit user intent, independent from temporary fail-closed capture state
   micUnavailable: boolean; // зашёл в голосовой без микрофона (нет доступа) — listen-only
   micRecovering?: boolean; // временная пересборка capture после фона/смены аудиомаршрута
   pttDown: boolean;
@@ -338,6 +343,8 @@ export class Engine {
   private deafened = storedFlag('voiceDeaf'); // персист: пред-установка «оглох» до входа (Discord-стиль)
   private noMic = false; // зашёл в голосовой без микрофона (нет доступа) — listen-only, НЕ персист
   private pttDown = false;
+  private pttKeyboardDown = false;
+  private pttPointerDown = false;
   private watchTimers = new Map<string, number>();
   private watchPlaybackGate = new StreamWatchPlaybackGate();
 
@@ -365,6 +372,7 @@ export class Engine {
   // an intentional listen-only join into repeated permission requests.
   private micBootstrapWanted = false;
   private manualMute = storedFlag('voiceMute'); // персист: пред-установка «мут мика» до входа (Discord-стиль)
+  private manualMuteIntentRevision = 0; // async capture retries cannot roll back a newer explicit click/hotkey
   private saveVoicePrefs() { try { localStorage.setItem('voiceMute', this.manualMute ? '1' : '0'); localStorage.setItem('voiceDeaf', this.deafened ? '1' : '0'); } catch { /**/ } }
 
   // Оба транспорта живут одновременно (не выбор build-флагом): нативный вещатель
@@ -821,8 +829,9 @@ export class Engine {
       voiceQuality: this.inVoice ? this.connQuality : 'unknown', voicePing: this.inVoice ? this.pingMs : null,
       voiceConnection, lostVoiceServerId: this.lostVoiceServerId, lostVoiceChannel: this.lostVoiceChannel,
       inVoice: this.inVoice, voiceConnecting: this.inVoice && (this.voiceConnecting || this.voiceLeaseVerifying || this.voiceClaimPending !== 0), myVoiceChannel: this.currentVc, voiceServerId: this.voiceServerId, voiceChannels, channelActiveSince, deafened: this.deafened,
-      localMicMuted: this.localMicMuted(), micUnavailable: this.noMic,
-      micRecovering: this.micRecoveryOwner !== 0, pttDown: this.pttDown,
+      localMicMuted: this.localMicMuted(), manualMicMuted: this.manualMute, micUnavailable: this.noMic,
+      micRecovering: this.micRecoveryOwner !== 0 || this.micStartOwnership.active
+        || (this.inVoice && this.noMic && this.micBootstrapWanted), pttDown: this.pttDown,
       presence, speaking, streams, watching, pending, watchers, messages: this.messages, chatHasMore: this.chatMore, chatTrimmed: this.trimmedFront, chatPrepended: this.chatPrepended,
       typing: [...this.typingUsers].filter(([n, exp]) => exp > Date.now() && n !== this.me.displayName).map(([n]) => n),
     };
@@ -1125,7 +1134,7 @@ export class Engine {
           ++this.voiceTransportDisruptionSeq;
           this.voiceReconnecting = true;
           // Reconnect always requires a fresh PTT press; a held key must not resume after a gap.
-          this.pttDown = false;
+          this.clearPttOwnership();
           // join/switch owns lease + media + attributes as one transaction. Starting a second
           // verifier here can consume/rewrite that transaction's state; its final boundary observes
           // voiceTransportDisruptionSeq and performs the exact bounded verification itself.
@@ -1307,7 +1316,7 @@ export class Engine {
         ++this.voiceTransportDisruptionSeq;
         this.voiceMediaActivated.delete(room);
         this.reconnectingRooms.add(room); this.reconnecting = true;
-        this.voiceReconnecting = true; this.pttDown = false;
+        this.voiceReconnecting = true; this.clearPttOwnership();
         ++this.voiceLeaseVerifySeq;
         if (!this.voiceConnecting && this.voiceClaimPending === 0) this.voiceLeaseVerifying = true;
         this.applyGate();
@@ -1321,7 +1330,7 @@ export class Engine {
           && this.currentVc === channelId && this.inVoice);
         if (!ownsCurrentIntent || !this.voiceRoom) return;
         const reconnectDeadline = this.beginVoiceReconnectRecovery(this.voiceRoom, this.voiceEpoch);
-        this.pttDown = false;
+        this.clearPttOwnership();
         this.voiceReconnecting = !!this.voiceRoom && this.reconnectingRooms.has(this.voiceRoom);
         if (!this.voiceConnecting && this.voiceClaimPending === 0 && room === this.voiceMediaRoom) {
           this.voiceLeaseVerifying = true;
@@ -1366,7 +1375,7 @@ export class Engine {
         const hub = this.voiceRoom;
         ++this.voiceTransportDisruptionSeq;
         this.voiceMediaActivated.delete(room);
-        this.pttDown = false;
+        this.clearPttOwnership();
         ++this.voiceLeaseVerifySeq;
         const deadline = this.beginVoicePermissionRecovery(room, this.voiceEpoch);
         // Permission revocation is authoritative and must fail closed before any HTTP recovery:
@@ -1632,7 +1641,7 @@ export class Engine {
     if (this.voiceTransportDisruptionSeq === disruptionAtStart && exactBoundary()) return true;
     if (!this.voiceMediaIntentCurrent(voiceEpoch, hub, media, channelId)) return false;
     this.voiceLeaseVerifying = true;
-    this.pttDown = false;
+    this.clearPttOwnership();
     const verifySeq = ++this.voiceLeaseVerifySeq;
     this.applyGate();
     this.emit();
@@ -1657,7 +1666,7 @@ export class Engine {
     this.voiceLeaseVerifying = false; ++this.voiceLeaseVerifySeq;
     this.clearVoicePermissionRecovery();
     this.voiceLeaseSession = ''; this.voiceLeaseChannel = ''; this.voiceLeaseEpoch = 0;
-    this.voiceReconnecting = false; this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.pttDown = false;
+    this.voiceReconnecting = false; this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.clearPttOwnership();
     this.myVcAt = null; this.voicePresenceConfirmed = false; this.noMic = false; this.micHadCapture = false; this.micBootstrapWanted = false; this.myChannelPeers.clear();
     this.lostVoiceServerId = lostServer; this.lostVoiceChannel = channelId;
     this.stopConnPoll(); this.subscriptionRetries.clear();
@@ -1711,7 +1720,7 @@ export class Engine {
       this.voiceClaimPending = 0; this.deferredVoiceLease = null; this.matchedVoiceLease = null;
       this.voiceLeaseVerifying = false; ++this.voiceLeaseVerifySeq;
       this.clearVoicePermissionRecovery();
-      this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.pttDown = false;
+      this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.clearPttOwnership();
       this.myVcAt = null; this.voicePresenceConfirmed = false; this.noMic = false; this.micHadCapture = false; this.micBootstrapWanted = false; this.myChannelPeers.clear();
       // Terminal network loss не release'ит серверный lease (reconnect = observation only), но
       // локально больше не считаем себя owner. Следующий явный join получит новый epoch.
@@ -2672,7 +2681,7 @@ export class Engine {
     this.currentVc = channelId;
     this.myVcAt = null;
     this.voicePresenceConfirmed = false;
-    this.inVoice = true; this.pttDown = false; // manualMute НЕ сбрасываем — пред-установка мута применяется на входе
+    this.inVoice = true; this.clearPttOwnership(); // manualMute НЕ сбрасываем — пред-установка мута применяется на входе
     this.voiceConnecting = true;
     // Until the channel transport and durable hub presence are confirmed, the safe state is
     // listen-only. Microphone bootstrap runs independently after that boundary.
@@ -2903,7 +2912,7 @@ export class Engine {
     this.myVcAt = this.channelStartFor(channelId);
     this.voicePresenceConfirmed = false;
     this.voiceConnecting = true;
-    this.pttDown = false;
+    this.clearPttOwnership();
     this.reconcileChannelSounds(true); // состав НОВОГО канала — молча и сразу (иначе reconcile в окне свитча даст залп entry)
     // Пока сервер решает, кому принадлежит аккаунт, старый uplink молчит и старый vc снимается.
     // Это делает A→B атомарным для слушателей: никто не услышит речь в уже покинутом канале.
@@ -3097,7 +3106,7 @@ export class Engine {
     this.voiceLeaseSession = ''; this.voiceLeaseChannel = ''; this.voiceLeaseEpoch = 0;
     if (leaseSession && leaseEpoch > 0) void api.releaseVoiceLease(leaseSession, leaseEpoch).catch(() => {}); // stale release сервер безопасно отвергнет
     // оптимистично: сразу убираем себя из канала (UI не ждёт async-очистку mic/треков)
-    this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.voiceReconnecting = false; this.pttDown = false; this.myVcAt = null; this.voicePresenceConfirmed = false; this.noMic = false; this.micHadCapture = false; this.micBootstrapWanted = false; // deafened/manualMute НЕ сбрасываем — персист-интент до след. входа
+    this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.voiceReconnecting = false; this.clearPttOwnership(); this.myVcAt = null; this.voicePresenceConfirmed = false; this.noMic = false; this.micHadCapture = false; this.micBootstrapWanted = false; // deafened/manualMute НЕ сбрасываем — персист-интент до след. входа
     this.myChannelPeers.clear(); // вышел — состав моего канала сброшен (другие услышат мой выход по unpub мика / vc'')
     playSound('exit'); // сам вышедший тоже слышит выход (остальные в канале — через onRemoteUnpub)
     this.emit();
@@ -3288,7 +3297,7 @@ export class Engine {
   ) {
     const changed = retainAvailability || (!retainAvailability && !this.noMic) || this.pttDown;
     if (!retainAvailability) this.noMic = true;
-    this.pttDown = false;
+    this.clearPttOwnership();
     this.applyGate();
     if (hub && hub === this.voiceRoom && this.inVoice) void this.setVoiceAttributes(hub, this.wantedVoiceAttributes(hub));
     if (changed) this.emit();
@@ -3989,7 +3998,12 @@ export class Engine {
     if (this.micRaw || this.micLocalTrack || this.micStartOwnership.active || this.micRecoveryOwner || this.micBootstrapWanted)
       this.micForegroundRecoveryPending = true;
   }
-  private onVoicePageHide = () => { this.markVoiceHidden(); };
+  private onVoicePageHide = () => {
+    // WebKit/BFCache may deliver pagehide without blur or visibilitychange. PTT is an explicit hold,
+    // so it must fail closed here; ordinary voice-activation capture keeps its existing background policy.
+    this.forcePttRelease();
+    this.markVoiceHidden();
+  };
   private onVoiceVisible = () => { this.onVisible(false); };
   private onVoiceFocus = () => { this.onVisible(true); };
   // iOS/WebKit is allowed to suspend or end WebRTC capture while a PWA is hidden. We do not claim
@@ -4443,53 +4457,12 @@ export class Engine {
     }
     this.emit();
   }
-  async toggleMic() {
-    // Зашёл в голосовой БЕЗ мика → клик = попытка получить доступ (дал разрешение позже / воткнул микрофон).
-    if (this.inVoice && this.noMic) {
-      // The initial permission prompt and automatic recovery are single-flight. A second tap must
-      // not open another gUM request or let the older continuation restore stale manualMute state.
-      if (this.micStartOwnership.active || this.micRecoveryOwner !== 0 || this.voiceConnecting
-        || this.voiceLeaseVerifying || this.voiceClaimPending !== 0) return;
-      const prevMute = this.manualMute; // не удалось поднять мик — интент мута обязан вернуться как был
-      this.manualMute = false; // клик по мику = «хочу говорить»
-      const hub = this.voiceRoom;
-      const room = this.voiceMediaRoom;
-      const channel = this.currentVc;
-      const voiceEpoch = this.voiceEpoch;
-      const foregroundGeneration = this.micForegroundGeneration;
-      if (!hub || !room || !channel) { this.manualMute = prevMute; return; }
-      this.micBootstrapWanted = true;
-      try {
-        const started = await this.startMicWithDefaultFallback(voiceEpoch, 'Сохранённый микрофон недоступен — включён системный');
-        if (!this.voiceMediaIntentCurrent(voiceEpoch, hub, room, channel)) return;
-        if (!started) {
-          // Hidden-page deferral or a newer reapply operation owns the next result. Preserve the
-          // user's "I want to speak" intent and let that fenced owner finish it.
-          if (this.micForegroundRecoveryPending || this.micStartOwnership.active || this.micLocalTrack) return;
-          this.manualMute = prevMute;
-          this.micBootstrapWanted = false;
-          this.emit();
-          return;
-        }
-        this.noMic = false; this.micRetryAt = 0; this.micFailureNotified = false;
-        this.saveVoicePrefs();
-        void this.setVoiceAttributes(hub, this.wantedVoiceAttributes(hub));
-        this.hooks.toast('Микрофон подключён');
-      }
-      catch {
-        if (!this.voiceMediaIntentCurrent(voiceEpoch, hub, room, channel)) return;
-        if (foregroundGeneration !== this.micForegroundGeneration || this.micStartOwnership.active
-          || this.micRecoveryOwner !== 0 || this.hasExactCurrentMicPublication()) return;
-        this.manualMute = prevMute;
-        this.micBootstrapWanted = false;
-        this.micForegroundRecoveryPending = false;
-        this.hooks.toast('Микрофон всё ещё недоступен', 'warn');
-      }
-      this.emit(); return;
-    }
-    // Работает и ВНЕ голоса: пред-установка мута (Discord-стиль) — применится на входе (startMic мьютит
-    // при manualMute). В голосе — сразу мьютим/размьючиваем трек. Всегда персистим.
+  private toggleManualMuteIntent() {
     this.manualMute = !this.manualMute;
+    ++this.manualMuteIntentRevision;
+    // Any explicit privacy change retires held PTT input. Removing mute later must require a fresh
+    // key/touch press instead of reviving a pre-mute owner which is still physically held.
+    this.clearPttOwnership();
     this.saveVoicePrefs();
     // While deafened the physical track stays muted regardless of this preference. Keep the
     // existing full-mute sound authoritative instead of announcing an unmute nobody can hear.
@@ -4507,10 +4480,77 @@ export class Engine {
     }
     this.emit();
   }
+  private restoreManualMuteIntent(previous: boolean, attemptRevision: number): boolean {
+    if (!manualMuteIntentIsCurrent(attemptRevision, this.manualMuteIntentRevision)) return false;
+    this.manualMute = previous;
+    ++this.manualMuteIntentRevision; // the same async attempt cannot restore twice
+    this.saveVoicePrefs();
+    return true;
+  }
+  async toggleMic() {
+    // Зашёл в голосовой БЕЗ мика → клик в устойчивом listen-only = новая попытка доступа. Пока
+    // capture/connect уже занят, второй gUM запрещён, но сам ручной mute-интент принимается сразу.
+    if (this.inVoice && this.noMic) {
+      const captureBusy = microphoneCaptureBusy({
+        startOwned: this.micStartOwnership.active,
+        recoveryOwned: this.micRecoveryOwner !== 0,
+        voiceTransaction: this.voiceConnecting || this.voiceLeaseVerifying || this.voiceClaimPending !== 0,
+        foregroundPending: this.micForegroundRecoveryPending,
+        bootstrapWanted: this.micBootstrapWanted,
+      });
+      if (unavailableMicrophoneButtonAction(captureBusy) === 'toggle-mute') {
+        this.toggleManualMuteIntent();
+        return;
+      }
+      const hub = this.voiceRoom;
+      const room = this.voiceMediaRoom;
+      const channel = this.currentVc;
+      if (!hub || !room || !channel) return;
+      const prevMute = this.manualMute; // не удалось поднять мик — интент мута обязан вернуться как был
+      this.manualMute = false; // клик по устойчивому listen-only = «хочу говорить»
+      const intentRevision = ++this.manualMuteIntentRevision;
+      this.saveVoicePrefs(); // explicit intent survives a deferred foreground/switch owner
+      const voiceEpoch = this.voiceEpoch;
+      const foregroundGeneration = this.micForegroundGeneration;
+      this.micBootstrapWanted = true;
+      this.emit(); // кнопка сразу показывает занятый single-flight, не дожидаясь gUM/RNNoise/publish
+      try {
+        const started = await this.startMicWithDefaultFallback(voiceEpoch, 'Сохранённый микрофон недоступен — включён системный');
+        if (!this.voiceMediaIntentCurrent(voiceEpoch, hub, room, channel)) return;
+        if (!started) {
+          // Hidden-page deferral or a newer reapply operation owns the next result. Preserve the
+          // user's "I want to speak" intent and let that fenced owner finish it.
+          if (this.micForegroundRecoveryPending || this.micStartOwnership.active || this.micLocalTrack) return;
+          this.restoreManualMuteIntent(prevMute, intentRevision);
+          this.micBootstrapWanted = false;
+          this.emit();
+          return;
+        }
+        this.noMic = false; this.micRetryAt = 0; this.micFailureNotified = false;
+        this.saveVoicePrefs();
+        void this.setVoiceAttributes(hub, this.wantedVoiceAttributes(hub));
+        this.hooks.toast('Микрофон подключён');
+      }
+      catch {
+        if (!this.voiceMediaIntentCurrent(voiceEpoch, hub, room, channel)) return;
+        if (foregroundGeneration !== this.micForegroundGeneration || this.micStartOwnership.active
+          || this.micRecoveryOwner !== 0 || this.hasExactCurrentMicPublication()) return;
+        this.restoreManualMuteIntent(prevMute, intentRevision);
+        this.micBootstrapWanted = false;
+        this.micForegroundRecoveryPending = false;
+        this.hooks.toast('Микрофон всё ещё недоступен', 'warn');
+      }
+      this.emit(); return;
+    }
+    // Работает и ВНЕ голоса: пред-установка мута (Discord-стиль) — применится на входе (startMic мьютит
+    // при manualMute). В голосе — сразу мьютим/размьючиваем трек. Всегда персистим.
+    this.toggleManualMuteIntent();
+  }
   toggleDeaf() {
     // Работает и ВНЕ голоса: пред-установка «оглох» — применится на входе (joinVoice ставит deaf-атрибут,
     // reconcile не подпишется). Всегда персистим.
     this.deafened = !this.deafened;
+    this.clearPttOwnership();
     this.saveVoicePrefs();
     if (this.inVoice) {
       // транслируем пирам, чтобы у них статус-бейдж отличался от простого мута мика (см. build())
@@ -4531,21 +4571,44 @@ export class Engine {
     this.emit();
   }
   isDeafened() { return this.deafened; }
-  pttPress() {
+  private clearPttOwnership() {
+    this.pttKeyboardDown = false;
+    this.pttPointerDown = false;
+    this.pttDown = false;
+  }
+  pttPress(owner: PttInputOwner): boolean {
     if (getSettings().mode !== 'ptt' || !this.inVoice || this.deafened || this.manualMute || this.noMic
       || this.voiceConnecting || this.voiceReconnecting || this.voiceLeaseVerifying || this.voiceClaimPending !== 0
-      || this.micStartOwnership.active || this.micRecoveryOwner !== 0 || !this.hasHealthyCurrentMicTransport() || this.pttDown) return;
-    this.pttDown = true; this.applyGate(); this.emit();
+      || this.voiceCaptureUnavailable() || this.micStartOwnership.active || this.micRecoveryOwner !== 0
+      || !this.hasHealthyCurrentMicTransport()) return false;
+    if ((owner === 'keyboard' && this.pttKeyboardDown) || (owner === 'pointer' && this.pttPointerDown)) return false;
+    if (owner === 'keyboard') this.pttKeyboardDown = true;
+    else this.pttPointerDown = true;
+    if (!this.pttDown) {
+      this.pttDown = true;
+      this.applyGate();
+      this.emit();
+    }
+    return true;
   }
   // Safe for blur/visibility/network handlers: always closes the gate even if mode or voice state
   // changed before the matching keyup was delivered.
   forcePttRelease() {
     const changed = this.pttDown;
-    this.pttDown = false;
+    this.clearPttOwnership();
     this.applyGate();
     if (changed) this.emit();
   }
-  pttRelease() { this.forcePttRelease(); }
+  pttRelease(owner: PttInputOwner) {
+    const owned = owner === 'keyboard' ? this.pttKeyboardDown : this.pttPointerDown;
+    if (!owned) return;
+    if (owner === 'keyboard') this.pttKeyboardDown = false;
+    else this.pttPointerDown = false;
+    if (this.pttKeyboardDown || this.pttPointerDown) return;
+    this.pttDown = false;
+    this.applyGate();
+    this.emit();
+  }
   onModeChanged() {
     if (!this.inVoice) return;
     const wasDown = this.pttDown;

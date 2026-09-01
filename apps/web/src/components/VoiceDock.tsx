@@ -16,7 +16,7 @@ import {
   loadAudioDevices,
   type AudioDeviceChoice,
 } from '../audioDevices';
-import { latchRejectedPttHold, PrimaryPointerHold, suppressPointerToggleWhilePtt, webScreenShareSupported } from '../mobileControls';
+import { DelayedPrimaryPointerHold, PTT_TOUCH_HOLD_MS, PttCompatibilityClickFence, webScreenShareSupported } from '../mobileControls';
 
 /* Вещание — только из нативного клиента (CLAUDE.md инвариант 2). Конфиг/статистика — в BroadcastModal. */
 function NativeBroadcastButton() {
@@ -345,6 +345,7 @@ export function VoiceControls({ up }: { up?: boolean }) {
   const E = getEngine()!;
   const mode = getSettings().mode;
   const muted = eng.localMicMuted;
+  const manualMuted = eng.manualMicMuted;
   const recovering = !!eng.micRecovering;
   const ptt = mode === 'ptt' && !eng.deafened;
   const connection = eng.voiceConnection ?? (eng.reconnecting ? 'reconnecting' : (eng.voiceConnecting ? 'connecting' : (eng.inVoice ? 'connected' : 'disconnected')));
@@ -352,68 +353,135 @@ export function VoiceControls({ up }: { up?: boolean }) {
   const pttIdle = ptt && !pttLive;
   const pttHoldReady = ptt && !muted && !recovering && connection === 'connected';
   const micClosed = muted || pttIdle;
-  const micClass = 'vd-btn' + (muted ? ' danger-on' : (pttLive ? ' ptt-live' : (pttIdle ? ' ptt-idle' : '')))
+  const micClass = 'vd-btn' + (manualMuted ? ' danger-on' : (pttLive ? ' ptt-live' : (pttIdle ? ' ptt-idle' : '')))
     + (pttHoldReady ? ' vd-ptt-hold' : '');
-  const pttPointer = useRef(new PrimaryPointerHold());
-  const suppressPttClick = useRef(false);
-  const releasePttPointer = (pointerId?: number) => {
-    const released = pointerId === undefined
-      ? pttPointer.current.cancel()
-      : pttPointer.current.end(pointerId);
-    if (released) E.pttRelease();
+  const pttPointer = useRef(new DelayedPrimaryPointerHold());
+  const pttActivationTimer = useRef<number | null>(null);
+  const pttClickFence = useRef(new PttCompatibilityClickFence());
+  const micButtonRef = useRef<HTMLButtonElement>(null);
+  const clearPttActivation = () => {
+    if (pttActivationTimer.current != null) window.clearTimeout(pttActivationTimer.current);
+    pttActivationTimer.current = null;
+  };
+  const finishPttPointer = (pointerId: number, clientX: number, clientY: number) => {
+    if (!pttPointer.current.owns(pointerId)) return;
+    if (pttPointer.current.pendingTap(pointerId)) {
+      const bounds = micButtonRef.current?.getBoundingClientRect();
+      if (!bounds || clientX < bounds.left || clientX > bounds.right || clientY < bounds.top || clientY > bounds.bottom) {
+        cancelPttPointer(pointerId, true);
+        return;
+      }
+    }
+    clearPttActivation();
+    const released = pttPointer.current.end(pointerId);
+    if (released === 'hold') {
+      E.pttRelease('pointer');
+      pttClickFence.current.arm(pointerId);
+    }
+    // A short touch intentionally falls through to the ordinary click handler. That preserves
+    // native button semantics (including accessibility) without doing the action twice.
+  };
+  const cancelPttPointer = (pointerId?: number, suppressReleasedClick = false) => {
+    if (pointerId !== undefined && !pttPointer.current.owns(pointerId)) return;
+    const owner = pointerId ?? pttPointer.current.active();
+    clearPttActivation();
+    const released = pttPointer.current.cancel(pointerId);
+    if (released === 'hold') E.pttRelease('pointer');
+    // A cancelled tap or hold is not an activation. If WebKit still emits a compatibility click,
+    // consume that exact touch; the next real physical pointerdown clears an unconsumed fence.
+    if (released && suppressReleasedClick && owner !== null) pttClickFence.current.arm(owner);
   };
   useEffect(() => {
-    if (!pttHoldReady) releasePttPointer();
-    const releaseWhenHidden = () => { if (document.hidden) releasePttPointer(); };
-    const releaseOnPageHide = () => releasePttPointer();
+    if (!pttHoldReady) cancelPttPointer(undefined, true);
+  }, [pttHoldReady, E]);
+  useEffect(() => {
+    const releaseWhenHidden = () => { if (document.hidden) cancelPttPointer(undefined, true); };
+    const releaseOnPageHide = () => cancelPttPointer(undefined, true);
+    const releaseOnBlur = () => cancelPttPointer(undefined, true);
+    const releaseOnWindowPointerUp = (event: PointerEvent) => finishPttPointer(event.pointerId, event.clientX, event.clientY);
+    const cancelOnWindowPointer = (event: PointerEvent) => cancelPttPointer(event.pointerId, true);
+    const moveOnWindowPointer = (event: PointerEvent) => {
+      if (pttPointer.current.tapMovedBeyond(event.pointerId, event.clientX, event.clientY)) {
+        cancelPttPointer(event.pointerId, true);
+      }
+    };
     document.addEventListener('visibilitychange', releaseWhenHidden);
     window.addEventListener('pagehide', releaseOnPageHide);
+    window.addEventListener('blur', releaseOnBlur);
+    window.addEventListener('pointerup', releaseOnWindowPointerUp, true);
+    window.addEventListener('pointercancel', cancelOnWindowPointer, true);
+    window.addEventListener('pointermove', moveOnWindowPointer, true);
     return () => {
       document.removeEventListener('visibilitychange', releaseWhenHidden);
       window.removeEventListener('pagehide', releaseOnPageHide);
-      releasePttPointer();
+      window.removeEventListener('blur', releaseOnBlur);
+      window.removeEventListener('pointerup', releaseOnWindowPointerUp, true);
+      window.removeEventListener('pointercancel', cancelOnWindowPointer, true);
+      window.removeEventListener('pointermove', moveOnWindowPointer, true);
+      clearPttActivation();
+      if (pttPointer.current.cancel() === 'hold') E.pttRelease('pointer');
+      pttClickFence.current.clear();
     };
-  }, [pttHoldReady, E]);
+  }, [E]);
   // «Недоступен» и «я себя замутил» — разные состояния: раньше оба выглядели как обычный мут, и когда
   // микрофон пропадал и возвращался сам, это читалось как «кнопка переключается сама по себе».
-  const micLabel = eng.micUnavailable
-    ? 'Микрофон недоступен — нажми, чтобы подключить'
-    : (muted ? 'Включить микрофон' : (recovering ? 'Микрофон восстанавливается'
-      : (pttIdle ? 'PTT: микрофон закрыт' : (pttLive ? 'PTT: идёт передача' : 'Выключить микрофон'))));
+  const micLabel = recovering
+    ? (manualMuted ? 'Микрофон выключен — подключение продолжается' : 'Микрофон подключается — нажми, чтобы выключить')
+    : (eng.micUnavailable ? 'Микрофон недоступен — нажми, чтобы подключить'
+      : (manualMuted ? 'Включить микрофон' : (pttIdle ? 'PTT: удерживай для передачи, нажми, чтобы выключить микрофон'
+        : (pttLive ? 'PTT: идёт передача' : 'Выключить микрофон'))));
   return (
     <div className="vd-controls">
       <div className="vd-grp">
-        <button className={micClass} aria-pressed={ptt ? pttLive : muted} aria-busy={recovering || undefined}
+        <button ref={micButtonRef} className={micClass} aria-pressed={manualMuted} aria-busy={recovering || undefined}
           aria-label={micLabel} data-tip={ptt || eng.micUnavailable || recovering ? micLabel : 'Микрофон · M'}
           onPointerDown={(event) => {
-            if (!pttHoldReady) {
-              // Capture this decision now: recovery may finish and rerender before the browser
-              // emits click for the same pointer, but that rejected hold must still be consumed.
-              suppressPttClick.current = latchRejectedPttHold(ptt, recovering, muted);
-              return;
-            }
-            if (!pttPointer.current.begin(event.pointerId, event.isPrimary, event.button)) return;
-            suppressPttClick.current = true;
+            // Desktop PTT has its configured keyboard key. Touch/pen needs one physical button,
+            // so a short tap remains manual mute and only a confirmed hold opens the uplink gate.
+            if (event.isPrimary && event.button === 0) pttClickFence.current.clear();
+            if (event.pointerType === 'mouse' || !ptt) return;
+            if (!pttPointer.current.begin(event.pointerId, event.isPrimary, event.button, event.clientX, event.clientY)) return;
             try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /** implicit touch capture remains */ }
-            E.pttPress();
+            if (!pttHoldReady) return; // the ordinary click remains the manual-mute action
+            const pointerId = event.pointerId;
+            pttActivationTimer.current = window.setTimeout(() => {
+              pttActivationTimer.current = null;
+              if (!pttPointer.current.owns(pointerId)) return;
+              if (document.hidden) { cancelPttPointer(pointerId, true); return; }
+              // Reaching the threshold owns the later compatibility click even if a concurrent
+              // recovery/mute makes the engine reject PTT. Otherwise release could undo that newer
+              // privacy state by being reinterpreted as a short manual-mute tap.
+              if (!pttPointer.current.activate(pointerId)) return;
+              E.pttPress('pointer');
+            }, PTT_TOUCH_HOLD_MS);
           }}
-          onPointerUp={(event) => releasePttPointer(event.pointerId)}
-          onPointerCancel={(event) => releasePttPointer(event.pointerId)}
-          onLostPointerCapture={(event) => releasePttPointer(event.pointerId)}
+          onPointerUp={(event) => finishPttPointer(event.pointerId, event.clientX, event.clientY)}
+          onPointerCancel={(event) => cancelPttPointer(event.pointerId, true)}
+          onPointerMove={(event) => {
+            if (pttPointer.current.tapMovedBeyond(event.pointerId, event.clientX, event.clientY)) {
+              cancelPttPointer(event.pointerId, true);
+            }
+          }}
+          onLostPointerCapture={(event) => cancelPttPointer(event.pointerId, true)}
           onContextMenu={(event) => { if (pttHoldReady) event.preventDefault(); }}
           onClick={(event) => {
-            // A recovering PTT pipeline is temporarily unable to accept a hold. Do not reinterpret
-            // the synthetic click following that rejected pointer-down as a persistent mute toggle.
-            if (ptt && recovering && !muted) {
+            const native = event.nativeEvent as MouseEvent & Partial<PointerEvent> & {
+              sourceCapabilities?: { firesTouchEvents?: boolean };
+            };
+            const rawPointerId = native.pointerId;
+            const nativePointerId = typeof rawPointerId === 'number' && Number.isFinite(rawPointerId)
+              ? rawPointerId
+              : null;
+            if (pttClickFence.current.consume(
+              nativePointerId,
+              typeof native.pointerType === 'string' ? native.pointerType : '',
+              event.detail,
+              native.sourceCapabilities?.firesTouchEvents,
+            )) {
               event.preventDefault();
               return;
             }
-            if (suppressPttClick.current && suppressPointerToggleWhilePtt(true, event.detail)) {
-              suppressPttClick.current = false;
-              event.preventDefault();
-              return;
-            }
-            E.toggleMic();
+            void E.toggleMic();
           }}><Icon name={micClosed ? 'mic-off' : 'mic'} sm /></button>
         <DeviceMenu kind="input" up={up} />
       </div>

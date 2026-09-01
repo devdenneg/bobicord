@@ -11,6 +11,7 @@ assert.equal(normalizeSource('windows\r\nlegacy-mac\r'), 'windows\nlegacy-mac\n'
   'source-contract checks normalize platform line endings');
 const source = readSource('engine.ts');
 const storeSource = readSource('store.ts');
+const appSource = readSource('App.tsx');
 const voiceDockSource = readSource('components', 'VoiceDock.tsx');
 const deploySource = readSource('..', '..', '..', '.github', 'workflows', 'deploy.yml');
 const file = ts.createSourceFile('engine.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
@@ -362,6 +363,8 @@ assert.match(stopConnPoll, /window\.removeEventListener\('focus', this\.onVoiceF
   'voice teardown must remove the exact focus recovery listener');
 assert.match(methodText('onVoiceFocus'), /onVisible\(true\)/,
   'focus fallback must explicitly request damaged-transport validation');
+assert.match(methodText('onVoicePageHide'), /forcePttRelease\(\)[\s\S]*markVoiceHidden/,
+  'pagehide must close keyboard and pointer PTT even when blur and visibilitychange are skipped');
 assert.match(methodText('onVoicePageHide'), /markVoiceHidden/,
   'pagehide must record iOS PWA backgrounding even when visibilitychange is skipped');
 assert.doesNotMatch(methodText('onVoicePageHide'), /disconnect|leaveVoice/,
@@ -401,14 +404,14 @@ assert.doesNotMatch(wireMedia, /RoomEvent\.TrackMuted[\s\S]{0,300}playSound\('mu
   'an iOS transport interruption must not impersonate a manual mute sound');
 assert.doesNotMatch(wireMedia, /RoomEvent\.TrackUnmuted[\s\S]{0,300}playSound\('unmute'\)/,
   'an automatic transport resume must not impersonate a manual unmute sound');
-assert.match(methodText('toggleMic'), /manualMute = !this\.manualMute[\s\S]*playSound\(this\.manualMute \? 'mute' : 'unmute'\)/,
+assert.match(methodText('toggleManualMuteIntent'), /manualMute = !this\.manualMute[\s\S]*playSound\(this\.manualMute \? 'mute' : 'unmute'\)/,
   'microphone sounds belong to the explicit user toggle');
 assert.doesNotMatch(methodText('build'), /mp\.isMuted/,
   'remote manual mute badges must not be derived from iOS transport mute');
 assert.match(methodText('build'), /attributes\?\.mic === '0' \|\| deaf/,
   'durable hub intent remains authoritative for remote mute badges');
 const mediaReconnected = wireMedia.slice(wireMedia.indexOf('.on(RoomEvent.Reconnected'));
-assert.match(mediaReconnected, /this\.pttDown = false/,
+assert.match(mediaReconnected, /this\.clearPttOwnership\(\)/,
   'media reconnect must always require a fresh PTT press');
 const permissionsAt = wireMedia.indexOf('.on(RoomEvent.ParticipantPermissionsChanged');
 assert.ok(permissionsAt >= 0, 'active media room must observe permission changes');
@@ -492,7 +495,17 @@ assert.match(switchVoice, /!this\.mediaPermissionsActive\(previousMediaRoom\) \|
 const toggleMic = methodText('toggleMic');
 assert.ok(toggleMic.indexOf('micStartOwnership.active') >= 0
   && toggleMic.indexOf('micStartOwnership.active') < toggleMic.indexOf('startMicWithDefaultFallback'),
-  'a second mic tap must be rejected before it can open a concurrent permission prompt');
+  'a second mic tap must not open a concurrent permission prompt');
+assert.match(toggleMic, /microphoneCaptureBusy\(\{[\s\S]*foregroundPending: this\.micForegroundRecoveryPending[\s\S]*bootstrapWanted: this\.micBootstrapWanted/,
+  'a deferred foreground/bootstrap owner keeps retry single-flight while the next click changes mute');
+assert.match(toggleMic, /unavailableMicrophoneButtonAction\(captureBusy\) === 'toggle-mute'[\s\S]*toggleManualMuteIntent\(\)[\s\S]*return/,
+  'a busy permission owner rejects only duplicate capture and still accepts manual mute');
+assert.equal((toggleMic.match(/restoreManualMuteIntent\(prevMute, intentRevision\)/g) || []).length, 2,
+  'both false-result and rejected retry rollbacks are fenced by the exact mute intent revision');
+assert.match(methodText('restoreManualMuteIntent'), /manualMuteIntentIsCurrent\(attemptRevision, this\.manualMuteIntentRevision\)[\s\S]*saveVoicePrefs\(\)/,
+  'an owned retry rollback restores storage, while an old retry cannot overwrite a newer click');
+assert.match(toggleMic, /intentRevision = \+\+this\.manualMuteIntentRevision;[\s\S]*saveVoicePrefs\(\)/,
+  'an explicit retry unmute survives a deferred foreground or channel-switch owner');
 
 const reconnectRecovery = methodText('beginVoiceReconnectRecovery');
 assert.match(reconnectRecovery, /existing\.hub === hub && existing\.voiceEpoch === voiceEpoch[\s\S]*return existing\.deadline/,
@@ -517,7 +530,7 @@ assert.match(permissionRecovery, /this\.pendingVoiceMediaRoom === room/,
 const micFence = methodText('fenceMicForCaptureRecovery');
 assert.match(micFence, /retainAvailability = retainMicAvailabilityDuringRecovery\(this\.micHadCapture, this\.noMic\)/,
   'every non-terminal capture recovery keeps a previously working microphone logically available');
-assert.match(micFence, /if \(!retainAvailability\) this\.noMic = true[\s\S]*this\.pttDown = false[\s\S]*setVoiceAttributes[\s\S]*emit/,
+assert.match(micFence, /if \(!retainAvailability\) this\.noMic = true[\s\S]*this\.clearPttOwnership\(\)[\s\S]*setVoiceAttributes[\s\S]*emit/,
   'only an actually unavailable microphone may publish listen-only state during recovery');
 assert.match(micRecovery, /retainMicAvailabilityDuringRecovery\(this\.micHadCapture, this\.noMic\)[\s\S]*fenceMicForCaptureRecovery\(hub, retainAvailability\)/,
   'a previously working microphone keeps its durable talk intent while transport is rebuilt');
@@ -525,17 +538,50 @@ assert.match(micRecovery, /catch \{[\s\S]*this\.noMic = true[\s\S]*setVoiceAttri
   'a confirmed recovery failure still exposes microphone unavailability to peers');
 assert.match(methodText('applyGate'), /micRecoveryOwner !== 0/,
   'the uplink gate stays closed while recovery no longer borrows the manual mute state');
+assert.match(methodText('build'), /manualMicMuted: this\.manualMute[\s\S]*micRecovering: this\.micRecoveryOwner !== 0 \|\| this\.micStartOwnership\.active/,
+  'the UI sees both the latest manual intent and every active capture owner');
 assert.match(methodText('watchMicTracks'), /new Set\(\[rawTrack, publishedTrack\]\)[\s\S]*track\.addEventListener\('mute'/,
   'raw and processed microphone tracks must share one lifecycle watchdog');
-assert.match(voiceDockSource, /suppressPttClick\.current = latchRejectedPttHold\(ptt, recovering, muted\)/,
-  'a rejected recovery-time PTT hold must remain latched until its later synthetic click');
-assert.match(voiceDockSource, /if \(ptt && recovering && !muted\)[\s\S]*event\.preventDefault\(\)[\s\S]*return/,
-  'a recovery-time PTT click must not become a persistent mute toggle');
-assert.match(methodText('toggleMic'), /if \(this\.inVoice && !this\.deafened\) playSound/,
+assert.match(voiceDockSource, /pointerType === 'mouse'[\s\S]*window\.setTimeout[\s\S]*E\.pttPress\('pointer'\)[\s\S]*PTT_TOUCH_HOLD_MS/,
+  'desktop click stays manual mute while touch PTT requires an intentional delayed hold');
+assert.match(voiceDockSource, /released === 'hold'[\s\S]*E\.pttRelease\('pointer'\)[\s\S]*pttClickFence\.current\.arm\(pointerId\)/,
+  'a mobile PTT hold cannot turn its compatibility click into a manual mute toggle');
+assert.match(voiceDockSource, /pttClickFence\.current\.consume\([\s\S]*nativePointerId,[\s\S]*native\.pointerType[\s\S]*firesTouchEvents/,
+  'touch-origin fencing tolerates WebKit detail and synthetic pointer-id differences');
+assert.match(voiceDockSource, /addEventListener\('pointerup', releaseOnWindowPointerUp, true\)/,
+  'failed element pointer capture cannot strand an active mobile PTT owner');
+assert.match(voiceDockSource, /addEventListener\('blur', releaseOnBlur\)/,
+  'window blur cancels a pending touch hold before its delayed PTT gate opens');
+assert.doesNotMatch(voiceDockSource, /ptt && recovering && !muted/,
+  'capture recovery must not swallow the manual mute click');
+assert.match(voiceDockSource, /manualMuted = eng\.manualMicMuted[\s\S]*aria-pressed=\{manualMuted\}/,
+  'busy capture shows each accepted manual mute click without opening its fail-closed gate');
+assert.match(methodText('toggleManualMuteIntent'), /if \(this\.inVoice && !this\.deafened\) playSound/,
   'manual mic preference changes while deafened must not announce a false audible unmute');
+assert.match(methodText('toggleManualMuteIntent'), /manualMute = !this\.manualMute[\s\S]*clearPttOwnership\(\)/,
+  'manual mute changes retire every held PTT owner before a later unmute can reopen the gate');
+assert.match(methodText('toggleDeaf'), /deafened = !this\.deafened[\s\S]*clearPttOwnership\(\)/,
+  'deafen changes retire every held PTT owner before sound is restored');
 const pttPress = methodText('pttPress');
 assert.match(pttPress, /micStartOwnership\.active[\s\S]*micRecoveryOwner !== 0[\s\S]*!this\.hasHealthyCurrentMicTransport\(\)/,
   'PTT must reject while capture is recovering or lacks the exact current publication');
+assert.match(pttPress, /voiceCaptureUnavailable\(\)/,
+  'PTT cannot open from a queued input after the page entered background');
+assert.match(pttPress, /owner === 'keyboard'[\s\S]*pttKeyboardDown[\s\S]*owner === 'pointer'[\s\S]*pttPointerDown/,
+  'keyboard and touch acquire independent PTT ownership');
+const pttRelease = methodText('pttRelease');
+assert.match(pttRelease, /if \(this\.pttKeyboardDown \|\| this\.pttPointerDown\) return[\s\S]*this\.pttDown = false/,
+  'releasing one input cannot close PTT while the other input is still held');
+assert.match(methodText('clearPttOwnership'), /pttKeyboardDown = false[\s\S]*pttPointerDown = false[\s\S]*pttDown = false/,
+  'terminal voice and lifecycle fences retire every PTT input owner together');
+assert.match(appSource, /pttPress\('keyboard'\)[\s\S]*pttRelease\('keyboard'\)/,
+  'desktop hotkeys use keyboard PTT ownership');
+assert.match(appSource, /!e\.repeat && e\.code === s\.pttKey[\s\S]*pttPress\('keyboard'\)/,
+  'keyboard autorepeat cannot resurrect PTT after a fail-closed lifecycle reset');
+assert.match(voiceDockSource, /pttPress\('pointer'\)/,
+  'mobile hold gestures acquire pointer PTT ownership');
+assert.match(voiceDockSource, /pttRelease\('pointer'\)/,
+  'mobile hold gestures use pointer PTT ownership');
 assert.match(methodText('hasExactCurrentMicPublication'), /publication\?\.track === track/,
   'stale-owner guards must recognize the newer publication by exact ownership');
 assert.doesNotMatch(methodText('hasExactCurrentMicPublication'), /microphoneTransportHealth|readyState|muted|upstreamPaused/,

@@ -19,6 +19,8 @@ const {
   automaticMicRecoveryAllowed,
   foregroundMicNeedsImmediateRecovery,
   isVoiceOperationTimeout,
+  manualMuteIntentIsCurrent,
+  microphoneCaptureBusy,
   microphoneTransportHealth,
   mutedTrackNeedsRestart,
   readStoredFlag,
@@ -27,6 +29,7 @@ const {
   resumeGestureAudioContext,
   resumeSharedGestureAudioContext,
   selectedInputUnavailable,
+  unavailableMicrophoneButtonAction,
   withVoiceDeadline,
   withVoiceTimeout,
   voiceWriteCommittedForCurrentIntent,
@@ -47,6 +50,40 @@ assert.equal(selectedInputUnavailable({ name: 'NotFoundError' }), true);
 assert.equal(selectedInputUnavailable({ name: 'OverconstrainedError' }), true);
 assert.equal(selectedInputUnavailable({ name: 'NotAllowedError' }), false);
 assert.equal(selectedInputUnavailable(new Error('busy')), false);
+
+assert.equal(unavailableMicrophoneButtonAction(false), 'retry-capture',
+  'a stable listen-only button can start one explicit microphone retry');
+assert.equal(unavailableMicrophoneButtonAction(true), 'toggle-mute',
+  'a busy capture keeps single-flight ownership but still accepts the mute intent');
+const idleCapture = {
+  startOwned: false,
+  recoveryOwned: false,
+  voiceTransaction: false,
+  foregroundPending: false,
+  bootstrapWanted: false,
+};
+assert.equal(microphoneCaptureBusy(idleCapture), false);
+for (const key of Object.keys(idleCapture)) {
+  assert.equal(microphoneCaptureBusy({ ...idleCapture, [key]: true }), true,
+    `${key} keeps microphone capture single-flight without disabling manual mute`);
+}
+{
+  let manualMute = true;
+  let revision = 0;
+  const previous = manualMute;
+  manualMute = false;
+  const retryRevision = ++revision;
+  manualMute = !manualMute;
+  ++revision; // a second click while getUserMedia is unresolved
+  if (manualMuteIntentIsCurrent(retryRevision, revision)) manualMute = previous;
+  assert.equal(manualMute, true, 'a late retry result cannot undo the newer explicit mute click');
+
+  manualMute = true;
+  const retryWithoutNewerClick = ++revision;
+  manualMute = false;
+  if (manualMuteIntentIsCurrent(retryWithoutNewerClick, revision)) manualMute = true;
+  assert.equal(manualMute, true, 'the retry may restore its own optimistic unmute after failure');
+}
 
 assert.equal(mutedTrackNeedsRestart(1000, 1000 + MIC_MUTED_RESTART_MS - 1), false);
 assert.equal(mutedTrackNeedsRestart(1000, 1000 + MIC_MUTED_RESTART_MS), true);

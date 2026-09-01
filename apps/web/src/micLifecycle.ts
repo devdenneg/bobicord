@@ -10,6 +10,32 @@ export const VOICE_CLEANUP_TIMEOUT_MS = 5_000;
 // verifier has one absolute fail-closed deadline in addition to per-call bounds.
 export const VOICE_RECONNECT_VERIFY_TIMEOUT_MS = 20_000;
 
+export type UnavailableMicrophoneButtonAction = 'retry-capture' | 'toggle-mute';
+
+export interface MicrophoneCaptureBusyState {
+  startOwned: boolean;
+  recoveryOwned: boolean;
+  voiceTransaction: boolean;
+  foregroundPending: boolean;
+  bootstrapWanted: boolean;
+}
+
+/** Every deferred/active capture owner keeps the retry path single-flight while mute stays usable. */
+export function microphoneCaptureBusy(state: MicrophoneCaptureBusyState): boolean {
+  return state.startOwned || state.recoveryOwned || state.voiceTransaction
+    || state.foregroundPending || state.bootstrapWanted;
+}
+
+/** A busy capture stays single-flight, but it must never swallow the user's latest mute intent. */
+export function unavailableMicrophoneButtonAction(captureBusy: boolean): UnavailableMicrophoneButtonAction {
+  return captureBusy ? 'toggle-mute' : 'retry-capture';
+}
+
+/** An async capture retry may roll its optimistic unmute back only while it still owns the intent. */
+export function manualMuteIntentIsCurrent(attemptRevision: number, currentRevision: number): boolean {
+  return attemptRevision === currentRevision;
+}
+
 export class VoiceOperationTimeoutError extends Error {
   override readonly name = 'VoiceOperationTimeoutError';
 
