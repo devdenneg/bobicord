@@ -203,8 +203,8 @@
   #root{height:100%}
   /* выделять мышью можно только текст сообщений чата и содержимое полей ввода */
   .msg .tx,.msg .tx *,.msg-link,input,textarea{user-select:text;-webkit-user-select:text}
-  button{font:inherit;cursor:pointer;border:none;border-radius:var(--r-sm);color:var(--txt);background:var(--panel3);padding:10px 14px;transition:background var(--tr),transform var(--tr),opacity var(--tr),box-shadow var(--tr)}
-  button:hover{background:var(--panel4)}button:active{transform:scale(.97)}button:disabled{opacity:.5;cursor:default}
+  button{font:inherit;cursor:pointer;border:none;border-radius:var(--r-sm);color:var(--txt);background:var(--panel3);padding:10px 14px;transition:background var(--tr),transform var(--tr),scale var(--tr),translate var(--tr),opacity var(--tr),box-shadow var(--tr)}
+  button:hover{background:var(--panel4)}button:active{scale:.97}button:disabled{opacity:.5;cursor:default}
   button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,.sw:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
   input,select,textarea{font:inherit;background:var(--panel2);border:1px solid var(--line);color:var(--txt);border-radius:var(--r-sm);padding:12px 14px;outline:none;width:100%;transition:border-color var(--tr)}
   input:focus,select:focus,textarea:focus{border-color:var(--accent)}
@@ -2256,9 +2256,9 @@ body:has(#voicedock) .admin{padding-bottom:max(132px,calc(118px + env(safe-area-
 
 button{
   -webkit-tap-highlight-color:transparent;
-  transition:color var(--workspace-ease),background-color var(--workspace-ease),border-color var(--workspace-ease),box-shadow var(--workspace-ease),transform 120ms ease,opacity var(--workspace-ease);
+  transition:color var(--workspace-ease),background-color var(--workspace-ease),border-color var(--workspace-ease),box-shadow var(--workspace-ease),transform 120ms ease,scale 120ms ease,translate 120ms ease,opacity var(--workspace-ease);
 }
-button:active:not(:disabled){transform:translateY(1px) scale(.98)}
+button:active:not(:disabled){translate:0 1px;scale:.98}
 button:disabled{cursor:not-allowed}
 button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,[tabindex]:focus-visible{
   outline:2px solid var(--workspace-focus);

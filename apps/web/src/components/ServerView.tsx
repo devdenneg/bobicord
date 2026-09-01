@@ -3094,6 +3094,10 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
     ]);
     if (attempt !== playAttemptSeq.current || vidRef.current !== v) return;
     if (!isLocal && outcome === 'playing') E.confirmWatchPlayback(identity, streamKey, playbackGeneration);
+    // Браузер явно отказал по политике автозапуска — ждём жеста, а не чиним сеть. Снимаем
+    // дедлайн watch, иначе он через 20 секунд оборвёт исправное соединение и покажет
+    // «Не удалось подключиться к трансляции», хотя не хватало только клика.
+    else if (!isLocal && outcome === 'blocked') E.holdWatchForGesture(identity, streamKey, playbackGeneration);
     // WebKit иногда оставляет play() pending вместо NotAllowedError. После bounded
     // ожидания это такой же recoverable gesture-case: не прячем единственную кнопку Retry.
     setPlaybackBlocked(!audioReady || outcome !== 'playing');
