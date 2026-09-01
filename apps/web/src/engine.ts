@@ -4825,22 +4825,6 @@ export class Engine {
     this.completeWatch(identity);
     this.emit();
   }
-  /**
-   * Плитка сообщает: медиа доехало, но браузер ЯВНО заблокировал воспроизведение до жеста
-   * пользователя (outcome 'blocked' — политика автозапуска, а не мёртвый поток).
-   *
-   * Это не отказ транспорта, и обходиться с ним как с отказом нельзя: дедлайн watch рвал
-   * исправное соединение и показывал «Не удалось подключиться к трансляции» просто потому,
-   * что зритель не успел нажать кнопку запуска за 20 секунд. Соединение при этом было живым.
-   *
-   * Снимаем только дедлайн, оставляя стрим в pending: как только жест случится и видео
-   * реально пойдёт, придёт confirmWatchPlayback и закроет попытку штатно. Неоднозначный
-   * случай ('waiting' — дорожка есть, а кадра нет) дедлайн сохраняет: там поток может быть мёртв.
-   */
-  holdWatchForGesture(identity: string, streamKey: string, generation: number) {
-    if (!this.pendingWatch.has(identity) || !this.watchPlaybackGate.confirms(identity, streamKey, generation)) return;
-    this.cancelWatchTimer(identity);
-  }
   private clearWatch(identity: string) {
     const transport = this.watchT.get(identity) ?? this.transportFor(identity);
     this.cancelWatchTimer(identity);

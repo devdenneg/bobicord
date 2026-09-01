@@ -3094,10 +3094,6 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
     ]);
     if (attempt !== playAttemptSeq.current || vidRef.current !== v) return;
     if (!isLocal && outcome === 'playing') E.confirmWatchPlayback(identity, streamKey, playbackGeneration);
-    // Браузер явно отказал по политике автозапуска — ждём жеста, а не чиним сеть. Снимаем
-    // дедлайн watch, иначе он через 20 секунд оборвёт исправное соединение и покажет
-    // «Не удалось подключиться к трансляции», хотя не хватало только клика.
-    else if (!isLocal && outcome === 'blocked') E.holdWatchForGesture(identity, streamKey, playbackGeneration);
     // WebKit иногда оставляет play() pending вместо NotAllowedError. После bounded
     // ожидания это такой же recoverable gesture-case: не прячем единственную кнопку Retry.
     setPlaybackBlocked(!audioReady || outcome !== 'playing');
@@ -3144,8 +3140,16 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
     (track as any).attach(v);
 
     const visible = () => { if (document.visibilityState === 'visible') retry(); };
+    // Декодированный кадр = поток доехал. Это доказательство соединения, и оно не зависит
+    // от того, разрешил ли браузер автозапуск: у заблокированного видео первый кадр есть,
+    // просто оно стоит на паузе.
+    const confirmDecoded = () => {
+      if (isLocal || !v.videoWidth || v.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+      E.confirmWatchPlayback(identity, streamKey, playbackGeneration);
+    };
     const playable = () => {
       v.classList.add('ready');
+      confirmDecoded();
       retry();
     };
     const playing = () => {
@@ -3157,10 +3161,13 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
     v.addEventListener('loadedmetadata', retry);
     v.addEventListener('canplay', playable);
     v.addEventListener('playing', playing);
+    // resize — канонический сигнал появления первого кадра у MediaStream: videoWidth 0 → N.
+    v.addEventListener('resize', confirmDecoded);
     mediaStream?.addEventListener('addtrack', retry);
     window.addEventListener('pageshow', retry);
     document.addEventListener('visibilitychange', visible);
     if (v.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) playable();
+    confirmDecoded();
     queueMicrotask(retry);
 
     return () => {
@@ -3169,6 +3176,7 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
       v.removeEventListener('loadedmetadata', retry);
       v.removeEventListener('canplay', playable);
       v.removeEventListener('playing', playing);
+      v.removeEventListener('resize', confirmDecoded);
       mediaStream?.removeEventListener('addtrack', retry);
       window.removeEventListener('pageshow', retry);
       document.removeEventListener('visibilitychange', visible);
@@ -3178,7 +3186,7 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
       videoPlayCoordinatorRef.current.forget(v);
       try { (track as any).detach(v); } catch { /**/ }
     };
-  }, [streamKey, isLocal, E, attemptPlayback]);
+  }, [streamKey, isLocal, E, attemptPlayback, identity, playbackGeneration]);
 
   useEffect(() => E.onEmote((sid, emoteId, by, x, size) => {
     if (sid !== identity) return;

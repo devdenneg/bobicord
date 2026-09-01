@@ -778,6 +778,18 @@ assert.match(serverView, /mediaStream\?\.addEventListener\('addtrack', retry\)/,
   'a tree audio track arriving after video immediately retries the exact media playback path');
 assert.match(serverView, /setPlaybackBlocked\(!audioReady \|\| outcome !== 'playing'\)/,
   'a hanging WebKit play promise exposes the gesture retry instead of silently timing out');
+// Просмотр подтверждается ДЕКОДИРОВАННЫМ КАДРОМ, а не началом воспроизведения. Раньше
+// подтверждение приходило только с события 'playing', то есть требовало разрешённого
+// автозапуска: пока зритель не нажал кнопку запуска, дедлайн watch (20 с) обрывал
+// исправное соединение с ошибкой «Не удалось подключиться к трансляции».
+// videoWidth > 0 доказывает наличие кадра, поэтому аудио-only и мёртвый поток
+// по-прежнему упираются в дедлайн — там подтверждать нечего.
+assert.match(serverView, /const confirmDecoded = \(\) => \{[\s\S]*?!v\.videoWidth[\s\S]*?confirmWatchPlayback/,
+  'a decoded video frame confirms the watch without waiting for autoplay permission');
+assert.match(serverView, /v\.addEventListener\('resize', confirmDecoded\)/,
+  'the first frame of a MediaStream (videoWidth 0 -> N) confirms the watch');
+assert.ok(/const playable = \(\) => \{[\s\S]*?confirmDecoded\(\)/.test(serverView),
+  'loadeddata/canplay confirm the watch as soon as the frame is decodable');
 assert.match(engine, /remoteAudioPlays\.request\(el,[\s\S]*explicitGesture/,
   'voice and screen audio share exact-element ordinary and gesture play owners');
 assert.match(engine, /remoteAudioPlays\.forget\(entry\.el\)/,
