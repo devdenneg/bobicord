@@ -4,7 +4,9 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const engine = readFileSync(join(here, 'engine.ts'), 'utf8');
+// Git may check the source out with CRLF on the Windows Tauri runner. Normalize it before
+// structural source assertions so CI validates the code rather than the host line-ending policy.
+const engine = readFileSync(join(here, 'engine.ts'), 'utf8').replace(/\r\n?/g, '\n');
 
 assert.match(engine, /VoiceDiagnosticsRecorder[\s\S]*VoiceEventLoopStallMonitor[\s\S]*detectVoiceDiagnosticNetworkType/,
   'Engine uses the bounded client recorder and foreground-only stall monitor');
