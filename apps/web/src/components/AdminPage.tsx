@@ -4,6 +4,8 @@ import { useStore } from '../store';
 import { Icon } from '../Icon';
 import { avColor, initial } from '../util';
 import type { AdminOverview, AdminServer, AdminMember, AdminUser, RegistrationInvite } from '../types';
+import { AdminVoiceDiagnostics } from './AdminVoiceDiagnostics';
+import { canViewVoiceDiagnostics } from '../adminDiagnosticsAccess';
 
 function RegistrationInviteCard({ invite, now, onReload, onRotate }: {
   invite: RegistrationInvite; now: number; onReload: () => void; onRotate: () => void;
@@ -47,14 +49,14 @@ export function AdminPage() {
   const [data, setData] = useState<AdminOverview | null>(null);
   const [err, setErr] = useState('');
   const [loading, setLoading] = useState(true);
-  const [tab, setTab] = useState<'servers' | 'users' | 'access'>('servers');
+  const [tab, setTab] = useState<'servers' | 'users' | 'diagnostics' | 'access'>('servers');
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [registrationInvite, setRegistrationInvite] = useState<RegistrationInvite | null>(null);
   const [inviteError, setInviteError] = useState('');
   const [inviteLoading, setInviteLoading] = useState(false);
   const [now, setNow] = useState(Date.now());
   const [bindingSupport, setBindingSupport] = useState<{ user: AdminUser; code: string; expiresAt: number } | null>(null);
-  const isBootstrapAdmin = me?.username === 'denis';
+  const isBootstrapAdmin = canViewVoiceDiagnostics(me);
 
   const load = useCallback(() => {
     setLoading(true); setErr('');
@@ -135,6 +137,7 @@ export function AdminPage() {
           <div className="admin-tabs">
             <button className={tab === 'servers' ? 'on' : ''} onClick={() => setTab('servers')}>Серверы</button>
             <button className={tab === 'users' ? 'on' : ''} onClick={() => setTab('users')}>Юзеры</button>
+            {isBootstrapAdmin ? <button className={tab === 'diagnostics' ? 'on' : ''} onClick={() => setTab('diagnostics')}>Диагностика</button> : null}
             {isBootstrapAdmin ? <button className={tab === 'access' ? 'on' : ''} onClick={() => setTab('access')}>Доступ</button> : null}
           </div>
 
@@ -196,7 +199,8 @@ export function AdminPage() {
                 );
               })}
             </div>
-          ) : isBootstrapAdmin ? (
+          ) : tab === 'diagnostics' && isBootstrapAdmin ? <AdminVoiceDiagnostics />
+          : isBootstrapAdmin ? (
             <section className="admin-access" aria-labelledby="admin-access-title" aria-busy={inviteLoading || undefined}>
               <div className="admin-access-head">
                 <span className="admin-access-icon"><Icon name="shield" /></span>

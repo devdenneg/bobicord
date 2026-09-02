@@ -102,6 +102,102 @@ export interface AdminUser {
 }
 export interface AdminOverview { stats: { servers: number; users: number }; servers: AdminServer[]; users: AdminUser[] }
 
+export type VoiceDiagnosticIncident =
+  | 'manual' | 'join_stuck' | 'connection_failed' | 'reconnect_loop' | 'uplink_silent'
+  | 'inbound_silent' | 'mute_divergence' | 'mic_failed' | 'playback_blocked'
+  | 'output_route_failed' | 'ui_stall' | 'session_ended';
+export type VoiceDiagnosticClientKind = 'web' | 'native';
+export interface VoiceDiagnosticClient {
+  kind: VoiceDiagnosticClientKind;
+  platform: 'ios' | 'ipados' | 'android' | 'macos' | 'windows' | 'linux' | 'other' | 'unknown';
+  installMode: 'browser' | 'standalone' | 'native' | 'unknown';
+  networkType: 'slow-2g' | '2g' | '3g' | '4g' | 'wifi' | 'ethernet' | 'cellular' | 'other' | 'unknown';
+  appVersion?: string;
+}
+export interface VoiceDiagnosticEvent {
+  atMs: number;
+  kind: 'join_started' | 'intent_finished' | 'hub_connected' | 'lease_claimed'
+    | 'media_token_received' | 'media_connected' | 'media_activated' | 'join_completed'
+    | 'join_failed' | 'mic_capture_finished' | 'mic_published' | 'mic_recovery_started'
+    | 'mic_recovery_finished' | 'mute_changed' | 'deafen_changed' | 'background'
+    | 'foreground' | 'network_changed' | 'reconnecting' | 'reconnected' | 'disconnected'
+    | 'playback_blocked' | 'output_route_failed' | 'ui_stall' | 'rtc_sample'
+    | 'uplink_stalled' | 'inbound_stalled' | 'left';
+  stage?: 'intent' | 'hub' | 'claim' | 'media_token' | 'media_connect' | 'activation'
+    | 'mic_capture' | 'mic_publish' | 'mic_recovery' | 'playback' | 'output_route' | 'rtc' | 'ui';
+  outcome?: 'started' | 'ok' | 'failed' | 'timed_out' | 'blocked' | 'unsupported'
+    | 'cancelled' | 'superseded' | 'stalled' | 'recovered';
+  code?: 'none' | 'timeout' | 'network' | 'offline' | 'auth' | 'permission' | 'device_lost'
+    | 'media_blocked' | 'disconnected' | 'sdk' | 'unsupported' | 'aborted' | 'unknown';
+  httpStatus?: number;
+  connectionState?: 'new' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected' | 'closed' | 'unknown';
+  iceState?: 'new' | 'checking' | 'connected' | 'completed' | 'failed' | 'disconnected' | 'closed' | 'unknown';
+  trackState?: 'live' | 'ended' | 'missing' | 'unknown';
+  audioContextState?: 'running' | 'suspended' | 'interrupted' | 'closed' | 'missing' | 'unknown';
+  outputRoute?: 'default' | 'custom' | 'system' | 'unsupported' | 'unknown';
+  micMode?: 'voice' | 'ptt' | 'unknown';
+  networkType?: VoiceDiagnosticClient['networkType'];
+  documentHidden?: boolean;
+  online?: boolean;
+  micEnabled?: boolean;
+  publicationMuted?: boolean;
+  upstreamPaused?: boolean;
+  deafened?: boolean;
+  pushToTalk?: boolean;
+  speechDetected?: boolean;
+  canPlaybackAudio?: boolean;
+  rttMs?: number;
+  jitterMs?: number;
+  packetsLostDelta?: number;
+  packetsReceivedDelta?: number;
+  packetsSentDelta?: number;
+  bytesReceivedDelta?: number;
+  bytesSentDelta?: number;
+  concealedSamplesDelta?: number;
+  audioLevel?: number;
+  eventLoopLagMs?: number;
+  joinElapsedMs?: number;
+  reconnectCount?: number;
+  participantCount?: number;
+}
+export interface VoiceDiagnosticReport {
+  schemaVersion: 1;
+  /** Random, non-secret idempotency key. Older deployed clients may omit it. */
+  clientReportId?: string;
+  incident: VoiceDiagnosticIncident;
+  client: VoiceDiagnosticClient;
+  durationMs: number;
+  events: VoiceDiagnosticEvent[];
+  truncated?: boolean;
+}
+export interface AdminVoiceDiagnosticSummary {
+  id: string;
+  userId: string;
+  username: string;
+  incident: VoiceDiagnosticIncident;
+  client: VoiceDiagnosticClientKind;
+  platform: VoiceDiagnosticClient['platform'];
+  createdAt: number;
+  eventCount: number;
+  durationMs: number;
+  truncated: boolean;
+}
+export interface AdminVoiceDiagnosticCursor {
+  createdAt: number;
+  id: string;
+}
+export interface AdminVoiceDiagnosticsPage {
+  items: AdminVoiceDiagnosticSummary[];
+  nextCursor: AdminVoiceDiagnosticCursor | null;
+}
+export interface AdminVoiceDiagnosticDetail {
+  id: string;
+  userId: string;
+  username: string;
+  createdAt: number;
+  report: VoiceDiagnosticReport;
+}
+
 // права роли (битовая маска, синхронно с server/index.js PERM)
 export const PERM = { MANAGE_SERVER: 1, MANAGE_ROLES: 2, MANAGE_MEMBERS: 4, MANAGE_MESSAGES: 8, CREATE_INVITE: 16, MANAGE_CHANNELS: 32 } as const;
 export const PERM_LIST: { key: keyof typeof PERM; label: string; hint: string }[] = [

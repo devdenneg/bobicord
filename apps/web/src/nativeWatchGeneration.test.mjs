@@ -39,7 +39,7 @@ assert.match(treeSource,
   /if \(!ownsStream\) \{[\s\S]*this\.nativeUnwatch\(streamId, st, true\);[\s\S]*return;[\s\S]*const terminal/,
   'a delayed failed start exits before scheduling a retry owned by its replacement');
 assert.match(treeSource,
-  /pc\.ontrack = \(e\) => \{[\s\S]*this\.nativeWatches\.get\(streamId\) !== st \|\| st\.pc !== pc[\s\S]*nativeWatchAnswer\(streamId, st\.generation/,
+  /const ownsOffer = \(\) => !st\.closed && this\.nativeWatches\.get\(streamId\) === st && st\.pc === pc[\s\S]*pc\.ontrack = \(e\) => \{[\s\S]*if \(!ownsOffer\(\)\) return;[\s\S]*nativeWatchAnswer\(streamId, st\.generation/,
   'late media and SDP callbacks are fenced to the exact current WebView peer connection');
 
 console.log('native watch generation: ok');

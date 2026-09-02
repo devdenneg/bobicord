@@ -27,7 +27,9 @@
     "test:mobile-push-pwa": "node src/mobilePushPwa.test.mjs",
     "test:version-entry": "node src/versionEntry.test.mjs",
     "test:press-transform": "node src/pressTransform.test.mjs",
-    "build": "npm run test:links && npm run test:volume && npm run test:chat-scroll && npm run test:chat-wallpaper && npm run test:chat-realtime && npm run test:audio-devices && npm run test:mobile-controls && npm run test:mic-lifecycle && npm run test:voice-media && npm run test:livekit-lifecycle && npm run test:rtc-stats && npm run test:auth-handoff && npm run test:auth-session && npm run test:native-auth && npm run test:mobile-network && npm run test:stream-playback && npm run test:transport && npm run test:pwa-offline && npm run test:mobile-push-pwa && npm run test:version-entry && npm run test:press-transform && npm run build:bundle",
+    "test:admin-diagnostics": "node src/adminDiagnosticsAccess.test.mjs",
+    "test:voice-diagnostics": "node src/voiceDiagnostics.test.mjs && node src/voiceDiagnosticRtc.test.mjs && node src/voiceDiagnosticsEngine.test.mjs",
+    "build": "npm run test:links && npm run test:volume && npm run test:chat-scroll && npm run test:chat-wallpaper && npm run test:chat-realtime && npm run test:audio-devices && npm run test:mobile-controls && npm run test:mic-lifecycle && npm run test:voice-media && npm run test:livekit-lifecycle && npm run test:rtc-stats && npm run test:auth-handoff && npm run test:auth-session && npm run test:native-auth && npm run test:mobile-network && npm run test:stream-playback && npm run test:transport && npm run test:pwa-offline && npm run test:mobile-push-pwa && npm run test:version-entry && npm run test:press-transform && npm run test:admin-diagnostics && npm run test:voice-diagnostics && npm run build:bundle",
     "build:bundle": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit"
   },

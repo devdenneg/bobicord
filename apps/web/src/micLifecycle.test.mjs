@@ -6,6 +6,7 @@ import ts from 'typescript';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(here, 'micLifecycle.ts'), 'utf8');
+const micMeterSource = readFileSync(join(here, 'components', 'MicMeter.tsx'), 'utf8');
 const js = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
@@ -17,7 +18,9 @@ const {
   VoiceMicStartOwnership,
   VoiceOperationTimeoutError,
   automaticMicRecoveryAllowed,
+  confirmedMicrophoneUnavailable,
   foregroundMicNeedsImmediateRecovery,
+  initialMicrophoneResultIsDeferred,
   isVoiceOperationTimeout,
   manualMuteIntentIsCurrent,
   microphoneCaptureBusy,
@@ -30,10 +33,48 @@ const {
   resumeSharedGestureAudioContext,
   selectedInputUnavailable,
   unavailableMicrophoneButtonAction,
+  voiceActivationAllowsAudio,
   withVoiceDeadline,
   withVoiceTimeout,
   voiceWriteCommittedForCurrentIntent,
 } = await import('data:text/javascript,' + encodeURIComponent(js));
+
+assert.equal(confirmedMicrophoneUnavailable(true, true), false,
+  'microphone bootstrap is not advertised as a user mute or a confirmed hardware failure');
+assert.equal(confirmedMicrophoneUnavailable(true, false), true,
+  'a completed capture failure is advertised as unavailable');
+assert.equal(confirmedMicrophoneUnavailable(false, true), false);
+
+const settledInitialMic = {
+  foregroundChanged: false,
+  foregroundPending: false,
+  startOwned: false,
+  recoveryOwned: false,
+  hasExactPublication: false,
+};
+assert.equal(initialMicrophoneResultIsDeferred(settledInitialMic), false,
+  'an ownerless false start becomes a stable listen-only failure instead of an endless bootstrap');
+for (const key of Object.keys(settledInitialMic)) {
+  assert.equal(initialMicrophoneResultIsDeferred({ ...settledInitialMic, [key]: true }), true,
+    `${key} preserves the state owned by the exact newer or foreground microphone operation`);
+}
+
+assert.equal(voiceActivationAllowsAudio('voice', true, false, false, false), false,
+  'automatic sensitivity still closes the real voice-activation gate below its adaptive threshold');
+assert.equal(voiceActivationAllowsAudio('voice', true, true, false, false), true,
+  'automatic sensitivity opens the gate when the adaptive VAD detects speech');
+assert.equal(voiceActivationAllowsAudio('voice', false, false, false, false), false,
+  'an explicit manual sensitivity threshold remains a hard gate');
+assert.equal(voiceActivationAllowsAudio('voice', false, false, true, false), true,
+  'a stale manual VAD measurement fails open');
+assert.equal(voiceActivationAllowsAudio('ptt', true, true, true, false), false,
+  'PTT remains closed until it is pressed');
+assert.equal(voiceActivationAllowsAudio('ptt', true, false, false, true), true,
+  'PTT opens only for the current press');
+assert.match(micMeterSource, /setSettings\(patch\);[\s\S]*?onVoiceActivationSettingsChanged\(\)/,
+  'changing auto/manual sensitivity applies the current gate immediately');
+assert.match(micMeterSource, /Порог подбирается автоматически по шуму фона/,
+  'automatic sensitivity describes its adaptive threshold behavior honestly');
 
 const deferred = () => {
   let resolve;

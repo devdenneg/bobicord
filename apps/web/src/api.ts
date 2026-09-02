@@ -2,6 +2,8 @@ import type {
   User, ServerSummary, Member, ServerDetail, InvitePreview, HistoryMessage, Role, VoiceChannel,
   Attachment, AdminOverview, Emote, AuthResponse, ChallengeResponse,
   RegistrationInvite, ReleaseHistoryResponse, SessionResponse, PersistentSessionResponse, NotificationPrivacy,
+  AdminVoiceDiagnosticCursor, AdminVoiceDiagnosticDetail, AdminVoiceDiagnosticsPage,
+  VoiceDiagnosticClientKind, VoiceDiagnosticIncident, VoiceDiagnosticReport,
 } from './types';
 import {
   PERSISTENT_AUTH_PROTOCOL,
@@ -1060,6 +1062,29 @@ export const api = {
     const rawExpiry = response.expiresAt || response.validUntil || 0;
     return { ...response, expiresAt: rawExpiry && rawExpiry < 1_000_000_000_000 ? rawExpiry * 1000 : rawExpiry };
   },
+  // Строго структурированная диагностика голоса: тип намеренно не содержит raw log/error,
+  // URL, ICE/SDP, device id/label, токенов, текста чата или аудиоданных.
+  submitVoiceDiagnostic: (payload: VoiceDiagnosticReport) => req<{ ok: true; reportId: string; createdAt: number }>(
+    'POST', '/diag/voice', payload,
+  ),
+  adminVoiceDiagnostics: (options: {
+    limit?: number; cursor?: AdminVoiceDiagnosticCursor;
+    incident?: VoiceDiagnosticIncident; client?: VoiceDiagnosticClientKind;
+  } = {}) => {
+    const query = new URLSearchParams();
+    if (options.limit != null) query.set('limit', String(options.limit));
+    if (options.cursor) {
+      query.set('beforeCreated', String(options.cursor.createdAt));
+      query.set('beforeId', options.cursor.id);
+    }
+    if (options.incident) query.set('incident', options.incident);
+    if (options.client) query.set('client', options.client);
+    const suffix = query.toString();
+    return req<AdminVoiceDiagnosticsPage>('GET', `/admin/diagnostics/voice${suffix ? `?${suffix}` : ''}`);
+  },
+  adminVoiceDiagnostic: (id: string) => req<AdminVoiceDiagnosticDetail>(
+    'GET', `/admin/diagnostics/voice/${encodeURIComponent(id)}`,
+  ),
   // Диагностика стрима: клиент сдаёт сессию по её окончании (см. diag.ts). Тело крупнее
   // обычного (лог + семплы) — сервер парсит этот путь отдельным express.json({limit:'2mb'}).
   diagSession: (payload: unknown) => req<{ ok: boolean; name: string }>('POST', '/diag/session', payload),

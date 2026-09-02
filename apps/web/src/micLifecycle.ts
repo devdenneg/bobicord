@@ -10,6 +10,42 @@ export const VOICE_CLEANUP_TIMEOUT_MS = 5_000;
 // verifier has one absolute fail-closed deadline in addition to per-call bounds.
 export const VOICE_RECONNECT_VERIFY_TIMEOUT_MS = 20_000;
 
+export function confirmedMicrophoneUnavailable(unavailable: boolean, bootstrapWanted: boolean): boolean {
+  return unavailable && !bootstrapWanted;
+}
+
+export interface InitialMicrophoneCompletionState {
+  foregroundChanged: boolean;
+  foregroundPending: boolean;
+  startOwned: boolean;
+  recoveryOwned: boolean;
+  hasExactPublication: boolean;
+}
+
+/**
+ * `startMic()` may return false either because another exact owner took over, or because the
+ * current attempt ended without a usable publication. Only the former is safe to leave pending;
+ * otherwise the UI would advertise an endless microphone bootstrap that no operation owns.
+ */
+export function initialMicrophoneResultIsDeferred(state: InitialMicrophoneCompletionState): boolean {
+  return state.foregroundChanged || state.foregroundPending || state.startOwned
+    || state.recoveryOwned || state.hasExactPublication;
+}
+
+export function voiceActivationAllowsAudio(
+  mode: 'voice' | 'ptt',
+  _sensitivityAuto: boolean,
+  vadOpen: boolean,
+  vadStale: boolean,
+  pttDown: boolean,
+): boolean {
+  if (mode === 'ptt') return pttDown;
+  // Both automatic and manual sensitivity are real voice-activation gates. Automatic mode only
+  // changes how the threshold is calculated; bypassing the gate would continuously transmit
+  // background noise and would silently change the existing privacy behaviour.
+  return vadOpen || vadStale;
+}
+
 export type UnavailableMicrophoneButtonAction = 'retry-capture' | 'toggle-mute';
 
 export interface MicrophoneCaptureBusyState {

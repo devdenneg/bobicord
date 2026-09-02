@@ -15,6 +15,7 @@ const js = ts.transpileModule(source, {
 }).outputText;
 const {
   ExactAsyncActionCoordinator,
+  ExactMediaOutputRouteGate,
   ExactMediaPlayCoordinator,
   StreamWatchPlaybackGate,
   TreeStreamAudioController,
@@ -36,6 +37,20 @@ assert.equal(effectiveStreamGain(50, 0.4), 0.2);
 assert.equal(effectiveStreamGain(100, 1, true), 0);
 assert.equal(effectiveStreamGain(150, 2), 1);
 assert.equal(effectiveStreamGain(Number.NaN, Number.NaN), 1);
+
+{
+  const routes = new ExactMediaOutputRouteGate();
+  const element = {};
+  assert.equal(routes.claim(element, 'speaker'), true);
+  for (let tick = 0; tick < 100; tick++) assert.equal(routes.claim(element, 'speaker'), false);
+  assert.equal(routes.claim(element, 'speaker', true), true,
+    'an explicit device/foreground recovery can retry the same route once');
+  assert.equal(routes.claim(element, 'headphones'), true,
+    'a real output selection supersedes the coalesced route');
+  routes.forget(element);
+  assert.equal(routes.claim(element, 'headphones'), true,
+    'a replacement media element owns a fresh route generation');
+}
 
 {
   const closedA = { state: 'closed' };
@@ -151,6 +166,15 @@ assert.equal(await playMediaElement({ play: () => new Promise(() => {}) }, 5), '
   await late.promise;
   await Promise.resolve();
   assert.equal(staleSuccess, 0, 'detaching an exact element fences its late play settlement');
+
+  const survivor = {};
+  const stranded = deferred();
+  let survivorCalls = 0;
+  coordinator.request(survivor, () => { survivorCalls++; return stranded.promise; });
+  coordinator.forget(survivor);
+  coordinator.request(survivor, () => { survivorCalls++; return Promise.resolve(); });
+  assert.equal(survivorCalls, 2,
+    'a physical playback-owner handoff can start once even when the previous browser promise never settles');
 }
 
 {
@@ -805,9 +829,30 @@ assert.ok(outputSwitchBody.indexOf('setTreeStreamOutputSink(requested)') < outpu
   'tree output starts before waiting for the independently bounded voice AudioContext route');
 assert.match(engine, /private queueContextOutput\([\s\S]*routeAudioSinkTarget\(ctx, requested,[\s\S]*normalizedContextSink/,
   'voice output enumeration and AudioContext routing share the bounded late-result-safe router');
-const elementOutputBody = engine.match(/private async switchElementOutput\([\s\S]*?\n  }\n\n  \/\* ---------- connection/)?.[0] || '';
+const elementOutputBody = engine.match(/private async switchElementOutput\([\s\S]*?\n  }\n  private forgetElementOutput/)?.[0] || '';
+assert.match(elementOutputBody, /elementOutputRoutes\.claim\(el, requested, force\)/,
+  'identical steady-state sink requests are coalesced before entering the native promise queue');
+assert.match(elementOutputBody, /elementOutputGenerations\.get\(el\) !== generation/,
+  'a detached or superseded queued route is fenced before calling the browser');
 assert.match(elementOutputBody, /routeAudioSinkTarget\(el, requested\)/,
   'attached voice and stream elements use the same bounded hardware output router');
+assert.match(engine, /private retryAttachedOutputRoutesAfterForeground[\s\S]*switchElementOutput\(el, requested, true\)/,
+  'a real foreground edge grants one forced retry to a previously failed attached output route');
+const foregroundOutputRetry = engine.match(/private retryAttachedOutputRoutesAfterForeground\(\)[\s\S]*?\n  }\n\n  private ensureInputLifecycleListener/)?.[0] || '';
+assert.match(foregroundOutputRetry, /now - this\.lastForegroundOutputRetryAt < 1_000[\s\S]*switchContextOutput\(requested, false\)/,
+  'the paired foreground events grant one bounded retry to the audible context and tree routes');
+assert.equal((foregroundOutputRetry.match(/switchContextOutput\(requested, false\)/g) || []).length, 1,
+  'one physical foreground edge starts exactly one context/tree route retry');
+assert.match(engine, /remoteAudioResumeHandler = \(\) => \{[\s\S]*retryAttachedOutputRoutesAfterForeground\(\)[\s\S]*ensureRemoteAudioPlayback\(\)/,
+  'foreground retries hardware routing before resuming exact media playback');
+const remotePlaybackBody = engine.match(/private resumeRemoteAudioPlayback\([\s\S]*?\n  }\n  private startRoomAudio/)?.[0] || '';
+assert.match(remotePlaybackBody, /room\.canPlaybackAudio === false/,
+  'a healthy watchdog does not call Room.startAudio again');
+assert.match(remotePlaybackBody, /!explicitGesture && !el\.paused/,
+  'a healthy watchdog does not call play on an already playing element');
+const ensureVoicePlaybackBody = engine.match(/private ensureRemoteVoicePlayback\([\s\S]*?\n  }\n  private onRemotePub/)?.[0] || '';
+assert.equal((ensureVoicePlaybackBody.match(/configureVoiceAudio\(entry, p!\)/g) || []).length, 1,
+  'steady reconciliation configures output only when an exact audio element is attached');
 assert.doesNotMatch(engine, /await ctx\.setSinkId|await setSinkId\.call/,
   'no raw browser sink promise can hold the Engine output queues forever');
 assert.match(engine, /onSeamlessSwitchFailed\?\.\(\(sid\) => \{[\s\S]*this\.closeWatch\(sid\)/,

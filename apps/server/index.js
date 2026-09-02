@@ -47,6 +47,10 @@ const {
   createDiagRateLimiter, createDiagStore, sanitizeDiagLines, sanitizeDiagSamples,
 } = require('./diagStore');
 const {
+  VoiceDiagnosticValidationError, createVoiceDiagnosticGlobalLimiter,
+  createVoiceDiagnosticsStore, isVoiceDiagnosticsAdmin,
+} = require('./voiceDiagnostics');
+const {
   BoundedTtlCache, createFixedWindowLimiter, fetchSeventvCdn,
   normalizeGlobalPayload, normalizeSearchPayload, readResponseLimited,
 } = require('./seventvProxy');
@@ -130,6 +134,9 @@ const jsonSmall = express.json({ limit: '32kb' });
 const jsonDiag = express.json({ limit: DIAG_MAX_BODY });
 const jsonRelease = express.json({ limit: '512kb' });
 app.use((req, res, next) => {
+  // Body-parser can reject a diagnostic upload before route middleware runs. Mark the response at
+  // parser entry so even malformed/oversized reports remain non-cacheable.
+  if (req.path === '/api/diag/voice') res.setHeader('Cache-Control', 'no-store');
   const parser = req.path === '/api/diag/session'
     ? jsonDiag
     : (req.path.startsWith('/internal/releases/') ? jsonRelease : jsonSmall);
@@ -369,6 +376,13 @@ CREATE INDEX IF NOT EXISTS idx_mroles ON member_roles(server_id, user_id);
 const voiceLeases = createVoiceLeaseStore(db);
 const voiceMediaRevocations = createVoiceMediaRevocationStore(db);
 const serverVolumeSettings = createServerVolumeSettingsStore(db);
+const voiceDiagnostics = createVoiceDiagnosticsStore(db);
+try { voiceDiagnostics.prune(); } catch { console.error('[voice-diag] initial prune failed'); }
+const voiceDiagnosticsPruneTimer = setInterval(() => {
+  try { voiceDiagnostics.prune(); }
+  catch { console.error('[voice-diag] prune failed'); }
+}, 10 * 60_000);
+voiceDiagnosticsPruneTimer.unref?.();
 installReleaseSchema(db);
 installAuthSchema(db);
 installPersistentSessionSchema(db);
@@ -570,6 +584,21 @@ function requireAdmin(req, res, next) {
     }
     return next();
   });
+}
+// Voice diagnostics intentionally have a narrower audience than normal moderation data. They do
+// not contain media/chat/credentials, but do describe a user's client and call state in detail.
+function requireDiagnosticsAdmin(req, res, next) {
+  return requireAuth(req, res, (error) => {
+    if (error) return next(error);
+    if (!isVoiceDiagnosticsAdmin(req.user, BOOTSTRAP_ADMIN)) {
+      return res.status(403).json({ error: { code: 'DIAGNOSTICS_ADMIN_ONLY', message: 'Диагностика доступна только владельцу.' } });
+    }
+    return next();
+  });
+}
+function noStoreResponse(req, res, next) {
+  res.setHeader('Cache-Control', 'no-store');
+  return next();
 }
 const rsc = new RoomServiceClient(WS_URL.replace('wss://', 'https://'), KEY, SECRET);
 // LiveKit identity = `username#<nonce>` (уникально на сессию — иначе второй девайс кикает первого).
@@ -1028,6 +1057,7 @@ function purgeUser(uid) {
   }
   if (authManager) authManager.purgeUser(uid);
   if (persistentSessions) persistentSessions.purgeUser(uid);
+  voiceDiagnostics.purgeUser(uid);
   db.prepare('DELETE FROM voice_session_intents WHERE user_id=?').run(uid);
   db.prepare('DELETE FROM voice_user_intents WHERE user_id=?').run(uid);
   db.prepare('DELETE FROM voice_leases WHERE user_id=?').run(uid);
@@ -2390,6 +2420,9 @@ const diagStore = createDiagStore({
   maxTotalBytes: DIAG_MAX_TOTAL_BYTES,
 });
 const diagRateLimiter = createDiagRateLimiter();
+const voiceDiagRateLimiter = createDiagRateLimiter({ burstLimit: 4, hourlyLimit: 20 });
+// Aggregate process pressure only: this limiter stores neither IPs nor account identifiers.
+const voiceDiagGlobalLimiter = createVoiceDiagnosticGlobalLimiter();
 
 const DIAG_ROLES = new Set(['broadcaster', 'viewer']);
 const DIAG_CLIENTS = new Set(['native', 'web']);
@@ -2421,6 +2454,68 @@ function sanitizeDiagEnv(raw) {
   if (Array.isArray(raw.gpus)) out.gpus = raw.gpus.slice(0, 4).map((g) => String(g).slice(0, 120));
   return Object.keys(out).length ? out : null;
 }
+
+/* ---------------- безопасная диагностика голоса ---------------- */
+
+// В отличие от legacy stream-diag эта ручка никогда не принимает строки логов. Store собирает
+// новый объект только из известных enum/number/boolean полей; неизвестные ключи не попадают в БД.
+app.post('/api/diag/voice', noStoreResponse, requireAuth, (req, res) => {
+  const rate = voiceDiagRateLimiter.consume(req.user.id);
+  if (!rate.allowed) {
+    res.setHeader('Retry-After', String(Math.max(1, Math.ceil(rate.retryAfterMs / 1000))));
+    return res.status(429).json({ error: 'Слишком много диагностических отчётов' });
+  }
+  const globalRate = voiceDiagGlobalLimiter.consume();
+  if (!globalRate.allowed) {
+    res.setHeader('Retry-After', String(Math.max(1, Math.ceil(globalRate.retryAfterMs / 1000))));
+    return res.status(429).json({ error: 'Диагностика временно перегружена' });
+  }
+  try {
+    const saved = voiceDiagnostics.save({
+      userId: req.user.id,
+      username: req.user.username,
+      raw: req.body,
+    });
+    // SQLite + the diagnostics admin API are the authoritative log. Do not mirror per-report
+    // metadata into Docker stdout: its size-based rotation cannot guarantee the three-day TTL.
+    return res.status(201).json({ ok: true, reportId: saved.id, createdAt: saved.createdAt });
+  } catch (error) {
+    if (error instanceof VoiceDiagnosticValidationError) {
+      return res.status(400).json({ error: { code: 'BAD_VOICE_DIAGNOSTIC', message: 'Некорректный формат диагностики.' } });
+    }
+    console.error('[voice-diag] save failed');
+    return res.status(500).json({ error: 'Не удалось сохранить диагностику' });
+  }
+});
+
+app.get('/api/admin/diagnostics/voice', noStoreResponse, requireDiagnosticsAdmin, (req, res) => {
+  const rawLimit = String(req.query.limit || '50');
+  const rawBeforeCreated = req.query.beforeCreated == null ? '' : String(req.query.beforeCreated);
+  const rawBeforeId = req.query.beforeId == null ? '' : String(req.query.beforeId);
+  const limit = Number(rawLimit);
+  const hasCompleteCursor = Boolean(rawBeforeCreated && rawBeforeId);
+  if (!/^\d{1,3}$/u.test(rawLimit) || !Number.isInteger(limit) || limit < 1 || limit > 100
+    || Boolean(rawBeforeCreated) !== Boolean(rawBeforeId)
+    || (hasCompleteCursor && (!/^\d{1,13}$/u.test(rawBeforeCreated) || !/^[a-f0-9]{24}$/u.test(rawBeforeId)))
+    || (req.query.incident != null && typeof req.query.incident !== 'string')
+    || (req.query.client != null && typeof req.query.client !== 'string')) {
+    return res.status(400).json({ error: 'Некорректная пагинация' });
+  }
+  const page = voiceDiagnostics.list({
+    limit,
+    beforeCreated: hasCompleteCursor ? Number(rawBeforeCreated) : undefined,
+    beforeId: hasCompleteCursor ? rawBeforeId : undefined,
+    incident: typeof req.query.incident === 'string' ? req.query.incident : undefined,
+    client: typeof req.query.client === 'string' ? req.query.client : undefined,
+  });
+  return res.json(page);
+});
+
+app.get('/api/admin/diagnostics/voice/:id', noStoreResponse, requireDiagnosticsAdmin, (req, res) => {
+  const detail = voiceDiagnostics.detail(String(req.params.id || ''));
+  if (!detail) return res.status(404).json({ error: 'Отчёт не найден' });
+  return res.json(detail);
+});
 
 app.post('/api/diag/session', requireAuth, async (req, res) => {
   const b = req.body || {};
@@ -4134,7 +4229,9 @@ if (process.env.NODE_ENV !== 'production') {
 /* JSON errors for body-parser / static failures */
 app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
-  if (err && (err.type === 'entity.too.large' || err.status === 413)) return res.status(413).json({ error: 'Файл больше 10 МБ' });
+  if (err && (err.type === 'entity.too.large' || err.status === 413)) {
+    return res.status(413).json({ error: { code: 'PAYLOAD_TOO_LARGE', message: 'Тело запроса слишком большое.' } });
+  }
   if (err && err.status === 404) return res.status(404).json({ error: 'Не найдено' });
   if (err && (err.type === 'entity.parse.failed' || (err.status === 400 && err instanceof SyntaxError))) {
     return res.status(400).json({ error: { code: 'INVALID_JSON', message: 'Некорректный JSON.' } });

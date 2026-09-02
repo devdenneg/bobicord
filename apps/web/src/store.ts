@@ -1,5 +1,9 @@
 import { create } from 'zustand';
-import { api } from './api';
+import { api, isTerminalSessionError } from './api';
+import {
+  AUTH_BOOTSTRAP_RETRY_DELAYS_MS,
+  isRecoverableAcceptedSessionBootstrapError,
+} from './authBootstrap';
 import { isWindowIdle, onWindowIdle } from './windowIdle';
 import { Engine } from './engine';
 import { ServerVolumePreferences } from './volumePreferences';
@@ -22,6 +26,7 @@ import { preloadSounds } from './sounds';
 import { isTauri, stopNativeBroadcastBounded } from './native';
 import { endAnyBroadcasterSession, flushPendingDiag } from './diag';
 import { OwnedLatestRefresh } from './serverListRefresh';
+import { clearTerminalAuthSession, getAccessToken } from './authSession';
 import type { User, ServerSummary, Member, ServerDetail, Toast, ToastKind, AccountStatus, ReleaseHistoryItem } from './types';
 
 let engine: Engine | null = null;
@@ -327,6 +332,59 @@ let releaseHistoryRequest = 0;
 let onboardedServerInMemory = false;
 type MeSnapshot = { user: User; servers: ServerSummary[] };
 const serverListRefresh = new OwnedLatestRefresh<MeSnapshot>();
+let authBootstrapRetryTimer: number | null = null;
+let authBootstrapRetryGeneration = 0;
+
+function cancelAuthBootstrapRetry() {
+  authBootstrapRetryGeneration += 1;
+  if (authBootstrapRetryTimer !== null) window.clearTimeout(authBootstrapRetryTimer);
+  authBootstrapRetryTimer = null;
+}
+
+function scheduleAuthBootstrapRetry(userId: string) {
+  cancelAuthBootstrapRetry();
+  const generation = authBootstrapRetryGeneration;
+  let attempt = 0;
+  const schedule = () => {
+    if (attempt >= AUTH_BOOTSTRAP_RETRY_DELAYS_MS.length) return;
+    const delay = AUTH_BOOTSTRAP_RETRY_DELAYS_MS[attempt++];
+    authBootstrapRetryTimer = window.setTimeout(async () => {
+      authBootstrapRetryTimer = null;
+      const state = useStore.getState();
+      if (generation !== authBootstrapRetryGeneration || state.me?.id !== userId) return;
+      try {
+        await state.loadMe();
+        if (generation === authBootstrapRetryGeneration) cancelAuthBootstrapRetry();
+      } catch (error) {
+        if (generation !== authBootstrapRetryGeneration || useStore.getState().me?.id !== userId) return;
+        if (isTerminalSessionError(error)) {
+          cancelAuthBootstrapRetry();
+          if (getAccessToken()) clearTerminalAuthSession();
+          viewEpoch++;
+          stopMemberPoll();
+          serverListRefresh.invalidate();
+          engine?.disconnect(true);
+          engine = null;
+          volumePreferences?.dispose();
+          volumePreferences = null;
+          disconnectNotifyWs();
+          if (unreadTimer !== null) window.clearInterval(unreadTimer);
+          unreadTimer = null;
+          if (releaseHistoryTimer !== null) window.clearInterval(releaseHistoryTimer);
+          releaseHistoryTimer = null;
+          useStore.setState({
+            view: 'auth', me: null, pendingUser: null, accountGate: null,
+            sessionError: error.message, servers: [], active: null, members: [],
+            loadingServer: false, loadingServerId: null, viewServerId: null, releaseUnread: 0,
+          });
+          return;
+        }
+        if (isRecoverableAcceptedSessionBootstrapError(error)) schedule();
+      }
+    }, delay);
+  };
+  schedule();
+}
 
 let toastSeq = 1;
 
@@ -362,10 +420,11 @@ export const useStore = create<AppState>((set, get) => ({
       });
       return;
     }
+    cancelAuthBootstrapRetry();
     set({ pendingUser: null, accountGate: null, sessionError: '', view: 'loading', modal: null });
     try { await get().afterAuth(user); }
     catch (error) {
-      engine?.disconnect(); engine = null;
+      engine?.disconnect(true); engine = null;
       volumePreferences?.dispose(); volumePreferences = null;
       set({
         view: 'auth', me: null, pendingUser: null, accountGate: null,
@@ -469,11 +528,20 @@ export const useStore = create<AppState>((set, get) => ({
     // can confirm push while loadMe is pending, then this handoff would overwrite true back to false.
     if (!isTauri) setSettings({ notif: false });
     set({ me: user, pendingUser: null, accountGate: null, sessionError: '', releaseUnread: 0 });
-    await get().loadMe();
+    let retryBootstrap = false;
+    try { await get().loadMe(); }
+    catch (error) {
+      if (!isRecoverableAcceptedSessionBootstrapError(error)) throw error;
+      retryBootstrap = true;
+    }
     set({ view: 'home' });
     connectNotifyWs(); // глобальный live-канал уведомлений (любой сервер, даже не подключённый)
     startIdleWatch();  // away-детект: апп давно не трогали → жёлтый статус (шлётся по notify-WS)
     preloadSounds(); // прогреть звуки (fetch+decode+нормализация громкости) — первый проигрыш без задержки
+    if (retryBootstrap) {
+      get().toast('Связь с сервером временно недоступна — аккаунт сохранён, повторяем подключение', 'warn');
+      scheduleAuthBootstrapRetry(user.id);
+    }
     const { invite: pend, openServer: pendingOpenServer } = takePendingEntryIntent();
     if (pend) {
       set({ modal: 'join', joinPrefill: pend });
@@ -630,8 +698,9 @@ export const useStore = create<AppState>((set, get) => ({
       : Promise.resolve();
     set({ broadcastLive: false });
     suspendNotificationPushRecovery(logoutUserId);
+    cancelAuthBootstrapRetry();
     invalidateAuthSessionHandoff(false);
-    viewEpoch++; stopMemberPoll(); engine?.disconnect();
+    viewEpoch++; stopMemberPoll(); engine?.disconnect(true);
     volumePreferences?.dispose(); volumePreferences = null;
     // A retained offline endpoint may still receive already queued account pushes. Persist the
     // worker's logged-out floor before cleanup/reload so those mandatory banners stay generic.

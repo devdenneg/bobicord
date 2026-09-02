@@ -34,6 +34,11 @@ assert.match(hubConnect, /RoomEvent\.DataReceived/,
   'hub must keep server-wide data events');
 
 const mediaConnect = methodText('connectVoiceMediaRoom');
+const mediaPartOf = methodText('mediaPartOf');
+assert.doesNotMatch(mediaPartOf, /activeVoiceSessions/,
+  'server-authorized media selection cannot be rejected by a stale listener-local hub claim');
+assert.match(mediaPartOf, /epoch > bestEpoch/,
+  'overlapping authorized media sessions still select the newest immutable lease epoch');
 assert.match(methodText('createVoiceMediaRoom'), /disconnectOnPageLeave: false/,
   'iOS PWA pagehide/freeze must preserve the exact channel room for foreground mic recovery');
 assert.ok(mediaConnect.indexOf('api.getVoiceMediaToken') < mediaConnect.indexOf('room.connect'),
@@ -69,8 +74,12 @@ assert.match(methodText('micPub'), /voiceMediaRoom/,
   'local microphone publication must be read only from media room');
 assert.match(methodText('startMic'), /const room = this\.voiceMediaRoom/,
   'local microphone must publish only into media room');
+assert.match(methodText('startMic'), /forceStereo: false[\s\S]*audioPreset: AudioPresets\.music/,
+  'new microphone audio stays mono and bounded to the resilient voice bitrate');
 assert.match(methodText('applyGate'), /voiceMediaActivated\.has\(media\)/,
   'uplink gate must remain closed until media activation is current');
+assert.match(methodText('applyGate'), /voiceActivationAllowsAudio/,
+  'the gate delegates automatic, manual-threshold and PTT behavior to the tested policy');
 
 const transfer = methodText('transferMicPublication');
 assert.match(transfer, /const track = this\.micLocalTrack/,
@@ -82,6 +91,8 @@ assert.match(transfer, /publishExistingMic\(newRoom/,
 assert.doesNotMatch(transfer, /getUserMedia/,
   'channel switch must not reacquire the microphone');
 const publishExisting = methodText('publishExistingMic');
+assert.match(publishExisting, /forceStereo: false[\s\S]*audioPreset: AudioPresets\.music/,
+  'republished microphone audio keeps the same resilient mono encoding policy');
 assert.match(publishExisting, /const micOp = this\.micEpoch/,
   'microphone republish must capture the exact pipeline generation');
 assert.match(publishExisting, /this\.micEpoch === micOp && this\.micLocalTrack === track/,
@@ -140,12 +151,19 @@ const resumeRemoteAudioPlayback = methodText('resumeRemoteAudioPlayback');
 const startRoomAudio = methodText('startRoomAudio');
 const beginOutputContextRecovery = methodText('beginOutputContextRecovery');
 const finishOutputContextRecovery = methodText('finishOutputContextRecovery');
+const getOutputContext = methodText('getOutputContext');
 assert.match(resumeRemoteAudioPlayback, /outputMixerNeedsRecovery\(\)[\s\S]*beginOutputContextRecovery\(explicitGesture, gestureToken\)/,
   'a closed or split exact mixer is rebound before any ordinary/gesture playback retry');
 assert.match(resumeRemoteAudioPlayback, /requestExactAudioContextResume\(this\.outputCtx, explicitGesture\)/,
   'ordinary and gesture playback recovery share exact output-context ownership');
-assert.match(resumeRemoteAudioPlayback, /this\.startRoomAudio\(room as Room, explicitGesture, gestureToken\)/,
+assert.match(resumeRemoteAudioPlayback, /this\.startRoomAudio\(room, explicitGesture, gestureToken\)/,
   'the exact room receives the same explicit-gesture recovery lane as its media elements');
+assert.match(resumeRemoteAudioPlayback, /refreshSdkFallbackRooms && room\.options\.webAudioMix === true/,
+  'a real foreground edge refreshes a LiveKit-owned fallback mixer even when cached playback flags stayed healthy');
+assert.match(methodText('ensureRemoteAudioPlayback'), /refreshSdkFallbackRooms = false[\s\S]*resumeRemoteAudioPlayback\(false, 0, refreshSdkFallbackRooms\)/,
+  'foreground fallback refresh bypasses only the initial cached-health early return');
+assert.match(methodText('ensureOutputLifecycleListeners'), /const freshForegroundEdge = this\.retryAttachedOutputRoutesAfterForeground\(\)[\s\S]*ensureRemoteAudioPlayback\(freshForegroundEdge\)/,
+  'paired lifecycle events share the bounded foreground retry boundary');
 assert.match(startRoomAudio, /this\.remoteAudioStarts\.acquire\([\s\S]*current\.startAudio\(\)[\s\S]*explicitGesture[\s\S]*gestureToken[\s\S]*return attempt\.outcome/,
   'a user gesture invokes room.startAudio synchronously without waiting behind a stuck ordinary call');
 assert.match(beginOutputContextRecovery, /rebindExactWebAudioMixContexts\(rooms, replacement\)/,
@@ -162,10 +180,21 @@ assert.match(finishOutputContextRecovery, /document\.hidden[\s\S]*remainingMs[\s
   'hidden time cannot launch/consume recovery, and visible recovery requires exact context plus room playback confirmation');
 assert.match(finishOutputContextRecovery, /failOutputContextRecovery\(recovery\.voiceEpoch, recovery\.voiceRoom, recovery\.voiceChannel\)/,
   'a bounded recovery failure exits only the exact still-current voice intent');
+assert.match(getOutputContext, /!this\.outputCtx && this\.exactOutputRooms\(\)\.some\(\(room\) => room\.options\.webAudioMix === true\)[\s\S]*return null/,
+  'a LiveKit-owned fallback mixer cannot be split from a newly-created shared output context');
 assert.match(resumeRemoteAudioPlayback, /remoteAudioPlays\.request\([\s\S]*explicitGesture[\s\S]*gestureToken/,
   'overlapping unlock consumers share the same physical gesture token for exact media elements');
 assert.match(methodText('disconnectRoom'), /this\.remoteAudioStarts\.forget\(room\)/,
   'disconnecting an exact room fences any late startAudio settlement');
+const repairSurvivingAudio = methodText('repairSurvivingRoomAudioAfterDisconnect');
+assert.match(repairSurvivingAudio, /audioRepairRetiredRooms\.add\(retiredRoom\)[\s\S]*audioRepairScheduled[\s\S]*Promise\.resolve\(\)\.then[\s\S]*engineLifecycleActive[\s\S]*exactOutputRooms\(\)[\s\S]*retiredRooms\.has\(room\) \|\| !this\.readyRooms\.has\(room\)[\s\S]*remoteAudioStarts\.forget\(room\)[\s\S]*startRoomAudio\(room\)/,
+  'one post-cleanup batch fences a stranded startAudio owner and repairs only exact ready survivors');
+assert.match(repairSurvivingAudio, /getElementById\('livekit-dummy-audio-el'\)[\s\S]*return/,
+  'a still-owned shared iOS playback element prevents a redundant autoplay attempt');
+assert.match(methodText('handleRoomDisconnected'), /repairSurvivingRoomAudioAfterDisconnect\(room\)/,
+  'terminal and intentional hub disconnects both hand hidden playback ownership to survivors');
+assert.match(methodText('handleVoiceMediaDisconnected'), /repairSurvivingRoomAudioAfterDisconnect\(room\)/,
+  'terminal and intentional media disconnects both hand hidden playback ownership to survivors');
 for (const method of [methodText('ensureRemoteAudioPlayback'), methodText('ensureVoiceAudioRunning')]) {
   assert.match(method, /new AudioUnlockGestureDeduper\(\)[\s\S]*if \(!gestures\.accept\(event\)\) return/,
     'every document-level audio unlock dedupes compatibility events from one physical activation');
@@ -243,8 +272,8 @@ assert.match(source, /voiceStatsInFlight: \{ room: Room; track: object; voiceEpo
   'WebRTC stats has one actual browser request owner across timer ticks and voice sessions');
 assert.ok(pollPing.indexOf('this.ensureRemoteVoicePlayback()') < pollPing.indexOf('this.voiceStatsInFlight) return'),
   'a stuck cosmetic stats request cannot stop the microphone and playback watchdog ticks');
-assert.match(pollPing, /const room = this\.voiceMediaRoom[\s\S]*const track = room\?\.localParticipant[\s\S]*this\.voiceStatsInFlight\) return/,
-  'stats polling captures the exact media room and track and is strictly single-flight');
+assert.match(pollPing, /const room = this\.voiceMediaRoom[\s\S]*const track = room \? this\.voiceDiagnosticStatsTrack\(room\) : null[\s\S]*this\.voiceStatsInFlight\) return/,
+  'stats polling captures the exact media room and bounded sender\/listen-only receiver selector');
 assert.match(pollPing, /owner = \{ room, track, voiceEpoch: this\.voiceEpoch, generation: this\.voiceStatsGeneration \}/,
   'a stats request captures both voice and polling generations before awaiting the browser');
 assert.match(pollPing, /await Promise\.resolve\(\)\.then\(\(\) => \(track as any\)\.getRTCStatsReport\(\)\)/,
@@ -534,8 +563,10 @@ assert.match(micFence, /if \(!retainAvailability\) this\.noMic = true[\s\S]*this
   'only an actually unavailable microphone may publish listen-only state during recovery');
 assert.match(micRecovery, /retainMicAvailabilityDuringRecovery\(this\.micHadCapture, this\.noMic\)[\s\S]*fenceMicForCaptureRecovery\(hub, retainAvailability\)/,
   'a previously working microphone keeps its durable talk intent while transport is rebuilt');
-assert.match(micRecovery, /catch \{[\s\S]*this\.noMic = true[\s\S]*setVoiceAttributes/,
+assert.match(micRecovery, /catch(?:\s*\([^)]*\))?\s*\{[\s\S]*this\.noMic = true[\s\S]*setVoiceAttributes/,
   'a confirmed recovery failure still exposes microphone unavailability to peers');
+assert.match(micRecovery, /const deferred = !recoveryCurrent\(\)[\s\S]*hasExactCurrentMicPublication\(\)[\s\S]*recordVoiceMicFailure\('mic_recovery'\)[\s\S]*micRetryAt/,
+  'an ownerless false recovery result becomes a bounded visible failure instead of a hot retry loop');
 assert.match(methodText('applyGate'), /micRecoveryOwner !== 0/,
   'the uplink gate stays closed while recovery no longer borrows the manual mute state');
 assert.match(methodText('build'), /manualMicMuted: this\.manualMute[\s\S]*micRecovering: this\.micRecoveryOwner !== 0 \|\| this\.micStartOwnership\.active/,

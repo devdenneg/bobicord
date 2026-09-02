@@ -192,6 +192,21 @@ export function routeAudioSinkTarget(
   return enqueueAudioSinkRoute(target, setSinkId, state, sinkId, generation, normalize, timeoutMs);
 }
 
+/** Coalesces identical output selections for one exact media element until an explicit retry. */
+export class ExactMediaOutputRouteGate<TTarget extends object = object> {
+  private readonly desired = new WeakMap<TTarget, string>();
+
+  claim(target: TTarget, sinkId: string, force = false): boolean {
+    if (!force && this.desired.get(target) === sinkId) return false;
+    this.desired.set(target, sinkId);
+    return true;
+  }
+
+  forget(target: TTarget): void {
+    this.desired.delete(target);
+  }
+}
+
 /** Keeps a playback confirmation tied to the exact watch attempt and track that produced it. */
 export class StreamWatchPlaybackGate {
   private generations = new Map<string, number>();
