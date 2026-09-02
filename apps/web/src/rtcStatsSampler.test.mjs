@@ -151,6 +151,9 @@ assert.match(diagSource, /const sample = await sampleInbound\(pc\)[\s\S]*session
   'late old-parent diagnostics cannot enter a replacement session');
 assert.match(diagSource, /setTimeout[\s\S]*settle-driven/,
   'diagnostic polling schedules only after the previous browser request settles');
+assert.match(diagSource,
+  /const queue = pending\.filter\([\s\S]*payload\.role === 'broadcaster'[\s\S]*localStorage\.removeItem\(PENDING_KEY\)/,
+  'an upgrade discards queued legacy viewer payloads instead of replaying their raw transport data');
 assert.match(serverViewSource, /if \(!statsOn\) \{ setStats\(''\); return; \}/,
   'the optional stats overlay performs no WebRTC polling while hidden');
 assert.match(serverViewSource, /setTimeout[\s\S]*Schedule after real settlement/,

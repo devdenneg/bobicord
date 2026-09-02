@@ -8,6 +8,7 @@ const {
   VOICE_DIAGNOSTIC_RETENTION_MS,
   createVoiceDiagnosticGlobalLimiter,
   createVoiceDiagnosticsStore,
+  isVoiceDiagnosticControlIncident,
   isVoiceDiagnosticsAdmin,
   sanitizeVoiceDiagnosticReport,
 } = require('./voiceDiagnostics');
@@ -45,10 +46,14 @@ test('diagnostic access is bootstrap-only even for another administrator', () =>
     'per-report metadata is not copied to Docker logs whose rotation is size-based rather than time-based');
   assert.match(serverSource, /SQLite \+ the diagnostics admin API are the authoritative log/,
     'the bounded SQLite store remains the authoritative server-side diagnostic log');
-  assert.match(serverSource, /const voiceDiagGlobalLimiter = createVoiceDiagnosticGlobalLimiter\(\)/,
-    'the upload route has a process-wide aggregate pressure cap');
-  assert.match(serverSource, /const globalRate = voiceDiagGlobalLimiter\.consume\(\)/,
-    'the global limiter does not receive an IP or account identifier');
+  assert.match(serverSource, /const voiceDiagIncidentGlobalLimiter = createVoiceDiagnosticGlobalLimiter\(\)/,
+    'incident uploads have a process-wide aggregate pressure cap');
+  assert.match(serverSource, /const voiceDiagControlGlobalLimiter = createVoiceDiagnosticGlobalLimiter\(\{ limit: 240 \}\)/,
+    'successful control reports have an independent aggregate pressure cap');
+  assert.match(serverSource, /control \? voiceDiagControlGlobalLimiter : voiceDiagIncidentGlobalLimiter\)\.consume\(\)/,
+    'aggregate limiters receive neither an IP nor an account identifier');
+  assert.match(serverSource, /sanitizeVoiceDiagnosticReport\(req\.body\)[\s\S]*findExisting\(req\.user\.id, report\.clientReportId\)[\s\S]*voiceDiagControlRateLimiter : voiceDiagIncidentRateLimiter/,
+    'validation and durable retry lookup happen before separate control/incident admission');
   assert.match(serverSource, /rawBeforeCreated[\s\S]*rawBeforeId[\s\S]*beforeCreated:[\s\S]*beforeId:/,
     'the admin list validates and forwards both parts of its keyset cursor');
   assert.match(serverSource, /req\.query\.incident != null && typeof req\.query\.incident !== 'string'[\s\S]*req\.query\.client != null && typeof req\.query\.client !== 'string'/,
@@ -92,6 +97,66 @@ test('sanitizer persists only fixed technical fields and canonical values', () =
     assert.equal(Object.prototype.hasOwnProperty.call(report, key), false, `top-level ${key}`);
     assert.equal(Object.prototype.hasOwnProperty.call(report.events[0], key), false, `event ${key}`);
   }
+});
+
+test('sanitizer accepts bounded stream-watch stages while discarding identities and raw transport data', () => {
+  const forbidden = 'stream-secret-that-must-not-be-stored';
+  const stages = [
+    'watch_intent', 'watch_auth', 'watch_listeners', 'watch_native_start',
+    'watch_signaling', 'watch_join', 'watch_parent', 'watch_negotiation',
+    'watch_track', 'watch_playback', 'watch_recovery',
+  ];
+  const codes = [
+    'signaling_unauthorized', 'signaling_forbidden', 'listener_failed',
+    'native_start_failed', 'signaling_closed', 'no_parent', 'negotiation_failed',
+    'ice_failed', 'track_missing', 'decode_timeout', 'playback_waiting',
+  ];
+  const kinds = ['stream_watch_started', 'stream_watch_step', 'stream_watch_retry', 'stream_watch_finished'];
+  const transports = ['livekit', 'tree_web', 'tree_native'];
+  const events = stages.map((stage, index) => ({
+    atMs: index * 10,
+    kind: kinds[index % kinds.length],
+    stage,
+    outcome: index === stages.length - 1 ? 'recovered' : 'started',
+    code: codes[index],
+    streamTransport: transports[index % transports.length],
+    streamId: forbidden,
+    streamer: forbidden,
+    url: forbidden,
+    sdp: forbidden,
+    iceCandidate: forbidden,
+    error: forbidden,
+  }));
+
+  for (const incident of ['stream_watch_succeeded', 'stream_watch_failed', 'stream_watch_recovered']) {
+    const report = sanitizeVoiceDiagnosticReport(validReport({
+      incident,
+      viewerUserId: forbidden,
+      viewerUsername: forbidden,
+      streamId: forbidden,
+      events,
+    }));
+    assert.equal(report.schemaVersion, 1);
+    assert.equal(report.incident, incident);
+    assert.deepEqual(report.events.map((event) => event.stage), stages);
+    assert.deepEqual(report.events.map((event) => event.code), codes);
+    assert.deepEqual(report.events.map((event) => event.streamTransport),
+      stages.map((_, index) => transports[index % transports.length]));
+    assert.equal(JSON.stringify(report).includes(forbidden), false,
+      'viewer identity comes from server auth and raw media/signaling values are discarded');
+  }
+
+  const unknownTransport = sanitizeVoiceDiagnosticReport(validReport({
+    incident: 'stream_watch_failed',
+    events: [{
+      atMs: 20_000, kind: 'stream_watch_finished', stage: 'watch_playback',
+      outcome: 'timed_out', code: 'decode_timeout', streamTransport: 'peer-id-from-client',
+    }],
+  }));
+  assert.deepEqual(unknownTransport.events[0], {
+    atMs: 20_000, kind: 'stream_watch_finished', stage: 'watch_playback',
+    outcome: 'timed_out', code: 'decode_timeout',
+  });
 });
 
 test('sanitizer preserves a bounded multi-day call timeline', () => {
@@ -148,6 +213,13 @@ test('global diagnostic backpressure keeps aggregate counters only', () => {
   assert.deepEqual(limiter.consume(), { allowed: false, retryAfterMs: 1 });
   clock = 1_100;
   assert.deepEqual(limiter.consume(), { allowed: true, retryAfterMs: 0 });
+});
+
+test('only successful stream watches use the lower-priority control lane', () => {
+  assert.equal(isVoiceDiagnosticControlIncident('stream_watch_succeeded'), true);
+  assert.equal(isVoiceDiagnosticControlIncident('stream_watch_failed'), false);
+  assert.equal(isVoiceDiagnosticControlIncident('stream_watch_recovered'), false);
+  assert.equal(isVoiceDiagnosticControlIncident('join_stuck'), false);
 });
 
 test('store enforces per-user/global caps, TTL, filters, detail and account purge', () => {
@@ -210,12 +282,57 @@ test('store makes a client retry idempotent per authenticated account', () => {
   });
   const report = validReport({ clientReportId: 'aaaaaaaaaaaaaaaaaaaaaaaa' });
   const first = store.save({ userId: 'owner-a', username: 'a', raw: report });
+  assert.deepEqual(store.findExisting('owner-a', report.clientReportId), first,
+    'the route can acknowledge a durable retry before consuming another rate-limit slot');
+  assert.equal(store.findExisting('owner-b', report.clientReportId), null,
+    'a durable retry lookup never crosses authenticated accounts');
   const retry = store.save({ userId: 'owner-a', username: 'a', raw: report });
   const anotherAccount = store.save({ userId: 'owner-b', username: 'b', raw: report });
 
   assert.deepEqual(retry, first, 'a lost 201 response can be retried without adding a second row');
   assert.notEqual(anotherAccount.id, first.id, 'the idempotency scope never crosses accounts');
   assert.equal(db.prepare('SELECT COUNT(*) count FROM voice_diagnostics').get().count, 2);
+  db.close();
+});
+
+test('storage caps evict successful controls before incidents', () => {
+  const db = new Database(':memory:');
+  let clock = 20_000;
+  let sequence = 0;
+  const store = createVoiceDiagnosticsStore(db, {
+    now: () => clock++,
+    randomId: () => (++sequence).toString(16).padStart(24, '0'),
+    retentionMs: 10_000,
+    maxRows: 3,
+    maxRowsPerUser: 2,
+  });
+  const save = (userId, incident) => store.save({
+    userId,
+    username: userId,
+    raw: validReport({
+      clientReportId: (++sequence).toString(16).padStart(24, '0'),
+      incident,
+    }),
+  });
+
+  const oldFailure = save('owner-a', 'stream_watch_failed');
+  const oldSuccess = save('owner-a', 'stream_watch_succeeded');
+  const newSuccess = save('owner-a', 'stream_watch_succeeded');
+  const ownerRows = store.list({ limit: 20 }).items.filter((row) => row.userId === 'owner-a');
+  assert.equal(ownerRows.some((row) => row.id === oldFailure.id), true,
+    'an older failure survives newer successful controls for the same user');
+  assert.equal(ownerRows.some((row) => row.id === oldSuccess.id), false);
+  assert.equal(ownerRows.some((row) => row.id === newSuccess.id), true);
+
+  const globalSuccess = save('owner-b', 'stream_watch_succeeded');
+  const globalFailure = save('owner-c', 'stream_watch_failed');
+  const globalRecovery = save('owner-d', 'stream_watch_recovered');
+  const globalRows = store.list({ limit: 20 }).items;
+  assert.equal(globalRows.some((row) => row.id === globalSuccess.id), false,
+    'global overflow discards a control before any incident');
+  assert.equal(globalRows.some((row) => row.id === oldFailure.id), true);
+  assert.equal(globalRows.some((row) => row.id === globalFailure.id), true);
+  assert.equal(globalRows.some((row) => row.id === globalRecovery.id), true);
   db.close();
 });
 

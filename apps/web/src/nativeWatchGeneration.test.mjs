@@ -4,6 +4,8 @@ import ts from 'typescript';
 
 const source = readFileSync(new URL('./nativeWatchGeneration.ts', import.meta.url), 'utf8');
 const treeSource = readFileSync(new URL('./transport/treeVideo.ts', import.meta.url), 'utf8');
+const nativeSource = readFileSync(new URL('./native.ts', import.meta.url), 'utf8');
+const nativeLibSource = readFileSync(new URL('../../native/src-tauri/src/lib.rs', import.meta.url), 'utf8');
 const js = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
@@ -41,5 +43,42 @@ assert.match(treeSource,
 assert.match(treeSource,
   /const ownsOffer = \(\) => !st\.closed && this\.nativeWatches\.get\(streamId\) === st && st\.pc === pc[\s\S]*pc\.ontrack = \(e\) => \{[\s\S]*if \(!ownsOffer\(\)\) return;[\s\S]*nativeWatchAnswer\(streamId, st\.generation/,
   'late media and SDP callbacks are fenced to the exact current WebView peer connection');
+
+const statusStart = nativeSource.indexOf('const NATIVE_WATCH_STATUS_STAGES');
+const statusEnd = nativeSource.indexOf('/** Structured native watch telemetry', statusStart);
+assert.ok(statusStart >= 0 && statusEnd > statusStart, 'native status normalizer is present');
+const statusJs = ts.transpileModule(nativeSource.slice(statusStart, statusEnd), {
+  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+}).outputText;
+const { normalizeNativeWatchStatusPayload } = await import(
+  'data:text/javascript,' + encodeURIComponent(statusJs)
+);
+const validStatus = normalizeNativeWatchStatusPayload({
+  streamId: 'streamer', generation: 7, stage: 'watch_signaling', outcome: 'failed',
+  code: 'signaling_forbidden', reconnectCount: 2,
+  rawError: 'must not cross', sdp: 'must not cross', candidate: 'must not cross', peerId: 'must not cross',
+});
+assert.deepEqual(validStatus, {
+  streamId: 'streamer', generation: 7, stage: 'watch_signaling', outcome: 'failed',
+  code: 'signaling_forbidden', reconnectCount: 2,
+}, 'the bridge rebuilds a status from allow-listed fields only');
+assert.equal(normalizeNativeWatchStatusPayload({
+  streamId: 'streamer', generation: 7, stage: 'watch_signaling', outcome: 'failed', code: 'server supplied raw error',
+}), null, 'a non-allow-listed code is rejected');
+assert.equal(normalizeNativeWatchStatusPayload({
+  streamId: 'streamer', generation: 7, stage: 'watch_signaling', outcome: 'failed',
+  code: 'signaling_closed', reconnectCount: -1,
+}), null, 'an invalid reconnect counter is rejected');
+assert.match(treeSource,
+  /const statusCb = \(status:[\s\S]*status\.streamId !== streamId \|\| status\.generation !== st\.generation \|\| !ownsStream\(\)[\s\S]*this\.emitWatchDiagnostic\(streamId/,
+  'native statuses are accepted only by the exact current stream generation');
+assert.match(treeSource, /retainListener\(onNativeWatchStatus\(statusCb\)\)/,
+  'the sanitized status bridge is installed before native watch startup');
+assert.match(nativeLibSource,
+  /object\.insert\("generation"\.into\(\), serde_json::Value::from\(generation\)\);[\s\S]*let _ = ui_app\.emit\(evt, payload\);/,
+  'every relay status acquires the exact local native-watch generation before its fire-and-forget Tauri emit');
+assert.match(nativeLibSource,
+  /app\.emit\("relay-watch-status", serde_json::json!\(\{[\s\S]*"generation": generation,[\s\S]*"stage": "watch_native_start",/,
+  'the pre-relay async-auth status also carries its exact native-watch generation');
 
 console.log('native watch generation: ok');

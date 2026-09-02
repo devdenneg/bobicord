@@ -5,6 +5,8 @@ import ts from 'typescript';
 const source = readFileSync(new URL('./treeAuth.ts', import.meta.url), 'utf8');
 const nativeSource = readFileSync(new URL('./native.ts', import.meta.url), 'utf8');
 const treeSource = readFileSync(new URL('./transport/treeVideo.ts', import.meta.url), 'utf8');
+const videoTransportSource = readFileSync(new URL('./transport/videoTransport.ts', import.meta.url), 'utf8');
+const livekitSource = readFileSync(new URL('./transport/livekitVideo.ts', import.meta.url), 'utf8');
 const probeSource = readFileSync(new URL('./transport/probe.ts', import.meta.url), 'utf8');
 const nativeLibSource = readFileSync(new URL('../../native/src-tauri/src/lib.rs', import.meta.url), 'utf8');
 const relaySource = readFileSync(new URL('../../relay-core/src/relay.rs', import.meta.url), 'utf8');
@@ -17,6 +19,51 @@ const treeMethod = (name) => {
   const method = treeClass.members.find((node) => node.name?.getText(treeFile) === name);
   assert.ok(method, `TreeVideoTransport.${name} must exist`);
   return method.getText(treeFile);
+};
+
+const videoTransportFile = ts.createSourceFile(
+  'videoTransport.ts', videoTransportSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS,
+);
+const watchDiagnosticInterface = videoTransportFile.statements.find((node) => ts.isInterfaceDeclaration(node)
+  && node.name.text === 'StreamWatchTransportDiagnostic');
+assert.ok(watchDiagnosticInterface && ts.isInterfaceDeclaration(watchDiagnosticInterface));
+assert.deepEqual(watchDiagnosticInterface.members.map((member) => member.name?.getText(videoTransportFile)), [
+  'streamId', 'stage', 'outcome', 'code', 'connectionState', 'iceState', 'trackState',
+  'reconnectCount', 'streamTransport',
+], 'transport diagnostics expose only the bounded structured contract');
+const stringUnion = (file, name) => {
+  const alias = file.statements.find((node) => ts.isTypeAliasDeclaration(node) && node.name.text === name);
+  assert.ok(alias && ts.isTypeAliasDeclaration(alias) && ts.isUnionTypeNode(alias.type));
+  return alias.type.types.map((node) => {
+    assert.ok(ts.isLiteralTypeNode(node) && ts.isStringLiteral(node.literal));
+    return node.literal.text;
+  });
+};
+assert.deepEqual(stringUnion(videoTransportFile, 'StreamWatchTransportDiagnosticStage'), [
+  'watch_auth', 'watch_listeners', 'watch_native_start', 'watch_signaling', 'watch_join',
+  'watch_parent', 'watch_negotiation', 'watch_track', 'watch_recovery',
+]);
+assert.deepEqual(stringUnion(videoTransportFile, 'StreamWatchTransportDiagnosticCode'), [
+  'none', 'timeout', 'network', 'offline', 'auth', 'permission', 'device_lost',
+  'media_blocked', 'disconnected', 'sdk', 'unsupported', 'aborted', 'unknown',
+  'signaling_unauthorized', 'signaling_forbidden', 'listener_failed', 'native_start_failed',
+  'signaling_closed', 'no_parent', 'negotiation_failed', 'ice_failed', 'track_missing',
+  'decode_timeout', 'playback_waiting',
+]);
+assert.deepEqual(stringUnion(videoTransportFile, 'StreamWatchTransportKind'), [
+  'tree_web', 'tree_native', 'livekit',
+]);
+
+const livekitFile = ts.createSourceFile(
+  'livekitVideo.ts', livekitSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS,
+);
+const livekitClass = livekitFile.statements.find((node) => ts.isClassDeclaration(node)
+  && node.name?.text === 'LiveKitVideoTransport');
+assert.ok(livekitClass && ts.isClassDeclaration(livekitClass));
+const livekitMethod = (name) => {
+  const method = livekitClass.members.find((node) => node.name?.getText(livekitFile) === name);
+  assert.ok(method, `LiveKitVideoTransport.${name} must exist`);
+  return method.getText(livekitFile);
 };
 
 globalThis.window = {};
@@ -184,8 +231,22 @@ assert.match(nativeWatchMethod,
   /const retainListener = async[\s\S]*if \(!ownsStream\(\)\)[\s\S]*unlisten\(\)[\s\S]*nativeUnwatch\(streamId, st, true\)/,
   'listener registration is retained only by the exact native watch attempt');
 assert.match(nativeWatchMethod,
-  /retainListener\(onNativeWatchOffer[\s\S]*retainListener\(onNativeWatchIce[\s\S]*retainListener\(onNativeWatchEnded[\s\S]*catch \{[\s\S]*nativeUnwatch\(streamId, st, live\)[\s\S]*armVideoFailsafe[\s\S]*scheduleNativeWatchRetry/,
+  /retainListener\(onNativeWatchOffer[\s\S]*retainListener\(onNativeWatchIce[\s\S]*retainListener\(onNativeWatchEnded[\s\S]*retainListener\(onNativeWatchStatus[\s\S]*catch \{[\s\S]*nativeUnwatch\(streamId, st, live\)[\s\S]*armVideoFailsafe[\s\S]*scheduleNativeWatchRetry/,
   'a missing mandatory Tauri listener fails closed and retries only through the bounded watch owner');
+assert.match(treeMethod('onParentOffer'),
+  /onconnectionstatechange[\s\S]*oniceconnectionstatechange[\s\S]*watch_track[\s\S]*track_missing/,
+  'browser watch diagnostics cover peer state, ICE state, first video and ended video');
+assert.match(treeMethod('onNativeOffer'),
+  /onconnectionstatechange[\s\S]*oniceconnectionstatechange[\s\S]*watch_track[\s\S]*nativeWatchAnswer/,
+  'native loopback diagnostics cover local peer state, first video and answer delivery');
+assert.match(treeMethod('armVideoFailsafe'), /watch_recovery[\s\S]*decode_timeout/,
+  'a seamless recovery which never delivers a replacement frame is reported before its tile closes');
+assert.match(livekitMethod('watch'), /watch_signaling[\s\S]*subscribeWatchSession/,
+  'LiveKit selection reports its room and subscription path');
+assert.match(livekitMethod('onSub'), /watch_track[\s\S]*watch_recovery/,
+  'LiveKit reports the subscribed video track and successful recovery');
+assert.match(livekitMethod('onRemoteUnpub'), /watch_track[\s\S]*beginWatchRecovery[\s\S]*subscribeWatchSession/,
+  'LiveKit reports a lost selected publication before selecting its replacement');
 
 // Exercise the actual private timer owners after stripping imports. TypeScript `private` methods
 // remain callable in the emitted JavaScript, while unrelated browser/native dependencies are only
@@ -217,9 +278,10 @@ const previousOnNativeWatchOffer = globalThis.onNativeWatchOffer;
 const previousOnNativeWatchIce = globalThis.onNativeWatchIce;
 const previousOnNativeTopology = globalThis.onNativeTopology;
 const previousOnNativeWatchEnded = globalThis.onNativeWatchEnded;
+const previousOnNativeWatchStatus = globalThis.onNativeWatchStatus;
 const previousStartNativeWatch = globalThis.startNativeWatch;
 const previousStopNativeWatch = globalThis.stopNativeWatch;
-const previousEndViewerSession = globalThis.endViewerSession;
+const previousIsTauri = globalThis.isTauri;
 let nextTimer = 0;
 const timers = new Map();
 globalThis.window.setTimeout = (callback, delay) => {
@@ -236,6 +298,35 @@ const fire = (id) => {
 };
 
 try {
+  globalThis.isTauri = false;
+  const diagnosticTransport = new TreeVideoTransport();
+  const safeDiagnostics = [];
+  const removeMutatingDiagnostic = diagnosticTransport.onWatchDiagnostic((event) => {
+    event.code = 'unknown';
+    event.unexpected = 'must-not-leak';
+    throw new Error('diagnostic consumer failure');
+  });
+  const removeSafeDiagnostic = diagnosticTransport.onWatchDiagnostic((event) => safeDiagnostics.push(event));
+  diagnosticTransport.emitWatchDiagnostic('local-stream-route', {
+    stage: 'watch_negotiation', outcome: 'failed', code: 'ice_failed',
+    connectionState: 'disconnected', iceState: 'failed', trackState: 'missing',
+    reconnectCount: 50_000,
+    rawError: 'secret', identity: 'remote-session', sdp: 'private-description', candidate: 'private-candidate',
+  });
+  assert.deepEqual(safeDiagnostics, [{
+    streamId: 'local-stream-route',
+    stage: 'watch_negotiation',
+    outcome: 'failed',
+    code: 'ice_failed',
+    connectionState: 'disconnected',
+    iceState: 'failed',
+    trackState: 'missing',
+    reconnectCount: 1000,
+    streamTransport: 'tree_web',
+  }], 'diagnostic consumers receive isolated copies with no raw transport payload');
+  removeMutatingDiagnostic();
+  removeSafeDiagnostic();
+
   const retries = new TreeVideoTransport();
   const firedRetries = [];
   retries.scheduleWatchRetry('same-stream', 1000, () => firedRetries.push('old'));
@@ -252,6 +343,21 @@ try {
     const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
     return { promise, resolve, reject };
   };
+
+  // A cancelled async auth generation must not append its late failure to a newer Engine attempt
+  // which happens to use the same local stream routing key.
+  const staleWatchAuth = deferred();
+  globalThis.freshTreeWsUrl = () => staleWatchAuth.promise;
+  const cancelledAuthWatch = new TreeVideoTransport();
+  const cancelledAuthDiagnostics = [];
+  cancelledAuthWatch.onWatchDiagnostic((event) => cancelledAuthDiagnostics.push(event));
+  cancelledAuthWatch.watch('cancelled-auth');
+  cancelledAuthWatch.unwatch('cancelled-auth');
+  staleWatchAuth.reject(new Error('late refresh rejection'));
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(cancelledAuthDiagnostics.some((event) => event.outcome === 'failed'), false,
+    'a late auth rejection from a cancelled watch generation is ignored');
 
   // A refresh from lifecycle A is intentionally left pending. detach -> attach must start B
   // immediately, and A must remain unable to construct a socket after it eventually resolves.
@@ -305,6 +411,7 @@ try {
   const peerConnections = [];
   class FakePeerConnection {
     connectionState = 'new';
+    iceConnectionState = 'new';
     remoteDescription = null;
     localDescription = null;
     addedIce = [];
@@ -460,8 +567,10 @@ try {
   globalThis.onNativeWatchEnded = async () => { endedListenerCalls += 1; return () => {}; };
   globalThis.startNativeWatch = async () => { startedNativeWatch += 1; };
   globalThis.stopNativeWatch = async (...args) => { stoppedNativeWatches.push(args); };
-  globalThis.endViewerSession = () => {};
   const rejectedListener = new TreeVideoTransport();
+  const listenerDiagnostics = [];
+  rejectedListener.onWatchDiagnostic((event) => listenerDiagnostics.push(event));
+  globalThis.isTauri = true;
   rejectedListener.intended.add('listener-reject');
   rejectedListener.liveStreams.set('listener-reject', {});
   await rejectedListener.nativeWatch('listener-reject', 'source', false);
@@ -478,6 +587,10 @@ try {
     'a still-live intended stream gets a bounded missing-video failsafe');
   assert.equal(rejectedListener.watchRetryTimers.has('listener-reject'), true,
     'a still-live intended stream gets one owned retry after listener registration fails');
+  assert.ok(listenerDiagnostics.some((event) => event.stage === 'watch_listeners'
+    && event.outcome === 'failed' && event.code === 'listener_failed'
+    && event.streamTransport === 'tree_native'),
+  'a native listener failure reaches the bounded transport diagnostic callback');
   rejectedListener.unwatch('listener-reject');
   assert.equal(timers.size, 0,
     'explicit cancellation removes both the listener-failure retry and its video failsafe');
@@ -489,6 +602,8 @@ try {
   globalThis.onNativeWatchIce = () => lateIceListener.promise;
   globalThis.stopNativeWatch = async (...args) => { lateStops.push(args); };
   const cancelledRegistration = new TreeVideoTransport();
+  const cancelledDiagnostics = [];
+  cancelledRegistration.onWatchDiagnostic((event) => cancelledDiagnostics.push(event));
   cancelledRegistration.intended.add('cancelled-registration');
   cancelledRegistration.liveStreams.set('cancelled-registration', {});
   const lateRegistration = cancelledRegistration.nativeWatch('cancelled-registration', 'source', false);
@@ -503,6 +618,43 @@ try {
     'late registration settlement cannot issue duplicate or replacement-generation stops');
   assert.equal(cancelledRegistration.watchRetryTimers.has('cancelled-registration'), false,
     'a cancelled listener attempt never schedules a reconnect');
+  assert.equal(cancelledDiagnostics.some((event) => event.outcome === 'failed'
+    && event.code === 'listener_failed'), false,
+  'a listener rejection settling after explicit cancellation does not create a false incident');
+  assert.equal(timers.size, 0);
+
+  const statusCallbacks = [];
+  globalThis.onNativeWatchOffer = async () => () => {};
+  globalThis.onNativeWatchIce = async () => () => {};
+  globalThis.onNativeTopology = async () => () => {};
+  globalThis.onNativeWatchEnded = async () => () => {};
+  globalThis.onNativeWatchStatus = async (callback) => {
+    statusCallbacks.push(callback);
+    return () => {};
+  };
+  globalThis.startNativeWatch = async () => {};
+  const statusTransport = new TreeVideoTransport();
+  const statusDiagnostics = [];
+  statusTransport.onWatchDiagnostic((event) => statusDiagnostics.push(event));
+  await statusTransport.nativeWatch('status-current', 'source', false);
+  const currentStatusOwner = statusTransport.nativeWatches.get('status-current');
+  assert.ok(currentStatusOwner);
+  assert.equal(statusCallbacks.length, 1);
+  const currentStatus = {
+    streamId: 'status-current', generation: currentStatusOwner.generation,
+    stage: 'watch_signaling', outcome: 'failed', code: 'signaling_forbidden', reconnectCount: 7,
+  };
+  statusCallbacks[0]({ ...currentStatus, streamId: 'other-stream' });
+  statusCallbacks[0]({ ...currentStatus, generation: currentStatusOwner.generation - 1 });
+  statusCallbacks[0](currentStatus);
+  assert.deepEqual(statusDiagnostics.filter((event) => event.code === 'signaling_forbidden'), [{
+    streamId: 'status-current', stage: 'watch_signaling', outcome: 'failed',
+    code: 'signaling_forbidden', reconnectCount: 7, streamTransport: 'tree_native',
+  }], 'only the exact current native watch owner accepts a normalized Rust status');
+  statusTransport.unwatch('status-current');
+  statusCallbacks[0](currentStatus);
+  assert.equal(statusDiagnostics.filter((event) => event.code === 'signaling_forbidden').length, 1,
+    'a retired native generation cannot append a late Rust status');
   assert.equal(timers.size, 0);
 } finally {
   if (previousWindowSetTimeout === undefined) delete globalThis.window.setTimeout;
@@ -534,19 +686,143 @@ try {
   restoreGlobal('onNativeWatchIce', previousOnNativeWatchIce);
   restoreGlobal('onNativeTopology', previousOnNativeTopology);
   restoreGlobal('onNativeWatchEnded', previousOnNativeWatchEnded);
+  restoreGlobal('onNativeWatchStatus', previousOnNativeWatchStatus);
   restoreGlobal('startNativeWatch', previousStartNativeWatch);
   restoreGlobal('stopNativeWatch', previousStopNativeWatch);
-  restoreGlobal('endViewerSession', previousEndViewerSession);
+  restoreGlobal('isTauri', previousIsTauri);
+}
+
+// Exercise the LiveKit selection/subscription/track sequence without importing the SDK. As with
+// the Tree harness above, TypeScript private members are ordinary JavaScript properties here.
+let executableLivekitSource = livekitSource;
+for (const statement of [...livekitFile.statements].reverse()) {
+  if (!ts.isImportDeclaration(statement)) continue;
+  executableLivekitSource = executableLivekitSource.slice(0, statement.getFullStart())
+    + executableLivekitSource.slice(statement.getEnd());
+}
+const executableLivekitJs = ts.transpileModule(executableLivekitSource, {
+  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+}).outputText;
+const previousExactPeerStatsSampler = globalThis.ExactPeerStatsSampler;
+const previousTrack = globalThis.Track;
+const previousBaseUid = globalThis.baseUid;
+try {
+  globalThis.ExactPeerStatsSampler = class {};
+  globalThis.Track = {
+    Source: { ScreenShare: 'screen', ScreenShareAudio: 'screen-audio' },
+    Kind: { Video: 'video' },
+  };
+  globalThis.baseUid = (identity) => identity.split(':')[0];
+  const { LiveKitVideoTransport } = await import(
+    `data:text/javascript;base64,${Buffer.from(executableLivekitJs).toString('base64')}`
+  );
+  const subscriptionCalls = [];
+  const videoPublication = {
+    source: 'screen', trackSid: 'video-one',
+    setSubscribed: (value) => subscriptionCalls.push(['video-one', value]),
+  };
+  const audioPublication = {
+    source: 'screen-audio', trackSid: 'audio-one',
+    setSubscribed: (value) => subscriptionCalls.push(['audio-one', value]),
+  };
+  const participant = {
+    identity: 'local-watch-key:session-one',
+    getTrackPublication: (source) => source === 'screen' ? videoPublication
+      : source === 'screen-audio' ? audioPublication : undefined,
+  };
+  const remoteParticipants = new Map([[participant.identity, participant]]);
+  const livekit = new LiveKitVideoTransport();
+  livekit.room = { remoteParticipants };
+  const livekitDiagnostics = [];
+  const livekitVideoTracks = [];
+  livekit.onWatchDiagnostic((event) => livekitDiagnostics.push(event));
+  livekit.onVideoTrack((key, track, identity) => livekitVideoTracks.push({ key, track, identity }));
+  livekit.watch('local-watch-key');
+  assert.deepEqual(livekitDiagnostics.slice(0, 4).map(({ stage, outcome, code }) => (
+    [stage, outcome, code]
+  )), [
+    ['watch_signaling', 'started', 'none'],
+    ['watch_signaling', 'ok', 'none'],
+    ['watch_join', 'started', 'none'],
+    ['watch_join', 'ok', 'none'],
+  ], 'LiveKit reports room selection and screen publication subscription');
+  assert.deepEqual(subscriptionCalls, [['video-one', true], ['audio-one', true]]);
+
+  const firstTrack = {
+    kind: 'video', mediaStreamTrack: { readyState: 'live' }, detach: () => [],
+  };
+  livekit.onSub(firstTrack, videoPublication, participant);
+  assert.ok(livekitDiagnostics.some((event) => event.stage === 'watch_track'
+    && event.outcome === 'ok' && event.trackState === 'live'));
+
+  remoteParticipants.delete(participant.identity);
+  livekit.onRemoteUnpub(videoPublication, participant);
+  assert.ok(livekitDiagnostics.some((event) => event.stage === 'watch_recovery'
+    && event.outcome === 'started' && event.reconnectCount === 1));
+
+  const replacementPublication = {
+    source: 'screen', trackSid: 'video-two',
+    setSubscribed: (value) => subscriptionCalls.push(['video-two', value]),
+  };
+  const replacement = {
+    identity: 'local-watch-key:session-two',
+    getTrackPublication: (source) => source === 'screen' ? replacementPublication : undefined,
+  };
+  remoteParticipants.set(replacement.identity, replacement);
+  livekit.onRemotePub(replacementPublication, replacement);
+  livekit.onSub({
+    kind: 'video', mediaStreamTrack: { readyState: 'live' }, detach: () => [],
+  }, replacementPublication, replacement);
+  assert.ok(livekitDiagnostics.some((event) => event.stage === 'watch_recovery'
+    && event.outcome === 'recovered' && event.reconnectCount === 1),
+  'a replacement LiveKit session closes the structured recovery sequence');
+  const acceptedTrackCount = livekitVideoTracks.length;
+  livekit.onSub({
+    kind: 'video', mediaStreamTrack: { readyState: 'live' }, detach: () => [],
+  }, videoPublication, participant);
+  assert.equal(livekitVideoTracks.length, acceptedTrackCount,
+    'a late subscribed track from the retired LiveKit session never reaches Engine');
+  assert.equal(subscriptionCalls.at(-1)?.[1], false,
+    'a late subscribed track from the retired LiveKit session is unsubscribed again');
+
+  const discoveryPublication = { source: 'screen', trackSid: 'discovery-video' };
+  const discoveryParticipant = {
+    identity: 'unwatched-user:session-one',
+    getTrackPublication: () => discoveryPublication,
+  };
+  livekit.onSub({
+    kind: 'video', mediaStreamTrack: { readyState: 'live' }, detach: () => [],
+  }, discoveryPublication, discoveryParticipant);
+  assert.equal(livekitVideoTracks.at(-1)?.identity, 'unwatched-user',
+    'an unwatched LiveKit publication keeps the existing discovery behavior');
+  const allowedDiagnosticKeys = new Set([
+    'streamId', 'stage', 'outcome', 'code', 'connectionState', 'iceState', 'trackState',
+    'reconnectCount', 'streamTransport',
+  ]);
+  for (const event of livekitDiagnostics) {
+    assert.ok(Object.keys(event).every((key) => allowedDiagnosticKeys.has(key)));
+    assert.equal(event.streamId, 'local-watch-key');
+    assert.equal(event.streamTransport, 'livekit');
+  }
+} finally {
+  if (previousExactPeerStatsSampler === undefined) delete globalThis.ExactPeerStatsSampler;
+  else globalThis.ExactPeerStatsSampler = previousExactPeerStatsSampler;
+  if (previousTrack === undefined) delete globalThis.Track;
+  else globalThis.Track = previousTrack;
+  if (previousBaseUid === undefined) delete globalThis.baseUid;
+  else globalThis.baseUid = previousBaseUid;
 }
 
 assert.match(treeSource, /\[\.\.\.this\.browserWatchStarts\.keys\(\)\][\s\S]*this\.unwatch\(streamId\)/,
-  'detach finishes diagnostic sessions which are still waiting behind the auth gate');
+  'detach cancels viewer attempts which are still waiting behind the auth gate');
+assert.doesNotMatch(treeSource, /(?:start|end)ViewerSession|from ['"]\.\.\/diag['"]/,
+  'a viewer uses only fixed-schema watch diagnostics and never starts the legacy raw session collector');
 assert.match(treeSource,
   /catch \(error\) \{[\s\S]*const ownsStream = this\.nativeWatches\.get\(streamId\) === st;[\s\S]*if \(!ownsStream\) \{[\s\S]*this\.nativeUnwatch\(streamId, st, true\);[\s\S]*return;/,
   'an out-of-order failure from native owner A cleans only A and cannot retry over owner B');
 assert.match(treeSource,
-  /private nativeUnwatch[\s\S]*const ownsStream = this\.nativeWatches\.get\(streamId\) === st;[\s\S]*stopNativeWatch\(streamId, st\.generation\)[\s\S]*if \(!ownsStream\) return;[\s\S]*endViewerSession\(streamId\)/,
-  'a stale native owner cannot delete diagnostics, topology, or video owned by its replacement');
+  /private nativeUnwatch[\s\S]*const ownsStream = this\.nativeWatches\.get\(streamId\) === st;[\s\S]*stopNativeWatch\(streamId, st\.generation\)[\s\S]*if \(!ownsStream\) return;[\s\S]*this\.nativeWatches\.delete\(streamId\)/,
+  'a stale native owner cannot delete topology or video owned by its replacement');
 assert.match(treeSource,
   /private async onNativeOffer[\s\S]*const ownsOffer = \(\) =>[\s\S]*st\.pc === pc[\s\S]*await pc\.setRemoteDescription[\s\S]*if \(!ownsOffer\(\)\) return;[\s\S]*st\.pendingIce\.splice\(0\)[\s\S]*nativeWatchAnswer\(streamId, st\.generation/,
   'late native offers stop before consuming replacement ICE or publishing a stale answer');

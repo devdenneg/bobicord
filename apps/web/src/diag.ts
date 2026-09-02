@@ -324,8 +324,17 @@ function savePending(payload: any) {
 /** Дослать всё, что не ушло в прошлый раз (сеть моргнула, апп закрыли). Зовётся после
  *  авторизации: без токена сервер вернёт 401 и очередь очистилась бы впустую. */
 export async function flushPendingDiag() {
-  const queue = readPending();
-  if (!queue.length) return;
+  const pending = readPending();
+  if (!pending.length) return;
+  // Viewer attempts moved to the bounded fixed-schema voice diagnostics. Never replay viewer
+  // payloads left by an older bundle: those legacy bodies may contain a stream id and raw native
+  // transport lines. Broadcaster sessions retain the detailed encoder diagnostics they need.
+  const queue = pending.filter((payload) => payload && typeof payload === 'object'
+    && payload.role === 'broadcaster');
+  if (!queue.length) {
+    try { localStorage.removeItem(PENDING_KEY); } catch { /**/ }
+    return;
+  }
   const left: any[] = [];
   for (const payload of queue) {
     try { await api.diagSession(payload); }

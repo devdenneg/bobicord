@@ -366,6 +366,142 @@ impl RtpContinuity {
 /// показ не поднимается.
 pub type UiSink = Arc<dyn Fn(&str, Value) + Send + Sync>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchStatusStage {
+    NativeStart,
+    Signaling,
+    Parent,
+    Negotiation,
+    Track,
+    Recovery,
+}
+
+impl WatchStatusStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeStart => "watch_native_start",
+            Self::Signaling => "watch_signaling",
+            Self::Parent => "watch_parent",
+            Self::Negotiation => "watch_negotiation",
+            Self::Track => "watch_track",
+            Self::Recovery => "watch_recovery",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchStatusOutcome {
+    Started,
+    Ok,
+    Failed,
+    Stalled,
+    Recovered,
+}
+
+impl WatchStatusOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Ok => "ok",
+            Self::Failed => "failed",
+            Self::Stalled => "stalled",
+            Self::Recovered => "recovered",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchStatusCode {
+    None,
+    NativeStartFailed,
+    SignalingUnauthorized,
+    SignalingForbidden,
+    SignalingClosed,
+    NoParent,
+    NegotiationFailed,
+    IceFailed,
+    TrackMissing,
+}
+
+impl WatchStatusCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::NativeStartFailed => "native_start_failed",
+            Self::SignalingUnauthorized => "signaling_unauthorized",
+            Self::SignalingForbidden => "signaling_forbidden",
+            Self::SignalingClosed => "signaling_closed",
+            Self::NoParent => "no_parent",
+            Self::NegotiationFailed => "negotiation_failed",
+            Self::IceFailed => "ice_failed",
+            Self::TrackMissing => "track_missing",
+        }
+    }
+}
+
+fn watch_status_payload(
+    stream_id: &str,
+    stage: WatchStatusStage,
+    outcome: WatchStatusOutcome,
+    code: WatchStatusCode,
+    reconnect_count: Option<u32>,
+) -> Value {
+    let mut payload = json!({
+        "streamId": stream_id,
+        "stage": stage.as_str(),
+        "outcome": outcome.as_str(),
+        "code": code.as_str(),
+    });
+    if let (Some(count), Some(object)) = (reconnect_count, payload.as_object_mut()) {
+        object.insert("reconnectCount".into(), Value::from(count));
+    }
+    payload
+}
+
+fn emit_watch_status(
+    ui: Option<&UiSink>,
+    stream_id: &str,
+    stage: WatchStatusStage,
+    outcome: WatchStatusOutcome,
+    code: WatchStatusCode,
+    reconnect_count: Option<u32>,
+) {
+    if let Some(ui) = ui {
+        ui(
+            "relay-watch-status",
+            watch_status_payload(stream_id, stage, outcome, code, reconnect_count),
+        );
+    }
+}
+
+fn emit_signaling_watch_status(
+    ui: &UiSink,
+    stream_id: &str,
+    status: signaling::SignalingStatus,
+) {
+    let stage = if status.outcome == signaling::SignalingStatusOutcome::Recovered {
+        WatchStatusStage::Recovery
+    } else {
+        WatchStatusStage::Signaling
+    };
+    let outcome = match status.outcome {
+        signaling::SignalingStatusOutcome::Started => WatchStatusOutcome::Started,
+        signaling::SignalingStatusOutcome::Ok => WatchStatusOutcome::Ok,
+        signaling::SignalingStatusOutcome::Failed => WatchStatusOutcome::Failed,
+        signaling::SignalingStatusOutcome::Stalled => WatchStatusOutcome::Stalled,
+        signaling::SignalingStatusOutcome::Recovered => WatchStatusOutcome::Recovered,
+    };
+    let code = match status.code {
+        signaling::SignalingStatusCode::None => WatchStatusCode::None,
+        signaling::SignalingStatusCode::Unauthorized => WatchStatusCode::SignalingUnauthorized,
+        signaling::SignalingStatusCode::Forbidden => WatchStatusCode::SignalingForbidden,
+        signaling::SignalingStatusCode::Closed => WatchStatusCode::SignalingClosed,
+    };
+    let _ = emit_watch_status(
+        Some(ui), stream_id, stage, outcome, code, Some(status.reconnect_count),
+    );
+}
+
 /// Конфиг запуска relay-viewer.
 pub struct RelayConfig {
     pub stream_id: String,
@@ -468,6 +604,12 @@ struct RelayManager {
     upstream_state: Arc<AtomicU8>,
     /// Момент последней смены upstream_state (мс) — чтобы отмерить длительность Disconnected.
     upstream_since_ms: Arc<AtomicU64>,
+    /// Эпоха текущего upstream для мягкой диагностики первого video RTP. Младший бит означает,
+    /// что пакет уже пришёл; смена parent/PC публикует новую чётную эпоху. Поэтому поздний пакет
+    /// старого upstream не может ошибочно закрыть watchdog нового.
+    upstream_media_state: Arc<AtomicU64>,
+    /// Начало текущей upstream-media эпохи для bounded track-missing watchdog.
+    upstream_media_since_ms: Arc<AtomicU64>,
     /// Д2: активные транскод-рендишны (rendition -> Transcode). Только vrelay-ingest сессия.
     renditions: HashMap<String, Transcode>,
     /// Д2: входы транскодов (rendition -> Feed) — читает on_track-цикл, дублируя видео-RTP
@@ -484,6 +626,29 @@ struct RelayManager {
 const UP_CONNECTED: u8 = 1;
 const UP_DISCONNECTED: u8 = 2;
 const UP_FAILED: u8 = 3;
+const UPSTREAM_MEDIA_SEEN_BIT: u64 = 1;
+
+fn begin_upstream_media_epoch(state: &AtomicU64) -> u64 {
+    let previous_epoch = state.load(Ordering::Relaxed) & !UPSTREAM_MEDIA_SEEN_BIT;
+    let mut next_epoch = previous_epoch.wrapping_add(2) & !UPSTREAM_MEDIA_SEEN_BIT;
+    if next_epoch == 0 { next_epoch = 2; }
+    state.store(next_epoch, Ordering::Release);
+    next_epoch
+}
+
+fn mark_first_upstream_video_packet(state: &AtomicU64, epoch: u64) -> bool {
+    epoch != 0 && state.compare_exchange(
+        epoch,
+        epoch | UPSTREAM_MEDIA_SEEN_BIT,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ).is_ok()
+}
+
+fn upstream_media_snapshot(state: &AtomicU64) -> (u64, bool) {
+    let snapshot = state.load(Ordering::Acquire);
+    (snapshot & !UPSTREAM_MEDIA_SEEN_BIT, snapshot & UPSTREAM_MEDIA_SEEN_BIT != 0)
+}
 
 impl RelayManager {
     /// `injected` (Д2 рендишн-корень): готовые треки (транскод-видео + passthrough-audio)
@@ -595,6 +760,8 @@ impl RelayManager {
             last_kf_ms,
             upstream_state: Arc::new(AtomicU8::new(0)),
             upstream_since_ms: Arc::new(AtomicU64::new(0)),
+            upstream_media_state: Arc::new(AtomicU64::new(0)),
+            upstream_media_since_ms: Arc::new(AtomicU64::new(0)),
             renditions: HashMap::new(),
             video_feeds: Arc::new(Mutex::new(HashMap::new())),
             feed_count: Arc::new(AtomicUsize::new(0)),
@@ -645,15 +812,41 @@ impl RelayManager {
         RTCConfiguration { ice_servers: self.ice_servers.clone(), ..Default::default() }
     }
 
+    fn reset_upstream_media_watchdog(&self) -> u64 {
+        let epoch = begin_upstream_media_epoch(&self.upstream_media_state);
+        self.upstream_media_since_ms.store(now_ms(), Ordering::Release);
+        epoch
+    }
+
     // ---- upstream (к родителю; мы answerer) ----
     async fn on_parent_offer(&mut self, from: String, sdp: String) {
         if self.parent_id.as_deref() != Some(from.as_str()) { return; }
-        let Some(upstream_epoch) = self.pending_upstream_ice.current_key(&from) else { return; };
+        let _ = emit_watch_status(
+            self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+            WatchStatusOutcome::Started, WatchStatusCode::None, None,
+        );
+        let Some(upstream_epoch) = self.pending_upstream_ice.current_key(&from) else {
+            let _ = emit_watch_status(
+                self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+                WatchStatusOutcome::Failed, WatchStatusCode::NegotiationFailed, None,
+            );
+            return;
+        };
+        // Каждый новый upstream-PC получает собственную media-эпоху. Старый on_track таск может
+        // завершаться с опозданием, но его первый пакет уже не засчитается новому транспорту.
+        let upstream_media_epoch = self.reset_upstream_media_watchdog();
         // старый upstream (если был reparent) закрываем
         if let Some(old) = self.upstream.take() { let _ = old.close().await; }
         let pc = match self.api.new_peer_connection(self.config()).await {
             Ok(pc) => Arc::new(pc),
-            Err(e) => { log::error!("relay: upstream new_peer_connection: {e}"); return; }
+            Err(e) => {
+                log::error!("relay: upstream new_peer_connection: {e}");
+                let _ = emit_watch_status(
+                    self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+                    WatchStatusOutcome::Failed, WatchStatusCode::NegotiationFailed, None,
+                );
+                return;
+            }
         };
 
         // Source-пакеты раскладывает SFU fanout: у каждого downstream отдельные track,
@@ -673,6 +866,9 @@ impl RelayManager {
         let kf_last = self.last_kf_ms.clone();
         let video_cont = self.video_cont.clone();
         let audio_cont = self.audio_cont.clone();
+        let track_ui = self.ui.clone();
+        let track_sid = self.stream_id.clone();
+        let upstream_media_state = self.upstream_media_state.clone();
         pc.on_track(Box::new(move |track: Arc<TrackRemote>, _r: Arc<RTCRtpReceiver>, _t: Arc<RTCRtpTransceiver>| {
             let video_local = video_local.clone();
             let audio_local = audio_local.clone();
@@ -685,8 +881,19 @@ impl RelayManager {
             let kf_last = kf_last.clone();
             let video_cont = video_cont.clone();
             let audio_cont = audio_cont.clone();
+            let track_ui = track_ui.clone();
+            let track_sid = track_sid.clone();
+            let upstream_media_state = upstream_media_state.clone();
             Box::pin(async move {
                 let is_video = track.kind() == RTPCodecType::Video;
+                if is_video
+                    && upstream_media_snapshot(&upstream_media_state).0 == upstream_media_epoch
+                {
+                    let _ = emit_watch_status(
+                        track_ui.as_ref(), &track_sid, WatchStatusStage::Track,
+                        WatchStatusOutcome::Started, WatchStatusCode::None, None,
+                    );
+                }
                 tokio::spawn(async move {
                     let kind = if is_video { "video" } else { "audio" };
                     let fanout_drops = Arc::new(AtomicU64::new(0));
@@ -705,6 +912,7 @@ impl RelayManager {
                     let cont = if is_video { video_cont } else { audio_cont };
                     let (ticks_per_ms, min_gap_ticks) = if is_video { (90u32, 3000u32) } else { (48u32, 960u32) };
                     let mut epoch: Option<EpochOffsets> = None;
+                    let mut first_video_packet = is_video;
 
                     // Shared writer нужен только старому injected-пути и passthrough-аудио
                     // активного рендишна. Обычный source сюда НЕ попадает: его раздаёт fanout
@@ -735,6 +943,16 @@ impl RelayManager {
                     loop {
                         match track.read_rtp().await {
                             Ok((mut packet, _)) => {
+                                let should_mark_first_video_packet = first_video_packet;
+                                first_video_packet = false;
+                                if should_mark_first_video_packet
+                                    && mark_first_upstream_video_packet(&upstream_media_state, upstream_media_epoch)
+                                {
+                                    let _ = emit_watch_status(
+                                        track_ui.as_ref(), &track_sid, WatchStatusStage::Track,
+                                        WatchStatusOutcome::Ok, WatchStatusCode::None, None,
+                                    );
+                                }
                                 // Монитор видит СЫРЫЕ входные seq (диагностика линка от родителя),
                                 // rewrite — после него.
                                 mon.on_packet(packet.header.sequence_number, packet.payload.len());
@@ -816,6 +1034,8 @@ impl RelayManager {
         self.upstream_since_ms.store(now_ms(), Ordering::Relaxed);
         let up_state = self.upstream_state.clone();
         let up_since = self.upstream_since_ms.clone();
+        let state_ui = self.ui.clone();
+        let state_sid = self.stream_id.clone();
         pc.on_peer_connection_state_change(Box::new(move |s| {
             let code = match s {
                 RTCPeerConnectionState::Connected => UP_CONNECTED,
@@ -824,13 +1044,66 @@ impl RelayManager {
                 RTCPeerConnectionState::Closed => 4,
                 _ => 0,
             };
-            up_state.store(code, Ordering::Relaxed);
+            let previous = up_state.swap(code, Ordering::Relaxed);
             up_since.store(now_ms(), Ordering::Relaxed);
+            match s {
+                RTCPeerConnectionState::Connecting => {
+                    let _ = emit_watch_status(
+                        state_ui.as_ref(), &state_sid, WatchStatusStage::Negotiation,
+                        WatchStatusOutcome::Started, WatchStatusCode::None, None,
+                    );
+                }
+                RTCPeerConnectionState::Connected => {
+                    let _ = emit_watch_status(
+                        state_ui.as_ref(), &state_sid,
+                        if matches!(previous, UP_DISCONNECTED | UP_FAILED) {
+                            WatchStatusStage::Recovery
+                        } else {
+                            WatchStatusStage::Negotiation
+                        },
+                        if matches!(previous, UP_DISCONNECTED | UP_FAILED) {
+                            WatchStatusOutcome::Recovered
+                        } else {
+                            WatchStatusOutcome::Ok
+                        },
+                        WatchStatusCode::None, None,
+                    );
+                }
+                RTCPeerConnectionState::Disconnected => {
+                    let _ = emit_watch_status(
+                        state_ui.as_ref(), &state_sid, WatchStatusStage::Recovery,
+                        WatchStatusOutcome::Stalled, WatchStatusCode::IceFailed, None,
+                    );
+                }
+                RTCPeerConnectionState::Failed => {
+                    let _ = emit_watch_status(
+                        state_ui.as_ref(), &state_sid, WatchStatusStage::Negotiation,
+                        WatchStatusOutcome::Failed, WatchStatusCode::IceFailed, None,
+                    );
+                }
+                _ => {}
+            }
             Box::pin(async {})
         }));
 
-        if let Err(e) = pc.set_remote_description(match RTCSessionDescription::offer(sdp) { Ok(d) => d, Err(e) => { log::error!("relay: bad parent offer: {e}"); return; } }).await {
-            log::error!("relay: upstream set_remote: {e}"); return;
+        let offer = match RTCSessionDescription::offer(sdp) {
+            Ok(description) => description,
+            Err(e) => {
+                log::error!("relay: bad parent offer: {e}");
+                let _ = emit_watch_status(
+                    self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+                    WatchStatusOutcome::Failed, WatchStatusCode::NegotiationFailed, None,
+                );
+                return;
+            }
+        };
+        if let Err(e) = pc.set_remote_description(offer).await {
+            log::error!("relay: upstream set_remote: {e}");
+            let _ = emit_watch_status(
+                self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+                WatchStatusOutcome::Failed, WatchStatusCode::NegotiationFailed, None,
+            );
+            return;
         }
         // Кандидаты могли прийти перед offer и были привязаны к точной эпохе этого
         // assign-parent. Применяем только после remoteDescription: webrtc-rs до неё их
@@ -838,16 +1111,44 @@ impl RelayManager {
         for candidate in self.pending_upstream_ice.take(&from, upstream_epoch) {
             if let Err(e) = pc.add_ice_candidate(candidate).await {
                 log::warn!("relay: pending upstream ICE rejected for {from}: {e}");
+                let _ = emit_watch_status(
+                    self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+                    WatchStatusOutcome::Stalled, WatchStatusCode::IceFailed, None,
+                );
             }
         }
         match pc.create_answer(None).await {
             Ok(answer) => {
-                if let Err(e) = pc.set_local_description(answer.clone()).await { log::error!("relay: upstream set_local: {e}"); return; }
-                let _ = self.cmd_tx.send(TreeCmd::Answer { to: from, sdp: answer.sdp });
+                if let Err(e) = pc.set_local_description(answer.clone()).await {
+                    log::error!("relay: upstream set_local: {e}");
+                    let _ = emit_watch_status(
+                        self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+                        WatchStatusOutcome::Failed, WatchStatusCode::NegotiationFailed, None,
+                    );
+                    return;
+                }
+                if self.cmd_tx.send(TreeCmd::Answer { to: from, sdp: answer.sdp }).is_err() {
+                    let _ = emit_watch_status(
+                        self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+                        WatchStatusOutcome::Failed, WatchStatusCode::SignalingClosed, None,
+                    );
+                    return;
+                }
             }
-            Err(e) => { log::error!("relay: create_answer: {e}"); return; }
+            Err(e) => {
+                log::error!("relay: create_answer: {e}");
+                let _ = emit_watch_status(
+                    self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+                    WatchStatusOutcome::Failed, WatchStatusCode::NegotiationFailed, None,
+                );
+                return;
+            }
         }
         self.upstream = Some(pc);
+        let _ = emit_watch_status(
+            self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+            WatchStatusOutcome::Ok, WatchStatusCode::None, None,
+        );
     }
 
     // ---- downstream (offerer): общий код для ребёнка и webview ----
@@ -1040,6 +1341,7 @@ impl RelayManager {
     async fn on_assign_parent(&mut self, parent_id: Option<String>) {
         self.pending_upstream_ice.begin_epoch(parent_id.as_deref());
         self.parent_id = parent_id;
+        self.reset_upstream_media_watchdog();
         // upstream пересоздастся, когда новый родитель пришлёт offer (on_parent_offer)
         if let Some(old) = self.upstream.take() { let _ = old.close().await; }
     }
@@ -1074,17 +1376,56 @@ impl RelayManager {
     // ---- webview (локальный показ через UiSink; мы offerer). Headless (ui=None) — не поднимаем. ----
     async fn start_webview(&mut self) {
         if self.ui.is_none() || self.webview.is_some() { return; }
+        let _ = emit_watch_status(
+            self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+            WatchStatusOutcome::Started, WatchStatusCode::None, None,
+        );
         const WEBVIEW_ID: &str = "__webview";
         let (pc, isolated) = match self.make_downstream(WEBVIEW_ID).await {
             Some(downstream) => downstream,
-            None => return,
+            None => {
+                let _ = emit_watch_status(
+                    self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+                    WatchStatusOutcome::Failed, WatchStatusCode::NegotiationFailed, None,
+                );
+                return;
+            }
         };
         // Локальный показ тоже должен получить IDR когда встанет транспорт (иначе чёрный
         // экран у самого вещателя-ретранслятора до следующего случайного keyframe).
         let kf_tx = self.cmd_tx.clone();
+        let state_ui = self.ui.clone();
+        let state_sid = self.stream_id.clone();
         pc.on_peer_connection_state_change(Box::new(move |s| {
             if s == RTCPeerConnectionState::Connected {
                 let _ = kf_tx.send(TreeCmd::RequestKeyframe);
+            }
+            match s {
+                RTCPeerConnectionState::Connecting => {
+                    let _ = emit_watch_status(
+                        state_ui.as_ref(), &state_sid, WatchStatusStage::Negotiation,
+                        WatchStatusOutcome::Started, WatchStatusCode::None, None,
+                    );
+                }
+                RTCPeerConnectionState::Connected => {
+                    let _ = emit_watch_status(
+                        state_ui.as_ref(), &state_sid, WatchStatusStage::Negotiation,
+                        WatchStatusOutcome::Ok, WatchStatusCode::None, None,
+                    );
+                }
+                RTCPeerConnectionState::Disconnected => {
+                    let _ = emit_watch_status(
+                        state_ui.as_ref(), &state_sid, WatchStatusStage::Recovery,
+                        WatchStatusOutcome::Stalled, WatchStatusCode::IceFailed, None,
+                    );
+                }
+                RTCPeerConnectionState::Failed => {
+                    let _ = emit_watch_status(
+                        state_ui.as_ref(), &state_sid, WatchStatusStage::Negotiation,
+                        WatchStatusOutcome::Failed, WatchStatusCode::IceFailed, None,
+                    );
+                }
+                _ => {}
             }
             Box::pin(async {})
         }));
@@ -1107,6 +1448,10 @@ impl RelayManager {
             Ok(offer) => {
                 if let Err(e) = pc.set_local_description(offer.clone()).await {
                     log::error!("relay: webview set_local: {e}");
+                    let _ = emit_watch_status(
+                        self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+                        WatchStatusOutcome::Failed, WatchStatusCode::NegotiationFailed, None,
+                    );
                     if let (Some(hub), Some(tracks)) = (&self.fanout, &isolated) {
                         hub.discard(tracks);
                     }
@@ -1120,6 +1465,10 @@ impl RelayManager {
             }
             Err(e) => {
                 log::error!("relay: webview create_offer: {e}");
+                let _ = emit_watch_status(
+                    self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+                    WatchStatusOutcome::Failed, WatchStatusCode::NegotiationFailed, None,
+                );
                 if let (Some(hub), Some(tracks)) = (&self.fanout, &isolated) {
                     hub.discard(tracks);
                 }
@@ -1140,12 +1489,38 @@ impl RelayManager {
 
     async fn on_webview_answer(&mut self, sdp: String) {
         const WEBVIEW_ID: &str = "__webview";
-        let Some(pc) = self.webview.clone() else { return; };
+        let _ = emit_watch_status(
+            self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+            WatchStatusOutcome::Started, WatchStatusCode::None, None,
+        );
+        let Some(pc) = self.webview.clone() else {
+            let _ = emit_watch_status(
+                self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+                WatchStatusOutcome::Failed, WatchStatusCode::NegotiationFailed, None,
+            );
+            return;
+        };
         let Some(webview_epoch) = self.pending_webview_ice.as_ref()
-            .and_then(|pending| pending.current_key(WEBVIEW_ID)) else { return; };
-        let Ok(desc) = RTCSessionDescription::answer(sdp) else { return; };
+            .and_then(|pending| pending.current_key(WEBVIEW_ID)) else {
+                let _ = emit_watch_status(
+                    self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+                    WatchStatusOutcome::Failed, WatchStatusCode::NegotiationFailed, None,
+                );
+                return;
+            };
+        let Ok(desc) = RTCSessionDescription::answer(sdp) else {
+            let _ = emit_watch_status(
+                self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+                WatchStatusOutcome::Failed, WatchStatusCode::NegotiationFailed, None,
+            );
+            return;
+        };
         if let Err(e) = pc.set_remote_description(desc).await {
             log::error!("relay: webview set_remote: {e}");
+            let _ = emit_watch_status(
+                self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+                WatchStatusOutcome::Failed, WatchStatusCode::NegotiationFailed, None,
+            );
             return;
         }
         let pending = self.pending_webview_ice.as_mut()
@@ -1154,14 +1529,28 @@ impl RelayManager {
         for candidate in pending {
             if let Err(e) = pc.add_ice_candidate(candidate).await {
                 log::warn!("relay: pending webview ICE rejected: {e}");
+                let _ = emit_watch_status(
+                    self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+                    WatchStatusOutcome::Stalled, WatchStatusCode::IceFailed, None,
+                );
             }
         }
+        let _ = emit_watch_status(
+            self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+            WatchStatusOutcome::Ok, WatchStatusCode::None, None,
+        );
     }
 
     async fn on_webview_ice(&mut self, candidate: Value) {
         const WEBVIEW_ID: &str = "__webview";
         let Some(pc) = self.webview.clone() else { return; };
-        let Ok(init) = serde_json::from_value::<RTCIceCandidateInit>(candidate) else { return; };
+        let Ok(init) = serde_json::from_value::<RTCIceCandidateInit>(candidate) else {
+            let _ = emit_watch_status(
+                self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+                WatchStatusOutcome::Failed, WatchStatusCode::IceFailed, None,
+            );
+            return;
+        };
         let Some(webview_epoch) = self.pending_webview_ice.as_ref()
             .and_then(|pending| pending.current_key(WEBVIEW_ID)) else { return; };
         let remote_ready = self.pending_webview_ice.as_ref()
@@ -1169,6 +1558,10 @@ impl RelayManager {
         if remote_ready {
             if let Err(e) = pc.add_ice_candidate(init).await {
                 log::warn!("relay: webview ICE rejected: {e}");
+                let _ = emit_watch_status(
+                    self.ui.as_ref(), &self.stream_id, WatchStatusStage::Negotiation,
+                    WatchStatusOutcome::Stalled, WatchStatusCode::IceFailed, None,
+                );
             }
         } else if let Some(pending) = self.pending_webview_ice.as_mut() {
             if pending.queue(WEBVIEW_ID, webview_epoch, init) == QueuePendingIce::QueuedAfterEviction {
@@ -1203,13 +1596,37 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
     let finished = Arc::new(Notify::new());
     let fin = finished.clone();
 
+    let _ = emit_watch_status(
+        ui.as_ref(), &stream_id, WatchStatusStage::NativeStart,
+        WatchStatusOutcome::Started, WatchStatusCode::None, None,
+    );
     let join = JoinParams { stream_id: stream_id.clone(), identity, server_id, role: "viewer", native: true, max_children, max_bitrate: 0, abr: false, virtual_relay, quality, server_ingest: false, app_name: None, app_icon: None, width: 0, height: 0, pinned };
-    let (cmd_tx, mut evt_rx) = signaling::connect(ws_url, join, reconnect);
+    let signaling_status = ui.clone().map(|status_ui| {
+        let status_stream_id = stream_id.clone();
+        Arc::new(move |status| {
+            emit_signaling_watch_status(&status_ui, &status_stream_id, status);
+        }) as signaling::SignalingStatusSink
+    });
+    let (cmd_tx, mut evt_rx) = signaling::connect_with_status(ws_url, join, reconnect, signaling_status);
 
     tokio::spawn(async move {
-        let mut mgr = match RelayManager::new(stream_id, cmd_tx, ui, None) {
-            Ok(m) => m,
-            Err(e) => { log::error!("relay: init: {e}"); fin.notify_one(); return; }
+        let mut mgr = match RelayManager::new(stream_id.clone(), cmd_tx, ui.clone(), None) {
+            Ok(m) => {
+                let _ = emit_watch_status(
+                    ui.as_ref(), &stream_id, WatchStatusStage::NativeStart,
+                    WatchStatusOutcome::Ok, WatchStatusCode::None, None,
+                );
+                m
+            }
+            Err(e) => {
+                log::error!("relay: init: {e}");
+                let _ = emit_watch_status(
+                    ui.as_ref(), &stream_id, WatchStatusStage::NativeStart,
+                    WatchStatusOutcome::Failed, WatchStatusCode::NativeStartFailed, None,
+                );
+                fin.notify_one();
+                return;
+            }
         };
         // Локальный показ поднимаем сразу — offer уедет в webview, тот ответит через ctrl.
         mgr.start_webview().await;
@@ -1225,15 +1642,30 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
         // репарентит, а teardown ждёт stop_watch из webview, который тоже мог пропустить конец.
         let mut orphan_since_ms: Option<u64> = None;
         const ORPHAN_EXIT_MS: u64 = 20_000;
+        const TRACK_MISSING_STATUS_MS: u64 = 12_000;
+        let mut track_missing_reported_epoch = 0u64;
         // true после break = конец стрима, а не явный Stop — сообщаем webview, чтобы он снёс watch.
         let mut watch_ended = false;
         loop {
             tokio::select! {
                 evt = evt_rx.recv() => {
                     match evt {
-                        Some(TreeEvent::Welcome { ice_servers }) => mgr.set_ice_servers(&ice_servers),
+                        Some(TreeEvent::Welcome { ice_servers }) => {
+                            mgr.set_ice_servers(&ice_servers);
+                            let _ = emit_watch_status(
+                                mgr.ui.as_ref(), &mgr.stream_id, WatchStatusStage::Parent,
+                                WatchStatusOutcome::Started, WatchStatusCode::None, None,
+                            );
+                        }
                         Some(TreeEvent::AssignParent { parent_id }) => {
+                            let has_parent = parent_id.is_some();
                             orphan_since_ms = if parent_id.is_none() { Some(now_ms()) } else { None };
+                            let _ = emit_watch_status(
+                                mgr.ui.as_ref(), &mgr.stream_id, WatchStatusStage::Parent,
+                                if has_parent { WatchStatusOutcome::Ok } else { WatchStatusOutcome::Stalled },
+                                if has_parent { WatchStatusCode::None } else { WatchStatusCode::NoParent },
+                                None,
+                            );
                             mgr.on_assign_parent(parent_id).await;
                         }
                         Some(TreeEvent::AssignChild { child_id }) => mgr.on_assign_child(child_id).await,
@@ -1256,10 +1688,16 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
                         // Рестарт сервера пережит: мы реджойнились свежим узлом, сервер сам
                         // пришлёт assign-parent (settleOrphans) — upstream пересоздастся. Старые
                         // child-PC живут, пока дети не пересоздадут соединения (sweep дочистит).
-                        Some(TreeEvent::Rejoined) => log::warn!("relay: сигналинг реджойнился — жду свежий assign-parent"),
-                        // The signalling task emits Closed after an unexpected terminal URL/auth
-                        // failure too. Explicit user Stop arrives through ctrl_rx below, so a close
-                        // on this branch must notify the webview and tear down its native watch.
+                        Some(TreeEvent::Rejoined) => {
+                            log::warn!("relay: сигналинг реджойнился — жду свежий assign-parent");
+                            let _ = emit_watch_status(
+                                mgr.ui.as_ref(), &mgr.stream_id, WatchStatusStage::Recovery,
+                                WatchStatusOutcome::Started, WatchStatusCode::None, None,
+                            );
+                        }
+                        // The signalling status sink reports the sanitized close reason. Explicit
+                        // user Stop arrives through ctrl_rx below, so this terminal branch only
+                        // owns lifecycle teardown and the webview-ended notification.
                         Some(TreeEvent::Closed) | None => { watch_ended = true; break; },
                     }
                 }
@@ -1291,8 +1729,25 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
                         if bad && now.saturating_sub(last_reparent_ms) >= 10_000 {
                             last_reparent_ms = now;
                             log::warn!("relay: upstream state={st} — авто-reparent");
+                            let _ = emit_watch_status(
+                                mgr.ui.as_ref(), &mgr.stream_id, WatchStatusStage::Recovery,
+                                WatchStatusOutcome::Started, WatchStatusCode::IceFailed, None,
+                            );
                             let _ = mgr.cmd_tx.send(TreeCmd::RequestReparent { target: None });
                         }
+                    }
+                    let (media_epoch, media_seen) = upstream_media_snapshot(&mgr.upstream_media_state);
+                    if media_epoch != 0
+                        && !media_seen
+                        && track_missing_reported_epoch != media_epoch
+                        && now_ms().saturating_sub(mgr.upstream_media_since_ms.load(Ordering::Acquire))
+                            >= TRACK_MISSING_STATUS_MS
+                    {
+                        track_missing_reported_epoch = media_epoch;
+                        let _ = emit_watch_status(
+                            mgr.ui.as_ref(), &mgr.stream_id, WatchStatusStage::Track,
+                            WatchStatusOutcome::Stalled, WatchStatusCode::TrackMissing, None,
+                        );
                     }
                     // Терминальный сирота (натив): родителя нет дольше ORPHAN_EXIT_MS — дерево
                     // умерло (settleOrphans/vrelay дали бы родителя за секунды). Выходим и
@@ -1301,6 +1756,10 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
                         if let Some(t) = orphan_since_ms {
                             if now_ms().saturating_sub(t) >= ORPHAN_EXIT_MS {
                                 log::warn!("relay: без родителя {}с — считаю стрим законченным, teardown", ORPHAN_EXIT_MS / 1000);
+                                let _ = emit_watch_status(
+                                    mgr.ui.as_ref(), &mgr.stream_id, WatchStatusStage::Parent,
+                                    WatchStatusOutcome::Failed, WatchStatusCode::NoParent, None,
+                                );
                                 watch_ended = true;
                                 break;
                             }
@@ -1331,6 +1790,13 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
             }
         }
         let _ = mgr.cmd_tx.send(TreeCmd::Leave);
+        let (media_epoch, media_seen) = upstream_media_snapshot(&mgr.upstream_media_state);
+        if watch_ended && media_epoch != 0 && !media_seen && track_missing_reported_epoch != media_epoch {
+            let _ = emit_watch_status(
+                mgr.ui.as_ref(), &mgr.stream_id, WatchStatusStage::Track,
+                WatchStatusOutcome::Failed, WatchStatusCode::TrackMissing, None,
+            );
+        }
         mgr.close_all().await;
         // Конец стрима определил Rust (stream-end/сирота), а не webview: говорим ему снести
         // watch (nativeUnwatch → delVideo), иначе <video> остаётся с повисшим кадром.
@@ -1425,7 +1891,9 @@ pub fn start_rendition_root(cfg: RelayConfig, video: Arc<TrackLocalStaticRTP>, a
 #[cfg(test)]
 mod tests {
     use super::{
-        IngestMonitor, PendingDownstreamIce, PendingUpstreamIce, QueuePendingIce, RtpContinuity,
+        begin_upstream_media_epoch, mark_first_upstream_video_packet, upstream_media_snapshot,
+        watch_status_payload, IngestMonitor, PendingDownstreamIce, PendingUpstreamIce,
+        QueuePendingIce, RtpContinuity, WatchStatusCode, WatchStatusOutcome, WatchStatusStage,
         PENDING_ICE_MAX,
     };
     use std::sync::atomic::AtomicU64;
@@ -1435,6 +1903,45 @@ mod tests {
 
     fn ice(candidate: &str) -> RTCIceCandidateInit {
         RTCIceCandidateInit { candidate: candidate.to_owned(), ..Default::default() }
+    }
+
+    #[test]
+    fn native_watch_status_payload_contains_only_safe_routing_and_allowlisted_state() {
+        let payload = watch_status_payload(
+            "stream-local-key",
+            WatchStatusStage::Signaling,
+            WatchStatusOutcome::Failed,
+            WatchStatusCode::SignalingForbidden,
+            Some(3),
+        );
+        let object = payload.as_object().unwrap();
+        assert_eq!(object.len(), 5);
+        assert_eq!(object.get("streamId").and_then(|v| v.as_str()), Some("stream-local-key"));
+        assert_eq!(object.get("stage").and_then(|v| v.as_str()), Some("watch_signaling"));
+        assert_eq!(object.get("outcome").and_then(|v| v.as_str()), Some("failed"));
+        assert_eq!(object.get("code").and_then(|v| v.as_str()), Some("signaling_forbidden"));
+        assert_eq!(object.get("reconnectCount").and_then(|v| v.as_u64()), Some(3));
+        for forbidden in ["url", "sdp", "ice", "candidate", "ip", "peerId", "error", "message"] {
+            assert!(!object.contains_key(forbidden));
+        }
+    }
+
+    #[test]
+    fn upstream_media_epoch_rejects_late_packets_from_replaced_parent() {
+        let state = AtomicU64::new(0);
+        let first_epoch = begin_upstream_media_epoch(&state);
+        assert_eq!(upstream_media_snapshot(&state), (first_epoch, false));
+        assert!(mark_first_upstream_video_packet(&state, first_epoch));
+        assert_eq!(upstream_media_snapshot(&state), (first_epoch, true));
+        assert!(!mark_first_upstream_video_packet(&state, first_epoch));
+
+        let replacement_epoch = begin_upstream_media_epoch(&state);
+        assert_ne!(replacement_epoch, first_epoch);
+        assert_eq!(upstream_media_snapshot(&state), (replacement_epoch, false));
+        assert!(!mark_first_upstream_video_packet(&state, first_epoch));
+        assert_eq!(upstream_media_snapshot(&state), (replacement_epoch, false));
+        assert!(mark_first_upstream_video_packet(&state, replacement_epoch));
+        assert_eq!(upstream_media_snapshot(&state), (replacement_epoch, true));
     }
 
     // ---- upstream trickle ICE до SDP offer ----

@@ -105,7 +105,8 @@ export interface AdminOverview { stats: { servers: number; users: number }; serv
 export type VoiceDiagnosticIncident =
   | 'manual' | 'join_stuck' | 'connection_failed' | 'reconnect_loop' | 'uplink_silent'
   | 'inbound_silent' | 'mute_divergence' | 'mic_failed' | 'playback_blocked'
-  | 'output_route_failed' | 'ui_stall' | 'session_ended';
+  | 'output_route_failed' | 'ui_stall' | 'session_ended'
+  | 'stream_watch_succeeded' | 'stream_watch_failed' | 'stream_watch_recovered';
 export type VoiceDiagnosticClientKind = 'web' | 'native';
 export interface VoiceDiagnosticClient {
   kind: VoiceDiagnosticClientKind;
@@ -122,13 +123,20 @@ export interface VoiceDiagnosticEvent {
     | 'mic_recovery_finished' | 'mute_changed' | 'deafen_changed' | 'background'
     | 'foreground' | 'network_changed' | 'reconnecting' | 'reconnected' | 'disconnected'
     | 'playback_blocked' | 'output_route_failed' | 'ui_stall' | 'rtc_sample'
-    | 'uplink_stalled' | 'inbound_stalled' | 'left';
+    | 'uplink_stalled' | 'inbound_stalled' | 'left'
+    | 'stream_watch_started' | 'stream_watch_step' | 'stream_watch_retry' | 'stream_watch_finished';
   stage?: 'intent' | 'hub' | 'claim' | 'media_token' | 'media_connect' | 'activation'
-    | 'mic_capture' | 'mic_publish' | 'mic_recovery' | 'playback' | 'output_route' | 'rtc' | 'ui';
+    | 'mic_capture' | 'mic_publish' | 'mic_recovery' | 'playback' | 'output_route' | 'rtc' | 'ui'
+    | 'watch_intent' | 'watch_auth' | 'watch_listeners' | 'watch_native_start'
+    | 'watch_signaling' | 'watch_join' | 'watch_parent' | 'watch_negotiation'
+    | 'watch_track' | 'watch_playback' | 'watch_recovery';
   outcome?: 'started' | 'ok' | 'failed' | 'timed_out' | 'blocked' | 'unsupported'
     | 'cancelled' | 'superseded' | 'stalled' | 'recovered';
   code?: 'none' | 'timeout' | 'network' | 'offline' | 'auth' | 'permission' | 'device_lost'
-    | 'media_blocked' | 'disconnected' | 'sdk' | 'unsupported' | 'aborted' | 'unknown';
+    | 'media_blocked' | 'disconnected' | 'sdk' | 'unsupported' | 'aborted' | 'unknown'
+    | 'signaling_unauthorized' | 'signaling_forbidden' | 'listener_failed'
+    | 'native_start_failed' | 'signaling_closed' | 'no_parent' | 'negotiation_failed'
+    | 'ice_failed' | 'track_missing' | 'decode_timeout' | 'playback_waiting';
   httpStatus?: number;
   connectionState?: 'new' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected' | 'closed' | 'unknown';
   iceState?: 'new' | 'checking' | 'connected' | 'completed' | 'failed' | 'disconnected' | 'closed' | 'unknown';
@@ -136,6 +144,7 @@ export interface VoiceDiagnosticEvent {
   audioContextState?: 'running' | 'suspended' | 'interrupted' | 'closed' | 'missing' | 'unknown';
   outputRoute?: 'default' | 'custom' | 'system' | 'unsupported' | 'unknown';
   micMode?: 'voice' | 'ptt' | 'unknown';
+  streamTransport?: 'livekit' | 'tree_web' | 'tree_native';
   networkType?: VoiceDiagnosticClient['networkType'];
   documentHidden?: boolean;
   online?: boolean;

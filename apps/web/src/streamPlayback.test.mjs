@@ -802,6 +802,12 @@ assert.match(serverView, /mediaStream\?\.addEventListener\('addtrack', retry\)/,
   'a tree audio track arriving after video immediately retries the exact media playback path');
 assert.match(serverView, /setPlaybackBlocked\(!audioReady \|\| outcome !== 'playing'\)/,
   'a hanging WebKit play promise exposes the gesture retry instead of silently timing out');
+assert.match(serverView, /const diagnosticAudioReady = controller \? audioReady : undefined;[\s\S]*recordWatchPlaybackOutcome\([\s\S]*outcome, diagnosticAudioReady,[\s\S]*confirmWatchPlayback/,
+  'the playback result is captured before success while LiveKit audio remains explicitly unknown');
+assert.match(serverView, /catch \{[\s\S]*recordWatchPlaybackOutcome\([\s\S]*'failed', mediaStream \? false : undefined,[\s\S]*setPlaybackBlocked\(true\)/,
+  'an element attach failure is visible to diagnostics and leaves a recoverable UI state');
+assert.match(engine, /audioReady\?: boolean[\s\S]*audioReady === undefined \? \{\} : \{ canPlaybackAudio: audioReady \}/,
+  'unknown separate LiveKit audio is omitted instead of being reported as playable');
 // Просмотр подтверждается ДЕКОДИРОВАННЫМ КАДРОМ, а не началом воспроизведения. Раньше
 // подтверждение приходило только с события 'playing', то есть требовало разрешённого
 // автозапуска: пока зритель не нажал кнопку запуска, дедлайн watch (20 с) обрывал
@@ -820,6 +826,12 @@ assert.match(engine, /remoteAudioPlays\.forget\(entry\.el\)/,
   'detaching an audible element invalidates its late play continuation');
 assert.match(engine, /confirmWatchPlayback\(identity: string, streamKey: string, generation: number\)[\s\S]*watchPlaybackGate\.confirms/,
   'the pending spinner accepts only its exact watch generation and track');
+assert.match(engine, /beginStreamWatchDiagnostic\(identity, t, playbackGeneration\)/,
+  'every accepted watch click starts one account-scoped structured report');
+assert.match(engine, /finishStreamWatchDiagnostic\([\s\S]*stream_watch_succeeded/,
+  'the first playable frame emits a success control report');
+assert.match(engine, /stage: 'watch_playback', outcome: 'timed_out', code: 'decode_timeout'/,
+  'a watch that never decodes a frame emits the exact terminal reason before teardown');
 assert.match(engine, /streamGainOf\(id: string\)[\s\S]*effectiveStreamGain\(getSettings\(\)\.master/,
   'LiveKit screen audio uses master multiplied by its per-stream volume');
 assert.match(engine, /applyMaster\(\)[^{]*\{[^}]*applyAllStreamVolumes\(\)/,
@@ -855,8 +867,8 @@ assert.equal((ensureVoicePlaybackBody.match(/configureVoiceAudio\(entry, p!\)/g)
   'steady reconciliation configures output only when an exact audio element is attached');
 assert.doesNotMatch(engine, /await ctx\.setSinkId|await setSinkId\.call/,
   'no raw browser sink promise can hold the Engine output queues forever');
-assert.match(engine, /onSeamlessSwitchFailed\?\.\(\(sid\) => \{[\s\S]*this\.closeWatch\(sid\)/,
-  'a failed seamless switch clears the exact watch ownership so the user can retry');
+assert.match(engine, /onSeamlessSwitchFailed\?\.\(\(sid\) => \{[\s\S]*finishStreamWatchDiagnostic\(sid, 'stream_watch_failed',[\s\S]*watch_recovery[\s\S]*decode_timeout[\s\S]*this\.closeWatch\(sid\)/,
+  'a failed seamless switch persists its exact timeout before clearing ownership for a retry');
 const watchBody = engine.match(/watch\(identity: string, quality: string = 'source'\)[\s\S]*?\n  }\n  closeWatch/)?.[0] || '';
 assert.doesNotMatch(watchBody, /localStorage\./,
   'blocked mobile storage cannot strand a pending stream watch');

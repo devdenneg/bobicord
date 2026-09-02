@@ -3093,7 +3093,18 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
       playMediaElementCoordinated(videoPlayCoordinatorRef.current, v, explicitGesture),
     ]);
     if (attempt !== playAttemptSeq.current || vidRef.current !== v) return;
-    if (!isLocal && outcome === 'playing') E.confirmWatchPlayback(identity, streamKey, playbackGeneration);
+    // Tree owns the combined stream audio and can report its exact state. LiveKit screen audio
+    // is attached separately by Engine, so this video tile must leave that state unknown.
+    const diagnosticAudioReady = controller ? audioReady : undefined;
+    if (!isLocal) E.recordWatchPlaybackOutcome(
+      identity, streamKey, playbackGeneration, outcome, diagnosticAudioReady,
+    );
+    // Do not close the diagnostic before the async play()/AudioContext result above is recorded.
+    // A decoded frame still proves transport success when autoplay is blocked, but the same report
+    // must explain why the viewer saw the explicit Retry control.
+    if (!isLocal && v.videoWidth > 0 && v.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+      E.confirmWatchPlayback(identity, streamKey, playbackGeneration);
+    }
     // WebKit иногда оставляет play() pending вместо NotAllowedError. После bounded
     // ожидания это такой же recoverable gesture-case: не прячем единственную кнопку Retry.
     setPlaybackBlocked(!audioReady || outcome !== 'playing');
@@ -3137,7 +3148,17 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
     // srcObject is assigned; muting every stream first made an ordinary desktop/tree stream stay
     // silent even though its audio track and saved non-zero gain were already available. The tree
     // controller keeps iOS volume-locked media muted and owns WebAudio before this same boundary.
-    (track as any).attach(v);
+    try { (track as any).attach(v); }
+    catch {
+      if (!isLocal) E.recordWatchPlaybackOutcome(
+        identity, streamKey, playbackGeneration, 'failed', mediaStream ? false : undefined,
+      );
+      setPlaybackBlocked(true);
+      const controller = audioControllerRef.current;
+      audioControllerRef.current = null;
+      controller?.dispose();
+      return;
+    }
 
     const visible = () => { if (document.visibilityState === 'visible') retry(); };
     // Декодированный кадр = поток доехал. Это доказательство соединения, и оно не зависит
@@ -3145,16 +3166,22 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
     // просто оно стоит на паузе.
     const confirmDecoded = () => {
       if (isLocal || !v.videoWidth || v.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
-      E.confirmWatchPlayback(identity, streamKey, playbackGeneration);
+      if (document.visibilityState === 'hidden') {
+        E.recordWatchPlaybackOutcome(
+          identity, streamKey, playbackGeneration, 'waiting',
+          mediaStream ? desiredStreamGainRef.current <= 0 : undefined,
+        );
+        E.confirmWatchPlayback(identity, streamKey, playbackGeneration);
+        return;
+      }
+      void attemptPlayback();
     };
     const playable = () => {
       v.classList.add('ready');
       confirmDecoded();
-      retry();
     };
     const playing = () => {
       v.classList.add('ready');
-      if (!isLocal) E.confirmWatchPlayback(identity, streamKey, playbackGeneration);
       retry();
     };
     v.addEventListener('loadeddata', playable);

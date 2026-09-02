@@ -48,7 +48,8 @@ const {
 } = require('./diagStore');
 const {
   VoiceDiagnosticValidationError, createVoiceDiagnosticGlobalLimiter,
-  createVoiceDiagnosticsStore, isVoiceDiagnosticsAdmin,
+  createVoiceDiagnosticsStore, isVoiceDiagnosticControlIncident, isVoiceDiagnosticsAdmin,
+  sanitizeVoiceDiagnosticReport,
 } = require('./voiceDiagnostics');
 const {
   BoundedTtlCache, createFixedWindowLimiter, fetchSeventvCdn,
@@ -2420,9 +2421,13 @@ const diagStore = createDiagStore({
   maxTotalBytes: DIAG_MAX_TOTAL_BYTES,
 });
 const diagRateLimiter = createDiagRateLimiter();
-const voiceDiagRateLimiter = createDiagRateLimiter({ burstLimit: 4, hourlyLimit: 20 });
-// Aggregate process pressure only: this limiter stores neither IPs nor account identifiers.
-const voiceDiagGlobalLimiter = createVoiceDiagnosticGlobalLimiter();
+// Control reports must never consume the incident budget: a run of successful stream views must
+// not delay the one failed attempt that an administrator is waiting to inspect.
+const voiceDiagIncidentRateLimiter = createDiagRateLimiter({ burstLimit: 4, hourlyLimit: 20 });
+const voiceDiagControlRateLimiter = createDiagRateLimiter({ burstLimit: 8, hourlyLimit: 60 });
+// Aggregate process pressure only: these limiters store neither IPs nor account identifiers.
+const voiceDiagIncidentGlobalLimiter = createVoiceDiagnosticGlobalLimiter();
+const voiceDiagControlGlobalLimiter = createVoiceDiagnosticGlobalLimiter({ limit: 240 });
 
 const DIAG_ROLES = new Set(['broadcaster', 'viewer']);
 const DIAG_CLIENTS = new Set(['native', 'web']);
@@ -2460,12 +2465,39 @@ function sanitizeDiagEnv(raw) {
 // В отличие от legacy stream-diag эта ручка никогда не принимает строки логов. Store собирает
 // новый объект только из известных enum/number/boolean полей; неизвестные ключи не попадают в БД.
 app.post('/api/diag/voice', noStoreResponse, requireAuth, (req, res) => {
-  const rate = voiceDiagRateLimiter.consume(req.user.id);
+  let report;
+  try {
+    report = sanitizeVoiceDiagnosticReport(req.body);
+  } catch (error) {
+    if (error instanceof VoiceDiagnosticValidationError) {
+      return res.status(400).json({ error: { code: 'BAD_VOICE_DIAGNOSTIC', message: 'Некорректный формат диагностики.' } });
+    }
+    console.error('[voice-diag] validation failed');
+    return res.status(500).json({ error: 'Не удалось проверить диагностику' });
+  }
+
+  // A retry after a lost HTTP response is already durable and must not spend another rate-limit
+  // slot. Identity is scoped to the authenticated account, never to a client supplied username.
+  let existing;
+  try {
+    existing = report.clientReportId
+      ? voiceDiagnostics.findExisting(req.user.id, report.clientReportId)
+      : null;
+  } catch {
+    console.error('[voice-diag] retry lookup failed');
+    return res.status(500).json({ error: 'Не удалось проверить сохранённую диагностику' });
+  }
+  if (existing) {
+    return res.status(200).json({ ok: true, reportId: existing.id, createdAt: existing.createdAt });
+  }
+
+  const control = isVoiceDiagnosticControlIncident(report.incident);
+  const rate = (control ? voiceDiagControlRateLimiter : voiceDiagIncidentRateLimiter).consume(req.user.id);
   if (!rate.allowed) {
     res.setHeader('Retry-After', String(Math.max(1, Math.ceil(rate.retryAfterMs / 1000))));
     return res.status(429).json({ error: 'Слишком много диагностических отчётов' });
   }
-  const globalRate = voiceDiagGlobalLimiter.consume();
+  const globalRate = (control ? voiceDiagControlGlobalLimiter : voiceDiagIncidentGlobalLimiter).consume();
   if (!globalRate.allowed) {
     res.setHeader('Retry-After', String(Math.max(1, Math.ceil(globalRate.retryAfterMs / 1000))));
     return res.status(429).json({ error: 'Диагностика временно перегружена' });
@@ -2474,7 +2506,7 @@ app.post('/api/diag/voice', noStoreResponse, requireAuth, (req, res) => {
     const saved = voiceDiagnostics.save({
       userId: req.user.id,
       username: req.user.username,
-      raw: req.body,
+      raw: report,
     });
     // SQLite + the diagnostics admin API are the authoritative log. Do not mirror per-report
     // metadata into Docker stdout: its size-based rotation cannot guarantee the three-day TTL.

@@ -14,7 +14,7 @@ import { isTauri, detectGame } from './native';
 import { getSettings, setSettings, subscribeSettings } from './settings';
 import { emoteUrl } from './emotes';
 import { playSound } from './sounds';
-import type { VideoTransport } from './transport/videoTransport';
+import type { StreamWatchTransportDiagnostic, VideoTransport } from './transport/videoTransport';
 import { LiveKitVideoTransport } from './transport/livekitVideo';
 import { TreeVideoTransport } from './transport/treeVideo';
 import { createDenoiseNode, destroyDenoiseNode } from './denoise';
@@ -99,6 +99,7 @@ import {
   voiceDiagnosticInboundExpected,
   type VoiceDiagnosticSilenceState,
 } from './voiceDiagnosticRtc';
+import { DiagnosticReportOutbox } from './diagnosticOutbox';
 
 installLiveKitAudioGainStability(RemoteAudioTrack as unknown as Parameters<typeof installLiveKitAudioGainStability>[0]);
 
@@ -185,6 +186,8 @@ const VOICE_DIAGNOSTIC_MUTE_DIVERGENCE_MS = 4_000;
 const VOICE_DIAGNOSTIC_HEALTHY_SESSION_SAMPLE_RATE = 0.02;
 const VOICE_DIAGNOSTIC_INCIDENT_PRIORITY: Record<VoiceDiagnosticIncident, number> = {
   session_ended: 0,
+  stream_watch_succeeded: 1,
+  stream_watch_recovered: 2,
   manual: 10,
   ui_stall: 20,
   reconnect_loop: 30,
@@ -195,6 +198,7 @@ const VOICE_DIAGNOSTIC_INCIDENT_PRIORITY: Record<VoiceDiagnosticIncident, number
   uplink_silent: 70,
   inbound_silent: 70,
   mic_failed: 80,
+  stream_watch_failed: 85,
   connection_failed: 90,
 };
 const MIN_DB = -50; // шкала подогнана под уже обработанный браузером сигнал (AGC/NS), а не под теоретический динамический диапазон
@@ -223,6 +227,13 @@ interface VoiceDiagnosticRtcTotals {
   inboundBytes: number;
   hasOutboundAudio: boolean;
   hasInboundAudio: boolean;
+}
+
+interface StreamWatchDiagnosticAttempt {
+  recorder: VoiceDiagnosticsRecorder;
+  playbackGeneration: number;
+  reconnectCount: number;
+  streamTransport: NonNullable<VoiceDiagnosticEvent['streamTransport']>;
 }
 
 // Error objects never enter a report. Only an allowlisted category and, for API responses, a
@@ -479,6 +490,8 @@ export class Engine {
   private pttPointerDown = false;
   private watchTimers = new Map<string, number>();
   private watchPlaybackGate = new StreamWatchPlaybackGate();
+  private streamWatchDiagnostics = new Map<string, StreamWatchDiagnosticAttempt>();
+  private streamDiagnosticOutbox: DiagnosticReportOutbox;
 
   // mic pipeline: raw device -> [denoise?] -> gain (громкость/мут) -> published track
   //                                        \-> vadDest (отвод для VAD/метра, ДО гейта)
@@ -672,12 +685,24 @@ export class Engine {
   constructor(me: User, hooks: EngineHooks) {
     this.me = me;
     this.hooks = hooks;
+    this.streamDiagnosticOutbox = new DiagnosticReportOutbox(
+      me.id,
+      (report) => api.submitVoiceDiagnostic(report),
+    );
+    this.streamDiagnosticOutbox.start();
     this.ensureIdleWatch();
     this.ensureGameSettingsWatch();
     const onVideoTrack = (key: string, _track: unknown, identity: string, isLocal: boolean) => {
       // Track arrival is progress, not success: an audio-first/dead MediaStream
       // can still render no frame. StreamTile confirms actual playable media.
-      if (!isLocal) this.watchPlaybackGate.acceptTrack(identity, key);
+      if (!isLocal) {
+        this.watchPlaybackGate.acceptTrack(identity, key);
+        const attempt = this.streamWatchDiagnostics.get(identity);
+        attempt?.recorder.record({
+          kind: 'stream_watch_step', stage: 'watch_track', outcome: 'ok', code: 'none',
+          streamTransport: attempt.streamTransport, trackState: 'live', ...this.streamWatchDiagnosticPageState(),
+        });
+      }
       this.emit();
     };
     const onStreamStart = (source: StreamSource, identity: string, silent: boolean) => this.onStreamSourceStart(source, identity, silent);
@@ -688,6 +713,7 @@ export class Engine {
       t.onVideoTrackRemoved(() => this.emit());
       t.onStreamStart((identity, silent) => onStreamStart(source, identity, silent));
       t.onStreamStop((identity) => onStreamStop(source, identity));
+      t.onWatchDiagnostic?.((event) => this.recordStreamWatchTransportDiagnostic(event));
     }
     // Э8: топология дерева меняется (join/leave/reparent) — перерисовать UI пикера пиров.
     this.treeT.onTopology?.(() => this.emit());
@@ -713,6 +739,12 @@ export class Engine {
     // Бесшовное переключение (смена качества/reparent/reconnect) не доехало за failsafe —
     // плитка закрыта, чтобы не морозить последний кадр. Тост + рефреш стримов.
     this.treeT.onSeamlessSwitchFailed?.((sid) => {
+      // emitWatchDiagnostic has already appended the transport timeout synchronously. Seal that
+      // attempt before closeWatch performs the ordinary user-cancel cleanup, otherwise the most
+      // useful failed recovery trace would be discarded together with the frozen tile.
+      this.finishStreamWatchDiagnostic(sid, 'stream_watch_failed', {
+        stage: 'watch_recovery', outcome: 'timed_out', code: 'decode_timeout', trackState: 'missing',
+      });
       // The transport already removed its failed tile. Clear the matching Engine ownership too;
       // otherwise watching.has(sid) makes every explicit retry a permanent no-op.
       this.closeWatch(sid);
@@ -721,6 +753,104 @@ export class Engine {
     this.ensureOutputLifecycleListeners();
     this.ensureInputLifecycleListener();
     this.snap = this.build();
+  }
+
+  /* ---------- bounded, privacy-safe stream watch diagnostics ---------- */
+  private streamWatchDiagnosticPageState() {
+    return {
+      documentHidden: typeof document === 'object' && document.hidden,
+      online: typeof navigator !== 'object' || navigator.onLine !== false,
+      networkType: detectVoiceDiagnosticNetworkType(),
+    };
+  }
+
+  private streamWatchTransportFor(transport: VideoTransport): NonNullable<VoiceDiagnosticEvent['streamTransport']> {
+    if (transport === this.liveKitT) return 'livekit';
+    return isTauri ? 'tree_native' : 'tree_web';
+  }
+
+  private beginStreamWatchDiagnostic(
+    identity: string,
+    transport: VideoTransport,
+    playbackGeneration: number,
+  ): void {
+    const recorder = new VoiceDiagnosticsRecorder();
+    recorder.start();
+    const streamTransport = this.streamWatchTransportFor(transport);
+    recorder.record({
+      kind: 'stream_watch_started', stage: 'watch_intent', outcome: 'started', code: 'none',
+      streamTransport, ...this.streamWatchDiagnosticPageState(),
+    });
+    this.streamWatchDiagnostics.set(identity, {
+      recorder, playbackGeneration, reconnectCount: 0, streamTransport,
+    });
+  }
+
+  private recordStreamWatchTransportDiagnostic(event: StreamWatchTransportDiagnostic): void {
+    // streamId is deliberately consumed only as a local map key. It is never spread into the
+    // recorder, so broadcaster identity cannot leave this device in the structured report.
+    const attempt = this.streamWatchDiagnostics.get(event.streamId);
+    if (!attempt || event.streamTransport !== attempt.streamTransport) return;
+    if (event.reconnectCount !== undefined) {
+      attempt.reconnectCount = Math.max(attempt.reconnectCount, event.reconnectCount);
+    }
+    attempt.recorder.record({
+      kind: event.stage === 'watch_recovery' && event.outcome === 'started'
+        ? 'stream_watch_retry'
+        : 'stream_watch_step',
+      stage: event.stage,
+      outcome: event.outcome,
+      code: event.code,
+      streamTransport: event.streamTransport,
+      ...(event.connectionState === undefined ? {} : { connectionState: event.connectionState }),
+      ...(event.iceState === undefined ? {} : { iceState: event.iceState }),
+      ...(event.trackState === undefined ? {} : { trackState: event.trackState }),
+      ...(event.reconnectCount === undefined ? {} : { reconnectCount: event.reconnectCount }),
+      ...this.streamWatchDiagnosticPageState(),
+    });
+  }
+
+  private finishStreamWatchDiagnostic(
+    identity: string,
+    incident: Extract<VoiceDiagnosticIncident,
+      'stream_watch_succeeded' | 'stream_watch_failed' | 'stream_watch_recovered'>,
+    event: Pick<VoiceDiagnosticEvent, 'stage' | 'outcome' | 'code' | 'trackState' | 'canPlaybackAudio'>,
+  ): void {
+    const attempt = this.streamWatchDiagnostics.get(identity);
+    if (!attempt) return;
+    this.streamWatchDiagnostics.delete(identity);
+    attempt.recorder.record({
+      kind: 'stream_watch_finished',
+      streamTransport: attempt.streamTransport,
+      reconnectCount: attempt.reconnectCount,
+      ...event,
+      ...this.streamWatchDiagnosticPageState(),
+    });
+    // Persist before the HTTP request. A WebView/process termination after this point is retried
+    // by the next authenticated Engine, with clientReportId making the server write idempotent.
+    this.streamDiagnosticOutbox.enqueue(attempt.recorder.buildReport(incident));
+  }
+
+  recordWatchPlaybackOutcome(
+    identity: string,
+    streamKey: string,
+    playbackGeneration: number,
+    outcome: 'playing' | 'blocked' | 'waiting' | 'failed',
+    audioReady?: boolean,
+  ): void {
+    const attempt = this.streamWatchDiagnostics.get(identity);
+    if (!attempt || attempt.playbackGeneration !== playbackGeneration
+      || !this.watchPlaybackGate.confirms(identity, streamKey, playbackGeneration)) return;
+    attempt.recorder.record({
+      kind: 'stream_watch_step', stage: 'watch_playback',
+      outcome: outcome === 'playing' ? 'ok' : outcome === 'blocked' ? 'blocked' : 'stalled',
+      code: outcome === 'playing' ? 'none' : outcome === 'blocked' ? 'media_blocked'
+        : outcome === 'failed' ? 'sdk' : 'playback_waiting',
+      streamTransport: attempt.streamTransport,
+      trackState: 'live',
+      ...(audioReady === undefined ? {} : { canPlaybackAudio: audioReady }),
+      ...this.streamWatchDiagnosticPageState(),
+    });
   }
 
   /* ---------- bounded, privacy-safe voice diagnostics ---------- */
@@ -1820,6 +1950,7 @@ export class Engine {
     // exitServer() performs a full disconnect but intentionally keeps this Engine instance for
     // the next server. Restore mobile route/playback listeners before creating the new room.
     this.engineLifecycleActive = true;
+    this.streamDiagnosticOutbox.start();
     this.ensureOutputLifecycleListeners();
     this.retryPendingVoiceDiagnostic();
     this.ensureInputLifecycleListener();
@@ -2561,7 +2692,11 @@ export class Engine {
     if (wasViewing) {
       this.stopGamePolling();
       this.resetStreamEdges();
-      this.clearAllWatches();
+      this.clearAllWatches({
+        stage: 'watch_signaling', outcome: 'failed',
+        code: typeof navigator === 'object' && navigator.onLine === false ? 'offline' : 'signaling_closed',
+        trackState: 'missing',
+      });
       ++this.connectEpoch;
       this.roomReady = false;
       this.viewRoom = null; this.viewServerId = '';
@@ -2624,6 +2759,7 @@ export class Engine {
       this.clearVoiceDiagnosticPendingReport();
       this.clearVoiceDiagnosticQueuedReport();
     }
+    this.streamDiagnosticOutbox.dispose(discardVoiceDiagnostics);
     this.cancelPendingVoiceJoin();
     if (this.deviceChangeHandler) {
       navigator.mediaDevices?.removeEventListener?.('devicechange', this.deviceChangeHandler);
@@ -5941,11 +6077,22 @@ export class Engine {
   }
   confirmWatchPlayback(identity: string, streamKey: string, generation: number) {
     if (!this.pendingWatch.has(identity) || !this.watchPlaybackGate.confirms(identity, streamKey, generation)) return;
+    const attempt = this.streamWatchDiagnostics.get(identity);
+    this.finishStreamWatchDiagnostic(
+      identity,
+      attempt && attempt.reconnectCount > 0 ? 'stream_watch_recovered' : 'stream_watch_succeeded',
+      { stage: 'watch_playback', outcome: attempt && attempt.reconnectCount > 0 ? 'recovered' : 'ok', code: 'none', trackState: 'live' },
+    );
     this.completeWatch(identity);
     this.emit();
   }
-  private clearWatch(identity: string) {
+  private clearWatch(identity: string, discardDiagnostic = false) {
     const transport = this.watchT.get(identity) ?? this.transportFor(identity);
+    if (discardDiagnostic) this.streamWatchDiagnostics.delete(identity);
+    else if (this.pendingWatch.has(identity)) this.finishStreamWatchDiagnostic(
+      identity, 'stream_watch_failed',
+      { stage: 'watch_track', outcome: 'failed', code: 'track_missing', trackState: 'missing' },
+    );
     this.cancelWatchTimer(identity);
     this.watching.delete(identity);
     this.pendingWatch.delete(identity);
@@ -5953,9 +6100,26 @@ export class Engine {
     transport.unwatch(identity);
     this.watchT.delete(identity);
   }
-  private clearAllWatches() {
+  private clearAllWatches(
+    unexpectedFailure?: Pick<VoiceDiagnosticEvent, 'stage' | 'outcome' | 'code' | 'trackState'>,
+  ) {
     this.cancelAllWatchTimers();
     const identities = new Set([...this.watching, ...this.pendingWatch, ...this.watchT.keys()]);
+    // Leaving/reloading the viewed server can race the 20-second first-frame deadline. Preserve a
+    // terminal snapshot for every still-pending attempt instead of silently deleting the exact
+    // timeline the administrator needs. Explicit logout has already discarded the account outbox,
+    // so the same cleanup remains privacy-preserving on an intentional account exit.
+    const failure = unexpectedFailure ?? {
+      stage: 'watch_playback' as const,
+      outcome: 'cancelled' as const,
+      code: 'aborted' as const,
+      trackState: 'missing' as const,
+    };
+    identities.forEach((identity) => {
+      if (this.pendingWatch.has(identity)) {
+        this.finishStreamWatchDiagnostic(identity, 'stream_watch_failed', failure);
+      }
+    });
     identities.forEach((identity) => {
       const transport = this.watchT.get(identity) ?? this.transportFor(identity);
       transport.unwatch(identity);
@@ -5964,6 +6128,7 @@ export class Engine {
     this.pendingWatch.clear();
     this.watchT.clear();
     this.watchPlaybackGate.clear();
+    this.streamWatchDiagnostics.clear();
   }
 
   // Д3: quality пробрасывается в транспорт (выбор рендишн-дерева). Дефолт 'source' — UI-ключ
@@ -5984,21 +6149,29 @@ export class Engine {
     // not a LiveKit room participant (voice and video are separate transports now) —
     // existence is the VideoTransport's job (it no-ops safely on an unknown identity).
     this.watching.add(identity); this.pendingWatch.add(identity);
-    this.watchPlaybackGate.begin(identity);
+    const playbackGeneration = this.watchPlaybackGate.begin(identity);
     const t = this.transportFor(identity);
     this.watchT.set(identity, t); // пин: unwatch/статы пойдут в тот же транспорт, даже если объявление пропадёт
+    this.beginStreamWatchDiagnostic(identity, t, playbackGeneration);
     const timer = window.setTimeout(() => {
       // A cancelled/replaced attempt is not allowed to tear down its successor.
       if (this.watchTimers.get(identity) !== timer) return;
       this.watchTimers.delete(identity);
       if (this.pendingWatch.has(identity)) {
-        this.clearWatch(identity);
+        this.finishStreamWatchDiagnostic(identity, 'stream_watch_failed', {
+          stage: 'watch_playback', outcome: 'timed_out', code: 'decode_timeout', trackState: 'missing',
+        });
+        this.clearWatch(identity, true);
         this.hooks.toast('Не удалось подключиться к трансляции', 'err'); this.emit();
       }
     }, WATCH_VIDEO_DEADLINE_MS);
     this.watchTimers.set(identity, timer);
     try { t.watch(identity, quality); }
-    catch {
+    catch (error) {
+      const classified = classifyVoiceDiagnosticError(error);
+      this.finishStreamWatchDiagnostic(identity, 'stream_watch_failed', {
+        stage: 'watch_signaling', outcome: 'failed', code: classified.code || 'unknown', trackState: 'missing',
+      });
       this.cancelWatchTimer(identity);
       this.watching.delete(identity); this.pendingWatch.delete(identity);
       this.watchPlaybackGate.end(identity); this.watchT.delete(identity);
@@ -6012,7 +6185,15 @@ export class Engine {
     this.emit();
   }
   closeWatch(identity: string) {
-    this.clearWatch(identity);
+    // A real viewer action can arrive before the 20-second watchdog (for example after the native
+    // client already surfaced a listener/signaling/ICE error). Preserve that bounded attempt before
+    // the ordinary transport cleanup removes its local routing key. Successful/already-finalized
+    // watches have no pending recorder here, so closing a healthy tile creates no extra incident.
+    if (this.pendingWatch.has(identity)) this.finishStreamWatchDiagnostic(
+      identity, 'stream_watch_failed',
+      { stage: 'watch_playback', outcome: 'cancelled', code: 'aborted', trackState: 'missing' },
+    );
+    this.clearWatch(identity, true);
     const m = this.streamWatchers.get(identity); if (m) { m.delete(this.me.username); }
     this.dataSend({ t: 'watch', s: identity, id: this.me.username, n: this.me.displayName, on: false });
     this.emit();

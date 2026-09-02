@@ -35,6 +35,47 @@ pub enum TreeEvent {
     Closed,
 }
 
+/// Sanitized lifecycle telemetry for a native relay-viewer. It deliberately carries neither the
+/// authenticated URL nor close reason/server text: callers may forward it to the renderer and then
+/// to diagnostics without leaking credentials, SDP/ICE, IP addresses or peer identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalingStatusOutcome {
+    Started,
+    Ok,
+    Failed,
+    Stalled,
+    Recovered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalingStatusCode {
+    None,
+    Unauthorized,
+    Forbidden,
+    Closed,
+}
+
+#[cfg(test)]
+impl SignalingStatusCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Unauthorized => "signaling_unauthorized",
+            Self::Forbidden => "signaling_forbidden",
+            Self::Closed => "signaling_closed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalingStatus {
+    pub outcome: SignalingStatusOutcome,
+    pub code: SignalingStatusCode,
+    pub reconnect_count: u32,
+}
+
+pub type SignalingStatusSink = Arc<dyn Fn(SignalingStatus) + Send + Sync>;
+
 pub enum TreeCmd {
     Offer { to: String, sdp: String },        // мы offerer (корень/relay → ребёнок)
     Answer { to: String, sdp: String },        // мы answerer (relay-viewer → родитель)
@@ -204,6 +245,82 @@ async fn wait_backoff(cmd_rx: &mut mpsc::UnboundedReceiver<TreeCmd>, secs: u64) 
     }
 }
 
+fn emit_signaling_status(
+    sink: &Option<SignalingStatusSink>,
+    outcome: SignalingStatusOutcome,
+    code: SignalingStatusCode,
+    reconnect_count: u32,
+) {
+    if let Some(sink) = sink {
+        sink(SignalingStatus { outcome, code, reconnect_count });
+    }
+}
+
+/// Only numeric protocol codes and an allow-listed server error code influence telemetry. Close
+/// reasons and arbitrary server messages are intentionally ignored because they can contain data
+/// that must never cross the native diagnostics bridge.
+fn close_status_code(code: Option<u16>) -> SignalingStatusCode {
+    match code {
+        Some(4001) => SignalingStatusCode::Unauthorized,
+        Some(4003) => SignalingStatusCode::Forbidden,
+        _ => SignalingStatusCode::Closed,
+    }
+}
+
+fn server_error_status_code(value: &Value) -> Option<SignalingStatusCode> {
+    if value.get("t").and_then(Value::as_str) != Some("error") { return None; }
+    Some(match value.get("code").and_then(Value::as_str) {
+        Some("FORBIDDEN") => SignalingStatusCode::Forbidden,
+        Some("UNAUTHORIZED") => SignalingStatusCode::Unauthorized,
+        _ => SignalingStatusCode::Closed,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HttpConnectFailure {
+    code: SignalingStatusCode,
+    invalidates_access: bool,
+    terminal: bool,
+}
+
+fn classify_http_connect_failure(status: Option<u16>) -> HttpConnectFailure {
+    match status {
+        // A rejected access JWT may be refreshed by WsUrl and retried without ending the watch.
+        Some(401) => HttpConnectFailure {
+            code: SignalingStatusCode::Unauthorized,
+            invalidates_access: true,
+            terminal: false,
+        },
+        // Membership/server authorization cannot be repaired by refreshing the global session.
+        Some(403) => HttpConnectFailure {
+            code: SignalingStatusCode::Forbidden,
+            invalidates_access: false,
+            terminal: true,
+        },
+        _ => HttpConnectFailure {
+            code: SignalingStatusCode::Closed,
+            invalidates_access: false,
+            terminal: false,
+        },
+    }
+}
+
+fn confirm_welcome_status(
+    value: &Value,
+    already_confirmed: &mut bool,
+    reconnect_count: u32,
+) -> Option<SignalingStatusOutcome> {
+    if *already_confirmed || value.get("t").and_then(Value::as_str) != Some("welcome") {
+        return None;
+    }
+    *already_confirmed = true;
+    Some(if reconnect_count == 0 {
+        SignalingStatusOutcome::Ok
+    } else {
+        SignalingStatusOutcome::Recovered
+    })
+}
+
 /// Поднимает ws-соединение и держит его в отдельной tokio-задаче. Возвращает канал
 /// команд (на отправку) и канал событий (на приём) — остальной код не трогает
 /// сериализацию протокола напрямую.
@@ -214,6 +331,26 @@ async fn wait_backoff(cmd_rx: &mut mpsc::UnboundedReceiver<TreeCmd>, secs: u64) 
 /// консьюмера. `reconnect=false` — старое поведение (первый обрыв = Closed); нужен
 /// vrelay-сессиям: агент сам переактивируется по vrelay-activate.
 pub fn connect(ws_url: WsUrl, join: JoinParams, reconnect: bool) -> (mpsc::UnboundedSender<TreeCmd>, mpsc::UnboundedReceiver<TreeEvent>) {
+    connect_inner(ws_url, join, reconnect, None)
+}
+
+/// Same wire protocol as [`connect`], with an optional side-channel containing only sanitized
+/// lifecycle states. The callback never affects reconnect or media behavior.
+pub fn connect_with_status(
+    ws_url: WsUrl,
+    join: JoinParams,
+    reconnect: bool,
+    status: Option<SignalingStatusSink>,
+) -> (mpsc::UnboundedSender<TreeCmd>, mpsc::UnboundedReceiver<TreeEvent>) {
+    connect_inner(ws_url, join, reconnect, status)
+}
+
+fn connect_inner(
+    ws_url: WsUrl,
+    join: JoinParams,
+    reconnect: bool,
+    status: Option<SignalingStatusSink>,
+) -> (mpsc::UnboundedSender<TreeCmd>, mpsc::UnboundedReceiver<TreeEvent>) {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<TreeCmd>();
     let (evt_tx, evt_rx) = mpsc::unbounded_channel::<TreeEvent>();
 
@@ -240,12 +377,27 @@ pub fn connect(ws_url: WsUrl, join: JoinParams, reconnect: bool) -> (mpsc::Unbou
         });
 
         let mut connects = 0u32; // сколько раз успешно джойнились (>=1 => дальше Rejoined)
+        let mut attempts = 0u32;
         let mut backoff = 1u64;
         'outer: loop {
+            let reconnect_count = attempts;
+            attempts = attempts.saturating_add(1);
+            emit_signaling_status(
+                &status,
+                SignalingStatusOutcome::Started,
+                SignalingStatusCode::None,
+                reconnect_count,
+            );
             let next_url = match ws_url.get().await {
                 Ok(url) => url,
                 Err(e) => {
                     log::warn!("tree ws credential refresh failed: {}", e.code());
+                    emit_signaling_status(
+                        &status,
+                        if e.is_terminal() || !reconnect { SignalingStatusOutcome::Failed } else { SignalingStatusOutcome::Stalled },
+                        if e.is_terminal() { SignalingStatusCode::Unauthorized } else { SignalingStatusCode::Closed },
+                        reconnect_count,
+                    );
                     if e.is_terminal() || !reconnect { break 'outer; }
                     if !wait_backoff(&mut cmd_rx, backoff).await { break 'outer; }
                     backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX_SEC);
@@ -255,16 +407,35 @@ pub fn connect(ws_url: WsUrl, join: JoinParams, reconnect: bool) -> (mpsc::Unbou
             let (ws_stream, _) = match tokio_tungstenite::connect_async(&next_url).await {
                 Ok(v) => v,
                 Err(error) => {
-                    let unauthorized = matches!(&error, tokio_tungstenite::tungstenite::Error::Http(response)
-                        if response.status().as_u16() == 401)
-                    ;
-                    if unauthorized {
+                    let http_status = match &error {
+                        tokio_tungstenite::tungstenite::Error::Http(response) => {
+                            Some(response.status().as_u16())
+                        }
+                        _ => None,
+                    };
+                    let failure = classify_http_connect_failure(http_status);
+                    if failure.invalidates_access {
                         ws_url.invalidate(&next_url);
                     }
                     // Never format the transport error itself: HTTP/TLS implementations may embed
                     // the request URI, including its access JWT, or an arbitrary upstream body.
-                    log::warn!("tree ws connect failed: {}", if unauthorized { "unauthorized" } else { "transport" });
-                    if !reconnect { break 'outer; }
+                    let safe_kind = match failure.code {
+                        SignalingStatusCode::Unauthorized => "unauthorized",
+                        SignalingStatusCode::Forbidden => "forbidden",
+                        _ => "transport",
+                    };
+                    log::warn!("tree ws connect failed: {safe_kind}");
+                    emit_signaling_status(
+                        &status,
+                        if failure.terminal || !reconnect {
+                            SignalingStatusOutcome::Failed
+                        } else {
+                            SignalingStatusOutcome::Stalled
+                        },
+                        failure.code,
+                        reconnect_count,
+                    );
+                    if failure.terminal || !reconnect { break 'outer; }
                     if !wait_backoff(&mut cmd_rx, backoff).await { break 'outer; }
                     backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX_SEC);
                     continue;
@@ -272,6 +443,12 @@ pub fn connect(ws_url: WsUrl, join: JoinParams, reconnect: bool) -> (mpsc::Unbou
             };
             let (mut write, mut read) = ws_stream.split();
             if write.send(Message::Text(join_msg.to_string().into())).await.is_err() {
+                emit_signaling_status(
+                    &status,
+                    if reconnect { SignalingStatusOutcome::Stalled } else { SignalingStatusOutcome::Failed },
+                    SignalingStatusCode::Closed,
+                    reconnect_count,
+                );
                 if !reconnect { break 'outer; }
                 if !wait_backoff(&mut cmd_rx, backoff).await { break 'outer; }
                 backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX_SEC);
@@ -286,12 +463,14 @@ pub fn connect(ws_url: WsUrl, join: JoinParams, reconnect: bool) -> (mpsc::Unbou
 
             // terminal=true — уходим совсем (Leave / консьюмер пропал); false — обрыв WS.
             let mut terminal = false;
+            let mut welcome_status_confirmed = false;
             // Дедлайн тишины: сбрасывается ЛЮБЫМ входящим кадром (ping сервера в том числе).
             let mut idle_deadline = tokio::time::Instant::now() + Duration::from_secs(READ_IDLE_TIMEOUT_SEC);
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep_until(idle_deadline) => {
                         log::warn!("tree ws: тишина {READ_IDLE_TIMEOUT_SEC}с ({stream_id}) — сокет полуоткрыт, реконнект");
+                        emit_signaling_status(&status, SignalingStatusOutcome::Stalled, SignalingStatusCode::Closed, reconnect_count);
                         break;
                     }
                     incoming = read.next() => {
@@ -299,6 +478,21 @@ pub fn connect(ws_url: WsUrl, join: JoinParams, reconnect: bool) -> (mpsc::Unbou
                         match incoming {
                             Some(Ok(Message::Text(txt))) => {
                                 if let Ok(v) = serde_json::from_str::<Value>(&txt) {
+                                    if let Some(outcome) = confirm_welcome_status(
+                                        &v,
+                                        &mut welcome_status_confirmed,
+                                        reconnect_count,
+                                    ) {
+                                        emit_signaling_status(
+                                            &status,
+                                            outcome,
+                                            SignalingStatusCode::None,
+                                            reconnect_count,
+                                        );
+                                    }
+                                    if let Some(code) = server_error_status_code(&v) {
+                                        emit_signaling_status(&status, SignalingStatusOutcome::Failed, code, reconnect_count);
+                                    }
                                     if let Some(evt) = parse_event(&v, &stream_id) {
                                         if evt_tx.send(evt).is_err() { terminal = true; break; }
                                     }
@@ -315,16 +509,37 @@ pub fn connect(ws_url: WsUrl, join: JoinParams, reconnect: bool) -> (mpsc::Unbou
                                 // used by this socket; a delayed close from token A must not erase a
                                 // newer token B already shared by another watch/broadcast. 4003 is
                                 // membership/server authorization and must not touch global auth.
-                                if frame.as_ref().is_some_and(|close| close_invalidates_access(u16::from(close.code))) {
+                                let close_code = frame.as_ref().map(|close| u16::from(close.code));
+                                if close_code.is_some_and(close_invalidates_access) {
                                     ws_url.invalidate(&next_url);
                                 }
+                                emit_signaling_status(
+                                    &status,
+                                    if reconnect { SignalingStatusOutcome::Stalled } else { SignalingStatusOutcome::Failed },
+                                    close_status_code(close_code),
+                                    reconnect_count,
+                                );
                                 break;
                             }
-                            None => break,
+                            None => {
+                                emit_signaling_status(
+                                    &status,
+                                    if reconnect { SignalingStatusOutcome::Stalled } else { SignalingStatusOutcome::Failed },
+                                    SignalingStatusCode::Closed,
+                                    reconnect_count,
+                                );
+                                break;
+                            }
                             Some(Err(_)) => {
                                 // As above, transport errors are deliberately opaque because some
                                 // backend error strings include the full authenticated request URI.
                                 log::warn!("tree ws transport error");
+                                emit_signaling_status(
+                                    &status,
+                                    if reconnect { SignalingStatusOutcome::Stalled } else { SignalingStatusOutcome::Failed },
+                                    SignalingStatusCode::Closed,
+                                    reconnect_count,
+                                );
                                 break;
                             }
                             _ => {}
@@ -334,15 +549,24 @@ pub fn connect(ws_url: WsUrl, join: JoinParams, reconnect: bool) -> (mpsc::Unbou
                         match cmd {
                             Some(TreeCmd::Offer { to, sdp }) => {
                                 let msg = json!({ "t": "sdp", "streamId": stream_id, "to": to, "type": "offer", "sdp": sdp });
-                                if write.send(Message::Text(msg.to_string().into())).await.is_err() { break; }
+                                if write.send(Message::Text(msg.to_string().into())).await.is_err() {
+                                    emit_signaling_status(&status, SignalingStatusOutcome::Stalled, SignalingStatusCode::Closed, reconnect_count);
+                                    break;
+                                }
                             }
                             Some(TreeCmd::Answer { to, sdp }) => {
                                 let msg = json!({ "t": "sdp", "streamId": stream_id, "to": to, "type": "answer", "sdp": sdp });
-                                if write.send(Message::Text(msg.to_string().into())).await.is_err() { break; }
+                                if write.send(Message::Text(msg.to_string().into())).await.is_err() {
+                                    emit_signaling_status(&status, SignalingStatusOutcome::Stalled, SignalingStatusCode::Closed, reconnect_count);
+                                    break;
+                                }
                             }
                             Some(TreeCmd::Ice { to, candidate }) => {
                                 let msg = json!({ "t": "ice", "streamId": stream_id, "to": to, "candidate": candidate });
-                                if write.send(Message::Text(msg.to_string().into())).await.is_err() { break; }
+                                if write.send(Message::Text(msg.to_string().into())).await.is_err() {
+                                    emit_signaling_status(&status, SignalingStatusOutcome::Stalled, SignalingStatusCode::Closed, reconnect_count);
+                                    break;
+                                }
                             }
                             Some(TreeCmd::Stats { to_child, available_outgoing }) => {
                                 let msg = json!({ "t": "stats", "streamId": stream_id, "toChild": to_child, "availableOutgoing": available_outgoing });
@@ -485,6 +709,71 @@ mod tests {
         assert!(close_invalidates_access(4001));
         assert!(!close_invalidates_access(4003));
         assert!(!close_invalidates_access(1006));
+    }
+
+    #[test]
+    fn native_watch_close_statuses_are_numeric_and_allowlisted() {
+        assert_eq!(close_status_code(Some(4001)), SignalingStatusCode::Unauthorized);
+        assert_eq!(close_status_code(Some(4003)), SignalingStatusCode::Forbidden);
+        assert_eq!(close_status_code(Some(1006)), SignalingStatusCode::Closed);
+        assert_eq!(close_status_code(None), SignalingStatusCode::Closed);
+        assert_eq!(SignalingStatusCode::Unauthorized.as_str(), "signaling_unauthorized");
+        assert_eq!(SignalingStatusCode::Forbidden.as_str(), "signaling_forbidden");
+        assert_eq!(SignalingStatusCode::Closed.as_str(), "signaling_closed");
+    }
+
+    #[test]
+    fn http_forbidden_is_terminal_without_invalidating_global_access() {
+        let unauthorized = classify_http_connect_failure(Some(401));
+        assert_eq!(unauthorized.code, SignalingStatusCode::Unauthorized);
+        assert!(unauthorized.invalidates_access);
+        assert!(!unauthorized.terminal);
+
+        let forbidden = classify_http_connect_failure(Some(403));
+        assert_eq!(forbidden.code, SignalingStatusCode::Forbidden);
+        assert!(!forbidden.invalidates_access);
+        assert!(forbidden.terminal);
+
+        let transport = classify_http_connect_failure(Some(503));
+        assert_eq!(transport.code, SignalingStatusCode::Closed);
+        assert!(!transport.invalidates_access);
+        assert!(!transport.terminal);
+    }
+
+    #[test]
+    fn signaling_success_requires_the_first_welcome_of_each_connection() {
+        let mut initial_confirmed = false;
+        assert_eq!(
+            confirm_welcome_status(&json!({ "t": "assign-parent" }), &mut initial_confirmed, 0),
+            None,
+        );
+        assert_eq!(
+            confirm_welcome_status(&json!({ "t": "welcome" }), &mut initial_confirmed, 0),
+            Some(SignalingStatusOutcome::Ok),
+        );
+        assert_eq!(
+            confirm_welcome_status(&json!({ "t": "welcome" }), &mut initial_confirmed, 0),
+            None,
+        );
+
+        let mut reconnect_confirmed = false;
+        assert_eq!(
+            confirm_welcome_status(&json!({ "t": "welcome" }), &mut reconnect_confirmed, 2),
+            Some(SignalingStatusOutcome::Recovered),
+        );
+    }
+
+    #[test]
+    fn native_watch_server_error_status_ignores_message_and_unknown_codes() {
+        let forbidden = json!({
+            "t": "error",
+            "code": "FORBIDDEN",
+            "message": "must-not-cross-the-status-bridge",
+        });
+        let unknown = json!({ "t": "error", "code": "SERVER_SUPPLIED", "message": "secret" });
+        assert_eq!(server_error_status_code(&forbidden), Some(SignalingStatusCode::Forbidden));
+        assert_eq!(server_error_status_code(&unknown), Some(SignalingStatusCode::Closed));
+        assert_eq!(server_error_status_code(&json!({ "t": "welcome" })), None);
     }
 
     #[tokio::test]

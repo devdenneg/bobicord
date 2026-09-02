@@ -1,5 +1,9 @@
 import type { Room } from 'livekit-client';
-import type { VideoTransport, TreeInfo, RtpStats, TreeTopology } from './videoTransport';
+import type {
+  VideoTransport, TreeInfo, RtpStats, TreeTopology,
+  StreamWatchTransportDiagnostic, StreamWatchTransportConnectionState,
+  StreamWatchTransportIceState, StreamWatchTransportTrackState,
+} from './videoTransport';
 import { MediaStreamVideoHandle } from './videoTransport';
 import type { StreamInfo } from '../engine';
 import { isTerminalSessionError } from '../api';
@@ -7,12 +11,12 @@ import {
   isTauri, isTerminalNativeTreeStartError, startNativeWatch, stopNativeWatch,
   nativeWatchAnswer, nativeWatchIce, nativeWatchReparent,
   onNativeWatchOffer, onNativeWatchIce, onNativeTopology, onNativeWatchEnded,
+  onNativeWatchStatus,
 } from '../native';
 import { freshTreeWsUrl, markTreeAccessRejected } from '../treeAuth';
 import { nextNativeWatchGeneration } from '../nativeWatchGeneration';
 import { DropWindow, shouldReparentOnDrops, DROP_COOLDOWN_MS } from './dropDetector';
 import { newStallState, shouldSelfHeal, STALL_COOLDOWN_MS, STALL_MS, type StallState } from './stallDetector';
-import { startViewerSession, endViewerSession } from '../diag';
 import { sampleRtcRecoveryStats, sampleRtcStats, type RtcRecoveryStatsUnavailable } from '../rtcStatsSampler';
 
 // Ёмкость нативного relay (passthrough) — сколько зрителей он ретранслирует. Rust держит
@@ -112,6 +116,22 @@ function applyJitterTarget(r: RTCRtpReceiver | null | undefined, targetMs: numbe
   try { rr.playoutDelayHint = targetMs / 1000; } catch { /**/ }   // legacy-имя Chrome (сек)
 }
 
+function diagnosticConnectionState(state: RTCPeerConnectionState): StreamWatchTransportConnectionState {
+  if (state === 'failed') return 'disconnected';
+  return state === 'new' || state === 'connecting' || state === 'connected'
+    || state === 'disconnected' || state === 'closed' ? state : 'unknown';
+}
+
+function diagnosticIceState(state: RTCIceConnectionState): StreamWatchTransportIceState {
+  return state === 'new' || state === 'checking' || state === 'connected' || state === 'completed'
+    || state === 'failed' || state === 'disconnected' || state === 'closed' ? state : 'unknown';
+}
+
+function diagnosticTrackState(track: MediaStreamTrack | null | undefined): StreamWatchTransportTrackState {
+  if (!track) return 'missing';
+  return track.readyState === 'live' || track.readyState === 'ended' ? track.readyState : 'unknown';
+}
+
 // Форс H.264 (инвариант 4) на видео-трансивере PC при приёме от родителя (receiver.track video).
 function preferH264(pc: RTCPeerConnection) {
   const caps = (window as any).RTCRtpReceiver?.getCapabilities?.('video');
@@ -199,6 +219,7 @@ export class TreeVideoTransport implements VideoTransport {
   private streamStopCbs = new Set<(identity: string) => void>();
   private videoTrackCbs = new Set<(key: string, track: MediaStreamVideoHandle, identity: string, isLocal: boolean) => void>();
   private videoTrackRemovedCbs = new Set<(key: string) => void>();
+  private watchDiagnosticCbs = new Set<(event: StreamWatchTransportDiagnostic) => void>();
 
   /* ---------- lifecycle ---------- */
   private readonly onDiscoveryReturn = () => { this.kickDiscovery(); };
@@ -372,8 +393,8 @@ export class TreeVideoTransport implements VideoTransport {
     if (this.discoveryWs) { try { this.discoveryWs.close(); } catch { /**/ } this.discoveryWs = null; }
     this.watches.forEach((_w, streamId) => this.unwatch(streamId));
     this.watches.clear();
-    // Pending browser starts are not in `watches` yet, but already own a diagnostic session and
-    // intent. Finish them through the same path before dropping their owner tokens.
+    // Pending browser starts are not in `watches` yet, but still own intent and async auth state.
+    // Cancel them through the same path before dropping their owner tokens.
     for (const streamId of [...this.browserWatchStarts.keys()]) this.unwatch(streamId);
     this.browserWatchStarts.clear();
     this.watchRetryTimers.forEach((timer) => clearTimeout(timer));
@@ -523,10 +544,7 @@ export class TreeVideoTransport implements VideoTransport {
     if (this.watches.has(streamId) || this.nativeWatches.has(streamId) || this.browserWatchStarts.has(streamId)) return;
     this.clearWatchRetry(streamId);
     this.intended.add(streamId); // намерение смотреть живёт ОТДЕЛЬНО от сокета (см. intended)
-    // Диагностика просмотра (diag.ts): freezeCount/потери раз в 2с, сдаётся на сервер в
-    // unwatch. PC берём лениво — он появится позже (после assign-parent / offer от Rust),
-    // и у нативного зрителя это другой объект (лупбек webview↔Rust).
-    startViewerSession(streamId, () => this.watches.get(streamId)?.pc ?? this.nativeWatches.get(streamId)?.pc ?? null);
+    this.emitWatchDiagnostic(streamId, { stage: 'watch_signaling', outcome: 'started', code: 'none' });
     // В Tauri видео/relay держит Rust (native passthrough): webview не джойнится в дерево
     // сам, а получает поток от локального Rust-пира через IPC (см. nativeWatch).
     if (isTauri) { this.nativeWatch(streamId, quality, pinned); return; }
@@ -536,10 +554,22 @@ export class TreeVideoTransport implements VideoTransport {
   }
 
   private async openBrowserWatch(streamId: string, quality: string, pinned: boolean, owner: symbol) {
+    const ownsStart = () => !this.closed && this.intended.has(streamId)
+      && this.browserWatchStarts.get(streamId) === owner;
+    if (!ownsStart()) return;
     let wsUrl: string;
+    this.emitWatchDiagnostic(streamId, { stage: 'watch_auth', outcome: 'started', code: 'none' });
     try {
       wsUrl = await freshTreeWsUrl();
     } catch (error) {
+      // A cancelled attempt (or its replacement) owns a different recorder. A late auth rejection
+      // from this abandoned generation must not contaminate the new timeline for the same stream.
+      if (!ownsStart()) return;
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_auth', outcome: 'failed',
+        code: isTerminalSessionError(error) ? 'signaling_unauthorized'
+          : (typeof navigator !== 'undefined' && navigator.onLine === false ? 'offline' : 'auth'),
+      });
       if (isTerminalSessionError(error)) {
         // A terminal refresh owns the same cleanup as an explicit cancellation: no orphan intent
         // or diagnostic timer may survive after the account session is gone.
@@ -550,10 +580,15 @@ export class TreeVideoTransport implements VideoTransport {
       return;
     }
     // unwatch/account/server teardown can win while native/browser auth refresh is in flight.
-    if (this.closed || !this.intended.has(streamId) || this.browserWatchStarts.get(streamId) !== owner) return;
+    if (!ownsStart()) return;
+    this.emitWatchDiagnostic(streamId, { stage: 'watch_auth', outcome: 'ok', code: 'none' });
     let ws: WebSocket;
     try { ws = new WebSocket(wsUrl); }
     catch {
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_signaling', outcome: 'failed',
+        code: typeof navigator !== 'undefined' && navigator.onLine === false ? 'offline' : 'network',
+      });
       this.scheduleBrowserWatchStartRetry(streamId, quality, pinned, owner);
       return;
     }
@@ -570,12 +605,25 @@ export class TreeVideoTransport implements VideoTransport {
     // iceServers для создаваемого затем peer connection.
     // Fallback: если welcome не пришёл за 1.5с — джойнимся всё равно (guard не даст дубль).
     ws.onopen = () => {
-      if (!st.closed && this.watches.get(streamId) === st) this.armWatchJoinFallback(streamId, st);
+      if (!st.closed && this.watches.get(streamId) === st) {
+        const reconnectCount = this.webReconnectAttempts.get(streamId) || 0;
+        this.emitWatchDiagnostic(streamId, {
+          stage: 'watch_signaling', outcome: 'ok', code: 'none', reconnectCount,
+          connectionState: 'connected',
+        });
+        this.armWatchJoinFallback(streamId, st);
+      }
     };
     ws.onmessage = (ev) => this.onWatchMessage(streamId, st, ev);
     ws.onclose = (ev) => {
       if (st.closed) return;
       if (ev.code === 4001) markTreeAccessRejected(wsUrl);
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_signaling', outcome: 'failed',
+        code: ev.code === 4001 ? 'signaling_unauthorized'
+          : ev.code === 4003 ? 'signaling_forbidden' : 'signaling_closed',
+        connectionState: 'closed', reconnectCount: this.webReconnectAttempts.get(streamId) || 0,
+      });
       // Стрим ещё жив → бесшовный реконнект: плитку держим (keepVideo), взводим failsafe.
       // Стрим кончился → полный снос (discovery уже снял liveStreams).
       const live = !this.closed && this.liveStreams.has(streamId);
@@ -587,19 +635,36 @@ export class TreeVideoTransport implements VideoTransport {
         this.armVideoFailsafe(streamId, 15000); // реконнект (сеть) медленнее смены качества
         const attempt = this.webReconnectAttempts.get(streamId) || 0;
         this.webReconnectAttempts.set(streamId, attempt + 1);
+        this.emitWatchDiagnostic(streamId, {
+          stage: 'watch_recovery', outcome: 'started', code: 'none', reconnectCount: attempt + 1,
+          connectionState: 'closed',
+        });
         const delay = Math.min(30_000, 1500 * 2 ** Math.min(attempt, 5));
         this.scheduleWatchRetry(streamId, delay, () => {
           if (!this.closed && this.intended.has(streamId) && !this.watches.has(streamId) && !this.nativeWatches.has(streamId) && this.liveStreams.has(streamId)) this.watch(streamId, st.quality, st.pinned);
         });
       }
     };
-    ws.onerror = () => { try { ws.close(); } catch { /**/ } };
+    ws.onerror = () => {
+      // close/unwatch may retire this exact socket before the browser delivers its queued error.
+      // Only the current watch owner may append to the active diagnostic attempt.
+      if (!st.closed && this.watches.get(streamId) === st) {
+        this.emitWatchDiagnostic(streamId, {
+          stage: 'watch_signaling', outcome: 'failed',
+          code: typeof navigator !== 'undefined' && navigator.onLine === false ? 'offline' : 'network',
+        });
+      }
+      try { ws.close(); } catch { /**/ }
+    };
   }
 
   private scheduleBrowserWatchStartRetry(streamId: string, quality: string, pinned: boolean, owner: symbol) {
     if (this.closed || !this.intended.has(streamId) || this.browserWatchStarts.get(streamId) !== owner) return;
     const attempt = this.webReconnectAttempts.get(streamId) || 0;
     this.webReconnectAttempts.set(streamId, attempt + 1);
+    this.emitWatchDiagnostic(streamId, {
+      stage: 'watch_recovery', outcome: 'started', code: 'none', reconnectCount: attempt + 1,
+    });
     const delay = Math.min(30_000, 1500 * 2 ** Math.min(attempt, 5));
     this.scheduleWatchRetry(streamId, delay, () => {
       if (this.closed || !this.intended.has(streamId)
@@ -621,7 +686,13 @@ export class TreeVideoTransport implements VideoTransport {
     if (st.joined || st.closed) return;
     st.joined = true;
     st.maxChildren = 0;
-    try { st.ws.send(JSON.stringify({ t: 'join', streamId, quality: st.quality, pinned: st.pinned, role: 'viewer', native: false, maxChildren: st.maxChildren, identity: this.me, symmetricNat: false, serverId: this.serverId })); } catch { /**/ }
+    this.emitWatchDiagnostic(streamId, { stage: 'watch_join', outcome: 'started', code: 'none' });
+    try {
+      st.ws.send(JSON.stringify({ t: 'join', streamId, quality: st.quality, pinned: st.pinned, role: 'viewer', native: false, maxChildren: st.maxChildren, identity: this.me, symmetricNat: false, serverId: this.serverId }));
+      this.emitWatchDiagnostic(streamId, { stage: 'watch_join', outcome: 'ok', code: 'none' });
+    } catch {
+      this.emitWatchDiagnostic(streamId, { stage: 'watch_join', outcome: 'failed', code: 'network' });
+    }
   }
 
   // opts.keepVideo — бесшовный режим (смена качества/self-heal/reconnect): watch сносится,
@@ -644,7 +715,6 @@ export class TreeVideoTransport implements VideoTransport {
     // Cancel a socket that is still behind the async access-refresh gate. The exact owner check in
     // openBrowserWatch prevents its late completion from resurrecting a user-cancelled tile.
     if (this.browserWatchStarts.delete(streamId)) {
-      endViewerSession(streamId);
       this.topologyByStream.delete(streamId);
       if (!keep) {
         this.lastJb.delete(streamId);
@@ -657,9 +727,6 @@ export class TreeVideoTransport implements VideoTransport {
     if (nst) { this.nativeUnwatch(streamId, nst, keep); return; }
     const st = this.watches.get(streamId);
     if (!st) {
-      // Записи уже нет (снёс teardownWatch при обрыве ws, а ре-watch не состоялся) — но диаг-сессия
-      // зрителя живёт отдельно и осталась бы висеть до закрытия вкладки вместе со своим тиком.
-      endViewerSession(streamId);
       this.topologyByStream.delete(streamId);
       if (!keep) {
         this.lastJb.delete(streamId);
@@ -668,9 +735,6 @@ export class TreeVideoTransport implements VideoTransport {
       }
       return;
     }
-    // Сессия закрывается ЗДЕСЬ, а не в teardownWatch: тот зовётся и при обрыве ws с
-    // последующим ре-watch — сдавали бы огрызок на каждый реконнект.
-    endViewerSession(streamId);
     st.closed = true;
     this.clearWatchStateTimers(st);
     try { st.ws.send(JSON.stringify({ t: 'leave' })); } catch { /**/ }
@@ -929,6 +993,10 @@ export class TreeVideoTransport implements VideoTransport {
         if (st.pc) { try { st.pc.close(); } catch { /**/ } st.pc = null; this.armVideoFailsafe(streamId); }
         st.parentId = msg.parentId || null;
         st.pendingIce.length = 0;
+        this.emitWatchDiagnostic(streamId, {
+          stage: 'watch_parent', outcome: st.parentId ? 'ok' : 'stalled',
+          code: st.parentId ? 'none' : 'no_parent',
+        });
         break;
       }
       case 'assign-child': {
@@ -940,7 +1008,10 @@ export class TreeVideoTransport implements VideoTransport {
       }
       case 'sdp': {
         // Единственный upstream — от родителя (мы всегда лист, детей не обслуживаем).
-        if (msg.from === st.parentId && msg.type === 'offer') { this.onParentOffer(streamId, st, msg.sdp); }
+        if (msg.from === st.parentId && msg.type === 'offer') {
+          this.emitWatchDiagnostic(streamId, { stage: 'watch_negotiation', outcome: 'started', code: 'none' });
+          void this.onParentOffer(streamId, st, msg.sdp);
+        }
         break;
       }
       case 'ice': {
@@ -949,7 +1020,14 @@ export class TreeVideoTransport implements VideoTransport {
         if (!parentId || msg.from !== parentId) return;
         const pc = st.pc;
         const parentGeneration = st.parentGeneration;
-        if (pc && pc.remoteDescription) pc.addIceCandidate(msg.candidate).catch(() => {});
+        if (pc && pc.remoteDescription) pc.addIceCandidate(msg.candidate).catch(() => {
+          if (!st.closed && this.watches.get(streamId) === st && st.pc === pc
+            && st.parentGeneration === parentGeneration) this.emitWatchDiagnostic(streamId, {
+            stage: 'watch_negotiation', outcome: 'failed', code: 'ice_failed',
+            connectionState: diagnosticConnectionState(pc.connectionState),
+            iceState: diagnosticIceState(pc.iceConnectionState),
+          });
+        });
         else if (st.pendingIce.length < 128) st.pendingIce.push({ parentId, parentGeneration, candidate: msg.candidate });
         break;
       }
@@ -997,6 +1075,13 @@ export class TreeVideoTransport implements VideoTransport {
         this.renditionUnavailableCbs.forEach((cb) => cb(streamId, msg.rendition || '', msg.reason || ''));
         break;
       }
+      case 'error': {
+        this.emitWatchDiagnostic(streamId, {
+          stage: 'watch_signaling', outcome: 'failed',
+          code: msg.code === 'FORBIDDEN' ? 'signaling_forbidden' : 'signaling_closed',
+        });
+        break;
+      }
     }
   }
 
@@ -1037,20 +1122,47 @@ export class TreeVideoTransport implements VideoTransport {
     const offerGeneration = ++st.offerGeneration;
     this.clearWatchReparentTimer(st);
     if (st.pc) { try { st.pc.close(); } catch { /**/ } }
-    const pc = new RTCPeerConnection({ iceServers: st.iceServers.length ? st.iceServers : DEFAULT_ICE_SERVERS });
+    let pc: RTCPeerConnection;
+    try {
+      pc = new RTCPeerConnection({ iceServers: st.iceServers.length ? st.iceServers : DEFAULT_ICE_SERVERS });
+    } catch {
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_negotiation', outcome: 'failed', code: 'negotiation_failed',
+        connectionState: 'unknown', iceState: 'unknown',
+      });
+      return;
+    }
     st.pc = pc;
     const ownsOffer = () => !st.closed && this.watches.get(streamId) === st && st.pc === pc
       && st.parentId === parentId && st.parentGeneration === parentGeneration
       && st.offerGeneration === offerGeneration;
     pc.onicecandidate = (e) => {
       if (!e.candidate || !ownsOffer()) return;
-      try { st.ws.send(JSON.stringify({ t: 'ice', streamId, to: parentId, candidate: e.candidate })); } catch { /**/ }
+      try { st.ws.send(JSON.stringify({ t: 'ice', streamId, to: parentId, candidate: e.candidate })); }
+      catch {
+        this.emitWatchDiagnostic(streamId, {
+          stage: 'watch_negotiation', outcome: 'failed', code: 'ice_failed',
+          connectionState: diagnosticConnectionState(pc.connectionState),
+          iceState: diagnosticIceState(pc.iceConnectionState),
+        });
+      }
     };
     // Обрыв upstream при живом WS: сервер об этом не узнает, картинка фризит. Просим
     // reparent — сервер даст другого родителя или реаттачит к тому же (свежий PC). failed
     // сразу; disconnected может само восстановиться (ICE), даём 5с.
     pc.onconnectionstatechange = () => {
       if (!ownsOffer()) return;
+      const connectionState = diagnosticConnectionState(pc.connectionState);
+      const outcome = pc.connectionState === 'connected' ? 'ok'
+        : pc.connectionState === 'failed' ? 'failed'
+          : pc.connectionState === 'disconnected' ? 'stalled'
+            : pc.connectionState === 'closed' ? 'cancelled' : 'started';
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_negotiation', outcome,
+        code: pc.connectionState === 'failed' ? 'ice_failed'
+          : pc.connectionState === 'disconnected' || pc.connectionState === 'closed' ? 'disconnected' : 'none',
+        connectionState, iceState: diagnosticIceState(pc.iceConnectionState),
+      });
       if (pc.connectionState === 'failed') {
         this.clearWatchReparentTimer(st);
         this.requestReparent(streamId, null);
@@ -1069,12 +1181,48 @@ export class TreeVideoTransport implements VideoTransport {
         st.reparentTimer = timer;
       } else this.clearWatchReparentTimer(st);
     };
+    pc.oniceconnectionstatechange = () => {
+      if (!ownsOffer()) return;
+      const iceState = diagnosticIceState(pc.iceConnectionState);
+      const outcome = pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed' ? 'ok'
+        : pc.iceConnectionState === 'failed' ? 'failed'
+          : pc.iceConnectionState === 'disconnected' ? 'stalled'
+            : pc.iceConnectionState === 'closed' ? 'cancelled' : 'started';
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_negotiation', outcome,
+        code: pc.iceConnectionState === 'failed' ? 'ice_failed'
+          : pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'closed' ? 'disconnected' : 'none',
+        connectionState: diagnosticConnectionState(pc.connectionState), iceState,
+      });
+    };
     pc.ontrack = (e) => {
       if (!ownsOffer()) return;
+      const reconnectCount = this.webReconnectAttempts.get(streamId) || 0;
       this.webReconnectAttempts.delete(streamId);
       this.applyJitter(streamId);
       // Оба kind в контейнер: аудио стрима едет тем же <video> (см. upsertTrack).
       this.upsertTrack(streamId, e.track);
+      if (e.track.kind === 'video') {
+        this.emitWatchDiagnostic(streamId, {
+          stage: 'watch_track', outcome: 'ok', code: 'none',
+          connectionState: diagnosticConnectionState(pc.connectionState),
+          iceState: diagnosticIceState(pc.iceConnectionState),
+          trackState: diagnosticTrackState(e.track), reconnectCount,
+        });
+        if (reconnectCount > 0) this.emitWatchDiagnostic(streamId, {
+          stage: 'watch_recovery', outcome: 'recovered', code: 'none', reconnectCount,
+          connectionState: diagnosticConnectionState(pc.connectionState),
+          iceState: diagnosticIceState(pc.iceConnectionState), trackState: diagnosticTrackState(e.track),
+        });
+        e.track.addEventListener('ended', () => {
+          if (!ownsOffer()) return;
+          this.emitWatchDiagnostic(streamId, {
+            stage: 'watch_track', outcome: 'stalled', code: 'track_missing', trackState: 'ended',
+            connectionState: diagnosticConnectionState(pc.connectionState),
+            iceState: diagnosticIceState(pc.iceConnectionState),
+          });
+        }, { once: true });
+      }
     };
     try {
       await pc.setRemoteDescription({ type: 'offer', sdp });
@@ -1082,7 +1230,13 @@ export class TreeVideoTransport implements VideoTransport {
       const pendingIce = st.pendingIce.splice(0)
         .filter((entry) => entry.parentId === parentId && entry.parentGeneration === parentGeneration);
       for (const entry of pendingIce) {
-        await pc.addIceCandidate(entry.candidate).catch(() => {});
+        await pc.addIceCandidate(entry.candidate).catch(() => {
+          if (ownsOffer()) this.emitWatchDiagnostic(streamId, {
+            stage: 'watch_negotiation', outcome: 'failed', code: 'ice_failed',
+            connectionState: diagnosticConnectionState(pc.connectionState),
+            iceState: diagnosticIceState(pc.iceConnectionState),
+          });
+        });
         if (!ownsOffer()) return;
       }
       preferH264(pc);
@@ -1091,7 +1245,19 @@ export class TreeVideoTransport implements VideoTransport {
       await pc.setLocalDescription(answer);
       if (!ownsOffer()) return;
       st.ws.send(JSON.stringify({ t: 'sdp', streamId, to: parentId, type: 'answer', sdp: pc.localDescription!.sdp }));
-    } catch { /**/ }
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_negotiation', outcome: 'ok', code: 'none',
+        connectionState: diagnosticConnectionState(pc.connectionState),
+        iceState: diagnosticIceState(pc.iceConnectionState),
+      });
+    } catch {
+      if (!ownsOffer()) return;
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_negotiation', outcome: 'failed', code: 'negotiation_failed',
+        connectionState: diagnosticConnectionState(pc.connectionState),
+        iceState: diagnosticIceState(pc.iceConnectionState),
+      });
+    }
   }
 
   /* ---------- native watch (Tauri: Rust держит upstream+relay, webview рендерит) ---------- */
@@ -1101,17 +1267,32 @@ export class TreeVideoTransport implements VideoTransport {
       pc: null, unlisten: [], closed: false, stopped: false, pendingIce: [], quality, pinned,
     };
     this.nativeWatches.set(streamId, st);
+    this.emitWatchDiagnostic(streamId, { stage: 'watch_listeners', outcome: 'started', code: 'none' });
     const offCb = (sid: string, generation: number, sdp: string) => {
-      if (sid === streamId && generation === st.generation && !st.closed) this.onNativeOffer(streamId, st, sdp);
+      if (sid === streamId && generation === st.generation && !st.closed) {
+        void this.onNativeOffer(streamId, st, sdp);
+      }
     };
     const iceCb = (sid: string, generation: number, candidate: any) => {
       if (sid !== streamId || generation !== st.generation || !candidate || st.closed) return;
-      if (st.pc && st.pc.remoteDescription) st.pc.addIceCandidate(candidate).catch(() => {});
+      if (st.pc && st.pc.remoteDescription) st.pc.addIceCandidate(candidate).catch(() => {
+        if (this.nativeWatches.get(streamId) === st && !st.closed) this.emitWatchDiagnostic(streamId, {
+          stage: 'watch_negotiation', outcome: 'failed', code: 'ice_failed',
+          connectionState: diagnosticConnectionState(st.pc?.connectionState ?? 'closed'),
+          iceState: diagnosticIceState(st.pc?.iceConnectionState ?? 'closed'),
+        });
+      });
       else if (st.pendingIce.length < 128) st.pendingIce.push(candidate);
     };
     const topoCb = (payload: any) => {
       if (payload && payload.streamId === streamId && payload.generation === st.generation && !st.closed) {
-        this.setTopology(streamId, { you: payload.you ?? null, nodes: payload.nodes || [] });
+        const topology = { you: payload.you ?? null, nodes: payload.nodes || [] };
+        this.setTopology(streamId, topology);
+        const you = topology.you ? topology.nodes.find((node: any) => node.id === topology.you) : null;
+        this.emitWatchDiagnostic(streamId, {
+          stage: 'watch_parent', outcome: you?.parentId ? 'ok' : 'stalled',
+          code: you?.parentId ? 'none' : 'no_parent',
+        });
       }
     };
     // onNativeWatchEnded может прийти СПУРИОЗНО: остановка СВОЕЙ трансляции (или свитч) сбрасывает
@@ -1121,6 +1302,10 @@ export class TreeVideoTransport implements VideoTransport {
     // мёртвый локальный watch; если стрим по discovery ещё жив — тут же переустанавливаем (авто-recovery).
     const endCb = (sid: string, generation: number) => {
       if (sid !== streamId || generation !== st.generation || st.closed) return;
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_recovery', outcome: 'stalled', code: 'signaling_closed',
+        reconnectCount: this.reWatchAttempts.get(streamId) || 0,
+      });
       // Стрим по discovery ещё жив → бесшовно (плитку держим, тут же переустановим watch).
       const live = !this.closed && this.liveStreams.has(streamId);
       this.unwatch(streamId, { keepVideo: live });
@@ -1132,6 +1317,17 @@ export class TreeVideoTransport implements VideoTransport {
       this.scheduleNativeWatchRetry(streamId, st.quality, st.pinned);
     };
     const ownsStream = () => !st.closed && this.nativeWatches.get(streamId) === st;
+    const statusCb = (status: Parameters<Parameters<typeof onNativeWatchStatus>[0]>[0]) => {
+      // Rust emits the local routing key and generation only so this exact JS owner can accept the
+      // status. emitWatchDiagnostic rebuilds a fixed object and never persists either value.
+      if (status.streamId !== streamId || status.generation !== st.generation || !ownsStream()) return;
+      this.emitWatchDiagnostic(streamId, {
+        stage: status.stage,
+        outcome: status.outcome,
+        code: status.code,
+        ...(status.reconnectCount === undefined ? {} : { reconnectCount: status.reconnectCount }),
+      });
+    };
     const retainListener = async (pending: Promise<() => void>): Promise<boolean> => {
       const unlisten = await pending;
       // An explicit unwatch or a newer quality generation may win while Tauri registers the
@@ -1153,8 +1349,14 @@ export class TreeVideoTransport implements VideoTransport {
       if (!await retainListener(onNativeWatchIce(iceCb))) return;
       if (!await retainListener(onNativeTopology(topoCb))) return;
       if (!await retainListener(onNativeWatchEnded(endCb))) return;
+      if (!await retainListener(onNativeWatchStatus(statusCb))) return;
+      this.emitWatchDiagnostic(streamId, { stage: 'watch_listeners', outcome: 'ok', code: 'none' });
     } catch {
       const current = ownsStream();
+      if (current) this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_listeners', outcome: 'failed', code: 'listener_failed',
+        reconnectCount: this.reWatchAttempts.get(streamId) || 0,
+      });
       const live = current && !this.closed && this.intended.has(streamId)
         && this.liveStreams.has(streamId);
       this.nativeUnwatch(streamId, st, live);
@@ -1189,11 +1391,15 @@ export class TreeVideoTransport implements VideoTransport {
       if (trusted) availableOutgoing = Math.round(cached!.bweKbps * 1000);
       else if (!cached) void measureUpload().catch(() => {}); // прогрев кэша, fire-and-forget
     } catch { /**/ }
+    this.emitWatchDiagnostic(streamId, { stage: 'watch_auth', outcome: 'started', code: 'none' });
+    this.emitWatchDiagnostic(streamId, { stage: 'watch_native_start', outcome: 'started', code: 'none' });
     try {
       await startNativeWatch(streamId, st.generation, this.me, this.serverId, NATIVE_RELAY_CAPACITY, st.quality, st.pinned, availableOutgoing);
       // unwatch/quality switch may win at any await above. Rust's generation tombstone prevents the
       // late command from creating a slot; this owner fence prevents stale JS continuation work.
       if (st.closed || this.nativeWatches.get(streamId) !== st) return;
+      this.emitWatchDiagnostic(streamId, { stage: 'watch_auth', outcome: 'ok', code: 'none' });
+      this.emitWatchDiagnostic(streamId, { stage: 'watch_native_start', outcome: 'ok', code: 'none' });
     }
     catch (error) {
       const ownsStream = this.nativeWatches.get(streamId) === st;
@@ -1204,6 +1410,12 @@ export class TreeVideoTransport implements VideoTransport {
         return;
       }
       const terminal = isTerminalSessionError(error) || isTerminalNativeTreeStartError(error);
+      this.emitWatchDiagnostic(streamId, {
+        stage: terminal ? 'watch_auth' : 'watch_native_start', outcome: 'failed',
+        code: terminal ? 'signaling_unauthorized'
+          : (typeof navigator !== 'undefined' && navigator.onLine === false ? 'offline' : 'native_start_failed'),
+        reconnectCount: this.reWatchAttempts.get(streamId) || 0,
+      });
       const live = !terminal && !this.closed && this.intended.has(streamId)
         && this.liveStreams.has(streamId);
       if (terminal) this.intended.delete(streamId);
@@ -1218,6 +1430,9 @@ export class TreeVideoTransport implements VideoTransport {
   private scheduleNativeWatchRetry(streamId: string, quality: string, pinned: boolean) {
     const attempt = this.reWatchAttempts.get(streamId) || 0;
     this.reWatchAttempts.set(streamId, attempt + 1);
+    this.emitWatchDiagnostic(streamId, {
+      stage: 'watch_recovery', outcome: 'started', code: 'none', reconnectCount: attempt + 1,
+    });
     const delay = Math.min(30_000, 1500 * 2 ** Math.min(attempt, 5));
     this.scheduleWatchRetry(streamId, delay, () => {
       if (!this.closed && this.intended.has(streamId) && this.liveStreams.has(streamId)
@@ -1229,19 +1444,88 @@ export class TreeVideoTransport implements VideoTransport {
   private async onNativeOffer(streamId: string, st: NativeWatchState, sdp: string) {
     if (st.closed || this.nativeWatches.get(streamId) !== st) return;
     if (st.pc) { try { st.pc.close(); } catch { /**/ } }
-    const pc = new RTCPeerConnection({ iceServers: this.iceServers.length ? this.iceServers : DEFAULT_ICE_SERVERS });
+    this.emitWatchDiagnostic(streamId, {
+      stage: 'watch_negotiation', outcome: 'started', code: 'none',
+      reconnectCount: this.reWatchAttempts.get(streamId) || 0,
+    });
+    let pc: RTCPeerConnection;
+    try {
+      pc = new RTCPeerConnection({ iceServers: this.iceServers.length ? this.iceServers : DEFAULT_ICE_SERVERS });
+    } catch {
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_negotiation', outcome: 'failed', code: 'negotiation_failed',
+        connectionState: 'unknown', iceState: 'unknown',
+      });
+      return;
+    }
     st.pc = pc;
     const ownsOffer = () => !st.closed && this.nativeWatches.get(streamId) === st && st.pc === pc;
     pc.onicecandidate = (e) => {
       if (e.candidate && ownsOffer()) {
-        nativeWatchIce(streamId, st.generation, e.candidate).catch(() => {});
+        nativeWatchIce(streamId, st.generation, e.candidate).catch(() => {
+          if (ownsOffer()) this.emitWatchDiagnostic(streamId, {
+            stage: 'watch_negotiation', outcome: 'failed', code: 'ice_failed',
+            connectionState: diagnosticConnectionState(pc.connectionState),
+            iceState: diagnosticIceState(pc.iceConnectionState),
+          });
+        });
       }
+    };
+    pc.onconnectionstatechange = () => {
+      if (!ownsOffer()) return;
+      const connectionState = diagnosticConnectionState(pc.connectionState);
+      const outcome = pc.connectionState === 'connected' ? 'ok'
+        : pc.connectionState === 'failed' ? 'failed'
+          : pc.connectionState === 'disconnected' ? 'stalled'
+            : pc.connectionState === 'closed' ? 'cancelled' : 'started';
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_negotiation', outcome,
+        code: pc.connectionState === 'failed' ? 'ice_failed'
+          : pc.connectionState === 'disconnected' || pc.connectionState === 'closed' ? 'disconnected' : 'none',
+        connectionState, iceState: diagnosticIceState(pc.iceConnectionState),
+      });
+    };
+    pc.oniceconnectionstatechange = () => {
+      if (!ownsOffer()) return;
+      const iceState = diagnosticIceState(pc.iceConnectionState);
+      const outcome = pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed' ? 'ok'
+        : pc.iceConnectionState === 'failed' ? 'failed'
+          : pc.iceConnectionState === 'disconnected' ? 'stalled'
+            : pc.iceConnectionState === 'closed' ? 'cancelled' : 'started';
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_negotiation', outcome,
+        code: pc.iceConnectionState === 'failed' ? 'ice_failed'
+          : pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'closed' ? 'disconnected' : 'none',
+        connectionState: diagnosticConnectionState(pc.connectionState), iceState,
+      });
     };
     pc.ontrack = (e) => {
       if (!ownsOffer()) return;
+      const reconnectCount = this.reWatchAttempts.get(streamId) || 0;
       this.reWatchAttempts.delete(streamId); // картинка пошла — прошлые неудачные круги не в счёт
       this.applyJitter(streamId);
       this.upsertTrack(streamId, e.track);
+      if (e.track.kind === 'video') {
+        this.emitWatchDiagnostic(streamId, {
+          stage: 'watch_track', outcome: 'ok', code: 'none',
+          connectionState: diagnosticConnectionState(pc.connectionState),
+          iceState: diagnosticIceState(pc.iceConnectionState),
+          trackState: diagnosticTrackState(e.track), reconnectCount,
+        });
+        if (reconnectCount > 0) this.emitWatchDiagnostic(streamId, {
+          stage: 'watch_recovery', outcome: 'recovered', code: 'none', reconnectCount,
+          connectionState: diagnosticConnectionState(pc.connectionState),
+          iceState: diagnosticIceState(pc.iceConnectionState), trackState: diagnosticTrackState(e.track),
+        });
+        e.track.addEventListener('ended', () => {
+          if (!ownsOffer()) return;
+          this.emitWatchDiagnostic(streamId, {
+            stage: 'watch_track', outcome: 'stalled', code: 'track_missing', trackState: 'ended',
+            connectionState: diagnosticConnectionState(pc.connectionState),
+            iceState: diagnosticIceState(pc.iceConnectionState),
+          });
+        }, { once: true });
+      }
     };
     try {
       await pc.setRemoteDescription({ type: 'offer', sdp });
@@ -1250,7 +1534,13 @@ export class TreeVideoTransport implements VideoTransport {
       if (!ownsOffer()) return;
       const pendingIce = st.pendingIce.splice(0);
       for (const candidate of pendingIce) {
-        await pc.addIceCandidate(candidate).catch(() => {});
+        await pc.addIceCandidate(candidate).catch(() => {
+          if (ownsOffer()) this.emitWatchDiagnostic(streamId, {
+            stage: 'watch_negotiation', outcome: 'failed', code: 'ice_failed',
+            connectionState: diagnosticConnectionState(pc.connectionState),
+            iceState: diagnosticIceState(pc.iceConnectionState),
+          });
+        });
         if (!ownsOffer()) return;
       }
       preferH264(pc);
@@ -1259,7 +1549,20 @@ export class TreeVideoTransport implements VideoTransport {
       await pc.setLocalDescription(answer);
       if (!ownsOffer()) return;
       await nativeWatchAnswer(streamId, st.generation, pc.localDescription!.sdp);
-    } catch { /**/ }
+      if (!ownsOffer()) return;
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_negotiation', outcome: 'ok', code: 'none',
+        connectionState: diagnosticConnectionState(pc.connectionState),
+        iceState: diagnosticIceState(pc.iceConnectionState),
+      });
+    } catch {
+      if (!ownsOffer()) return;
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_negotiation', outcome: 'failed', code: 'negotiation_failed',
+        connectionState: diagnosticConnectionState(pc.connectionState),
+        iceState: diagnosticIceState(pc.iceConnectionState),
+      });
+    }
   }
   private nativeUnwatch(streamId: string, st: NativeWatchState, keepVideo = false) {
     const ownsStream = this.nativeWatches.get(streamId) === st;
@@ -1275,7 +1578,6 @@ export class TreeVideoTransport implements VideoTransport {
       stopNativeWatch(streamId, st.generation).catch(() => {});
     }
     if (!ownsStream) return;
-    endViewerSession(streamId);
     this.nativeWatches.delete(streamId);
     this.treeInfoByStream.delete(streamId);
     this.lastJb.delete(streamId);
@@ -1360,6 +1662,11 @@ export class TreeVideoTransport implements VideoTransport {
     this.videoFailsafe.set(streamId, window.setTimeout(() => {
       this.videoFailsafe.delete(streamId);
       if (!this.videoTracks.has(streamId)) return; // плитки уже нет — нечего сносить
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_recovery', outcome: 'timed_out', code: 'decode_timeout',
+        trackState: 'missing', reconnectCount: this.webReconnectAttempts.get(streamId)
+          || this.reWatchAttempts.get(streamId) || 0,
+      });
       this.containers.delete(streamId);
       this.delVideo(streamId);
       this.switchFailedCbs.forEach((cb) => cb(streamId));
@@ -1383,4 +1690,33 @@ export class TreeVideoTransport implements VideoTransport {
   onStreamStop(cb: (identity: string) => void) { this.streamStopCbs.add(cb); return () => { this.streamStopCbs.delete(cb); }; }
   onVideoTrack(cb: (key: string, track: MediaStreamVideoHandle, identity: string, isLocal: boolean) => void) { this.videoTrackCbs.add(cb); return () => { this.videoTrackCbs.delete(cb); }; }
   onVideoTrackRemoved(cb: (key: string) => void) { this.videoTrackRemovedCbs.add(cb); return () => { this.videoTrackRemovedCbs.delete(cb); }; }
+  onWatchDiagnostic(cb: (event: StreamWatchTransportDiagnostic) => void) {
+    this.watchDiagnosticCbs.add(cb);
+    return () => { this.watchDiagnosticCbs.delete(cb); };
+  }
+
+  private emitWatchDiagnostic(
+    streamId: string,
+    event: Omit<StreamWatchTransportDiagnostic, 'streamId' | 'streamTransport'>,
+  ) {
+    // Never forward caller-owned objects or transport payloads. In particular, SDP, candidates,
+    // URLs, peer identities and raw errors cannot enter this fixed projection.
+    const diagnostic: StreamWatchTransportDiagnostic = {
+      streamId,
+      stage: event.stage,
+      outcome: event.outcome,
+      code: event.code,
+      streamTransport: isTauri ? 'tree_native' : 'tree_web',
+    };
+    if (event.connectionState !== undefined) diagnostic.connectionState = event.connectionState;
+    if (event.iceState !== undefined) diagnostic.iceState = event.iceState;
+    if (event.trackState !== undefined) diagnostic.trackState = event.trackState;
+    if (event.reconnectCount !== undefined) {
+      diagnostic.reconnectCount = Number.isFinite(event.reconnectCount)
+        ? Math.max(0, Math.min(1000, Math.trunc(event.reconnectCount))) : 0;
+    }
+    this.watchDiagnosticCbs.forEach((cb) => {
+      try { cb({ ...diagnostic }); } catch { /** diagnostics must not destabilize playback */ }
+    });
+  }
 }

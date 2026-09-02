@@ -297,6 +297,70 @@ export async function onNativeWatchEnded(cb: (streamId: string, generation: numb
   return un;
 }
 
+export type NativeWatchStatusStage =
+  | 'watch_native_start' | 'watch_signaling' | 'watch_parent'
+  | 'watch_negotiation' | 'watch_track' | 'watch_recovery';
+export type NativeWatchStatusOutcome = 'started' | 'ok' | 'failed' | 'stalled' | 'recovered';
+export type NativeWatchStatusCode =
+  | 'none' | 'native_start_failed' | 'signaling_unauthorized' | 'signaling_forbidden'
+  | 'signaling_closed' | 'no_parent' | 'negotiation_failed' | 'ice_failed' | 'track_missing';
+export interface NativeWatchStatus {
+  /** Local routing key only. Strip it before building any server diagnostic event. */
+  streamId: string;
+  generation: number;
+  stage: NativeWatchStatusStage;
+  outcome: NativeWatchStatusOutcome;
+  code: NativeWatchStatusCode;
+  reconnectCount?: number;
+}
+
+const NATIVE_WATCH_STATUS_STAGES = new Set<NativeWatchStatusStage>([
+  'watch_native_start', 'watch_signaling', 'watch_parent',
+  'watch_negotiation', 'watch_track', 'watch_recovery',
+]);
+const NATIVE_WATCH_STATUS_OUTCOMES = new Set<NativeWatchStatusOutcome>([
+  'started', 'ok', 'failed', 'stalled', 'recovered',
+]);
+const NATIVE_WATCH_STATUS_CODES = new Set<NativeWatchStatusCode>([
+  'none', 'native_start_failed', 'signaling_unauthorized', 'signaling_forbidden',
+  'signaling_closed', 'no_parent', 'negotiation_failed', 'ice_failed', 'track_missing',
+]);
+
+/** Accept only the fixed Rust wire vocabulary and construct a fresh object. Unknown fields (which
+ * could accidentally contain SDP/ICE, an address or a raw error) never cross this bridge. */
+export function normalizeNativeWatchStatusPayload(value: unknown): NativeWatchStatus | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.streamId !== 'string' || !raw.streamId || raw.streamId.length > 128) return null;
+  if (!Number.isSafeInteger(raw.generation) || Number(raw.generation) <= 0) return null;
+  if (!NATIVE_WATCH_STATUS_STAGES.has(raw.stage as NativeWatchStatusStage)
+    || !NATIVE_WATCH_STATUS_OUTCOMES.has(raw.outcome as NativeWatchStatusOutcome)
+    || !NATIVE_WATCH_STATUS_CODES.has(raw.code as NativeWatchStatusCode)) return null;
+  const status: NativeWatchStatus = {
+    streamId: raw.streamId,
+    generation: Number(raw.generation),
+    stage: raw.stage as NativeWatchStatusStage,
+    outcome: raw.outcome as NativeWatchStatusOutcome,
+    code: raw.code as NativeWatchStatusCode,
+  };
+  if (raw.reconnectCount !== undefined) {
+    if (!Number.isSafeInteger(raw.reconnectCount) || Number(raw.reconnectCount) < 0) return null;
+    status.reconnectCount = Number(raw.reconnectCount);
+  }
+  return status;
+}
+
+/** Structured native watch telemetry. `streamId` is only for selecting the current local watch;
+ * consumers must not include it in the diagnostic event sent to the server. */
+export async function onNativeWatchStatus(cb: (status: NativeWatchStatus) => void): Promise<() => void> {
+  const { listen } = await import('@tauri-apps/api/event');
+  const un = await listen<unknown>('relay-watch-status', (e) => {
+    const status = normalizeNativeWatchStatusPayload(e.payload);
+    if (status) cb(status);
+  });
+  return un;
+}
+
 /* ---------- диагностика: лог сессии из Rust (diag.rs) ---------- */
 
 /** Забирает и очищает кольцевой буфер лога текущей сессии (включая строки webrtc-rs:

@@ -14,8 +14,29 @@ assert.match(engine, /VOICE_DIAGNOSTIC_REPORT_COOLDOWN_MS = 15_000[\s\S]*VOICE_D
   'diagnostic admission remains cooled down and bounded');
 assert.match(engine, /if \(!this\.voiceDiagnosticAccountActive \|\| this\.voiceDiagnosticReportInFlight\) return false/,
   'physical uploads remain single-flight for the account');
-assert.equal((engine.match(/api\.submitVoiceDiagnostic\(/g) || []).length, 1,
-  'all incidents pass through one privacy-safe upload gate');
+const voiceUploadGate = engine.match(/private beginVoiceDiagnosticUpload\([\s\S]*?\n  }\n\n  private drainQueuedVoiceDiagnostic/)?.[0] || '';
+assert.equal((voiceUploadGate.match(/api\.submitVoiceDiagnostic\(/g) || []).length, 1,
+  'all voice incidents pass through one privacy-safe upload gate');
+assert.match(engine, /new DiagnosticReportOutbox\([\s\S]*?api\.submitVoiceDiagnostic\(report\)/,
+  'stream watch reports use the same fixed-schema authenticated endpoint');
+assert.match(engine, /async connect\([\s\S]*streamDiagnosticOutbox\.start\(\)[\s\S]*ensureOutputLifecycleListeners/,
+  'a reused Engine restarts durable diagnostic delivery after a full server disconnect');
+assert.match(engine, /beginStreamWatchDiagnostic[\s\S]*stream_watch_started[\s\S]*recordStreamWatchTransportDiagnostic/,
+  'one structured timeline starts at the exact viewer click and receives transport progress');
+assert.match(engine, /finishStreamWatchDiagnostic[\s\S]*streamDiagnosticOutbox\.enqueue/,
+  'a terminal stream result is persisted before its upload starts');
+assert.match(engine, /const attempt = this\.streamWatchDiagnostics\.get\(event\.streamId\);[\s\S]*attempt\.recorder\.record\(\{[\s\S]*kind:/,
+  'the broadcaster identity is consumed only as a local routing key');
+assert.match(engine, /confirmWatchPlayback[\s\S]*stream_watch_recovered[\s\S]*stream_watch_succeeded/,
+  'the first playable frame always emits a success or recovered control report');
+assert.match(engine, /decode_timeout[\s\S]*clearWatch\(identity, true\)/,
+  'the exact 20 second watch owner records its terminal timeout before cleanup');
+assert.match(engine, /closeWatch\(identity: string\)[\s\S]*pendingWatch\.has\(identity\)[\s\S]*stream_watch_failed[\s\S]*outcome: 'cancelled'[\s\S]*code: 'aborted'[\s\S]*clearWatch\(identity, true\)/,
+  'closing a still-pending tile preserves the failed attempt before exact transport cleanup');
+assert.match(engine, /clearAllWatches\([\s\S]*const failure = unexpectedFailure \?\?[\s\S]*outcome: 'cancelled'[\s\S]*code: 'aborted'[\s\S]*finishStreamWatchDiagnostic\(identity, 'stream_watch_failed', failure\)/,
+  'server exit and ordinary engine teardown preserve every pending watch timeline');
+assert.match(engine, /if \(wasViewing\)[\s\S]*clearAllWatches\(\{[\s\S]*watch_signaling[\s\S]*signaling_closed/,
+  'an unexpected room loss persists pending watch attempts before transport teardown');
 
 for (const event of [
   'join_started', 'intent_finished', 'hub_connected', 'lease_claimed',

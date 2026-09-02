@@ -179,6 +179,38 @@ struct NativeWatchRegistry {
 
 struct WatchState(Mutex<NativeWatchRegistry>);
 
+#[derive(Clone, Copy)]
+enum NativeWatchStartStatus {
+  Started,
+  Unauthorized,
+  SignalingClosed,
+  Failed,
+}
+
+fn emit_native_watch_status(
+  app: &tauri::AppHandle,
+  stream_id: &str,
+  generation: u64,
+  status: NativeWatchStartStatus,
+) {
+  use tauri::Emitter;
+  // Exhaustive local enums are the only source of wire strings. Never forward a native auth error,
+  // URL, token or other transport detail through this renderer-facing event.
+  let (outcome, code) = match status {
+    NativeWatchStartStatus::Started => ("started", "none"),
+    NativeWatchStartStatus::Unauthorized => ("failed", "signaling_unauthorized"),
+    NativeWatchStartStatus::SignalingClosed => ("failed", "signaling_closed"),
+    NativeWatchStartStatus::Failed => ("failed", "native_start_failed"),
+  };
+  let _ = app.emit("relay-watch-status", serde_json::json!({
+    "streamId": stream_id,
+    "generation": generation,
+    "stage": "watch_native_start",
+    "outcome": outcome,
+    "code": code,
+  }));
+}
+
 fn native_watch_generation_is_newer(
   registry: &NativeWatchRegistry,
   stream_id: &str,
@@ -456,7 +488,19 @@ async fn start_watch(
       return Ok(()); // cancelled/replaced before this command reached the auth gate
     }
   }
-  let signalling = native_tree_ws_url(app.clone(), ws_url).await?;
+  emit_native_watch_status(&app, &stream_id, generation, NativeWatchStartStatus::Started);
+  let signalling = match native_tree_ws_url(app.clone(), ws_url).await {
+    Ok(signalling) => signalling,
+    Err(error) => {
+      let status = match error.as_str() {
+        "TREE_AUTH_TERMINAL" => NativeWatchStartStatus::Unauthorized,
+        "TREE_AUTH_TRANSIENT" => NativeWatchStartStatus::SignalingClosed,
+        _ => NativeWatchStartStatus::Failed,
+      };
+      emit_native_watch_status(&app, &stream_id, generation, status);
+      return Err(error);
+    }
+  };
   let key = stream_id.clone();
   let mut registry = state.0.lock().await;
   if !claim_native_watch_generation(&mut registry, &key, generation) {

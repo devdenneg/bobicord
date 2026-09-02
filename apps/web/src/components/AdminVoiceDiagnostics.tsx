@@ -24,6 +24,9 @@ const INCIDENT_LABELS: Record<VoiceDiagnosticIncident, string> = {
   output_route_failed: 'Ошибка аудиовыхода',
   ui_stall: 'Зависание интерфейса',
   session_ended: 'Завершённая сессия',
+  stream_watch_succeeded: 'Трансляция подключена',
+  stream_watch_failed: 'Трансляция не подключилась',
+  stream_watch_recovered: 'Просмотр трансляции восстановлен',
 };
 
 const EVENT_LABELS: Partial<Record<VoiceDiagnosticEvent['kind'], string>> = {
@@ -45,6 +48,10 @@ const EVENT_LABELS: Partial<Record<VoiceDiagnosticEvent['kind'], string>> = {
   uplink_stalled: 'Исходящий звук остановился',
   inbound_stalled: 'Входящий звук остановился',
   left: 'Выход из канала',
+  stream_watch_started: 'Подключение к трансляции начато',
+  stream_watch_step: 'Этап подключения к трансляции',
+  stream_watch_retry: 'Повтор подключения к трансляции',
+  stream_watch_finished: 'Подключение к трансляции завершено',
 };
 
 const FIELD_LABELS: Record<string, string> = {
@@ -61,6 +68,66 @@ const FIELD_LABELS: Record<string, string> = {
   concealedSamplesDelta: 'скрыто аудиосэмплов', audioLevel: 'уровень аудио',
   eventLoopLagMs: 'задержка UI, мс', joinElapsedMs: 'подключение, мс',
   reconnectCount: 'переподключений', participantCount: 'участников',
+  streamTransport: 'медиатранспорт',
+};
+
+const VALUE_LABELS: Record<string, string> = {
+  watch_intent: 'намерение смотреть',
+  watch_auth: 'авторизация',
+  watch_listeners: 'слушатели клиента',
+  watch_native_start: 'запуск нативного просмотра',
+  watch_signaling: 'сигналинг',
+  watch_join: 'вход в дерево трансляции',
+  watch_parent: 'назначение источника',
+  watch_negotiation: 'согласование WebRTC',
+  watch_track: 'получение видеотрека',
+  watch_playback: 'декодирование и показ',
+  watch_recovery: 'восстановление просмотра',
+  started: 'начато',
+  ok: 'успешно',
+  failed: 'ошибка',
+  timed_out: 'истекло время ожидания',
+  blocked: 'заблокировано браузером',
+  unsupported: 'не поддерживается',
+  cancelled: 'отменено',
+  superseded: 'заменено новой попыткой',
+  stalled: 'нет прогресса',
+  recovered: 'восстановлено',
+  none: 'без ошибки',
+  timeout: 'превышено время ожидания',
+  network: 'ошибка сети',
+  offline: 'устройство офлайн',
+  auth: 'ошибка авторизации',
+  permission: 'нет разрешения',
+  media_blocked: 'медиа заблокировано браузером',
+  disconnected: 'соединение разорвано',
+  sdk: 'ошибка медиадвижка',
+  aborted: 'попытка прервана',
+  unknown: 'неизвестно',
+  signaling_unauthorized: 'сигналинг: сессия не авторизована',
+  signaling_forbidden: 'сигналинг: доступ запрещён',
+  listener_failed: 'не удалось подключить слушатели клиента',
+  native_start_failed: 'не удалось запустить нативный просмотр',
+  signaling_closed: 'сигналинг закрылся',
+  no_parent: 'источник трансляции не назначен',
+  negotiation_failed: 'согласование WebRTC не удалось',
+  ice_failed: 'ICE-соединение не установлено',
+  track_missing: 'видеотрек не получен',
+  decode_timeout: 'кадр не декодирован вовремя',
+  playback_waiting: 'воспроизведение ожидает запуска',
+  livekit: 'LiveKit',
+  tree_web: 'дерево — браузер',
+  tree_native: 'дерево — клиент',
+  new: 'создано',
+  connecting: 'подключается',
+  connected: 'подключено',
+  reconnecting: 'переподключается',
+  closed: 'закрыто',
+  checking: 'проверка',
+  completed: 'завершено',
+  live: 'активен',
+  ended: 'завершён',
+  missing: 'отсутствует',
 };
 
 function formatDuration(milliseconds: number): string {
@@ -74,7 +141,7 @@ function eventFacts(event: VoiceDiagnosticEvent): { label: string; value: string
     .filter(([key, value]) => key !== 'atMs' && key !== 'kind' && value !== undefined)
     .map(([key, value]) => ({
       label: FIELD_LABELS[key] || key,
-      value: typeof value === 'boolean' ? (value ? 'да' : 'нет') : String(value),
+      value: typeof value === 'boolean' ? (value ? 'да' : 'нет') : (VALUE_LABELS[String(value)] || String(value)),
     }));
 }
 
@@ -137,8 +204,8 @@ export function AdminVoiceDiagnostics() {
     <section className="admin-diag" aria-labelledby="admin-diag-title">
       <div className="admin-diag-head">
         <div>
-          <h2 id="admin-diag-title">Диагностика голоса</h2>
-          <p>Технические состояния и метрики за последние 3 дня. Токены, адреса, ICE-кандидаты, SDP, идентификаторы устройств, сообщения и аудио не сохраняются.</p>
+          <h2 id="admin-diag-title">Диагностика связи</h2>
+          <p>Технические состояния голоса и подключения к трансляциям за последние 3 дня. В этом разделе не сохраняются токены, адреса, ICE-кандидаты, SDP, идентификаторы устройств, сообщения и аудио.</p>
         </div>
         <button type="button" className="admin-refresh" aria-label="Обновить диагностику" onClick={load}><Icon name="refresh" sm /></button>
       </div>

@@ -14,7 +14,8 @@ const MAX_SESSION_MS = 3 * 24 * 60 * 60_000;
 const INCIDENTS = new Set<VoiceDiagnosticIncident>([
   'manual', 'join_stuck', 'connection_failed', 'reconnect_loop', 'uplink_silent',
   'inbound_silent', 'mute_divergence', 'mic_failed', 'playback_blocked',
-  'output_route_failed', 'ui_stall', 'session_ended',
+  'output_route_failed', 'ui_stall', 'session_ended', 'stream_watch_succeeded',
+  'stream_watch_failed', 'stream_watch_recovered',
 ]);
 const EVENT_KINDS = new Set<VoiceDiagnosticEvent['kind']>([
   'join_started', 'intent_finished', 'hub_connected', 'lease_claimed',
@@ -23,7 +24,8 @@ const EVENT_KINDS = new Set<VoiceDiagnosticEvent['kind']>([
   'mic_recovery_finished', 'mute_changed', 'deafen_changed', 'background',
   'foreground', 'network_changed', 'reconnecting', 'reconnected', 'disconnected',
   'playback_blocked', 'output_route_failed', 'ui_stall', 'rtc_sample',
-  'uplink_stalled', 'inbound_stalled', 'left',
+  'uplink_stalled', 'inbound_stalled', 'left', 'stream_watch_started',
+  'stream_watch_step', 'stream_watch_retry', 'stream_watch_finished',
 ]);
 const PLATFORMS = new Set<VoiceDiagnosticClient['platform']>([
   'ios', 'ipados', 'android', 'macos', 'windows', 'linux', 'other', 'unknown',
@@ -37,6 +39,9 @@ const NETWORK_TYPES = new Set<VoiceDiagnosticClient['networkType']>([
 const STAGES = new Set<NonNullable<VoiceDiagnosticEvent['stage']>>([
   'intent', 'hub', 'claim', 'media_token', 'media_connect', 'activation',
   'mic_capture', 'mic_publish', 'mic_recovery', 'playback', 'output_route', 'rtc', 'ui',
+  'watch_intent', 'watch_auth', 'watch_listeners', 'watch_native_start',
+  'watch_signaling', 'watch_join', 'watch_parent', 'watch_negotiation',
+  'watch_track', 'watch_playback', 'watch_recovery',
 ]);
 const OUTCOMES = new Set<NonNullable<VoiceDiagnosticEvent['outcome']>>([
   'started', 'ok', 'failed', 'timed_out', 'blocked', 'unsupported', 'cancelled',
@@ -45,6 +50,9 @@ const OUTCOMES = new Set<NonNullable<VoiceDiagnosticEvent['outcome']>>([
 const ERROR_CODES = new Set<NonNullable<VoiceDiagnosticEvent['code']>>([
   'none', 'timeout', 'network', 'offline', 'auth', 'permission', 'device_lost',
   'media_blocked', 'disconnected', 'sdk', 'unsupported', 'aborted', 'unknown',
+  'signaling_unauthorized', 'signaling_forbidden', 'listener_failed',
+  'native_start_failed', 'signaling_closed', 'no_parent', 'negotiation_failed',
+  'ice_failed', 'track_missing', 'decode_timeout', 'playback_waiting',
 ]);
 const CONNECTION_STATES = new Set<NonNullable<VoiceDiagnosticEvent['connectionState']>>([
   'new', 'connecting', 'connected', 'reconnecting', 'disconnected', 'closed', 'unknown',
@@ -62,6 +70,9 @@ const OUTPUT_ROUTES = new Set<NonNullable<VoiceDiagnosticEvent['outputRoute']>>(
   'default', 'custom', 'system', 'unsupported', 'unknown',
 ]);
 const MIC_MODES = new Set<NonNullable<VoiceDiagnosticEvent['micMode']>>(['voice', 'ptt', 'unknown']);
+const STREAM_TRANSPORTS = new Set<NonNullable<VoiceDiagnosticEvent['streamTransport']>>([
+  'livekit', 'tree_web', 'tree_native',
+]);
 
 const BOOLEAN_FIELDS = [
   'documentHidden', 'online', 'micEnabled', 'publicationMuted', 'upstreamPaused',
@@ -211,6 +222,7 @@ function sanitizeEvent(input: VoiceDiagnosticEventInput, atMs: number): VoiceDia
   const audioContextState = enumValue(source.audioContextState, AUDIO_CONTEXT_STATES);
   const outputRoute = enumValue(source.outputRoute, OUTPUT_ROUTES);
   const micMode = enumValue(source.micMode, MIC_MODES);
+  const streamTransport = enumValue(source.streamTransport, STREAM_TRANSPORTS);
   const networkType = enumValue(source.networkType, NETWORK_TYPES);
   if (stage) event.stage = stage;
   if (outcome) event.outcome = outcome;
@@ -221,6 +233,7 @@ function sanitizeEvent(input: VoiceDiagnosticEventInput, atMs: number): VoiceDia
   if (audioContextState) event.audioContextState = audioContextState;
   if (outputRoute) event.outputRoute = outputRoute;
   if (micMode) event.micMode = micMode;
+  if (streamTransport) event.streamTransport = streamTransport;
   if (networkType) event.networkType = networkType;
   if (typeof source.httpStatus === 'number' && Number.isInteger(source.httpStatus)
     && source.httpStatus >= 100 && source.httpStatus <= 599) event.httpStatus = source.httpStatus;

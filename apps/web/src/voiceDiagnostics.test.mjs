@@ -120,6 +120,55 @@ const {
   let now = 0;
   const recorder = new VoiceDiagnosticsRecorder({
     now: () => ++now,
+    createReportId: () => '222222222222222222222222',
+    client: { kind: 'native', platform: 'windows', installMode: 'native', networkType: 'wifi' },
+  });
+  const stages = [
+    'watch_intent', 'watch_auth', 'watch_listeners', 'watch_native_start',
+    'watch_signaling', 'watch_join', 'watch_parent', 'watch_negotiation',
+    'watch_track', 'watch_playback', 'watch_recovery',
+  ];
+  const codes = [
+    'signaling_unauthorized', 'signaling_forbidden', 'listener_failed',
+    'native_start_failed', 'signaling_closed', 'no_parent', 'negotiation_failed',
+    'ice_failed', 'track_missing', 'decode_timeout', 'playback_waiting',
+  ];
+  const kinds = ['stream_watch_started', 'stream_watch_step', 'stream_watch_retry', 'stream_watch_finished'];
+  const transports = ['livekit', 'tree_web', 'tree_native'];
+  recorder.start();
+  for (let index = 0; index < stages.length; index += 1) {
+    assert.equal(recorder.record({
+      kind: kinds[index % kinds.length],
+      stage: stages[index],
+      outcome: index === stages.length - 1 ? 'recovered' : 'started',
+      code: codes[index],
+      streamTransport: transports[index % transports.length],
+    }), true);
+  }
+  recorder.record({
+    kind: 'stream_watch_step', stage: 'watch_signaling', outcome: 'failed',
+    code: 'signaling_closed', streamTransport: 'raw-peer-route',
+    streamId: 'DO_NOT_STORE_STREAM_ID', sdp: 'DO_NOT_STORE_SDP', error: 'DO_NOT_STORE_ERROR',
+  });
+  for (const incident of ['stream_watch_succeeded', 'stream_watch_failed', 'stream_watch_recovered']) {
+    const report = recorder.buildReport(incident);
+    assert.equal(report.incident, incident);
+    assert.equal(report.schemaVersion, 1, 'stream diagnostics remain backward-compatible schema v1');
+    assert.equal(report.events.length, stages.length + 1);
+    assert.deepEqual(report.events.slice(0, stages.length).map((event) => event.stage), stages);
+    assert.deepEqual(report.events.slice(0, stages.length).map((event) => event.code), codes);
+    assert.deepEqual(report.events.slice(0, stages.length).map((event) => event.streamTransport),
+      stages.map((_, index) => transports[index % transports.length]));
+    assert.equal('streamTransport' in report.events.at(-1), false, 'unknown transport values are discarded');
+    assert.doesNotMatch(JSON.stringify(report), /DO_NOT_STORE/,
+      'stream identity, SDP and raw errors never enter the fixed report');
+  }
+}
+
+{
+  let now = 0;
+  const recorder = new VoiceDiagnosticsRecorder({
+    now: () => ++now,
     createReportId: () => 'abcdef0123456789abcdef01',
     client: { kind: 'native', platform: 'macos', installMode: 'native', networkType: 'ethernet' },
   });

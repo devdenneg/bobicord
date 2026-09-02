@@ -30,6 +30,27 @@ assert.match(apiSource, /query\.set\('beforeId', options\.cursor\.id\)/,
   'the admin API sends the id half of the compound cursor');
 
 const diagnosticsPage = readFileSync(join(here, 'components', 'AdminVoiceDiagnostics.tsx'), 'utf8');
+assert.match(diagnosticsPage, /<h2 id="admin-diag-title">Диагностика связи<\/h2>/,
+  'the diagnostics panel covers both voice and stream connectivity');
+assert.match(diagnosticsPage, /В этом разделе не сохраняются токены, адреса, ICE-кандидаты, SDP/,
+  'the privacy promise is scoped to the fixed-schema diagnostics panel');
+for (const label of [
+  "stream_watch_succeeded: 'Трансляция подключена'",
+  "stream_watch_failed: 'Трансляция не подключилась'",
+  "stream_watch_recovered: 'Просмотр трансляции восстановлен'",
+  "stream_watch_started: 'Подключение к трансляции начато'",
+  "stream_watch_step: 'Этап подключения к трансляции'",
+  "stream_watch_retry: 'Повтор подключения к трансляции'",
+  "stream_watch_finished: 'Подключение к трансляции завершено'",
+  "streamTransport: 'медиатранспорт'",
+  "watch_native_start: 'запуск нативного просмотра'",
+  "decode_timeout: 'кадр не декодирован вовремя'",
+  "aborted: 'попытка прервана'",
+  "network: 'ошибка сети'",
+  "tree_native: 'дерево — клиент'",
+]) {
+  assert.ok(diagnosticsPage.includes(label), `missing Russian stream diagnostic label: ${label}`);
+}
 assert.match(diagnosticsPage, /setNextCursor\(response\.nextCursor\)/,
   'the diagnostics page retains the server-issued cursor');
 assert.match(diagnosticsPage, /onClick=\{\(\) => loadPage\(nextCursor, true\)\}/,

@@ -2,7 +2,11 @@ import {
   Room, RoomEvent, Track, LocalVideoTrack, LocalAudioTrack,
   type RemoteParticipant, type TrackPublication, type RemoteTrack,
 } from 'livekit-client';
-import type { VideoTransport } from './videoTransport';
+import type {
+  StreamWatchTransportDiagnostic,
+  StreamWatchTransportTrackState,
+  VideoTransport,
+} from './videoTransport';
 import type { StreamInfo } from '../engine';
 import { baseUid } from '../util';
 import { ExactPeerStatsSampler } from '../rtcStatsSampler';
@@ -12,6 +16,11 @@ interface LocalScreenStatsTrack {
 }
 
 const localScreenStatsSampler = new ExactPeerStatsSampler<LocalScreenStatsTrack, RTCStatsReport>(2);
+
+function diagnosticTrackState(track: RemoteTrack | null | undefined): StreamWatchTransportTrackState {
+  const state = track?.mediaStreamTrack?.readyState;
+  return state === 'live' || state === 'ended' ? state : track ? 'unknown' : 'missing';
+}
 
 /**
  * LiveKit SFU implementation of VideoTransport — behavior identical to pre-Э0 engine.ts.
@@ -34,11 +43,14 @@ export class LiveKitVideoTransport implements VideoTransport {
   private watchedUsers = new Set<string>();
   private activeWatchSession = new Map<string, string>();
   private announcedScreenSessions = new Set<string>();
+  private watchReconnectCount = new Map<string, number>();
+  private recoveringWatches = new Set<string>();
 
   private streamStartCbs = new Set<(identity: string, silent: boolean) => void>();
   private streamStopCbs = new Set<(identity: string) => void>();
   private videoTrackCbs = new Set<(key: string, track: LocalVideoTrack | RemoteTrack, identity: string, isLocal: boolean) => void>();
   private videoTrackRemovedCbs = new Set<(key: string) => void>();
+  private watchDiagnosticCbs = new Set<(event: StreamWatchTransportDiagnostic) => void>();
 
   /* ---------- lifecycle ---------- */
   attach(room: Room, ctx: { me: string; serverId: string }) {
@@ -76,6 +88,8 @@ export class LiveKitVideoTransport implements VideoTransport {
     this.watchedUsers.clear();
     this.activeWatchSession.clear();
     this.announcedScreenSessions.clear();
+    this.watchReconnectCount.clear();
+    this.recoveringWatches.clear();
     this.videoTracks.clear();
     this.streamInfoByKey.clear();
     this.room = null;
@@ -127,31 +141,58 @@ export class LiveKitVideoTransport implements VideoTransport {
       : undefined;
     return active || participants.find((p) => p.identity !== excludeIdentity && !!p.getTrackPublication(Track.Source.ScreenShare));
   }
-  private setParticipantSubscribed(p: RemoteParticipant, subscribed: boolean) {
+  private setParticipantSubscribed(p: RemoteParticipant, subscribed: boolean): boolean {
     const video = p.getTrackPublication(Track.Source.ScreenShare);
     const audio = p.getTrackPublication(Track.Source.ScreenShareAudio);
+    let ok = !!video;
     [video, audio].forEach((pub) => {
       if (!pub) return;
-      try { (pub as any).setSubscribed(subscribed); } catch { /**/ }
+      try { (pub as any).setSubscribed(subscribed); } catch { ok = false; }
     });
+    return ok;
   }
   private setUserSubscribed(username: string, subscribed: boolean) {
     this.participantsByUser(username).forEach((p) => this.setParticipantSubscribed(p, subscribed));
   }
-  private activateWatchSession(username: string, next?: RemoteParticipant) {
+  private activateWatchSession(username: string, next?: RemoteParticipant): boolean {
     const previousIdentity = this.activeWatchSession.get(username);
     if (previousIdentity === next?.identity) {
-      if (next) this.setParticipantSubscribed(next, true);
-      return;
+      return next ? this.setParticipantSubscribed(next, true) : false;
     }
     const previous = previousIdentity ? this.room?.remoteParticipants.get(previousIdentity) : undefined;
     if (previous) this.setParticipantSubscribed(previous, false);
     if (next) {
       this.activeWatchSession.set(username, next.identity);
-      this.setParticipantSubscribed(next, true);
+      return this.setParticipantSubscribed(next, true);
     } else {
       this.activeWatchSession.delete(username);
+      return false;
     }
+  }
+
+  private subscribeWatchSession(username: string, next?: RemoteParticipant) {
+    this.emitWatchDiagnostic(username, {
+      stage: 'watch_join', outcome: 'started', code: 'none',
+      reconnectCount: this.watchReconnectCount.get(username) || 0,
+    });
+    const subscribed = this.activateWatchSession(username, next);
+    this.emitWatchDiagnostic(username, {
+      stage: 'watch_join', outcome: subscribed ? 'ok' : next ? 'failed' : 'stalled',
+      code: subscribed ? 'none' : next ? 'sdk' : 'track_missing',
+      trackState: next ? 'unknown' : 'missing',
+      reconnectCount: this.watchReconnectCount.get(username) || 0,
+    });
+  }
+
+  private beginWatchRecovery(username: string) {
+    if (this.recoveringWatches.has(username)) return;
+    this.recoveringWatches.add(username);
+    const reconnectCount = (this.watchReconnectCount.get(username) || 0) + 1;
+    this.watchReconnectCount.set(username, reconnectCount);
+    this.emitWatchDiagnostic(username, {
+      stage: 'watch_recovery', outcome: 'started', code: 'none', reconnectCount,
+      trackState: 'missing',
+    });
   }
   isRemoteBroadcasting(username: string) {
     return !!this.broadcastingParticipant(username);
@@ -182,13 +223,28 @@ export class LiveKitVideoTransport implements VideoTransport {
   /* ---------- watching (remote) ---------- */
   watch(streamId: string, _quality?: string) {
     // Д3: quality игнорируется — LiveKit-путь идёт через SFU, деревьев/рендишнов нет.
+    this.watchReconnectCount.delete(streamId);
+    this.recoveringWatches.delete(streamId);
+    this.emitWatchDiagnostic(streamId, { stage: 'watch_signaling', outcome: 'started', code: 'none' });
     this.watchedUsers.add(streamId);
-    this.activateWatchSession(streamId, this.broadcastingParticipant(streamId));
+    if (!this.room) {
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_signaling', outcome: 'failed', code: 'signaling_closed', connectionState: 'closed',
+      });
+      this.subscribeWatchSession(streamId);
+      return;
+    }
+    this.emitWatchDiagnostic(streamId, {
+      stage: 'watch_signaling', outcome: 'ok', code: 'none', connectionState: 'connected',
+    });
+    this.subscribeWatchSession(streamId, this.broadcastingParticipant(streamId));
   }
   unwatch(streamId: string) {
     this.watchedUsers.delete(streamId);
     this.setUserSubscribed(streamId, false);
     this.activeWatchSession.delete(streamId);
+    this.watchReconnectCount.delete(streamId);
+    this.recoveringWatches.delete(streamId);
   }
 
   /* ---------- track registry ---------- */
@@ -221,7 +277,7 @@ export class LiveKitVideoTransport implements VideoTransport {
     if (pub.source !== Track.Source.ScreenShare) return;
     if (this.watchedUsers.has(username)) {
       const active = this.broadcastingParticipant(username);
-      this.activateWatchSession(username, active || p);
+      this.subscribeWatchSession(username, active || p);
     }
     if (this.announcedScreenSessions.has(p.identity)) return;
     this.announcedScreenSessions.add(p.identity);
@@ -231,8 +287,13 @@ export class LiveKitVideoTransport implements VideoTransport {
     if (pub.source !== Track.Source.ScreenShare) return;
     const username = baseUid(p.identity);
     if (this.watchedUsers.has(username) && this.activeWatchSession.get(username) === p.identity) {
+      this.emitWatchDiagnostic(username, {
+        stage: 'watch_track', outcome: 'stalled', code: 'track_missing', trackState: 'missing',
+        reconnectCount: this.watchReconnectCount.get(username) || 0,
+      });
+      this.beginWatchRecovery(username);
       this.setParticipantSubscribed(p, false);
-      this.activateWatchSession(username, this.broadcastingParticipant(username, p.identity));
+      this.subscribeWatchSession(username, this.broadcastingParticipant(username, p.identity));
     }
     if (!this.announcedScreenSessions.delete(p.identity)) return;
     this.streamStopCbs.forEach((cb) => cb(p.identity));
@@ -240,16 +301,48 @@ export class LiveKitVideoTransport implements VideoTransport {
   private onParticipantDisconnected = (p: RemoteParticipant) => {
     const username = baseUid(p.identity);
     if (this.watchedUsers.has(username) && this.activeWatchSession.get(username) === p.identity) {
-      this.activateWatchSession(username, this.broadcastingParticipant(username, p.identity));
+      this.emitWatchDiagnostic(username, {
+        stage: 'watch_track', outcome: 'stalled', code: 'track_missing', trackState: 'missing',
+        reconnectCount: this.watchReconnectCount.get(username) || 0,
+      });
+      this.beginWatchRecovery(username);
+      this.subscribeWatchSession(username, this.broadcastingParticipant(username, p.identity));
     }
     if (this.announcedScreenSessions.delete(p.identity)) this.streamStopCbs.forEach((cb) => cb(p.identity));
   };
   private onSub = (track: RemoteTrack, pub: TrackPublication, p: RemoteParticipant) => {
     if (track.kind !== Track.Kind.Video) return;
-    this.addVideo(pub.trackSid, track, baseUid(p.identity), false);
+    const username = baseUid(p.identity);
+    const watched = this.watchedUsers.has(username);
+    // TrackSubscribed can settle after a logical watch has already moved to another
+    // LiveKit participant session. Fence that stale physical track before it reaches
+    // Engine: otherwise its callback can be accepted as the new watch attempt's track.
+    if (watched && this.activeWatchSession.get(username) !== p.identity) {
+      try { (pub as any).setSubscribed(false); } catch { /** selection already moved on */ }
+      return;
+    }
+    this.addVideo(pub.trackSid, track, username, false);
+    if (!watched) return;
+    const reconnectCount = this.watchReconnectCount.get(username) || 0;
+    const trackState = diagnosticTrackState(track);
+    this.emitWatchDiagnostic(username, {
+      stage: 'watch_track', outcome: trackState === 'ended' ? 'stalled' : 'ok',
+      code: trackState === 'ended' ? 'track_missing' : 'none', trackState, reconnectCount,
+    });
+    if (this.recoveringWatches.delete(username)) this.emitWatchDiagnostic(username, {
+      stage: 'watch_recovery', outcome: 'recovered', code: 'none', trackState, reconnectCount,
+    });
   };
-  private onUnsub = (track: RemoteTrack, pub: TrackPublication) => {
+  private onUnsub = (track: RemoteTrack, pub: TrackPublication, p: RemoteParticipant) => {
     if (track.kind !== Track.Kind.Video) return;
+    const username = baseUid(p.identity);
+    if (this.watchedUsers.has(username) && this.activeWatchSession.get(username) === p.identity) {
+      this.emitWatchDiagnostic(username, {
+        stage: 'watch_track', outcome: 'stalled', code: 'track_missing',
+        trackState: track.mediaStreamTrack?.readyState === 'ended' ? 'ended' : 'missing',
+        reconnectCount: this.watchReconnectCount.get(username) || 0,
+      });
+    }
     track.detach().forEach((el) => el.remove());
     this.delVideo(pub.trackSid);
   };
@@ -267,4 +360,33 @@ export class LiveKitVideoTransport implements VideoTransport {
   onStreamStop(cb: (identity: string) => void) { this.streamStopCbs.add(cb); return () => { this.streamStopCbs.delete(cb); }; }
   onVideoTrack(cb: (key: string, track: LocalVideoTrack | RemoteTrack, identity: string, isLocal: boolean) => void) { this.videoTrackCbs.add(cb); return () => { this.videoTrackCbs.delete(cb); }; }
   onVideoTrackRemoved(cb: (key: string) => void) { this.videoTrackRemovedCbs.add(cb); return () => { this.videoTrackRemovedCbs.delete(cb); }; }
+  onWatchDiagnostic(cb: (event: StreamWatchTransportDiagnostic) => void) {
+    this.watchDiagnosticCbs.add(cb);
+    return () => { this.watchDiagnosticCbs.delete(cb); };
+  }
+
+  private emitWatchDiagnostic(
+    streamId: string,
+    event: Omit<StreamWatchTransportDiagnostic, 'streamId' | 'streamTransport'>,
+  ) {
+    // Keep the emitted shape closed: LiveKit participant identities, room URLs and SDK errors
+    // are deliberately unavailable to diagnostic consumers.
+    const diagnostic: StreamWatchTransportDiagnostic = {
+      streamId,
+      stage: event.stage,
+      outcome: event.outcome,
+      code: event.code,
+      streamTransport: 'livekit',
+    };
+    if (event.connectionState !== undefined) diagnostic.connectionState = event.connectionState;
+    if (event.iceState !== undefined) diagnostic.iceState = event.iceState;
+    if (event.trackState !== undefined) diagnostic.trackState = event.trackState;
+    if (event.reconnectCount !== undefined) {
+      diagnostic.reconnectCount = Number.isFinite(event.reconnectCount)
+        ? Math.max(0, Math.min(1000, Math.trunc(event.reconnectCount))) : 0;
+    }
+    this.watchDiagnosticCbs.forEach((cb) => {
+      try { cb({ ...diagnostic }); } catch { /** diagnostics must not destabilize playback */ }
+    });
+  }
 }

@@ -8,7 +8,8 @@ const VOICE_DIAGNOSTIC_MAX_SESSION_MS = 3 * 24 * 60 * 60_000;
 const INCIDENTS = new Set([
   'manual', 'join_stuck', 'connection_failed', 'reconnect_loop', 'uplink_silent',
   'inbound_silent', 'mute_divergence', 'mic_failed', 'playback_blocked',
-  'output_route_failed', 'ui_stall', 'session_ended',
+  'output_route_failed', 'ui_stall', 'session_ended', 'stream_watch_succeeded',
+  'stream_watch_failed', 'stream_watch_recovered',
 ]);
 const CLIENT_KINDS = new Set(['web', 'native']);
 const PLATFORMS = new Set(['ios', 'ipados', 'android', 'macos', 'windows', 'linux', 'other', 'unknown']);
@@ -21,11 +22,15 @@ const EVENT_KINDS = new Set([
   'mic_recovery_finished', 'mute_changed', 'deafen_changed', 'background',
   'foreground', 'network_changed', 'reconnecting', 'reconnected', 'disconnected',
   'playback_blocked', 'output_route_failed', 'ui_stall', 'rtc_sample',
-  'uplink_stalled', 'inbound_stalled', 'left',
+  'uplink_stalled', 'inbound_stalled', 'left', 'stream_watch_started',
+  'stream_watch_step', 'stream_watch_retry', 'stream_watch_finished',
 ]);
 const STAGES = new Set([
   'intent', 'hub', 'claim', 'media_token', 'media_connect', 'activation',
   'mic_capture', 'mic_publish', 'mic_recovery', 'playback', 'output_route', 'rtc', 'ui',
+  'watch_intent', 'watch_auth', 'watch_listeners', 'watch_native_start',
+  'watch_signaling', 'watch_join', 'watch_parent', 'watch_negotiation',
+  'watch_track', 'watch_playback', 'watch_recovery',
 ]);
 const OUTCOMES = new Set([
   'started', 'ok', 'failed', 'timed_out', 'blocked', 'unsupported', 'cancelled',
@@ -34,6 +39,9 @@ const OUTCOMES = new Set([
 const ERROR_CODES = new Set([
   'none', 'timeout', 'network', 'offline', 'auth', 'permission', 'device_lost',
   'media_blocked', 'disconnected', 'sdk', 'unsupported', 'aborted', 'unknown',
+  'signaling_unauthorized', 'signaling_forbidden', 'listener_failed',
+  'native_start_failed', 'signaling_closed', 'no_parent', 'negotiation_failed',
+  'ice_failed', 'track_missing', 'decode_timeout', 'playback_waiting',
 ]);
 const CONNECTION_STATES = new Set(['new', 'connecting', 'connected', 'reconnecting', 'disconnected', 'closed', 'unknown']);
 const ICE_STATES = new Set(['new', 'checking', 'connected', 'completed', 'failed', 'disconnected', 'closed', 'unknown']);
@@ -41,6 +49,8 @@ const TRACK_STATES = new Set(['live', 'ended', 'missing', 'unknown']);
 const AUDIO_CONTEXT_STATES = new Set(['running', 'suspended', 'interrupted', 'closed', 'missing', 'unknown']);
 const OUTPUT_ROUTES = new Set(['default', 'custom', 'system', 'unsupported', 'unknown']);
 const MIC_MODES = new Set(['voice', 'ptt', 'unknown']);
+const STREAM_TRANSPORTS = new Set(['livekit', 'tree_web', 'tree_native']);
+const CONTROL_INCIDENTS = new Set(['stream_watch_succeeded']);
 
 const BOOLEAN_FIELDS = [
   'documentHidden', 'online', 'micEnabled', 'publicationMuted', 'upstreamPaused',
@@ -144,6 +154,7 @@ function sanitizeVoiceDiagnosticReport(raw, { maxPayloadBytes = VOICE_DIAGNOSTIC
     const audioContextState = enumValue(source.audioContextState, AUDIO_CONTEXT_STATES);
     const outputRoute = enumValue(source.outputRoute, OUTPUT_ROUTES);
     const micMode = enumValue(source.micMode, MIC_MODES);
+    const streamTransport = enumValue(source.streamTransport, STREAM_TRANSPORTS);
     const networkType = enumValue(source.networkType, NETWORK_TYPES);
     if (stage) event.stage = stage;
     if (outcome) event.outcome = outcome;
@@ -154,6 +165,7 @@ function sanitizeVoiceDiagnosticReport(raw, { maxPayloadBytes = VOICE_DIAGNOSTIC
     if (audioContextState) event.audioContextState = audioContextState;
     if (outputRoute) event.outputRoute = outputRoute;
     if (micMode) event.micMode = micMode;
+    if (streamTransport) event.streamTransport = streamTransport;
     if (networkType) event.networkType = networkType;
     if (Number.isInteger(source.httpStatus) && source.httpStatus >= 100 && source.httpStatus <= 599) {
       event.httpStatus = source.httpStatus;
@@ -256,6 +268,10 @@ function isVoiceDiagnosticsAdmin(user, bootstrapUsername = 'denis') {
   return Boolean(user && user.username === bootstrapUsername);
 }
 
+function isVoiceDiagnosticControlIncident(incident) {
+  return CONTROL_INCIDENTS.has(incident);
+}
+
 function createVoiceDiagnosticsStore(db, {
   now = () => Date.now(),
   randomId = () => crypto.randomBytes(12).toString('hex'),
@@ -266,16 +282,20 @@ function createVoiceDiagnosticsStore(db, {
   installVoiceDiagnosticsSchema(db);
   const deleteExpired = db.prepare('DELETE FROM voice_diagnostics WHERE created < ?');
   const deleteUserOverflow = db.prepare(`DELETE FROM voice_diagnostics WHERE id IN (
-    SELECT id FROM voice_diagnostics WHERE user_id=? ORDER BY created DESC, id DESC LIMIT -1 OFFSET ?
+    SELECT id FROM voice_diagnostics WHERE user_id=?
+      ORDER BY CASE WHEN incident='stream_watch_succeeded' THEN 0 ELSE 1 END DESC,
+        created DESC, id DESC LIMIT -1 OFFSET ?
   )`);
   const deleteGlobalOverflow = db.prepare(`DELETE FROM voice_diagnostics WHERE id IN (
-    SELECT id FROM voice_diagnostics ORDER BY created DESC, id DESC LIMIT -1 OFFSET ?
+    SELECT id FROM voice_diagnostics
+      ORDER BY CASE WHEN incident='stream_watch_succeeded' THEN 0 ELSE 1 END DESC,
+        created DESC, id DESC LIMIT -1 OFFSET ?
   )`);
   const insert = db.prepare(`INSERT INTO voice_diagnostics(
     id,client_report_id,user_id,username,incident,client_kind,platform,created,event_count,duration_ms,truncated,payload
   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`);
   const findByClientReportId = db.prepare(`SELECT id,created,incident,client_kind,platform,event_count
-    FROM voice_diagnostics WHERE user_id=? AND client_report_id=?`);
+    FROM voice_diagnostics WHERE user_id=? AND client_report_id=? AND created>=?`);
 
   const savedMetadata = (row) => ({
     id: row.id,
@@ -295,6 +315,16 @@ function createVoiceDiagnosticsStore(db, {
     if (maxRows >= 0) deleteGlobalOverflow.run(maxRows);
   });
 
+  function findExisting(userId, clientReportId) {
+    if (typeof clientReportId !== 'string' || !/^[a-f0-9]{24}$/u.test(clientReportId)) return null;
+    const createdAt = now();
+    // This runs before admission limiting so a lost HTTP response can be acknowledged without
+    // spending another slot. Keep it as one indexed lookup: maintenance remains owned by startup,
+    // the bounded timer, save and admin reads rather than every retry probe.
+    const existing = findByClientReportId.get(String(userId), clientReportId, createdAt - retentionMs);
+    return existing ? savedMetadata(existing) : null;
+  }
+
   const save = db.transaction(({ userId, username, raw }) => {
     const report = sanitizeVoiceDiagnosticReport(raw);
     const normalizedUserId = String(userId);
@@ -303,7 +333,7 @@ function createVoiceDiagnosticsStore(db, {
     // that the bounded read window already hides (and the next maintenance pass would delete).
     prune(createdAt);
     if (report.clientReportId) {
-      const existing = findByClientReportId.get(normalizedUserId, report.clientReportId);
+      const existing = findByClientReportId.get(normalizedUserId, report.clientReportId, createdAt - retentionMs);
       if (existing) return savedMetadata(existing);
     }
     const id = randomId();
@@ -316,7 +346,7 @@ function createVoiceDiagnosticsStore(db, {
       );
     } catch (error) {
       const existing = report.clientReportId
-        ? findByClientReportId.get(normalizedUserId, report.clientReportId)
+        ? findByClientReportId.get(normalizedUserId, report.clientReportId, createdAt - retentionMs)
         : null;
       if (existing) return savedMetadata(existing);
       throw error;
@@ -389,7 +419,7 @@ function createVoiceDiagnosticsStore(db, {
     return db.prepare('DELETE FROM voice_diagnostics WHERE user_id=?').run(String(userId)).changes;
   }
 
-  return { save, list, detail, prune, purgeUser };
+  return { save, findExisting, list, detail, prune, purgeUser };
 }
 
 module.exports = {
@@ -401,6 +431,7 @@ module.exports = {
   createVoiceDiagnosticGlobalLimiter,
   createVoiceDiagnosticsStore,
   installVoiceDiagnosticsSchema,
+  isVoiceDiagnosticControlIncident,
   isVoiceDiagnosticsAdmin,
   sanitizeVoiceDiagnosticReport,
 };

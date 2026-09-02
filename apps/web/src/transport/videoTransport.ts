@@ -76,6 +76,95 @@ export interface TreeTopology {
   nodes: TreeNode[];
 }
 
+/**
+ * Privacy-bounded progress emitted while a viewer transport establishes or repairs playback.
+ * `streamId` is a local routing key only: consumers must use it to find the owning attempt and
+ * must never copy it into an uploaded diagnostic report. The transport deliberately exposes no
+ * SDP, ICE candidates, URLs, peer identities or raw errors.
+ */
+export type StreamWatchTransportDiagnosticStage =
+  | 'watch_auth'
+  | 'watch_listeners'
+  | 'watch_native_start'
+  | 'watch_signaling'
+  | 'watch_join'
+  | 'watch_parent'
+  | 'watch_negotiation'
+  | 'watch_track'
+  | 'watch_recovery';
+
+export type StreamWatchTransportDiagnosticOutcome =
+  | 'started'
+  | 'ok'
+  | 'failed'
+  | 'timed_out'
+  | 'blocked'
+  | 'unsupported'
+  | 'cancelled'
+  | 'superseded'
+  | 'stalled'
+  | 'recovered';
+
+export type StreamWatchTransportDiagnosticCode =
+  | 'none'
+  | 'timeout'
+  | 'network'
+  | 'offline'
+  | 'auth'
+  | 'permission'
+  | 'device_lost'
+  | 'media_blocked'
+  | 'disconnected'
+  | 'sdk'
+  | 'unsupported'
+  | 'aborted'
+  | 'unknown'
+  | 'signaling_unauthorized'
+  | 'signaling_forbidden'
+  | 'listener_failed'
+  | 'native_start_failed'
+  | 'signaling_closed'
+  | 'no_parent'
+  | 'negotiation_failed'
+  | 'ice_failed'
+  | 'track_missing'
+  | 'decode_timeout'
+  | 'playback_waiting';
+
+export type StreamWatchTransportConnectionState =
+  | 'new'
+  | 'connecting'
+  | 'connected'
+  | 'reconnecting'
+  | 'disconnected'
+  | 'closed'
+  | 'unknown';
+
+export type StreamWatchTransportIceState =
+  | 'new'
+  | 'checking'
+  | 'connected'
+  | 'completed'
+  | 'failed'
+  | 'disconnected'
+  | 'closed'
+  | 'unknown';
+
+export type StreamWatchTransportTrackState = 'live' | 'ended' | 'missing' | 'unknown';
+export type StreamWatchTransportKind = 'tree_web' | 'tree_native' | 'livekit';
+
+export interface StreamWatchTransportDiagnostic {
+  streamId: string;
+  stage: StreamWatchTransportDiagnosticStage;
+  outcome: StreamWatchTransportDiagnosticOutcome;
+  code: StreamWatchTransportDiagnosticCode;
+  connectionState?: StreamWatchTransportConnectionState;
+  iceState?: StreamWatchTransportIceState;
+  trackState?: StreamWatchTransportTrackState;
+  reconnectCount?: number;
+  streamTransport: StreamWatchTransportKind;
+}
+
 export interface VideoTransport {
   /** Wire room-event listeners. Call once, BEFORE `room.connect()`. */
   attach(room: Room, ctx: { me: string; serverId: string }): void;
@@ -136,4 +225,6 @@ export interface VideoTransport {
   onStreamStop(cb: (identity: string) => void): () => void;
   onVideoTrack(cb: (key: string, track: LocalVideoTrack | RemoteTrack | MediaStreamVideoHandle, identity: string, isLocal: boolean) => void): () => void;
   onVideoTrackRemoved(cb: (key: string) => void): () => void;
+  /** Safe, structured watch progress. The callback must not persist its local-only `streamId`. */
+  onWatchDiagnostic?(cb: (event: StreamWatchTransportDiagnostic) => void): () => void;
 }
