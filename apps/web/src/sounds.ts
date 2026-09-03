@@ -8,7 +8,7 @@ import {
   acquireExactAudioContextResume,
   forgetExactAudioContextResume,
 } from './micLifecycle';
-import { routeAudioSinkTarget } from './streamPlayback';
+import { routeAudioSinkTarget, seedAudioSinkTargetRoute } from './streamPlayback';
 
 const FILES = {
   entry: '/entry.wav',        // зашёл в голосовой (слышат все в канале + сам зашедший)
@@ -35,6 +35,7 @@ let actx: AudioContext | null = null;
 let lastSink: string | null = null; // последний применённый deviceId вывода (антиспам setSinkId)
 let sinkGeneration = 0;
 let sinkSwitch: Promise<void> = Promise.resolve();
+let sinkRefreshPending = false;
 const buffers: Partial<Record<SoundName, AudioBuffer>> = {};
 const norm: Partial<Record<SoundName, number>> = {}; // нормировочный множитель громкости на звук
 const loading: Partial<Record<SoundName, Promise<void>>> = {};
@@ -45,7 +46,7 @@ let soundResumeObserver: { context: AudioContext; outcome: Promise<boolean> } | 
 // сырой setSinkId('default'/'') на этом проекте вёл себя ненадёжно (для голоса ради этого и заведён
 // normalizedContextSink), поэтому default резолвим в реальное устройство. Конкретный id — как есть.
 async function resolveSink(want: string): Promise<string> {
-  if (want) return want;
+  if (want && want !== 'default') return want;
   try {
     const devices = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'audiooutput');
     const def = devices.find((d) => d.deviceId === 'default');
@@ -56,22 +57,22 @@ async function resolveSink(want: string): Promise<string> {
 // Звуки должны идти в ТО ЖЕ устройство вывода, что и голос (иначе «иногда не слышно вход/выход» —
 // звук уходил в системный дефолт мимо выбранных наушников). AudioContext.setSinkId есть только на
 // десктоп-Chromium; на мобилках/Firefox его нет — там вывод и так выбирает система (no-op).
-async function applySink(): Promise<void> {
+async function applySink(force = false): Promise<void> {
   const a = actx as (AudioContext & { setSinkId?: (id: string) => Promise<void> }) | null;
   if (!a || typeof a.setSinkId !== 'function') return;
   const want = getSettings().output || '';
-  if (want === lastSink) return;
+  if (!force && want === lastSink) return;
   lastSink = want;
   const generation = ++sinkGeneration;
   const run = sinkSwitch.catch(() => {}).then(async () => {
     if (generation !== sinkGeneration || actx !== a) return;
-    const outcome = await routeAudioSinkTarget(a, want, { normalize: resolveSink });
+    const outcome = await routeAudioSinkTarget(a, want || 'default', { normalize: resolveSink, force });
     if (generation !== sinkGeneration || actx !== a
       || outcome === 'applied' || outcome === 'unsupported' || outcome === 'superseded') return;
     lastSink = null;
     // A rejected or never-settled hardware promise cannot poison every later notification sound.
     // The shared router also repairs this system fallback if the stale browser promise succeeds late.
-    await routeAudioSinkTarget(a, '');
+    await routeAudioSinkTarget(a, 'default', { normalize: resolveSink });
   });
   sinkSwitch = run.catch(() => {});
   await run;
@@ -101,6 +102,15 @@ function observeSoundContextResume(context: AudioContext | null, explicitGesture
 
 const soundUnlockGestures = new AudioUnlockGestureDeduper();
 function wake(): void { observeSoundContextResume(actx); }
+function wakeAndRefreshOutput(): void {
+  if (document.hidden) return;
+  if (sinkRefreshPending) {
+    sinkRefreshPending = false;
+    lastSink = null;
+    void applySink(true);
+  }
+  wake();
+}
 function wakeFromGesture(event: Event): void {
   if (soundUnlockGestures.accept(event)) observeSoundContextResume(actx, true);
 }
@@ -108,7 +118,9 @@ function wakeFromGesture(event: Event): void {
 function ctx(): AudioContext {
   if (!actx || actx.state === 'closed') {
     forgetExactAudioContextResume(actx);
-    actx = new AudioContext(); lastSink = null; applySink();
+    actx = new AudioContext();
+    seedAudioSinkTargetRoute(actx);
+    lastSink = null; applySink();
   }
   observeSoundContextResume(actx);
   // A transient Bluetooth/setSinkId failure falls back to system output and clears lastSink.
@@ -122,9 +134,9 @@ function ctx(): AudioContext {
 // жесте и при возврате на вкладку; звуки нужны и в фоне (слышно вход/выход, пока сидишь в другой
 // вкладке) — running-контекст в фоне не усыпляется, пока страница «живая» (WebRTC-звонок её держит).
 if (typeof window !== 'undefined') {
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) wake(); });
+  document.addEventListener('visibilitychange', wakeAndRefreshOutput);
   // iOS может вернуть PWA из back-forward cache без нового visibilitychange.
-  window.addEventListener('pageshow', wake);
+  window.addEventListener('pageshow', wakeAndRefreshOutput);
   (['pointerdown', 'keydown', 'touchstart', 'click'] as const)
     .forEach((ev) => window.addEventListener(ev, wakeFromGesture, { passive: true }));
   subscribeSettings(applySink); // вывод звуков следует за выбранным устройством вывода
@@ -132,7 +144,14 @@ if (typeof window !== 'undefined') {
   // resolveSink отдаст уже другой deviceId, но applySink без этого хука не позвался бы — звуки
   // остались бы в прежнем (отключённом) устройстве, и «вход/выход» переставало быть слышно.
   try {
-    navigator.mediaDevices?.addEventListener?.('devicechange', () => { lastSink = null; void applySink(); });
+    navigator.mediaDevices?.addEventListener?.('devicechange', () => {
+      if (document.hidden) {
+        sinkRefreshPending = true;
+        return;
+      }
+      lastSink = null;
+      void applySink(true);
+    });
   } catch { /** устройство вывода выберет система */ }
 }
 

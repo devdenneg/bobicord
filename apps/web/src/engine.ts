@@ -58,15 +58,19 @@ import { userVolumeToGain } from './volumeCurve';
 import { installLiveKitAudioGainStability } from './livekitAudioStability';
 import type { ServerVolumeMutation } from './volumePreferences';
 import {
+  type AudioSinkRouteFailure,
+  type AudioSinkRouteOutcome,
   ExactAsyncActionCoordinator,
   ExactMediaOutputRouteGate,
   ExactMediaPlayCoordinator,
   StreamWatchPlaybackGate,
   applyExactScreenAudioGain,
+  audioSinkRoutesConfirmed,
   exactWebAudioMixContext,
   effectiveStreamGain,
   rebindExactWebAudioMixContexts,
   routeAudioSinkTarget,
+  seedAudioSinkTargetRoute,
   setTreeStreamOutputSink,
 } from './streamPlayback';
 import { automaticMicrophoneCaptureAllowed, beginMicrophoneCapture } from './audioDevices';
@@ -93,6 +97,11 @@ import {
   detectVoiceDiagnosticNetworkType,
   type VoiceDiagnosticEventInput,
 } from './voiceDiagnostics';
+import {
+  boundedVoiceActivationRetryDelayMs,
+  shouldReportSlowVoiceJoin,
+  voiceActivationHttpFailureDisposition,
+} from './voiceActivation';
 import {
   advanceVoiceDiagnosticSilence,
   emptyVoiceDiagnosticSilenceState,
@@ -518,6 +527,10 @@ export class Engine {
   private micBootstrapWanted = false;
   private manualMute = storedFlag('voiceMute'); // персист: пред-установка «мут мика» до входа (Discord-стиль)
   private manualMuteIntentRevision = 0; // async capture retries cannot roll back a newer explicit click/hotkey
+  // LiveKit mute/unmute is asynchronous. Keep an explicit unmute separate from the capture
+  // watchdog so a still-paused sender cannot race the user's click into an unnecessary gUM rebuild.
+  private micMuteWriteSeq = 0;
+  private micUnmuteWriteOwner = 0;
   private saveVoicePrefs() { try { localStorage.setItem('voiceMute', this.manualMute ? '1' : '0'); localStorage.setItem('voiceDeaf', this.deafened ? '1' : '0'); } catch { /**/ } }
 
   // Оба транспорта живут одновременно (не выбор build-флагом): нативный вещатель
@@ -646,6 +659,7 @@ export class Engine {
   private voiceOutputPending: { room: Room; sink: string } | null = null;
   private outputDeviceTimer: number | null = null;
   private deviceChangeHandler: (() => void) | null = null;
+  private outputDeviceRefreshPending = false;
 
   private emoteListeners = new Set<EmoteListener>();
   private subs = new Set<() => void>();
@@ -967,10 +981,15 @@ export class Engine {
 
   private completeVoiceDiagnosticJoin(): void {
     this.clearVoiceDiagnosticJoinTimer();
+    const joinElapsedMs = this.voiceDiagnosticJoinElapsed();
     this.recordVoiceDiagnostic({
-      kind: 'join_completed', outcome: 'ok', joinElapsedMs: this.voiceDiagnosticJoinElapsed(),
+      kind: 'join_completed', outcome: 'ok', joinElapsedMs,
       ...this.voiceDiagnosticState(),
     });
+    // Keep ordinary successful joins local. A genuinely slow success is useful precisely because
+    // its fixed-schema timeline shows which activation/connect step consumed the delay. Reuse the
+    // existing bounded join incident so this remains compatible with an older server during rollout.
+    if (shouldReportSlowVoiceJoin(joinElapsedMs)) this.submitVoiceDiagnostic('join_stuck');
   }
 
   private clearVoiceDiagnosticPendingReport(): void {
@@ -1184,14 +1203,18 @@ export class Engine {
   private recordVoiceOutputFailure(
     outputRoute: NonNullable<VoiceDiagnosticEvent['outputRoute']>,
     outcome: 'failed' | 'timed_out' | 'unsupported' = 'failed',
+    outputTarget: NonNullable<VoiceDiagnosticEvent['outputTarget']> = 'voice_mixer',
+    outputOperation: NonNullable<VoiceDiagnosticEvent['outputOperation']> = 'set_sink',
+    code?: NonNullable<VoiceDiagnosticEvent['code']>,
+    submitIncident = true,
   ): void {
     if (!this.voiceDiagnostics.active) return;
     this.recordVoiceDiagnostic({
       kind: 'output_route_failed', stage: 'output_route', outcome,
-      code: outcome === 'timed_out' ? 'timeout' : outcome === 'unsupported' ? 'unsupported' : 'device_lost',
-      ...this.voiceDiagnosticState(), outputRoute,
+      code: code ?? (outcome === 'timed_out' ? 'timeout' : outcome === 'unsupported' ? 'unsupported' : 'unknown'),
+      ...this.voiceDiagnosticState(), outputRoute, outputTarget, outputOperation,
     });
-    this.submitVoiceDiagnostic('output_route_failed');
+    if (submitIncident) this.submitVoiceDiagnostic('output_route_failed');
   }
 
   private recordVoiceMicFailure(
@@ -1448,7 +1471,15 @@ export class Engine {
         if (this.outputDeviceTimer) clearTimeout(this.outputDeviceTimer);
         this.outputDeviceTimer = window.setTimeout(() => {
           this.outputDeviceTimer = null;
-          if (this.viewRoom || this.voiceRoom) void this.applyOutput();
+          if (this.viewRoom || this.voiceRoom) {
+            // Chromium/CoreAudio can reject setSinkId while a PWA is hidden. Keep the current
+            // audible route untouched and re-enumerate once on the next real foreground edge.
+            if (document.hidden) this.outputDeviceRefreshPending = true;
+            else {
+              this.outputDeviceRefreshPending = false;
+              void this.applyOutput(true);
+            }
+          }
           if (this.inVoice) void this.checkMicAlive(true);
           else if (this.levelListeners.size > 0) this.restartLevelMeter();
         }, 200);
@@ -1478,14 +1509,16 @@ export class Engine {
     const now = Date.now();
     if (now - this.lastForegroundOutputRetryAt < 1_000) return false;
     this.lastForegroundOutputRetryAt = now;
+    const forceRefresh = this.outputDeviceRefreshPending;
+    this.outputDeviceRefreshPending = false;
     const requested = getSettings().output || 'default';
     // LiveKit WebAudio tracks are intentionally muted at the element layer: outputCtx is their
     // actual audible sink. Retry that shared context and the independent tree path once on the
     // same physical foreground edge; the timestamp above coalesces visibilitychange + pageshow.
     if (this.outputCtx || this.exactOutputRooms().length)
-      void this.switchContextOutput(requested, false);
+      void this.switchContextOutput(requested, false, forceRefresh);
     [...this.voiceAudioEls.values(), ...this.screenAudioEls.values()].forEach(({ el }) => {
-      void this.switchElementOutput(el, requested, true);
+      void this.switchElementOutput(el, requested, true, forceRefresh);
     });
     return true;
   }
@@ -1701,7 +1734,11 @@ export class Engine {
       .filter(Boolean) as Room[])];
   }
   private createOutputContext(): SinkableAudioContext | null {
-    try { return new AudioContext() as SinkableAudioContext; }
+    try {
+      const context = new AudioContext() as SinkableAudioContext;
+      seedAudioSinkTargetRoute(context);
+      return context;
+    }
     catch { return null; }
   }
   private outputMixerNeedsRecovery(): boolean {
@@ -1714,9 +1751,15 @@ export class Engine {
     voiceEpoch: number,
     voiceRoom: Room | null,
     voiceChannel: string | null,
+    outputOperation: NonNullable<VoiceDiagnosticEvent['outputOperation']>,
+    code: NonNullable<VoiceDiagnosticEvent['code']>,
   ) {
     if (!voiceRoom || !voiceChannel || !this.voiceIntentCurrent(voiceEpoch, voiceRoom, voiceChannel)) return;
-    this.recordVoiceOutputFailure((getSettings().output || 'default') === 'default' ? 'default' : 'custom');
+    this.recordVoiceOutputFailure(
+      (getSettings().output || 'default') === 'default' ? 'default' : 'custom',
+      code === 'timeout' ? 'timed_out' : code === 'unsupported' ? 'unsupported' : 'failed',
+      'context_recovery', outputOperation, code,
+    );
     this.hooks.toast('Не удалось восстановить вывод звука — голосовой канал отключён', 'err');
     void this.leaveVoice();
   }
@@ -1783,7 +1826,13 @@ export class Engine {
     // the fresh context incompatible — a later explicit session may resume it, or replace it if it
     // subsequently reaches the terminal `closed` state.
     this.outputRecoveryRejectedFor = null;
-    this.failOutputContextRecovery(recovery.voiceEpoch, recovery.voiceRoom, recovery.voiceChannel);
+    this.failOutputContextRecovery(
+      recovery.voiceEpoch,
+      recovery.voiceRoom,
+      recovery.voiceChannel,
+      recovery.context.state === 'running' ? 'start_audio' : 'resume',
+      'timeout',
+    );
   }
   private beginOutputContextRecovery(explicitGesture = false, gestureToken = 0): boolean {
     if (document.hidden) return false;
@@ -1798,7 +1847,9 @@ export class Engine {
     const replacement = previous.state === 'closed' ? this.createOutputContext() : previous;
     if (!replacement) {
       this.outputRecoveryRejectedFor = previous;
-      this.failOutputContextRecovery(this.voiceEpoch, this.voiceRoom, this.currentVc);
+      this.failOutputContextRecovery(
+        this.voiceEpoch, this.voiceRoom, this.currentVc, 'create_context', 'unsupported',
+      );
       return false;
     }
     if (!rebindExactWebAudioMixContexts(rooms, replacement)) {
@@ -1807,7 +1858,7 @@ export class Engine {
         try { void replacement.close(); } catch { /**/ }
       }
       this.outputRecoveryRejectedFor = previous;
-      this.failOutputContextRecovery(this.voiceEpoch, this.voiceRoom, this.currentVc);
+      this.failOutputContextRecovery(this.voiceEpoch, this.voiceRoom, this.currentVc, 'rebind', 'sdk');
       return false;
     }
     if (replacement !== previous) {
@@ -1860,81 +1911,174 @@ export class Engine {
       return devices.find((d) => d.deviceId !== 'default' && !!defaultDevice?.groupId && d.groupId === defaultDevice.groupId)?.deviceId || '';
     } catch { return ''; }
   }
-  private queueContextOutput(requested: string): Promise<void> {
+  private queueContextOutput(
+    requested: string,
+    force = false,
+    onFailure?: (failure: AudioSinkRouteFailure) => void,
+  ): Promise<AudioSinkRouteOutcome> {
     const ctx = this.getOutputContext();
-    const run = this.outputSwitch.catch(() => {}).then(async () => {
+    const run = this.outputSwitch.catch(() => {}).then(async (): Promise<AudioSinkRouteOutcome> => {
       if (!ctx) {
-        if (requested !== 'default') throw new Error('Audio output switching is not supported');
-        return;
+        if (requested !== 'default') onFailure?.({ operation: 'set_sink', outcome: 'unsupported', code: 'unsupported' });
+        return 'unsupported';
       }
-      const outcome = await routeAudioSinkTarget(ctx, requested, {
+      return routeAudioSinkTarget(ctx, requested, {
         normalize: (sink) => this.normalizedContextSink(sink),
+        force,
+        onFailure,
       });
-      if (outcome === 'applied' || outcome === 'superseded'
-        || (outcome === 'unsupported' && requested === 'default')) return;
-      throw new Error(`Audio output switch ${outcome}`);
     });
-    // Keep the queue usable after a rejected hardware switch while returning
-    // the original promise to the caller so it can perform the fallback.
-    this.outputSwitch = run.catch(() => {});
+    // Keep the queue usable after a rejected hardware switch while returning its fixed outcome to
+    // the caller. Browser exceptions are reduced inside routeAudioSinkTarget and never escape.
+    this.outputSwitch = run.then(() => {}, () => {});
     return run;
   }
-  private async switchContextOutput(requested: string, notifyOnFallback = true): Promise<string | null> {
+  private async switchContextOutput(
+    requested: string,
+    notifyOnFallback = true,
+    force = false,
+  ): Promise<string | null> {
     const generation = ++this.outputGeneration;
+    let contextFailure: AudioSinkRouteFailure | undefined;
+    let treeFailure: AudioSinkRouteFailure | undefined;
     // Tree playback owns a separate exact element/shared-context route. Both routes are bounded,
     // and Settings is committed only when every currently audible path reached the same device.
-    const treeSwitch = setTreeStreamOutputSink(requested);
-    try {
-      const [contextResult, treeResult] = await Promise.allSettled([
-        this.queueContextOutput(requested),
-        treeSwitch,
-      ]);
-      if (generation !== this.outputGeneration || (getSettings().output || 'default') !== requested) return null;
-      if (contextResult.status === 'rejected') throw contextResult.reason;
-      const treeOutcome = treeResult.status === 'fulfilled' ? treeResult.value : 'failed';
-      if (treeOutcome === 'failed' || treeOutcome === 'timed-out'
-        || (treeOutcome === 'unsupported' && requested !== 'default')) {
-        throw new Error(`Tree audio output switch ${treeOutcome}`);
-      }
-      return requested;
-    } catch {
-      // Never let a failed A overwrite a newer B. The generation check occurs
-      // before enqueueing the fallback; if B starts just after this check, its
-      // operation is queued after default and therefore still wins.
-      if (generation !== this.outputGeneration || (getSettings().output || 'default') !== requested) return null;
-      this.recordVoiceOutputFailure(requested === 'default' ? 'default' : 'custom');
-      if (requested === 'default') { void setTreeStreamOutputSink('default'); return 'default'; }
-      await Promise.allSettled([
-        this.queueContextOutput('default'),
-        setTreeStreamOutputSink('default'),
-      ]);
-      if (generation !== this.outputGeneration || (getSettings().output || 'default') !== requested) return null;
-      // A newer A -> B selection may already be queued. Only the still-current
-      // failed selection is allowed to rewrite settings or show a warning.
-      setSettings({ output: '' });
-      if (notifyOnFallback) this.hooks.toast('Устройство вывода недоступно — включено системное', 'warn');
-      return 'default';
+    const [treeResult, contextResult] = await Promise.allSettled([
+      setTreeStreamOutputSink(requested, {
+        force,
+        onFailure: (failure) => { treeFailure ??= failure; },
+      }),
+      this.queueContextOutput(requested, force, (failure) => { contextFailure ??= failure; }),
+    ]);
+    if (generation !== this.outputGeneration || (getSettings().output || 'default') !== requested) return null;
+    const contextOutcome: AudioSinkRouteOutcome = contextResult.status === 'fulfilled'
+      ? contextResult.value
+      : 'failed';
+    const treeOutcome: AudioSinkRouteOutcome = treeResult.status === 'fulfilled'
+      ? treeResult.value
+      : 'failed';
+    const contextFailed = contextOutcome === 'failed' || contextOutcome === 'timed-out'
+      || (contextOutcome === 'unsupported' && requested !== 'default');
+    const treeFailed = treeOutcome === 'failed' || treeOutcome === 'timed-out'
+      || (treeOutcome === 'unsupported' && requested !== 'default');
+    if (audioSinkRoutesConfirmed(requested, [contextOutcome, treeOutcome])) return requested;
+    // A nested router may already belong to a newer exact target operation. It is neither a
+    // confirmed route nor a hardware failure attributable to this request; leave the cache empty
+    // so ordinary reconciliation can retry without emitting a false incident.
+    if (contextOutcome === 'superseded' || treeOutcome === 'superseded') return null;
+
+    // Never let a failed A overwrite a newer B. This check occurs before enqueueing the fallback;
+    // if B starts just afterwards, its exact generation is queued after default and still wins.
+    const failedOutcome = contextFailed ? contextOutcome : treeOutcome;
+    const failure = contextFailed ? contextFailure : treeFailure;
+    this.recordVoiceOutputFailure(
+      requested === 'default' ? 'default' : 'custom',
+      failedOutcome === 'timed-out' ? 'timed_out'
+        : failedOutcome === 'unsupported' ? 'unsupported' : 'failed',
+      contextFailed ? 'voice_mixer' : 'stream_mixer',
+      failure?.operation ?? 'set_sink',
+      failure?.code ?? (failedOutcome === 'timed-out' ? 'timeout'
+        : failedOutcome === 'unsupported' ? 'unsupported' : 'unknown'),
+      requested === 'default',
+    );
+    if (requested === 'default') return null;
+    let fallbackContextFailure: AudioSinkRouteFailure | undefined;
+    let fallbackTreeFailure: AudioSinkRouteFailure | undefined;
+    const [fallbackContextResult, fallbackTreeResult] = await Promise.allSettled([
+      this.queueContextOutput('default', false, (current) => { fallbackContextFailure ??= current; }),
+      setTreeStreamOutputSink('default', {
+        onFailure: (current) => { fallbackTreeFailure ??= current; },
+      }),
+    ]);
+    if (generation !== this.outputGeneration || (getSettings().output || 'default') !== requested) {
+      this.submitVoiceDiagnostic('output_route_failed');
+      return null;
     }
+    const fallbackContextOutcome: AudioSinkRouteOutcome = fallbackContextResult.status === 'fulfilled'
+      ? fallbackContextResult.value
+      : 'failed';
+    const fallbackTreeOutcome: AudioSinkRouteOutcome = fallbackTreeResult.status === 'fulfilled'
+      ? fallbackTreeResult.value
+      : 'failed';
+    if (fallbackContextOutcome === 'superseded' || fallbackTreeOutcome === 'superseded') {
+      this.submitVoiceDiagnostic('output_route_failed');
+      return null;
+    }
+    if (!audioSinkRoutesConfirmed('default', [fallbackContextOutcome, fallbackTreeOutcome])) {
+      const contextFallbackFailed = fallbackContextOutcome !== 'applied'
+        && fallbackContextOutcome !== 'unsupported';
+      const fallbackOutcome = contextFallbackFailed ? fallbackContextOutcome : fallbackTreeOutcome;
+      const fallbackFailure = contextFallbackFailed ? fallbackContextFailure : fallbackTreeFailure;
+      this.recordVoiceOutputFailure(
+        'default',
+        fallbackOutcome === 'timed-out' ? 'timed_out'
+          : fallbackOutcome === 'unsupported' ? 'unsupported' : 'failed',
+        contextFallbackFailed ? 'voice_mixer' : 'stream_mixer',
+        fallbackFailure?.operation ?? 'set_sink',
+        fallbackFailure?.code ?? (fallbackOutcome === 'timed-out' ? 'timeout' : 'unknown'),
+      );
+      return null;
+    }
+    // A newer A -> B selection may already be queued. Only the still-current failed selection is
+    // allowed to rewrite settings or show a warning.
+    this.submitVoiceDiagnostic('output_route_failed');
+    setSettings({ output: '' });
+    if (notifyOnFallback) this.hooks.toast('Устройство вывода недоступно — включено системное', 'warn');
+    return 'default';
   }
-  private async switchElementOutput(el: HTMLMediaElement, requested: string, force = false): Promise<void> {
+  private async switchElementOutput(
+    el: HTMLMediaElement,
+    requested: string,
+    retry = false,
+    force = false,
+  ): Promise<void> {
     // Two watchdogs reconcile voice concurrently. Coalesce their identical route request before it
     // reaches the promise queue; a slow/hung CoreAudio setSinkId must never accumulate per peer.
-    if (!this.elementOutputRoutes.claim(el, requested, force)) return;
+    if (!this.elementOutputRoutes.claim(el, requested, retry || force)) return;
     const generation = (this.elementOutputGenerations.get(el) || 0) + 1;
     this.elementOutputGenerations.set(el, generation);
     const previous = this.elementOutputSwitches.get(el) || Promise.resolve();
     const run = previous.catch(() => {}).then(async () => {
       if (this.elementOutputGenerations.get(el) !== generation) return;
-      const outcome = await routeAudioSinkTarget(el, requested);
-      if (outcome === 'applied' || outcome === 'unsupported' || outcome === 'superseded') return;
+      let failure: AudioSinkRouteFailure | undefined;
+      const outcome = await routeAudioSinkTarget(el, requested, {
+        force,
+        onFailure: (current) => { failure ??= current; },
+      });
+      // A newer Settings selection is queued behind this exact element owner, so the shared sink
+      // router cannot observe that successor until this run releases the outer queue. Fence the
+      // stale result here before it can create a false incident for the already-abandoned route.
+      if (this.elementOutputGenerations.get(el) !== generation) return;
+      if (audioSinkRoutesConfirmed(requested, [outcome]) || outcome === 'superseded') return;
       this.recordVoiceOutputFailure(
         requested === 'default' ? 'default' : 'custom',
-        outcome === 'timed-out' ? 'timed_out' : 'failed',
+        outcome === 'timed-out' ? 'timed_out' : outcome === 'unsupported' ? 'unsupported' : 'failed',
+        'media_element', failure?.operation ?? 'set_sink', failure?.code
+          ?? (outcome === 'timed-out' ? 'timeout' : outcome === 'unsupported' ? 'unsupported' : 'unknown'),
+        requested === 'default',
       );
       // Per-element serialization makes the fallback finish before any newer selection; a
       // superseded request skips fallback entirely. Thus an old Bluetooth failure cannot win.
-      if (this.elementOutputGenerations.get(el) !== generation || requested === 'default') return;
-      await routeAudioSinkTarget(el, 'default');
+      if (this.elementOutputGenerations.get(el) !== generation || requested === 'default') {
+        if (requested !== 'default') this.submitVoiceDiagnostic('output_route_failed');
+        return;
+      }
+      let fallbackFailure: AudioSinkRouteFailure | undefined;
+      const fallbackOutcome = await routeAudioSinkTarget(el, 'default', {
+        onFailure: (current) => { fallbackFailure ??= current; },
+      });
+      if (this.elementOutputGenerations.get(el) !== generation
+        || audioSinkRoutesConfirmed('default', [fallbackOutcome])
+        || fallbackOutcome === 'superseded') {
+        this.submitVoiceDiagnostic('output_route_failed');
+        return;
+      }
+      this.recordVoiceOutputFailure(
+        'default',
+        fallbackOutcome === 'timed-out' ? 'timed_out' : 'failed',
+        'media_element', fallbackFailure?.operation ?? 'set_sink', fallbackFailure?.code
+          ?? (fallbackOutcome === 'timed-out' ? 'timeout' : 'unknown'),
+      );
     });
     this.elementOutputSwitches.set(el, run.catch(() => {}));
     await run;
@@ -2304,6 +2448,7 @@ export class Engine {
     serverId: string,
     channelId: string,
     operationDeadline = Date.now() + VOICE_JOIN_TIMEOUT_MS,
+    onTerminalFailure?: (reason: VoiceMediaConnectFailure) => void,
   ): Promise<boolean> {
     const session = this.sessionId(hub);
     const leaseEpoch = this.voiceLeaseEpoch;
@@ -2320,22 +2465,72 @@ export class Engine {
     // can reject activation while that removal is still closing; the join-only grant keeps this
     // room fail-closed, so bounded retry is safe and avoids forcing an unnecessary leave.
     while (current() && Date.now() < deadline) {
+      let serverRetryAfterSeconds: number | undefined;
       try {
         const activated = await withVoiceDeadline(
           api.activateVoiceMedia(session, serverId, channelId, leaseEpoch),
           Math.min(deadline, Date.now() + VOICE_OPERATION_TIMEOUT_MS),
           'voice media activation',
         );
-        if (!current() || activated.room !== room.name || activated.epoch !== leaseEpoch) return false;
-        if (await this.waitVoiceMediaPermissions(room, current, Math.min(2000, Math.max(250, deadline - Date.now())))) {
+        if (!current()) return false;
+        if (activated.room !== room.name || activated.epoch !== leaseEpoch) {
+          this.recordVoiceDiagnostic({
+            kind: 'media_activated', stage: 'activation', outcome: 'failed', code: 'sdk',
+            joinElapsedMs: this.voiceDiagnosticJoinElapsed(), ...this.voiceDiagnosticState(),
+          });
+          return false;
+        }
+        const permissionBudget = Math.min(2_000, Math.max(0, deadline - Date.now()));
+        if (permissionBudget > 0 && await this.waitVoiceMediaPermissions(room, current, permissionBudget)) {
           if (!current()) return false;
           this.voiceMediaActivated.add(room);
           return true;
         }
-      } catch { /** bounded exact-intent retry below */ }
+        if (!current()) return false;
+        this.recordVoiceDiagnostic({
+          kind: 'media_activated', stage: 'activation', outcome: 'timed_out', code: 'timeout',
+          joinElapsedMs: this.voiceDiagnosticJoinElapsed(), ...this.voiceDiagnosticState(),
+        });
+      } catch (error) {
+        if (!current()) return false;
+        const sessionClosing = isApiError(error) && error.status === 409
+          && Number.isFinite(error.retryAfter);
+        const failureDisposition = isApiError(error)
+          ? voiceActivationHttpFailureDisposition(error.status)
+          : 'retry';
+        // A finite server retry hint is the protocol-level proof that an exact previous media
+        // identity is still closing. Keep ordinary 409 responses generic: neither raw error text
+        // nor message matching is safe enough to promote them to this diagnostic category.
+        const classified = sessionClosing
+          ? { code: 'session_closing' as const, httpStatus: 409 }
+          : classifyVoiceDiagnosticError(error);
+        this.recordVoiceDiagnostic({
+          kind: 'media_activated', stage: 'activation', outcome: 'failed', ...classified,
+          joinElapsedMs: this.voiceDiagnosticJoinElapsed(), ...this.voiceDiagnosticState(),
+        });
+        // req() already performed its single access-session refresh before exposing a 401 here.
+        // Retrying malformed/unauthorized/forbidden requests only extends a guaranteed failure to
+        // the full join deadline. A missing route/method is likewise fixed for this server version,
+        // but preserves the rollout-specific user explanation without matching response text.
+        if (failureDisposition === 'server-updating') {
+          onTerminalFailure?.('server-updating');
+          return false;
+        }
+        if (failureDisposition === 'terminal') {
+          onTerminalFailure?.('activation');
+          return false;
+        }
+        if (sessionClosing)
+          serverRetryAfterSeconds = Math.max(0, error.retryAfter!);
+      }
       if (!current()) return false;
-      const delay = Math.min(1500, 200 * (2 ** Math.min(attempt++, 3)));
-      await new Promise((resolve) => window.setTimeout(resolve, Math.min(delay, Math.max(0, deadline - Date.now()))));
+      const normalBackoff = Math.min(1_500, 200 * (2 ** Math.min(attempt++, 3)));
+      const delay = boundedVoiceActivationRetryDelayMs(
+        normalBackoff,
+        deadline - Date.now(),
+        serverRetryAfterSeconds,
+      );
+      if (delay > 0) await new Promise((resolve) => window.setTimeout(resolve, delay));
     }
     return false;
   }
@@ -2354,6 +2549,7 @@ export class Engine {
       if (this.voiceIntentCurrent(voiceEpoch, hub, channelId))
         this.voiceMediaConnectFailure = { voiceEpoch, reason };
     };
+    let activationFailureRemembered = false;
     let token;
     this.setVoiceDiagnosticJoinStage('media_token');
     try {
@@ -2416,7 +2612,18 @@ export class Engine {
         kind: 'media_activated', stage: 'activation', outcome: 'started',
         joinElapsedMs: this.voiceDiagnosticJoinElapsed(), ...this.voiceDiagnosticState(),
       });
-      if (!await this.activateVoiceMediaRoom(room, hub, voiceEpoch, serverId, channelId, operationDeadline))
+      if (!await this.activateVoiceMediaRoom(
+        room,
+        hub,
+        voiceEpoch,
+        serverId,
+        channelId,
+        operationDeadline,
+        (reason) => {
+          activationFailureRemembered = true;
+          rememberFailure(reason);
+        },
+      ))
         throw new Error('voice media activation failed');
       this.recordVoiceDiagnostic({
         kind: 'media_activated', stage: 'activation', outcome: 'ok', code: 'none',
@@ -2424,7 +2631,9 @@ export class Engine {
       });
       return room;
     } catch (error) {
-      rememberFailure(failure);
+      // activateVoiceMediaRoom may already have identified a route/method rollout mismatch. Keep
+      // that fixed reason instead of replacing it with the generic activation failure below.
+      if (!activationFailureRemembered) rememberFailure(failure);
       if (this.voiceIntentCurrent(voiceEpoch, hub, channelId)) {
         const stage = failure === 'activation' ? 'activation' : 'media_connect';
         const timedOut = Date.now() >= operationDeadline || classifyVoiceDiagnosticError(error).code === 'timeout';
@@ -2509,8 +2718,24 @@ export class Engine {
         if (!await retry(Math.min(1500, 250 * (2 ** Math.min(failures, 3))))) return false;
         continue;
       }
+      let terminalActivationFailure: VoiceMediaConnectFailure | null = null;
       if ((!this.voiceMediaActivated.has(activeMedia) || !this.mediaPermissionsActive(activeMedia))
-        && !await this.activateVoiceMediaRoom(activeMedia, room, voiceEpoch, serverId, channelId, deadline)) {
+        && !await this.activateVoiceMediaRoom(
+          activeMedia,
+          room,
+          voiceEpoch,
+          serverId,
+          channelId,
+          deadline,
+          (reason) => { terminalActivationFailure = reason; },
+        )) {
+        // Invalid/revoked authorization and a rolling-old activation route cannot recover inside
+        // this exact lease verifier. Keep media fail-closed and retire it immediately; retryable
+        // network/timeout/conflict responses leave this marker empty and retain the bounded loop.
+        if (terminalActivationFailure) {
+          await this.leaveVoice();
+          return false;
+        }
         failures++;
         if (!await retry(Math.min(5000, 400 * (2 ** Math.min(failures, 4))))) return false;
         continue;
@@ -2825,6 +3050,7 @@ export class Engine {
     this.subscriptionRetries.clear();
     this.voiceOutputRoom = null; this.voiceOutputSink = ''; this.voiceOutputPending = null;
     if (this.outputDeviceTimer) { clearTimeout(this.outputDeviceTimer); this.outputDeviceTimer = null; }
+    this.outputDeviceRefreshPending = false;
     void this.stopMic(oldVoiceMediaRoom);
     this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.voiceReconnecting = false; this.lostVoiceServerId = null; this.lostVoiceChannel = null; this.roomReady = false; this.screenStream = null; this.voicePresenceConfirmed = false; this.noMic = false; this.micHadCapture = false; this.micBootstrapWanted = false; // deafened/manualMute НЕ трогаем — персист-интент
     // Hub/view and active/pending media can all be distinct during a channel handoff.
@@ -4373,6 +4599,7 @@ export class Engine {
       track?.mediaStreamTrack,
       publication?.track === track,
       publication?.isUpstreamPaused === true,
+      track?.isMuted === true || publication?.isMuted === true,
     );
     return !!room && !!track && this.voiceMediaChannelId === this.currentVc
       && this.voiceMediaActivated.has(room) && !health.ended && !health.muted && !health.upstreamPaused;
@@ -4941,6 +5168,8 @@ export class Engine {
   private micRetryAt = 0;
   private micFailureNotified = false;
   private clearMicTrackLifecycle() {
+    ++this.micMuteWriteSeq;
+    this.micUnmuteWriteOwner = 0;
     this.micTrackCleanup?.();
     this.micTrackCleanup = null;
     if (this.micRecoveryTimer != null) clearTimeout(this.micRecoveryTimer);
@@ -5007,7 +5236,11 @@ export class Engine {
       this.micHadCapture,
       this.micBootstrapWanted,
       this.micForegroundRecoveryPending,
+      this.manualMute || this.deafened,
     )) return;
+    // An explicit unmute owns the exact LiveKit sender until its bounded write settles. Inspecting
+    // isUpstreamPaused before then would mistake the old deliberate mute for transport damage.
+    if (this.micUnmuteWriteOwner !== 0) return;
     const voiceEpoch = this.voiceEpoch;
     const t = this.micRaw?.getAudioTracks()[0];
     const publication = room.localParticipant.getTrackPublication(Track.Source.Microphone);
@@ -5016,6 +5249,7 @@ export class Engine {
       this.micLocalTrack?.mediaStreamTrack,
       publication?.track === this.micLocalTrack,
       publication?.isUpstreamPaused === true,
+      this.micLocalTrack?.isMuted === true || publication?.isMuted === true,
     );
     // reapplyMic can prepare a context under the user's mobile gesture while permission recovery is
     // still fail-closed. Once the room is re-activated, consume that context directly: tearing it
@@ -5137,6 +5371,100 @@ export class Engine {
       }
     }
   }
+  private reconcileMicPrivacyIntent() {
+    const owner = ++this.micMuteWriteSeq;
+    this.micUnmuteWriteOwner = 0;
+    const hub = this.voiceRoom;
+    const room = this.voiceMediaRoom;
+    const channel = this.currentVc;
+    const voiceEpoch = this.voiceEpoch;
+    const publication = this.micPub(room);
+    const track = publication?.track;
+    const shouldMute = this.manualMute || this.deafened;
+
+    if (shouldMute) {
+      // If privacy changes while an automatic rebuild is between teardown and capture, retire that
+      // owner. A later explicit unmute will validate/reacquire the damaged pipeline exactly once.
+      if (this.micRecoveryOwner !== 0) {
+        this.micForegroundRecoveryPending = true;
+        this.invalidateMicRecoveryOwner();
+        if (this.micStartOwnership.active) {
+          ++this.micEpoch;
+          this.micStartOwnership.invalidate();
+        }
+      }
+      if (track) {
+        try { void Promise.resolve(track.mute()).catch(() => { /** durable mute attribute remains authoritative */ }); }
+        catch { /** durable mute attribute remains authoritative */ }
+      }
+      return;
+    }
+
+    // Physical unmute is allowed only for the app-owned, live publication of this exact voice
+    // intent. A stale publication may still be present during a channel/lease handoff; touching it
+    // could reopen an old sender. Mute above remains deliberately broader for privacy.
+    const exactOwnership = !!hub && !!room && !!channel && !!track
+      && track === this.micLocalTrack && this.hasExactCurrentMicPublication()
+      && this.voiceMediaIntentCurrent(voiceEpoch, hub, room, channel);
+    if (!hub || !room || !channel || !track || !exactOwnership) {
+      void this.checkMicAlive(false);
+      return;
+    }
+    const ownershipHealth = microphoneTransportHealth(
+      this.micRaw?.getAudioTracks()[0],
+      this.micLocalTrack?.mediaStreamTrack,
+      true,
+      publication?.isUpstreamPaused === true,
+      track?.isMuted === true || publication?.isMuted === true,
+    );
+    // No exact/live publication means the previous source really disappeared. The normal fenced
+    // recovery path is safe to start immediately now that the user explicitly wants to speak.
+    if (ownershipHealth.ended) {
+      void this.checkMicAlive(false);
+      return;
+    }
+
+    this.micUnmuteWriteOwner = owner;
+    let raw: Promise<unknown>;
+    try { raw = Promise.resolve(track.unmute()); }
+    catch (error) { raw = Promise.reject(error); }
+    // A browser/SDK write is not cancellable. If this unmute resolves after a newer mute/deafen,
+    // reassert privacy on the same exact publication; the gain gate and durable hub attribute stay
+    // closed while this bounded repair catches the physical LiveKit track up.
+    void raw.then(() => {
+      if (this.micMuteWriteSeq === owner || (!this.manualMute && !this.deafened)
+        || this.micPub(room)?.track !== track) return;
+      try {
+        void withVoiceTimeout(track.mute(), VOICE_ATTRIBUTE_TIMEOUT_MS, 'microphone remute')
+          .catch(() => undefined);
+      } catch { /** durable mute attribute remains authoritative */ }
+    }, () => { /** the bounded owner below handles the failed explicit unmute */ });
+    const finishUnmute = (writeSucceeded: boolean) => {
+      if (this.micUnmuteWriteOwner !== owner) return;
+      this.micUnmuteWriteOwner = 0;
+      if (this.manualMute || this.deafened) return;
+      const currentPublication = this.micPub(room);
+      const currentOwnership = track === this.micLocalTrack
+        && currentPublication?.track === track
+        && this.voiceMediaIntentCurrent(voiceEpoch, hub, room, channel)
+        && this.voiceMediaActivated.has(room);
+      if (!currentOwnership) {
+        // Never touch the stale track. The current room, if any, is evaluated by its own fenced
+        // recovery generation rather than inheriting this old write's result.
+        void this.checkMicAlive(false);
+        return;
+      }
+      const stillMuted = !writeSucceeded || track.isMuted || currentPublication.isMuted
+        || track.mediaStreamTrack.enabled === false;
+      // A rejected/timed-out unmute is not evidence of a healthy sender, even when stale browser
+      // flags still say `live`. Arm one immediate, generation-fenced rebuild; checkMicAlive
+      // consumes this flag before starting its single recovery owner.
+      if (stillMuted) this.micForegroundRecoveryPending = true;
+      void this.checkMicAlive(false);
+    };
+    void withVoiceTimeout(raw, VOICE_ATTRIBUTE_TIMEOUT_MS, 'microphone unmute')
+      .then(() => finishUnmute(true), () => finishUnmute(false));
+  }
   private supersedeHiddenMicOperations() {
     let superseded = false;
     if (this.hiddenMicStartOwner && this.micStartOwnership.owner === this.hiddenMicStartOwner) {
@@ -5211,6 +5539,7 @@ export class Engine {
       this.micLocalTrack?.mediaStreamTrack,
       publication?.track === this.micLocalTrack,
       publication?.isUpstreamPaused === true,
+      this.micLocalTrack?.isMuted === true || publication?.isMuted === true,
     );
     const contextUnusable = !!this.micActx && !reusableMicrophoneAudioContextState(this.micActx.state);
     const ownsCapture = this.micHadCapture || this.micBootstrapWanted;
@@ -5654,12 +5983,11 @@ export class Engine {
     // existing full-mute sound authoritative instead of announcing an unmute nobody can hear.
     if (this.inVoice && !this.deafened) playSound(this.manualMute ? 'mute' : 'unmute');
     if (this.inVoice && this.voiceRoom && this.voiceMediaRoom) {
-      const p = this.micPub();
       // пока фулл-мут (deafened) активен, трек должен оставаться замьюченным на уровне LiveKit
       // независимо от ручного тогла — иначе снятие ручного мута во время deafen паразитно
       // размучивает трек (звук всё равно молчит через applyGate/gain=0, но у пиров и у себя
       // пропадает бейдж мута, будто фулл-мута больше нет).
-      if (p && p.track) { (this.manualMute || this.deafened) ? p.track.mute() : p.track.unmute(); } // ручной мут виден другим
+      this.reconcileMicPrivacyIntent(); // ручной мут виден другим
       // Публикации может не быть (listen-only/рестарт мика) — тогда пиры узнают о муте только атрибутом.
       void this.setVoiceAttributes(this.voiceRoom, this.wantedVoiceAttributes(this.voiceRoom));
       this.applyGate();
@@ -5745,9 +6073,7 @@ export class Engine {
     if (this.inVoice) {
       // транслируем пирам, чтобы у них статус-бейдж отличался от простого мута мика (см. build())
       if (this.voiceRoom) void this.setVoiceAttributes(this.voiceRoom, this.wantedVoiceAttributes(this.voiceRoom));
-      const p = this.micPub();
-      if (this.deafened) { if (p && p.track) p.track.mute(); }
-      else { if (p && p.track && !this.manualMute) p.track.unmute(); }
+      this.reconcileMicPrivacyIntent();
       // deafen → отписка от всех миков (want=false при deafened), undeafen → переподписка. Отписка
       // надёжнее глушения громкостью: нет трека = точно тишина, и размут пира не воскресит звук.
       this.reconcileAllAudio();
@@ -5924,6 +6250,8 @@ export class Engine {
     el.setAttribute('data-origin', 'view');
     el.setAttribute('data-screen-identity', entry.identity);
     if (!el.isConnected) document.getElementById('audioSink')?.appendChild(el);
+    // attach() creates a fresh element on the OS route; do not reassert default through CoreAudio.
+    seedAudioSinkTargetRoute(el);
     void this.switchElementOutput(el, getSettings().output || 'default');
     this.applyScreenAudioGain(baseUid(p.identity), p);
     this.ensureRemoteAudioPlayback();
@@ -5934,6 +6262,7 @@ export class Engine {
     el.setAttribute('data-origin', 'voice');
     el.setAttribute('data-voice-identity', entry.identity);
     if (!el.isConnected) document.getElementById('audioSink')?.appendChild(el);
+    seedAudioSinkTargetRoute(el);
     // При webAudioMix SDK намеренно держит element muted/volume=0 и выводит через GainNode.
     // Размьют element создал бы обход gain (двойной звук и сломанный local mute).
     this.applyVolumeToParticipant(p);
@@ -6386,15 +6715,15 @@ export class Engine {
     });
     if (this.screenAudioEls.size) this.ensureRemoteAudioPlayback();
   }
-  async applyOutput() {
+  async applyOutput(forceRouteRefresh = false) {
     const sink = getSettings().output || 'default';
     // The shared WebAudio context is the actual audible mixer. Await it first;
     // HTML elements below are only the Chromium echo-cancellation workaround
     // and the non-mixed screen-audio path.
-    const effectiveSink = await this.switchContextOutput(sink);
+    const effectiveSink = await this.switchContextOutput(sink, true, forceRouteRefresh);
     if (!effectiveSink) return; // a newer device selection owns the queue
     document.querySelectorAll('#audioSink audio').forEach((a) => {
-      void this.switchElementOutput(a as HTMLMediaElement, effectiveSink, true);
+      void this.switchElementOutput(a as HTMLMediaElement, effectiveSink, true, forceRouteRefresh);
     });
     this.ensureRemoteVoicePlayback();
     this.ensureVoiceOutput(true);

@@ -121,4 +121,16 @@ assert.match(classifier, /NotAllowedError[\s\S]*NotFoundError[\s\S]*NotSupported
 assert.doesNotMatch(classifier, /\.message|\.stack|JSON\.stringify/,
   'classification never serializes an error payload');
 
+const outputFailureRecorder = engine.match(/private recordVoiceOutputFailure\([\s\S]*?\n  }\n\n  private recordVoiceMicFailure/)?.[0] || '';
+assert.match(outputFailureRecorder, /outputTarget[\s\S]*outputOperation[\s\S]*code \?\?[\s\S]*'unknown'/,
+  'output failures preserve a fixed target and operation while generic failures remain unknown');
+assert.doesNotMatch(outputFailureRecorder, /code \?\?[\s\S]*'device_lost'/,
+  'a generic browser output failure is not mislabeled as a disconnected device');
+assert.match(engine, /if \(document\.hidden\) this\.outputDeviceRefreshPending = true;[\s\S]*void this\.applyOutput\(true\)/,
+  'a hidden devicechange is deferred until a visible hardware refresh is safe');
+assert.match(engine, /forceRefresh = this\.outputDeviceRefreshPending;[\s\S]*this\.outputDeviceRefreshPending = false;[\s\S]*switchContextOutput\(requested, false, forceRefresh\)/,
+  'ordinary foreground reconciliation consumes only a real deferred devicechange force flag');
+assert.match(engine, /recordVoiceOutputFailure\([\s\S]*contextFailed \? 'voice_mixer' : 'stream_mixer'[\s\S]*failure\?\.operation[\s\S]*failure\?\.code/,
+  'aggregate output diagnostics identify the failing logical path without a device id or raw error');
+
 console.log('voice diagnostics engine: ok');

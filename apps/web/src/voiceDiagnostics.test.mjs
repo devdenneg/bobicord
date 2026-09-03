@@ -168,6 +168,71 @@ const {
 {
   let now = 0;
   const recorder = new VoiceDiagnosticsRecorder({
+    now: () => now,
+    createReportId: () => '454545454545454545454545',
+    client: { kind: 'native', platform: 'macos', installMode: 'native', networkType: 'wifi' },
+  });
+  recorder.start();
+  recorder.record({
+    kind: 'join_started', stage: 'intent', outcome: 'started', joinElapsedMs: 0,
+    token: 'DO_NOT_STORE_TOKEN', deviceId: 'DO_NOT_STORE_DEVICE_ID', rawPayload: 'DO_NOT_STORE_PAYLOAD',
+  });
+  now = 6_600;
+  recorder.record({
+    kind: 'media_activated', stage: 'activation', outcome: 'ok', code: 'none', joinElapsedMs: now,
+    sdp: 'DO_NOT_STORE_SDP', identity: 'DO_NOT_STORE_IDENTITY',
+  });
+  recorder.record({ kind: 'join_completed', outcome: 'ok', joinElapsedMs: now });
+  const slowJoin = recorder.buildReport('join_stuck');
+  assert.deepEqual(slowJoin.events, [
+    { atMs: 0, kind: 'join_started', stage: 'intent', outcome: 'started', joinElapsedMs: 0 },
+    { atMs: 6_600, kind: 'media_activated', stage: 'activation', outcome: 'ok', code: 'none', joinElapsedMs: 6_600 },
+    { atMs: 6_600, kind: 'join_completed', outcome: 'ok', joinElapsedMs: 6_600 },
+  ], 'a slow successful join retains only the bounded stage timeline');
+  assert.doesNotMatch(JSON.stringify(slowJoin), /DO_NOT_STORE/,
+    'a slow successful join cannot upload tokens, device identifiers, SDP or raw payloads');
+}
+
+{
+  let now = 0;
+  const recorder = new VoiceDiagnosticsRecorder({
+    now: () => ++now,
+    createReportId: () => '333333333333333333333333',
+    client: { kind: 'web', platform: 'macos', installMode: 'standalone', networkType: 'wifi' },
+  });
+  recorder.start();
+  recorder.record({
+    kind: 'output_route_failed', stage: 'output_route', outcome: 'failed', code: 'invalid_state',
+    outputRoute: 'default', outputTarget: 'voice_mixer', outputOperation: 'set_sink',
+    error: 'DO_NOT_STORE_RAW_ERROR', deviceId: 'DO_NOT_STORE_DEVICE_ID',
+  });
+  recorder.record({
+    kind: 'output_route_failed', stage: 'output_route', outcome: 'failed', code: 'browser-secret',
+    outputTarget: 'hardware-id-from-client', outputOperation: 'raw-browser-method',
+  });
+  recorder.record({
+    kind: 'media_activated', stage: 'activation', outcome: 'failed', code: 'session_closing',
+    httpStatus: 409, error: 'DO_NOT_STORE_SERVER_RESPONSE',
+  });
+  const events = recorder.buildReport('output_route_failed').events;
+  assert.deepEqual(events[0], {
+    atMs: 1, kind: 'output_route_failed', stage: 'output_route', outcome: 'failed',
+    code: 'invalid_state', outputRoute: 'default', outputTarget: 'voice_mixer', outputOperation: 'set_sink',
+  });
+  assert.deepEqual(events[1], {
+    atMs: 2, kind: 'output_route_failed', stage: 'output_route', outcome: 'failed',
+  }, 'unknown diagnostic categories are discarded rather than copied');
+  assert.deepEqual(events[2], {
+    atMs: 3, kind: 'media_activated', stage: 'activation', outcome: 'failed',
+    code: 'session_closing', httpStatus: 409,
+  }, 'activation closing backoff keeps only its fixed protocol category and HTTP status');
+  assert.doesNotMatch(JSON.stringify(events), /DO_NOT_STORE|hardware-id|raw-browser/,
+    'output diagnostics contain no raw errors or hardware identifiers');
+}
+
+{
+  let now = 0;
+  const recorder = new VoiceDiagnosticsRecorder({
     now: () => ++now,
     createReportId: () => 'abcdef0123456789abcdef01',
     client: { kind: 'native', platform: 'macos', installMode: 'native', networkType: 'ethernet' },
@@ -176,6 +241,7 @@ const {
   const full = {
     kind: 'rtc_sample', stage: 'rtc', outcome: 'ok', code: 'none', connectionState: 'connected',
     iceState: 'connected', trackState: 'live', audioContextState: 'running', outputRoute: 'custom',
+    outputTarget: 'stream_mixer', outputOperation: 'enumerate',
     micMode: 'voice', networkType: 'ethernet', documentHidden: false, online: true,
     micEnabled: true, publicationMuted: false, upstreamPaused: false, deafened: false,
     pushToTalk: false, speechDetected: true, canPlaybackAudio: true, rttMs: 120_000,

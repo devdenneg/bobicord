@@ -30,6 +30,8 @@ assert.match(apiSource, /query\.set\('beforeId', options\.cursor\.id\)/,
   'the admin API sends the id half of the compound cursor');
 
 const diagnosticsPage = readFileSync(join(here, 'components', 'AdminVoiceDiagnostics.tsx'), 'utf8');
+assert.match(diagnosticsPage, /join_stuck: 'Медленное или зависшее подключение'/,
+  'the shared incident label covers both timed-out and successful-but-slow joins');
 assert.match(diagnosticsPage, /<h2 id="admin-diag-title">Диагностика связи<\/h2>/,
   'the diagnostics panel covers both voice and stream connectivity');
 assert.match(diagnosticsPage, /В этом разделе не сохраняются токены, адреса, ICE-кандидаты, SDP/,
@@ -43,10 +45,19 @@ for (const label of [
   "stream_watch_retry: 'Повтор подключения к трансляции'",
   "stream_watch_finished: 'Подключение к трансляции завершено'",
   "streamTransport: 'медиатранспорт'",
+  "outputTarget: 'источник вывода'",
+  "outputOperation: 'операция вывода'",
+  "voice_mixer: 'голосовой микшер'",
+  "media_element: 'медиаэлемент'",
+  "stream_mixer: 'микшер трансляции'",
+  "context_recovery: 'восстановление аудиоконтекста'",
+  "enumerate: 'поиск системного устройства'",
+  "set_sink: 'переключение устройства'",
   "watch_native_start: 'запуск нативного просмотра'",
   "decode_timeout: 'кадр не декодирован вовремя'",
   "aborted: 'попытка прервана'",
   "network: 'ошибка сети'",
+  "session_closing: 'предыдущая медиасессия завершается'",
   "tree_native: 'дерево — клиент'",
 ]) {
   assert.ok(diagnosticsPage.includes(label), `missing Russian stream diagnostic label: ${label}`);

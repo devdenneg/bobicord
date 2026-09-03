@@ -10,6 +10,8 @@ const {
   createVoiceMediaRevocationStore,
   createVoiceMediaRevocationWorker,
   drainDueVoiceMediaRevocations,
+  voiceMediaClosingResult,
+  voiceMediaRevocationRetryAfterSeconds,
 } = require('./voiceMediaRevocations');
 
 function createVoiceSchema(db) {
@@ -184,6 +186,52 @@ test('per-username due listing filters exact user, due time and participant targ
     'alice2#v2.other~3',
   ]);
   assert.deepEqual(outbox.listDueForUsername('nobody', 1_100), []);
+  db.close();
+});
+
+test('activation retry hint uses the earliest exact-auth-session attempt and stays bounded', () => {
+  const db = new Database(':memory:');
+  createVoiceSchema(db);
+  const outbox = createVoiceMediaRevocationStore(db, { baseDelayMs: 100, maxDelayMs: 10_000 });
+  const subjectA = `va1_${'a'.repeat(22)}`;
+  const subjectB = `va1_${'b'.repeat(22)}`;
+
+  outbox.enqueueParticipant('voice:s1:a', 'alice#device-a~1', 100, { authSubject: subjectA });
+  outbox.fail('voice:s1:a', 'alice#device-a~1', 1_000);
+  outbox.enqueueParticipant('voice:s1:a2', 'alice#device-a~2', 101, { authSubject: subjectA });
+  outbox.fail('voice:s1:a2', 'alice#device-a~2', 1_300);
+  outbox.enqueueParticipant('voice:s1:b', 'alice#device-b~1', 102, { authSubject: subjectB });
+  outbox.fail('voice:s1:b', 'alice#device-b~1', 1_500);
+  outbox.enqueueParticipant('voice:s1:other', 'alice2#device-a~1', 103, { authSubject: subjectA });
+  outbox.fail('voice:s1:other', 'alice2#device-a~1', 0);
+  outbox.enqueueRoom('voice:s1:deleted', 104);
+
+  assert.equal(outbox.nextAttemptForVoiceSession('alice', subjectA), 1_100);
+  assert.equal(outbox.nextAttemptForVoiceSession('alice', subjectB), 1_600,
+    'another authorization session must not inherit A retry timing');
+  assert.equal(outbox.nextAttemptForVoiceSession('alice2', subjectA), 100,
+    'username matching must remain exact rather than prefix based');
+  assert.equal(outbox.nextAttemptForVoiceSession('alice', 'invalid'), null);
+  assert.equal(outbox.nextAttemptForVoiceSession('nobody', subjectA), null);
+
+  outbox.enqueueParticipant('voice:s1:legacy', 'alice#legacy~1', 105);
+  outbox.fail('voice:s1:legacy', 'alice#legacy~1', 600);
+  assert.equal(outbox.nextAttemptForVoiceSession('alice', subjectA), 700);
+  assert.equal(outbox.nextAttemptForVoiceSession('alice', subjectB), 700,
+    'an unattributed rollout target remains conservatively account-wide');
+
+  assert.equal(voiceMediaRevocationRetryAfterSeconds(null, 1_000), 1);
+  assert.equal(voiceMediaRevocationRetryAfterSeconds(1_000, 1_000), 1,
+    'a due or in-flight removal must never create a zero-delay retry loop');
+  assert.equal(voiceMediaRevocationRetryAfterSeconds(2_001, 1_000), 2,
+    'the HTTP hint rounds up and therefore never retries before due');
+  assert.equal(voiceMediaRevocationRetryAfterSeconds(1_000_000, 0), 300,
+    'the public hint is capped at the durable outbox maximum');
+  assert.deepEqual(voiceMediaClosingResult(outbox, 'alice', subjectA, 0), {
+    status: 409,
+    error: 'Previous voice media session is still closing',
+    retryAfterSeconds: 1,
+  });
   db.close();
 });
 
@@ -364,12 +412,22 @@ test('activation route uses the production drain before a bounded LiveKit permis
     /drainDueVoiceMediaRevocations\(\s*voiceMediaRevocations,\s*voiceMediaRevocationWorker,\s*req\.user\.username,\s*\{ timeoutMs: VOICE_MEDIA_DRAIN_TIMEOUT_MS, authSubject: voiceAuth\.authSubject \},/u,
     'the route must execute the bounded exact-auth-session drain helper',
   );
+  assert.equal(
+    (route.match(/return voiceMediaClosingResult\(\s*voiceMediaRevocations, req\.user\.username, voiceAuth\.authSubject,/gu) || []).length,
+    2,
+    'either failed preflight drain must derive its retry hint from the exact authorization session',
+  );
   assert.ok(finalPendingFence > activation,
     'authorization changes during the permission RPC must remain fail-closed');
   assert.match(
     route,
     /await withTimeout\(\s*activateVoiceMediaParticipant\(rsc, room, identity\),\s*VOICE_MEDIA_RPC_TIMEOUT_MS,/u,
     'LiveKit UpdateParticipant must not hold the per-user claim queue without a deadline',
+  );
+  assert.match(
+    route,
+    /if \(result\.retryAfterSeconds\) res\.setHeader\('Retry-After', String\(result\.retryAfterSeconds\)\)[\s\S]*retryAfter: result\.retryAfterSeconds/u,
+    'the closing response must expose the same bounded hint in both the standard header and JSON body',
   );
 });
 

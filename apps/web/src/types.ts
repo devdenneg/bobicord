@@ -133,7 +133,8 @@ export interface VoiceDiagnosticEvent {
   outcome?: 'started' | 'ok' | 'failed' | 'timed_out' | 'blocked' | 'unsupported'
     | 'cancelled' | 'superseded' | 'stalled' | 'recovered';
   code?: 'none' | 'timeout' | 'network' | 'offline' | 'auth' | 'permission' | 'device_lost'
-    | 'media_blocked' | 'disconnected' | 'sdk' | 'unsupported' | 'aborted' | 'unknown'
+    | 'media_blocked' | 'disconnected' | 'sdk' | 'unsupported' | 'aborted' | 'invalid_state' | 'unknown'
+    | 'session_closing'
     | 'signaling_unauthorized' | 'signaling_forbidden' | 'listener_failed'
     | 'native_start_failed' | 'signaling_closed' | 'no_parent' | 'negotiation_failed'
     | 'ice_failed' | 'track_missing' | 'decode_timeout' | 'playback_waiting';
@@ -143,6 +144,8 @@ export interface VoiceDiagnosticEvent {
   trackState?: 'live' | 'ended' | 'missing' | 'unknown';
   audioContextState?: 'running' | 'suspended' | 'interrupted' | 'closed' | 'missing' | 'unknown';
   outputRoute?: 'default' | 'custom' | 'system' | 'unsupported' | 'unknown';
+  outputTarget?: 'voice_mixer' | 'media_element' | 'stream_mixer' | 'context_recovery';
+  outputOperation?: 'enumerate' | 'set_sink' | 'create_context' | 'rebind' | 'resume' | 'start_audio';
   micMode?: 'voice' | 'ptt' | 'unknown';
   streamTransport?: 'livekit' | 'tree_web' | 'tree_native';
   networkType?: VoiceDiagnosticClient['networkType'];

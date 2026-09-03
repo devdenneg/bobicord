@@ -1441,9 +1441,39 @@ export class TreeVideoTransport implements VideoTransport {
       }
     });
   }
+
+  /**
+   * Retires only the exact native/WebView negotiation owner which failed and gives the still-live
+   * stream one existing bounded-backoff retry. `pc` pins failures from an older overlapping offer:
+   * its late rejection/state callback cannot stop or reschedule the replacement peer.
+   */
+  private failNativeNegotiation(
+    streamId: string,
+    st: NativeWatchState,
+    code: 'negotiation_failed' | 'ice_failed',
+    pc?: RTCPeerConnection,
+  ): boolean {
+    if (st.closed || this.nativeWatches.get(streamId) !== st || (pc !== undefined && st.pc !== pc)) return false;
+    this.emitWatchDiagnostic(streamId, {
+      stage: 'watch_negotiation', outcome: 'failed', code,
+      connectionState: pc ? diagnosticConnectionState(pc.connectionState) : 'unknown',
+      iceState: pc ? diagnosticIceState(pc.iceConnectionState) : 'unknown',
+      reconnectCount: this.reWatchAttempts.get(streamId) || 0,
+    });
+    const live = !this.closed && this.intended.has(streamId) && this.liveStreams.has(streamId);
+    this.nativeUnwatch(streamId, st, live);
+    if (live) {
+      this.armVideoFailsafe(streamId, 15_000);
+      this.scheduleNativeWatchRetry(streamId, st.quality, st.pinned);
+    }
+    return true;
+  }
+
   private async onNativeOffer(streamId: string, st: NativeWatchState, sdp: string) {
     if (st.closed || this.nativeWatches.get(streamId) !== st) return;
-    if (st.pc) { try { st.pc.close(); } catch { /**/ } }
+    const previousPc = st.pc;
+    st.pc = null;
+    if (previousPc) { try { previousPc.close(); } catch { /**/ } }
     this.emitWatchDiagnostic(streamId, {
       stage: 'watch_negotiation', outcome: 'started', code: 'none',
       reconnectCount: this.reWatchAttempts.get(streamId) || 0,
@@ -1452,10 +1482,7 @@ export class TreeVideoTransport implements VideoTransport {
     try {
       pc = new RTCPeerConnection({ iceServers: this.iceServers.length ? this.iceServers : DEFAULT_ICE_SERVERS });
     } catch {
-      this.emitWatchDiagnostic(streamId, {
-        stage: 'watch_negotiation', outcome: 'failed', code: 'negotiation_failed',
-        connectionState: 'unknown', iceState: 'unknown',
-      });
+      this.failNativeNegotiation(streamId, st, 'negotiation_failed');
       return;
     }
     st.pc = pc;
@@ -1473,29 +1500,38 @@ export class TreeVideoTransport implements VideoTransport {
     };
     pc.onconnectionstatechange = () => {
       if (!ownsOffer()) return;
+      if (pc.connectionState === 'failed') {
+        this.failNativeNegotiation(
+          streamId,
+          st,
+          pc.iceConnectionState === 'failed' ? 'ice_failed' : 'negotiation_failed',
+          pc,
+        );
+        return;
+      }
       const connectionState = diagnosticConnectionState(pc.connectionState);
       const outcome = pc.connectionState === 'connected' ? 'ok'
-        : pc.connectionState === 'failed' ? 'failed'
-          : pc.connectionState === 'disconnected' ? 'stalled'
-            : pc.connectionState === 'closed' ? 'cancelled' : 'started';
+        : pc.connectionState === 'disconnected' ? 'stalled'
+          : pc.connectionState === 'closed' ? 'cancelled' : 'started';
       this.emitWatchDiagnostic(streamId, {
         stage: 'watch_negotiation', outcome,
-        code: pc.connectionState === 'failed' ? 'ice_failed'
-          : pc.connectionState === 'disconnected' || pc.connectionState === 'closed' ? 'disconnected' : 'none',
+        code: pc.connectionState === 'disconnected' || pc.connectionState === 'closed' ? 'disconnected' : 'none',
         connectionState, iceState: diagnosticIceState(pc.iceConnectionState),
       });
     };
     pc.oniceconnectionstatechange = () => {
       if (!ownsOffer()) return;
+      if (pc.iceConnectionState === 'failed') {
+        this.failNativeNegotiation(streamId, st, 'ice_failed', pc);
+        return;
+      }
       const iceState = diagnosticIceState(pc.iceConnectionState);
       const outcome = pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed' ? 'ok'
-        : pc.iceConnectionState === 'failed' ? 'failed'
-          : pc.iceConnectionState === 'disconnected' ? 'stalled'
-            : pc.iceConnectionState === 'closed' ? 'cancelled' : 'started';
+        : pc.iceConnectionState === 'disconnected' ? 'stalled'
+          : pc.iceConnectionState === 'closed' ? 'cancelled' : 'started';
       this.emitWatchDiagnostic(streamId, {
         stage: 'watch_negotiation', outcome,
-        code: pc.iceConnectionState === 'failed' ? 'ice_failed'
-          : pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'closed' ? 'disconnected' : 'none',
+        code: pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'closed' ? 'disconnected' : 'none',
         connectionState: diagnosticConnectionState(pc.connectionState), iceState,
       });
     };
@@ -1557,11 +1593,7 @@ export class TreeVideoTransport implements VideoTransport {
       });
     } catch {
       if (!ownsOffer()) return;
-      this.emitWatchDiagnostic(streamId, {
-        stage: 'watch_negotiation', outcome: 'failed', code: 'negotiation_failed',
-        connectionState: diagnosticConnectionState(pc.connectionState),
-        iceState: diagnosticIceState(pc.iceConnectionState),
-      });
+      this.failNativeNegotiation(streamId, st, 'negotiation_failed', pc);
     }
   }
   private nativeUnwatch(streamId: string, st: NativeWatchState, keepVideo = false) {

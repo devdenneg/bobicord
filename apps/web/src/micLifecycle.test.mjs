@@ -336,6 +336,10 @@ assert.equal(foregroundMicNeedsImmediateRecovery(true, false, false, true), true
     'a muted raw gUM source is unhealthy');
   assert.equal(microphoneTransportHealth(live(), { ...live(), muted: true }, true, false).muted, true,
     'a muted MediaStreamDestination is unhealthy even while raw gUM still looks live');
+  assert.equal(microphoneTransportHealth(live(), { ...live(), enabled: false }, true, false).muted, true,
+    'a disabled published MediaStreamTrack is unhealthy even without a browser mute event');
+  assert.equal(microphoneTransportHealth(live(), live(), true, false, true).muted, true,
+    'LiveKit LocalAudioTrack/publication mute remains authoritative over live browser flags');
   assert.equal(microphoneTransportHealth(live(), { readyState: 'ended' }, true, false).ended, true,
     'an ended published destination requires a full pipeline rebuild');
   assert.equal(microphoneTransportHealth(live(), live(), false, false).ended, true,
@@ -458,6 +462,10 @@ assert.equal(automaticMicRecoveryAllowed(false, false, false, true), true,
   'foreground recovery is allowed exactly when the hidden lifecycle armed it');
 assert.equal(automaticMicRecoveryAllowed(false, true, false, false), true,
   'a microphone which worked before remains eligible for hardware recovery');
+assert.equal(automaticMicRecoveryAllowed(false, true, false, true, true), false,
+  'a deliberate manual mute suppresses automatic capture rebuilds');
+assert.equal(automaticMicRecoveryAllowed(false, false, true, true, true), false,
+  'a deliberate deafen suppresses bootstrap and foreground capture rebuilds');
 
 // Pagehide while WebKit keeps the old gUM unresolved: foreground replaces the exact observed
 // owner, duplicate visibility/pageshow cannot stack, and a late old rejection cannot overwrite

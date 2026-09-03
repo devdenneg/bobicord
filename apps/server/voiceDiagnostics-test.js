@@ -75,6 +75,7 @@ test('sanitizer persists only fixed technical fields and canonical values', () =
     },
     events: [{
       atMs: 12.6, kind: 'rtc_sample', stage: 'rtc', outcome: 'ok', code: 'none',
+      outputRoute: 'default', outputTarget: 'voice_mixer', outputOperation: 'set_sink',
       rttMs: 999_999, jitterMs: 2.3456, audioLevel: 0.12349, packetsSentDelta: 18,
       micEnabled: true, documentHidden: false, connectionState: 'connected',
       token: forbidden, sdp: forbidden, iceCandidate: forbidden, ip: forbidden,
@@ -88,6 +89,7 @@ test('sanitizer persists only fixed technical fields and canonical values', () =
   });
   assert.deepEqual(report.events, [{
     atMs: 13, kind: 'rtc_sample', stage: 'rtc', outcome: 'ok', code: 'none',
+    outputRoute: 'default', outputTarget: 'voice_mixer', outputOperation: 'set_sink',
     connectionState: 'connected', documentHidden: false, micEnabled: true,
     rttMs: 120_000, jitterMs: 2, packetsSentDelta: 18, audioLevel: 0.123,
   }]);
@@ -97,6 +99,41 @@ test('sanitizer persists only fixed technical fields and canonical values', () =
     assert.equal(Object.prototype.hasOwnProperty.call(report, key), false, `top-level ${key}`);
     assert.equal(Object.prototype.hasOwnProperty.call(report.events[0], key), false, `event ${key}`);
   }
+});
+
+test('output diagnostics preserve only privacy-safe source and operation categories', () => {
+  const forbidden = 'raw-output-detail-that-must-not-be-stored';
+  const report = sanitizeVoiceDiagnosticReport(validReport({
+    incident: 'output_route_failed',
+    events: [
+      {
+        atMs: 1, kind: 'output_route_failed', stage: 'output_route', outcome: 'failed',
+        code: 'invalid_state', outputRoute: 'custom', outputTarget: 'media_element',
+        outputOperation: 'set_sink', error: forbidden, deviceId: forbidden,
+      },
+      {
+        atMs: 2, kind: 'output_route_failed', stage: 'output_route', outcome: 'failed',
+        code: forbidden, outputTarget: forbidden, outputOperation: forbidden,
+      },
+      {
+        atMs: 3, kind: 'media_activated', stage: 'activation', outcome: 'failed',
+        code: 'session_closing', httpStatus: 409, error: forbidden,
+      },
+    ],
+  }));
+  assert.deepEqual(report.events[0], {
+    atMs: 1, kind: 'output_route_failed', stage: 'output_route', outcome: 'failed',
+    code: 'invalid_state', outputRoute: 'custom', outputTarget: 'media_element',
+    outputOperation: 'set_sink',
+  });
+  assert.deepEqual(report.events[1], {
+    atMs: 2, kind: 'output_route_failed', stage: 'output_route', outcome: 'failed',
+  });
+  assert.deepEqual(report.events[2], {
+    atMs: 3, kind: 'media_activated', stage: 'activation', outcome: 'failed',
+    code: 'session_closing', httpStatus: 409,
+  });
+  assert.equal(JSON.stringify(report).includes(forbidden), false);
 });
 
 test('sanitizer accepts bounded stream-watch stages while discarding identities and raw transport data', () => {

@@ -416,6 +416,7 @@ try {
     localDescription = null;
     addedIce = [];
     onconnectionstatechange = null;
+    oniceconnectionstatechange = null;
     onicecandidate = null;
     ontrack = null;
     constructor() { peerConnections.push(this); }
@@ -541,18 +542,131 @@ try {
   const nativePeerB = nativeState.pc;
   nativeState.pendingIce.push({ candidate: 'native-remote-b' });
 
-  nativeOfferA.resolve();
+  nativePeerA.connectionState = 'failed';
+  nativePeerA.onconnectionstatechange();
+  assert.equal(nativeOverlap.nativeWatches.get('native-overlap'), nativeState,
+    'a terminal state callback from the retired peer cannot tear down the replacement owner');
+  assert.equal(nativeOverlap.watchRetryTimers.has('native-overlap'), false,
+    'a retired peer cannot schedule a retry over its replacement');
+  nativeOfferA.reject(new Error('retired native offer failed late'));
   await firstNativeOffer;
   assert.deepEqual(nativePeerA.addedIce, [],
     'a retired native offer cannot consume ICE queued for its replacement peer');
   assert.equal(nativeState.pendingIce.length, 1,
     'replacement native ICE remains queued while the retired remote description settles');
+  assert.equal(nativeOverlap.nativeWatches.get('native-overlap'), nativeState,
+    'a late negotiation failure from the retired peer cannot tear down the replacement owner');
+  assert.equal(nativeOverlap.watchRetryTimers.has('native-overlap'), false,
+    'a stale peer failure cannot schedule a retry over its replacement');
 
   nativeOfferB.resolve();
   await secondNativeOffer;
   assert.deepEqual(nativePeerB.addedIce, [{ candidate: 'native-remote-b' }]);
   assert.equal(nativeAnswers.length, 1,
     'only the current native peer publishes an SDP answer');
+
+  const negotiationStops = [];
+  globalThis.isTauri = true;
+  globalThis.nativeWatchAnswer = async () => {};
+  globalThis.stopNativeWatch = async (...args) => { negotiationStops.push(args); };
+  const seedNativeAttempt = (transport, streamId, generation) => {
+    const state = {
+      generation, pc: null, unlisten: [], closed: false, stopped: false, pendingIce: [],
+      quality: 'source', pinned: false,
+    };
+    transport.nativeWatches.set(streamId, state);
+    transport.intended.add(streamId);
+    transport.liveStreams.set(streamId, {});
+    return state;
+  };
+  const assertOwnedRetry = (transport, streamId, state, expectedStop) => {
+    assert.equal(state.closed, true, 'the failed exact native owner is retired');
+    assert.equal(transport.nativeWatches.has(streamId), false,
+      'the failed native owner leaves the active-watch slot before retry');
+    assert.equal(transport.watchRetryTimers.has(streamId), true,
+      'the still-live stream owns one bounded retry timer');
+    assert.equal(transport.reWatchAttempts.get(streamId), 1,
+      'one terminal negotiation failure counts as exactly one reconnect');
+    assert.deepEqual(negotiationStops.splice(0), [expectedStop],
+      'recovery fences only the exact failed Rust generation');
+    transport.unwatch(streamId);
+    assert.equal(transport.watchRetryTimers.has(streamId), false,
+      'explicit unwatch physically cancels the pending native retry');
+    assert.equal(transport.videoFailsafe.has(streamId), false,
+      'explicit unwatch also cancels the retained-frame failsafe');
+    assert.equal(timers.size, 0, 'explicit unwatch leaves no negotiation recovery timers');
+  };
+
+  const constructorFailure = new TreeVideoTransport();
+  const constructorDiagnostics = [];
+  constructorFailure.onWatchDiagnostic((event) => constructorDiagnostics.push(event));
+  const constructorState = seedNativeAttempt(constructorFailure, 'constructor-failure', 801);
+  globalThis.RTCPeerConnection = class {
+    constructor() { throw new Error('peer construction failed'); }
+  };
+  await constructorFailure.onNativeOffer('constructor-failure', constructorState, 'offer');
+  assert.ok(constructorDiagnostics.some((event) => event.stage === 'watch_negotiation'
+    && event.outcome === 'failed' && event.code === 'negotiation_failed'),
+  'RTCPeerConnection construction failure is reported before recovery');
+  assertOwnedRetry(constructorFailure, 'constructor-failure', constructorState, ['constructor-failure', 801]);
+
+  class RejectRemoteDescriptionPeerConnection extends FakePeerConnection {
+    async setRemoteDescription() { throw new Error('remote description rejected'); }
+  }
+  globalThis.RTCPeerConnection = RejectRemoteDescriptionPeerConnection;
+  const descriptionFailure = new TreeVideoTransport();
+  const descriptionState = seedNativeAttempt(descriptionFailure, 'description-failure', 802);
+  await descriptionFailure.onNativeOffer('description-failure', descriptionState, 'offer');
+  assertOwnedRetry(descriptionFailure, 'description-failure', descriptionState, ['description-failure', 802]);
+
+  globalThis.RTCPeerConnection = FakePeerConnection;
+  globalThis.nativeWatchAnswer = async () => { throw new Error('native answer delivery rejected'); };
+  const answerFailure = new TreeVideoTransport();
+  const answerState = seedNativeAttempt(answerFailure, 'answer-failure', 803);
+  await answerFailure.onNativeOffer('answer-failure', answerState, 'offer');
+  assertOwnedRetry(answerFailure, 'answer-failure', answerState, ['answer-failure', 803]);
+
+  globalThis.nativeWatchAnswer = async () => {};
+  const connectionFailure = new TreeVideoTransport();
+  const connectionDiagnostics = [];
+  connectionFailure.onWatchDiagnostic((event) => connectionDiagnostics.push(event));
+  const connectionState = seedNativeAttempt(connectionFailure, 'connection-failure', 804);
+  await connectionFailure.onNativeOffer('connection-failure', connectionState, 'offer');
+  const failedConnectionPeer = connectionState.pc;
+  failedConnectionPeer.connectionState = 'failed';
+  failedConnectionPeer.onconnectionstatechange();
+  assert.ok(connectionDiagnostics.some((event) => event.stage === 'watch_negotiation'
+    && event.outcome === 'failed' && event.code === 'negotiation_failed'
+    && event.connectionState === 'disconnected' && event.iceState === 'new'),
+  'a terminal aggregate connection failure is not mislabeled as ICE when ICE itself did not fail');
+  failedConnectionPeer.iceConnectionState = 'failed';
+  failedConnectionPeer.oniceconnectionstatechange();
+  assertOwnedRetry(connectionFailure, 'connection-failure', connectionState, ['connection-failure', 804]);
+
+  const iceFailure = new TreeVideoTransport();
+  const iceState = seedNativeAttempt(iceFailure, 'ice-failure', 805);
+  await iceFailure.onNativeOffer('ice-failure', iceState, 'offer');
+  const failedIcePeer = iceState.pc;
+  failedIcePeer.iceConnectionState = 'failed';
+  failedIcePeer.oniceconnectionstatechange();
+  assertOwnedRetry(iceFailure, 'ice-failure', iceState, ['ice-failure', 805]);
+
+  const disconnected = new TreeVideoTransport();
+  const disconnectedState = seedNativeAttempt(disconnected, 'transient-disconnect', 806);
+  await disconnected.onNativeOffer('transient-disconnect', disconnectedState, 'offer');
+  const disconnectedPeer = disconnectedState.pc;
+  disconnectedPeer.connectionState = 'disconnected';
+  disconnectedPeer.onconnectionstatechange();
+  disconnectedPeer.iceConnectionState = 'disconnected';
+  disconnectedPeer.oniceconnectionstatechange();
+  assert.equal(disconnected.nativeWatches.get('transient-disconnect'), disconnectedState,
+    'a transient disconnected state retains the exact peer so WebRTC can recover it');
+  assert.equal(disconnected.watchRetryTimers.has('transient-disconnect'), false,
+    'disconnected is not treated as a terminal retry signal');
+  assert.equal(disconnected.reWatchAttempts.has('transient-disconnect'), false);
+  disconnected.unwatch('transient-disconnect');
+  assert.deepEqual(negotiationStops.splice(0), [['transient-disconnect', 806]]);
+  assert.equal(timers.size, 0);
 
   let nextNativeGeneration = 9000;
   let releasedOfferListener = 0;

@@ -20,6 +20,7 @@ const {
   StreamWatchPlaybackGate,
   TreeStreamAudioController,
   applyExactScreenAudioGain,
+  audioSinkRoutesConfirmed,
   effectiveStreamGain,
   isAutoplayBlocked,
   mediaElementVolumeLocked,
@@ -28,6 +29,7 @@ const {
   exactWebAudioMixContext,
   rebindExactWebAudioMixContexts,
   routeAudioSinkTarget,
+  seedAudioSinkTargetRoute,
   setTreeStreamOutputSink,
   toggleStreamFullscreen,
   toggleStreamPictureInPicture,
@@ -37,6 +39,16 @@ assert.equal(effectiveStreamGain(50, 0.4), 0.2);
 assert.equal(effectiveStreamGain(100, 1, true), 0);
 assert.equal(effectiveStreamGain(150, 2), 1);
 assert.equal(effectiveStreamGain(Number.NaN, Number.NaN), 1);
+assert.equal(audioSinkRoutesConfirmed('default', ['applied', 'unsupported']), true,
+  'a setSinkId-less path already confirms the logical system default');
+assert.equal(audioSinkRoutesConfirmed('default', ['applied', 'failed']), false,
+  'a failed default write cannot be cached as the physical route');
+assert.equal(audioSinkRoutesConfirmed('default', ['timed-out', 'applied']), false,
+  'an uncertain timed-out default write remains retryable');
+assert.equal(audioSinkRoutesConfirmed('speaker-a', ['applied', 'unsupported']), false,
+  'unsupported cannot confirm a custom hardware route');
+assert.equal(audioSinkRoutesConfirmed('default', ['applied', 'superseded']), false,
+  'a superseded nested operation never confirms the aggregate route');
 
 {
   const routes = new ExactMediaOutputRouteGate();
@@ -232,6 +244,150 @@ assert.equal(await routeAudioSinkTarget({ setSinkId: async () => { throw new Err
 {
   const calls = [];
   const target = { setSinkId: async (sinkId) => { calls.push(sinkId); } };
+  assert.equal(seedAudioSinkTargetRoute(target), true);
+  assert.equal(seedAudioSinkTargetRoute(target), false,
+    'a shared exact target cannot have its known route overwritten by a later owner');
+  assert.equal(await routeAudioSinkTarget(target, 'default'), 'applied');
+  assert.deepEqual(calls, [],
+    'a freshly created exact target is already on logical default and needs no physical switch');
+  assert.equal(await routeAudioSinkTarget(target, 'headphones'), 'applied');
+  assert.equal(await routeAudioSinkTarget(target, 'default'), 'applied');
+  assert.deepEqual(calls, ['headphones', 'default'],
+    'returning from a confirmed custom route physically restores system default');
+  assert.equal(await routeAudioSinkTarget(target, 'default'), 'applied');
+  assert.deepEqual(calls, ['headphones', 'default'],
+    'a repeated confirmed default route is a logical no-op');
+  assert.equal(await routeAudioSinkTarget(target, 'default', { force: true }), 'applied');
+  assert.deepEqual(calls, ['headphones', 'default', 'default'],
+    'an actual visible device-change edge can explicitly re-resolve the same default route');
+}
+
+{
+  const failures = [];
+  const target = {};
+  seedAudioSinkTargetRoute(target);
+  assert.equal(await routeAudioSinkTarget(target, 'default', {
+    onFailure: (failure) => failures.push(failure),
+  }), 'applied');
+  assert.deepEqual(failures, [],
+    'Safari system-default playback is already correct and does not emit an unsupported incident');
+  assert.equal(await routeAudioSinkTarget(target, 'headphones', {
+    onFailure: (failure) => failures.push(failure),
+  }), 'unsupported');
+  assert.deepEqual(failures, [{ operation: 'set_sink', outcome: 'unsupported', code: 'unsupported' }],
+    'an actual custom route request still reports unsupported on a target without setSinkId');
+}
+
+{
+  let attempts = 0;
+  const failures = [];
+  const missing = Object.assign(new Error('private browser detail'), { name: 'NotFoundError' });
+  const target = {
+    async setSinkId() {
+      attempts++;
+      if (attempts === 1) throw missing;
+    },
+  };
+  seedAudioSinkTargetRoute(target);
+  assert.equal(await routeAudioSinkTarget(target, 'default', {
+    force: true,
+    onFailure: (failure) => failures.push(failure),
+  }), 'failed');
+  assert.deepEqual(failures, [{ operation: 'set_sink', outcome: 'failed', code: 'device_lost' }],
+    'diagnostics receive only a fixed operation and category, never the raw browser error');
+  assert.doesNotMatch(JSON.stringify(failures), /private browser detail/);
+  assert.equal(await routeAudioSinkTarget(target, 'default'), 'applied');
+  assert.equal(attempts, 2,
+    'a failed forced default remains eligible for the next ordinary bounded retry');
+  assert.equal(await routeAudioSinkTarget(target, 'default'), 'applied');
+  assert.equal(attempts, 2, 'the successful retry confirms default and restores coalescing');
+}
+
+{
+  let rejectOld;
+  const failures = [];
+  const calls = [];
+  const target = {
+    setSinkId(sinkId) {
+      calls.push(sinkId);
+      if (sinkId === 'stale-headphones') {
+        return new Promise((_resolve, reject) => { rejectOld = reject; });
+      }
+      return Promise.resolve();
+    },
+  };
+  seedAudioSinkTargetRoute(target);
+  const stale = routeAudioSinkTarget(target, 'stale-headphones', {
+    timeoutMs: 50,
+    onFailure: (failure) => failures.push(failure),
+  });
+  for (let spin = 0; spin < 5 && !rejectOld; spin++) await Promise.resolve();
+  const current = routeAudioSinkTarget(target, 'default', { timeoutMs: 50 });
+  rejectOld(Object.assign(new Error('private stale error'), { name: 'NotFoundError' }));
+  assert.equal(await stale, 'superseded');
+  assert.equal(await current, 'applied');
+  assert.deepEqual(calls, ['stale-headphones']);
+  assert.deepEqual(failures, [],
+    'a late rejection from a superseded custom selection cannot create a false device-lost incident');
+}
+
+{
+  let attempts = 0;
+  const failures = [];
+  const target = {
+    setSinkId() {
+      attempts++;
+      return attempts === 1 ? new Promise(() => {}) : Promise.resolve();
+    },
+  };
+  seedAudioSinkTargetRoute(target);
+  assert.equal(await routeAudioSinkTarget(target, 'default', {
+    force: true, timeoutMs: 5, onFailure: (failure) => failures.push(failure),
+  }), 'timed-out');
+  assert.equal(await routeAudioSinkTarget(target, 'default', { timeoutMs: 20 }), 'applied');
+  assert.equal(attempts, 2, 'a timed-out default route is retried instead of treated as confirmed');
+  assert.deepEqual(failures, [{ operation: 'set_sink', outcome: 'timed-out', code: 'timeout' }]);
+}
+
+{
+  let releaseCustom;
+  const calls = [];
+  const target = {
+    setSinkId(sinkId) {
+      calls.push(sinkId);
+      if (sinkId === 'uncertain-custom') return new Promise((resolve) => { releaseCustom = resolve; });
+      return Promise.resolve();
+    },
+  };
+  seedAudioSinkTargetRoute(target);
+  assert.equal(await routeAudioSinkTarget(target, 'uncertain-custom', { timeoutMs: 5 }), 'timed-out');
+  assert.equal(await routeAudioSinkTarget(target, 'default', { timeoutMs: 20 }), 'applied');
+  assert.deepEqual(calls, ['uncertain-custom', 'default'],
+    'custom to default is physical even when the old browser promise left hardware uncertain');
+  releaseCustom();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(calls, ['uncertain-custom', 'default', 'default'],
+    'a late stale custom success repairs back to the current default route');
+}
+
+{
+  const failures = [];
+  let physicalCalls = 0;
+  const denied = Object.assign(new Error('private enumeration detail'), { name: 'NotAllowedError' });
+  const target = { setSinkId: async () => { physicalCalls++; } };
+  seedAudioSinkTargetRoute(target);
+  assert.equal(await routeAudioSinkTarget(target, 'headphones', {
+    normalize: async () => { throw denied; },
+    onFailure: (failure) => failures.push(failure),
+  }), 'failed');
+  assert.equal(physicalCalls, 0);
+  assert.deepEqual(failures, [{ operation: 'enumerate', outcome: 'failed', code: 'permission' }]);
+  assert.doesNotMatch(JSON.stringify(failures), /private enumeration detail/);
+}
+
+{
+  const calls = [];
+  const target = { setSinkId: async (sinkId) => { calls.push(sinkId); } };
   assert.equal(await routeAudioSinkTarget(target, 'default', {
     normalize: () => new Promise(() => {}),
     timeoutMs: 5,
@@ -410,6 +566,43 @@ releaseOldSink();
 await Promise.all([routeA, routeB]);
 assert.deepEqual(sinkCalls, ['route-a', 'route-b'], 'the latest output route deterministically wins');
 routedFallback.dispose();
+await setTreeStreamOutputSink('default');
+
+let rejectAggregateOld;
+let aggregateFastApplied = false;
+const aggregateSlowVideo = {
+  muted: true, volume: 1, matches: () => false,
+  setSinkId(sinkId) {
+    if (sinkId === 'aggregate-old')
+      return new Promise((_resolve, reject) => { rejectAggregateOld = reject; });
+    return Promise.resolve();
+  },
+};
+const aggregateFastVideo = {
+  muted: true, volume: 1, matches: () => false,
+  setSinkId(sinkId) {
+    if (sinkId === 'aggregate-old') aggregateFastApplied = true;
+    return Promise.resolve();
+  },
+};
+const aggregateSlow = new TreeStreamAudioController(
+  aggregateSlowVideo, new FakeStream([new FakeTrack('aggregate-slow')]), { preferWebAudio: false },
+);
+const aggregateFast = new TreeStreamAudioController(
+  aggregateFastVideo, new FakeStream([new FakeTrack('aggregate-fast')]), { preferWebAudio: false },
+);
+const aggregateOld = setTreeStreamOutputSink('aggregate-old');
+for (let i = 0; i < 20 && (!rejectAggregateOld || !aggregateFastApplied); i++) await Promise.resolve();
+assert.equal(typeof rejectAggregateOld, 'function');
+assert.equal(aggregateFastApplied, true);
+const aggregateNew = setTreeStreamOutputSink('aggregate-new');
+rejectAggregateOld(new Error('old aggregate target disappeared'));
+const [aggregateOldOutcome, aggregateNewOutcome] = await Promise.all([aggregateOld, aggregateNew]);
+assert.equal(aggregateOldOutcome, 'superseded',
+  'one superseded target prevents a partially applied tree aggregate from claiming success');
+assert.equal(aggregateNewOutcome, 'applied', 'the exact newer aggregate remains authoritative');
+aggregateSlow.dispose();
+aggregateFast.dispose();
 await setTreeStreamOutputSink('default');
 
 const boundedSinkCalls = [];
@@ -753,7 +946,10 @@ const sounds = readSource('sounds.ts');
     export const getSettings = () => ({ notifyVolume: 60, output: '' });
     export const subscribeSettings = () => () => {};
   `);
-  const routingModule = asDataModule('export const routeAudioSinkTarget = async () => "applied";');
+  const routingModule = asDataModule(`
+    export const routeAudioSinkTarget = async () => 'applied';
+    export const seedAudioSinkTargetRoute = () => true;
+  `);
   let soundJs = ts.transpileModule(`${sounds}\nexport { observeSoundContextResume };`, {
     compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
   }).outputText;
@@ -837,23 +1033,43 @@ assert.match(engine, /streamGainOf\(id: string\)[\s\S]*effectiveStreamGain\(getS
 assert.match(engine, /applyMaster\(\)[^{]*\{[^}]*applyAllStreamVolumes\(\)/,
   'master changes immediately reach screen-share audio as well as voice audio');
 const outputSwitchBody = engine.match(/private async switchContextOutput\([\s\S]*?\n  }\n  private async switchElementOutput/)?.[0] || '';
-assert.ok(outputSwitchBody.indexOf('setTreeStreamOutputSink(requested)') < outputSwitchBody.indexOf('this.queueContextOutput(requested)'),
+assert.ok(outputSwitchBody.indexOf('setTreeStreamOutputSink(requested,') < outputSwitchBody.indexOf('this.queueContextOutput(requested,'),
   'tree output starts before waiting for the independently bounded voice AudioContext route');
 assert.match(engine, /private queueContextOutput\([\s\S]*routeAudioSinkTarget\(ctx, requested,[\s\S]*normalizedContextSink/,
   'voice output enumeration and AudioContext routing share the bounded late-result-safe router');
+assert.match(outputSwitchBody, /audioSinkRoutesConfirmed\(requested,[\s\S]*if \(requested === 'default'\) return null/,
+  'a failed system-default route stays uncached and eligible for ordinary reconciliation');
+assert.match(outputSwitchBody, /audioSinkRoutesConfirmed\('default',[\s\S]*recordVoiceOutputFailure\([\s\S]*return null;[\s\S]*setSettings\(\{ output: '' \}\)/,
+  'a failed custom route is rewritten to system default only after every audible path confirms fallback');
+assert.match(outputSwitchBody, /recordVoiceOutputFailure\([\s\S]*requested === 'default',[\s\S]*queueContextOutput\('default'[\s\S]*submitVoiceDiagnostic\('output_route_failed'\)[\s\S]*setSettings/,
+  'custom failure and its fallback result are submitted together in one diagnostic snapshot');
 const elementOutputBody = engine.match(/private async switchElementOutput\([\s\S]*?\n  }\n  private forgetElementOutput/)?.[0] || '';
-assert.match(elementOutputBody, /elementOutputRoutes\.claim\(el, requested, force\)/,
+assert.match(elementOutputBody, /elementOutputRoutes\.claim\(el, requested, retry \|\| force\)/,
   'identical steady-state sink requests are coalesced before entering the native promise queue');
 assert.match(elementOutputBody, /elementOutputGenerations\.get\(el\) !== generation/,
   'a detached or superseded queued route is fenced before calling the browser');
-assert.match(elementOutputBody, /routeAudioSinkTarget\(el, requested\)/,
+const elementRouteAwait = elementOutputBody.indexOf('await routeAudioSinkTarget');
+const postRouteGenerationFence = elementOutputBody.indexOf(
+  'if (this.elementOutputGenerations.get(el) !== generation) return;', elementRouteAwait,
+);
+const firstElementOutputIncident = elementOutputBody.indexOf('this.recordVoiceOutputFailure');
+assert.ok(
+  elementRouteAwait >= 0 && postRouteGenerationFence > elementRouteAwait
+    && firstElementOutputIncident > postRouteGenerationFence,
+  'a route superseded while its browser promise was pending cannot emit a stale output incident',
+);
+assert.match(elementOutputBody, /routeAudioSinkTarget\(el, requested, \{/,
   'attached voice and stream elements use the same bounded hardware output router');
-assert.match(engine, /private retryAttachedOutputRoutesAfterForeground[\s\S]*switchElementOutput\(el, requested, true\)/,
+assert.match(elementOutputBody, /audioSinkRoutesConfirmed\(requested, \[outcome\]\)[\s\S]*outcome === 'unsupported'[\s\S]*routeAudioSinkTarget\(el, 'default'/,
+  'unsupported confirms only system default; a custom element route records failure and falls back');
+assert.match(elementOutputBody, /recordVoiceOutputFailure\([\s\S]*requested === 'default',[\s\S]*routeAudioSinkTarget\(el, 'default'[\s\S]*submitVoiceDiagnostic\('output_route_failed'\)/,
+  'element diagnostics include both the custom failure and the system fallback result');
+assert.match(engine, /private retryAttachedOutputRoutesAfterForeground[\s\S]*switchElementOutput\(el, requested, true, forceRefresh\)/,
   'a real foreground edge grants one forced retry to a previously failed attached output route');
 const foregroundOutputRetry = engine.match(/private retryAttachedOutputRoutesAfterForeground\(\)[\s\S]*?\n  }\n\n  private ensureInputLifecycleListener/)?.[0] || '';
-assert.match(foregroundOutputRetry, /now - this\.lastForegroundOutputRetryAt < 1_000[\s\S]*switchContextOutput\(requested, false\)/,
+assert.match(foregroundOutputRetry, /now - this\.lastForegroundOutputRetryAt < 1_000[\s\S]*forceRefresh = this\.outputDeviceRefreshPending[\s\S]*switchContextOutput\(requested, false, forceRefresh\)/,
   'the paired foreground events grant one bounded retry to the audible context and tree routes');
-assert.equal((foregroundOutputRetry.match(/switchContextOutput\(requested, false\)/g) || []).length, 1,
+assert.equal((foregroundOutputRetry.match(/switchContextOutput\(requested, false, forceRefresh\)/g) || []).length, 1,
   'one physical foreground edge starts exactly one context/tree route retry');
 assert.match(engine, /remoteAudioResumeHandler = \(\) => \{[\s\S]*retryAttachedOutputRoutesAfterForeground\(\)[\s\S]*ensureRemoteAudioPlayback\(\)/,
   'foreground retries hardware routing before resuming exact media playback');
@@ -881,8 +1097,14 @@ assert.doesNotMatch(screenGainBody, /entry\.el\.(?:muted|volume)\s*=/,
   'the SDK-muted element cannot become a second audio path around webAudioMix');
 assert.doesNotMatch(engine, /screenAudioEls\.forEach\(\(\{ el \}\) => \(el\.muted = false\)\)/,
   'leaving voice cannot reopen a direct screen-audio path around LiveKit gain');
-assert.match(sounds, /routeAudioSinkTarget\(a, want, \{ normalize: resolveSink \}\)/,
+assert.match(sounds, /routeAudioSinkTarget\(a, want \|\| 'default', \{ normalize: resolveSink, force \}\)/,
   'notification sounds share the bounded, late-result-safe hardware output router');
+assert.match(sounds, /function wakeAndRefreshOutput[\s\S]*if \(sinkRefreshPending\) \{[\s\S]*applySink\(true\)/,
+  'a matching foreground edge consumes the deferred notification-output refresh');
+assert.match(sounds, /addEventListener\?\.\('devicechange',[\s\S]*if \(document\.hidden\) \{[\s\S]*sinkRefreshPending = true;[\s\S]*return;[\s\S]*applySink\(true\)/,
+  'a hidden device change never calls the native output switch until foreground');
+assert.match(sounds, /actx = new AudioContext\(\);[\s\S]*seedAudioSinkTargetRoute\(actx\)/,
+  'a fresh notification mixer records its natural system-default route before Settings reconciliation');
 assert.doesNotMatch(sounds, /await a\.setSinkId!?\(/,
   'a browser setSinkId promise cannot permanently poison the notification-sound queue');
 assert.match(sounds, /if \(\(getSettings\(\)\.output \|\| ''\) !== lastSink\) void applySink\(\)/,

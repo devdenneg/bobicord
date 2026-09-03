@@ -49,7 +49,8 @@ const OUTCOMES = new Set<NonNullable<VoiceDiagnosticEvent['outcome']>>([
 ]);
 const ERROR_CODES = new Set<NonNullable<VoiceDiagnosticEvent['code']>>([
   'none', 'timeout', 'network', 'offline', 'auth', 'permission', 'device_lost',
-  'media_blocked', 'disconnected', 'sdk', 'unsupported', 'aborted', 'unknown',
+  'media_blocked', 'disconnected', 'sdk', 'unsupported', 'aborted', 'invalid_state', 'unknown',
+  'session_closing',
   'signaling_unauthorized', 'signaling_forbidden', 'listener_failed',
   'native_start_failed', 'signaling_closed', 'no_parent', 'negotiation_failed',
   'ice_failed', 'track_missing', 'decode_timeout', 'playback_waiting',
@@ -68,6 +69,12 @@ const AUDIO_CONTEXT_STATES = new Set<NonNullable<VoiceDiagnosticEvent['audioCont
 ]);
 const OUTPUT_ROUTES = new Set<NonNullable<VoiceDiagnosticEvent['outputRoute']>>([
   'default', 'custom', 'system', 'unsupported', 'unknown',
+]);
+const OUTPUT_TARGETS = new Set<NonNullable<VoiceDiagnosticEvent['outputTarget']>>([
+  'voice_mixer', 'media_element', 'stream_mixer', 'context_recovery',
+]);
+const OUTPUT_OPERATIONS = new Set<NonNullable<VoiceDiagnosticEvent['outputOperation']>>([
+  'enumerate', 'set_sink', 'create_context', 'rebind', 'resume', 'start_audio',
 ]);
 const MIC_MODES = new Set<NonNullable<VoiceDiagnosticEvent['micMode']>>(['voice', 'ptt', 'unknown']);
 const STREAM_TRANSPORTS = new Set<NonNullable<VoiceDiagnosticEvent['streamTransport']>>([
@@ -221,6 +228,8 @@ function sanitizeEvent(input: VoiceDiagnosticEventInput, atMs: number): VoiceDia
   const trackState = enumValue(source.trackState, TRACK_STATES);
   const audioContextState = enumValue(source.audioContextState, AUDIO_CONTEXT_STATES);
   const outputRoute = enumValue(source.outputRoute, OUTPUT_ROUTES);
+  const outputTarget = enumValue(source.outputTarget, OUTPUT_TARGETS);
+  const outputOperation = enumValue(source.outputOperation, OUTPUT_OPERATIONS);
   const micMode = enumValue(source.micMode, MIC_MODES);
   const streamTransport = enumValue(source.streamTransport, STREAM_TRANSPORTS);
   const networkType = enumValue(source.networkType, NETWORK_TYPES);
@@ -232,6 +241,8 @@ function sanitizeEvent(input: VoiceDiagnosticEventInput, atMs: number): VoiceDia
   if (trackState) event.trackState = trackState;
   if (audioContextState) event.audioContextState = audioContextState;
   if (outputRoute) event.outputRoute = outputRoute;
+  if (outputTarget) event.outputTarget = outputTarget;
+  if (outputOperation) event.outputOperation = outputOperation;
   if (micMode) event.micMode = micMode;
   if (streamTransport) event.streamTransport = streamTransport;
   if (networkType) event.networkType = networkType;

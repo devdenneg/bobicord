@@ -16,6 +16,7 @@ const {
 const {
   DEFAULT_USERNAME_DRAIN_TIMEOUT_MS,
   createVoiceMediaRevocationStore, createVoiceMediaRevocationWorker, drainDueVoiceMediaRevocations,
+  voiceMediaClosingResult,
 } = require('./voiceMediaRevocations');
 const {
   VoiceAuthRevokedError, createVoiceAuthSubjectCodec, createVoiceSessionId,
@@ -1775,7 +1776,9 @@ app.post('/api/voice/media/activate', requireAuth, async (req, res, next) => {
         req.user.username,
         { timeoutMs: VOICE_MEDIA_DRAIN_TIMEOUT_MS, authSubject: voiceAuth.authSubject },
       )) {
-        return { status: 409, error: 'Previous voice media session is still closing' };
+        return voiceMediaClosingResult(
+          voiceMediaRevocations, req.user.username, voiceAuth.authSubject,
+        );
       }
       const connected = await voiceSessionConnectedOnce(params.serverId, hubIdentity);
       if (connected !== true) return { status: connected === null ? 503 : 409, error: connected === null ? 'Voice service unavailable' : 'Voice hub session is not active' };
@@ -1786,7 +1789,9 @@ app.post('/api/voice/media/activate', requireAuth, async (req, res, next) => {
         req.user.username,
         { timeoutMs: VOICE_MEDIA_DRAIN_TIMEOUT_MS, authSubject: voiceAuth.authSubject },
       )) {
-        return { status: 409, error: 'Previous voice media session is still closing' };
+        return voiceMediaClosingResult(
+          voiceMediaRevocations, req.user.username, voiceAuth.authSubject,
+        );
       }
       if (!requestVoiceAuthStillCurrent(req, voiceAuth)) {
         return { status: 401, error: 'Authorization session was revoked' };
@@ -1812,7 +1817,13 @@ app.post('/api/voice/media/activate', requireAuth, async (req, res, next) => {
       }
       return { ok: true };
     });
-    if (result.error) return res.status(result.status).json({ error: result.error });
+    if (result.error) {
+      if (result.retryAfterSeconds) res.setHeader('Retry-After', String(result.retryAfterSeconds));
+      return res.status(result.status).json({
+        error: result.error,
+        ...(result.retryAfterSeconds ? { retryAfter: result.retryAfterSeconds } : {}),
+      });
+    }
     res.setHeader('Cache-Control', 'no-store');
     return res.json({ ok: true, room, epoch: params.epoch });
   } catch (error) { return next(error); }

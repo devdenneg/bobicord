@@ -136,6 +136,31 @@ function rowToTarget(row) {
   };
 }
 
+function voiceMediaRevocationRetryAfterSeconds(nextAttempt, at = Date.now()) {
+  const rawNextAttempt = Number(nextAttempt);
+  const rawAt = Number(at);
+  if (nextAttempt == null || !Number.isFinite(rawNextAttempt) || !Number.isFinite(rawAt)) return 1;
+  const waitMs = Math.max(0, Math.floor(rawNextAttempt) - Math.max(0, Math.floor(rawAt)));
+  return Math.max(1, Math.min(
+    Math.ceil(DEFAULT_MAX_DELAY_MS / 1000),
+    Math.ceil(waitMs / 1000),
+  ));
+}
+
+function voiceMediaClosingResult(store, username, authSubject, at = Date.now()) {
+  if (!store || typeof store.nextAttemptForVoiceSession !== 'function') {
+    throw new TypeError('voice media revocation retry store is required');
+  }
+  return {
+    status: 409,
+    error: 'Previous voice media session is still closing',
+    retryAfterSeconds: voiceMediaRevocationRetryAfterSeconds(
+      store.nextAttemptForVoiceSession(username, authSubject),
+      at,
+    ),
+  };
+}
+
 function createVoiceMediaRevocationStore(db, options = {}) {
   installVoiceMediaRevocationSchema(db);
   const baseDelayMs = Math.max(1, Number(options.baseDelayMs) || DEFAULT_BASE_DELAY_MS);
@@ -193,6 +218,12 @@ function createVoiceMediaRevocationStore(db, options = {}) {
     WHERE identity<>'' AND substr(identity,1,instr(identity,'#')-1)=?
       AND (auth_subject='' OR auth_subject=?)
     LIMIT 1
+  `);
+  const nextVoiceSessionAttempt = db.prepare(`
+    SELECT MIN(next_attempt) AS next_attempt FROM voice_media_revocations
+    WHERE identity<>'' AND instr(identity,'#')>1
+      AND substr(identity,1,instr(identity,'#')-1)=?
+      AND (auth_subject='' OR auth_subject=?)
   `);
 
   function enqueue(room, identity = ROOM_DELETE_IDENTITY, now = Date.now(), options = {}) {
@@ -260,6 +291,15 @@ function createVoiceMediaRevocationStore(db, options = {}) {
       && !!pendingVoiceSession.get(value, subject);
   }
 
+  function nextAttemptForVoiceSession(username, authSubject) {
+    const value = String(username || '');
+    const subject = String(authSubject || '');
+    if (!value || !AUTH_SUBJECT_RE.test(subject)) return null;
+    const nextAttempt = nextVoiceSessionAttempt.get(value, subject)?.next_attempt;
+    if (nextAttempt == null || !Number.isFinite(Number(nextAttempt))) return null;
+    return Math.max(0, Math.floor(Number(nextAttempt)));
+  }
+
   return Object.freeze({
     enqueueParticipant: (room, identity, now, options) => enqueue(room, identity, now, options),
     enqueueRoom: (room, now) => enqueue(room, ROOM_DELETE_IDENTITY, now),
@@ -270,6 +310,7 @@ function createVoiceMediaRevocationStore(db, options = {}) {
     hasPendingUsername,
     listDueForVoiceSession,
     hasPendingVoiceSession,
+    nextAttemptForVoiceSession,
     get: (room, identity = ROOM_DELETE_IDENTITY) => {
       const scope = normalizeScope(room, identity);
       return rowToTarget(get.get(scope.room, scope.identity));
@@ -413,4 +454,6 @@ module.exports = {
   createVoiceMediaRevocationStore,
   createVoiceMediaRevocationWorker,
   drainDueVoiceMediaRevocations,
+  voiceMediaClosingResult,
+  voiceMediaRevocationRetryAfterSeconds,
 };

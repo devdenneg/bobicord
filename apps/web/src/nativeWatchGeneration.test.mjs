@@ -6,6 +6,7 @@ const source = readFileSync(new URL('./nativeWatchGeneration.ts', import.meta.ur
 const treeSource = readFileSync(new URL('./transport/treeVideo.ts', import.meta.url), 'utf8');
 const nativeSource = readFileSync(new URL('./native.ts', import.meta.url), 'utf8');
 const nativeLibSource = readFileSync(new URL('../../native/src-tauri/src/lib.rs', import.meta.url), 'utf8');
+const windowsWorkflowSource = readFileSync(new URL('../../../.github/workflows/build-windows.yml', import.meta.url), 'utf8');
 const js = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
@@ -80,5 +81,8 @@ assert.match(nativeLibSource,
 assert.match(nativeLibSource,
   /app\.emit\("relay-watch-status", serde_json::json!\(\{[\s\S]*"generation": generation,[\s\S]*"stage": "watch_native_start",/,
   'the pre-relay async-auth status also carries its exact native-watch generation');
+assert.match(windowsWorkflowSource,
+  /- name: Build Tauri app[\s\S]*?env:[\s\S]*?VITE_BUILD: \$\{\{ steps\.ver\.outputs\.v \}\}/,
+  'the embedded WebView diagnostics use the exact monotonic Tauri release version');
 
 console.log('native watch generation: ok');

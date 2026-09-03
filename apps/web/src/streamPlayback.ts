@@ -6,9 +6,35 @@ type SinkTarget = object & {
 
 export type AudioSinkRouteOutcome = 'applied' | 'unsupported' | 'failed' | 'timed-out' | 'superseded';
 
+export type AudioSinkRouteOperation = 'enumerate' | 'set_sink';
+export type AudioSinkRouteFailureCode =
+  | 'timeout' | 'permission' | 'device_lost' | 'unsupported' | 'aborted' | 'invalid_state' | 'unknown';
+
+export interface AudioSinkRouteFailure {
+  operation: AudioSinkRouteOperation;
+  outcome: 'unsupported' | 'failed' | 'timed-out';
+  code: AudioSinkRouteFailureCode;
+}
+
 export interface AudioSinkRouteOptions {
   timeoutMs?: number;
   normalize?: (sinkId: string) => string | Promise<string>;
+  /** Re-resolve and reapply a logical route after an actual OS device-change edge. */
+  force?: boolean;
+  /** Receives fixed categories only; browser error objects and hardware identifiers never escape. */
+  onFailure?: (failure: AudioSinkRouteFailure) => void;
+}
+
+/**
+ * A platform without setSinkId already follows the system route, so `unsupported` confirms only
+ * logical default. Failed, timed-out and superseded writes never prove which physical route won.
+ */
+export function audioSinkRoutesConfirmed(
+  requested: string,
+  outcomes: readonly AudioSinkRouteOutcome[],
+): boolean {
+  return outcomes.every((outcome) => outcome === 'applied'
+    || (requested === 'default' && outcome === 'unsupported'));
 }
 
 type NavigatorLike = Pick<Navigator, 'userAgent' | 'platform' | 'maxTouchPoints'>;
@@ -81,15 +107,42 @@ const AUDIO_OUTPUT_ROUTE_TIMEOUT_MS = 1_500;
 interface SinkRouteState {
   generation: number;
   desired: string;
+  applied?: string;
+  failedDesired?: string;
   normalize: (sinkId: string) => string | Promise<string>;
   timeoutMs: number;
+  onFailure?: (failure: AudioSinkRouteFailure) => void;
   queue: Promise<void>;
 }
 const sinkRouteStates = new WeakMap<object, SinkRouteState>();
 
 type SinkOperationResult<T> =
   | { outcome: 'resolved'; value: T }
-  | { outcome: 'failed' | 'timed-out' };
+  | { outcome: 'failed'; code: AudioSinkRouteFailureCode }
+  | { outcome: 'timed-out'; code: 'timeout' };
+
+function classifyAudioSinkFailure(error: unknown): AudioSinkRouteFailureCode {
+  const name = error && typeof error === 'object' && 'name' in error
+    && typeof (error as { name?: unknown }).name === 'string'
+    ? (error as { name: string }).name
+    : '';
+  if (name === 'NotAllowedError' || name === 'SecurityError') return 'permission';
+  if (name === 'NotFoundError' || name === 'DevicesNotFoundError' || name === 'NotReadableError')
+    return 'device_lost';
+  if (name === 'NotSupportedError') return 'unsupported';
+  if (name === 'AbortError') return 'aborted';
+  if (name === 'InvalidStateError') return 'invalid_state';
+  return 'unknown';
+}
+
+function reportAudioSinkFailure(
+  observer: AudioSinkRouteOptions['onFailure'],
+  operation: AudioSinkRouteOperation,
+  outcome: 'unsupported' | 'failed' | 'timed-out',
+  code: AudioSinkRouteFailureCode,
+) {
+  try { observer?.({ operation, outcome, code }); } catch { /** diagnostics cannot affect routing */ }
+}
 
 function settleSinkOperation<T>(promise: Promise<T>, timeoutMs: number): Promise<SinkOperationResult<T>> {
   return new Promise((resolve) => {
@@ -97,18 +150,18 @@ function settleSinkOperation<T>(promise: Promise<T>, timeoutMs: number): Promise
     const timer = globalThis.setTimeout(() => {
       if (settled) return;
       settled = true;
-      resolve({ outcome: 'timed-out' });
+      resolve({ outcome: 'timed-out', code: 'timeout' });
     }, Math.max(0, timeoutMs));
     promise.then((value) => {
       if (settled) return;
       settled = true;
       globalThis.clearTimeout(timer);
       resolve({ outcome: 'resolved', value });
-    }, () => {
+    }, (error) => {
       if (settled) return;
       settled = true;
       globalThis.clearTimeout(timer);
-      resolve({ outcome: 'failed' });
+      resolve({ outcome: 'failed', code: classifyAudioSinkFailure(error) });
     });
   });
 }
@@ -120,34 +173,81 @@ function settleSinkOperation<T>(promise: Promise<T>, timeoutMs: number): Promise
  */
 function enqueueAudioSinkRoute(
   target: SinkTarget,
-  setSinkId: (sinkId: string) => Promise<void>,
+  setSinkId: SinkTarget['setSinkId'],
   state: SinkRouteState,
   sinkId: string,
   generation: number,
   normalize: (sinkId: string) => string | Promise<string>,
   timeoutMs: number,
+  force: boolean,
+  onFailure?: (failure: AudioSinkRouteFailure) => void,
 ): Promise<AudioSinkRouteOutcome> {
   const run = state.queue.catch(() => {}).then(async (): Promise<AudioSinkRouteOutcome> => {
     if (generation !== state.generation) return 'superseded';
+    // Fresh browser media targets already use the system route. Keep the logical state without
+    // asking CoreAudio/WebKit to re-apply the same default on every join or foreground edge.
+    if (!force && state.applied === sinkId && state.failedDesired !== sinkId) return 'applied';
+    if (typeof setSinkId !== 'function') {
+      reportAudioSinkFailure(onFailure, 'set_sink', 'unsupported', 'unsupported');
+      return 'unsupported'; // Safari follows the system route.
+    }
     let normalization: SinkOperationResult<string>;
     try {
       normalization = await settleSinkOperation(Promise.resolve(normalize(sinkId)), timeoutMs);
-    } catch {
+    } catch (error) {
+      if (generation !== state.generation) return 'superseded';
+      if (generation === state.generation) state.failedDesired = sinkId;
+      reportAudioSinkFailure(onFailure, 'enumerate', 'failed', classifyAudioSinkFailure(error));
       return 'failed';
     }
-    if (normalization.outcome !== 'resolved') return normalization.outcome;
+    if (normalization.outcome !== 'resolved') {
+      if (generation !== state.generation) return 'superseded';
+      if (generation === state.generation) state.failedDesired = sinkId;
+      reportAudioSinkFailure(onFailure, 'enumerate', normalization.outcome, normalization.code);
+      return normalization.outcome;
+    }
     // A newer selection that arrived while device enumeration was pending owns the hardware.
     if (generation !== state.generation) return 'superseded';
     let raw: Promise<void>;
     try { raw = Promise.resolve(setSinkId.call(target, normalization.value)); }
-    catch { return 'failed'; }
+    catch (error) {
+      if (generation !== state.generation) return 'superseded';
+      if (generation === state.generation) state.failedDesired = sinkId;
+      reportAudioSinkFailure(onFailure, 'set_sink', 'failed', classifyAudioSinkFailure(error));
+      return 'failed';
+    }
     const result = await settleSinkOperation(raw, timeoutMs);
-    if (result.outcome === 'resolved') return 'applied';
-    if (result.outcome === 'failed') return 'failed';
+    if (result.outcome === 'resolved') {
+      // Even a superseded operation changed the physical target before the next queued request.
+      // Recording that exact intermediate route makes a same-as-before successor re-apply instead
+      // of incorrectly no-oping and leaving this stale route audible.
+      state.applied = sinkId;
+      if (generation === state.generation && state.failedDesired === sinkId) delete state.failedDesired;
+      return 'applied';
+    }
+    if (result.outcome === 'failed') {
+      if (generation !== state.generation) return 'superseded';
+      if (generation === state.generation) state.failedDesired = sinkId;
+      reportAudioSinkFailure(onFailure, 'set_sink', 'failed', result.code);
+      return 'failed';
+    }
+    // The browser may already have changed hardware before leaving its promise pending. The
+    // previous logical route is therefore no longer confirmed: a following custom -> default
+    // request must physically restore the system route even before this promise settles.
+    state.applied = undefined;
+    const current = generation === state.generation;
+    if (current) {
+      state.failedDesired = sinkId;
+      reportAudioSinkFailure(onFailure, 'set_sink', 'timed-out', 'timeout');
+    }
     // A rejected promise changed nothing. A promise that merely exceeded the deadline may still
     // apply later; only that late success needs to repair a now-stale route.
     void raw.then(() => {
-      if (generation === state.generation) return;
+      state.applied = sinkId;
+      if (generation === state.generation) {
+        if (state.failedDesired === sinkId) delete state.failedDesired;
+        return;
+      }
       const currentSetSinkId = target.setSinkId;
       if (typeof currentSetSinkId !== 'function') return;
       // Append a repair for the current generation without minting a newer generation. That keeps
@@ -161,9 +261,11 @@ function enqueueAudioSinkRoute(
         state.generation,
         state.normalize,
         state.timeoutMs,
+        true,
+        state.onFailure,
       );
     }, () => {});
-    return 'timed-out';
+    return current ? 'timed-out' : 'superseded';
   });
   state.queue = run.then(() => {}, () => {});
   return run;
@@ -175,7 +277,6 @@ export function routeAudioSinkTarget(
   options: AudioSinkRouteOptions = {},
 ): Promise<AudioSinkRouteOutcome> {
   const setSinkId = target.setSinkId;
-  if (typeof setSinkId !== 'function') return Promise.resolve('unsupported'); // Safari follows the system route.
   const normalize = options.normalize ?? ((value: string) => value);
   const timeoutMs = Number.isFinite(options.timeoutMs)
     ? Math.max(0, options.timeoutMs as number)
@@ -188,8 +289,25 @@ export function routeAudioSinkTarget(
   state.desired = sinkId;
   state.normalize = normalize;
   state.timeoutMs = timeoutMs;
+  state.onFailure = options.onFailure;
   const generation = ++state.generation;
-  return enqueueAudioSinkRoute(target, setSinkId, state, sinkId, generation, normalize, timeoutMs);
+  return enqueueAudioSinkRoute(
+    target, setSinkId, state, sinkId, generation, normalize, timeoutMs, options.force === true, options.onFailure,
+  );
+}
+
+/** Seeds the route of an exact, newly-created browser target before any asynchronous switch. */
+export function seedAudioSinkTargetRoute(target: object, sinkId = 'default'): boolean {
+  if (sinkRouteStates.has(target)) return false;
+  sinkRouteStates.set(target, {
+    generation: 0,
+    desired: sinkId,
+    applied: sinkId,
+    normalize: (value) => value,
+    timeoutMs: AUDIO_OUTPUT_ROUTE_TIMEOUT_MS,
+    queue: Promise.resolve(),
+  });
+  return true;
 }
 
 /** Coalesces identical output selections for one exact media element until an explicit retry. */
@@ -437,12 +555,13 @@ async function routeTreeOutputTarget(
   target: SinkTarget,
   sinkId: string,
   reportInheritedFailure = false,
+  options: Pick<AudioSinkRouteOptions, 'force' | 'onFailure'> = {},
 ): Promise<AudioSinkRouteOutcome> {
   // Returning to the system route ends the failed custom-selection episode even if the browser
   // reports `unsupported` (Safari follows the OS route without setSinkId). A later selection of
   // the same device must be allowed to report a fresh disconnect.
   if (sinkId === 'default') notifiedTreeOutputFailures.delete(target);
-  const outcome = await routeAudioSinkTarget(target, sinkId);
+  const outcome = await routeAudioSinkTarget(target, sinkId, options);
   // A late result belongs only to the exact inherited route that requested it. A newer Settings
   // selection must never be reset by an older tile that finished routing afterwards.
   if (treeStreamOutputSink !== sinkId) return outcome;
@@ -541,6 +660,8 @@ export class TreeStreamAudioController {
       if (!Constructor) throw new Error('WebAudio unavailable');
       return new Constructor();
     });
+    // A newly-created media element follows the OS route until this controller explicitly moves it.
+    seedAudioSinkTargetRoute(video);
     treeStreamAudioControllers.add(this);
     stream.addEventListener('addtrack', this.onTracksChanged);
     stream.addEventListener('removetrack', this.onTracksChanged);
@@ -580,6 +701,9 @@ export class TreeStreamAudioController {
     const context = this.shareContext
       ? acquireSharedTreeAudioContext(this.audioContextFactory)
       : this.audioContextFactory();
+    // A fresh or replacement AudioContext starts on the system route. For a shared context the
+    // first controller seeds it and later controllers leave its exact route state untouched.
+    seedAudioSinkTargetRoute(context);
     this.context = context;
     if (typeof context.addEventListener === 'function') context.addEventListener('statechange', this.onContextStateChange);
     else context.onstatechange = this.onContextStateChange;
@@ -736,7 +860,10 @@ export class TreeStreamAudioController {
 }
 
 /** Updates every live tree/P2P tile and becomes the initial route for tracks arriving later. */
-export async function setTreeStreamOutputSink(sinkId: string): Promise<AudioSinkRouteOutcome> {
+export async function setTreeStreamOutputSink(
+  sinkId: string,
+  options: Pick<AudioSinkRouteOptions, 'force' | 'onFailure'> = {},
+): Promise<AudioSinkRouteOutcome> {
   treeStreamOutputSink = sinkId || 'default';
   const targets = new Set<SinkTarget>();
   treeStreamAudioControllers.forEach((controller) => {
@@ -744,11 +871,14 @@ export async function setTreeStreamOutputSink(sinkId: string): Promise<AudioSink
     if (target) targets.add(target); // shared AudioContext is switched exactly once.
   });
   if (!targets.size) return 'applied'; // future controllers inherit treeStreamOutputSink on creation.
-  const outcomes = await Promise.all([...targets].map((target) => routeTreeOutputTarget(target, treeStreamOutputSink)));
+  const outcomes = await Promise.all(
+    [...targets].map((target) => routeTreeOutputTarget(target, treeStreamOutputSink, false, options)),
+  );
   // A partially routed tree is not a successful device switch: every audible target must agree.
   if (outcomes.includes('failed')) return 'failed';
   if (outcomes.includes('timed-out')) return 'timed-out';
   if (outcomes.includes('unsupported')) return 'unsupported';
+  if (outcomes.includes('superseded')) return 'superseded';
   if (outcomes.includes('applied')) return 'applied';
   return 'superseded';
 }

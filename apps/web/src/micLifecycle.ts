@@ -403,8 +403,10 @@ export function automaticMicRecoveryAllowed(
   hadCapture: boolean,
   bootstrapWanted: boolean,
   foregroundRecoveryPending: boolean,
+  intentionallyMuted = false,
 ): boolean {
-  return !pageHidden && (hadCapture || bootstrapWanted || foregroundRecoveryPending);
+  return !pageHidden && !intentionallyMuted
+    && (hadCapture || bootstrapWanted || foregroundRecoveryPending);
 }
 
 export function foregroundMicNeedsImmediateRecovery(
@@ -419,6 +421,7 @@ export function foregroundMicNeedsImmediateRecovery(
 export interface MicrophoneTrackHealthLike {
   readonly readyState?: string;
   readonly muted?: boolean;
+  readonly enabled?: boolean;
 }
 
 /**
@@ -432,11 +435,17 @@ export function microphoneTransportHealth(
   publishedTrack: MicrophoneTrackHealthLike | null | undefined,
   exactPublication: boolean,
   upstreamPaused: boolean,
+  publicationMuted = false,
 ): { ended: boolean; muted: boolean; upstreamPaused: boolean } {
   return {
     ended: !rawTrack || rawTrack.readyState === 'ended'
       || !publishedTrack || publishedTrack.readyState === 'ended' || !exactPublication,
-    muted: !!rawTrack?.muted || !!publishedTrack?.muted || upstreamPaused,
+    // LiveKit mute can disable the MediaStreamTrack without firing its `mute` event, and its
+    // LocalAudioTrack/publication state can remain authoritative while both browser tracks still
+    // report `muted=false`. Every one of these signals means peers can receive silence.
+    muted: !!rawTrack?.muted || rawTrack?.enabled === false
+      || !!publishedTrack?.muted || publishedTrack?.enabled === false
+      || publicationMuted || upstreamPaused,
     upstreamPaused,
   };
 }

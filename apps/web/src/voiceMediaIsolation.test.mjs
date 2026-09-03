@@ -14,6 +14,47 @@ const storeSource = readSource('store.ts');
 const appSource = readSource('App.tsx');
 const voiceDockSource = readSource('components', 'VoiceDock.tsx');
 const deploySource = readSource('..', '..', '..', '.github', 'workflows', 'deploy.yml');
+const activationSource = readSource('voiceActivation.ts');
+const activationJs = ts.transpileModule(activationSource, {
+  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+}).outputText;
+const {
+  boundedVoiceActivationRetryDelayMs,
+  shouldReportSlowVoiceJoin,
+  voiceActivationHttpFailureDisposition,
+} = await import(
+  'data:text/javascript,' + encodeURIComponent(activationJs)
+);
+for (const status of [400, 401, 403]) {
+  assert.equal(voiceActivationHttpFailureDisposition(status), 'terminal',
+    `HTTP ${status} cannot recover after the API client's bounded auth handling`);
+}
+for (const status of [404, 405]) {
+  assert.equal(voiceActivationHttpFailureDisposition(status), 'server-updating',
+    `HTTP ${status} keeps the rolling-deploy explanation without a retry loop`);
+}
+for (const status of [undefined, 0, 408, 409, 429, 500, 503]) {
+  assert.equal(voiceActivationHttpFailureDisposition(status), 'retry',
+    `${String(status)} retains the existing deadline-bounded transient retry`);
+}
+assert.equal(boundedVoiceActivationRetryDelayMs(400, 10_000, 3), 3_000,
+  'a server Retry-After is the earliest allowed activation retry');
+assert.equal(boundedVoiceActivationRetryDelayMs(1_500, 10_000, 0.2), 1_500,
+  'the ordinary exponential backoff still wins over a shorter server hint');
+assert.equal(boundedVoiceActivationRetryDelayMs(400, 900, 3), 900,
+  'a server hint cannot extend activation past the transaction deadline');
+assert.equal(boundedVoiceActivationRetryDelayMs(400, 10_000, Number.NaN), 400,
+  'an invalid server hint cannot poison retry scheduling');
+assert.equal(shouldReportSlowVoiceJoin(4_999), false,
+  'an ordinary successful voice join does not create a diagnostic upload');
+assert.equal(shouldReportSlowVoiceJoin(5_000), true,
+  'a successful join at the bounded slow threshold creates one diagnostic report');
+assert.equal(shouldReportSlowVoiceJoin(6_600), true,
+  'the observed slow successful activation is retained for admin diagnosis');
+for (const invalidElapsed of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -1]) {
+  assert.equal(shouldReportSlowVoiceJoin(invalidElapsed), false,
+    'invalid or negative elapsed time cannot trigger a diagnostic upload');
+}
 const file = ts.createSourceFile('engine.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
 const engine = file.statements.find((node) => ts.isClassDeclaration(node) && node.name?.text === 'Engine');
 assert.ok(engine && ts.isClassDeclaration(engine), 'Engine class must exist');
@@ -67,6 +108,26 @@ assert.match(mediaActivation, /const deadline = operationDeadline/,
   'durable revocation retry must retain the transaction absolute deadline');
 assert.doesNotMatch(mediaActivation, /Date\.now\(\) \+ 10_000/,
   'a shorter activation ceiling must not expire before the server due-drain window');
+assert.match(mediaActivation, /catch \(error\)[\s\S]*status === 409[\s\S]*Number\.isFinite\(error\.retryAfter\)[\s\S]*code: 'session_closing'[\s\S]*classifyVoiceDiagnosticError\(error\)[\s\S]*kind: 'media_activated'[\s\S]*outcome: 'failed'[\s\S]*joinElapsedMs:[\s\S]*voiceDiagnosticState\(\)/,
+  'every failed activation response records one fixed-schema attempt without submitting an incident');
+assert.match(mediaActivation, /permissionBudget[\s\S]*kind: 'media_activated'[\s\S]*outcome: 'timed_out'[\s\S]*code: 'timeout'/,
+  'HTTP activation without propagated media permissions records the exact timeout answer');
+assert.match(mediaActivation, /isApiError\(error\)[\s\S]*error\.status === 409[\s\S]*Number\.isFinite\(error\.retryAfter\)[\s\S]*boundedVoiceActivationRetryDelayMs/,
+  '409 activation retry obeys a finite server Retry-After and the shared absolute deadline');
+assert.match(mediaActivation, /voiceActivationHttpFailureDisposition\(error\.status\)[\s\S]*failureDisposition === 'server-updating'[\s\S]*onTerminalFailure\?\.\('server-updating'\)[\s\S]*return false[\s\S]*failureDisposition === 'terminal'[\s\S]*onTerminalFailure\?\.\('activation'\)[\s\S]*return false/,
+  'terminal activation HTTP responses stop before the retry delay and preserve rollout failures');
+assert.match(mediaActivation, /failureDisposition === 'terminal'[\s\S]*return false[\s\S]*if \(sessionClosing\)[\s\S]*boundedVoiceActivationRetryDelayMs/,
+  'retryable activation failures still reach the existing bounded backoff after terminal exits');
+assert.doesNotMatch(mediaActivation, /recordVoiceJoinFailure|submitVoiceDiagnostic/,
+  'per-attempt activation telemetry cannot consume a separate incident upload slot');
+assert.match(source, /activationFailureRemembered = true;[\s\S]*rememberFailure\(reason\)[\s\S]*if \(!activationFailureRemembered\) rememberFailure\(failure\)/,
+  'the outer connection failure handler cannot overwrite an activation rollout diagnosis');
+const completeVoiceDiagnosticJoin = methodText('completeVoiceDiagnosticJoin');
+assert.match(completeVoiceDiagnosticJoin,
+  /const joinElapsedMs = this\.voiceDiagnosticJoinElapsed\(\)[\s\S]*kind: 'join_completed'[\s\S]*shouldReportSlowVoiceJoin\(joinElapsedMs\)[\s\S]*submitVoiceDiagnostic\('join_stuck'\)/,
+  'only the completed exact join may upload its slow fixed-schema timeline');
+assert.equal((completeVoiceDiagnosticJoin.match(/submitVoiceDiagnostic\(/g) || []).length, 1,
+  'one successful join can enqueue at most one slow-join diagnostic');
 assert.match(methodText('waitVoiceMediaPermissions'), /ParticipantPermissionsChanged/,
   'microphone must wait for server-applied publish and subscribe permissions');
 
@@ -178,7 +239,7 @@ assert.match(methodText('triggerOutputContextRecovery'), /explicitGesture \|\| !
   'the recovery watchdog also makes at most one ordinary native context resume');
 assert.match(finishOutputContextRecovery, /document\.hidden[\s\S]*remainingMs[\s\S]*context\.state === 'running'[\s\S]*allBound[\s\S]*allStarted/,
   'hidden time cannot launch/consume recovery, and visible recovery requires exact context plus room playback confirmation');
-assert.match(finishOutputContextRecovery, /failOutputContextRecovery\(recovery\.voiceEpoch, recovery\.voiceRoom, recovery\.voiceChannel\)/,
+assert.match(finishOutputContextRecovery, /failOutputContextRecovery\([\s\S]*recovery\.voiceEpoch,[\s\S]*recovery\.voiceRoom,[\s\S]*recovery\.voiceChannel,[\s\S]*'timeout'/,
   'a bounded recovery failure exits only the exact still-current voice intent');
 assert.match(getOutputContext, /!this\.outputCtx && this\.exactOutputRooms\(\)\.some\(\(room\) => room\.options\.webAudioMix === true\)[\s\S]*return null/,
   'a LiveKit-owned fallback mixer cannot be split from a newly-created shared output context');
@@ -314,10 +375,14 @@ assert.match(joinVoiceText, /voiceMediaFailureText\(/,
 assert.match(methodText('voiceMediaFailureText'), /Сервер ещё обновляется — голос станет доступен/,
   'an old API reports an actionable rollout mismatch instead of blaming the device or channel');
 const switchContextOutput = methodText('switchContextOutput');
-assert.match(switchContextOutput, /Promise\.allSettled\([\s\S]*queueContextOutput\(requested\)[\s\S]*treeSwitch/,
+assert.match(switchContextOutput, /Promise\.allSettled\([\s\S]*setTreeStreamOutputSink\(requested,[\s\S]*queueContextOutput\(requested, force/,
   'main and tree playback routes must both settle before an output device is accepted');
 assert.match(switchContextOutput, /treeOutcome === 'failed'[\s\S]*treeOutcome === 'timed-out'/,
   'a failed or timed-out tree route must fall back instead of leaving split output');
+assert.match(switchContextOutput, /audioSinkRoutesConfirmed\(requested,[\s\S]*if \(requested === 'default'\) return null/,
+  'an unconfirmed system route must stay retryable instead of poisoning the output cache');
+assert.match(methodText('switchElementOutput'), /audioSinkRoutesConfirmed\(requested, \[outcome\]\)[\s\S]*outcome === 'unsupported'[\s\S]*routeAudioSinkTarget\(el, 'default'/,
+  'a custom route unsupported by an exact media element must use the safe system fallback');
 const finishInitialMic = methodText('finishInitialMic');
 assert.match(finishInitialMic, /await this\.startMicWithDefaultFallback/,
   'listen-only join must still attempt bounded microphone bootstrap');
@@ -425,6 +490,10 @@ assert.match(startMic, /micHadCapture = true;[\s\S]*micBootstrapWanted = false;[
   'a successful foreground capture must consume recovery intent instead of causing a second watchdog capture');
 assert.match(micRecovery, /automaticMicRecoveryAllowed/,
   'watchdog must distinguish prior capture from stable initial listen-only denial');
+assert.match(micRecovery, /automaticMicRecoveryAllowed\([\s\S]*this\.manualMute \|\| this\.deafened/,
+  'intentional manual mute and deafen must suppress automatic capture rebuilds');
+assert.match(micRecovery, /micUnmuteWriteOwner !== 0/,
+  'the watchdog must not race a pending explicit LiveKit unmute into a capture rebuild');
 assert.match(micRecovery, /if \(!this\.micHadCapture\) \{[\s\S]*this\.micBootstrapWanted = false/,
   'an initial denied bootstrap must disarm periodic permission retries');
 
@@ -469,8 +538,10 @@ assert.match(leaseVerifier, /const reconnectRecovery = this\.voiceReconnectRecov
   'replacement reconnect verifiers must inherit the first transport disruption deadline');
 assert.match(leaseVerifier, /withVoiceDeadline\([\s\S]*api\.getVoiceLease\(\)[\s\S]*voice reconnect lease snapshot/,
   'each reconnect lease snapshot must be individually bounded');
-assert.match(leaseVerifier, /activateVoiceMediaRoom\(activeMedia, room, voiceEpoch, serverId, channelId, deadline\)/,
-  'media reactivation must inherit the common reconnect deadline');
+assert.match(leaseVerifier, /activateVoiceMediaRoom\([\s\S]*activeMedia[\s\S]*deadline[\s\S]*terminalActivationFailure = reason/,
+  'media reactivation inherits the common deadline and exposes terminal status to its verifier');
+assert.match(leaseVerifier, /if \(terminalActivationFailure\)[\s\S]*await this\.leaveVoice\(\)[\s\S]*return false[\s\S]*failures\+\+[\s\S]*retry/,
+  'terminal reactivation retires the fail-closed room before the verifier retry path');
 assert.match(leaseVerifier, /commitVoiceAttributes\(room, voiceEpoch, channelId, deadline\)/,
   'attribute re-commit must inherit the common reconnect deadline');
 assert.match(leaseVerifier, /!this\.voiceMediaActivated\.has\(activeMedia\) \|\| !this\.mediaPermissionsActive\(activeMedia\)/,
@@ -593,6 +664,27 @@ assert.match(methodText('toggleManualMuteIntent'), /manualMute = !this\.manualMu
   'manual mute changes retire every held PTT owner before a later unmute can reopen the gate');
 assert.match(methodText('toggleDeaf'), /deafened = !this\.deafened[\s\S]*clearPttOwnership\(\)/,
   'deafen changes retire every held PTT owner before sound is restored');
+const reconcileMicPrivacy = methodText('reconcileMicPrivacyIntent');
+assert.match(reconcileMicPrivacy, /shouldMute[\s\S]*invalidateMicRecoveryOwner\(\)/,
+  'a new privacy intent retires an automatic recovery before it can reacquire capture');
+assert.match(reconcileMicPrivacy, /if \(shouldMute\)[\s\S]*if \(track\)[\s\S]*track\.mute\(\)[\s\S]*const exactOwnership/,
+  'privacy mute closes any current publication before exact unmute ownership is considered');
+assert.match(reconcileMicPrivacy, /exactOwnership[\s\S]*track === this\.micLocalTrack[\s\S]*hasExactCurrentMicPublication\(\)[\s\S]*voiceMediaIntentCurrent/,
+  'physical unmute is restricted to the exact current app-owned microphone publication');
+assert.match(reconcileMicPrivacy, /track\.unmute\(\)[\s\S]*finishUnmute[\s\S]*checkMicAlive\(false\)[\s\S]*withVoiceTimeout\(raw[\s\S]*finishUnmute\(true\)[\s\S]*finishUnmute\(false\)/,
+  'explicit unmute validates the exact sender after a bounded write and recovers real damage');
+assert.match(reconcileMicPrivacy, /finishUnmute[\s\S]*!writeSucceeded[\s\S]*track\.isMuted[\s\S]*mediaStreamTrack\.enabled === false[\s\S]*micForegroundRecoveryPending = true[\s\S]*checkMicAlive\(false\)/,
+  'a rejected, timed-out or still-muted exact unmute arms one current generation-fenced recovery');
+assert.match(reconcileMicPrivacy, /raw\.then[\s\S]*micMuteWriteSeq === owner[\s\S]*micPub\(room\)\?\.track !== track[\s\S]*track\.mute\(\)/,
+  'a late old unmute must reassert a newer mute only on its exact still-owned publication');
+assert.match(reconcileMicPrivacy, /withVoiceTimeout\(track\.mute\(\), VOICE_ATTRIBUTE_TIMEOUT_MS, 'microphone remute'\)[\s\S]*\.catch/,
+  'the late privacy repair is bounded and cannot leak an unhandled rejection');
+assert.match(methodText('clearMicTrackLifecycle'), /\+\+this\.micMuteWriteSeq;[\s\S]*this\.micUnmuteWriteOwner = 0/,
+  'replacing or stopping the microphone invalidates every old unmute owner');
+assert.match(methodText('toggleManualMuteIntent'), /reconcileMicPrivacyIntent\(\)/,
+  'manual mute changes use the fenced LiveKit privacy reconciliation');
+assert.match(methodText('toggleDeaf'), /reconcileMicPrivacyIntent\(\)/,
+  'deafen changes use the same fenced LiveKit privacy reconciliation');
 const pttPress = methodText('pttPress');
 assert.match(pttPress, /micStartOwnership\.active[\s\S]*micRecoveryOwner !== 0[\s\S]*!this\.hasHealthyCurrentMicTransport\(\)/,
   'PTT must reject while capture is recovering or lacks the exact current publication');
