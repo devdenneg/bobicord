@@ -18,6 +18,7 @@ const MAX_NOTE_LENGTH = 200;
 const MAX_NOTES_PER_COMMIT = 5;
 const MAX_RELEASE_NOTES = 30;
 const MAX_RELEASE_CANDIDATES = 256;
+const MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024;
 
 function fail(message) {
   throw new Error(message);
@@ -28,8 +29,15 @@ function fail(message) {
 // классификация путей на такой строке ломается — isNonRuntimePath не видел ни префикса
 // docs/, ни расширения .md, и легальный «Patch-Note: skip» для документа был отклонён как
 // «запрещён для поставляемых файлов» (падение релиза e088f345154c).
+// Откат большой серии коммитов даёт дифф в несколько мегабайт, а execFileSync по умолчанию
+// обрывает вывод на одном мегабайте и падает с ENOBUFS — валидация релиза не могла даже
+// прочитать собственный дифф и роняла деплой целиком.
 function git(args) {
-  return execFileSync('git', ['-c', 'core.quotepath=false', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  return execFileSync('git', ['-c', 'core.quotepath=false', ...args], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    maxBuffer: MAX_GIT_OUTPUT_BYTES,
+  }).trim();
 }
 
 function cleanSha(value) {
