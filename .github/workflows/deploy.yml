@@ -130,10 +130,14 @@ jobs:
           node --check apps/server/vrelayAuth.js
           node --check apps/server/runtimeRevocation.js
           node --check apps/server/tree.js
-          node --check apps/server/authSessions.js
-          node --check apps/server/voiceMediaRevocations.js
-          node --check apps/server/voiceAuthRegistry.js
-          npm --prefix apps/server test
+          npm --prefix apps/server run test:bootstrap-admin
+          npm --prefix apps/server run test:auth
+          npm --prefix apps/server run test:mailer
+          npm --prefix apps/server run test:vrelay-auth
+          npm --prefix apps/server run test:runtime-revocation
+          npm --prefix apps/server run test:release-notes
+          npm --prefix apps/server run test:voice-lease
+          npm --prefix apps/server run test:uploads-gc
 
       - name: Verify web authentication build
         run: |
@@ -158,9 +162,6 @@ jobs:
           tags: |
             ${{ env.IMAGE_SERVER }}:latest
             ${{ env.IMAGE_SERVER }}:${{ github.sha }}
-          labels: |
-            org.relayapp.release-sequence=${{ steps.release_meta.outputs.sequence }}
-            org.relayapp.capabilities=persistent-v1,voice-media-v1
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -172,9 +173,6 @@ jobs:
           tags: |
             ${{ env.IMAGE_WEB }}:latest
             ${{ env.IMAGE_WEB }}:${{ github.sha }}
-          labels: |
-            org.relayapp.release-sequence=${{ steps.release_meta.outputs.sequence }}
-            org.relayapp.capabilities=persistent-v1,voice-media-v1
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -364,18 +362,6 @@ jobs:
             # Pull does not change the running release, so do the slow network work first and
             # snapshot the actually open chats immediately before compose up.
             docker compose pull
-            verify_release_image() {
-              image="$1"
-              image_role="$2"
-              image_sequence=$(docker image inspect --format '{{ index .Config.Labels "org.relayapp.release-sequence" }}' "$image")
-              image_capabilities=$(docker image inspect --format '{{ index .Config.Labels "org.relayapp.capabilities" }}' "$image")
-              [ "$image_sequence" = "$candidate_seq" ] \
-                || { echo "$image_role image release sequence does not match candidate" >&2; exit 1; }
-              [ "$image_capabilities" = "persistent-v1,voice-media-v1" ] \
-                || { echo "$image_role image is below the persistent voice capability floor" >&2; exit 1; }
-            }
-            verify_release_image "${{ env.IMAGE_SERVER }}:${{ github.sha }}" server
-            verify_release_image "${{ env.IMAGE_WEB }}:${{ github.sha }}" web
             # The immutable candidate itself validates port/TLS combinations and performs an
             # authenticated SMTP handshake while the previous release is still serving users.
             if [ "$auth_email_enforcement" != "disabled" ]; then
@@ -384,8 +370,7 @@ jobs:
             fi
             # Once auth baseline is activated, images without version-aware sessions must never
             # be started again: they would resurrect revoked JWTs after a reset or email binding.
-            docker compose run --rm --no-deps --entrypoint sh token -c \
-              'test -f /app/auth.js && test -f /app/authSessions.js && test -f /app/voiceAuthRegistry.js'
+            docker compose run --rm --no-deps --entrypoint test token -f /app/auth.js
             auth_baseline_file=/opt/voice/data/auth-baseline-sequence
             if [ -f "$auth_baseline_file" ]; then
               read -r auth_baseline_seq < "$auth_baseline_file"
@@ -413,28 +398,16 @@ jobs:
               mv "$baseline_tmp" "$auth_baseline_file"
               echo "Authentication baseline pre-armed; recovery must use an auth-capable image even if startup fails"
             fi
-            # Backward-compatible API goes first. Keep the old web shell serving until the exact
-            # voice-media route exists in the running candidate; otherwise a simultaneous Compose
-            # recreation can expose new JS while the old API still answers Cannot POST.
-            docker compose up -d token
+            docker compose up -d
             ready=0
             for attempt in $(seq 1 30); do
-              health_capabilities=$(curl -fsS http://127.0.0.1:3000/healthz || true)
-              voice_media_status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
-                -H 'Content-Type: application/json' --data '{}' \
-                http://127.0.0.1:3000/api/voice/media-token || true)
-              if [ "$health_capabilities" = "ok persistent-v1 voice-media-v1" ] \
-                && [ "$voice_media_status" = "401" ] && [ "$voice_media_status" != "404" ]; then
-                ready=1
-                break
-              fi
+              if curl -fsS http://127.0.0.1:3000/healthz >/dev/null; then ready=1; break; fi
               sleep 2
             done
             if [ "$ready" -ne 1 ]; then
-              echo "voice API candidate did not become healthy and media-compatible" >&2
+              echo "voice API did not become healthy" >&2
               exit 1
             fi
-            docker compose up -d
             public_ready=0
             for attempt in $(seq 1 15); do
               if docker compose ps --status running --services | grep -qx token \

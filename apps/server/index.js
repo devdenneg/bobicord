@@ -9,53 +9,8 @@ const { AccessToken, RoomServiceClient, DataPacket_Kind } = require('livekit-ser
 const { WebSocketServer } = require('ws');
 const { attachTreeServer } = require('./tree');
 const { createVoiceLeaseStore, voiceLeaseEvent, selectVoiceState } = require('./voiceLease');
-const {
-  voiceMediaRoomName, voiceHubIdentity, voiceMediaIdentity, exactVoiceLease, initialVoiceMediaGrant,
-  activateVoiceMediaParticipant, removeVoiceMediaParticipant,
-} = require('./voiceMedia');
-const {
-  DEFAULT_USERNAME_DRAIN_TIMEOUT_MS,
-  createVoiceMediaRevocationStore, createVoiceMediaRevocationWorker, drainDueVoiceMediaRevocations,
-  voiceMediaClosingResult,
-} = require('./voiceMediaRevocations');
-const {
-  VoiceAuthRevokedError, createVoiceAuthSubjectCodec, createVoiceSessionId,
-  voiceSessionMatchesSubject, releaseExactVoiceLease, createVoiceAuthTargetRegistry,
-} = require('./voiceAuthRegistry');
-const {
-  hubTokenGrant, createVoiceTokenMintLimiter, noStoreVoiceTokenResponse,
-} = require('./voiceTokenPolicy');
-const {
-  admitBoundedNotifySocket, canonicalReactionIdentity, chatClearedEvent, chatReadyEvent,
-  cleanupInvalidLegacyReactions, createChatRateLimiter, createChatRealtimeFanout,
-  createChatRevisionStore, createNotifyInboundGuard, hasAllMention,
-  messageCreatedEvent, messageDeletedEvent, messageUpdatedEvent, reactionsUpdatedEvent,
-  sanitizeMessageEmotes, sendBoundedNotifyFrames,
-} = require('./chatRealtime');
-const {
-  createLegacyChatRefreshBridge, isCanonicalChatRequest, legacyChatSocketEligible,
-} = require('./legacyChatBridge');
 const { installRuntimeRevocationSchema } = require('./runtimeRevocation');
-const {
-  clearRequestedPushEndpoints, clearSessionPushEndpoints, installPushSubscriptionPrivacySchema,
-  normalizedPushEndpoint, normalizedPushPrivacy, pushPayloadForSubscription, unsubscribeOwnedPushEndpoint,
-} = require('./pushSubscriptions');
-const {
-  boundedAccountSettings, createServerVolumeSettingsStore, normalizeServerVolumeMutation,
-} = require('./serverSettings');
-const { planUploadSweep, uploadUrlsOfMessageRows, normalizeUploadRef, uploadRefsInText, isOwnedUploadRow } = require('./uploadsGc'); // квоты, владение и уборка пользовательских файлов
-const {
-  createDiagRateLimiter, createDiagStore, sanitizeDiagLines, sanitizeDiagSamples,
-} = require('./diagStore');
-const {
-  VoiceDiagnosticValidationError, createVoiceDiagnosticGlobalLimiter,
-  createVoiceDiagnosticsStore, isVoiceDiagnosticControlIncident, isVoiceDiagnosticsAdmin,
-  sanitizeVoiceDiagnosticReport,
-} = require('./voiceDiagnostics');
-const {
-  BoundedTtlCache, createFixedWindowLimiter, fetchSeventvCdn,
-  normalizeGlobalPayload, normalizeSearchPayload, readResponseLimited,
-} = require('./seventvProxy');
+const { planUploadSweep, uploadUrlsOfMessageRows, normalizeUploadRef, UPLOAD_REF_RE } = require('./uploadsGc'); // квоты и уборка пользовательских файлов
 const {
   installReleaseSchema, listReleaseHistory, parseReleaseMeta, prepareRelease, finalizeRelease,
 } = require('./releaseNotes');
@@ -63,12 +18,6 @@ const {
   AuthError, installAuthSchema, installVerifiedRegistrationGuard, createAuthManager, readCodePepperFile,
   passwordPrehash, formatPasswordHash, verifiedEmailForOwner,
 } = require('./auth');
-const {
-  PersistentSessionError, clearWebSessionCookieHeaders, createPersistentSessionManager,
-  installPersistentSessionSchema, parseExactHttpOrigins, parseRefreshToken, persistentProtocolRequested,
-  persistentSessionRateSubject, transportRequest,
-  webSessionCookieHeaders,
-} = require('./authSessions');
 const { createSmtpMailer } = require('./mailer');
 const {
   VRELAY_UID,
@@ -89,24 +38,13 @@ const corsOrigins = new Set([
   'http://tauri.localhost',
   'https://tauri.localhost',
 ]);
-const persistentWebOrigins = new Set(['https://reelay.online', 'https://www.reelay.online']);
-const persistentNativeOrigins = new Set(['tauri://localhost', 'http://tauri.localhost', 'https://tauri.localhost']);
 if (process.env.NODE_ENV !== 'production') {
   corsOrigins.add('http://localhost:5173');
   corsOrigins.add('http://127.0.0.1:5173');
-  persistentWebOrigins.add('http://localhost:5173');
-  persistentWebOrigins.add('http://127.0.0.1:5173');
 }
 for (const origin of String(process.env.CORS_ALLOWED_ORIGINS || '').split(',')) {
   const normalized = origin.trim();
   if (normalized) corsOrigins.add(normalized);
-}
-// Cookie-auth origins are a deliberately narrower trust boundary than general CORS. An explicitly
-// trusted browser origin is also CORS-readable, but a generic API/Tauri CORS origin never gains
-// ambient HttpOnly-cookie authority by accident.
-for (const origin of parseExactHttpOrigins(process.env.PERSISTENT_WEB_ORIGINS)) {
-  persistentWebOrigins.add(origin);
-  corsOrigins.add(origin);
 }
 // Нативный Tauri-клиент обращается к prod API со своего origin. Разрешаем только
 // известные origins; запросы без Origin остаются доступны нативным сервисам и health-check.
@@ -115,14 +53,14 @@ app.use((req, res, next) => {
   const allowed = !origin || corsOrigins.has(origin);
   if (origin && allowed) {
     res.header('Access-Control-Allow-Origin', origin);
-    res.header('Access-Control-Allow-Credentials', 'true');
     res.header('Vary', 'Origin');
   }
   res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-  // X-Attachment-Name carries the upload filename; X-Relay-Chat-Protocol marks one canonical chat
-  // mutation for the bounded rollout bridge. Both are used by cross-origin Tauri requests, so an
-  // omitted allow-list entry would make the browser reject the request during preflight.
-  res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Attachment-Name,X-Relay-Chat-Protocol,X-Relay-Auth-Protocol,X-Relay-Auth-Transport,X-Relay-CSRF');
+  // X-Attachment-Name — кастомный заголовок POST /api/upload-file (имя файла для форс-скачивания).
+  // Без него в нативе (кросс-доменный запрос, tauri://localhost → прод-API) CORS-preflight не
+  // пропускал бы заголовок → реальный POST блокировался браузером ещё до отправки («ошибка загрузки»
+  // на любой файл). В вебе не всплывало — там same-origin через Caddy, CORS не участвует вовсе.
+  res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Attachment-Name');
   res.header('Access-Control-Max-Age', '600');
   if (req.method === 'OPTIONS') return allowed ? res.sendStatus(204) : res.sendStatus(403);
   next();
@@ -136,9 +74,6 @@ const jsonSmall = express.json({ limit: '32kb' });
 const jsonDiag = express.json({ limit: DIAG_MAX_BODY });
 const jsonRelease = express.json({ limit: '512kb' });
 app.use((req, res, next) => {
-  // Body-parser can reject a diagnostic upload before route middleware runs. Mark the response at
-  // parser entry so even malformed/oversized reports remain non-cacheable.
-  if (req.path === '/api/diag/voice') res.setHeader('Cache-Control', 'no-store');
   const parser = req.path === '/api/diag/session'
     ? jsonDiag
     : (req.path.startsWith('/internal/releases/') ? jsonRelease : jsonSmall);
@@ -211,8 +146,6 @@ const SEVENTV_DIR = path.join(DATA_DIR, '7tv');
 const SEVENTV_MAX_FILES = 20000;
 const SEVENTV_MAX_TOTAL_BYTES = 500 * 1024 * 1024; // ~500 МБ
 const SEVENTV_MAX_UPSTREAM = 2 * 1024 * 1024; // отсечка патологически крупной анимации (защита egress VPS)
-const SEVENTV_MAX_GLOBAL_JSON = 4 * 1024 * 1024;
-const SEVENTV_MAX_SEARCH_JSON = 512 * 1024;
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
 try { fs.mkdirSync(UPLOADS_DIR, { recursive: true }); } catch (e) {}
 try { fs.mkdirSync(RELEASES_DIR, { recursive: true }); } catch (e) {}
@@ -303,12 +236,8 @@ CREATE TABLE IF NOT EXISTS voice_channels(
 CREATE TABLE IF NOT EXISTS push_subs(
   endpoint TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
-  session_id TEXT NOT NULL DEFAULT '',
   p256dh TEXT NOT NULL,
   auth TEXT NOT NULL,
-  privacy TEXT NOT NULL DEFAULT 'hidden',
-  mention INTEGER NOT NULL DEFAULT 1,
-  stream INTEGER NOT NULL DEFAULT 1,
   created INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS push_prefs(
@@ -342,11 +271,6 @@ CREATE TABLE IF NOT EXISTS read_state(
   last_read INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(user_id, server_id)
 );
-CREATE TABLE IF NOT EXISTS chat_revisions(
-  server_id TEXT PRIMARY KEY,
-  revision INTEGER NOT NULL DEFAULT 0,
-  last_clear_revision INTEGER NOT NULL DEFAULT 0
-);
 CREATE TABLE IF NOT EXISTS auth_runtime_revocations(
   user_id TEXT PRIMARY KEY,
   username TEXT NOT NULL,
@@ -376,20 +300,8 @@ CREATE INDEX IF NOT EXISTS idx_roles_server ON roles(server_id);
 CREATE INDEX IF NOT EXISTS idx_mroles ON member_roles(server_id, user_id);
 `);
 const voiceLeases = createVoiceLeaseStore(db);
-const voiceMediaRevocations = createVoiceMediaRevocationStore(db);
-const serverVolumeSettings = createServerVolumeSettingsStore(db);
-const voiceDiagnostics = createVoiceDiagnosticsStore(db);
-try { voiceDiagnostics.prune(); } catch { console.error('[voice-diag] initial prune failed'); }
-const voiceDiagnosticsPruneTimer = setInterval(() => {
-  try { voiceDiagnostics.prune(); }
-  catch { console.error('[voice-diag] prune failed'); }
-}, 10 * 60_000);
-voiceDiagnosticsPruneTimer.unref?.();
 installReleaseSchema(db);
 installAuthSchema(db);
-installPersistentSessionSchema(db);
-const voiceAuthSubjectCodec = createVoiceAuthSubjectCodec(SESSION_SECRET);
-const voiceAuthTargets = createVoiceAuthTargetRegistry(db, voiceMediaRevocations);
 installRuntimeRevocationSchema(db);
 
 /* add new columns to pre-existing DBs (idempotent — throws if column exists) */
@@ -410,10 +322,7 @@ for (const sql of [
   "ALTER TABLE messages ADD COLUMN meta TEXT NOT NULL DEFAULT ''",           // JSON доп-данных сообщения (для levelup: {level})
   "ALTER TABLE auth_runtime_revocations ADD COLUMN revoked_before_version INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE uploads ADD COLUMN released INTEGER NOT NULL DEFAULT 0",      // строка живёт после удаления файла — по ней считается суточная квота
-  "ALTER TABLE push_subs ADD COLUMN session_id TEXT NOT NULL DEFAULT ''",
 ]) { try { db.exec(sql); } catch (e) { /* column already exists */ } }
-installPushSubscriptionPrivacySchema(db);
-try { db.exec('CREATE INDEX IF NOT EXISTS idx_push_session ON push_subs(user_id,session_id)'); } catch (e) { /**/ }
 
 // Старые версии могли хранить внешний provider-id вместо локального upload URL.
 // После миграции разрешены только файлы из /api/uploads; очищаем лишь этот legacy-префикс.
@@ -447,11 +356,6 @@ try { db.prepare("UPDATE users SET is_admin=1 WHERE username=?").run('denis'); }
 try { db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_ckey ON messages(server_id, user_id, client_key) WHERE client_key <> ''"); } catch (e) {}
 // memberships PK = (user_id, server_id) → выборка по server_id (appOpenMembers, memberCount — часто в /me/presence) сканировала бы; индекс по server_id ускоряет.
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_mem_server ON memberships(server_id)"); } catch (e) {}
-try { db.exec(`CREATE TABLE IF NOT EXISTS chat_revisions(
-  server_id TEXT PRIMARY KEY,
-  revision INTEGER NOT NULL DEFAULT 0,
-  last_clear_revision INTEGER NOT NULL DEFAULT 0
-)`); } catch (e) {}
 // Реакции 7TV на сообщения: (сервер, сообщение, эмоут, юзер) — уникальны (один юзер = одна реакция этим эмоутом).
 try {
   db.exec(`CREATE TABLE IF NOT EXISTS reactions(
@@ -502,7 +406,6 @@ function hashColor(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 3
 const UNAME = /^[a-zA-Z0-9_]{3,20}$/;
 const norm = u => String(u || '').trim().toLowerCase();
 let authManager = null;
-let persistentSessions = null;
 
 function bearerToken(req) {
   const header = req.headers.authorization || '';
@@ -526,14 +429,7 @@ function sendAuthError(res, error) {
 
 function authRoute(handler) {
   return (req, res, next) => Promise.resolve().then(() => handler(req, res, next)).catch((error) => {
-    if (error instanceof AuthError || error instanceof PersistentSessionError) return sendAuthError(res, error);
-    return next(error);
-  });
-}
-
-function persistentAuthRoute(handler) {
-  return (req, res, next) => Promise.resolve().then(() => handler(req, res, next)).catch((error) => {
-    if (error instanceof PersistentSessionError || error instanceof AuthError) return sendAuthError(res, error);
+    if (error instanceof AuthError) return sendAuthError(res, error);
     return next(error);
   });
 }
@@ -555,7 +451,6 @@ function requireSession(req, res, next) {
     const context = authManager.verifySession(bearerToken(req));
     req.user = context.user;
     req.authState = context.state;
-    req.authPayload = context.payload;
     return next();
   } catch (error) {
     if (error instanceof AuthError) return sendAuthError(res, error);
@@ -569,7 +464,6 @@ function requireAuth(req, res, next) {
     const context = authManager.verifySession(bearerToken(req), { requireVerified: true });
     req.user = context.user;
     req.authState = context.state;
-    req.authPayload = context.payload;
     return next();
   } catch (error) {
     if (error instanceof AuthError) return sendAuthError(res, error);
@@ -586,21 +480,6 @@ function requireAdmin(req, res, next) {
     }
     return next();
   });
-}
-// Voice diagnostics intentionally have a narrower audience than normal moderation data. They do
-// not contain media/chat/credentials, but do describe a user's client and call state in detail.
-function requireDiagnosticsAdmin(req, res, next) {
-  return requireAuth(req, res, (error) => {
-    if (error) return next(error);
-    if (!isVoiceDiagnosticsAdmin(req.user, BOOTSTRAP_ADMIN)) {
-      return res.status(403).json({ error: { code: 'DIAGNOSTICS_ADMIN_ONLY', message: 'Диагностика доступна только владельцу.' } });
-    }
-    return next();
-  });
-}
-function noStoreResponse(req, res, next) {
-  res.setHeader('Cache-Control', 'no-store');
-  return next();
 }
 const rsc = new RoomServiceClient(WS_URL.replace('wss://', 'https://'), KEY, SECRET);
 // LiveKit identity = `username#<nonce>` (уникально на сессию — иначе второй девайс кикает первого).
@@ -712,8 +591,8 @@ let VAPID = null;
   } catch (e) { console.warn('Web Push отключён:', e.message); }
 })();
 
-// Разослать web-push набору user_id. Тип и приватность фильтруются на каждой подписке отдельно:
-// телефон и браузер могут иметь противоположные настройки. Протухшие подписки (404/410) удаляем.
+// Разослать web-push набору user_id. kind фильтруется по push_prefs (юзер мог выключить тип);
+// отсутствие строки prefs = дефолт «всё включено». Протухшие подписки (404/410) удаляем.
 async function pushToUsers(kind, userIds, payload) {
   if (!VAPID || !userIds || !userIds.length) return;
   const ids = [...new Set(userIds.filter(Boolean))];
@@ -722,8 +601,9 @@ async function pushToUsers(kind, userIds, payload) {
   const prefCol = kind === 'stream' ? 'stream' : 'mention';
   const rows = db.prepare(
     `SELECT s.* FROM push_subs s WHERE s.user_id IN (${ph}) ` +
-    `AND s.${prefCol}=1`
+    `AND NOT EXISTS (SELECT 1 FROM push_prefs p WHERE p.user_id=s.user_id AND p.${prefCol}=0)`
   ).all(...ids);
+  const body = JSON.stringify(payload);
   // urgency:'high' — КРИТИЧНО для мгновенной доставки: без него push-сервисы (FCM/APNs/Mozilla)
   // считают уведомление низкоприоритетным и БАТЧАТ его (доставка минутами, особенно на спящем
   // мобильном) → симптом «приходят не сразу». high → FCM high priority / APNs apns-priority:10.
@@ -733,7 +613,6 @@ async function pushToUsers(kind, userIds, payload) {
   // и зависший push-endpoint держал бы сокет и промис неограниченно долго.
   const opts = { TTL: 86400, urgency: 'high', timeout: 10000 };
   await Promise.all(rows.map(async (r) => {
-    const body = JSON.stringify(pushPayloadForSubscription(payload, r.privacy));
     try { await VAPID.webpush.sendNotification({ endpoint: r.endpoint, keys: { p256dh: r.p256dh, auth: r.auth } }, body, opts); }
     catch (e) { if (e && (e.statusCode === 404 || e.statusCode === 410)) db.prepare('DELETE FROM push_subs WHERE endpoint=?').run(r.endpoint); }
   }));
@@ -766,42 +645,14 @@ function serverMembersFull(sid) {
 // (веб-push бьёт только по свёрнутому/закрытому; натив web-push не получает вообще). Карта
 // user_id → набор живых ws-соединений (несколько устройств/вкладок). Заполняется в WS-setup внизу.
 const notifyConns = new Map();
-const MAX_NOTIFY_SOCKETS_PER_ACCOUNT = 8;
 function notifyUser(userId, payload) {
   const set = notifyConns.get(userId);
   if (!set || !set.size) return;
-  sendBoundedNotifyFrames(set, payload);
+  const data = JSON.stringify(payload);
+  for (const ws of set) { if (ws.readyState === 1 /* OPEN */) { try { ws.send(data); } catch (e) { /**/ } } }
 }
-function notifyServerMembers(serverId, payload, { legacyChatOnly = false } = {}) {
-  for (const row of db.prepare('SELECT user_id FROM memberships WHERE server_id=?').all(serverId)) {
-    if (!legacyChatOnly) { notifyUser(row.user_id, payload); continue; }
-    const sockets = notifyConns.get(row.user_id);
-    if (!sockets || !sockets.size) continue;
-    sendBoundedNotifyFrames([...sockets].filter((ws) => legacyChatSocketEligible(ws, serverId)), payload);
-  }
-}
-const legacyChatRefreshBridge = createLegacyChatRefreshBridge({
-  notifyServer: (serverId, payload) => notifyServerMembers(serverId, payload, { legacyChatOnly: true }),
-});
-function scheduleLegacyChatRefresh(req, serverId) {
-  if (!isCanonicalChatRequest(req && req.headers)) return false;
-  return legacyChatRefreshBridge.enqueue(serverId);
-}
-const _chatMemberIdsStmt = db.prepare('SELECT user_id FROM memberships WHERE server_id=?');
-const chatRealtime = createChatRealtimeFanout({
-  // Resolve membership at dispatch time. A socket authenticated before a kick remains a valid
-  // account socket, but it must never receive later events from the server it left.
-  currentMemberIds: (serverId) => _chatMemberIdsStmt.all(serverId).map((row) => row.user_id),
-  socketsForUser: (userId) => notifyConns.get(userId),
-  isCurrentMember: (userId, serverId) => isMember(userId, serverId),
-});
-const chatMutationLimiter = createChatRateLimiter();
-function allowChatMutation(req, res, action, options) {
-  const result = chatMutationLimiter.consume(req.user.id, action, Date.now(), options);
-  if (result.allowed) return true;
-  res.setHeader('Retry-After', String(result.retryAfterSeconds));
-  res.status(429).json({ error: 'Слишком много действий в чате', retryAfter: result.retryAfterSeconds });
-  return false;
+function notifyServerMembers(serverId, payload) {
+  for (const row of db.prepare('SELECT user_id FROM memberships WHERE server_id=?').all(serverId)) notifyUser(row.user_id, payload);
 }
 function serverName(sid) { const s = db.prepare('SELECT name FROM servers WHERE id=?').get(sid); return s ? s.name : 'Сервер'; }
 
@@ -843,100 +694,6 @@ function publicAccountState(state) {
 
 function sessionPayload(user, state = authManager.sessionState(user)) {
   return { user: ownUser(user), account: publicAccountState(state) };
-}
-
-function requestedPersistentTransport(req, { bootstrap = false } = {}) {
-  if (!persistentSessions) {
-    throw new PersistentSessionError(503, 'AUTH_STARTING', 'Авторизация запускается. Попробуйте ещё раз.');
-  }
-  return transportRequest(req, {
-    webOrigins: persistentWebOrigins,
-    nativeOrigins: persistentNativeOrigins,
-    bootstrap,
-  });
-}
-
-function limitPersistentSessionRequest(req, action, credential, options) {
-  persistentSessions.checkRate(`${action}-ip`, req.ip, options.ip);
-  const subject = persistentSessionRateSubject(credential, { allowOpaque: options.allowOpaqueCredential === true });
-  if (subject) persistentSessions.checkRate(`${action}-session`, subject, options.session);
-}
-
-function requireCurrentPersistentTransport(req, transport) {
-  const currentSessionId = req.authPayload && req.authPayload.sid;
-  if (!currentSessionId) {
-    throw new PersistentSessionError(409, 'SESSION_MISMATCH', 'Текущая сессия не поддерживает это защитное действие. Повторите вход.');
-  }
-  if (transport.kind === 'web') {
-    const parsed = parseRefreshToken(transport.refreshToken);
-    if (!parsed || parsed.sessionId !== currentSessionId) {
-      throw new PersistentSessionError(409, 'SESSION_MISMATCH', 'Сессия браузера изменилась. Повторите действие.');
-    }
-  }
-}
-
-function sendPersistentSession(res, transport, bundle, user, state, extra = {}) {
-  if (transport.kind === 'web') {
-    res.setHeader('Set-Cookie', webSessionCookieHeaders(bundle.refreshToken, bundle.csrfToken));
-  }
-  res.setHeader('Cache-Control', 'no-store');
-  return res.json({
-    protocol: 'persistent-v1',
-    token: bundle.accessToken,
-    accessToken: bundle.accessToken,
-    accessExpiresAt: bundle.accessExpiresAt,
-    sessionId: bundle.sessionId,
-    csrfToken: transport.kind === 'web' ? bundle.csrfToken : undefined,
-    refreshToken: transport.kind === 'native' ? bundle.refreshToken : undefined,
-    ...sessionPayload(user, state),
-    ...extra,
-  });
-}
-
-function createPersistentLogin(req, res, transport, user, extra = {}) {
-  const bundle = persistentSessions.create(user, {
-    clientKind: transport.kind,
-    deviceName: req.body && req.body.deviceName,
-  });
-  return sendPersistentSession(res, transport, bundle, user, authManager.sessionState(user), extra);
-}
-
-function unchangedSecurityUser(userId, expectedSessionVersion) {
-  const user = db.prepare('SELECT * FROM users WHERE id=?').get(userId);
-  if (!user || (Number(user.session_version) || 0) !== Number(expectedSessionVersion)) {
-    throw new AuthError(401, 'SESSION_REVOKED', 'Сессия завершена другим защитным действием. Войдите снова.');
-  }
-  return user;
-}
-
-function closePersistentRealtimeSession(sessionId) {
-  const wanted = String(sessionId || '');
-  if (!wanted) return;
-  for (const sockets of notifyConns.values()) for (const ws of [...sockets]) {
-    if (ws._authSessionId !== wanted) continue;
-    try { ws.close(4001, 'session revoked'); }
-    catch { try { ws.terminate(); } catch { /**/ } }
-  }
-  try { treeSrv.revokeAuthSession(wanted); } catch { /** Server may still be starting. */ }
-}
-
-function closeLegacyRealtimeSession(tokenHash) {
-  const wanted = String(tokenHash || '');
-  if (!wanted) return;
-  for (const sockets of notifyConns.values()) for (const ws of [...sockets]) {
-    if (ws._authLegacyTokenHash !== wanted) continue;
-    try { ws.close(4001, 'session revoked'); }
-    catch { try { ws.terminate(); } catch { /**/ } }
-  }
-  try { treeSrv.revokeLegacySession(wanted); } catch { /** Server may still be starting. */ }
-}
-function closePersistentLogoutRealtime(logoutSubject) {
-  if (!logoutSubject) return;
-  closePersistentRealtimeSession(logoutSubject.sessionId);
-  // A rolling-upgraded device can still have an already-open socket authenticated by the exact
-  // legacy bearer that created this persistent row. Its hash is device-specific and tombstoned by
-  // the same logout transaction, so closing it cannot disconnect another device of the account.
-  if (logoutSubject.legacyTokenHash) closeLegacyRealtimeSession(logoutSubject.legacyTokenHash);
 }
 // Имена всегда выпускает наш upload route: 12 random bytes + расширение из проверенного MIME.
 // Узкий regexp не пропускает `..`, произвольные имена и не-image расширения в профили/чат.
@@ -991,20 +748,14 @@ function memberCount(sid) { return db.prepare('SELECT COUNT(*) c FROM membership
 // Полный каскад-снос сервера (все связанные таблицы по server_id). Имена таблиц — литералы, не ввод.
 function purgeServer(sid) {
   invalidateVoiceLeasesForServer(sid, 'server-deleted');
-  try {
-    for (const { id } of db.prepare('SELECT id FROM voice_channels WHERE server_id=?').all(sid)) {
-      void revokeVoiceMediaChannel(sid, id).catch(() => {});
-    }
-  } catch (e) { /**/ }
   evictRoomParticipants(sid);
-  treeSrv?.revokeServer(sid);
   // Ссылки на файлы снимаем ДО удаления сообщений — потом их уже негде взять. Сама уборка идёт
   // после сноса записей: пока сообщения живы, файл считается используемым.
   const orphaned = uploadUrlsOfMessageRows(selectMessageUploadRows('server_id=?', sid));
   const icon = db.prepare('SELECT icon_url FROM servers WHERE id=?').get(sid)?.icon_url;
   if (icon) orphaned.push(icon);
   // reactions и user_stats раньше не чистились вовсе — записи удалённого сервера копились навсегда.
-  for (const t of ['memberships', 'invites', 'server_settings', 'roles', 'member_roles', 'messages', 'voice_channels', 'read_state', 'deploy_release_targets', 'reactions', 'user_stats', 'chat_revisions']) {
+  for (const t of ['memberships', 'invites', 'server_settings', 'roles', 'member_roles', 'messages', 'voice_channels', 'read_state', 'deploy_release_targets', 'reactions', 'user_stats']) {
     try { db.prepare(`DELETE FROM ${t} WHERE server_id=?`).run(sid); } catch (e) { /* таблицы-миграции могло не быть */ }
   }
   db.prepare('DELETE FROM servers WHERE id=?').run(sid);
@@ -1014,11 +765,6 @@ function purgeServer(sid) {
 function purgeUser(uid) {
   const account = db.prepare('SELECT username FROM users WHERE id=?').get(uid);
   const joinedServers = db.prepare('SELECT server_id FROM memberships WHERE user_id=?').all(uid).map(row => row.server_id);
-  const ownedServerIds = new Set(db.prepare('SELECT id FROM servers WHERE owner_id=?').all(uid).map((row) => row.id));
-  const affectedChatServers = db.prepare(`SELECT server_id FROM messages WHERE user_id=?
-    UNION SELECT server_id FROM reactions WHERE user_id=?`).all(uid, uid)
-    .map((row) => row.server_id)
-    .filter((serverId) => !ownedServerIds.has(serverId));
   if (account) {
     // The version bump atomically snapshots exact LiveKit rooms and clears push/voice state.
     db.prepare('UPDATE users SET session_version=session_version+1 WHERE id=?').run(uid);
@@ -1026,7 +772,7 @@ function purgeUser(uid) {
   }
   invalidateVoiceLease(uid, () => true, 'account-deleted');
   if (account) for (const serverId of joinedServers) evictUserFromRoom(serverId, account.username);
-  for (const serverId of ownedServerIds) purgeServer(serverId);
+  for (const s of db.prepare('SELECT id FROM servers WHERE owner_id=?').all(uid)) purgeServer(s.id);
   // Файлы аккаунта: его сообщения, аватар, фон профиля и всё, что он успел загрузить, но не
   // отправить. Реальное удаление — отложенное (queueUploadRelease): часть может быть процитирована
   // в чужих сообщениях, такие файлы остаются.
@@ -1034,32 +780,12 @@ function purgeUser(uid) {
   const profile = db.prepare('SELECT avatar_url, profile_banner_url FROM users WHERE id=?').get(uid);
   if (profile) { if (profile.avatar_url) orphaned.push(profile.avatar_url); if (profile.profile_banner_url) orphaned.push(profile.profile_banner_url); }
   try { for (const row of db.prepare('SELECT url FROM uploads WHERE user_id=?').all(uid)) orphaned.push(row.url); } catch (e) { /**/ }
-  // Chat state and every affected surviving server revision change atomically. This also covers
-  // reactions the account left in servers it had already left; otherwise open clients retain
-  // ghost messages/counts without observing a revision gap.
-  const purgeAccountChat = db.transaction(() => {
-    db.prepare('DELETE FROM reactions WHERE msg_id IN (SELECT id FROM messages WHERE user_id=?)').run(uid);
-    db.prepare('DELETE FROM messages WHERE user_id=?').run(uid);
-    db.prepare('DELETE FROM reactions WHERE user_id=?').run(uid);
-    for (const table of ['memberships', 'member_roles', 'server_settings', 'read_state']) {
-      db.prepare(`DELETE FROM ${table} WHERE user_id=?`).run(uid);
-    }
-    const revised = [];
-    for (const serverId of affectedChatServers) {
-      if (!db.prepare('SELECT 1 FROM servers WHERE id=?').get(serverId)) continue;
-      revised.push({ serverId, revision: bumpChatRevision(serverId) });
-    }
-    return revised;
-  });
-  const revisedChatServers = purgeAccountChat();
-  for (const { serverId } of revisedChatServers) chatRealtime.broadcast(serverId, () => null);
+  for (const t of ['memberships', 'member_roles', 'server_settings', 'messages', 'read_state']) db.prepare(`DELETE FROM ${t} WHERE user_id=?`).run(uid);
   // reactions, user_stats и profile_banner_uploads раньше переживали удаление аккаунта.
-  for (const t of ['user_settings', 'push_subs', 'push_prefs', 'user_stats', 'profile_banner_uploads']) {
+  for (const t of ['user_settings', 'push_subs', 'push_prefs', 'reactions', 'user_stats', 'profile_banner_uploads']) {
     try { db.prepare(`DELETE FROM ${t} WHERE user_id=?`).run(uid); } catch (e) { /* таблицы-миграции могло не быть */ }
   }
   if (authManager) authManager.purgeUser(uid);
-  if (persistentSessions) persistentSessions.purgeUser(uid);
-  voiceDiagnostics.purgeUser(uid);
   db.prepare('DELETE FROM voice_session_intents WHERE user_id=?').run(uid);
   db.prepare('DELETE FROM voice_user_intents WHERE user_id=?').run(uid);
   db.prepare('DELETE FROM voice_leases WHERE user_id=?').run(uid);
@@ -1070,29 +796,27 @@ function purgeUser(uid) {
   queueUploadRelease(orphaned);
 }
 
-function closeLocalRuntimeSessions(userId, username, reason, preservedSessionId = '') {
+function closeLocalRuntimeSessions(userId, username, reason) {
   const sockets = notifyConns.get(userId);
   if (sockets) {
     for (const ws of [...sockets]) {
-      if (preservedSessionId && ws._authSessionId === preservedSessionId) continue;
       try { ws.close(4001, reason); } catch { try { ws.terminate(); } catch { /* noop */ } }
     }
   }
   if (treeSrv && treeSrv.peers) {
     for (const peer of treeSrv.peers.values()) {
       if (peer.ws && (peer.ws.__uid === userId || peer.ws.__uid === username)) {
-        if (preservedSessionId && peer.ws.__authSessionId === preservedSessionId) continue;
         try { peer.ws.close(4001, reason); } catch { try { peer.ws.terminate(); } catch { /* noop */ } }
       }
     }
   }
 }
 
-async function revokeRuntimeSessions(userId, username, reason = 'session-revoked', preservedSessionId = '') {
+async function revokeRuntimeSessions(userId, username, reason = 'session-revoked') {
   // The users.session_version trigger has already persisted exact room targets and revoked push/
   // voice state in the same transaction as the account mutation. This function only closes local
   // sockets and drains that durable queue; it must never reconstruct or bulk-delete targets.
-  closeLocalRuntimeSessions(userId, username, reason, preservedSessionId);
+  closeLocalRuntimeSessions(userId, username, reason);
   await drainRuntimeRevocation(userId);
 }
 // Непрочитанные: только пользовательские сообщения новее last_read и не свои. Release-патчноут
@@ -1126,10 +850,6 @@ function permsOf(uid, sid) {
   return rows.reduce((a, r) => a | (r.p || 0), 0);
 }
 const can = (uid, sid, perm) => (permsOf(uid, sid) & perm) === perm;
-// Управляющий ролями не может выдать себе или другому участнику права,
-// которых нет у него самого. Владелец сервера остаётся единственным полным
-// администратором и может настраивать весь набор разрешений.
-const canGrantPerms = (uid, sid, permissions) => isOwner(uid, sid) || (permsOf(uid, sid) & permissions) === permissions;
 const pubRole = r => ({ id: r.id, name: r.name, color: r.color || '', permissions: r.permissions || 0, position: r.position || 0 });
 function rolesOfServer(sid) { return db.prepare('SELECT * FROM roles WHERE server_id=? ORDER BY position DESC, created ASC').all(sid).map(pubRole); }
 function rolesOfMember(sid, uid) { return db.prepare('SELECT r.* FROM member_roles mr JOIN roles r ON r.id=mr.role_id WHERE mr.server_id=? AND mr.user_id=? ORDER BY r.position DESC').all(sid, uid).map(pubRole); }
@@ -1146,113 +866,8 @@ function ensureDefaultChannel(sid) {
 /* ---- authoritative voice ownership (one device/session per account) ---- */
 const VOICE_SESSION_RE = /^[A-Za-z0-9._:~-]{1,128}$/;
 const VOICE_RESOURCE_RE = /^[A-Za-z0-9_-]{1,96}$/;
-const HUB_TOKEN_TTL_MS = 10 * 60 * 1000;
-const VOICE_MEDIA_TOKEN_TTL_MS = 2 * 60 * 1000;
 const voiceClaimQueues = new Map();
 const pendingVoiceEvictions = new Map();
-const voiceTokenMintLimiter = createVoiceTokenMintLimiter();
-function persistentVoiceAuthContext(userId, sessionId) {
-  const row = db.prepare(`SELECT id,user_id,legacy_token_hash,revoked_at
-    FROM auth_sessions WHERE id=?`).get(String(sessionId || ''));
-  if (!row || row.user_id !== String(userId || '')) return null;
-  const authSubject = row.legacy_token_hash
-    ? voiceAuthSubjectCodec.legacy(row.user_id, row.legacy_token_hash)
-    : voiceAuthSubjectCodec.persistent(row.user_id, row.id);
-  return {
-    authSubject,
-    authKind: 'persistent',
-    authKey: row.id,
-    userId: row.user_id,
-    revoked: Boolean(row.revoked_at),
-  };
-}
-function requestVoiceAuthContext(req, verified = null) {
-  if (!persistentSessions) return null;
-  const user = verified?.user || req.user;
-  const payload = verified?.payload || req.authPayload;
-  if (!user || !payload) return null;
-  if (payload.sid) return persistentVoiceAuthContext(user.id, payload.sid);
-  const tokenHash = persistentSessions.legacyTokenKey(bearerToken(req));
-  if (!tokenHash) return null;
-  return {
-    authSubject: voiceAuthSubjectCodec.legacy(user.id, tokenHash),
-    authKind: 'legacy',
-    authKey: tokenHash,
-    userId: user.id,
-    revoked: false,
-  };
-}
-function requestVoiceAuthStillCurrent(req, expected) {
-  if (!authManager || !expected || expected.revoked) return false;
-  try {
-    const verified = authManager.verifySession(bearerToken(req), { requireVerified: true });
-    const current = requestVoiceAuthContext(req, verified);
-    return !!current && !current.revoked
-      && current.userId === expected.userId
-      && current.authKind === expected.authKind
-      && current.authKey === expected.authKey
-      && current.authSubject === expected.authSubject;
-  } catch { return false; }
-}
-function voiceSessionOwnedByRequest(req, sessionId) {
-  const context = requestVoiceAuthContext(req);
-  return !!context && !context.revoked
-    && voiceSessionMatchesSubject(sessionId, context.authSubject);
-}
-function registerVoiceAuthTarget(req, context, room, identity, tokenTtlMs) {
-  const issued = Date.now();
-  try {
-    const result = voiceAuthTargets.register({
-      ...context,
-      room,
-      identity,
-      issued,
-      tokenExpires: issued + tokenTtlMs,
-    }, () => requestVoiceAuthStillCurrent(req, context));
-    if (result.evicted > 0) setImmediate(() => { void voiceMediaRevocationWorker.retryDue(); });
-    return true;
-  } catch (error) {
-    if (error instanceof VoiceAuthRevokedError) return false;
-    throw error;
-  }
-}
-function releaseVoiceLeaseForAuthSubject(userId, authSubject) {
-  const result = releaseExactVoiceLease(voiceLeases, userId, authSubject);
-  if (!result) return null;
-  const username = db.prepare('SELECT username FROM users WHERE id=?').get(userId)?.username;
-  if (username) {
-    voiceMediaRevocations.enqueueParticipant(
-      voiceMediaRoomName(result.previousLease.serverId, result.previousLease.channelId),
-      voiceMediaIdentity(username, result.previousLease.sessionId, result.previousLease.epoch),
-      Date.now(),
-      { authSubject },
-    );
-  }
-  return result;
-}
-function releaseVoiceLeaseForPersistentLogout(logoutSubject) {
-  if (!logoutSubject?.userId || !logoutSubject?.sessionId) return null;
-  const context = persistentVoiceAuthContext(logoutSubject.userId, logoutSubject.sessionId);
-  return context ? {
-    authSubject: context.authSubject,
-    released: releaseVoiceLeaseForAuthSubject(context.userId, context.authSubject),
-  } : null;
-}
-function finishExactVoiceLogout(userId, released, authSubject = '') {
-  if (released) notifyUser(userId, voiceLeaseEvent(released.released, 'session-logout'));
-  // The exact outbox rows were committed with auth revocation. Logout response latency never
-  // depends on LiveKit; this eager pass merely shortens the normal 15-second retry interval.
-  const username = db.prepare('SELECT username FROM users WHERE id=?').get(userId)?.username || '';
-  setImmediate(() => {
-    if (username && authSubject) {
-      void voiceMediaRevocationWorker.retryDueForVoiceSession(
-        username, authSubject, Date.now(), 1000,
-      );
-      return;
-    }
-    void voiceMediaRevocationWorker.retryDue();
-  });
-}
 function leaseResponse(state, reason) {
   return { ok: true, ...voiceLeaseEvent(state, reason) };
 }
@@ -1266,13 +881,8 @@ function serializeVoiceClaim(userId, task) {
 function invalidateVoiceLease(userId, predicate, reason = 'revoked') {
   const state = voiceLeases.read(userId);
   if (!state.lease || (predicate && !predicate(state.lease))) return state;
-  const previousLease = state.lease;
-  const released = voiceLeases.release(userId, previousLease.sessionId, previousLease.epoch);
-  if (released.released) {
-    notifyUser(userId, voiceLeaseEvent(released, reason));
-    const username = db.prepare('SELECT username FROM users WHERE id=?').get(userId)?.username;
-    if (username) void revokeVoiceMediaLease(username, previousLease).catch(() => {});
-  }
+  const released = voiceLeases.release(userId, state.lease.sessionId, state.lease.epoch);
+  if (released.released) notifyUser(userId, voiceLeaseEvent(released, reason));
   return released;
 }
 function invalidateVoiceLeasesForServer(serverId, reason = 'server-revoked') {
@@ -1289,66 +899,6 @@ function liveKitResourceMissing(error) {
   const message = String(error && error.message || '').toLowerCase();
   return status === 404 || code === 'not_found' || code === 'not-found' || code === '5'
     || /(?:room|participant|resource).*(?:not found|does not exist)/u.test(message);
-}
-const VOICE_MEDIA_RPC_TIMEOUT_MS = 2500;
-const VOICE_MEDIA_DRAIN_TIMEOUT_MS = DEFAULT_USERNAME_DRAIN_TIMEOUT_MS;
-const voiceMediaRevocationWorker = createVoiceMediaRevocationWorker({
-  store: voiceMediaRevocations,
-  removeParticipant: ({ room, identity, revokeTokenTs = 0 }) => withTimeout(
-    removeVoiceMediaParticipant(rsc, room, identity, Date.now(), revokeTokenTs),
-    VOICE_MEDIA_RPC_TIMEOUT_MS,
-    'removeVoiceMediaParticipant',
-  ),
-  // A room-delete target is enough even after channel/server rows disappear: deleteRoom ejects
-  // updated participants, while any reconnect uses the token's initial-deny grant and exact
-  // activation can no longer pass for the deleted resource.
-  deleteRoom: ({ room }) => withTimeout(rsc.deleteRoom(room), VOICE_MEDIA_RPC_TIMEOUT_MS, 'deleteVoiceMediaRoom'),
-  isMissing: liveKitResourceMissing,
-});
-function scheduleVoiceMediaRemoval(room, identity) {
-  return voiceMediaRevocationWorker.scheduleParticipant(room, identity);
-}
-function scheduleVoiceMediaRoomDeletion(room) {
-  return voiceMediaRevocationWorker.scheduleRoom(room);
-}
-setImmediate(() => { void voiceMediaRevocationWorker.retryDue(); });
-setInterval(() => { void voiceMediaRevocationWorker.retryDue(); }, 15_000).unref?.();
-function revokeVoiceMediaLease(username, lease) {
-  if (!username || !lease) return Promise.resolve();
-  return scheduleVoiceMediaRemoval(
-    voiceMediaRoomName(lease.serverId, lease.channelId),
-    voiceMediaIdentity(username, lease.sessionId, lease.epoch),
-  );
-}
-async function evictUserFromVoiceMedia(serverId, username, revokedBeforeVersion = null) {
-  if (!serverId || !username) return;
-  const channels = db.prepare('SELECT id FROM voice_channels WHERE server_id=?').all(serverId);
-  const listed = await Promise.all(channels.map(async ({ id }) => {
-    const room = voiceMediaRoomName(serverId, id);
-    try {
-      return { room, participants: await withTimeout(rsc.listParticipants(room), 2500, 'listVoiceMediaParticipants') };
-    } catch (error) {
-      if (liveKitResourceMissing(error)) return { room, participants: [] };
-      throw error;
-    }
-  }));
-  const removals = [];
-  for (const result of listed) {
-    for (const participant of result.participants) {
-      if (baseIdentity(participant.identity) !== username) continue;
-      if (revokedBeforeVersion !== null) {
-        const version = liveKitSessionVersion(participant.identity, username);
-        if (version !== null && version >= revokedBeforeVersion) continue;
-      }
-      removals.push(scheduleVoiceMediaRemoval(result.room, participant.identity));
-    }
-  }
-  await Promise.all(removals.map((removal) => withTimeout(removal, 2500, 'removeVoiceMediaParticipant')));
-}
-function revokeVoiceMediaChannel(serverId, channelId) {
-  // The durable room target is self-contained: channel/server rows may be deleted immediately
-  // after this synchronous enqueue, while retries still retain the exact LiveKit room name.
-  return scheduleVoiceMediaRoomDeletion(voiceMediaRoomName(serverId, channelId));
 }
 function liveKitSessionVersion(identity, username) {
   const value = String(identity || '');
@@ -1383,10 +933,7 @@ async function evictRoomParticipantsAwait(serverId, username, revokedBeforeVersi
 function evictRoomParticipants(serverId, username) {
   void evictRoomParticipantsAwait(serverId, username).catch(() => { /** room may already be gone */ });
 }
-function evictUserFromRoom(serverId, username) {
-  evictRoomParticipants(serverId, username);
-  void evictUserFromVoiceMedia(serverId, username).catch(() => {});
-}
+function evictUserFromRoom(serverId, username) { evictRoomParticipants(serverId, username); }
 let runtimeRevocationRetryRunning = false;
 async function drainRuntimeRevocation(userId) {
   const item = db.prepare('SELECT * FROM auth_runtime_revocations WHERE user_id=?').get(userId);
@@ -1394,11 +941,9 @@ async function drainRuntimeRevocation(userId) {
   const targets = db.prepare(`SELECT server_id,revoked_before_version
     FROM auth_runtime_revocation_rooms WHERE user_id=?`).all(userId);
   const results = await Promise.allSettled(targets.map(async (target) => {
-    const revokedBeforeVersion = Number(target.revoked_before_version) || 0;
-    await Promise.all([
-      evictRoomParticipantsAwait(target.server_id, item.username, revokedBeforeVersion),
-      evictUserFromVoiceMedia(target.server_id, item.username, revokedBeforeVersion),
-    ]);
+    await evictRoomParticipantsAwait(
+      target.server_id, item.username, Number(target.revoked_before_version) || 0,
+    );
     db.prepare(`DELETE FROM auth_runtime_revocation_rooms
       WHERE user_id=? AND server_id=? AND revoked_before_version=?`)
       .run(userId, target.server_id, target.revoked_before_version);
@@ -1463,12 +1008,6 @@ function scheduleVoiceEviction(serverId, identity) {
   return tracked;
 }
 async function revokeOlderVoiceParticipants(userId, username, keep, previousLease) {
-  // Media-room привязан к точному lease. Даже switch в другой канал той же hub-сессии обязан
-  // закрыть прежнюю комнату и её обновлённый LiveKit-token; account JWT при этом не меняется.
-  if (previousLease && !exactVoiceLease(previousLease, keep)) {
-    try { await withTimeout(revokeVoiceMediaLease(username, previousLease), 2500, 'removeVoiceMediaParticipant'); }
-    catch (e) { /* initial-deny + exact activate не дадут старому token снова получить аудиоправа */ }
-  }
   if (previousLease && previousLease.sessionId === keep.sessionId) return;
   const ownsKeep = () => {
     const current = voiceLeases.read(userId).lease;
@@ -1547,15 +1086,8 @@ app.post('/api/voice/lease/intent', requireAuth, async (req, res, next) => {
     || !Number.isSafeInteger(clientIntent) || clientIntent < 1) {
     return res.status(400).json({ error: 'Invalid voice intent parameters' });
   }
-  const voiceAuth = requestVoiceAuthContext(req);
-  if (!voiceAuth || voiceAuth.revoked || !voiceSessionMatchesSubject(sessionId, voiceAuth.authSubject)) {
-    return res.status(409).json({ error: 'Voice session belongs to another authorization session' });
-  }
   try {
     const state = await serializeVoiceClaim(req.user.id, async () => {
-      if (!requestVoiceAuthStillCurrent(req, voiceAuth)) {
-        return { status: 401, error: 'Authorization session was revoked' };
-      }
       if (!db.prepare('SELECT 1 FROM memberships WHERE user_id=? AND server_id=?').get(req.user.id, serverId)) {
         return { status: 403, error: 'Not a server member' };
       }
@@ -1585,10 +1117,6 @@ app.post('/api/voice/lease/claim', requireAuth, async (req, res, next) => {
     || !Number.isSafeInteger(clientIntent) || clientIntent < 1
     || (ticket !== null && (!Number.isSafeInteger(ticket) || ticket < 1))) {
     return res.status(400).json({ error: 'Invalid voice lease parameters' });
-  }
-  const voiceAuth = requestVoiceAuthContext(req);
-  if (!voiceAuth || voiceAuth.revoked || !voiceSessionMatchesSubject(sessionId, voiceAuth.authSubject)) {
-    return res.status(409).json({ error: 'Voice session belongs to another authorization session' });
   }
   let requestCanceled = false;
   const markCanceled = () => { requestCanceled = true; };
@@ -1621,9 +1149,6 @@ app.post('/api/voice/lease/claim', requireAuth, async (req, res, next) => {
         return { status: 404, error: 'Voice channel not found' };
       }
       if (canceled()) return { canceled: true };
-      if (!requestVoiceAuthStillCurrent(req, voiceAuth)) {
-        return { status: 401, error: 'Authorization session was revoked' };
-      }
       const previousLease = voiceLeases.read(req.user.id).lease;
       const claimed = ticket === null
         ? voiceLeases.claim(req.user.id, { sessionId, serverId, channelId, intent: clientIntent })
@@ -1670,163 +1195,14 @@ app.post('/api/voice/lease/release', requireAuth, async (req, res, next) => {
   if (!VOICE_SESSION_RE.test(sessionId) || !Number.isSafeInteger(epoch) || epoch < 1) {
     return res.status(400).json({ error: 'Invalid voice lease parameters' });
   }
-  if (!voiceSessionOwnedByRequest(req, sessionId)) {
-    return res.status(409).json({ error: 'Voice session belongs to another authorization session' });
-  }
   try {
     const state = await serializeVoiceClaim(req.user.id, async () => {
-      const previousLease = voiceLeases.read(req.user.id).lease;
       const released = voiceLeases.release(req.user.id, sessionId, epoch);
-      if (released.released) {
-        notifyUser(req.user.id, voiceLeaseEvent(released, 'released'));
-        if (previousLease) void revokeVoiceMediaLease(req.user.username, previousLease).catch(() => {});
-      }
+      if (released.released) notifyUser(req.user.id, voiceLeaseEvent(released, 'released'));
       return released;
     });
     res.json({ ok: true, ...voiceLeaseEvent(state, state.reason), released: state.released });
   } catch (error) { next(error); }
-});
-
-function voiceMediaRequest(body) {
-  const sessionId = String(body?.sessionId || '');
-  const serverId = String(body?.serverId || '');
-  const channelId = String(body?.channelId || '');
-  const epoch = Number(body?.epoch);
-  if (!VOICE_SESSION_RE.test(sessionId) || !VOICE_RESOURCE_RE.test(serverId) || !VOICE_RESOURCE_RE.test(channelId)
-    || !Number.isSafeInteger(epoch) || epoch < 1) return null;
-  return { sessionId, serverId, channelId, epoch };
-}
-
-function voiceMediaStillAllowed(userId, params) {
-  return !!db.prepare('SELECT 1 FROM memberships WHERE user_id=? AND server_id=?').get(userId, params.serverId)
-    && !!db.prepare('SELECT 1 FROM voice_channels WHERE id=? AND server_id=?').get(params.channelId, params.serverId)
-    && exactVoiceLease(voiceLeases.read(userId).lease, params);
-}
-
-// Подготовительная фаза изоляции: token может только войти в точную media-room. Слушать и
-// публиковать он сможет лишь после отдельной exact-lease активации ниже.
-app.post('/api/voice/media-token', noStoreVoiceTokenResponse, requireAuth, async (req, res, next) => {
-  const params = voiceMediaRequest(req.body);
-  if (!params) return res.status(400).json({ error: 'Invalid voice media parameters' });
-  const voiceAuth = requestVoiceAuthContext(req);
-  if (!voiceAuth || voiceAuth.revoked || !voiceSessionMatchesSubject(params.sessionId, voiceAuth.authSubject)) {
-    return res.status(409).json({ error: 'Voice session belongs to another authorization session' });
-  }
-  try {
-    const result = await serializeVoiceClaim(req.user.id, async () => {
-      if (!db.prepare('SELECT 1 FROM memberships WHERE user_id=? AND server_id=?').get(req.user.id, params.serverId)) {
-        return { status: 403, error: 'Not a server member' };
-      }
-      if (!db.prepare('SELECT 1 FROM voice_channels WHERE id=? AND server_id=?').get(params.channelId, params.serverId)) {
-        return { status: 404, error: 'Voice channel not found' };
-      }
-      if (!exactVoiceLease(voiceLeases.read(req.user.id).lease, params)) return { status: 409, error: 'Voice lease is not current' };
-      const mintRate = voiceTokenMintLimiter.consume(req.user.id);
-      if (!mintRate.allowed) {
-        return { status: 429, error: 'Too many voice token requests', retryAfterSeconds: mintRate.retryAfterSeconds };
-      }
-      const connected = await voiceSessionConnectedOnce(params.serverId, voiceHubIdentity(req.user.username, params.sessionId));
-      if (connected !== true) return { status: connected === null ? 503 : 409, error: connected === null ? 'Voice service unavailable' : 'Voice hub session is not active' };
-      if (!voiceMediaStillAllowed(req.user.id, params)) return { status: 409, error: 'Voice lease is not current' };
-      const room = voiceMediaRoomName(params.serverId, params.channelId);
-      const identity = voiceMediaIdentity(req.user.username, params.sessionId, params.epoch);
-      const at = new AccessToken(KEY, SECRET, {
-        identity,
-        name: req.user.display_name,
-        ttl: '2m',
-        attributes: {
-          voiceServer: params.serverId,
-          voiceChannel: params.channelId,
-          voiceSession: params.sessionId,
-          voiceEpoch: String(params.epoch),
-        },
-      });
-      at.addGrant(initialVoiceMediaGrant(room));
-      const token = await at.toJwt();
-      if (!voiceMediaStillAllowed(req.user.id, params)) return { status: 409, error: 'Voice lease is not current' };
-      if (!registerVoiceAuthTarget(req, voiceAuth, room, identity, VOICE_MEDIA_TOKEN_TTL_MS)) {
-        return { status: 401, error: 'Authorization session was revoked' };
-      }
-      return { token, room, identity };
-    });
-    if (result.error) {
-      if (result.retryAfterSeconds) res.setHeader('Retry-After', String(result.retryAfterSeconds));
-      return res.status(result.status).json({ error: result.error, ...(result.retryAfterSeconds ? { retryAfter: result.retryAfterSeconds } : {}) });
-    }
-    return res.json({ ok: true, url: WS_URL, token: result.token, room: result.room, identity: result.identity, epoch: params.epoch });
-  } catch (error) { return next(error); }
-});
-
-app.post('/api/voice/media/activate', requireAuth, async (req, res, next) => {
-  const params = voiceMediaRequest(req.body);
-  if (!params) return res.status(400).json({ error: 'Invalid voice media parameters' });
-  const voiceAuth = requestVoiceAuthContext(req);
-  if (!voiceAuth || voiceAuth.revoked || !voiceSessionMatchesSubject(params.sessionId, voiceAuth.authSubject)) {
-    return res.status(409).json({ error: 'Voice session belongs to another authorization session' });
-  }
-  const room = voiceMediaRoomName(params.serverId, params.channelId);
-  const hubIdentity = voiceHubIdentity(req.user.username, params.sessionId);
-  const identity = voiceMediaIdentity(req.user.username, params.sessionId, params.epoch);
-  try {
-    const result = await serializeVoiceClaim(req.user.id, async () => {
-      if (!voiceMediaStillAllowed(req.user.id, params)) return { status: 409, error: 'Voice lease is not current' };
-      if (!await drainDueVoiceMediaRevocations(
-        voiceMediaRevocations,
-        voiceMediaRevocationWorker,
-        req.user.username,
-        { timeoutMs: VOICE_MEDIA_DRAIN_TIMEOUT_MS, authSubject: voiceAuth.authSubject },
-      )) {
-        return voiceMediaClosingResult(
-          voiceMediaRevocations, req.user.username, voiceAuth.authSubject,
-        );
-      }
-      const connected = await voiceSessionConnectedOnce(params.serverId, hubIdentity);
-      if (connected !== true) return { status: connected === null ? 503 : 409, error: connected === null ? 'Voice service unavailable' : 'Voice hub session is not active' };
-      if (!voiceMediaStillAllowed(req.user.id, params)) return { status: 409, error: 'Voice lease is not current' };
-      if (!await drainDueVoiceMediaRevocations(
-        voiceMediaRevocations,
-        voiceMediaRevocationWorker,
-        req.user.username,
-        { timeoutMs: VOICE_MEDIA_DRAIN_TIMEOUT_MS, authSubject: voiceAuth.authSubject },
-      )) {
-        return voiceMediaClosingResult(
-          voiceMediaRevocations, req.user.username, voiceAuth.authSubject,
-        );
-      }
-      if (!requestVoiceAuthStillCurrent(req, voiceAuth)) {
-        return { status: 401, error: 'Authorization session was revoked' };
-      }
-      try {
-        await withTimeout(
-          activateVoiceMediaParticipant(rsc, room, identity),
-          VOICE_MEDIA_RPC_TIMEOUT_MS,
-          'activateVoiceMediaParticipant',
-        );
-      }
-      catch (error) {
-        if (liveKitResourceMissing(error)) return { status: 409, error: 'Voice media session is not connected' };
-        throw error;
-      }
-      // Membership/channel revoke не проходит через per-user claim queue. Если он случился во
-      // время RoomService update, сразу снимаем выданные media-права и не возвращаем ложный успех.
-      if (!requestVoiceAuthStillCurrent(req, voiceAuth)
-        || !voiceMediaStillAllowed(req.user.id, params)
-        || voiceMediaRevocations.hasPendingVoiceSession(req.user.username, voiceAuth.authSubject)) {
-        await scheduleVoiceMediaRemoval(room, identity).catch(() => {});
-        return { status: 409, error: 'Voice media authorization changed during activation' };
-      }
-      return { ok: true };
-    });
-    if (result.error) {
-      if (result.retryAfterSeconds) res.setHeader('Retry-After', String(result.retryAfterSeconds));
-      return res.status(result.status).json({
-        error: result.error,
-        ...(result.retryAfterSeconds ? { retryAfter: result.retryAfterSeconds } : {}),
-      });
-    }
-    res.setHeader('Cache-Control', 'no-store');
-    return res.json({ ok: true, room, epoch: params.epoch });
-  } catch (error) { return next(error); }
 });
 
 /* ---------------- AUTH ---------------- */
@@ -1836,189 +1212,6 @@ app.get('/api/auth/session', requireSession, (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   res.json(sessionPayload(req.user, req.authState));
 });
-
-// Rolling upgrade for a legacy bearer already stored by an installed client. The old JWT is
-// never accepted in JSON and is never destroyed on a network failure. Retrying the same bearer
-// returns the same durable device session; after explicit logout its hash tombstone prevents
-// that legacy token from resurrecting the account.
-app.post('/api/auth/session/upgrade', requireSession, persistentAuthRoute((req, res) => {
-  const transport = requestedPersistentTransport(req, { bootstrap: true });
-  if (req.authPayload && req.authPayload.sid) {
-    throw new PersistentSessionError(409, 'SESSION_ALREADY_UPGRADED', 'Сессия уже обновлена.');
-  }
-  const legacyToken = bearerToken(req);
-  limitPersistentSessionRequest(req, 'upgrade', legacyToken, {
-    ip: { limit: 10_000, windowMs: 15 * 60 * 1000 },
-    session: { limit: 10, windowMs: 15 * 60 * 1000 },
-    allowOpaqueCredential: true,
-  });
-  const bundle = persistentSessions.create(req.user, {
-    clientKind: transport.kind,
-    deviceName: req.body && req.body.deviceName,
-    legacyToken,
-  });
-  return sendPersistentSession(res, transport, bundle, req.user, req.authState);
-}));
-
-app.post('/api/auth/session/refresh', persistentAuthRoute((req, res) => {
-  const transport = requestedPersistentTransport(req);
-  limitPersistentSessionRequest(req, 'refresh', transport.refreshToken, {
-    ip: { limit: 30_000, windowMs: 15 * 60 * 1000 },
-    session: { limit: 60, windowMs: 5 * 60 * 1000 },
-  });
-  const bundle = persistentSessions.refresh(transport.refreshToken, {
-    csrfToken: transport.csrfToken,
-    clientKind: transport.kind,
-  });
-  return sendPersistentSession(
-    res,
-    transport,
-    bundle,
-    bundle.user,
-    authManager.sessionState(bundle.user),
-  );
-}));
-
-// Exact-origin resume repair for a surviving HttpOnly refresh cookie whose readable CSRF partner
-// was lost by browser state restoration/interrupted cookie updates. It accepts only an authentic
-// current/previous refresh generation and immediately reissues the normal paired cookies; no
-// credential means an ordinary terminal 401, never account creation or ambient login replacement.
-app.post('/api/auth/session/recover', persistentAuthRoute((req, res) => {
-  const transport = requestedPersistentTransport(req, { bootstrap: true });
-  if (transport.kind !== 'web') {
-    throw new PersistentSessionError(400, 'AUTH_TRANSPORT_INVALID', 'Восстановление сессии доступно только браузеру.');
-  }
-  limitPersistentSessionRequest(req, 'recover', transport.refreshToken, {
-    ip: { limit: 30_000, windowMs: 15 * 60 * 1000 },
-    session: { limit: 20, windowMs: 5 * 60 * 1000 },
-  });
-  const bundle = persistentSessions.refresh(transport.refreshToken, {
-    clientKind: 'web',
-    allowCsrfRecovery: true,
-  });
-  return sendPersistentSession(
-    res,
-    transport,
-    bundle,
-    bundle.user,
-    authManager.sessionState(bundle.user),
-  );
-}));
-
-app.post('/api/auth/session/logout', persistentAuthRoute((req, res) => {
-  const transport = requestedPersistentTransport(req);
-  limitPersistentSessionRequest(req, 'logout', transport.refreshToken, {
-    ip: { limit: 10_000, windowMs: 15 * 60 * 1000 },
-    session: { limit: 10, windowMs: 60 * 1000 },
-  });
-  let pushCleanup = { userId: '', endpoints: [] };
-  let logoutSubject = null;
-  let voiceLogout = null;
-  const revoke = db.transaction(() => {
-    logoutSubject = persistentSessions.logoutRefreshSubject(transport.refreshToken, {
-      csrfToken: transport.csrfToken,
-      clientKind: transport.kind,
-    });
-    voiceLogout = releaseVoiceLeaseForPersistentLogout(logoutSubject);
-    const loggedOut = persistentSessions.logoutRefresh(transport.refreshToken, {
-      csrfToken: transport.csrfToken,
-      clientKind: transport.kind,
-      reason: 'logout',
-    });
-    if (logoutSubject?.userId) {
-      clearSessionPushEndpoints(db, logoutSubject.userId, logoutSubject.sessionId);
-      pushCleanup = clearRequestedPushEndpoints(db, req.body, logoutSubject.userId);
-    }
-    return loggedOut;
-  });
-  if (revoke.immediate) revoke.immediate(); else revoke();
-  // Do not discard the only HttpOnly refresh credential before rate-limit/CSRF validation and
-  // server-side revocation have completed. Otherwise a recoverable 429/403 would strand an active
-  // durable session that this browser can no longer retry revoking.
-  if (transport.kind === 'web') res.setHeader('Set-Cookie', clearWebSessionCookieHeaders());
-  closePersistentLogoutRealtime(logoutSubject);
-  if (logoutSubject) finishExactVoiceLogout(
-    logoutSubject.userId, voiceLogout?.released, voiceLogout?.authSubject,
-  );
-  res.setHeader('Cache-Control', 'no-store');
-  return res.json({ ok: true, ...(pushCleanup.userId ? { pushCleanup } : {}) });
-}));
-
-// A browser can rarely retain a valid HttpOnly refresh cookie while its readable CSRF partner is
-// stale (concurrent cookie rotation, restored WebKit state, interrupted response). Normal refresh
-// must remain CSRF-protected, but explicit logout needs a finite recovery path or the local logout
-// fence would permanently block both revocation and a new login. This endpoint is exact-origin,
-// SameSite=Strict, host-only-cookie only and performs revocation without returning any credential.
-app.post('/api/auth/session/logout-recover', persistentAuthRoute((req, res) => {
-  const transport = requestedPersistentTransport(req, { bootstrap: true });
-  if (transport.kind !== 'web') {
-    throw new PersistentSessionError(400, 'AUTH_TRANSPORT_INVALID', 'Восстановление выхода доступно только браузеру.');
-  }
-  limitPersistentSessionRequest(req, 'logout-recover', transport.refreshToken, {
-    ip: { limit: 10_000, windowMs: 15 * 60 * 1000 },
-    session: { limit: 10, windowMs: 60 * 1000 },
-  });
-  let pushCleanup = { userId: '', endpoints: [] };
-  let logoutSubject = null;
-  let voiceLogout = null;
-  const revoke = db.transaction(() => {
-    logoutSubject = persistentSessions.logoutRefreshSubject(transport.refreshToken, {
-      clientKind: 'web', allowCsrfRecovery: true,
-    });
-    voiceLogout = releaseVoiceLeaseForPersistentLogout(logoutSubject);
-    const loggedOut = persistentSessions.logoutRefresh(transport.refreshToken, {
-      clientKind: 'web',
-      reason: 'logout-csrf-recovery',
-      allowCsrfRecovery: true,
-    });
-    if (logoutSubject?.userId) {
-      clearSessionPushEndpoints(db, logoutSubject.userId, logoutSubject.sessionId);
-      pushCleanup = clearRequestedPushEndpoints(db, req.body, logoutSubject.userId);
-    }
-    return loggedOut;
-  });
-  if (revoke.immediate) revoke.immediate(); else revoke();
-  // All parsing, origin/rate checks and authentic-refresh verification completed. Clearing both
-  // cookies now makes recovery idempotent even if the session was already revoked.
-  res.setHeader('Set-Cookie', clearWebSessionCookieHeaders());
-  closePersistentLogoutRealtime(logoutSubject);
-  if (logoutSubject) finishExactVoiceLogout(
-    logoutSubject.userId, voiceLogout?.released, voiceLogout?.authSubject,
-  );
-  res.setHeader('Cache-Control', 'no-store');
-  return res.json({ ok: true, ...(pushCleanup.userId ? { pushCleanup } : {}) });
-}));
-
-// Rolling/native clients still holding a legacy bearer must be able to explicitly destroy that
-// exact credential. The client keeps a bounded pending-logout copy only until a new server has
-// persisted this hash-only tombstone; old deployments simply answer 404 and the retry survives.
-app.post('/api/auth/session/logout-legacy', requireSession, authRoute((req, res) => {
-  if (req.authPayload && req.authPayload.sid) {
-    throw new AuthError(409, 'SESSION_ALREADY_UPGRADED', 'Используйте защищённый выход текущей сессии.');
-  }
-  const token = bearerToken(req);
-  const tokenHash = persistentSessions.legacyTokenKey(token);
-  persistentSessions.checkRate('legacy-logout-ip', req.ip, { limit: 10_000, windowMs: 15 * 60 * 1000 });
-  persistentSessions.checkRate('legacy-logout-token', tokenHash, { limit: 10, windowMs: 60 * 1000 });
-  let pushCleanup = { userId: '', endpoints: [] };
-  const voiceAuth = requestVoiceAuthContext(req);
-  let voiceReleased = null;
-  let upgradedSessionId = '';
-  const revoke = db.transaction(() => {
-    upgradedSessionId = db.prepare(`SELECT id FROM auth_sessions
-      WHERE legacy_token_hash=? AND user_id=?`).get(tokenHash, req.user.id)?.id || '';
-    if (voiceAuth) voiceReleased = releaseVoiceLeaseForAuthSubject(req.user.id, voiceAuth.authSubject);
-    persistentSessions.logoutLegacy(token, req.user, 'logout');
-    if (upgradedSessionId) clearSessionPushEndpoints(db, req.user.id, upgradedSessionId);
-    pushCleanup = clearRequestedPushEndpoints(db, req.body, req.user.id);
-  });
-  if (revoke.immediate) revoke.immediate(); else revoke();
-  closeLegacyRealtimeSession(tokenHash);
-  if (upgradedSessionId) closePersistentRealtimeSession(upgradedSessionId);
-  finishExactVoiceLogout(req.user.id, voiceReleased, voiceAuth?.authSubject);
-  res.setHeader('Cache-Control', 'no-store');
-  return res.json({ ok: true, ...(pushCleanup.userId ? { pushCleanup } : {}) });
-}));
 
 // Старый прямой endpoint больше не создаёт аккаунты: регистрация атомарно завершается только
 // после проверки суточного приглашения и кода из письма.
@@ -2030,9 +1223,6 @@ app.post('/api/register', (req, res) => res.status(410).json({
 }));
 
 app.post('/api/login', authRoute(async (req, res) => {
-  const persistentTransport = persistentProtocolRequested(req)
-    ? requestedPersistentTransport(req, { bootstrap: true })
-    : null;
   const uname = norm(req.body.username);
   const pass = String(req.body.password || '');
   authManager.checkLoginRate({ username: uname, ip: req.ip });
@@ -2053,9 +1243,6 @@ app.post('/api/login', authRoute(async (req, res) => {
     if (changed.changes === 1) u.passhash = upgraded;
   }
   const state = authManager.sessionState(u);
-  if (persistentTransport) {
-    return createPersistentLogin(req, res, persistentTransport, u, { username: u.username });
-  }
   res.setHeader('Cache-Control', 'no-store');
   res.json({ token: authManager.issueSession(u), ...sessionPayload(u, state), username: u.username });
 }));
@@ -2074,12 +1261,8 @@ app.post('/api/auth/register/start', authRoute(async (req, res) => {
 }));
 
 app.post('/api/auth/register/verify', authRoute((req, res) => {
-  const persistentTransport = persistentProtocolRequested(req)
-    ? requestedPersistentTransport(req, { bootstrap: true })
-    : null;
   const result = authManager.verifyRegistration({ flowId: req.body.flowId, code: req.body.code, ip: req.ip });
   const user = db.prepare('SELECT * FROM users WHERE id=?').get(result.user.id);
-  if (persistentTransport) return createPersistentLogin(req, res, persistentTransport, user);
   res.setHeader('Cache-Control', 'no-store');
   res.json({ token: authManager.issueSession(user), ...sessionPayload(user) });
 }));
@@ -2104,28 +1287,14 @@ app.post('/api/auth/email/start', requireSession, authRoute(async (req, res) => 
 }));
 
 app.post('/api/auth/email/verify', requireSession, authRoute(async (req, res) => {
-  const persistentTransport = persistentProtocolRequested(req)
-    ? requestedPersistentTransport(req)
-    : null;
-  if (persistentTransport) requireCurrentPersistentTransport(req, persistentTransport);
   const result = authManager.verifyEmailBinding({
     userId: req.user.id,
     flowId: req.body.flowId,
     code: req.body.code,
     ip: req.ip,
-    preserveSessionId: persistentTransport ? req.authPayload.sid : '',
-    preserveClientKind: persistentTransport ? persistentTransport.kind : '',
   });
-  let user = db.prepare('SELECT * FROM users WHERE id=?').get(result.user.id);
-  const expectedSessionVersion = Number(user.session_version) || 0;
-  const preservedSessionId = result.persistentSession?.sessionId || '';
-  await revokeRuntimeSessions(user.id, user.username, 'email-verified', preservedSessionId);
-  user = unchangedSecurityUser(user.id, expectedSessionVersion);
-  if (persistentTransport) {
-    const bundle = persistentSessions.currentAccess(preservedSessionId, user, persistentTransport.kind);
-    if (!bundle) throw new AuthError(401, 'SESSION_REVOKED', 'Сессия завершена другим защитным действием. Войдите снова.');
-    return sendPersistentSession(res, persistentTransport, bundle, user, authManager.sessionState(user));
-  }
+  const user = db.prepare('SELECT * FROM users WHERE id=?').get(result.user.id);
+  await revokeRuntimeSessions(user.id, user.username, 'email-verified');
   res.setHeader('Cache-Control', 'no-store');
   res.json({ token: authManager.issueSession(user), ...sessionPayload(user) });
 }));
@@ -2165,27 +1334,14 @@ app.post('/api/auth/password/reset', authRoute(async (req, res) => {
 }));
 
 app.post('/api/auth/password/change', requireAuth, authRoute(async (req, res) => {
-  const persistentTransport = persistentProtocolRequested(req)
-    ? requestedPersistentTransport(req)
-    : null;
-  if (persistentTransport) requireCurrentPersistentTransport(req, persistentTransport);
   const result = await authManager.changePassword({
     userId: req.user.id,
     currentPassword: req.body.currentPassword,
     newPassword: req.body.newPassword,
     ip: req.ip,
-    preserveSessionId: persistentTransport ? req.authPayload.sid : '',
-    preserveClientKind: persistentTransport ? persistentTransport.kind : '',
   });
-  let user = db.prepare('SELECT * FROM users WHERE id=?').get(result.userId);
-  const preservedSessionId = result.persistentSession?.sessionId || '';
-  await revokeRuntimeSessions(user.id, user.username, 'password-changed', preservedSessionId);
-  user = unchangedSecurityUser(user.id, result.sessionVersion);
-  if (persistentTransport) {
-    const bundle = persistentSessions.currentAccess(preservedSessionId, user, persistentTransport.kind);
-    if (!bundle) throw new AuthError(401, 'SESSION_REVOKED', 'Сессия завершена другим защитным действием. Войдите снова.');
-    return sendPersistentSession(res, persistentTransport, bundle, user, authManager.sessionState(user));
-  }
+  const user = db.prepare('SELECT * FROM users WHERE id=?').get(result.userId);
+  await revokeRuntimeSessions(user.id, user.username, 'password-changed');
   res.setHeader('Cache-Control', 'no-store');
   res.json({ token: authManager.issueSession(user), ...sessionPayload(user) });
 }));
@@ -2267,14 +1423,9 @@ app.post('/api/servers/:id/read', requireAuth, (req, res) => {
   // all:true — «прочитать всё» (last_read = максимальный id сервера). Нужно, т.к. ЖИВЫЕ сообщения на
   // клиенте не имеют серверного sid (узнаются лишь через refetch) → клиент не может назвать актуальный
   // lastId, last_read отставал бы, и прочитанное считалось бы непрочитанным (на главной / др. устройстве).
-  const maxId = db.prepare('SELECT MAX(id) m FROM messages WHERE server_id=?').get(req.params.id).m || 0;
-  let lastId;
-  if (req.body.all) lastId = maxId;
-  else {
-    const parsed = Number(req.body.lastId);
-    if (!Number.isSafeInteger(parsed) || parsed < 0) return res.status(400).json({ error: 'bad lastId' });
-    lastId = Math.min(parsed, maxId);
-  }
+  const lastId = req.body.all
+    ? (db.prepare('SELECT MAX(id) m FROM messages WHERE server_id=?').get(req.params.id).m || 0)
+    : req.body.lastId;
   markRead(req.user.id, req.params.id, lastId);
   const lr = _lastReadStmt.get(req.user.id, req.params.id);
   const lastRead = lr ? lr.last_read : 0;
@@ -2333,7 +1484,7 @@ app.delete('/api/admin/servers/:id/members/:userId', requireAdmin, (req, res) =>
   db.prepare('DELETE FROM server_settings WHERE user_id=? AND server_id=?').run(uid, s.id);
   invalidateVoiceLease(uid, lease => lease.serverId === s.id, 'membership-revoked');
   const ku = db.prepare('SELECT username FROM users WHERE id=?').get(uid);
-  if (ku) { evictUserFromRoom(s.id, ku.username); treeSrv?.revokeUser(uid, s.id); }
+  if (ku) evictUserFromRoom(s.id, ku.username);
   res.json({ ok: true });
 });
 
@@ -2363,35 +1514,23 @@ app.get('/api/push/vapid', (req, res) => {
   res.json({ enabled: !!VAPID, key: VAPID ? VAPID.publicKey : '' });
 });
 // Сохранить/обновить подписку текущего юзера (+ его пер-типовые предпочтения push).
-app.post('/api/push/subscribe', requireAuth, authRoute((req, res) => {
+app.post('/api/push/subscribe', requireAuth, (req, res) => {
   const sub = req.body && req.body.sub;
   if (!sub || !sub.endpoint || !sub.keys || !sub.keys.p256dh || !sub.keys.auth) return res.status(400).json({ error: 'плохая подписка' });
-  const endpoint = normalizedPushEndpoint(sub.endpoint);
-  if (!endpoint) return res.status(400).json({ error: 'плохая подписка' });
+  db.prepare('INSERT INTO push_subs(endpoint,user_id,p256dh,auth,created) VALUES(?,?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth')
+    .run(String(sub.endpoint).slice(0, 512), req.user.id, String(sub.keys.p256dh).slice(0, 256), String(sub.keys.auth).slice(0, 128), Date.now());
   const pr = req.body && req.body.prefs;
-  const privacy = normalizedPushPrivacy(pr && pr.privacy);
-  const mention = pr && pr.mention === false ? 0 : 1;
-  const stream = pr && pr.stream === false ? 0 : 1;
-  // Hold the SQLite write lock while revalidating the exact bearer and inserting the endpoint.
-  // Therefore a concurrent logout either revokes first (this fails) or runs second and deletes the
-  // just-inserted session/provisional endpoint; a request authenticated before logout cannot win late.
-  const persist = db.transaction(() => {
-    const current = authManager.verifySession(bearerToken(req), { requireVerified: true });
-    if (!current?.user || current.user.id !== req.user.id) {
-      throw new AuthError(401, 'SESSION_REVOKED', 'Сессия завершена. Войдите снова.');
-    }
-    const sessionId = typeof current.payload?.sid === 'string' ? current.payload.sid.slice(0, 128) : '';
-    db.prepare('INSERT INTO push_subs(endpoint,user_id,session_id,p256dh,auth,privacy,mention,stream,created) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,session_id=excluded.session_id,p256dh=excluded.p256dh,auth=excluded.auth,privacy=excluded.privacy,mention=excluded.mention,stream=excluded.stream')
-      .run(endpoint, current.user.id, sessionId, String(sub.keys.p256dh).slice(0, 256), String(sub.keys.auth).slice(0, 128), privacy, mention, stream, Date.now());
-  });
-  if (persist.immediate) persist.immediate(); else persist();
-  res.json({ ok: true, userId: req.user.id, endpoint });
-}));
+  if (pr && typeof pr === 'object') {
+    db.prepare('INSERT INTO push_prefs(user_id,mention,stream) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET mention=excluded.mention,stream=excluded.stream')
+      .run(req.user.id, pr.mention === false ? 0 : 1, pr.stream === false ? 0 : 1);
+  }
+  res.json({ ok: true });
+});
 // Отписаться (юзер выключил уведомления / вышел). Удаляем по endpoint.
 app.post('/api/push/unsubscribe', requireAuth, (req, res) => {
-  const endpoint = normalizedPushEndpoint(req.body && req.body.endpoint);
-  const result = unsubscribeOwnedPushEndpoint(db, endpoint, req.user.id);
-  res.json({ ok: true, ...result });
+  const ep = req.body && req.body.endpoint;
+  if (ep) db.prepare('DELETE FROM push_subs WHERE endpoint=? AND user_id=?').run(String(ep), req.user.id);
+  res.json({ ok: true });
 });
 // Вещатель начал трансляцию → пуш участникам сервера, которых сейчас НЕТ в комнате (те, кто в
 // комнате, узнают через LiveKit/дерево — без дублей). Клиент дёргает это на старте шары.
@@ -2424,21 +1563,23 @@ app.post('/api/servers/:id/stream-start', requireAuth, async (req, res) => {
 
 /* ---------------- диагностика стрима ---------------- */
 
-// Запись и prune идут через async FS и одну очередь: большая диагностика больше не
-// останавливает HTTP/WebSocket event loop, а параллельные POST не обходят дисковые квоты.
-const diagStore = createDiagStore({
-  dir: DIAG_DIR,
-  maxFiles: DIAG_MAX_FILES,
-  maxTotalBytes: DIAG_MAX_TOTAL_BYTES,
-});
-const diagRateLimiter = createDiagRateLimiter();
-// Control reports must never consume the incident budget: a run of successful stream views must
-// not delay the one failed attempt that an administrator is waiting to inspect.
-const voiceDiagIncidentRateLimiter = createDiagRateLimiter({ burstLimit: 4, hourlyLimit: 20 });
-const voiceDiagControlRateLimiter = createDiagRateLimiter({ burstLimit: 8, hourlyLimit: 60 });
-// Aggregate process pressure only: these limiters store neither IPs nor account identifiers.
-const voiceDiagIncidentGlobalLimiter = createVoiceDiagnosticGlobalLimiter();
-const voiceDiagControlGlobalLimiter = createVoiceDiagnosticGlobalLimiter({ limit: 240 });
+// Удаляет самые старые сессии, пока каталог не влезет в капы. Вызывается после каждой
+// записи: клиентов много, а диск на VPS общий с БД и загрузками — переполнение здесь
+// уронило бы всё остальное.
+function pruneDiag() {
+  let files;
+  try {
+    files = fs.readdirSync(DIAG_DIR)
+      .filter((n) => n.endsWith('.json'))
+      .map((n) => { const p = path.join(DIAG_DIR, n); const st = fs.statSync(p); return { p, size: st.size, mtime: st.mtimeMs }; })
+      .sort((a, b) => a.mtime - b.mtime); // старые первыми
+  } catch (e) { return; }
+  let total = files.reduce((s, f) => s + f.size, 0);
+  while (files.length && (files.length > DIAG_MAX_FILES || total > DIAG_MAX_TOTAL_BYTES)) {
+    const f = files.shift();
+    try { fs.unlinkSync(f.p); total -= f.size; } catch (e) { /* уже удалён */ }
+  }
+}
 
 const DIAG_ROLES = new Set(['broadcaster', 'viewer']);
 const DIAG_CLIENTS = new Set(['native', 'web']);
@@ -2471,96 +1612,7 @@ function sanitizeDiagEnv(raw) {
   return Object.keys(out).length ? out : null;
 }
 
-/* ---------------- безопасная диагностика голоса ---------------- */
-
-// В отличие от legacy stream-diag эта ручка никогда не принимает строки логов. Store собирает
-// новый объект только из известных enum/number/boolean полей; неизвестные ключи не попадают в БД.
-app.post('/api/diag/voice', noStoreResponse, requireAuth, (req, res) => {
-  let report;
-  try {
-    report = sanitizeVoiceDiagnosticReport(req.body);
-  } catch (error) {
-    if (error instanceof VoiceDiagnosticValidationError) {
-      return res.status(400).json({ error: { code: 'BAD_VOICE_DIAGNOSTIC', message: 'Некорректный формат диагностики.' } });
-    }
-    console.error('[voice-diag] validation failed');
-    return res.status(500).json({ error: 'Не удалось проверить диагностику' });
-  }
-
-  // A retry after a lost HTTP response is already durable and must not spend another rate-limit
-  // slot. Identity is scoped to the authenticated account, never to a client supplied username.
-  let existing;
-  try {
-    existing = report.clientReportId
-      ? voiceDiagnostics.findExisting(req.user.id, report.clientReportId)
-      : null;
-  } catch {
-    console.error('[voice-diag] retry lookup failed');
-    return res.status(500).json({ error: 'Не удалось проверить сохранённую диагностику' });
-  }
-  if (existing) {
-    return res.status(200).json({ ok: true, reportId: existing.id, createdAt: existing.createdAt });
-  }
-
-  const control = isVoiceDiagnosticControlIncident(report.incident);
-  const rate = (control ? voiceDiagControlRateLimiter : voiceDiagIncidentRateLimiter).consume(req.user.id);
-  if (!rate.allowed) {
-    res.setHeader('Retry-After', String(Math.max(1, Math.ceil(rate.retryAfterMs / 1000))));
-    return res.status(429).json({ error: 'Слишком много диагностических отчётов' });
-  }
-  const globalRate = (control ? voiceDiagControlGlobalLimiter : voiceDiagIncidentGlobalLimiter).consume();
-  if (!globalRate.allowed) {
-    res.setHeader('Retry-After', String(Math.max(1, Math.ceil(globalRate.retryAfterMs / 1000))));
-    return res.status(429).json({ error: 'Диагностика временно перегружена' });
-  }
-  try {
-    const saved = voiceDiagnostics.save({
-      userId: req.user.id,
-      username: req.user.username,
-      raw: report,
-    });
-    // SQLite + the diagnostics admin API are the authoritative log. Do not mirror per-report
-    // metadata into Docker stdout: its size-based rotation cannot guarantee the three-day TTL.
-    return res.status(201).json({ ok: true, reportId: saved.id, createdAt: saved.createdAt });
-  } catch (error) {
-    if (error instanceof VoiceDiagnosticValidationError) {
-      return res.status(400).json({ error: { code: 'BAD_VOICE_DIAGNOSTIC', message: 'Некорректный формат диагностики.' } });
-    }
-    console.error('[voice-diag] save failed');
-    return res.status(500).json({ error: 'Не удалось сохранить диагностику' });
-  }
-});
-
-app.get('/api/admin/diagnostics/voice', noStoreResponse, requireDiagnosticsAdmin, (req, res) => {
-  const rawLimit = String(req.query.limit || '50');
-  const rawBeforeCreated = req.query.beforeCreated == null ? '' : String(req.query.beforeCreated);
-  const rawBeforeId = req.query.beforeId == null ? '' : String(req.query.beforeId);
-  const limit = Number(rawLimit);
-  const hasCompleteCursor = Boolean(rawBeforeCreated && rawBeforeId);
-  if (!/^\d{1,3}$/u.test(rawLimit) || !Number.isInteger(limit) || limit < 1 || limit > 100
-    || Boolean(rawBeforeCreated) !== Boolean(rawBeforeId)
-    || (hasCompleteCursor && (!/^\d{1,13}$/u.test(rawBeforeCreated) || !/^[a-f0-9]{24}$/u.test(rawBeforeId)))
-    || (req.query.incident != null && typeof req.query.incident !== 'string')
-    || (req.query.client != null && typeof req.query.client !== 'string')) {
-    return res.status(400).json({ error: 'Некорректная пагинация' });
-  }
-  const page = voiceDiagnostics.list({
-    limit,
-    beforeCreated: hasCompleteCursor ? Number(rawBeforeCreated) : undefined,
-    beforeId: hasCompleteCursor ? rawBeforeId : undefined,
-    incident: typeof req.query.incident === 'string' ? req.query.incident : undefined,
-    client: typeof req.query.client === 'string' ? req.query.client : undefined,
-  });
-  return res.json(page);
-});
-
-app.get('/api/admin/diagnostics/voice/:id', noStoreResponse, requireDiagnosticsAdmin, (req, res) => {
-  const detail = voiceDiagnostics.detail(String(req.params.id || ''));
-  if (!detail) return res.status(404).json({ error: 'Отчёт не найден' });
-  return res.json(detail);
-});
-
-app.post('/api/diag/session', requireAuth, async (req, res) => {
+app.post('/api/diag/session', requireAuth, (req, res) => {
   const b = req.body || {};
   const role = String(b.role || '');
   const client = String(b.client || '');
@@ -2568,50 +1620,29 @@ app.post('/api/diag/session', requireAuth, async (req, res) => {
   const streamId = SAFE_ID(b.streamId);
   if (!streamId) return res.status(400).json({ error: 'bad streamId' });
 
-  const rate = diagRateLimiter.consume(req.user.id);
-  if (!rate.allowed) {
-    res.setHeader('Retry-After', String(Math.max(1, Math.ceil(rate.retryAfterMs / 1000))));
-    return res.status(429).json({ error: 'Слишком много диагностических отчётов' });
-  }
-
-  const lines = sanitizeDiagLines(b.lines);
-  const samples = sanitizeDiagSamples(b.samples);
+  const lines = Array.isArray(b.lines) ? b.lines.slice(-20000).map((l) => String(l).slice(0, 2000)) : [];
+  const samples = Array.isArray(b.samples) ? b.samples.slice(-2000) : [];
   const env = sanitizeDiagEnv(b.env);
-  const now = Date.now();
-  const rawEndedAt = Number(b.endedAt);
-  const endedAt = Number.isSafeInteger(rawEndedAt) && Math.abs(rawEndedAt - now) <= 30 * 24 * 60 * 60_000
-    ? rawEndedAt : now;
-  const rawStartedAt = Number(b.startedAt);
-  const startedAt = Number.isSafeInteger(rawStartedAt) && rawStartedAt > 0 && rawStartedAt <= endedAt
-    && endedAt - rawStartedAt <= 30 * 24 * 60 * 60_000 ? rawStartedAt : null;
-  const inputLines = Array.isArray(b.lines) ? b.lines.length : 0;
-  const inputSamples = Array.isArray(b.samples) ? b.samples.length : 0;
   const payload = {
     streamId, role, client,
     userId: req.user.id,
     username: req.user.username,
-    startedAt,
-    endedAt,
+    startedAt: Number(b.startedAt) || null,
+    endedAt: Number(b.endedAt) || Date.now(),
     appVersion: String(b.appVersion || '').slice(0, 32),
     userAgent: String(req.headers['user-agent'] || '').slice(0, 200),
     env,
     lines, samples,
   };
-  if (b.truncated || lines.length < inputLines || samples.length < inputSamples) payload.truncated = true;
+  const name = `${payload.endedAt}-${streamId}-${role}-${SAFE_ID(req.user.username)}.json`;
   try {
-    const { name } = await diagStore.save({
-      userId: req.user.id,
-      username: req.user.username,
-      streamId,
-      role,
-      endedAt,
-      payload,
-    });
-    return res.json({ ok: true, name });
+    fs.writeFileSync(path.join(DIAG_DIR, name), JSON.stringify(payload));
+    pruneDiag();
   } catch (e) {
     console.error('[diag] write:', e && e.message);
     return res.status(500).json({ error: 'write failed' });
   }
+  res.json({ ok: true, name });
 });
 
 // Разбор жалоб: список сессий (новые первыми) и выгрузка одной. Только админ —
@@ -2641,12 +1672,10 @@ app.patch('/api/me', requireAuth, (req, res) => {
   const dn = req.body.displayName != null ? String(req.body.displayName).trim().slice(0, 32) : null;
   const bio = req.body.bio != null ? String(req.body.bio).slice(0, 200) : null;
   const ac = req.body.avatarColor != null ? (parseInt(req.body.avatarColor, 10) % 8 + 8) % 8 : null;
-  const previousAvatar = String(db.prepare('SELECT avatar_url FROM users WHERE id=?').get(req.user.id)?.avatar_url || '');
   let au = null;
   if (req.body.avatarUrl != null) {
     const v = String(req.body.avatarUrl);
-    if (v === '' || v === previousAvatar || (UPLOAD_RE.test(v) && ownsActiveUpload(req.user.id, v, 'image'))) au = v;
-    else return res.status(400).json({ error: 'Аватар нужно загрузить из своего аккаунта' });
+    if (v === '' || UPLOAD_RE.test(v)) au = v; else return res.status(400).json({ error: 'Неверный аватар' });
   }
   let pbu = null;
   let previousProfileBanner = '';
@@ -2656,14 +1685,13 @@ app.patch('/api/me', requireAuth, (req, res) => {
     if (!(v === '' || UPLOAD_RE.test(v))) return res.status(400).json({ error: 'Неверный фон профиля' });
     if (UPLOAD_RE.test(v) && v !== previousProfileBanner) {
       const tracked = db.prepare('SELECT user_id FROM profile_banner_uploads WHERE url=?').get(v);
-      if (!tracked || tracked.user_id !== req.user.id || !ownsActiveUpload(req.user.id, v, 'banner')) return res.status(400).json({ error: 'Фон нужно загрузить через редактор профиля' });
+      if (!tracked || tracked.user_id !== req.user.id) return res.status(400).json({ error: 'Фон нужно загрузить через редактор профиля' });
     }
     pbu = v;
   }
   if (dn !== null && dn.length < 1) return res.status(400).json({ error: 'Имя не может быть пустым' });
   db.prepare('UPDATE users SET display_name=COALESCE(?,display_name), bio=COALESCE(?,bio), avatar_color=COALESCE(?,avatar_color), avatar_url=COALESCE(?,avatar_url), profile_banner_url=COALESCE(?,profile_banner_url) WHERE id=?')
     .run(dn, bio, ac, au, pbu, req.user.id);
-  if (au !== null && previousAvatar && previousAvatar !== au && ownsActiveUpload(req.user.id, previousAvatar, 'image')) queueUploadRelease([previousAvatar]);
   if (pbu !== null && previousProfileBanner && previousProfileBanner !== pbu) deleteOwnedProfileBannerIfUnused(req.user.id, previousProfileBanner);
   const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
   res.json({ user: ownUser(u) });
@@ -2838,10 +1866,9 @@ function saveImageUpload(req, res, profileBanner = false) {
   try {
     fs.writeFileSync(path.join(UPLOADS_DIR, name), req.body, { flag: 'wx' });
     if (profileBanner) db.prepare('INSERT INTO profile_banner_uploads(url,user_id,size,created) VALUES(?,?,?,?)').run(url, req.user.id, req.body.length, Date.now());
-    if (!recordUpload(url, req.user.id, profileBanner ? 'banner' : 'image', req.body.length)) throw new Error('upload ledger unavailable');
+    recordUpload(url, req.user.id, profileBanner ? 'banner' : 'image', req.body.length);
   } catch (e) {
     try { fs.unlinkSync(path.join(UPLOADS_DIR, name)); } catch (_) { /**/ }
-    if (profileBanner) { try { db.prepare('DELETE FROM profile_banner_uploads WHERE url=?').run(url); } catch (_) { /**/ } }
     return res.status(500).json({ error: 'Не удалось сохранить файл' });
   }
   res.json({ url, width: info.width, height: info.height });
@@ -2875,7 +1902,7 @@ function pruneSeventv() {
   let files;
   try {
     files = fs.readdirSync(SEVENTV_DIR)
-      .filter((n) => n.endsWith('.webp') || n.endsWith('.tmp'))
+      .filter((n) => n.endsWith('.webp'))
       .map((n) => { const p = path.join(SEVENTV_DIR, n); const st = fs.statSync(p); return { p, size: st.size, mtime: st.mtimeMs }; })
       .sort((a, b) => a.mtime - b.mtime); // старые первыми
   } catch (e) { return; }
@@ -2886,73 +1913,35 @@ function pruneSeventv() {
   }
 }
 
-// Полный stat+sort каталога на 20k файлов нельзя делать после КАЖДОЙ картинки: публичный miss тогда
-// превращает cache housekeeping в синхронный event-loop DoS. Склеиваем burst и запускаем не чаще
-// раза в минуту; inflight/rate/body caps ограничивают возможный overshoot между проходами.
-let _7tvPruneTimer = null;
-let _7tvLastPruneAt = 0;
-function scheduleSeventvPrune() {
-  if (_7tvPruneTimer) return;
-  const delay = Math.max(1000, 60_000 - (Date.now() - _7tvLastPruneAt));
-  _7tvPruneTimer = setTimeout(() => {
-    _7tvPruneTimer = null;
-    pruneSeventv();
-    _7tvLastPruneAt = Date.now();
-  }, delay);
-  _7tvPruneTimer.unref?.();
-}
-pruneSeventv();
-_7tvLastPruneAt = Date.now();
-
 // single-flight по ключу кэша: N зрителей одного эмоута → 1 запрос наружу (против thundering herd
 // при одновременной загрузке заблокированных клиентов). Плюс мягкий cap distinct-фетчей — бэкпрешур,
 // чтобы зависший upstream не копил сокеты в ТОМ ЖЕ процессе, что и tree-WS сигналинг дерева.
 const _7tvInflight = new Map();
 const SEVENTV_MAX_INFLIGHT = 48;
-const _7tvNegative = new BoundedTtlCache(5000, 30_000);
-const allowSeventvImageMiss = createFixedWindowLimiter({ limit: 240, windowMs: 60_000, maxKeys: 20_000 });
-const allowSeventvGlobalImageMiss = createFixedWindowLimiter({ limit: 600, windowMs: 60_000, maxKeys: 1 });
 async function fetchSeventvEmote(id, file, dest) {
   const key = id + '_' + file;
   const existing = _7tvInflight.get(key);
   if (existing) return existing;
-  if (_7tvNegative.get(key)) return null;
   if (_7tvInflight.size >= SEVENTV_MAX_INFLIGHT) return null; // бэкпрешур
-  if (!allowSeventvGlobalImageMiss('all')) return null;
   const p = (async () => {
-    // Хост и КАЖДЫЙ redirect фиксированы helper-ом. Легаси Mongo ObjectId всё ещё может сделать
-    // штатный 308→ULID, но Location на private/произвольный host отклоняется до второго запроса.
-    const r = await fetchSeventvCdn(`https://cdn.7tv.app/emote/${id}/${file}`, { signal: AbortSignal.timeout(6000) });
-    if (r.status !== 200) {
-      _7tvNegative.set(key, true, r.status === 404 ? 5 * 60_000 : 15_000);
-      try { await r.body?.cancel(); } catch (e) { /**/ }
-      return null;
-    }
-    const mime = String(r.headers.get('content-type') || '').split(';', 1)[0].trim().toLowerCase();
-    if (mime !== 'image/webp') {
-      _7tvNegative.set(key, true, 60_000);
-      try { await r.body?.cancel(); } catch (e) { /**/ }
-      return null; // HTML/SVG/другой тип не отравляет immutable webp-кэш
-    }
-    const buf = await readResponseLimited(r, SEVENTV_MAX_UPSTREAM);
-    if (buf.length === 0) { _7tvNegative.set(key, true, 60_000); return null; }
+    // Хост ЗАХАРДКОЖЕН, id/file уже провалидированы — только конкатенация, никогда new URL(userInput).
+    // redirect:'follow' обязателен — легаси Mongo ObjectId (24 симв. из старых сообщений) отдаёт 308→ULID.
+    const r = await fetch(`https://cdn.7tv.app/emote/${id}/${file}`, { signal: AbortSignal.timeout(6000), redirect: 'follow' });
+    if (r.status !== 200) return null; // 404/редирект-петля/5xx — не кэшируем
+    if (!String(r.headers.get('content-type') || '').startsWith('image/')) return null; // HTML-заглушка провайдера с 200 → не отравляем immutable-кэш
+    const ab = await r.arrayBuffer();
+    if (ab.byteLength === 0 || ab.byteLength > SEVENTV_MAX_UPSTREAM) return null;
+    const buf = Buffer.from(ab);
     // персист best-effort (клиент получит буфер в любом случае): атомарно tmp+rename — усечённый
     // при обрыве не раздастся как immutable 30д.
-    let tmp = '';
     try {
-      tmp = dest + '.' + crypto.randomBytes(6).toString('hex') + '.tmp';
+      const tmp = dest + '.' + crypto.randomBytes(6).toString('hex') + '.tmp';
       fs.writeFileSync(tmp, buf);
       fs.renameSync(tmp, dest);
-      tmp = '';
-      scheduleSeventvPrune();
+      pruneSeventv();
     } catch (e) { console.error('[7tv] cache write:', e && e.message); }
-    finally { if (tmp) { try { fs.unlinkSync(tmp); } catch (e) { /**/ } } }
     return buf;
-  })().catch((e) => {
-    _7tvNegative.set(key, true, 15_000);
-    console.error('[7tv] upstream:', e && e.message);
-    return null;
-  }).finally(() => _7tvInflight.delete(key));
+  })().catch((e) => { console.error('[7tv] upstream:', e && e.message); return null; }).finally(() => _7tvInflight.delete(key));
   _7tvInflight.set(key, p);
   return p;
 }
@@ -2971,10 +1960,6 @@ app.get('/api/7tv/emote/:id/:file', async (req, res) => {
       // заголовки задаём через опции sendFile — иначе send затрёт Cache-Control дефолтным max-age=0.
       return res.sendFile(dest, { maxAge: '30d', immutable: true, headers: { 'Content-Type': 'image/webp', 'X-Content-Type-Options': 'nosniff' } }, (err) => { if (err && !res.headersSent) res.sendStatus(500); });
     }
-    if (!allowSeventvImageMiss(req.ip)) {
-      res.setHeader('Retry-After', '60');
-      return res.sendStatus(429);
-    }
     const buf = await fetchSeventvEmote(id, file, dest);
     if (!buf) return res.sendStatus(502);
     res.setHeader('Cache-Control', 'public, max-age=2592000, immutable');
@@ -2990,42 +1975,25 @@ app.get('/api/7tv/emote/:id/:file', async (req, res) => {
 // Глобальный сет (name→id). Публичный намеренно: loadGlobalEmotes зовётся ДО логина. Абьюз
 // ограничен — это один кэш-блоб (апстрим дёргается максимум раз в TTL). Паттерн getDetectableGames:
 // TTL 1ч + диск-персист + serve-stale-on-error + single-flight.
-let _7tvGlobal = null, _7tvGlobalAt = 0, _7tvGlobalInflight = null, _7tvGlobalRetryAt = 0;
+let _7tvGlobal = null, _7tvGlobalAt = 0, _7tvGlobalInflight = null;
 const _7TV_GLOBAL_FILE = path.join(SEVENTV_DIR, 'global.json');
 function getSeventvGlobal() {
   const now = Date.now();
-  if (_7tvGlobal && (now - _7tvGlobalAt < 3600 * 1000 || now < _7tvGlobalRetryAt)) return Promise.resolve(_7tvGlobal);
+  if (_7tvGlobal && now - _7tvGlobalAt < 3600 * 1000) return Promise.resolve(_7tvGlobal);
   if (_7tvGlobalInflight) return _7tvGlobalInflight;
-  if (!_7tvGlobal && now < _7tvGlobalRetryAt) return Promise.resolve(null);
   _7tvGlobalInflight = (async () => {
     try {
-      const r = await fetch('https://7tv.io/v3/emote-sets/global', { signal: AbortSignal.timeout(10000), redirect: 'error' });
-      if (r.status !== 200) { try { await r.body?.cancel(); } catch (e) { /**/ } throw new Error(`global status ${r.status}`); }
-      const d = normalizeGlobalPayload(JSON.parse((await readResponseLimited(r, SEVENTV_MAX_GLOBAL_JSON)).toString('utf8')));
-      if (d) {
-        _7tvGlobal = d; _7tvGlobalAt = now; _7tvGlobalRetryAt = 0;
-        let tmp = '';
-        try {
-          tmp = _7TV_GLOBAL_FILE + '.' + crypto.randomBytes(6).toString('hex') + '.tmp';
-          fs.writeFileSync(tmp, JSON.stringify(d));
-          fs.renameSync(tmp, _7TV_GLOBAL_FILE);
-          tmp = '';
-        } catch (e) { /** memory cache remains usable */ }
-        finally { if (tmp) { try { fs.unlinkSync(tmp); } catch (e) { /**/ } } }
+      const r = await fetch('https://7tv.io/v3/emote-sets/global', { signal: AbortSignal.timeout(10000) });
+      const d = await r.json();
+      if (d && Array.isArray(d.emotes)) {
+        _7tvGlobal = d; _7tvGlobalAt = now;
+        try { fs.writeFileSync(_7TV_GLOBAL_FILE, JSON.stringify(d)); } catch (e) {}
         return d;
       }
-      _7tvGlobalRetryAt = Date.now() + 30_000;
       return _7tvGlobal; // мусорный ответ — держим прежнюю копию, если была
     } catch (e) {
-      if (_7tvGlobal) { _7tvGlobalRetryAt = Date.now() + 30_000; return _7tvGlobal; } // serve-stale + backoff
-      try {
-        const st = fs.statSync(_7TV_GLOBAL_FILE);
-        if (st.size <= 0 || st.size > SEVENTV_MAX_GLOBAL_JSON) throw new Error('global disk cache too large');
-        _7tvGlobal = normalizeGlobalPayload(JSON.parse(fs.readFileSync(_7TV_GLOBAL_FILE, 'utf8')));
-        if (!_7tvGlobal) throw new Error('invalid global disk cache');
-        _7tvGlobalAt = now;
-        return _7tvGlobal;
-      } catch (e2) { _7tvGlobalRetryAt = Date.now() + 30_000; return null; }
+      if (_7tvGlobal) return _7tvGlobal; // serve-stale из памяти
+      try { _7tvGlobal = JSON.parse(fs.readFileSync(_7TV_GLOBAL_FILE, 'utf8')); _7tvGlobalAt = now; return _7tvGlobal; } catch (e2) { return null; }
     } finally { _7tvGlobalInflight = null; }
   })();
   return _7tvGlobalInflight;
@@ -3041,23 +2009,9 @@ app.get('/api/7tv/global', async (req, res) => {
 
 // Поиск эмоутов. Под auth (пикер открывается после логина). GQL-строка ЗАХАРДКОЖЕНА на сервере
 // (не форвардим клиентский body → нет инъекции); q/p валидируются и капаются.
-const _7tvSearchCache = new BoundedTtlCache(512, 60_000);
-const allowSeventvSearch = createFixedWindowLimiter({ limit: 60, windowMs: 60_000, maxKeys: 20_000 });
-const allowSeventvGlobalSearch = createFixedWindowLimiter({ limit: 300, windowMs: 60_000, maxKeys: 1 });
 app.get('/api/7tv/search', requireAuth, async (req, res) => {
   const q = String(req.query.q || '').trim().slice(0, 64);
   const p = Math.min(20, Math.max(1, parseInt(req.query.p, 10) || 1));
-  const cacheKey = `${q.toLocaleLowerCase()}\u0000${p}`;
-  const cached = _7tvSearchCache.get(cacheKey);
-  if (cached !== undefined) return res.json({ items: cached });
-  if (!allowSeventvSearch(`${req.user.id}|${req.ip}`)) {
-    res.setHeader('Retry-After', '60');
-    return res.status(429).json({ error: 'Слишком много запросов к поиску эмоутов' });
-  }
-  if (!allowSeventvGlobalSearch('all')) {
-    res.setHeader('Retry-After', '60');
-    return res.status(429).json({ error: 'Поиск эмоутов временно перегружен' });
-  }
   try {
     const body = {
       query: 'query($q:String!,$p:Int){emotes(query:$q,page:$p,limit:100,sort:{value:"popularity",order:DESCENDING}){items{id name}}}',
@@ -3065,13 +2019,9 @@ app.get('/api/7tv/search', requireAuth, async (req, res) => {
     };
     const r = await fetch('https://7tv.io/v3/gql', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(8000),
-      redirect: 'error',
     });
-    if (r.status !== 200) { try { await r.body?.cancel(); } catch (e) { /**/ } throw new Error(`search status ${r.status}`); }
-    const d = JSON.parse((await readResponseLimited(r, SEVENTV_MAX_SEARCH_JSON)).toString('utf8'));
-    const items = normalizeSearchPayload(d);
-    if (!items) throw new Error('invalid search response');
-    _7tvSearchCache.set(cacheKey, items);
+    const d = await r.json();
+    const items = ((d.data && d.data.emotes && d.data.emotes.items) || []).map((e) => ({ id: e.id, name: e.name }));
     res.json({ items });
   } catch (e) { if (!res.headersSent) res.sendStatus(502); }
 });
@@ -3097,10 +2047,7 @@ app.post('/api/upload-file', requireAuth, express.raw({ type: () => true, limit:
   const url = '/api/files/' + name;
   try { fs.writeFileSync(path.join(FILES_DIR, name), req.body, { flag: 'wx' }); }
   catch (e) { return res.status(500).json({ error: 'Не удалось сохранить файл' }); }
-  if (!recordUpload(url, req.user.id, 'file', req.body.length)) {
-    try { fs.unlinkSync(path.join(FILES_DIR, name)); } catch (_) { /**/ }
-    return res.status(500).json({ error: 'Не удалось сохранить файл' });
-  }
+  recordUpload(url, req.user.id, 'file', req.body.length);
   res.json({ url, name: origName, size: req.body.length });
 });
 /* ---------------- КВОТЫ И УБОРКА ЗАГРУЗОК ----------------
@@ -3124,12 +2071,8 @@ const UPLOAD_LEGACY_GRACE_MS = 7 * 24 * 60 * 60 * 1000;  // файл вне ре
 const UPLOAD_LEDGER_TTL_MS = 3 * 24 * 60 * 60 * 1000;    // сколько держим строку уже удалённого файла (см. released)
 const UPLOAD_RELEASE_DEBOUNCE_MS = 20_000;               // склейка отложенной уборки после удалений
 const UPLOAD_SWEEP_CHUNK = 200;                          // файлов на одну транзакцию/тик
-// На старте берём хотя бы учтённый живой объём из БД. Он может не включать legacy-файлы, зато
-// рестарт больше не открывает 60-секундное окно без общего потолка; полный sweep уточнит размер.
-let uploadsBytesCached = (() => {
-  try { return Number(db.prepare('SELECT COALESCE(SUM(size),0) total FROM uploads WHERE released=0').get()?.total || 0); }
-  catch (e) { return 0; }
-})();
+let uploadsBytesCached = 0;   // пересчитывается уборкой; между проходами корректируется приходом/уходом
+let uploadsSweepKnown = false; // до первого прохода реальный объём неизвестен — потолок не применяем
 
 // Реестр держит строку и ПОСЛЕ удаления файла (released=1): суточная квота считается по нему, и без
 // этого пользователь снимал бы себе лимит, просто удалив свои же сообщения.
@@ -3137,7 +2080,6 @@ const upStmt = {
   insert: db.prepare('INSERT OR REPLACE INTO uploads(url,user_id,kind,size,created,released) VALUES(?,?,?,?,?,0)'),
   dailyUsed: db.prepare('SELECT COALESCE(SUM(size),0) total FROM uploads WHERE user_id=? AND created>?'),
   byUrl: db.prepare('SELECT created,released FROM uploads WHERE url=?'),
-  ownedByUrl: db.prepare('SELECT user_id,kind,released FROM uploads WHERE url=?'),
   markReleased: db.prepare('UPDATE uploads SET released=1 WHERE url=?'),
   dropBanner: db.prepare('DELETE FROM profile_banner_uploads WHERE url=?'),
   dropOld: db.prepare('DELETE FROM uploads WHERE released=1 AND created<?'),
@@ -3147,32 +2089,19 @@ function recordUpload(url, userId, kind, size) {
   try {
     upStmt.insert.run(url, userId, kind, size, Date.now());
     uploadsBytesCached += size;
-    return true;
-  } catch (e) {
-    // Без строки владельца файл нельзя безопасно прикрепить или посчитать в квоте. Вызывающий
-    // роут удалит уже записанный файл и вернёт ошибку вместо неучтённой загрузки.
-    console.error('[uploads] учёт загрузки:', e && e.message);
-    return false;
-  }
-}
-
-function ownsActiveUpload(userId, url, kind) {
-  const filePath = uploadPathFor(url);
-  if (!filePath) return false;
-  try { return fs.existsSync(filePath) && isOwnedUploadRow(upStmt.ownedByUrl.get(url), userId, kind); }
-  catch (e) { return false; } // проверка владения всегда fail-closed
+  } catch (e) { console.error('[uploads] учёт загрузки:', e && e.message); } // учёт не должен ронять саму загрузку
 }
 
 // Суточное потребление: строки за последние сутки, включая уже удалённые файлы (см. released).
 function uploadDailyUsed(userId) {
   try { return Number(upStmt.dailyUsed.get(userId, Date.now() - UPLOAD_GC_GRACE_MS)?.total || 0); }
-  catch (e) { return UPLOAD_DAILY_QUOTA_BYTES; } // недоступен реестр — не открываем квоту fail-open
+  catch (e) { return 0; }
 }
 
 // Общая для всех загрузок проверка: суточная квота пользователя + потолок хранилища. Возвращает
 // текст ошибки или null. Вызывается ДО записи файла на диск.
 function uploadRejectReason(userId, size) {
-  if (uploadsBytesCached + size > UPLOADS_CAP_BYTES) return 'Хранилище файлов заполнено — попробуй позже';
+  if (uploadsSweepKnown && uploadsBytesCached + size > UPLOADS_CAP_BYTES) return 'Хранилище файлов заполнено — попробуй позже';
   if (uploadDailyUsed(userId) + size > UPLOAD_DAILY_QUOTA_BYTES) return 'Дневной лимит загрузок исчерпан — попробуй завтра';
   return null;
 }
@@ -3183,13 +2112,12 @@ function uploadPathFor(url) {
   return null;
 }
 
-// Ссылается ли хоть что-то на этот файл. Используем тот же структурный сборщик, что и GC:
-// LIKE по сырому JSON считал обычный текст/имя вложения ссылкой и позволял удерживать чужой файл.
+// Ссылается ли хоть что-то на этот файл (точечная проверка для одиночных случаев).
 function uploadIsReferenced(url) {
-  const refs = collectReferencedUploadUrls();
-  if (!refs) return true; // не смогли доказать отсутствие ссылки — удалять нельзя
-  const normalized = normalizeUploadRef(url);
-  return refs.has(url) || !!(normalized && refs.has(normalized));
+  if (db.prepare('SELECT 1 FROM users WHERE avatar_url=? OR profile_banner_url=? LIMIT 1').get(url, url)) return true;
+  if (db.prepare('SELECT 1 FROM servers WHERE icon_url=? LIMIT 1').get(url)) return true;
+  const contains = `%${url}%`; // имена файлов — hex, символов LIKE в них нет
+  return !!db.prepare('SELECT 1 FROM messages WHERE image=? OR attachments LIKE ? OR reply_to LIKE ? LIMIT 1').get(url, contains, contains);
 }
 
 // Все живые ссылки одним проходом. null = собрать не удалось: удалять по неполному списку нельзя.
@@ -3207,11 +2135,11 @@ function collectReferencedUploadUrls() {
     for (const r of db.prepare("SELECT image FROM messages WHERE image<>''").all()) add(r.image);
     for (const r of db.prepare("SELECT attachments FROM messages WHERE attachments<>'' AND attachments<>'[]'").all()) {
       try { for (const a of JSON.parse(r.attachments) || []) if (a && a.url) add(a.url); }
-      catch (e) { for (const url of uploadRefsInText(r.attachments)) add(url); }
+      catch (e) { for (const m of String(r.attachments).match(new RegExp(UPLOAD_REF_RE.source, 'g')) || []) refs.add(m); } // битый JSON: вытаскиваем ссылки как есть, лишь бы не удалить лишнее
     }
     for (const r of db.prepare("SELECT reply_to FROM messages WHERE reply_to<>''").all()) {
       try { const rp = JSON.parse(r.reply_to); if (rp && rp.thumb) add(rp.thumb); }
-      catch (e) { for (const url of uploadRefsInText(r.reply_to)) add(url); }
+      catch (e) { for (const m of String(r.reply_to).match(new RegExp(UPLOAD_REF_RE.source, 'g')) || []) refs.add(m); } // обрезанный по лимиту JSON тоже обязан сохранить ссылку
     }
   } catch (e) {
     console.error('[uploads] сбор ссылок не удался, уборка пропущена:', e && e.message);
@@ -3226,19 +2154,8 @@ function collectReferencedUploadUrls() {
 const purgeLedgerRows = db.transaction((urls) => {
   for (const url of urls) { upStmt.markReleased.run(url); upStmt.dropBanner.run(url); }
 });
-const claimUploadsForRemoval = db.transaction((urls) => {
-  for (const url of urls) upStmt.markReleased.run(url);
-});
 
 async function removeUploads(urls, sizeByUrl) {
-  // Между чанками отдаём event loop, поэтому сначала атомарно закрываем владельцу возможность
-  // прикрепить запланированный к удалению URL. Иначе сообщение могло появиться после снимка ссылок,
-  // но до unlink более позднего чанка, и история получала уже удалённый файл.
-  try { claimUploadsForRemoval(urls); }
-  catch (e) {
-    console.error('[uploads] не удалось зафиксировать удаление:', e && e.message);
-    return { removed: 0, freed: 0 };
-  }
   let removed = 0, freed = 0;
   for (let i = 0; i < urls.length; i += UPLOAD_SWEEP_CHUNK) {
     const chunk = urls.slice(i, i + UPLOAD_SWEEP_CHUNK);
@@ -3248,14 +2165,10 @@ async function removeUploads(urls, sizeByUrl) {
       if (!p) continue; // имя вне наших схем — ни файл, ни строку не трогаем (иначе учёт разъедется с диском)
       let size = sizeByUrl ? sizeByUrl.get(url) : undefined;
       if (size === undefined) { try { size = fs.statSync(p).size; } catch (e) { size = 0; } }
-      let didDelete = true;
       try { fs.unlinkSync(p); }
-      catch (e) {
-        if (e && e.code !== 'ENOENT') { console.error('[uploads] не удалось удалить', url, e.message); continue; }
-        didDelete = false; // другой уборщик уже удалил файл и вычел его размер
-      }
+      catch (e) { if (e && e.code !== 'ENOENT') { console.error('[uploads] не удалось удалить', url, e.message); continue; } }
       done.push(url);
-      if (didDelete) { removed++; freed += size || 0; }
+      removed++; freed += size || 0;
     }
     if (done.length) { try { purgeLedgerRows(done); } catch (e) { console.error('[uploads] обновление реестра:', e && e.message); } }
     if (i + UPLOAD_SWEEP_CHUNK < urls.length) await new Promise((r) => setImmediate(r));
@@ -3318,13 +2231,11 @@ async function sweepUploads() {
     }
   }
   // Решение «что удалять» — в uploadsGc.js: оно чистое и покрыто тестами (uploads-gc-test.js).
-  const { remove } = planUploadSweep({ files, referenced: refs, now, graceMs: UPLOAD_GC_GRACE_MS, legacyGraceMs: UPLOAD_LEGACY_GRACE_MS });
+  const { remove, keepBytes } = planUploadSweep({ files, referenced: refs, now, graceMs: UPLOAD_GC_GRACE_MS, legacyGraceMs: UPLOAD_LEGACY_GRACE_MS });
   const sizeByUrl = new Map(files.map((f) => [f.url, f.size]));
-  // Фиксируем размер снимка ДО первого await. Новые загрузки, пришедшие во время порционного
-  // удаления, увеличат cached поверх него, а removeUploads вычтет реально удалённые байты.
-  // Присваивание keepBytes после await теряло бы такие параллельные загрузки из общего cap.
-  uploadsBytesCached = files.reduce((sum, file) => sum + file.size, 0);
   const { removed, freed } = await removeUploads(remove, sizeByUrl);
+  uploadsBytesCached = keepBytes;
+  uploadsSweepKnown = true;
   // Строки реестра без файла на диске (ручное удаление, сбой записи) помечаем удалёнными, иначе они
   // вечно висят в суточной квоте пользователя. Каталоги уже прочитаны — повторно диск не трогаем.
   try {
@@ -3332,13 +2243,14 @@ async function sweepUploads() {
     if (stale.length) purgeLedgerRows(stale.map((r) => r.url));
     upStmt.dropOld.run(now - UPLOAD_LEDGER_TTL_MS); // строки давно удалённых файлов больше не нужны даже квоте
   } catch (e) { console.error('[uploads] сверка реестра:', e && e.message); }
-  console.log(`[uploads] проход: файлов ${files.length}, убрано ${removed}, освобождено ${Math.round(freed / 1048576)} МБ, занято ${Math.round(uploadsBytesCached / 1048576)} МБ из ${Math.round(UPLOADS_CAP_BYTES / 1048576)} МБ`);
-  if (uploadsBytesCached > UPLOADS_CAP_BYTES) console.warn('[uploads] хранилище выше потолка — новые загрузки отклоняются; подними UPLOADS_CAP_MB или удали старые сообщения');
+  console.log(`[uploads] проход: файлов ${files.length}, убрано ${removed}, освобождено ${Math.round(freed / 1048576)} МБ, занято ${Math.round(keepBytes / 1048576)} МБ из ${Math.round(UPLOADS_CAP_BYTES / 1048576)} МБ`);
+  if (keepBytes > UPLOADS_CAP_BYTES) console.warn('[uploads] хранилище выше потолка — новые загрузки отклоняются; подними UPLOADS_CAP_MB или удали старые сообщения');
 }
 
 const uploadSweepTimer = setInterval(() => { sweepUploads().catch((e) => console.error('[uploads] уборка:', e && e.message)); }, 6 * 60 * 60 * 1000);
 uploadSweepTimer.unref?.();
-// Первый полный проход при старте уточняет объём с учётом legacy-файлов вне реестра.
+// Первый проход при старте, но не в момент запуска: даём подняться остальному, а заодно сразу
+// получаем реальный объём хранилища (до этого потолок не применяем — uploadsSweepKnown).
 const uploadSweepBoot = setTimeout(() => { sweepUploads().catch((e) => console.error('[uploads] уборка:', e && e.message)); }, 60_000);
 uploadSweepBoot.unref?.();
 app.get('/api/files/:name', (req, res) => {
@@ -3426,7 +2338,7 @@ app.post('/api/servers/:id/kick', requireAuth, (req, res) => {
   invalidateVoiceLease(uid, lease => lease.serverId === s.id, 'membership-revoked');
   const ku = db.prepare('SELECT username FROM users WHERE id=?').get(uid);
   // выгоняем ВСЕ live-сессии юзера из комнаты (identity = username#nonce)
-  if (ku) { evictUserFromRoom(s.id, ku.username); treeSrv?.revokeUser(uid, s.id); }
+  if (ku) evictUserFromRoom(s.id, ku.username);
   res.json({ ok: true });
 });
 
@@ -3439,7 +2351,6 @@ app.post('/api/servers/:id/leave', requireAuth, (req, res) => {
   db.prepare('DELETE FROM server_settings WHERE user_id=? AND server_id=?').run(req.user.id, s.id);
   invalidateVoiceLease(req.user.id, lease => lease.serverId === s.id, 'membership-revoked');
   evictUserFromRoom(s.id, req.user.username);
-  treeSrv?.revokeUser(req.user.id, s.id);
   res.json({ ok: true });
 });
 
@@ -3460,16 +2371,11 @@ app.patch('/api/servers/:id', requireAuth, (req, res) => {
   const desc = req.body.description != null ? String(req.body.description).slice(0, 300) : null;
   const ic = req.body.iconColor != null ? (parseInt(req.body.iconColor, 10) % 8 + 8) % 8 : null;
   let iu = null;
-  if (req.body.iconUrl != null) {
-    const v = String(req.body.iconUrl);
-    if (v === '' || v === String(s.icon_url || '') || (UPLOAD_RE.test(v) && ownsActiveUpload(req.user.id, v, 'image'))) iu = v;
-    else return res.status(400).json({ error: 'Обложку нужно загрузить из своего аккаунта' });
-  }
+  if (req.body.iconUrl != null) { const v = String(req.body.iconUrl); if (v === '' || UPLOAD_RE.test(v)) iu = v; else return res.status(400).json({ error: 'Неверная обложка' }); }
   if (name !== null && name.length < 2) return res.status(400).json({ error: 'Название минимум 2 символа' });
   const statsOn = req.body.statsEnabled != null ? (req.body.statsEnabled ? 1 : 0) : null;
   db.prepare('UPDATE servers SET name=COALESCE(?,name), description=COALESCE(?,description), icon_color=COALESCE(?,icon_color), icon_url=COALESCE(?,icon_url), stats_enabled=COALESCE(?,stats_enabled) WHERE id=?')
     .run(name, desc, ic, iu, statsOn, s.id);
-  if (iu !== null && s.icon_url && s.icon_url !== iu && ownsActiveUpload(req.user.id, s.icon_url, 'image')) queueUploadRelease([s.icon_url]);
   const ns = db.prepare('SELECT * FROM servers WHERE id=?').get(s.id);
   res.json({ server: { ...pubServer(ns), memberCount: memberCount(s.id) } });
 });
@@ -3517,7 +2423,6 @@ app.post('/api/servers/:id/roles', requireAuth, (req, res) => {
   if (name.length < 1) return res.status(400).json({ error: 'Название роли не может быть пустым' });
   const color = validColor(req.body.color);
   const perms = (parseInt(req.body.permissions, 10) || 0) & ALL_PERMS;
-  if (!canGrantPerms(req.user.id, sid, perms)) return res.status(403).json({ error: 'Нельзя выдать права выше своих' });
   const maxPos = db.prepare('SELECT COALESCE(MAX(position),0) p FROM roles WHERE server_id=?').get(sid).p;
   const id = newId('r');
   db.prepare('INSERT INTO roles(id,server_id,name,color,permissions,position,created) VALUES(?,?,?,?,?,?,?)').run(id, sid, name, color, perms, maxPos + 1, Date.now());
@@ -3532,7 +2437,6 @@ app.patch('/api/servers/:id/roles/:rid', requireAuth, (req, res) => {
   if (name !== null && name.length < 1) return res.status(400).json({ error: 'Название роли не может быть пустым' });
   const color = req.body.color != null ? validColor(req.body.color) : null;
   const perms = req.body.permissions != null ? ((parseInt(req.body.permissions, 10) || 0) & ALL_PERMS) : null;
-  if (perms !== null && !canGrantPerms(req.user.id, sid, perms)) return res.status(403).json({ error: 'Нельзя выдать права выше своих' });
   const pos = req.body.position != null ? (parseInt(req.body.position, 10) || 0) : null;
   db.prepare('UPDATE roles SET name=COALESCE(?,name), color=COALESCE(?,color), permissions=COALESCE(?,permissions), position=COALESCE(?,position) WHERE id=?')
     .run(name, color, perms, pos, r.id);
@@ -3551,13 +2455,7 @@ app.put('/api/servers/:id/members/:uid/roles', requireAuth, (req, res) => {
   const uid = req.params.uid;
   if (!isMember(uid, sid)) return res.status(404).json({ error: 'Не участник' });
   const ids = Array.isArray(req.body.roleIds) ? req.body.roleIds.map(String) : [];
-  const available = db.prepare('SELECT id,permissions FROM roles WHERE server_id=?').all(sid);
-  const valid = new Set(available.map(r => r.id));
-  const granted = ids.reduce((mask, rid) => {
-    const role = available.find((item) => item.id === rid);
-    return role ? (mask | (Number(role.permissions) || 0)) : mask;
-  }, 0);
-  if (!canGrantPerms(req.user.id, sid, granted)) return res.status(403).json({ error: 'Нельзя назначить права выше своих' });
+  const valid = new Set(db.prepare('SELECT id FROM roles WHERE server_id=?').all(sid).map(r => r.id));
   db.prepare('DELETE FROM member_roles WHERE server_id=? AND user_id=?').run(sid, uid);
   const ins = db.prepare('INSERT OR IGNORE INTO member_roles(server_id,user_id,role_id) VALUES(?,?,?)');
   for (const rid of ids) if (valid.has(rid)) ins.run(sid, uid, rid);
@@ -3603,7 +2501,6 @@ app.delete('/api/servers/:id/channels/:cid', requireAuth, (req, res) => {
   // Удаление занятого канала — атомарный server-side leave для его владельцев lease. Закрытая
   // вкладка могла оставить lease без participant, поэтому вечный 409 по одной БД-строке недопустим.
   invalidateVoiceLeasesForChannel(sid, req.params.cid, 'channel-deleted');
-  void revokeVoiceMediaChannel(sid, req.params.cid).catch(() => {});
   evictLegacyVoiceChannelParticipants(sid, req.params.cid);
   db.prepare('DELETE FROM voice_channels WHERE id=? AND server_id=?').run(req.params.cid, sid);
   notifyServerMembers(sid, { t: 'server-refresh', serverId: sid, reason: 'channels' });
@@ -3614,49 +2511,27 @@ app.delete('/api/servers/:id/channels/:cid', requireAuth, (req, res) => {
 app.post('/api/servers/:id/clear', requireAuth, (req, res) => {
   const sid = req.params.id;
   if (!can(req.user.id, sid, PERM.MANAGE_MESSAGES)) return res.status(403).json({ error: 'Нет прав' });
-  if (!allowChatMutation(req, res, 'clear')) return;
   const orphaned = uploadUrlsOfMessageRows(selectMessageUploadRows('server_id=?', sid));
-  const clearChat = db.transaction(() => {
-    db.prepare('DELETE FROM messages WHERE server_id=?').run(sid);
-    db.prepare('DELETE FROM reactions WHERE server_id=?').run(sid);
-    return bumpChatRevision(sid, { clear: true });
-  });
-  const revision = clearChat();
-  chatRealtime.broadcast(sid, () => chatClearedEvent(sid, revision, chatRealtime.maxEventBytes));
-  scheduleLegacyChatRefresh(req, sid);
-  res.json({ ok: true, revision });
+  db.prepare('DELETE FROM messages WHERE server_id=?').run(sid);
+  db.prepare('DELETE FROM reactions WHERE server_id=?').run(sid);
+  res.json({ ok: true });
   queueUploadRelease(orphaned);
 });
 
 /* ---------------- LIVEKIT TOKEN (per server) ---------------- */
-app.get('/api/servers/:id/token', noStoreVoiceTokenResponse, requireAuth, async (req, res) => {
+app.get('/api/servers/:id/token', requireAuth, async (req, res) => {
   const s = db.prepare('SELECT * FROM servers WHERE id=?').get(req.params.id);
   if (!s) return res.status(404).json({ error: 'нет' });
   if (!isMember(req.user.id, s.id)) return res.status(403).json({ error: 'Ты не участник' });
-  const mintRate = voiceTokenMintLimiter.consume(req.user.id);
-  if (!mintRate.allowed) {
-    res.setHeader('Retry-After', String(mintRate.retryAfterSeconds));
-    return res.status(429).json({ error: 'Слишком много запросов голосового токена', retryAfter: mintRate.retryAfterSeconds });
-  }
   try {
-    const voiceAuth = requestVoiceAuthContext(req);
-    if (!voiceAuth || voiceAuth.revoked) {
-      return res.status(401).json({ error: 'Authorization session was revoked' });
-    }
     // Connected clients refresh LiveKit grants automatically. Keep the initial
     // grant short-lived so a token copied from an evicted device cannot be
     // reused hours after its voice lease was transferred or revoked.
     const sessionVersion = Math.max(0, Number(req.user.session_version) || 0);
-    const voiceSession = createVoiceSessionId(sessionVersion, voiceAuth.authSubject);
-    const identity = req.user.username + '#' + voiceSession;
-    const room = 'srv:' + s.id;
-    const at = new AccessToken(KEY, SECRET, { identity, name: req.user.display_name, ttl: '10m' });
-    at.addGrant(hubTokenGrant('srv:' + s.id));
-    const token = await at.toJwt();
-    if (!registerVoiceAuthTarget(req, voiceAuth, room, identity, HUB_TOKEN_TTL_MS)) {
-      return res.status(401).json({ error: 'Authorization session was revoked' });
-    }
-    res.json({ token, url: WS_URL, room, sessionId: voiceSession });
+    const voiceSession = `v${sessionVersion}.${crypto.randomBytes(4).toString('hex')}`;
+    const at = new AccessToken(KEY, SECRET, { identity: req.user.username + '#' + voiceSession, name: req.user.display_name, ttl: '10m' });
+    at.addGrant({ roomJoin: true, room: 'srv:' + s.id, canPublish: true, canSubscribe: true, canPublishData: true, canUpdateOwnMetadata: true });
+    res.json({ token: await at.toJwt(), url: WS_URL, room: 'srv:' + s.id, sessionId: voiceSession });
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
@@ -3666,7 +2541,7 @@ app.get('/api/me/settings', requireAuth, (req, res) => {
   res.json({ data: row ? JSON.parse(row.data) : {} });
 });
 app.put('/api/me/settings', requireAuth, (req, res) => {
-  const data = boundedAccountSettings(req.body.data || {}, 20000);
+  const data = JSON.stringify(req.body.data || {}).slice(0, 20000);
   db.prepare(`INSERT INTO user_settings(user_id,data) VALUES(?,?)
     ON CONFLICT(user_id) DO UPDATE SET data=excluded.data`).run(req.user.id, data);
   res.json({ ok: true });
@@ -3674,19 +2549,15 @@ app.put('/api/me/settings', requireAuth, (req, res) => {
 
 /* ---------------- PER-SERVER SETTINGS (volumes etc) ---------------- */
 app.get('/api/servers/:id/settings', requireAuth, (req, res) => {
-  res.json({ data: serverVolumeSettings.get(req.user.id, req.params.id) });
+  const row = db.prepare('SELECT data FROM server_settings WHERE user_id=? AND server_id=?').get(req.user.id, req.params.id);
+  res.json({ data: row ? JSON.parse(row.data) : {} });
 });
 app.put('/api/servers/:id/settings', requireAuth, (req, res) => {
   if (!isMember(req.user.id, req.params.id)) return res.status(403).json({ error: 'нет' });
-  serverVolumeSettings.replace(req.user.id, req.params.id, req.body.data || {});
+  const data = JSON.stringify(req.body.data || {}).slice(0, 20000);
+  db.prepare(`INSERT INTO server_settings(user_id,server_id,data) VALUES(?,?,?)
+    ON CONFLICT(user_id,server_id) DO UPDATE SET data=excluded.data`).run(req.user.id, req.params.id, data);
   res.json({ ok: true });
-});
-app.patch('/api/servers/:id/settings', requireAuth, (req, res) => {
-  if (!isMember(req.user.id, req.params.id)) return res.status(403).json({ error: 'нет' });
-  const mutation = normalizeServerVolumeMutation(req.body || {});
-  if (!mutation) return res.status(400).json({ error: 'Некорректная настройка громкости' });
-  const next = serverVolumeSettings.patch(req.user.id, req.params.id, mutation);
-  res.json({ ok: true, data: next });
 });
 
 /* ---------------- РЕЙТИНГ (leaderboard) ---------------- */
@@ -3717,61 +2588,18 @@ app.get('/api/servers/:id/leaderboard', requireAuth, (req, res) => {
 
 /* ---------- CHAT HISTORY (persist 7 days) ---------- */
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
-const chatRevisions = createChatRevisionStore(db);
-try {
-  const cleaned = cleanupInvalidLegacyReactions(db, chatRevisions);
-  if (cleaned.removed > 0) console.warn(`[db] removed ${cleaned.removed} invalid legacy chat reaction(s)`);
-} catch (error) {
-  console.warn('[db] failed to clean invalid legacy reactions:', error?.message || error);
-}
-function currentChatRevision(serverId) {
-  return chatRevisions.current(serverId);
-}
-function bumpChatRevision(serverId, options) {
-  return chatRevisions.bump(serverId, options);
-}
-
-function parseStoredJson(raw, fallback) {
-  try { return JSON.parse(raw || JSON.stringify(fallback)); }
-  catch { return fallback; }
-}
 
 function serializeHistoryMessage(row, reactions) {
   let level;
   if (row.kind === 'levelup' && row.meta) { try { level = JSON.parse(row.meta).level || undefined; } catch { /**/ } }
   const release = parseReleaseMeta(row.kind, row.meta);
-  const attachments = parseStoredJson(row.attachments, []);
-  const reply = row.reply_to ? parseStoredJson(row.reply_to, null) : undefined;
   return {
     id: row.id, uid: row.user_id, name: row.display_name, color: row.avatar_color, text: row.text,
-    em: sanitizeMessageEmotes(parseStoredJson(row.emotes, {})), img: row.image || '',
-    files: Array.isArray(attachments) ? attachments.slice(0, 5) : [],
-    reply: reply && typeof reply === 'object' && !Array.isArray(reply) ? reply : undefined,
-    ts: row.created, edited: !!row.edited,
+    em: JSON.parse(row.emotes || '{}'), img: row.image || '', files: JSON.parse(row.attachments || '[]'),
+    reply: row.reply_to ? JSON.parse(row.reply_to) : undefined, ts: row.created, edited: !!row.edited,
     reactions: reactions && reactions.length ? reactions : undefined,
-    kind: row.kind || undefined, level, release, mkey: row.client_key || undefined,
+    kind: row.kind || undefined, level, release,
   };
-}
-
-function exactReactionSnapshot(serverId, messageId) {
-  const rows = db.prepare(`SELECT emote_id,emote_name,user_id FROM reactions
-    WHERE server_id=? AND msg_id=? ORDER BY emote_id ASC,created ASC,user_id ASC`).all(serverId, messageId);
-  const aggregate = new Map();
-  for (const row of rows) {
-    let item = aggregate.get(row.emote_id);
-    if (!item) {
-      item = { id: row.emote_id, name: row.emote_name, count: 0, users: new Set() };
-      aggregate.set(row.emote_id, item);
-    }
-    item.count++;
-    item.users.add(row.user_id);
-  }
-  return (recipientId) => [...aggregate.values()].map((item) => ({
-    id: item.id,
-    name: item.name,
-    count: item.count,
-    mine: item.users.has(recipientId),
-  }));
 }
 
 app.get('/api/servers/:id/messages', requireAuth, (req, res) => {
@@ -3779,38 +2607,32 @@ app.get('/api/servers/:id/messages', requireAuth, (req, res) => {
   if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
   const limit = Math.min(60, Math.max(1, parseInt(req.query.limit, 10) || 30));
   const before = parseInt(req.query.before, 10) || 0; // курсор: id, СТАРШЕ которого грузим (0 = последняя страница)
-  const readSnapshot = db.transaction(() => {
-    const minTs = Date.now() - WEEK_MS;
-    // limit+1 distinguishes the final page. All rows, reactions and revision are read inside one
-    // SQLite snapshot so a client can safely buffer and replay WS events with rev > revision.
-    const rows = before > 0
-      ? db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,edited,kind,meta,client_key FROM messages WHERE server_id=? AND created>? AND id<? ORDER BY id DESC LIMIT ?').all(sid, minTs, before, limit + 1)
-      : db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,edited,kind,meta,client_key FROM messages WHERE server_id=? AND created>? ORDER BY id DESC LIMIT ?').all(sid, minTs, limit + 1);
-    const hasMore = rows.length > limit;
-    const page = rows.slice(0, limit).reverse();
-    const reactByMsg = new Map();
-    const pageIds = page.map(r => r.id);
-    if (pageIds.length) {
-      const ph = pageIds.map(() => '?').join(',');
-      const rr = db.prepare(`SELECT msg_id, emote_id, emote_name, user_id FROM reactions WHERE server_id=? AND msg_id IN (${ph})`).all(sid, ...pageIds);
-      for (const x of rr) {
-        let em = reactByMsg.get(x.msg_id); if (!em) { em = new Map(); reactByMsg.set(x.msg_id, em); }
-        let e = em.get(x.emote_id); if (!e) { e = { id: x.emote_id, name: x.emote_name, count: 0, mine: false }; em.set(x.emote_id, e); }
-        e.count++; if (x.user_id === req.user.id) e.mine = true;
-      }
+  const minTs = Date.now() - WEEK_MS;
+  // берём limit+1, чтобы понять, есть ли ещё более старые сообщения (hasMore)
+  const rows = before > 0
+    ? db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,edited,kind,meta FROM messages WHERE server_id=? AND created>? AND id<? ORDER BY id DESC LIMIT ?').all(sid, minTs, before, limit + 1)
+    : db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,edited,kind,meta FROM messages WHERE server_id=? AND created>? ORDER BY id DESC LIMIT ?').all(sid, minTs, limit + 1);
+  const hasMore = rows.length > limit;
+  const page = rows.slice(0, limit).reverse(); // ASC: старые → новые (как рисуем в чате)
+  // Реакции по загруженным сообщениям: агрегируем в {id,name,count,mine} на сообщение.
+  const reactByMsg = new Map();
+  const pageIds = page.map(r => r.id);
+  if (pageIds.length) {
+    const ph = pageIds.map(() => '?').join(',');
+    const rr = db.prepare(`SELECT msg_id, emote_id, emote_name, user_id FROM reactions WHERE server_id=? AND msg_id IN (${ph})`).all(sid, ...pageIds);
+    for (const x of rr) {
+      let em = reactByMsg.get(x.msg_id); if (!em) { em = new Map(); reactByMsg.set(x.msg_id, em); }
+      let e = em.get(x.emote_id); if (!e) { e = { id: x.emote_id, name: x.emote_name, count: 0, mine: false }; em.set(x.emote_id, e); }
+      e.count++; if (x.user_id === req.user.id) e.mine = true;
     }
-    const chatState = chatRevisions.snapshot(sid);
-    return {
-      revision: chatState.revision,
-      lastClearRevision: chatState.lastClearRevision,
-      hasMore,
-      messages: page.map((r) => serializeHistoryMessage(
-        r,
-        reactByMsg.has(r.id) ? [...reactByMsg.get(r.id).values()] : undefined,
-      )),
-    };
+  }
+  res.json({
+    hasMore,
+    messages: page.map((r) => serializeHistoryMessage(
+      r,
+      reactByMsg.has(r.id) ? [...reactByMsg.get(r.id).values()] : undefined,
+    )),
   });
-  res.json(readSnapshot());
 });
 
 // Точное назначение уведомления: не заставляем клиент пролистывать всю недельную историю.
@@ -3819,7 +2641,7 @@ app.get('/api/servers/:id/messages/:mid', requireAuth, (req, res) => {
   if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
   const mid = Number(req.params.mid);
   if (!Number.isSafeInteger(mid) || mid <= 0) return res.status(400).json({ error: 'bad' });
-  const row = db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,edited,kind,meta,client_key FROM messages WHERE server_id=? AND id=? AND created>?').get(sid, mid, Date.now() - WEEK_MS);
+  const row = db.prepare('SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,edited,kind,meta FROM messages WHERE server_id=? AND id=? AND created>?').get(sid, mid, Date.now() - WEEK_MS);
   if (!row) return res.status(404).json({ error: 'no msg' });
   const reactionMap = new Map();
   const reactionRows = db.prepare('SELECT emote_id, emote_name, user_id FROM reactions WHERE server_id=? AND msg_id=?').all(sid, mid);
@@ -3832,7 +2654,7 @@ app.get('/api/servers/:id/messages/:mid', requireAuth, (req, res) => {
     item.count++;
     if (reaction.user_id === req.user.id) item.mine = true;
   }
-  res.json({ revision: currentChatRevision(sid), message: serializeHistoryMessage(row, [...reactionMap.values()]) });
+  res.json({ message: serializeHistoryMessage(row, [...reactionMap.values()]) });
 });
 
 // Migration recovery: after checking the person outside RelayApp, exact denis can issue a short
@@ -3842,9 +2664,9 @@ app.post('/api/admin/users/:id/email-binding-support-code', requireAdmin, authRo
   res.setHeader('Cache-Control', 'no-store');
   res.json({ ok: true, ...result });
 }));
-// вложения: до 5 на сообщение, URL принадлежит автору и валиден для своего kind
-// (картинки — /api/uploads/*, файлы — /api/files/*), остальные поля — санитайз размера.
-function sanitizeAttachments(raw, userId) {
+// вложения: до 5 на сообщение, url валиден для своего kind (картинки — /api/uploads/*, инлайн;
+// файлы — /api/files/*, форс-скачивание — см. FILE ATTACHMENTS выше), остальные поля — санитайз размера.
+function sanitizeAttachments(raw) {
   if (!Array.isArray(raw)) return [];
   const out = [];
   for (const a of raw.slice(0, 5)) {
@@ -3852,11 +2674,9 @@ function sanitizeAttachments(raw, userId) {
     const kind = a.kind === 'file' ? 'file' : 'image';
     const url = String(a.url || '');
     const urlOk = kind === 'image' ? UPLOAD_RE.test(url) : FILE_URL_RE.test(url);
-    if (!urlOk || !ownsActiveUpload(userId, url, kind)) continue;
+    if (!urlOk) continue;
     const name = String(a.name || '').slice(0, 255);
-    const size = Number.isFinite(a.size)
-      ? Math.round(Math.max(0, Math.min(10 * 1024 * 1024, a.size)))
-      : 0;
+    const size = Number.isFinite(a.size) ? Math.max(0, Math.min(10 * 1024 * 1024, a.size)) : 0;
     const mime = String(a.mime || '').slice(0, 100);
     const width = kind === 'image' && Number.isFinite(a.width) ? Math.max(1, Math.min(4096, Math.round(a.width))) : 0;
     const height = kind === 'image' && Number.isFinite(a.height) ? Math.max(1, Math.min(4096, Math.round(a.height))) : 0;
@@ -3866,90 +2686,31 @@ function sanitizeAttachments(raw, userId) {
   }
   return out;
 }
-
-// Не обрезаем уже сериализованный JSON: срез строки после stringify мог сохранить
-// невалидный JSON и сделать всю историю сервера нечитаемой. Для пользовательских
-// объектов оставляем только целые поля, пока сериализованный результат помещается
-// в лимит; при переполнении лишние поля/записи безопасно отбрасываются.
-function boundedJsonObject(raw, maxBytes, fallback = '{}') {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return fallback;
-  const out = {};
-  for (const [key, value] of Object.entries(raw)) {
-    if (typeof key !== 'string' || (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean' && value !== null)) continue;
-    const candidate = { ...out, [key]: value };
-    let encoded;
-    try { encoded = JSON.stringify(candidate); } catch { continue; }
-    if (Buffer.byteLength(encoded, 'utf8') > maxBytes) continue;
-    Object.assign(out, { [key]: value });
-  }
-  try { return JSON.stringify(out); } catch { return fallback; }
-}
-
-function buildReplySnapshot(serverId, userId, raw) {
-  if (!raw || typeof raw !== 'object') return '';
-  const sourceId = Number(raw.sid);
-  if (Number.isSafeInteger(sourceId) && sourceId > 0) {
-    const source = db.prepare('SELECT id,user_id,display_name,text,image,attachments FROM messages WHERE server_id=? AND id=?').get(serverId, sourceId);
-    if (!source) return '';
-    let files = [];
-    try { const parsed = JSON.parse(source.attachments || '[]'); files = Array.isArray(parsed) ? parsed : []; }
-    catch (e) { files = []; }
-    const image = (UPLOAD_RE.test(String(source.image || '')) && source.image)
-      || files.find((file) => file && file.kind === 'image' && UPLOAD_RE.test(String(file.url || '')))?.url
-      || '';
-    const hasFile = files.some((file) => file && file.kind === 'file' && FILE_URL_RE.test(String(file.url || '')));
-    const clean = {
-      author: String(source.display_name || '').slice(0, 80),
-      text: String(source.text || '').slice(0, 160),
-      img: !!image,
-      hasFile,
-      uid: String(source.user_id || '').slice(0, 64),
-      sid: Number(source.id),
-    };
-    if (image) clean.thumb = image;
-    return boundedJsonObject(clean, 600);
-  }
-
-  // У оптимистичного сообщения sid может ещё не быть. Сохраняем прежний UX, но превью разрешаем
-  // только из собственных активных загрузок: произвольный thumb больше не закрепляет чужой файл.
-  const author = String(raw.author || '').slice(0, 80);
-  if (!author) return '';
-  const clean = { author, text: String(raw.text || '').slice(0, 160), img: !!raw.img, hasFile: !!raw.hasFile };
-  if (raw.uid) clean.uid = String(raw.uid).slice(0, 64);
-  const thumb = normalizeUploadRef(String(raw.thumb || ''));
-  if (thumb && ownsActiveUpload(userId, thumb, 'image')) clean.thumb = thumb;
-  return boundedJsonObject(clean, 600);
-}
-
 app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
   const sid = req.params.id;
   if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
-  const clientKey = String(req.body.key || '').slice(0, 64);
-  if (clientKey) {
-    const duplicate = db.prepare('SELECT id FROM messages WHERE server_id=? AND user_id=? AND client_key=?')
-      .get(sid, req.user.id, clientKey);
-    // A lost-response retry is recovery, not a fresh mutation. It must stay available even when the
-    // sender exhausted the message rate after the first successful INSERT.
-    if (duplicate) return res.json({ ok: true, id: Number(duplicate.id), revision: currentChatRevision(sid) });
-  }
-  if (!allowChatMutation(req, res, 'message')) return;
   const text = String(req.body.text || '').slice(0, 1000);
-  const image = (() => { const v = String(req.body.image || ''); return UPLOAD_RE.test(v) && ownsActiveUpload(req.user.id, v, 'image') ? v : ''; })();
-  const attachments = sanitizeAttachments(req.body.files, req.user.id);
+  const image = (() => { const v = String(req.body.image || ''); return UPLOAD_RE.test(v) ? v : ''; })();
+  const attachments = sanitizeAttachments(req.body.files);
   if (!text.trim() && !image && !attachments.length) return res.status(400).json({ error: 'пусто' });
-  if (hasAllMention(text)) {
-    // A single message must not turn into an unbounded push/WS fanout. Large communities can still
-    // post normal messages; only the explicit all-member notification is rejected at this bound.
-    if (!can(req.user.id, sid, PERM.MANAGE_MESSAGES)) {
-      return res.status(403).json({ error: 'Нет права на массовое упоминание участников' });
-    }
-    if (memberCount(sid) > 2000) return res.status(413).json({ error: 'Слишком много участников для массового упоминания' });
-    if (!allowChatMutation(req, res, 'mentionAll', { includeTotal: false })) return;
-  }
-  const em = JSON.stringify(sanitizeMessageEmotes(req.body.em));
+  const em = JSON.stringify(req.body.em || {}).slice(0, 4000);
   // reply-ссылка на исходное сообщение (санитайзим, ограничиваем размер)
-  const replyTo = buildReplySnapshot(sid, req.user.id, req.body.reply);
+  const replyTo = (() => {
+    const rp = req.body.reply;
+    if (!rp || typeof rp !== 'object') return '';
+    const author = String(rp.author || '').slice(0, 80);
+    if (!author) return '';
+    const clean = { author, text: String(rp.text || '').slice(0, 160), img: !!rp.img };
+    if (rp.uid) clean.uid = String(rp.uid).slice(0, 64);
+    if (Number.isFinite(rp.sid)) clean.sid = rp.sid;
+    // Превью картинки оригинала в цитате. Нормализуем к относительному пути: старые нативные
+    // клиенты присылают абсолютный URL, а уборка сверяет ссылки точным совпадением (см.
+    // normalizeUploadRef) — иначе показанная в цитате картинка считалась бы мусором.
+    if (rp.thumb) clean.thumb = normalizeUploadRef(String(rp.thumb)) || String(rp.thumb).slice(0, 300);
+    return JSON.stringify(clean).slice(0, 600);
+  })();
   const now = Date.now();
+  const clientKey = String(req.body.key || '').slice(0, 64);
   // kind/meta: пока единственный спец-тип — 'levelup' (карточка достижения). Анти-спуф: принимаем ТОЛЬКО
   // если фича включена И заявленный уровень ≤ реального уровня автора (сервер — источник истины).
   let kind = '', meta = '';
@@ -3961,38 +2722,16 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
   // OR IGNORE: повторный POST с тем же (server_id,user_id,client_key) схлопывается (retry после
   // потери ответа). info.changes===0 → это дубль: не чистим/не пушим повторно, но отвечаем ok
   // (сообщение уже в БД — для клиента это успех).
-  const persistMessage = db.transaction(() => {
-    const info = db.prepare('INSERT OR IGNORE INTO messages(server_id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,client_key,kind,meta) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)')
-      .run(sid, req.user.id, req.user.display_name, req.user.avatar_color, text, em, image, JSON.stringify(attachments), replyTo, now, clientKey, kind, meta);
-    // На duplicate retry mutation/revision не повторяются. Точный DB id всё равно возвращается
-    // отправителю, чтобы его optimistic message не завис без sid после потерянного HTTP-ответа.
-    const msgId = info.changes ? Number(info.lastInsertRowid)
-      : (clientKey ? Number((db.prepare('SELECT id FROM messages WHERE server_id=? AND user_id=? AND client_key=?').get(sid, req.user.id, clientKey) || {}).id || 0) : 0);
-    if (info.changes === 0) return { created: false, msgId, revision: currentChatRevision(sid), expired: 0, row: null };
-    const retentionCutoff = now - WEEK_MS;
-    db.prepare(`DELETE FROM reactions WHERE server_id=? AND msg_id IN (
-      SELECT id FROM messages WHERE server_id=? AND created<?
-    )`).run(sid, sid, retentionCutoff);
-    const expired = db.prepare('DELETE FROM messages WHERE server_id=? AND created<?').run(sid, retentionCutoff).changes;
-    const revision = bumpChatRevision(sid);
-    const row = db.prepare(`SELECT id,user_id,display_name,avatar_color,text,emotes,image,attachments,
-      reply_to,created,edited,kind,meta,client_key FROM messages WHERE server_id=? AND id=?`).get(sid, msgId);
-    return { created: true, msgId, revision, expired, row };
-  });
-  const persisted = persistMessage();
-  if (!persisted.created) return res.json({ ok: true, id: persisted.msgId || null, revision: persisted.revision });
-  const canonicalMessage = persisted.row ? serializeHistoryMessage(persisted.row) : null;
-  // If weekly retention removed rows in the same revision, an incremental upsert alone would leave
-  // those old messages on already-open clients. Force an exact HTTP snapshot as the safe fallback.
-  if (persisted.expired > 0) {
-    chatRealtime.broadcast(sid, () => null);
-  } else {
-    chatRealtime.broadcast(sid, () => messageCreatedEvent(
-      sid, persisted.revision, canonicalMessage, persisted.row && persisted.row.client_key, chatRealtime.maxEventBytes,
-    ));
-  }
-  scheduleLegacyChatRefresh(req, sid);
-  res.json({ ok: true, id: persisted.msgId, revision: persisted.revision });
+  const info = db.prepare('INSERT OR IGNORE INTO messages(server_id,user_id,display_name,avatar_color,text,emotes,image,attachments,reply_to,created,client_key,kind,meta) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run(sid, req.user.id, req.user.display_name, req.user.avatar_color, text, em, image, JSON.stringify(attachments), replyTo, now, clientKey, kind, meta);
+  // Возвращаем DB-id сообщения → клиент усыновляет sid на оптимистичное сообщение СРАЗУ (без ожидания
+  // refetch): иначе свежеотправленное без sid нельзя удалить/реагировать, а реплай на него не кликабелен.
+  // На дубль-ретрае (changes===0) достаём уже существующий id по client_key.
+  const msgId = info.changes ? info.lastInsertRowid
+    : (clientKey ? (db.prepare('SELECT id FROM messages WHERE server_id=? AND user_id=? AND client_key=?').get(sid, req.user.id, clientKey) || {}).id : null);
+  res.json({ ok: true, id: msgId });
+  if (info.changes === 0) return; // дубль — дальше (cleanup/push) не нужно
+  db.prepare('DELETE FROM messages WHERE server_id=? AND created<?').run(sid, now - WEEK_MS);
   // (сообщения в XP НЕ входят — рейтинг только по голосу+эфиру)
   // Уведомление упомянутым/адресату ответа. ДВА канала: (1) глобальный notify-WS — мгновенно тем,
   // кто онлайн в приложении (натив + веб), для ЛЮБОГО сервера, даже НЕ подключённого («куда зайти»);
@@ -4013,7 +2752,7 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
       if (!targets.length) return;
       const body = text.slice(0, 140) || (image ? '🖼 изображение' : (attachments.length ? '📎 вложение' : ''));
       const nm = serverName(sid);
-      const notificationMsgId = persisted.msgId;
+      const notificationMsgId = Number(info.lastInsertRowid);
       const notificationTag = 'mention:' + sid + ':' + (clientKey || notificationMsgId);
       for (const uid of targets) notifyUser(uid, { t: 'notify', kind: 'mention', serverId: sid, serverName: nm, title: req.user.display_name, body, msgId: notificationMsgId, tag: notificationTag });
       if (VAPID) pushToUsers('mention', targets, {
@@ -4024,80 +2763,35 @@ app.post('/api/servers/:id/messages', requireAuth, (req, res) => {
     } catch (e) { console.error('[notify] mention:', e && e.message); }
   })();
 });
-// Реакция 7TV на сообщение (тогл). Сервер рассылает точный агрегированный snapshot после записи.
+// Реакция 7TV на сообщение (тогл). Realtime-раздача — через data-канал клиента (как чат), сервер персистит.
 app.post('/api/servers/:id/messages/:mid/react', requireAuth, (req, res) => {
   const sid = req.params.id;
   if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
-  if (!allowChatMutation(req, res, 'reaction')) return;
   const mid = parseInt(req.params.mid, 10);
-  if (typeof req.body.add !== 'boolean') return res.status(400).json({ error: 'bad' });
-  const identity = canonicalReactionIdentity(req.body.emoteId, req.body.emoteName);
-  if (!mid || !identity) return res.status(400).json({ error: 'bad' });
-  const { id: emoteId, name: emoteName } = identity;
+  const emoteId = String(req.body.emoteId || '').slice(0, 64);
+  const emoteName = String(req.body.emoteName || '').slice(0, 64);
+  if (!mid || !emoteId || !emoteName) return res.status(400).json({ error: 'bad' });
   const msg = db.prepare('SELECT id FROM messages WHERE id=? AND server_id=?').get(mid, sid);
   if (!msg) return res.status(404).json({ error: 'no msg' });
-  const mutateReaction = db.transaction(() => {
-    let changes = 0;
-    if (req.body.add) {
-      const existing = db.prepare('SELECT 1 FROM reactions WHERE server_id=? AND msg_id=? AND emote_id=? AND user_id=?')
-        .get(sid, mid, emoteId, req.user.id);
-      if (!existing) {
-        const count = db.prepare('SELECT COUNT(*) c FROM reactions WHERE server_id=? AND msg_id=?').get(sid, mid).c;
-        if (count >= 1000) return { full: true, changes: 0, revision: currentChatRevision(sid) };
-      }
-      changes = db.prepare('INSERT OR IGNORE INTO reactions(server_id,msg_id,emote_id,emote_name,user_id,created) VALUES(?,?,?,?,?,?)')
-        .run(sid, mid, emoteId, emoteName, req.user.id, Date.now()).changes;
-    } else {
-      changes = db.prepare('DELETE FROM reactions WHERE server_id=? AND msg_id=? AND emote_id=? AND user_id=?')
-        .run(sid, mid, emoteId, req.user.id).changes;
-    }
-    return { full: false, changes, revision: changes > 0 ? bumpChatRevision(sid) : currentChatRevision(sid) };
-  });
-  const mutation = mutateReaction();
-  if (mutation.full) return res.status(429).json({ error: 'Слишком много реакций' });
-  const reactionsFor = exactReactionSnapshot(sid, mid);
-  if (mutation.changes > 0) {
-    chatRealtime.broadcast(sid, (recipientId) => reactionsUpdatedEvent(
-      sid, mutation.revision, mid, reactionsFor(recipientId), chatRealtime.maxEventBytes,
-    ));
-    scheduleLegacyChatRefresh(req, sid);
-  }
-  res.json({
-    ok: true,
-    changed: mutation.changes > 0,
-    revision: mutation.revision,
-    reactions: reactionsFor(req.user.id),
-  });
+  if (req.body.add) db.prepare('INSERT OR IGNORE INTO reactions(server_id,msg_id,emote_id,emote_name,user_id,created) VALUES(?,?,?,?,?,?)').run(sid, mid, emoteId, emoteName, req.user.id, Date.now());
+  else db.prepare('DELETE FROM reactions WHERE server_id=? AND msg_id=? AND emote_id=? AND user_id=?').run(sid, mid, emoteId, req.user.id);
+  res.json({ ok: true });
 });
-// Редактирование СВОЕГО сообщения (флаг edited + новый текст).
+// Редактирование СВОЕГО сообщения (флаг edited + новый текст). Realtime — через data-канал.
 app.patch('/api/servers/:id/messages/:mid', requireAuth, (req, res) => {
   const sid = req.params.id;
-  if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
-  if (!allowChatMutation(req, res, 'edit')) return;
   const mid = parseInt(req.params.mid, 10);
   const text = String(req.body.text || '').slice(0, 1000);
   if (!mid || !text.trim()) return res.status(400).json({ error: 'пусто' });
   const msg = db.prepare('SELECT user_id FROM messages WHERE id=? AND server_id=?').get(mid, sid);
   if (!msg) return res.status(404).json({ error: 'no msg' });
   if (msg.user_id !== req.user.id) return res.status(403).json({ error: 'не твоё' });
-  const editMessage = db.transaction(() => {
-    const changed = db.prepare('UPDATE messages SET text=?, edited=1 WHERE id=? AND server_id=?').run(text, mid, sid).changes;
-    return { changed, revision: changed > 0 ? bumpChatRevision(sid) : currentChatRevision(sid) };
-  });
-  const edited = editMessage();
-  if (edited.changed > 0) {
-    chatRealtime.broadcast(sid, () => messageUpdatedEvent(
-      sid, edited.revision, mid, text, chatRealtime.maxEventBytes,
-    ));
-    scheduleLegacyChatRefresh(req, sid);
-  }
-  res.json({ ok: true, revision: edited.revision });
+  db.prepare('UPDATE messages SET text=?, edited=1 WHERE id=?').run(text, mid);
+  res.json({ ok: true });
 });
 // Удаление сообщения: автор ИЛИ владелец сервера. Сносим и его реакции.
 app.delete('/api/servers/:id/messages/:mid', requireAuth, (req, res) => {
   const sid = req.params.id;
-  if (!isMember(req.user.id, sid)) return res.status(403).json({ error: 'нет' });
-  if (!allowChatMutation(req, res, 'delete')) return;
   const mid = parseInt(req.params.mid, 10);
   if (!mid) return res.status(400).json({ error: 'bad' });
   const msg = db.prepare('SELECT user_id FROM messages WHERE id=? AND server_id=?').get(mid, sid);
@@ -4105,28 +2799,15 @@ app.delete('/api/servers/:id/messages/:mid', requireAuth, (req, res) => {
   const owner = (db.prepare('SELECT owner_id FROM servers WHERE id=?').get(sid) || {}).owner_id === req.user.id;
   if (msg.user_id !== req.user.id && !owner) return res.status(403).json({ error: 'нельзя' });
   const orphaned = uploadUrlsOfMessageRows(selectMessageUploadRows('id=?', mid));
-  const removeMessage = db.transaction(() => {
-    const changed = db.prepare('DELETE FROM messages WHERE id=? AND server_id=?').run(mid, sid).changes;
-    db.prepare('DELETE FROM reactions WHERE server_id=? AND msg_id=?').run(sid, mid);
-    return { changed, revision: changed > 0 ? bumpChatRevision(sid) : currentChatRevision(sid) };
-  });
-  const removed = removeMessage();
-  if (removed.changed > 0) {
-    chatRealtime.broadcast(sid, () => messageDeletedEvent(
-      sid, removed.revision, mid, chatRealtime.maxEventBytes,
-    ));
-    scheduleLegacyChatRefresh(req, sid);
-  }
-  res.json({ ok: true, revision: removed.revision });
+  db.prepare('DELETE FROM messages WHERE id=?').run(mid);
+  db.prepare('DELETE FROM reactions WHERE server_id=? AND msg_id=?').run(sid, mid);
+  res.json({ ok: true });
   // Файлы удалённого сообщения больше никому не нужны — если на них не ссылается ничто другое
   // (цитата в чужом сообщении, аватар). Разбор отложенный: см. queueUploadRelease.
   queueUploadRelease(orphaned);
 });
 
-// Deployment treats this exact marker as a compatibility contract, not merely liveness. Never
-// expose a web image that needs durable auth/media isolation until the running API advertises both.
-const HEALTH_CAPABILITY_MARKER = 'ok persistent-v1 voice-media-v1';
-app.get('/healthz', (req, res) => res.type('text/plain').send(HEALTH_CAPABILITY_MARKER));
+app.get('/healthz', (req, res) => res.send('ok'));
 
 /* ---------- INTERNAL RELEASE PATCH NOTES ----------
  * CI вызывает эти маршруты только изнутри token-контейнера. Prepare выполняется ДО замены
@@ -4161,15 +2842,13 @@ function sendReleaseRefresh(ws, serverId, messageId) {
   if (ws._releaseRefreshAckSids.has(sid)) return false;
   const now = Date.now();
   if (now - (ws._releaseRefreshSentAt.get(sid) || 0) < RELEASE_REFRESH_COOLDOWN_MS) return false;
-  const sent = sendBoundedNotifyFrames(new Set([ws]), { t: 'chat-refresh', serverId, lastReleaseSid: sid });
-  if (sent.delivered !== 1) return false;
-  // Sending the command is not an ACK: the following HTTP history merge may still fail.
-  // The client acknowledges lastReleaseSid in its next presence frame only after that merge.
-  if (ws._releaseRefreshSentAt.size >= 64 && !ws._releaseRefreshSentAt.has(sid)) {
-    ws._releaseRefreshSentAt.delete(ws._releaseRefreshSentAt.keys().next().value);
-  }
-  ws._releaseRefreshSentAt.set(sid, now);
-  return true;
+  try {
+    ws.send(JSON.stringify({ t: 'chat-refresh', serverId, lastReleaseSid: sid }));
+    // Sending the command is not an ACK: the following HTTP history merge may still fail.
+    // The client acknowledges lastReleaseSid in its next presence frame only after that merge.
+    ws._releaseRefreshSentAt.set(sid, now);
+    return true;
+  } catch { return false; }
 }
 
 function recoverRecentReleaseForSocket(ws, serverId) {
@@ -4272,9 +2951,7 @@ if (process.env.NODE_ENV !== 'production') {
 /* JSON errors for body-parser / static failures */
 app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
-  if (err && (err.type === 'entity.too.large' || err.status === 413)) {
-    return res.status(413).json({ error: { code: 'PAYLOAD_TOO_LARGE', message: 'Тело запроса слишком большое.' } });
-  }
+  if (err && (err.type === 'entity.too.large' || err.status === 413)) return res.status(413).json({ error: 'Файл больше 10 МБ' });
   if (err && err.status === 404) return res.status(404).json({ error: 'Не найдено' });
   if (err && (err.type === 'entity.parse.failed' || (err.status === 400 && err instanceof SyntaxError))) {
     return res.status(400).json({ error: { code: 'INVALID_JSON', message: 'Некорректный JSON.' } });
@@ -4301,24 +2978,7 @@ const treeSrv = attachTreeServer(server, {
     }
     if (!authManager) throw new Error('auth is starting');
     const context = authManager.verifySession(encoded, { requireVerified: true });
-    const sid = context.payload.sid || '';
-    return {
-      id: context.user.id,
-      u: context.user.username,
-      sid,
-      legacyTokenHash: sid ? '' : persistentSessions.legacyTokenKey(encoded),
-    };
-  },
-  authorizePeer: (uid, params) => {
-    if (uid === 'virtual-relay' && params.virtual) return true;
-    const sid = String(params.serverId || '');
-    if (!sid || !isMember(uid, sid)) return false;
-    if (params.role === 'discovery') return true;
-    const user = db.prepare('SELECT username FROM users WHERE id=?').get(uid);
-    if (!user) return false;
-    const identity = String(params.identity || '');
-    const base = identity.split('#', 1)[0];
-    return base === user.username;
+    return { id: context.user.id, u: context.user.username };
   },
   path: '/tree',
   stunServers: STUN_URLS.map((urls) => ({ urls })),
@@ -4329,17 +2989,15 @@ const treeSrv = attachTreeServer(server, {
 
 /* ---------- Глобальный notify-WS (/ws): уведомления по любому серверу, вкл. не подключённый ---------- */
 // maxPayload: дефолт ws — 100 МиБ. Клиент шлёт сюда только presence/ack-фреймы в сотни байт.
-const notifyWss = new WebSocketServer({ noServer: true, maxPayload: 4 * 1024 });
-const notifyInboundGuard = createNotifyInboundGuard();
+const notifyWss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
 notifyWss.on('error', (e) => console.error('[notify-ws] server error:', e && e.message));
 server.on('upgrade', (req, socket, head) => {
   let url; try { url = new URL(req.url, 'http://internal'); } catch { return; }
   if (url.pathname !== '/ws') return; // не наш путь — оставляем tree-хендлеру
   let context;
-  const notifyToken = url.searchParams.get('token') || '';
   try {
     if (!authManager) throw new Error('auth is starting');
-    context = authManager.verifySession(notifyToken, { requireVerified: true });
+    context = authManager.verifySession(url.searchParams.get('token') || '', { requireVerified: true });
   }
   catch (e) { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
   const uid = context.user.id;
@@ -4347,80 +3005,40 @@ server.on('upgrade', (req, socket, head) => {
   notifyWss.handleUpgrade(req, socket, head, (ws) => {
     ws._away = false; // idle-статус сессии: клиент шлёт {t:'presence',away} при бездействии. Юзер «away» (жёлтый), если ВСЕ его сокеты idle.
     ws._activeServerId = '';
-    ws._chatServerId = '';
-    ws._chatProtocolV1 = false;
     ws._userId = uid;
-    ws._authSessionId = typeof context.payload.sid === 'string' ? context.payload.sid : '';
-    ws._authLegacyTokenHash = ws._authSessionId ? '' : persistentSessions.legacyTokenKey(notifyToken);
-    ws._openedAt = Date.now();
     ws._releaseRefreshAckSids = new Set();
     ws._releaseRefreshSentAt = new Map();
-    ws._chatResyncServers = new Set();
-    ws._chatResyncReasons = new Map();
-    ws._chatResyncAll = false;
     ws._isAlive = true;
     let set = notifyConns.get(uid); if (!set) { set = new Set(); notifyConns.set(uid, set); }
-    // Capacity refusal affects only this extra realtime transport. It neither revokes nor shortens
-    // the account session, and existing devices stay stable instead of evicting one another.
-    if (!admitBoundedNotifySocket(set, ws, MAX_NOTIFY_SOCKETS_PER_ACCOUNT)) return;
-    // Rollout capability: clients keep the legacy LiveKit path until this authenticated frame is
-    // observed, then HTTP-resync before accepting canonical chat-event incrementals.
-    try { ws.send(JSON.stringify(chatReadyEvent())); } catch (e) { /**/ }
+    set.add(ws);
     // A newly opened socket only observes the lease; reconnect never claims it.
     try { ws.send(JSON.stringify(voiceLeaseEvent(voiceLeases.read(uid), 'snapshot'))); } catch (e) { /**/ }
     ws.on('close', () => { const s = notifyConns.get(uid); if (s) { s.delete(ws); if (!s.size) notifyConns.delete(uid); } });
-    ws.on('pong', () => { ws._isAlive = true; chatRealtime.flushSocket(ws); });
+    ws.on('pong', () => { ws._isAlive = true; });
     ws.on('error', () => { try { ws.close(); } catch (e) {} });
     ws.on('message', (data) => {
       try {
-        const inspected = notifyInboundGuard.inspect(ws, data);
-        if (!inspected.allowed) {
-          try { ws.close(inspected.code, inspected.reason); } catch { try { ws.terminate(); } catch { /**/ } }
-          return;
-        }
-        const d = inspected.value;
-        chatRealtime.flushSocket(ws);
+        const d = JSON.parse(data);
+        if (!d) return;
         // Прикладной ping/pong. Транспортный ws.ping() браузеру не виден из JS (pong шлёт сам движок),
         // поэтому клиент не может отличить живой сокет от полуоткрытого и никогда не переподключался.
         // Этот ответ — единственный регулярный входящий фрейм, по которому клиент судит о живости.
         if (d.t === 'ping') { try { ws.send(JSON.stringify({ t: 'pong' })); } catch (e) { /**/ } return; }
         if (d.t !== 'presence') return;
-        if (d.chatProtocol === 1) ws._chatProtocolV1 = true;
         ws._away = !!d.away;
         const requested = typeof d.activeServerId === 'string' ? d.activeServerId.trim().slice(0, 80) : '';
         const activeServerId = requested && isMember(uid, requested) ? requested : '';
-        const activeChanged = activeServerId !== ws._activeServerId;
+        const changed = activeServerId !== ws._activeServerId;
         ws._activeServerId = activeServerId;
-        const requestedConnected = typeof d.connectedServerId === 'string' ? d.connectedServerId.trim().slice(0, 80) : '';
-        const chatServerId = requestedConnected && isMember(uid, requestedConnected) ? requestedConnected : '';
-        const chatChanged = chatServerId !== ws._chatServerId;
-        ws._chatServerId = chatServerId;
         const lastReleaseSid = Number(d.lastReleaseSid);
-        // Only acknowledge a refresh this exact authenticated socket was actually asked to merge.
-        // Arbitrary presence ids must not grow the ACK set or pre-ack a future release forever.
-        if (Number.isSafeInteger(lastReleaseSid) && lastReleaseSid > 0
-          && ws._releaseRefreshSentAt.has(lastReleaseSid)) {
-          if (ws._releaseRefreshAckSids.size >= 64 && !ws._releaseRefreshAckSids.has(lastReleaseSid)) {
-            ws._releaseRefreshAckSids.delete(ws._releaseRefreshAckSids.values().next().value);
-          }
+        if (Number.isSafeInteger(lastReleaseSid) && lastReleaseSid > 0) {
           ws._releaseRefreshAckSids.add(lastReleaseSid);
           ws._releaseRefreshSentAt.delete(lastReleaseSid);
         }
         // Не refetch-им историю на каждом обычном входе. Узкая recovery-проверка нужна только
         // для недавнего release, который мог быть записан, пока API/notify-WS перезапускались.
-        if (activeChanged && activeServerId && ws.readyState === 1) {
+        if (changed && activeServerId && ws.readyState === 1) {
           recoverRecentReleaseForSocket(ws, activeServerId);
-          if (!ws._chatProtocolV1) {
-            sendBoundedNotifyFrames(new Set([ws]), {
-              t: 'chat-refresh', serverId: activeServerId, reason: 'chat-mutation',
-            });
-          }
-        }
-        // Subscription ACK comes only after membership validation and assignment. The client now
-        // fetches a revisioned HTTP snapshot while subsequent events are already routed/buffered.
-        if (chatChanged && chatServerId && ws.readyState === 1) {
-          chatRealtime.requestResync(ws, chatServerId, 'reconnect');
-          chatRealtime.flushSocket(ws);
         }
       } catch (e) { /* ping/мусор игнорим */ }
     });
@@ -4496,21 +3114,11 @@ async function startServer() {
       console.warn('[auth] email delivery is unavailable; legacy sessions remain accessible until SMTP is configured');
     }
   }
-  persistentSessions = createPersistentSessionManager({
-    db,
-    sessionSecret: SESSION_SECRET,
-    accessTtlSeconds: boundedIntegerEnv('AUTH_ACCESS_TTL_SEC', 900, 300, 3600),
-  });
   authManager = createAuthManager({
     db,
     mailer,
     codePepper,
     sessionSecret: SESSION_SECRET,
-    verifyAccessSession: (payload, user) => persistentSessions.verifyAccessPayload(payload, user),
-    verifyLegacySession: (token, user) => persistentSessions.verifyLegacyToken(token, user),
-    preserveSecuritySession: ({ sessionId, user, reason, clientKind }) => (
-      persistentSessions.preserveAfterSecurityChange(sessionId, user, reason, clientKind)
-    ),
     logger: {
       warn: (message) => console.warn(message),
       error: (message) => console.error(message),

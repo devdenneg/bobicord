@@ -1,6 +1,6 @@
 'use strict';
 const assert = require('assert');
-const { planUploadSweep, uploadUrlsOfMessageRows, normalizeUploadRef, uploadRefsInText, isOwnedUploadRow } = require('./uploadsGc');
+const { planUploadSweep, uploadUrlsOfMessageRows, normalizeUploadRef } = require('./uploadsGc');
 
 const HOUR = 3600_000;
 const DAY = 24 * HOUR;
@@ -62,29 +62,6 @@ const legacy = (url, ageMs, size = 100) => ({ url, size, createdAt: null, mtimeM
   assert.deepStrictEqual(uploadUrlsOfMessageRows(null), []);
 }
 
-// Старые версии могли обрезать JSON после stringify. Даже из такого хвоста извлекаем только
-// строгие локальные upload-пути, чтобы миграционная уборка не удаляла реально показанный файл.
-{
-  const broken = '{"thumb":"https://reelay.online/api/uploads/quoted.webp"';
-  assert.deepStrictEqual(uploadRefsInText(broken), ['/api/uploads/quoted.webp']);
-  assert.deepStrictEqual(uploadRefsInText('/api/uploads/../../etc/passwd'), []);
-  assert.deepStrictEqual(uploadUrlsOfMessageRows([{ attachments: '[{"url":"/api/files/doc.pdf"', reply_to: broken }]), [
-    '/api/files/doc.pdf', '/api/uploads/quoted.webp',
-  ]);
-}
-
-// URL, написанный в имени вложения или тексте цитаты, не является файловой ссылкой. Раньше
-// проверка LIKE по сырому JSON давала ложную ссылку и позволяла удерживать файл от быстрой уборки.
-{
-  const mentioned = '/api/uploads/not-a-reference.png';
-  const rows = [{
-    image: '',
-    attachments: JSON.stringify([{ url: '/api/files/real.bin', name: mentioned }]),
-    reply_to: JSON.stringify({ text: mentioned }),
-  }];
-  assert.deepStrictEqual(uploadUrlsOfMessageRows(rows), ['/api/files/real.bin']);
-}
-
 // Сквозной сценарий: сообщение удалили, но картинка осталась в чужой цитате — файл обязан выжить.
 {
   const quoted = '/api/uploads/quoted.png';
@@ -119,19 +96,6 @@ const legacy = (url, ageMs, size = 100) => ({ url, size, createdAt: null, mtimeM
   }
   const r = plan([tracked(rel, 30 * DAY)], refs);
   assert.deepStrictEqual(r.remove, [], 'файл, процитированный абсолютной ссылкой, не удаляется');
-}
-
-// Пользовательский URL можно закрепить в новом сообщении/аватаре/иконке только владельцу
-// активной записи нужного типа. Это не даёт чужим ссылкам удерживать файл от уборки.
-{
-  const image = { user_id: 'u1', kind: 'image', released: 0 };
-  const file = { user_id: 'u1', kind: 'file', released: 0 };
-  assert.strictEqual(isOwnedUploadRow(image, 'u1', 'image'), true);
-  assert.strictEqual(isOwnedUploadRow(file, 'u1', ['image', 'file']), true);
-  assert.strictEqual(isOwnedUploadRow(image, 'u2', 'image'), false, 'чужую загрузку нельзя присвоить ссылкой');
-  assert.strictEqual(isOwnedUploadRow({ ...image, released: 1 }, 'u1', 'image'), false, 'удалённую загрузку нельзя воскресить ссылкой');
-  assert.strictEqual(isOwnedUploadRow(file, 'u1', 'image'), false, 'тип файла обязан совпадать с назначением');
-  assert.strictEqual(isOwnedUploadRow(null, 'u1', 'image'), false);
 }
 
 console.log('uploads-gc-test: все проверки прошли');
