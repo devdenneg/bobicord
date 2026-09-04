@@ -7,6 +7,7 @@ export interface AudioDeviceLike {
 export interface AudioDeviceChoice {
   id: string;
   label: string;
+  unavailable?: boolean;
 }
 
 export interface AppleMobilePlatform {
@@ -21,8 +22,16 @@ function isDefaultDevice(device: AudioDeviceLike): boolean {
   const label = normalized(device.label);
   return !device.deviceId
     || device.deviceId === 'default'
+    || device.deviceId === 'communications'
     || label === 'default'
     || label === 'по умолчанию';
+}
+
+export function withSelectedAudioDevice(choices: AudioDeviceChoice[], selectedId: string): AudioDeviceChoice[] {
+  if (!selectedId || choices.some((device) => device.id === selectedId)) return choices;
+  // Missing labels/devices before permission or during route changes are not proof that the saved
+  // preference is invalid. Keep it visible and never silently rewrite settings from enumeration.
+  return [...choices, { id: selectedId, label: 'Выбранное устройство недоступно', unavailable: true }];
 }
 
 export function isAppleMobilePlatform(platform: AppleMobilePlatform): boolean {

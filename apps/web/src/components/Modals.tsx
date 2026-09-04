@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent as ReactKeyboardEvent } from 'react';
-import { Room } from 'livekit-client';
 import { api, isApiError, resolveUploadUrl, setToken, webOrigin } from '../api';
 import {
   beginAuthSessionHandoff,
@@ -7,7 +6,8 @@ import {
   useStore,
   getEngine,
 } from '../store';
-import { getSettings, setSettings } from '../settings';
+import { getSettings, setSettings, subscribeSettings } from '../settings';
+import { audioDeviceInventory } from '../audioDeviceInventory';
 import { THEMES, getTheme, setTheme } from '../theme';
 import { playSound } from '../sounds';
 import { Icon } from '../Icon';
@@ -28,7 +28,7 @@ import {
   audioDeviceChoices,
   audioOutputChoices,
   currentAppleMobilePlatform,
-  type AudioDeviceChoice,
+  withSelectedAudioDevice,
 } from '../audioDevices';
 
 function CreateModal() {
@@ -684,27 +684,16 @@ function SettingsModal() {
   const [, force] = useState(0); const rerender = () => force((n) => n + 1);
   const s = getSettings();
   const appleMobile = currentAppleMobilePlatform();
-  const [ins, setIns] = useState<AudioDeviceChoice[]>([]); const [outs, setOuts] = useState<AudioDeviceChoice[]>([]);
-  const [outputViaInput, setOutputViaInput] = useState(false);
+  const [inventory, setInventory] = useState(audioDeviceInventory.getSnapshot);
+  const output = audioOutputChoices(appleMobile, inventory.inputs, inventory.outputs);
+  // A saved iOS input route must remain visible when privacy filtering temporarily hides it.
+  const outputViaInput = output.viaInput || (appleMobile && !output.choices.length && !!s.input && !s.output);
+  const ins = withSelectedAudioDevice(audioDeviceChoices(inventory.inputs), s.input);
+  const outs = withSelectedAudioDevice(output.choices, outputViaInput ? s.input : s.output);
   const [binding, setBinding] = useState(false);
   const [captureAction, setCaptureAction] = useState<KeybindAction | null>(null);
-  useEffect(() => {
-    let disposed = false, generation = 0;
-    const load = () => {
-      const requestGeneration = ++generation;
-      // Enumeration must not start/stop an extra capture on iOS while a call owns the mic.
-      void Promise.all([Room.getLocalDevices('audioinput', false), Room.getLocalDevices('audiooutput', false)]).then(([inputs, outputs]) => {
-      if (disposed || generation !== requestGeneration) return;
-      setIns(audioDeviceChoices(inputs));
-      const output = audioOutputChoices(appleMobile, inputs, outputs);
-      setOuts(output.choices);
-      setOutputViaInput(output.viaInput);
-    }).catch(() => {});
-    };
-    load();
-    navigator.mediaDevices?.addEventListener?.('devicechange', load);
-    return () => { disposed = true; navigator.mediaDevices?.removeEventListener?.('devicechange', load); };
-  }, [appleMobile]);
+  useEffect(() => audioDeviceInventory.subscribe(setInventory), []);
+  useEffect(() => subscribeSettings(rerender), []);
   useEffect(() => { if (!binding) return; const k = (e: KeyboardEvent) => { e.preventDefault(); setSettings({ pttKey: e.code }); setBinding(false); rerender(); }; window.addEventListener('keydown', k, { once: true }); return () => window.removeEventListener('keydown', k); }, [binding]);
   const E = getEngine();
   const upd = (patch: Partial<AudioSettings>, act?: () => void) => { setSettings(patch); act?.(); rerender(); };
@@ -735,7 +724,7 @@ function SettingsModal() {
             <h2><Icon name="mic-sm" />Голос и звук</h2>
             <div className="grp">
               <div className="gt">Микрофон</div>
-              {!appleMobile ? <div className="fld"><label>Устройство ввода</label><select value={s.input} onChange={(e) => upd({ input: e.target.value }, () => E?.reapplyMic())}><option value="">По умолчанию</option>{ins.map((d) => <option key={d.id} value={d.id}>{d.label}</option>)}</select></div>
+              {!appleMobile ? <div className="fld"><label>Устройство ввода</label><select value={s.input} onFocus={audioDeviceInventory.refresh} onPointerDown={audioDeviceInventory.refresh} onChange={(e) => upd({ input: e.target.value }, () => { void E?.reapplyMic(); E?.restartLevelMeter(); })}><option value="">По умолчанию</option>{ins.map((d) => <option key={d.id} value={d.id} disabled={d.unavailable}>{d.label}</option>)}</select></div>
                 : <div className="mm-hint">На iPhone и iPad микрофон выбирается системой вместе с маршрутом звука.</div>}
               <div className="fld" style={{ marginTop: 10 }}><label>Шумоподавление</label>
                 <select value={s.nsMode} onChange={(e) => upd({ nsMode: e.target.value as AudioSettings['nsMode'] }, () => { E?.reapplyMic(); E?.restartLevelMeter(); })}>
@@ -755,14 +744,14 @@ function SettingsModal() {
             </div>
             <div className="grp"><div className="gt">Звук</div>
               <div className="fld"><label>{outputViaInput ? 'Маршрут звука' : 'Устройство вывода'}</label>
-                <select value={outputViaInput ? s.input : s.output} onChange={(e) => {
+                <select value={outputViaInput ? s.input : s.output} onFocus={audioDeviceInventory.refresh} onPointerDown={audioDeviceInventory.refresh} onChange={(e) => {
                   const id = e.target.value;
                   if (outputViaInput) {
-                    upd({ input: id, output: '' }, () => { void E?.reapplyMic('route').then(() => E.applyOutput()); });
+                    upd({ input: id, output: '' }, () => { void E?.reapplyMic('route').then(() => E.applyOutput()); E?.restartLevelMeter(); });
                   } else upd({ output: id }, () => { void E?.applyOutput(); });
                 }}>
                   <option value="">{outputViaInput ? 'Автоматически' : 'По умолчанию'}</option>
-                  {outs.map((d) => <option key={d.id} value={d.id}>{d.label}</option>)}
+                  {outs.map((d) => <option key={d.id} value={d.id} disabled={d.unavailable}>{d.label}</option>)}
                 </select>
               </div>
               <div className="fld"><label>Общая громкость: {s.master}%</label><input type="range" min={0} max={100} value={s.master} onChange={(e) => upd({ master: +e.target.value }, () => E?.applyMaster())} /></div>

@@ -1,17 +1,17 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Room } from 'livekit-client';
 import { useStore, getEngine } from '../store';
 import { useEngine } from '../hooks';
 import { Icon } from '../Icon';
-import { getSettings, setSettings } from '../settings';
+import { getSettings, setSettings, subscribeSettings } from '../settings';
+import { audioDeviceInventory } from '../audioDeviceInventory';
 import { isTauri, onBroadcastStopped, stopNativeBroadcast } from '../native';
 import { endAnyBroadcasterSession } from '../diag';
 import {
   audioDeviceChoices,
   audioOutputChoices,
   currentAppleMobilePlatform,
-  type AudioDeviceChoice,
+  withSelectedAudioDevice,
 } from '../audioDevices';
 
 /* Вещание — только из нативного клиента (CLAUDE.md инвариант 2). Конфиг/статистика — в BroadcastModal. */
@@ -62,12 +62,16 @@ function ShareButton() {
 function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
   const E = getEngine();
   const [open, setOpen] = useState(false);
-  const [devs, setDevs] = useState<AudioDeviceChoice[]>([]);
-  const [outputViaInput, setOutputViaInput] = useState(false);
+  const [inventory, setInventory] = useState(audioDeviceInventory.getSnapshot);
+  const [, force] = useState(0);
   const [activeIndex, setActiveIndex] = useState(0);
   const [position, setPosition] = useState<{ left: number; top: number; maxHeight: number; above: boolean } | null>(null);
   const appleMobile = currentAppleMobilePlatform();
-  const cur = kind === 'input' || outputViaInput ? getSettings().input : getSettings().output;
+  const settings = getSettings();
+  const output = useMemo(() => audioOutputChoices(appleMobile, inventory.inputs, inventory.outputs), [appleMobile, inventory]);
+  const outputViaInput = kind === 'output' && (output.viaInput || (appleMobile && !output.choices.length && !!settings.input && !settings.output));
+  const cur = kind === 'input' || outputViaInput ? settings.input : settings.output;
+  const devs = useMemo(() => withSelectedAudioDevice(kind === 'input' ? audioDeviceChoices(inventory.inputs) : output.choices, cur), [kind, inventory, output, cur]);
   const ref = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -84,6 +88,7 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
     if (restoreFocus) requestAnimationFrame(() => triggerRef.current?.focus());
   };
   const openMenu = (initial: 'selected' | 'first' | 'last' = 'selected') => {
+    audioDeviceInventory.refresh();
     openFocusRef.current = initial;
     const selected = cur ? devs.findIndex((device) => device.id === cur) + 1 : 0;
     const next = initial === 'first' ? 0 : initial === 'last' ? optionCount - 1 : Math.max(0, selected);
@@ -92,43 +97,30 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
     setOpen(true);
     requestAnimationFrame(() => menuRef.current?.querySelector<HTMLElement>(`[data-menu-index="${next}"]`)?.focus());
   };
+  useEffect(() => audioDeviceInventory.subscribe(setInventory), []);
+  useEffect(() => subscribeSettings(() => force((n) => n + 1)), []);
   useEffect(() => {
     if (!open) return;
-    let generation = 0, disposed = false;
-    const load = () => {
-      const requestGeneration = ++generation;
-      const request = kind === 'output' && appleMobile
-        ? Promise.all([Room.getLocalDevices('audioinput', false), Room.getLocalDevices('audiooutput', false)])
-          .then(([inputs, outputs]) => audioOutputChoices(true, inputs, outputs))
-        : Room.getLocalDevices(kind === 'input' ? 'audioinput' : 'audiooutput', false)
-          .then((devices) => ({ choices: audioDeviceChoices(devices), viaInput: false }));
-      request.then(({ choices, viaInput }) => {
-        if (disposed || generation !== requestGeneration) return;
-        setDevs(choices);
-        setOutputViaInput(kind === 'output' && viaInput);
-        const selectedId = kind === 'input' || viaInput ? getSettings().input : getSettings().output;
-        const selected = selectedId ? choices.findIndex((device) => device.id === selectedId) + 1 : 0;
-        const intent = openFocusRef.current;
-        const next = intent === 'first' ? 0 : intent === 'last' ? choices.length : Math.max(0, selected);
-        openFocusRef.current = 'selected';
-        setActiveIndex(next);
-        requestAnimationFrame(() => menuRef.current?.querySelector<HTMLElement>(`[data-menu-index="${next}"]`)?.focus());
-      }).catch(() => {});
-    };
-    load();
     const onDoc = (e: PointerEvent) => {
       const target = e.target as Node | null;
       if (!target || ref.current?.contains(target) || menuRef.current?.contains(target)) return;
       closeMenu();
     };
     document.addEventListener('pointerdown', onDoc, true);
-    navigator.mediaDevices?.addEventListener?.('devicechange', load);
     return () => {
-      disposed = true;
       document.removeEventListener('pointerdown', onDoc, true);
-      navigator.mediaDevices?.removeEventListener?.('devicechange', load);
     };
-  }, [appleMobile, open, kind, cur]);
+  }, [open]);
+  useEffect(() => {
+    if (!open) return;
+    const selected = cur ? devs.findIndex((device) => device.id === cur) + 1 : 0;
+    const intent = openFocusRef.current;
+    const next = intent === 'first' ? 0 : intent === 'last' ? devs.length : Math.max(0, selected);
+    openFocusRef.current = 'selected';
+    setActiveIndex(next);
+    const frame = requestAnimationFrame(() => menuRef.current?.querySelector<HTMLElement>(`[data-menu-index="${next}"]`)?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [open, devs, cur]);
   useLayoutEffect(() => {
     if (!open) return;
     let frame = 0;
@@ -197,11 +189,13 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
     if (kind === 'input') {
       setSettings({ input: id });
       void E?.reapplyMic();
+      E?.restartLevelMeter();
     } else if (outputViaInput) {
       // iOS/iPadOS связывает Speakerphone/earpiece с audioinput, хотя для пользователя это
       // именно маршрут вывода. Переснимаем мик один раз и затем возобновляем удалённый звук.
       setSettings({ input: id, output: '' });
       void E?.reapplyMic('route').then(() => E.applyOutput());
+      E?.restartLevelMeter();
     } else {
       setSettings({ output: id });
       void E?.applyOutput();
@@ -246,9 +240,9 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
       <button role="menuitemradio" aria-checked={!cur} tabIndex={activeIndex === 0 ? 0 : -1} data-menu-index="0"
         className={'vd-devitem' + (!cur ? ' on' : '')} onFocus={() => setActiveIndex(0)} onClick={() => pick('')}>{outputViaInput ? 'Автоматически' : 'По умолчанию'}</button>
       {devs.map((d, index) => (
-        <button role="menuitemradio" aria-checked={cur === d.id} tabIndex={activeIndex === index + 1 ? 0 : -1}
+        <button role="menuitemradio" aria-checked={cur === d.id} aria-disabled={d.unavailable || undefined} tabIndex={activeIndex === index + 1 ? 0 : -1}
           data-menu-index={index + 1} key={d.id} className={'vd-devitem' + (cur === d.id ? ' on' : '')}
-          onFocus={() => setActiveIndex(index + 1)} onClick={() => pick(d.id)}>
+          onFocus={() => setActiveIndex(index + 1)} onClick={() => { if (!d.unavailable) pick(d.id); }}>
           {d.label}
         </button>
       ))}

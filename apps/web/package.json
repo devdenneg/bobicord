@@ -9,7 +9,7 @@
     "test:volume": "node src/volumeCurve.test.mjs",
     "test:chat-scroll": "node src/chatScroll.test.mjs",
     "test:chat-wallpaper": "node src/chatWallpaper.test.mjs",
-    "test:audio-devices": "node src/audioDevices.test.mjs",
+    "test:audio-devices": "node src/audioDevices.test.mjs && node --test src/audioDeviceInventory.test.mjs",
     "test:denoise": "node src/denoise.test.mjs",
     "test:voice-engine": "node src/engine.test.mjs",
     "test:version-entry": "node src/versionEntry.test.mjs",

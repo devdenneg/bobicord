@@ -14,6 +14,7 @@ const {
   audioDeviceChoices,
   audioOutputChoices,
   isAppleMobilePlatform,
+  withSelectedAudioDevice,
 } = await import('data:text/javascript,' + encodeURIComponent(js));
 
 const device = (deviceId, label, groupId = '') => ({ deviceId, label, groupId });
@@ -25,6 +26,7 @@ assert.equal(isAppleMobilePlatform({ userAgent: 'Mozilla/5.0 (Linux; Android 15)
 
 assert.deepEqual(audioDeviceChoices([
   device('default', 'По умолчанию'),
+  device('communications', 'Default communications device'),
   device('ios-default', 'По умолчанию'),
   device('mic-1', 'Встроенный микрофон'),
   device('mic-1', 'Встроенный микрофон'),
@@ -67,3 +69,9 @@ assert.deepEqual(audioOutputChoices(true, [device('route-speaker', 'Speakerphone
 });
 
 console.log('audio devices: ok');
+
+assert.deepEqual(withSelectedAudioDevice([], 'saved-mic'), [
+  { id: 'saved-mic', label: 'Выбранное устройство недоступно', unavailable: true },
+]);
+assert.deepEqual(withSelectedAudioDevice([{ id: 'saved-mic', label: 'USB' }], 'saved-mic'), [{ id: 'saved-mic', label: 'USB' }]);
+assert.deepEqual(withSelectedAudioDevice([], ''), []);

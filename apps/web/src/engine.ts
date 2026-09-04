@@ -19,6 +19,7 @@ import { createVadNode, destroyVadNode, type VadNode } from './vad';
 import { userVolumeToGain } from './volumeCurve';
 import { createMicrophoneAudioContext } from './microphoneAudioContext';
 import { currentAppleMobilePlatform } from './audioDevices';
+import { notifyAudioCaptureChanged } from './audioDeviceInventory';
 import { VoiceDiagnosticsRecorder, VoiceEventLoopStallMonitor, type VoiceDiagnosticEventInput } from './voiceDiagnostics';
 import { DiagnosticReportOutbox } from './diagnosticOutbox';
 import { summarizeVoiceDiagnosticStats, type VoiceDiagnosticStatsState } from './voiceDiagnosticStats';
@@ -1871,6 +1872,43 @@ export class Engine {
       noiseSuppression: currentAppleMobilePlatform() ? s.nsMode !== 'off' : s.nsMode === 'basic', autoGainControl: true, channelCount: 1 };
   }
 
+  // Device IDs can expire between sessions or disappear with a headset. Only an
+  // explicit missing device warrants one system-default retry, never permission,
+  // hardware-busy or unrelated constraints failures. A cancelled request owns
+  // neither the eventual stream nor a newer device selection.
+  private async acquireMicStream(current: () => boolean): Promise<{ stream: MediaStream; input: string } | null> {
+    const audio = this.micCapture();
+    const selectedInput = getSettings().input;
+    const ownsSelection = () => current() && getSettings().input === selectedInput;
+    if (!ownsSelection()) return null;
+    let stream: MediaStream;
+    let usedDefault = false;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio });
+    } catch (error) {
+      if (!ownsSelection()) return null;
+      const failure = error as { name?: string; constraint?: string };
+      const missingDevice = failure?.name === 'NotFoundError'
+        || (failure?.name === 'OverconstrainedError' && failure.constraint === 'deviceId');
+      if (!selectedInput || !missingDevice) throw error;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: { ...audio, deviceId: undefined } });
+      } catch (fallbackError) {
+        if (!ownsSelection()) return null;
+        throw fallbackError;
+      }
+      usedDefault = true;
+    }
+    if (!ownsSelection()) { stream.getTracks().forEach((track) => track.stop()); return null; }
+    if (usedDefault) setSettings({ input: '' }); // only commit after a successful, still-owned capture
+    const expectedInput = usedDefault ? '' : selectedInput;
+    if (!current() || getSettings().input !== expectedInput) { stream.getTracks().forEach((track) => track.stop()); return null; }
+    notifyAudioCaptureChanged(); // refresh previously hidden labels after permission, and the fallback selection
+    if (!current() || getSettings().input !== expectedInput) { stream.getTracks().forEach((track) => track.stop()); return null; }
+    if (usedDefault) this.hooks.toast('Выбранный микрофон недоступен — включён системный', 'warn');
+    return { stream, input: expectedInput };
+  }
+
   // строим цепочку: устройство -> [denoise?] -> preGate -> gain (микс/мут) -> published track
   //                                                     \-> vadDest (VAD/метр, ДО гейта — иначе
   //                                                         гейт слушает уже замолченный gain=0 сигнал
@@ -1897,7 +1935,9 @@ export class Engine {
     // second capture owner when a call starts, particularly on iOS audio routes.
     this.stopLevelMeter();
     const op = ++this.micEpoch;
-    const current = () => op === this.micEpoch && this.voiceIntentCurrent(expectedVoiceEpoch, room);
+    let capturedInput: string | undefined;
+    const current = () => op === this.micEpoch && this.voiceIntentCurrent(expectedVoiceEpoch, room)
+      && (capturedInput === undefined || getSettings().input === capturedInput);
     // Publication могла пережить сбой локального AudioContext. Перед новым pipeline обязательно ждём
     // её удаления — одновременно две mic publications дают разным слушателям разные «первые» треки.
     const stalePublication = room.localParticipant.getTrackPublication(Track.Source.Microphone)?.track;
@@ -1941,13 +1981,16 @@ export class Engine {
       void this.spCtx.resume().catch(() => {});
     }
     try {
-      raw = await navigator.mediaDevices.getUserMedia({ audio: this.micCapture() });
+      const captured = await this.acquireMicStream(current);
+      raw = captured?.stream ?? null;
+      capturedInput = captured?.input;
+      if (captured && getSettings().input !== captured.input) { await dispose(false); return false; }
     } catch (e) {
       await dispose(false);
       if (!current()) return false;
       throw e;
     }
-    if (!current()) { await dispose(false); return false; }
+    if (!raw || !current()) { await dispose(false); return false; }
     this.recordVoiceDiagnostic({ kind: 'mic_capture_finished', stage: 'mic_capture', outcome: 'ok', trackState: raw.getAudioTracks()[0]?.readyState ?? 'missing', audioContextState: ctx?.state ?? 'missing', micCapturePath: direct ? 'direct' : 'webaudio' });
     try {
     let preGate: AudioNode | null = null;
@@ -2181,16 +2224,7 @@ export class Engine {
     try {
       await this.stopMic(room);
       if (reapplyEpoch !== this.micReapplyEpoch || !this.voiceIntentCurrent(voiceEpoch, room)) return;
-      let started = false;
-      try { started = await this.startMic(voiceEpoch); }
-      catch (error) {
-        const name = String((error as any)?.name || '');
-        const selectedDeviceGone = !!getSettings().input && (name === 'NotFoundError' || name === 'OverconstrainedError');
-        if (!selectedDeviceGone || reapplyEpoch !== this.micReapplyEpoch || !this.voiceIntentCurrent(voiceEpoch, room)) throw error;
-        setSettings({ input: '' });
-        started = await this.startMic(voiceEpoch);
-        if (started && this.voiceIntentCurrent(voiceEpoch, room)) this.hooks.toast('Выбранный микрофон отключён — включён системный', 'warn');
-      }
+      const started = await this.startMic(voiceEpoch);
       // started===false при живом voice-intent значит одно: pipeline перехватила более свежая операция
       // (reapplyMic/toggleMic) — она и владеет состоянием. Писать сюда noMic нельзя, это протухшая
       // запись поверх нового владельца (ложное «микрофон недоступен» на каждой смене устройства).
@@ -2351,10 +2385,18 @@ export class Engine {
     // открытым до перезагрузки (индикатор «микрофон используется» вне звонка), а её RnnoiseWorkletNode
     // и MediaStreamSource оставались висеть, потому что поля объекта уже перезаписал победитель.
     const op = ++this.levelEpoch;
-    let stream: MediaStream;
-    try { stream = await navigator.mediaDevices.getUserMedia({ audio: this.micCapture() }); }
-    catch { this.hooks.toast('Нет доступа к микрофону', 'err'); return; }
-    const stale = () => op !== this.levelEpoch || this.levelListeners.size === 0 || this.inVoice;
+    let capturedInput: string | undefined;
+    const stale = () => op !== this.levelEpoch || this.levelListeners.size === 0 || this.inVoice
+      || (capturedInput !== undefined && getSettings().input !== capturedInput);
+    let stream: MediaStream | null;
+    try {
+      const captured = await this.acquireMicStream(() => !stale());
+      stream = captured?.stream ?? null;
+      capturedInput = captured?.input;
+      if (captured && getSettings().input !== captured.input) { stream?.getTracks().forEach((track) => track.stop()); return; }
+    }
+    catch { if (!stale()) this.hooks.toast('Нет доступа к микрофону', 'err'); return; }
+    if (!stream) return;
     if (stale()) { stream.getTracks().forEach((t) => t.stop()); return; }
     this.levelStream = stream;
     // Узлы держим локально и переносим в поля одним куском только после последнего гарда — иначе
@@ -2462,19 +2504,10 @@ export class Engine {
     }
     catch {
       if (reapplyEpoch !== this.micReapplyEpoch || !this.voiceIntentCurrent(voiceEpoch, room)) return;
-      // На iPhone/iPad встроенный маршрут вывода WebKit предоставляет как связанный audioinput,
-      // поэтому и обычный микрофон, и мобильный аудиомаршрут откатываются одним input reset.
-      setSettings({ input: '' });
-      try {
-        if (!await this.startMic(voiceEpoch) || reapplyEpoch !== this.micReapplyEpoch || !this.voiceIntentCurrent(voiceEpoch, room)) return;
-        this.noMic = false; this.micRetryAt = 0; this.micFailureNotified = false;
-        this.hooks.toast(route ? 'Аудиомаршрут недоступен — включён системный' : 'Выбранный микрофон недоступен — включён дефолтный', 'warn');
-      }
-      catch {
-        if (reapplyEpoch !== this.micReapplyEpoch || !this.voiceIntentCurrent(voiceEpoch, room)) return;
-        this.noMic = true; this.micRetryAt = Date.now() + 5000;
-        this.hooks.toast(route ? 'Не удалось переключить вывод звука' : 'Не удалось включить микрофон', 'err');
-      }
+      // acquireMicStream already owns the single deviceId fallback. In particular,
+      // permission denial or a failed fallback must not erase the saved selection.
+      this.noMic = true; this.micRetryAt = Date.now() + 5000;
+      this.hooks.toast(route ? 'Не удалось переключить вывод звука' : 'Не удалось включить микрофон', 'err');
     }
     this.emit();
     } finally { if (reapplyEpoch === this.micReapplyEpoch) this.micReapplying = false; }

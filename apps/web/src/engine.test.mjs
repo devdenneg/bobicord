@@ -11,6 +11,7 @@ const deferred = () => {
   return { promise, resolve, reject };
 };
 const flush = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
+const captureError = (name, constraint) => Object.assign(new Error(name), { name, ...(constraint ? { constraint } : {}) });
 
 class Events {
   listeners = new Map();
@@ -48,7 +49,7 @@ class AudioNode {
 }
 
 function fixture(engineSource = source, costs = {}, options = {}) {
-  let time = 1000, timerId = 1, captureCalls = 0, denoiseCalls = 0;
+  let time = 1000, timerId = 1, captureCalls = 0, denoiseCalls = 0, inventoryRefreshes = 0;
   const sources = [], contexts = [], vadNodes = [], diagnosticEvents = [];
   const timers = new Map();
   const schedule = (fn, delay = 0, repeat = false) => {
@@ -126,6 +127,7 @@ function fixture(engineSource = source, costs = {}, options = {}) {
     './chatScroll': { CHAT_SESSION_MESSAGE_LIMIT: 500 },
     './microphoneAudioContext': { createMicrophoneAudioContext: () => new Context() },
     './audioDevices': { currentAppleMobilePlatform: () => !!options.appleMobile },
+    './audioDeviceInventory': { notifyAudioCaptureChanged: () => { inventoryRefreshes++; } },
     './voiceDiagnostics': {
       VoiceDiagnosticsRecorder: class { active = false; start() { this.active = true; } record(event) { diagnosticEvents.push(event); } reset() { this.active = false; } buildReport() { return {}; } },
       VoiceEventLoopStallMonitor: class { start() {} stop() {} },
@@ -196,6 +198,7 @@ function fixture(engineSource = source, costs = {}, options = {}) {
   return { e, room, publication, settings, document, devices, Context, LocalAudioTrack, activeVoice, finish, timers, sources, contexts, vadNodes, diagnosticEvents,
     setCapture(fn) { capture = fn; }, get captureCalls() { return captureCalls; },
     get denoiseCalls() { return denoiseCalls; },
+    get inventoryRefreshes() { return inventoryRefreshes; },
     get time() { return time; }, advance(ms) { time += ms; },
   };
 }
@@ -626,6 +629,114 @@ for (const failure of [{ suspended: true }, { contextThrows: true }, { sourceThr
     if (previousStream === undefined) delete globalThis.MediaStream;
     else globalThis.MediaStream = previousStream;
   }
+}
+
+// Initial join retries a vanished explicit input exactly once; only successful default
+// capture commits the preference reset, and a mute made while waiting stays authoritative.
+for (const error of [captureError('NotFoundError'), captureError('OverconstrainedError', 'deviceId')]) {
+  const f = fixture(source, {}, { appleMobile: true }); f.activeVoice(null); f.settings.input = 'removed-headset';
+  const fallback = deferred(); const requests = [];
+  f.setCapture(({ audio }) => {
+    requests.push(audio);
+    return requests.length === 1 ? Promise.reject(error) : fallback.promise;
+  });
+  const starting = f.e.startMic(); await flush();
+  assert.equal(requests.length, 2); assert.equal(requests[0].deviceId.exact, 'removed-headset');
+  assert.equal(requests[1].deviceId, undefined); assert.equal(f.settings.input, 'removed-headset');
+  assert.equal(f.inventoryRefreshes, 0);
+  await f.e.toggleMic();
+  const stream = new Stream(); fallback.resolve(stream);
+  assert.equal(await starting, true); await flush();
+  assert.equal(f.settings.input, ''); assert.equal(f.inventoryRefreshes, 1);
+  assert.equal(f.e.manualMute, true); assert.equal(f.publication.track.isMuted, true);
+  assert.equal(f.e.micDirectTrack.enabled, false); assert.equal(stream.getAudioTracks()[0].enabled, true);
+  await f.e.stopMic();
+}
+
+// Permission, device-busy, network and unrelated constraints failures preserve explicit input.
+for (const error of [captureError('NotAllowedError'), captureError('NotReadableError'), captureError('AbortError'),
+  captureError('TypeError'), captureError('OverconstrainedError', 'sampleRate'), captureError('OverconstrainedError', 'channelCount'),
+  captureError('OverconstrainedError')]) {
+  const f = fixture(); f.activeVoice(null); f.settings.input = 'chosen-mic';
+  f.setCapture(async () => { throw error; });
+  await assert.rejects(f.e.startMic(), (caught) => caught === error);
+  assert.equal(f.captureCalls, 1); assert.equal(f.settings.input, 'chosen-mic'); assert.equal(f.inventoryRefreshes, 0);
+}
+{
+  const f = fixture(); f.activeVoice(null);
+  f.setCapture(async () => { throw captureError('NotFoundError'); });
+  await assert.rejects(f.e.startMic(), { name: 'NotFoundError' });
+  assert.equal(f.captureCalls, 1, 'system default has no second fallback');
+}
+
+// A failed default fallback is terminal for this attempt; reapply/watchdog cannot clear
+// the saved input and secretly try a third capture outside the common guard.
+for (const action of ['start', 'reapply', 'watchdog']) {
+  const f = fixture(); f.activeVoice(null); f.settings.input = 'chosen-mic';
+  f.setCapture(async () => { throw captureError('NotFoundError'); });
+  if (action === 'start') await assert.rejects(f.e.startMic(), { name: 'NotFoundError' });
+  else if (action === 'reapply') await f.e.reapplyMic();
+  else await f.e.checkMicAlive(true);
+  assert.equal(f.captureCalls, 2, `${action} has only one fallback`);
+  assert.equal(f.settings.input, 'chosen-mic'); assert.equal(f.inventoryRefreshes, 0);
+}
+{
+  const f = fixture(); f.activeVoice(null); f.settings.input = 'chosen-mic';
+  f.setCapture(async () => { throw captureError('NotAllowedError'); });
+  await f.e.reapplyMic(); assert.equal(f.captureCalls, 1); assert.equal(f.settings.input, 'chosen-mic');
+}
+
+// A newer device choice invalidates either result of the old request, not just its fallback.
+for (const succeeds of [true, false]) {
+  const f = fixture(); f.activeVoice(null); f.settings.input = 'old-mic';
+  const pending = deferred(); f.setCapture(() => pending.promise);
+  const starting = f.e.startMic(); await flush();
+  f.settings.input = 'new-mic';
+  const late = new Stream();
+  if (succeeds) pending.resolve(late); else pending.reject(captureError('NotFoundError'));
+  assert.equal(await starting, false);
+  assert.equal(f.captureCalls, 1); assert.equal(f.settings.input, 'new-mic'); assert.equal(f.inventoryRefreshes, 0);
+  if (succeeds) assert.equal(late.getAudioTracks()[0].readyState, 'ended');
+}
+for (const cancellation of ['choice', 'stop']) {
+  const f = fixture(); f.activeVoice(null); f.settings.input = 'old-mic';
+  const pending = deferred(); let calls = 0;
+  f.setCapture(() => ++calls === 1 ? Promise.reject(captureError('NotFoundError')) : pending.promise);
+  const starting = f.e.startMic(); await flush(); assert.equal(calls, 2);
+  if (cancellation === 'choice') f.settings.input = 'new-mic'; else await f.e.stopMic();
+  const late = new Stream(); pending.resolve(late);
+  assert.equal(await starting, false); await flush();
+  assert.equal(late.getAudioTracks()[0].readyState, 'ended'); assert.equal(f.inventoryRefreshes, 0);
+  assert.equal(f.settings.input, cancellation === 'choice' ? 'new-mic' : 'old-mic');
+}
+
+// Preview shares the same fallback and ownership behavior, including late default capture.
+{
+  const f = fixture(source, { denoise: 100 }); f.activeVoice(null); f.settings.input = 'old-mic'; f.settings.nsMode = 'rnnoise';
+  const raw = new Stream(); f.setCapture(async () => raw);
+  const starting = f.e.startMic(); await flush();
+  f.settings.input = 'new-mic';
+  assert.equal(await f.finish(starting), false, 'a newer input also invalidates post-capture async graph setup');
+  assert.equal(raw.getAudioTracks()[0].readyState, 'ended'); assert.equal(f.publication.track, null);
+}
+
+// Preview shares the same fallback and ownership behavior, including late default capture.
+{
+  const f = fixture(); f.settings.input = 'removed-mic'; f.e.levelListeners.add(() => {});
+  let calls = 0;
+  f.setCapture(() => ++calls === 1 ? Promise.reject(captureError('NotFoundError')) : Promise.resolve(new Stream()));
+  await f.e.startLevelMeter();
+  assert.equal(calls, 2); assert.equal(f.settings.input, ''); assert.ok(f.e.levelStream);
+  assert.equal(f.inventoryRefreshes, 1); f.e.stopLevelMeter();
+}
+{
+  const f = fixture(); f.settings.input = 'removed-mic'; f.e.levelListeners.add(() => {});
+  const pending = deferred(); let calls = 0;
+  f.setCapture(() => ++calls === 1 ? Promise.reject(captureError('OverconstrainedError', 'deviceId')) : pending.promise);
+  const preview = f.e.startLevelMeter(); await flush(); assert.equal(calls, 2);
+  f.e.stopLevelMeter(); const late = new Stream(); pending.resolve(late); await preview;
+  assert.equal(late.getAudioTracks()[0].readyState, 'ended'); assert.equal(f.settings.input, 'removed-mic');
+  assert.equal(f.inventoryRefreshes, 0); assert.equal(f.e.levelStream, null);
 }
 
 function gateStress(engineSource) {
