@@ -739,11 +739,13 @@ function SettingsModal() {
                 : <div className="mm-hint">На iPhone и iPad микрофон выбирается системой вместе с маршрутом звука.</div>}
               <div className="fld" style={{ marginTop: 10 }}><label>Шумоподавление</label>
                 <select value={s.nsMode} onChange={(e) => upd({ nsMode: e.target.value as AudioSettings['nsMode'] }, () => { E?.reapplyMic(); E?.restartLevelMeter(); })}>
-                  <option value="rnnoise">RNNoise (нейросеть)</option>
+                  <option value="rnnoise">{appleMobile ? 'Системное (вместо RNNoise)' : 'RNNoise (нейросеть)'}</option>
                   <option value="basic">Базовый (браузер)</option>
                   <option value="off">Нет</option>
                 </select>
-                <div className="mm-hint">RNNoise — нейросеть, режет фоновый гул (кулеры, гудение); Базовый — встроенный шумодав браузера; Нет — без обработки.</div>
+                <div className="mm-hint">{appleMobile
+                  ? 'На iPhone и iPad голос передаётся напрямую. Включённый шумодав использует системную обработку, чтобы отправка не зависела от Web Audio.'
+                  : 'RNNoise — нейросеть, режет фоновый гул (кулеры, гудение); Базовый — встроенный шумодав браузера; Нет — без обработки.'}</div>
               </div>
               <MicMeter />
               <div className="fld" style={{ marginTop: 10 }}><label>Режим передачи</label>

@@ -4,6 +4,7 @@ import vm from 'node:vm';
 import ts from 'typescript';
 
 function loadModule(name, globals = {}, dependencies = {}) {
+  dependencies = { './audioDevices': { currentAppleMobilePlatform: () => false }, ...dependencies };
   const source = readFileSync(new URL(name, import.meta.url), 'utf8');
   const js = ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
@@ -43,6 +44,16 @@ function context(sampleRate = 48_000, addModule = async () => {}) {
     audioWorklet: { addModule: () => { modules++; return addModule(); } },
     get modules() { return modules; },
   };
+}
+
+{
+  const options = [];
+  class AudioContext { constructor(value) { options.push(value); this.sampleRate = 44_100; } }
+  const { createMicrophoneAudioContext } = loadModule('microphoneAudioContext.ts', { AudioContext }, {
+    './audioDevices': { currentAppleMobilePlatform: () => true },
+  });
+  assert.equal(createMicrophoneAudioContext().sampleRate, 44_100);
+  assert.deepEqual(options, [undefined], 'iOS meter follows hardware sample rate, never forces RNNoise rate');
 }
 
 {

@@ -1,5 +1,5 @@
 import {
-  Room, RoomEvent, Track, LocalAudioTrack, AudioPresets, ConnectionQuality,
+  Room, RoomEvent, Track, TrackEvent, LocalAudioTrack, AudioPresets, ConnectionQuality,
   type RemoteParticipant, type Participant, type TrackPublication, type RemoteTrack,
 } from 'livekit-client';
 import { isWindowIdle, onWindowIdle } from './windowIdle';
@@ -18,6 +18,7 @@ import { createDenoiseNode, destroyDenoiseNode } from './denoise';
 import { createVadNode, destroyVadNode, type VadNode } from './vad';
 import { userVolumeToGain } from './volumeCurve';
 import { createMicrophoneAudioContext } from './microphoneAudioContext';
+import { currentAppleMobilePlatform } from './audioDevices';
 import { VoiceDiagnosticsRecorder, VoiceEventLoopStallMonitor, type VoiceDiagnosticEventInput } from './voiceDiagnostics';
 import { DiagnosticReportOutbox } from './diagnosticOutbox';
 import { summarizeVoiceDiagnosticStats, type VoiceDiagnosticStatsState } from './voiceDiagnosticStats';
@@ -191,6 +192,9 @@ export class Engine {
   private micStateWrites = new WeakMap<LocalAudioTrack, Promise<void>>();
   private micHealthCleanup: (() => void) | null = null;
   private micGateTarget: number | null = null;
+  // On iOS publish a capture clone, not a WebAudio destination: a suspended meter
+  // must not suspend transmission. Only this clone is gated; raw keeps feeding VAD.
+  private micDirectTrack: MediaStreamTrack | null = null;
   private connectEpoch = 0; // поколение view-connect; протухший r.connect не помечает новую комнату готовой
   private voiceLeaseEpoch = 0; // серверный ownership fence текущей локальной voice-сессии
   private voiceLeaseSession = '';
@@ -451,6 +455,7 @@ export class Engine {
       micMode: getSettings().mode, publicationMuted: this.micPub()?.isMuted,
       trackState: this.micRaw?.getAudioTracks()[0]?.readyState ?? 'missing',
       audioContextState: (this.micActx?.state ?? 'missing') as VoiceDiagnosticEventInput['audioContextState'],
+      micCapturePath: this.micRaw ? (this.micDirectTrack ? 'direct' : 'webaudio') : undefined,
       canPlaybackAudio: this.voiceRoom?.canPlaybackAudio, ...event });
   }
   private reportVoiceDiagnostic(incident: VoiceDiagnosticIncident, completed = false) {
@@ -1445,10 +1450,14 @@ export class Engine {
   // клика уже потеряна. Подготавливаем оба контекста синхронно в начале первого входа; startMic ниже
   // заберёт micActx и построит на нём pipeline после завершения сетевой части.
   private prepareVoiceAudio() {
-    if (!this.micRaw && !this.micActx) this.micActx = createMicrophoneAudioContext();
-    this.spCtx = this.spCtx || new AudioContext();
-    this.micActx?.resume?.().catch(() => {});
-    this.spCtx.resume?.().catch(() => {});
+    try {
+      if (!this.micRaw && !this.micActx) this.micActx = createMicrophoneAudioContext();
+      this.spCtx = this.spCtx || new AudioContext();
+      this.micActx?.resume?.().catch(() => {});
+      this.spCtx.resume?.().catch(() => {});
+    } catch (error) {
+      if (!currentAppleMobilePlatform()) throw error; // iOS metering is optional
+    }
   }
 
   /* ---------- VOICE join/leave/switch (несколько каналов на сервер) ---------- */
@@ -1858,7 +1867,8 @@ export class Engine {
   // только часть каналов — второй проходит необработанным и может доминировать в RMS/метре.
   private micCapture() {
     const s = getSettings();
-    return { deviceId: s.input ? { exact: s.input } : undefined, echoCancellation: true, noiseSuppression: s.nsMode === 'basic', autoGainControl: true, channelCount: 1 };
+    return { deviceId: s.input ? { exact: s.input } : undefined, echoCancellation: true,
+      noiseSuppression: currentAppleMobilePlatform() ? s.nsMode !== 'off' : s.nsMode === 'basic', autoGainControl: true, channelCount: 1 };
   }
 
   // строим цепочку: устройство -> [denoise?] -> preGate -> gain (микс/мут) -> published track
@@ -1881,7 +1891,11 @@ export class Engine {
   private async startMicPipeline(expectedVoiceEpoch: number): Promise<boolean> {
     const room = this.voiceRoom;
     if (!room || !this.voiceIntentCurrent(expectedVoiceEpoch, room)) return false;
-    if (this.micRaw && this.micActx && this.micPub()?.track) return true;
+    if (this.micRaw && (this.micDirectTrack || this.micActx) && this.micPub()?.track) return true;
+    const direct = currentAppleMobilePlatform();
+    // A settings preview (including a pending permission result) must not remain a
+    // second capture owner when a call starts, particularly on iOS audio routes.
+    this.stopLevelMeter();
     const op = ++this.micEpoch;
     const current = () => op === this.micEpoch && this.voiceIntentCurrent(expectedVoiceEpoch, room);
     // Publication могла пережить сбой локального AudioContext. Перед новым pipeline обязательно ждём
@@ -1896,6 +1910,7 @@ export class Engine {
     let denoise: RnnoiseWorkletNode | null = null;
     let vadDest: MediaStreamAudioDestinationNode | null = null;
     let lat: LocalAudioTrack | null = null;
+    let directTrack: MediaStreamTrack | null = null;
     let disposed = false;
     const dispose = async (unpublish: boolean) => {
       if (disposed) return;
@@ -1903,6 +1918,7 @@ export class Engine {
       const waits: Promise<unknown>[] = [];
       if (unpublish && lat) { try { waits.push(room.localParticipant.unpublishTrack(lat, true)); } catch { /**/ } }
       if (lat) { try { lat.stop(); } catch { /**/ } }
+      directTrack?.stop();
       raw?.getTracks().forEach((t) => t.stop());
       destroyDenoiseNode(denoise);
       if (vadDest) { try { vadDest.disconnect(); } catch { /**/ } }
@@ -1912,14 +1928,18 @@ export class Engine {
     // Первый вход и ручная смена устройства заранее создают контекст непосредственно в обработчике
     // клика (prepareVoiceAudio/reapplyMic): после сетевых await пользовательская активация уже потеряна.
     // Автовосстановление без пользовательского жеста создаёт новый контекст здесь и страхуется unlock.
-    ctx = (!this.micRaw && this.micActx) || createMicrophoneAudioContext();
-    if (this.micActx === ctx) this.micActx = null; // pipeline локален до успешного publish/commit
-    void ctx.resume().catch(() => {});
+    try {
+      ctx = (!this.micRaw && this.micActx) || createMicrophoneAudioContext();
+      if (this.micActx === ctx) this.micActx = null; // pipeline локален до успешного publish/commit
+      void ctx.resume().catch(() => {});
+    } catch (error) { if (!direct) { await dispose(false); throw error; } }
     if (!current()) { await dispose(false); return false; }
     // spCtx тоже заранее подготавливается на первом входе: именно его анализатор открывает VAD-гейт.
     // При восстановлении без подготовленного контекста resume + gesture-unlock/watchdog остаются подстраховкой.
-    this.spCtx = this.spCtx || new AudioContext();
-    void this.spCtx.resume().catch(() => {});
+    if (!direct) {
+      this.spCtx = this.spCtx || new AudioContext();
+      void this.spCtx.resume().catch(() => {});
+    }
     try {
       raw = await navigator.mediaDevices.getUserMedia({ audio: this.micCapture() });
     } catch (e) {
@@ -1928,10 +1948,23 @@ export class Engine {
       throw e;
     }
     if (!current()) { await dispose(false); return false; }
-    this.recordVoiceDiagnostic({ kind: 'mic_capture_finished', stage: 'mic_capture', outcome: 'ok', trackState: raw.getAudioTracks()[0]?.readyState ?? 'missing', audioContextState: ctx.state });
+    this.recordVoiceDiagnostic({ kind: 'mic_capture_finished', stage: 'mic_capture', outcome: 'ok', trackState: raw.getAudioTracks()[0]?.readyState ?? 'missing', audioContextState: ctx?.state ?? 'missing', micCapturePath: direct ? 'direct' : 'webaudio' });
     try {
+    let preGate: AudioNode | null = null;
+    let gain: GainNode | null = null;
+    if (direct) {
+      directTrack = raw.getAudioTracks()[0].clone();
+      directTrack.enabled = false; // no audio before publication + ownership commit
+      lat = new LocalAudioTrack(directTrack);
+      try { if (ctx) preGate = ctx.createMediaStreamSource(raw); }
+      catch {
+        if (ctx) void ctx.close().catch(() => {});
+        ctx = null; // metering failure must not discard a working microphone
+      }
+    } else {
+    if (!ctx) throw new Error('Microphone AudioContext unavailable');
     const src = ctx.createMediaStreamSource(raw);
-    let preGate: AudioNode = src;
+    preGate = src;
     if (getSettings().nsMode === 'rnnoise') {
       denoise = await createDenoiseNode(ctx);
       if (!current()) { await dispose(false); return false; }
@@ -1948,7 +1981,7 @@ export class Engine {
       }
       else this.hooks.toast('Шумодав недоступен — звук без обработки', 'warn');
     }
-    const gain = ctx.createGain();
+    gain = ctx.createGain();
     gain.gain.value = 0; // до commit/applyGate не выпускаем звук из ещё не подтверждённого pipeline
     preGate.connect(gain);
     const dest = ctx.createMediaStreamDestination();
@@ -1958,11 +1991,16 @@ export class Engine {
     vadDest = ctx.createMediaStreamDestination();
     preGate.connect(vadDest);
     lat = new LocalAudioTrack(dest.stream.getAudioTracks()[0]);
+    }
     // Мьютим ДО publish (обязательно await — LocalAudioTrack.mute асинхронный, берёт свой lock):
     // AddTrackRequest несёт muted, поэтому SFU и все пиры сразу видят мут. Раньше трек публиковался
     // незамьюченным и глушился отдельным запросом следом — на каждом рестарте мика watchdog-ом у пиров
     // мигал бейдж «мик включился», а сам пользователь слышал щелчок мута, ничего не нажимая.
-    if (this.manualMute || this.deafened) { try { await lat.mute(); } catch { /**/ } }
+    // LocalTrack's async constructor synchronizes track.enabled with SDK isMuted.
+    // A clone.enabled=false assignment alone is overwritten before publish. Establish
+    // SDK mute unconditionally for direct capture and fail closed if it cannot be set.
+    if (direct) await lat.mute();
+    else if (this.manualMute || this.deafened) { try { await lat.mute(); } catch { /**/ } }
     if (!current()) { await dispose(false); return false; }
     try {
       await room.localParticipant.publishTrack(lat, { source: Track.Source.Microphone, dtx: true, red: true, audioPreset: AudioPresets.musicHighQuality });
@@ -1978,24 +2016,29 @@ export class Engine {
     this.micRaw = raw;
     this.micActx = ctx;
     this.micGain = gain;
+    this.micDirectTrack = directTrack;
     this.micGateTarget = null;
     this.micDenoise = denoise;
     this.micVadDest = vadDest;
-    this.recordVoiceDiagnostic({ kind: 'mic_published', stage: 'mic_publish', outcome: 'ok' });
+    this.recordVoiceDiagnostic({ kind: 'mic_published', stage: 'mic_publish', outcome: 'ok', micCapturePath: direct ? 'direct' : 'webaudio' });
     this.watchMicHealth(raw.getAudioTracks()[0], lat, ctx, op);
     void this.syncMicState();
-    this.micLevelAt = performance.now(); // отсчёт протухания стартует с момента запуска мика, а не с нуля
+    // Direct capture can speak without a functioning meter. Only a real level
+    // update may enable voice-activation gating on that path.
+    this.micLevelAt = direct ? -Infinity : performance.now();
     this.startVadWatchdog();
     // индикатор «говорит» + VAD на rAF-анализаторе — сразу (рабочий на переднем плане и на время загрузки
     // ворклета); как только VAD-ворклет поднимется, он перехватит vadOpen и снимет свой мик со spLoop.
-    this.attachAnalyser(this.me.username, vadDest.stream.getAudioTracks()[0]);
+    if (direct) {
+      if (ctx && preGate) this.attachAnalyser(this.me.username, raw.getAudioTracks()[0], ctx);
+    } else this.attachAnalyser(this.me.username, vadDest!.stream.getAudioTracks()[0]);
     this.applyGate();
     this.ensureVoiceAudioRunning(); // добить, если контекст всё ещё suspended (анлок на первый жест + watchdog)
     this.noMic = false;
     void this.setVoiceAttributes(room, this.wantedVoiceAttributes(room));
     // VAD на аудио-потоке (не на rAF): гейт активации голосом должен работать и в фоновой вкладке, где
     // requestAnimationFrame заморожен и spLoop не двигал бы vadOpen (микрофон молча гейтился в тишину).
-    void this.setupVadWorklet(ctx, preGate, op);
+    if (ctx && preGate) void this.setupVadWorklet(ctx, preGate, op);
     return true;
     } catch (error) {
       await dispose(true);
@@ -2028,6 +2071,7 @@ export class Engine {
   // Обработка уровня своего мика из VAD-ворклета: порог/хвост/шумовой фон + гейт + индикатор «говорю».
   // Дублирует ветку isMe в spLoop, но с хвостом по времени (такт ворклета ≠ такту rAF).
   private applyLocalLevel(rms: number) {
+    if (this.micDirectTrack && this.micActx?.state !== 'running') { this.applyGate(); return; }
     const db = rmsToDb(rms);
     const norm = dbToNorm(db);
     const threshold = this.thresholdNorm();
@@ -2083,19 +2127,34 @@ export class Engine {
   private micMutedTicks = 0;
   private micRetryAt = 0;
   private micFailureNotified = false;
-  private watchMicHealth(raw: MediaStreamTrack, published: LocalAudioTrack, ctx: AudioContext, generation: number) {
+  private watchMicHealth(raw: MediaStreamTrack, published: LocalAudioTrack, ctx: AudioContext | null, generation: number) {
     this.micHealthCleanup?.();
     const changed = () => {
       if (this.micEpoch !== generation || document.hidden) return;
       this.ensureVoiceAudioRunning();
+      this.applyGate();
       void this.checkMicAlive(false);
     };
     const tracks = [raw, published.mediaStreamTrack];
+    const direct = this.micDirectTrack === published.mediaStreamTrack ? this.micDirectTrack : null;
+    // SDK unmute first writes enabled=true and emits synchronously, before its
+    // promise settles. Reapply our gate in that same event, including hidden PTT
+    // and ownership loss. The raw device source is never disabled here.
+    const gateAfterUnmute = () => {
+      if (!direct) return;
+      if (this.micEpoch !== generation || this.micDirectTrack !== direct || this.micPub()?.track !== published) {
+        direct.enabled = false;
+        return;
+      }
+      this.applyGate();
+    };
+    if (direct) published.on(TrackEvent.Unmuted, gateAfterUnmute);
     for (const track of tracks) for (const event of ['ended', 'mute', 'unmute']) track.addEventListener(event, changed);
-    ctx.addEventListener('statechange', changed);
+    ctx?.addEventListener('statechange', changed);
     this.micHealthCleanup = () => {
       for (const track of tracks) for (const event of ['ended', 'mute', 'unmute']) track.removeEventListener(event, changed);
-      ctx.removeEventListener('statechange', changed);
+      ctx?.removeEventListener('statechange', changed);
+      if (direct) published.off(TrackEvent.Unmuted, gateAfterUnmute);
     };
   }
   private async checkMicAlive(fromWatchdog = false) {
@@ -2107,8 +2166,9 @@ export class Engine {
     const t = this.micRaw?.getAudioTracks()[0];
     const publication = room.localParticipant.getTrackPublication(Track.Source.Microphone);
     const processed = publication?.track?.mediaStreamTrack;
-    const ended = !this.micActx || this.micActx.state === 'closed' || !t || t.readyState === 'ended' || !processed || processed.readyState === 'ended';
-    const interrupted = t?.muted || processed?.muted || (this.micActx && this.micActx.state !== 'running');
+    const needsGraph = !this.micDirectTrack;
+    const ended = (needsGraph && (!this.micActx || this.micActx.state === 'closed')) || !t || t.readyState === 'ended' || !processed || processed.readyState === 'ended';
+    const interrupted = t?.muted || processed?.muted || (needsGraph && this.micActx && this.micActx.state !== 'running');
     if (!ended && interrupted && fromWatchdog) this.micMutedTicks++;
     else if (!interrupted) this.micMutedTicks = 0;
     if (!ended && !interrupted) {
@@ -2173,6 +2233,7 @@ export class Engine {
     ++this.micEpoch; // первым действием отменяем любой незавершённый gUM/RNNoise/publish
     this.micStartTask?.cancel();
     this.micHealthCleanup?.(); this.micHealthCleanup = null;
+    if (this.micDirectTrack) { this.micDirectTrack.enabled = false; this.micDirectTrack.stop(); this.micDirectTrack = null; }
     if (this.micGain) { this.micGain.gain.cancelScheduledValues(0); this.micGain.gain.value = 0; }
     this.micGateTarget = null;
     const p = room?.localParticipant.getTrackPublication(Track.Source.Microphone);
@@ -2208,7 +2269,7 @@ export class Engine {
   private vadStale(): boolean { return performance.now() - this.micLevelAt > VAD_STALE_MS; }
   // gain = 1 (передаём) либо 0 (мут/оглушение/PTT-не-нажат/ниже порога чувствительности)
   private applyGate() {
-    if (!this.micGain || !this.micActx) return;
+    if (!this.micDirectTrack && (!this.micGain || !this.micActx)) return;
     const s = getSettings();
     let target = 1;
     // Нет подтверждённого ownership — нет звука наружу. Особенно важно во время handoff и switch:
@@ -2216,16 +2277,23 @@ export class Engine {
     if (!this.inVoice || this.voiceReconnecting || this.voiceLeaseVerifying || this.voiceClaimPending !== 0 || this.voiceLeaseEpoch <= 0 || this.voiceLeaseSession !== this.sessionId()) target = 0;
     else if (this.manualMute || this.deafened) target = 0;
     else if (s.mode === 'ptt') target = this.pttDown ? 1 : 0;
-    else if (!document.hidden && !this.vadOpen && !this.vadStale()) target = 0;
+    else if (!document.hidden && !this.vadOpen && !this.vadStale()
+      && !(this.micDirectTrack && this.micActx?.state !== 'running')) target = 0;
+    if (this.micDirectTrack) {
+      // SDK unmute also writes enabled. Compare the actual clone, not a cached
+      // target; never disable the raw source that detects when speech resumes.
+      if (this.micDirectTrack.enabled !== !!target) this.micDirectTrack.enabled = !!target;
+      return;
+    }
     if (target === this.micGateTarget) return;
     this.micGateTarget = target;
-    const param = this.micGain.gain;
+    const param = this.micGain!.gain;
     // Keep the automation timeline bounded. Repeated watchdog/speech updates must not accumulate
     // thousands of ramps, and a manual mute must silence the local graph in the same event turn.
     try {
       param.cancelScheduledValues(0);
-      if (!target) param.setValueAtTime(0, this.micActx.currentTime);
-      else param.setTargetAtTime(1, this.micActx.currentTime, 0.015);
+      if (!target) param.setValueAtTime(0, this.micActx!.currentTime);
+      else param.setTargetAtTime(1, this.micActx!.currentTime, 0.015);
     } catch { param.value = target; }
   }
   // Сторож фейл-опена: сам по себе гейт пересчитывается только на событиях (замер уровня, мут, PTT),
@@ -2234,7 +2302,7 @@ export class Engine {
   private startVadWatchdog() {
     if (this.vadWatchdog != null) return;
     this.vadWatchdog = window.setInterval(() => {
-      if (!this.micGain) return;
+      if (!this.micGain && !this.micDirectTrack) return;
       if (getSettings().mode === 'voice') this.applyGate();
     }, VAD_WATCHDOG_MS);
   }
@@ -2304,7 +2372,7 @@ export class Engine {
       ctx.resume?.().catch(() => {});
       src = ctx.createMediaStreamSource(stream);
       let preAnalyser: AudioNode = src;
-      if (getSettings().nsMode === 'rnnoise') {
+      if (!currentAppleMobilePlatform() && getSettings().nsMode === 'rnnoise') {
         denoise = await createDenoiseNode(ctx);
         if (denoise) {
           src.connect(denoise);
@@ -2418,12 +2486,18 @@ export class Engine {
     const active = this.micStateWrites.get(track);
     if (active) return active;
     const current = () => this.inVoice && this.voiceRoom === room && this.micPub()?.track === track;
+    const direct = this.micDirectTrack === track.mediaStreamTrack ? this.micDirectTrack : null;
     const run = Promise.resolve().then(async () => {
       while (current()) {
         const muted = this.manualMute || this.deafened;
         if (track.isMuted === muted) break;
         try { await (muted ? track.mute() : track.unmute()); }
         catch { break; } // watchdog retries; never spin on a failed network operation
+        finally {
+          if (direct && this.micDirectTrack !== direct) direct.enabled = false;
+          else if (current()) this.applyGate();
+          else if (direct) direct.enabled = false; // a stopped/replaced clone stays closed after a late SDK write
+        }
       }
     }).finally(() => { if (this.micStateWrites.get(track) === run) this.micStateWrites.delete(track); });
     this.micStateWrites.set(track, run);
@@ -2504,14 +2578,14 @@ export class Engine {
   }
 
   /* ---------- speaking ---------- */
-  private attachAnalyser(username: string, mst: MediaStreamTrack) {
+  private attachAnalyser(username: string, mst: MediaStreamTrack, context?: AudioContext) {
     if (!mst) return;
     try {
       this.detachAnalyser(username);
-      this.spCtx = this.spCtx || new AudioContext();
-      this.spCtx.resume?.().catch(() => {});
-      const src = this.spCtx.createMediaStreamSource(new MediaStream([mst]));
-      const an = this.spCtx.createAnalyser(); an.fftSize = 512; an.smoothingTimeConstant = 0.5; src.connect(an);
+      const ctx = context || (this.spCtx = this.spCtx || new AudioContext());
+      ctx.resume?.().catch(() => {});
+      const src = ctx.createMediaStreamSource(new MediaStream([mst]));
+      const an = ctx.createAnalyser(); an.fftSize = 512; an.smoothingTimeConstant = 0.5; src.connect(an);
       this.analysers.set(username, { an, buf: new Uint8Array(an.fftSize), hold: 0, src });
       if (isWindowIdle()) {
         if (!this.spIdleTimer) this.spIdleTimer = window.setInterval(() => { if (this.analysers.size) this.spLoop(true); }, 150);
@@ -2533,6 +2607,7 @@ export class Engine {
     if (fromTimer || this.spTick % 3 === 0) {
       let changed = false;
       this.analysers.forEach((o, id) => {
+        if (id === this.me.username && this.micDirectTrack && this.micActx?.state !== 'running') return;
         o.an.getByteTimeDomainData(o.buf as any);
         let sum = 0; for (let i = 0; i < o.buf.length; i++) { const v = (o.buf[i] - 128) / 128; sum += v * v; }
         const rms = Math.sqrt(sum / o.buf.length);
