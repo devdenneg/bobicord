@@ -9,9 +9,9 @@
 // Сигналинг probe идёт по выделенному WS к /tree: probe-start будит приёмник, probe-offer/
 // answer/ice — SDP/ICE (tree.js релеит вещатель↔сервер↔агент).
 
+import { getToken } from '../api';
 import { detectSymmetricNat } from './natDetect';
-import { sampleRtcStats } from '../rtcStatsSampler';
-import { freshTreeWsUrl } from '../treeAuth';
+import { isTauri } from '../native';
 
 const CACHE_KEY = 'probeUpload';
 const CACHE_TTL_MS = 24 * 3600 * 1000; // сутки
@@ -44,6 +44,14 @@ export function getCachedProbe(): ProbeResult | null {
 }
 export function clearCachedProbe() { try { localStorage.removeItem(CACHE_KEY); } catch { /**/ } }
 function cacheProbe(r: ProbeResult) { try { localStorage.setItem(CACHE_KEY, JSON.stringify(r)); } catch { /**/ } }
+
+function treeWsUrl(): string {
+  const override = (import.meta as any).env?.VITE_TREE_WS_URL as string | undefined;
+  const nativeDefault = isTauri ? 'wss://138-16-170-21.sslip.io/tree' : null;
+  const base = override || nativeDefault || ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/tree');
+  const token = getToken() || '';
+  return base + (base.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
+}
 
 const DEFAULT_ICE: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
 
@@ -99,8 +107,8 @@ function makeCanvasTrack(): { track: MediaStreamTrack; stop: () => void } {
 
 /** Читает candidate-pair.availableOutgoingBitrate (бит/с) из активной пары; null если нет. */
 async function readAvailableOutgoing(pc: RTCPeerConnection): Promise<number | null> {
-  const report = await sampleRtcStats(pc);
-  if (!report) return null;
+  let report: RTCStatsReport;
+  try { report = await pc.getStats(); } catch { return null; }
   let aob: number | null = null;
   report.forEach((s: any) => {
     if (s.type === 'candidate-pair' && (s.nominated || s.state === 'succeeded') && typeof s.availableOutgoingBitrate === 'number') {
@@ -137,11 +145,7 @@ async function measureUploadOnce(opts?: { onPhase?: (p: string) => void }): Prom
   onPhase('connect');
 
   let ws: WebSocket;
-  try {
-    ws = new WebSocket(await freshTreeWsUrl());
-  } catch {
-    throw new Error('probe: не удалось открыть сокет');
-  }
+  try { ws = new WebSocket(treeWsUrl()); } catch { throw new Error('probe: не удалось открыть сокет'); }
 
   const cleanups: Array<() => void> = [];
   const cleanup = () => { for (const c of cleanups) { try { c(); } catch { /**/ } } };
@@ -188,21 +192,12 @@ async function measureUploadOnce(opts?: { onPhase?: (p: string) => void }): Prom
       const runMeasurement = () => {
         const t0 = Date.now();
         const samples: Array<{ t: number; v: number }> = [];
-        let statsTimer: number | null = null;
-        let statsStopped = false;
-        const stopStats = () => {
-          statsStopped = true;
-          if (statsTimer !== null) window.clearTimeout(statsTimer);
-          statsTimer = null;
-        };
-        const sample = async () => {
-          const exactPc = pc;
-          if (!exactPc || settled || statsStopped) return;
-          const aob = await readAvailableOutgoing(exactPc);
-          if (pc !== exactPc || settled || statsStopped) return;
+        const iv = window.setInterval(async () => {
+          if (!pc || settled) return;
+          const aob = await readAvailableOutgoing(pc);
           if (aob != null && aob > 0) samples.push({ t: Date.now() - t0, v: aob });
           if (Date.now() - t0 >= MEASURE_MS) {
-            stopStats();
+            clearInterval(iv);
             // Плато (p90) хвоста после прогрева. Медиана давала середину разгона — занижение ~×2.
             const tail = samples.filter((s) => s.t >= WARMUP_MS).map((s) => s.v);
             const bwe = plateau(tail.length ? tail : samples.map((s) => s.v));
@@ -212,14 +207,9 @@ async function measureUploadOnce(opts?: { onPhase?: (p: string) => void }): Prom
               // BWE не поднялось (нет transport-cc / трек не разогнался) — фолбэк на DataChannel.
               measureDataChannel();
             }
-            return;
           }
-          // Settle-driven sampling: a browser getStats that ignores closed PC/radio cancellation
-          // can hold at most one optional probe read until the overall measurement timeout.
-          statsTimer = window.setTimeout(() => { statsTimer = null; void sample(); }, SAMPLE_MS);
-        };
-        statsTimer = window.setTimeout(() => { statsTimer = null; void sample(); }, SAMPLE_MS);
-        cleanups.push(stopStats);
+        }, SAMPLE_MS);
+        cleanups.push(() => clearInterval(iv));
       };
 
       // Фолбэк: пушим в DataChannel, держа bufferedAmount около cap, и меряем goodput.
