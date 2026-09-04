@@ -1,6 +1,5 @@
 import type { Emote } from './types';
 import { api, resolveUploadUrl } from './api';
-import { fetchJsonWithDeadline } from './boundedJsonFetch';
 
 export const emoteMap = new Map<string, string>(); // name -> id
 
@@ -74,14 +73,20 @@ function probeImgReachability(force = false): void {
 // onError любой контентной картинки — только ТРИГГЕР пробы (флаг флипнет сама проба по sentinel).
 export function onEmoteImgError(): void { probeImgReachability(); }
 
+function fetchTimeout(url: string, ms: number, opt?: RequestInit): Promise<Response> {
+  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const t = ctrl ? setTimeout(() => ctrl.abort(), ms) : null;
+  return fetch(url, { ...opt, signal: ctrl?.signal }).finally(() => { if (t) clearTimeout(t); });
+}
+
 // Если давно на прокси — тихо пробуем direct: разблокировали/сменил сеть → сбрасываем флаг.
 function reprobeIfStale(): void {
   const imgF = readFlag(IMG_FLAG);
   if (imgF.proxy && Date.now() - imgF.ts > REPROBE_MS) probeImgReachability(true);
   const apiF = readFlag(API_FLAG);
   if (apiF.proxy && Date.now() - apiF.ts > REPROBE_MS) {
-    fetchJsonWithDeadline<any>('https://7tv.io/v3/emote-sets/global', PROBE_MS)
-      .then((d) => { if (d && Array.isArray(d.emotes)) setApiProxy(false); }).catch(() => { /* всё ещё блок */ });
+    fetchTimeout('https://7tv.io/v3/emote-sets/global', PROBE_MS)
+      .then((r) => r.json()).then((d) => { if (d && Array.isArray(d.emotes)) setApiProxy(false); }).catch(() => { /* всё ещё блок */ });
   }
 }
 if (typeof window !== 'undefined') window.addEventListener('online', reprobeIfStale);
@@ -105,7 +110,7 @@ export async function loadGlobalEmotes(): Promise<void> {
   let data: any = null;
   // direct-first: при блоке 7tv.io (reject/таймаут ИЛИ 200+HTML-заглушка → провал r.json()) → apiProxy.
   if (!apiProxy) {
-    try { data = await fetchJsonWithDeadline('https://7tv.io/v3/emote-sets/global', PROBE_MS); }
+    try { data = await (await fetchTimeout('https://7tv.io/v3/emote-sets/global', PROBE_MS)).json(); }
     catch { setApiProxy(true); }
   }
   if (!data) { try { data = await api.sevenGlobal(); } catch { /* оба пути мертвы */ } }
@@ -123,7 +128,8 @@ export async function searchEmotes(query: string, page: number): Promise<Emote[]
         query: 'query($q:String!,$p:Int){emotes(query:$q,page:$p,limit:100,sort:{value:"popularity",order:DESCENDING}){items{id name}}}',
         variables: { q: query, p: page },
       };
-      const d: any = await fetchJsonWithDeadline('https://7tv.io/v3/gql', PROBE_MS, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const r = await fetchTimeout('https://7tv.io/v3/gql', PROBE_MS, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const d = await r.json();
       const items: Emote[] = ((d.data && d.data.emotes && d.data.emotes.items) || []).map((e: any) => ({ id: e.id, name: e.name }));
       items.forEach((e) => emoteMap.set(e.name, e.id));
       return items;

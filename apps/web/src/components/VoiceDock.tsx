@@ -8,15 +8,11 @@ import { getSettings, setSettings } from '../settings';
 import { isTauri, onBroadcastStopped, stopNativeBroadcast } from '../native';
 import { endAnyBroadcasterSession } from '../diag';
 import {
-  audioDeviceSelectionMissing,
   audioDeviceChoices,
   audioOutputChoices,
   currentAppleMobilePlatform,
-  directAudioOutputSelectionSupported,
-  loadAudioDevices,
   type AudioDeviceChoice,
 } from '../audioDevices';
-import { DelayedPrimaryPointerHold, PTT_TOUCH_HOLD_MS, PttCompatibilityClickFence, webScreenShareSupported } from '../mobileControls';
 
 /* Вещание — только из нативного клиента (CLAUDE.md инвариант 2). Конфиг/статистика — в BroadcastModal. */
 function NativeBroadcastButton() {
@@ -51,15 +47,11 @@ function ShareButton() {
   const me = useStore((s) => s.me)!;
   if (!eng.inVoice) return null;
   const live = !!eng.presence[me.username]?.streaming;
-  const supported = webScreenShareSupported(typeof navigator === 'undefined' ? null : navigator.mediaDevices);
-  // iOS/unsupported browsers cannot satisfy this action. Do not render a dead control that only
-  // produces an error toast; if a live stream outlives capability detection, keep its Stop action.
-  if (!live && !supported) return null;
   return (
     <button className={'vd-btn' + (live ? ' danger-on' : '')} aria-pressed={live}
       aria-label={live ? 'Остановить трансляцию' : 'Транслировать экран'}
       data-tip={live ? 'Трансляция идёт' : 'Транслировать экран'}
-      onClick={() => live ? E.stopShare() : E.share()}>
+      onClick={() => E.share()}>
       <Icon name={live ? 'screen-stop' : 'screen'} sm />
     </button>
   );
@@ -71,20 +63,13 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
   const [open, setOpen] = useState(false);
   const [devs, setDevs] = useState<AudioDeviceChoice[]>([]);
   const [outputViaInput, setOutputViaInput] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [loadFailed, setLoadFailed] = useState(false);
-  const [partial, setPartial] = useState(false);
-  const [permissionDenied, setPermissionDenied] = useState(false);
-  const [loaded, setLoaded] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
   const [position, setPosition] = useState<{ left: number; top: number; maxHeight: number; above: boolean } | null>(null);
   const appleMobile = currentAppleMobilePlatform();
   const cur = kind === 'input' || outputViaInput ? getSettings().input : getSettings().output;
-  const selectionMissing = loaded && !loading && audioDeviceSelectionMissing(cur, devs);
   const ref = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const reloadRef = useRef<(forcePermission?: boolean) => void>(() => {});
   const openFocusRef = useRef<'selected' | 'first' | 'last'>('selected');
   const optionCount = devs.length + 1;
   const focusOption = (index: number) => {
@@ -103,52 +88,20 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
     const next = initial === 'first' ? 0 : initial === 'last' ? optionCount - 1 : Math.max(0, selected);
     setActiveIndex(next);
     setPosition(null);
-    setDevs([]);
-    setLoaded(false);
-    setLoadFailed(false);
-    setPartial(false);
-    setPermissionDenied(false);
     setOpen(true);
     requestAnimationFrame(() => menuRef.current?.querySelector<HTMLElement>(`[data-menu-index="${next}"]`)?.focus());
   };
   useEffect(() => {
     if (!open) return;
-    let disposed = false;
-    let requestId = 0;
-    let timer: number | null = null;
-    const load = (forcePermission = false) => {
-      const id = ++requestId;
-      setLoading(true);
-      setLoaded(false);
-      setLoadFailed(false);
-      const request = loadAudioDevices(
-        (deviceKind, requestPermissions) => Room.getLocalDevices(deviceKind, requestPermissions),
-        { forcePermission },
-      );
-      const apply = (result: Awaited<typeof request.bounded>) => {
-        if (disposed || id !== requestId) return;
-        const output = audioOutputChoices(
-          appleMobile,
-          result.inputs,
-          result.outputs,
-          directAudioOutputSelectionSupported(),
-        );
-        const viaInput = kind === 'output' && output.viaInput;
-        const choices = kind === 'input'
-          ? audioDeviceChoices(result.inputs, 'Микрофон')
-          : output.choices;
-        const failed = kind === 'input'
-          ? result.inputFailed
-          : (viaInput ? result.inputFailed : result.outputFailed);
-        if (!failed) {
-          setDevs(choices);
-          setOutputViaInput(viaInput);
-        }
-        setLoadFailed(failed);
-        setPartial(result.partial);
-        setPermissionDenied(result.permissionDenied);
-        setLoading(false);
-        setLoaded(!failed && !result.partial);
+    const load = () => {
+      const request = kind === 'output' && appleMobile
+        ? Promise.all([Room.getLocalDevices('audioinput'), Room.getLocalDevices('audiooutput')])
+          .then(([inputs, outputs]) => audioOutputChoices(true, inputs, outputs))
+        : Room.getLocalDevices(kind === 'input' ? 'audioinput' : 'audiooutput')
+          .then((devices) => ({ choices: audioDeviceChoices(devices), viaInput: false }));
+      request.then(({ choices, viaInput }) => {
+        setDevs(choices);
+        setOutputViaInput(kind === 'output' && viaInput);
         const selectedId = kind === 'input' || viaInput ? getSettings().input : getSettings().output;
         const selected = selectedId ? choices.findIndex((device) => device.id === selectedId) + 1 : 0;
         const intent = openFocusRef.current;
@@ -156,36 +109,21 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
         openFocusRef.current = 'selected';
         setActiveIndex(next);
         requestAnimationFrame(() => menuRef.current?.querySelector<HTMLElement>(`[data-menu-index="${next}"]`)?.focus());
-      };
-      void request.bounded.then(apply);
-      void request.settled.then(apply);
+      }).catch(() => {});
     };
-    reloadRef.current = load;
-    const onDeviceChange = () => {
-      if (timer != null) window.clearTimeout(timer);
-      setDevs([]);
-      setLoaded(false);
-      setLoadFailed(false);
-      setLoading(true);
-      timer = window.setTimeout(() => { timer = null; load(false); }, 150);
-    };
-    load(false);
+    load();
     const onDoc = (e: PointerEvent) => {
       const target = e.target as Node | null;
       if (!target || ref.current?.contains(target) || menuRef.current?.contains(target)) return;
       closeMenu();
     };
     document.addEventListener('pointerdown', onDoc, true);
-    navigator.mediaDevices?.addEventListener?.('devicechange', onDeviceChange);
+    navigator.mediaDevices?.addEventListener?.('devicechange', load);
     return () => {
-      disposed = true;
-      requestId++;
-      if (timer != null) window.clearTimeout(timer);
-      if (reloadRef.current === load) reloadRef.current = () => {};
       document.removeEventListener('pointerdown', onDoc, true);
-      navigator.mediaDevices?.removeEventListener?.('devicechange', onDeviceChange);
+      navigator.mediaDevices?.removeEventListener?.('devicechange', load);
     };
-  }, [appleMobile, open, kind]);
+  }, [appleMobile, open, kind, cur]);
   useLayoutEffect(() => {
     if (!open) return;
     let frame = 0;
@@ -253,15 +191,12 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
   const pick = (id: string) => {
     if (kind === 'input') {
       setSettings({ input: id });
-      if (E) void E.reapplyMic().finally(() => E.restartLevelMeter());
+      void E?.reapplyMic();
     } else if (outputViaInput) {
       // iOS/iPadOS связывает Speakerphone/earpiece с audioinput, хотя для пользователя это
       // именно маршрут вывода. Переснимаем мик один раз и затем возобновляем удалённый звук.
       setSettings({ input: id, output: '' });
-      if (E) void E.reapplyMic('route').finally(() => {
-        void E.applyOutput();
-        E.restartLevelMeter();
-      });
+      void E?.reapplyMic('route').then(() => E.applyOutput());
     } else {
       setSettings({ output: id });
       void E?.applyOutput();
@@ -301,16 +236,10 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
         '--vd-menu-top': `${position.top}px`,
         '--vd-menu-max-height': `${position.maxHeight}px`,
       } as React.CSSProperties : undefined}
-      role="menu" aria-label={kind === 'input' ? 'Микрофоны' : 'Устройства вывода'} aria-busy={loading} onKeyDown={onMenuKeyDown}>
+      role="menu" aria-label={kind === 'input' ? 'Микрофоны' : 'Устройства вывода'} onKeyDown={onMenuKeyDown}>
       <div className="vd-devh" aria-hidden="true">{kind === 'input' ? 'МИКРОФОН' : (outputViaInput ? 'МАРШРУТ ЗВУКА' : 'ВЫВОД ЗВУКА')}</div>
-      {loading ? <div className="vd-devstatus" role="status" aria-live="polite">Обновляем список…</div> : null}
-      {loadFailed ? <div className="vd-devstatus is-error" role="status">Не удалось получить устройства</div> : null}
-      {!loading && permissionDenied ? <div className="vd-devstatus is-error" role="status">Доступ к микрофону запрещён</div> : null}
-      {!loading && partial && !permissionDenied && !loadFailed ? <div className="vd-devstatus" role="status">Показан неполный список</div> : null}
-      {!loading && (partial || loadFailed) ? <button type="button" className="vd-devitem" onClick={() => reloadRef.current(true)}>Повторить поиск</button> : null}
-      {selectionMissing ? <div className="vd-devstatus warn" role="status">Выбранное устройство отключено</div> : null}
-      <button role="menuitemradio" aria-checked={!cur || selectionMissing} tabIndex={activeIndex === 0 ? 0 : -1} data-menu-index="0"
-        className={'vd-devitem' + (!cur || selectionMissing ? ' on' : '')} onFocus={() => setActiveIndex(0)} onClick={() => pick('')}>{outputViaInput ? 'Автоматически' : 'По умолчанию'}</button>
+      <button role="menuitemradio" aria-checked={!cur} tabIndex={activeIndex === 0 ? 0 : -1} data-menu-index="0"
+        className={'vd-devitem' + (!cur ? ' on' : '')} onFocus={() => setActiveIndex(0)} onClick={() => pick('')}>{outputViaInput ? 'Автоматически' : 'По умолчанию'}</button>
       {devs.map((d, index) => (
         <button role="menuitemradio" aria-checked={cur === d.id} tabIndex={activeIndex === index + 1 ? 0 : -1}
           data-menu-index={index + 1} key={d.id} className={'vd-devitem' + (cur === d.id ? ' on' : '')}
@@ -325,12 +254,10 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
   // системными аудиомаршрутами. Показываем их только у вывода, чтобы не провоцировать
   // бессмысленное переключение микрофона по кругу.
   if (kind === 'input' && appleMobile) return null;
-  const selectedLabel = devs.find((device) => device.id === cur)?.label;
-  const triggerLabel = kind === 'input' ? 'Выбрать микрофон' : 'Выбрать устройство вывода';
   return <>
     <div className="vd-devwrap" ref={ref}>
       <button ref={triggerRef} className={'vd-caret' + (open ? ' on' : '')} aria-expanded={open} aria-haspopup="menu" aria-controls={`vd-device-${kind}`}
-        aria-label={`${triggerLabel}: ${selectionMissing ? 'выбранное устройство отключено' : (selectedLabel || (cur ? 'выбранное устройство' : (outputViaInput ? 'автоматически' : 'по умолчанию')))}`}
+        aria-label={kind === 'input' ? 'Выбрать микрофон' : 'Выбрать устройство вывода'}
         data-tip={open ? undefined : (kind === 'input' ? 'Выбрать микрофон' : 'Выбрать устройство вывода')}
         onKeyDown={onTriggerKeyDown}
         onClick={() => open ? closeMenu() : openMenu()}><Icon name="chevron" sm /></button>
@@ -345,144 +272,21 @@ export function VoiceControls({ up }: { up?: boolean }) {
   const E = getEngine()!;
   const mode = getSettings().mode;
   const muted = eng.localMicMuted;
-  const manualMuted = eng.manualMicMuted;
-  const recovering = !!eng.micRecovering;
   const ptt = mode === 'ptt' && !eng.deafened;
   const connection = eng.voiceConnection ?? (eng.reconnecting ? 'reconnecting' : (eng.voiceConnecting ? 'connecting' : (eng.inVoice ? 'connected' : 'disconnected')));
   const pttLive = ptt && eng.pttDown && !muted && connection === 'connected';
   const pttIdle = ptt && !pttLive;
-  const pttHoldReady = ptt && !muted && !recovering && connection === 'connected';
   const micClosed = muted || pttIdle;
-  const micClass = 'vd-btn' + (manualMuted ? ' danger-on' : (pttLive ? ' ptt-live' : (pttIdle ? ' ptt-idle' : '')))
-    + (pttHoldReady ? ' vd-ptt-hold' : '');
-  const pttPointer = useRef(new DelayedPrimaryPointerHold());
-  const pttActivationTimer = useRef<number | null>(null);
-  const pttClickFence = useRef(new PttCompatibilityClickFence());
-  const micButtonRef = useRef<HTMLButtonElement>(null);
-  const clearPttActivation = () => {
-    if (pttActivationTimer.current != null) window.clearTimeout(pttActivationTimer.current);
-    pttActivationTimer.current = null;
-  };
-  const finishPttPointer = (pointerId: number, clientX: number, clientY: number) => {
-    if (!pttPointer.current.owns(pointerId)) return;
-    if (pttPointer.current.pendingTap(pointerId)) {
-      const bounds = micButtonRef.current?.getBoundingClientRect();
-      if (!bounds || clientX < bounds.left || clientX > bounds.right || clientY < bounds.top || clientY > bounds.bottom) {
-        cancelPttPointer(pointerId, true);
-        return;
-      }
-    }
-    clearPttActivation();
-    const released = pttPointer.current.end(pointerId);
-    if (released === 'hold') {
-      E.pttRelease('pointer');
-      pttClickFence.current.arm(pointerId);
-    }
-    // A short touch intentionally falls through to the ordinary click handler. That preserves
-    // native button semantics (including accessibility) without doing the action twice.
-  };
-  const cancelPttPointer = (pointerId?: number, suppressReleasedClick = false) => {
-    if (pointerId !== undefined && !pttPointer.current.owns(pointerId)) return;
-    const owner = pointerId ?? pttPointer.current.active();
-    clearPttActivation();
-    const released = pttPointer.current.cancel(pointerId);
-    if (released === 'hold') E.pttRelease('pointer');
-    // A cancelled tap or hold is not an activation. If WebKit still emits a compatibility click,
-    // consume that exact touch; the next real physical pointerdown clears an unconsumed fence.
-    if (released && suppressReleasedClick && owner !== null) pttClickFence.current.arm(owner);
-  };
-  useEffect(() => {
-    if (!pttHoldReady) cancelPttPointer(undefined, true);
-  }, [pttHoldReady, E]);
-  useEffect(() => {
-    const releaseWhenHidden = () => { if (document.hidden) cancelPttPointer(undefined, true); };
-    const releaseOnPageHide = () => cancelPttPointer(undefined, true);
-    const releaseOnBlur = () => cancelPttPointer(undefined, true);
-    const releaseOnWindowPointerUp = (event: PointerEvent) => finishPttPointer(event.pointerId, event.clientX, event.clientY);
-    const cancelOnWindowPointer = (event: PointerEvent) => cancelPttPointer(event.pointerId, true);
-    const moveOnWindowPointer = (event: PointerEvent) => {
-      if (pttPointer.current.tapMovedBeyond(event.pointerId, event.clientX, event.clientY)) {
-        cancelPttPointer(event.pointerId, true);
-      }
-    };
-    document.addEventListener('visibilitychange', releaseWhenHidden);
-    window.addEventListener('pagehide', releaseOnPageHide);
-    window.addEventListener('blur', releaseOnBlur);
-    window.addEventListener('pointerup', releaseOnWindowPointerUp, true);
-    window.addEventListener('pointercancel', cancelOnWindowPointer, true);
-    window.addEventListener('pointermove', moveOnWindowPointer, true);
-    return () => {
-      document.removeEventListener('visibilitychange', releaseWhenHidden);
-      window.removeEventListener('pagehide', releaseOnPageHide);
-      window.removeEventListener('blur', releaseOnBlur);
-      window.removeEventListener('pointerup', releaseOnWindowPointerUp, true);
-      window.removeEventListener('pointercancel', cancelOnWindowPointer, true);
-      window.removeEventListener('pointermove', moveOnWindowPointer, true);
-      clearPttActivation();
-      if (pttPointer.current.cancel() === 'hold') E.pttRelease('pointer');
-      pttClickFence.current.clear();
-    };
-  }, [E]);
+  const micClass = 'vd-btn' + (muted ? ' danger-on' : (pttLive ? ' ptt-live' : (pttIdle ? ' ptt-idle' : '')));
   // «Недоступен» и «я себя замутил» — разные состояния: раньше оба выглядели как обычный мут, и когда
   // микрофон пропадал и возвращался сам, это читалось как «кнопка переключается сама по себе».
-  const micLabel = recovering
-    ? (manualMuted ? 'Микрофон выключен — подключение продолжается' : 'Микрофон подключается — нажми, чтобы выключить')
-    : (eng.micUnavailable ? 'Микрофон недоступен — нажми, чтобы подключить'
-      : (manualMuted ? 'Включить микрофон' : (pttIdle ? 'PTT: удерживай для передачи, нажми, чтобы выключить микрофон'
-        : (pttLive ? 'PTT: идёт передача' : 'Выключить микрофон'))));
+  const micLabel = eng.micUnavailable
+    ? 'Микрофон недоступен — нажми, чтобы подключить'
+    : (muted ? 'Включить микрофон' : (pttIdle ? 'PTT: микрофон закрыт' : (pttLive ? 'PTT: идёт передача' : 'Выключить микрофон')));
   return (
     <div className="vd-controls">
       <div className="vd-grp">
-        <button ref={micButtonRef} className={micClass} aria-pressed={manualMuted} aria-busy={recovering || undefined}
-          aria-label={micLabel} data-tip={ptt || eng.micUnavailable || recovering ? micLabel : 'Микрофон · M'}
-          onPointerDown={(event) => {
-            // Desktop PTT has its configured keyboard key. Touch/pen needs one physical button,
-            // so a short tap remains manual mute and only a confirmed hold opens the uplink gate.
-            if (event.isPrimary && event.button === 0) pttClickFence.current.clear();
-            if (event.pointerType === 'mouse' || !ptt) return;
-            if (!pttPointer.current.begin(event.pointerId, event.isPrimary, event.button, event.clientX, event.clientY)) return;
-            try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /** implicit touch capture remains */ }
-            if (!pttHoldReady) return; // the ordinary click remains the manual-mute action
-            const pointerId = event.pointerId;
-            pttActivationTimer.current = window.setTimeout(() => {
-              pttActivationTimer.current = null;
-              if (!pttPointer.current.owns(pointerId)) return;
-              if (document.hidden) { cancelPttPointer(pointerId, true); return; }
-              // Reaching the threshold owns the later compatibility click even if a concurrent
-              // recovery/mute makes the engine reject PTT. Otherwise release could undo that newer
-              // privacy state by being reinterpreted as a short manual-mute tap.
-              if (!pttPointer.current.activate(pointerId)) return;
-              E.pttPress('pointer');
-            }, PTT_TOUCH_HOLD_MS);
-          }}
-          onPointerUp={(event) => finishPttPointer(event.pointerId, event.clientX, event.clientY)}
-          onPointerCancel={(event) => cancelPttPointer(event.pointerId, true)}
-          onPointerMove={(event) => {
-            if (pttPointer.current.tapMovedBeyond(event.pointerId, event.clientX, event.clientY)) {
-              cancelPttPointer(event.pointerId, true);
-            }
-          }}
-          onLostPointerCapture={(event) => cancelPttPointer(event.pointerId, true)}
-          onContextMenu={(event) => { if (pttHoldReady) event.preventDefault(); }}
-          onClick={(event) => {
-            const native = event.nativeEvent as MouseEvent & Partial<PointerEvent> & {
-              sourceCapabilities?: { firesTouchEvents?: boolean };
-            };
-            const rawPointerId = native.pointerId;
-            const nativePointerId = typeof rawPointerId === 'number' && Number.isFinite(rawPointerId)
-              ? rawPointerId
-              : null;
-            if (pttClickFence.current.consume(
-              nativePointerId,
-              typeof native.pointerType === 'string' ? native.pointerType : '',
-              event.detail,
-              native.sourceCapabilities?.firesTouchEvents,
-            )) {
-              event.preventDefault();
-              return;
-            }
-            void E.toggleMic();
-          }}><Icon name={micClosed ? 'mic-off' : 'mic'} sm /></button>
+        <button className={micClass} aria-pressed={muted} aria-label={micLabel} data-tip={ptt || eng.micUnavailable ? micLabel : 'Микрофон · M'} onClick={() => E.toggleMic()}><Icon name={micClosed ? 'mic-off' : 'mic'} sm /></button>
         <DeviceMenu kind="input" up={up} />
       </div>
       <div className="vd-grp">

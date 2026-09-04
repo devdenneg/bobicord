@@ -10,32 +10,13 @@ export function MicMeter() {
   const [, force] = useState(0);
   const rerender = () => force((n) => n + 1);
   const s = getSettings();
-  const updateSensitivity = (patch: { sensitivityAuto?: boolean; sensitivity?: number }) => {
-    setSettings(patch);
-    // Settings persistence is synchronous, so the existing voice graph can apply the new gate in
-    // the same input event instead of waiting for the next VAD/audio-meter sample.
-    getEngine()?.onVoiceActivationSettingsChanged();
-    rerender();
-  };
 
-  // Колбэк уровня приходит 20-60 раз в секунду. Писать сюда `width` и `left` — значит
-  // заказывать пересчёт раскладки на каждом кадре, пока микрофон открыт; на машине, которая
-  // делит кадры с полноэкранной игрой, это заметная плата за декоративную шкалу.
-  // Заливка едет transform'ом (композитор, без раскладки), а порог переставляется только
-  // когда реально изменился — он двигается лишь при перетаскивании ползунка.
-  const lastThreshold = useRef(-1);
   useEffect(() => {
     const E = getEngine();
     if (!E) return;
     return E.onInputLevel((level, open, threshold) => {
-      if (fillRef.current) {
-        fillRef.current.style.transform = 'scaleX(' + Math.max(0, Math.min(1, level)) + ')';
-        fillRef.current.classList.toggle('open', open);
-      }
-      if (markerRef.current && threshold !== lastThreshold.current) {
-        lastThreshold.current = threshold;
-        markerRef.current.style.left = threshold * 100 + '%';
-      }
+      if (fillRef.current) { fillRef.current.style.width = level * 100 + '%'; fillRef.current.classList.toggle('open', open); }
+      if (markerRef.current) markerRef.current.style.left = threshold * 100 + '%';
     });
   }, []);
 
@@ -46,8 +27,8 @@ export function MicMeter() {
         <span style={{ display: 'flex', alignItems: 'center', gap: 8, textTransform: 'none', fontWeight: 400 }}>
           Авто
           <div className={'sw' + (s.sensitivityAuto ? ' on' : '')} role="switch" aria-checked={s.sensitivityAuto} aria-label="Определять автоматически" tabIndex={0}
-            onClick={() => updateSensitivity({ sensitivityAuto: !s.sensitivityAuto })}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); updateSensitivity({ sensitivityAuto: !s.sensitivityAuto }); } }} />
+            onClick={() => { setSettings({ sensitivityAuto: !s.sensitivityAuto }); rerender(); }}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setSettings({ sensitivityAuto: !s.sensitivityAuto }); rerender(); } }} />
         </span>
       </label>
       <div className={'micmeter' + (s.sensitivityAuto ? ' auto' : '')}>
@@ -56,7 +37,7 @@ export function MicMeter() {
         {!s.sensitivityAuto ? (
           <input type="range" min={0} max={100} value={s.sensitivity}
             aria-label="Порог чувствительности ввода"
-            onChange={(e) => updateSensitivity({ sensitivity: +e.target.value })} />
+            onChange={(e) => { setSettings({ sensitivity: +e.target.value }); rerender(); }} />
         ) : null}
       </div>
       <div className="mm-hint">

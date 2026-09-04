@@ -1,9 +1,4 @@
-// Фоны аватаров и иконок серверов. Поверх них ВСЕГДА идут белые инициалы, поэтому
-// каждый цвет обязан давать белым текстом контраст ≥4.5 (WCAG AA). Прежняя палитра
-// проваливала это в семи случаях из восьми (#f0b232 давал 1.89, #e0a423 — 2.21):
-// инициал на аватаре просто не читался, и одинаково в обеих темах.
-// Здесь же снят #5865f2 — фирменный цвет Discord (см. PRODUCT.md, Brand Commitments).
-export const AV_COLORS = ['#2f6fd0', '#1a7d4b', '#a8631a', '#c33b7a', '#6b4fd6', '#0f7a86', '#c04434', '#5c6b7a'];
+export const AV_COLORS = ['#5865f2', '#3ba55d', '#e0a423', '#eb459e', '#9b6dff', '#00a8b5', '#f47b67', '#f0b232'];
 export function hueOf(s: string): number { let h = 0; for (let i = 0; i < (s || '').length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0; return h; }
 export const initial = (n: string) => (n || '?').trim().charAt(0).toUpperCase() || '?';
 export const avColor = (name: string, ci?: number) => AV_COLORS[(ci != null ? ci : hueOf(name)) % AV_COLORS.length];

@@ -30,12 +30,4 @@ assert.equal(appEntryFromHtml('<script src="/assets/not-the-module-entry.js"></s
 assert.equal(appEntryFromHtml('<script type="module" data-src="/assets/not-a-real-source.js"></script>'), null);
 assert.equal(appEntryFromHtml('<link rel="modulepreload" href="/assets/main-FalsePositive.js">'), null);
 
-const watcher = readFileSync(join(here, 'version.ts'), 'utf8');
-assert.match(watcher, /let checking: Promise<void> \| null = null/,
-  'foreground and interval update checks share one in-flight request');
-assert.match(watcher, /AbortController[\s\S]*UPDATE_CHECK_TIMEOUT_MS[\s\S]*signal: controller\.signal/,
-  'a stalled mobile network cannot accumulate update fetches forever');
-assert.match(watcher, /addEventListener\('pageshow',[\s\S]*void check\(\)/,
-  'Safari tab and standalone PWA BFCache restores both trigger a bounded update check');
-
 console.log('version entry: ok');

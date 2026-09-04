@@ -23,17 +23,6 @@ import { getDownloads, addDownload, subscribeDownloads, type DownloadItem } from
 import { sendActiveChat } from '../notifyws';
 import { linkifyHttpUrls } from '../linkify';
 import { readCatWallpaper, writeCatWallpaper } from '../chatWallpaper';
-import { fetchDownloadBlob } from '../downloadFetch';
-import {
-  ExactMediaPlayCoordinator,
-  ExactVideoTrackFrameObserver,
-  TreeStreamAudioController,
-  effectiveStreamGain,
-  playMediaElementCoordinated,
-  toggleStreamFullscreen,
-  toggleStreamPictureInPicture,
-} from '../streamPlayback';
-import { AudioUnlockGestureDeduper } from '../micLifecycle';
 import { fetchTitle, parseYouTubeVideo, type YouTubeVideoRef } from '../youtube';
 import {
   clearNotificationDestination,
@@ -68,7 +57,6 @@ import {
 } from '../chatScroll';
 import type { Attachment, ChatMessage, Emote, Leaderboard, Member, MemberStats, ReleaseNote, ReplyRef, Role } from '../types';
 import { PERM, hasPerm } from '../types';
-import { safeLocalStorageGet, safeLocalStorageSet } from '../safeStorage';
 
 const MAX_ATTACH = 5;
 const MAX_ATTACH_SIZE = 10 * 1024 * 1024;
@@ -405,9 +393,7 @@ function VoiceParticipantRow({ m, anim }: { m: Member; anim?: string }) {
   const profileBannerUrl = normalizeProfileBanner(isLocal ? me.profileBannerUrl : m.profileBannerUrl);
   const watching = !!eng.watching[m.username];
   const pending = !!eng.pending[m.username];
-  // Engine is the single source of truth. A mount-only local copy made the slider continue to show
-  // an old value while hydration or audio recovery had already changed the audible gain.
-  const vol = Math.round(E.userVolOf(m.username) * 100);
+  const [vol, setVol] = useState(() => Math.round(E.userVolOf(m.username) * 100));
   const talking = speaking && !pr?.micMuted;
   const connecting = isLocal && eng.voiceConnecting;
   const rowId = `vc-${m.username}`;
@@ -510,8 +496,8 @@ function VoiceParticipantRow({ m, anim }: { m: Member; anim?: string }) {
               <div className="exp-controls">
                 <input type="range" min={0} max={200} value={vol} tabIndex={open ? 0 : -1} aria-label={`Громкость: ${m.displayName}`}
                   style={{ ['--volume' as string]: `${vol / 2}%` } as CSSProperties}
-                  onChange={(e) => { armAutoClose(); let v = +e.target.value; if (Math.abs(v - 100) < 4) v = 100; E.setUserVol(m.username, v / 100); }}
-                  onDoubleClick={() => { E.setUserVol(m.username, 1); }} />
+                  onChange={(e) => { armAutoClose(); let v = +e.target.value; if (Math.abs(v - 100) < 4) v = 100; setVol(v); E.setUserVol(m.username, v / 100); }}
+                  onDoubleClick={() => { setVol(100); E.setUserVol(m.username, 1); }} />
                 <button className={'mut' + (E.isMutedFor(m.username) ? ' on' : '')} tabIndex={open ? 0 : -1}
                   aria-pressed={E.isMutedFor(m.username)}
                   aria-label={E.isMutedFor(m.username) ? `Снова слышать ${m.displayName}` : `Заглушить у себя ${m.displayName}`}
@@ -741,7 +727,7 @@ function MemberRow({ m, anim }: { m: Member; anim?: string }) {
         <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} size={36} dot={st} live={!!streaming} />
         <div className="pi-main">
           <div className="pi-l1">
-            <div className="nm" style={roleColorOf(m) ? ({ ['--nc' as string]: roleColorOf(m) } as CSSProperties) : undefined}>{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div>
+            <div className="nm" style={roleColorOf(m) ? { color: roleColorOf(m) } : undefined}>{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div>
           </div>
           {activityName || (m.roles && m.roles.length > 0) ? (
             <div className="pi-l2">
@@ -987,23 +973,19 @@ function ReleasePatchCard({ release, ts }: { release: ReleaseNote; ts?: number }
 // скачано и файл всё ещё на месте — ОТКРЫВАЕТ его с диска вместо повторного скачивания.
 // Возвращает true, если состоялось реальное скачивание (для тоста "Сохранено"), false — если
 // просто открыли уже существующий файл.
-async function saveAttachment(f: Attachment, downloads: DownloadItem[], signal?: AbortSignal): Promise<boolean> {
-  if (signal?.aborted) throw new DOMException('Загрузка отменена', 'AbortError');
+async function saveAttachment(f: Attachment, downloads: DownloadItem[]): Promise<boolean> {
   if (isTauri) {
     const rec = downloads.find((d) => d.url === f.url && d.path);
     if (rec?.path) {
-      let exists = false;
-      try { [exists] = await pathsExist([rec.path]); }
-      catch { /** an uncertain/timed-out disk check safely falls back to downloading again */ }
-      if (signal?.aborted) throw new DOMException('Загрузка отменена', 'AbortError');
+      const [exists] = await pathsExist([rec.path]);
       if (exists) { await openFile(rec.path); return false; }
     }
   }
-  const blob = await fetchDownloadBlob(resolveUploadUrl(f.url), signal);
-  if (signal?.aborted) throw new DOMException('Загрузка отменена', 'AbortError');
+  const r = await fetch(resolveUploadUrl(f.url));
+  if (!r.ok) throw new Error('Ошибка ' + r.status);
+  const blob = await r.blob();
   if (isTauri) {
     const bytes = new Uint8Array(await blob.arrayBuffer());
-    if (signal?.aborted) throw new DOMException('Загрузка отменена', 'AbortError');
     const path = await saveFileDialog(bytes, f.name);
     if (path) addDownload({ url: f.url, name: f.name, size: f.size, mime: f.mime, savedAt: Date.now(), path });
     return !!path;
@@ -1021,31 +1003,20 @@ function ImageLightbox({ attachment, onClose }: { attachment: Attachment; onClos
   const toast = useStore((s) => s.toast);
   const downloads = useSyncExternalStore(subscribeDownloads, getDownloads);
   const [busy, setBusy] = useState(false);
-  const downloadController = useRef<AbortController | null>(null);
-  const downloadGeneration = useRef(0);
   useEffect(() => {
     const k = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
     window.addEventListener('keydown', k);
     return () => window.removeEventListener('keydown', k);
   }, [onClose]);
-  useEffect(() => () => { downloadGeneration.current += 1; downloadController.current?.abort(); }, []);
   const url = resolveUploadUrl(attachment.url);
   async function onDownload() {
-    if (busy || downloadController.current) return;
+    if (busy) return;
     setBusy(true);
-    const generation = ++downloadGeneration.current;
-    const controller = new AbortController();
-    downloadController.current = controller;
     try {
-      const saved = await saveAttachment(attachment, downloads, controller.signal);
-      if (saved && downloadGeneration.current === generation && !controller.signal.aborted) toast(`Сохранено: ${attachment.name}`, 'ok');
-    } catch { if (downloadGeneration.current === generation && !controller.signal.aborted) toast(`Не удалось скачать ${attachment.name}`, 'err'); }
-    finally {
-      if (downloadGeneration.current === generation) {
-        if (downloadController.current === controller) downloadController.current = null;
-        setBusy(false);
-      }
-    }
+      const saved = await saveAttachment(attachment, downloads);
+      if (saved) toast(`Сохранено: ${attachment.name}`, 'ok');
+    } catch { toast(`Не удалось скачать ${attachment.name}`, 'err'); }
+    finally { setBusy(false); }
   }
   return (
     <div className="lightbox" role="dialog" aria-modal="true" onClick={onClose}>
@@ -1085,25 +1056,14 @@ function MessageAttachments({ files, onImageClick }: { files: Attachment[]; onIm
   const images = files.filter((f) => f.kind === 'image');
   const others = files.filter((f) => f.kind === 'file');
   const [downloading, setDownloading] = useState<number | null>(null);
-  const downloadController = useRef<AbortController | null>(null);
-  const downloadGeneration = useRef(0);
-  useEffect(() => () => { downloadGeneration.current += 1; downloadController.current?.abort(); }, []);
   async function downloadFile(i: number, f: Attachment) {
-    if (downloading != null || downloadController.current) return;
+    if (downloading != null) return;
     setDownloading(i);
-    const generation = ++downloadGeneration.current;
-    const controller = new AbortController();
-    downloadController.current = controller;
     try {
-      const saved = await saveAttachment(f, downloads, controller.signal);
-      if (saved && downloadGeneration.current === generation && !controller.signal.aborted) toast(`Сохранено: ${f.name}`, 'ok');
-    } catch { if (downloadGeneration.current === generation && !controller.signal.aborted) toast(`Не удалось скачать ${f.name}`, 'err'); }
-    finally {
-      if (downloadGeneration.current === generation) {
-        if (downloadController.current === controller) downloadController.current = null;
-        setDownloading(null);
-      }
-    }
+      const saved = await saveAttachment(f, downloads);
+      if (saved) toast(`Сохранено: ${f.name}`, 'ok');
+    } catch { toast(`Не удалось скачать ${f.name}`, 'err'); }
+    finally { setDownloading(null); }
   }
   return (
     <div className="msg-files">
@@ -2419,19 +2379,7 @@ function Chat() {
       toast(enabled ? 'Мяу!' : 'Котики спрятались', 'ok');
     } else if (c === 'clear') {
       if (!active || !canMod) { toast('Нет прав на очистку чата', 'warn'); return; }
-      const canonicalTransport = E.canonicalChatEnabled();
-      try {
-        await api.clearChat(active.id, canonicalTransport);
-        E.publishLegacyConfirmed(active.id, { t: 'clear', by: me.displayName });
-        // The canonical chat.cleared revision owns ordering. An unconditional
-        // local wipe after the HTTP response could erase a newer created event
-        // that arrived between the clear mutation and this continuation.
-        if (canonicalTransport) void E.resynchronizeChat(active.id);
-        else {
-          E.clearMessages(me.displayName, false);
-          void E.resynchronizeChat(active.id);
-        }
-      } catch (e: any) { toast(e?.message || 'Ошибка', 'err'); }
+      try { await api.clearChat(active.id); E.clearMessages(me.displayName); } catch (e: any) { toast(e?.message || 'Ошибка', 'err'); }
     } else {
       E.sysMsg(`Неизвестная команда: /${c}. Напиши /help для списка.`);
     }
@@ -2812,7 +2760,7 @@ function Chat() {
           {!m.sys ? <div className="msg-av">{!cont ? <Avatar name={m.who || ''} ci={m.color ?? 0} url={author?.avatarUrl} size={36} /> : null}</div> : null}
           <div className="msg-body">
             {replyQuote}
-            {!m.sys && !cont ? <div className="who" style={{ ['--nc' as string]: nameColor } as CSSProperties}>{m.who}{aRoles.length ? <span className="who-roles">{aRoles.map((r) => <span key={r.id} className="who-role" style={{ background: (r.color || 'var(--panel3)') + '22', color: r.color || 'var(--muted)', borderColor: (r.color || 'var(--line-2)') + '55' }}>{r.name}</span>)}</span> : null}{m.ts ? <span className="mtime">{fmtTime(m.ts)}</span> : null}</div> : null}
+            {!m.sys && !cont ? <div className="who" style={{ color: nameColor }}>{m.who}{aRoles.length ? <span className="who-roles">{aRoles.map((r) => <span key={r.id} className="who-role" style={{ background: (r.color || 'var(--panel3)') + '22', color: r.color || 'var(--muted)', borderColor: (r.color || 'var(--line-2)') + '55' }}>{r.name}</span>)}</span> : null}{m.ts ? <span className="mtime">{fmtTime(m.ts)}</span> : null}</div> : null}
             <div className="msg-main">
               <div className="msg-content" data-chat-visual-anchor="">
                 {editing?.id === m.id ? (
@@ -3053,21 +3001,6 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
   const [qualOpen, setQualOpen] = useState(false); // Д4: меню качества
   const [pickAnchor, setPickAnchor] = useState<DOMRect | null | undefined>(undefined);
   const sprayRef = useRef<HTMLButtonElement>(null);
-  const audioControllerRef = useRef<TreeStreamAudioController | null>(null);
-  const exactVideoFrameObserverRef = useRef<ExactVideoTrackFrameObserver | null>(null);
-  const videoPlayCoordinatorRef = useRef(new ExactMediaPlayCoordinator<HTMLVideoElement>());
-  const streamVolumeGestureDeduperRef = useRef(new AudioUnlockGestureDeduper());
-  const streamVolumeGesturePendingRef = useRef(false);
-  const playAttemptSeq = useRef(0);
-  const [playbackBlocked, setPlaybackBlocked] = useState(false);
-  const [svol, setSvol] = useState(() => Math.round(E.streamVolOf(identity) * 100));
-  const wrapRef = useRef<HTMLDivElement>(null);
-  const [prevVol, setPrevVol] = useState(100);
-  const playbackGeneration = E.watchPlaybackGeneration(identity, streamKey);
-  const transportTrack = E.getVideoTrack(streamKey);
-  const desiredStreamGain = effectiveStreamGain(getSettings().master, svol / 100, eng.deafened || isLocal);
-  const desiredStreamGainRef = useRef(desiredStreamGain);
-  desiredStreamGainRef.current = desiredStreamGain;
   // контролы прячутся не только при уходе мыши с плитки (:hover в CSS), но и если мышь
   // осталась над плиткой, но не двигалась 5с — как в видеоплеерах. idle-класс перебивает :hover.
   const [idle, setIdle] = useState(false);
@@ -3081,179 +3014,13 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
   const floatSeq = useRef(1);
   const name = members.find((m) => m.username === identity)?.displayName || identity;
 
-  const attemptPlayback = useCallback(async (
-    explicitGesture = false,
-    decodedVideoCandidate?: MediaStreamTrack,
-  ) => {
-    const v = vidRef.current;
-    if (!v || document.visibilityState === 'hidden') return;
-    const attempt = ++playAttemptSeq.current;
-    const controller = audioControllerRef.current;
-    const audioReadyAttempt = desiredStreamGainRef.current <= 0 || !controller
-      ? true
-      : controller.resume(1_500, explicitGesture);
-    // Muted video playback must not wait behind an iOS AudioContext.resume()
-    // promise: WebKit may leave it pending until the next user gesture.
-    const [audioReady, outcome] = await Promise.all([
-      audioReadyAttempt,
-      playMediaElementCoordinated(videoPlayCoordinatorRef.current, v, explicitGesture),
-    ]);
-    if (attempt !== playAttemptSeq.current || vidRef.current !== v) return;
-    // Tree owns the combined stream audio and can report its exact state. LiveKit screen audio
-    // is attached separately by Engine, so this video tile must leave that state unknown.
-    const diagnosticAudioReady = controller ? audioReady : undefined;
-    if (!isLocal) E.recordWatchPlaybackOutcome(
-      identity, streamKey, playbackGeneration, outcome, diagnosticAudioReady,
-    );
-    // Do not close the diagnostic before the async play()/AudioContext result above is recorded.
-    // A decoded frame still proves transport success when autoplay is blocked, but the same report
-    // must explain why the viewer saw the explicit Retry control.
-    if (!isLocal && v.videoWidth > 0 && v.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-      // Only the observer callback carries decoded-frame authority. An ordinary play()/gesture can
-      // see videoWidth retained from the predecessor after a LiveKit resubscribe or tree reparent;
-      // in that case request a fresh exact-generation frame instead of confirming stale pixels.
-      if (decodedVideoCandidate) {
-        E.confirmWatchPlayback(identity, streamKey, playbackGeneration, decodedVideoCandidate);
-      } else {
-        exactVideoFrameObserverRef.current?.requestCurrentFrame();
-      }
-    }
-    // WebKit иногда оставляет play() pending вместо NotAllowedError. После bounded
-    // ожидания это такой же recoverable gesture-case: не прячем единственную кнопку Retry.
-    setPlaybackBlocked(!audioReady || outcome !== 'playing');
-  }, [E, identity, isLocal, playbackGeneration, streamKey]);
-
   useEffect(() => {
-    const track = transportTrack; if (!track || !vidRef.current) return;
+    const track = E.getVideoTrack(streamKey); if (!track || !vidRef.current) return;
     const v = vidRef.current;
-    v.autoplay = true;
-    v.playsInline = true;
-    v.classList.remove('ready');
-    setPlaybackBlocked(false);
-
-    const streamHandle = track as unknown as { getMediaStream?: () => MediaStream };
-    const mediaStream = typeof streamHandle.getMediaStream === 'function'
-      ? streamHandle.getMediaStream()
-      : null;
-    const exactLiveKitVideo = !mediaStream && !isLocal
-      ? (track as unknown as { mediaStreamTrack?: MediaStreamTrack }).mediaStreamTrack
-      : undefined;
-    const retry = () => {
-      if (document.visibilityState !== 'hidden') void attemptPlayback(false);
-    };
-    if (mediaStream && !isLocal) {
-      const controller = new TreeStreamAudioController(v, mediaStream, {
-        onNeedsUnlock: () => {
-          if (document.visibilityState !== 'hidden' && desiredStreamGainRef.current > 0) setPlaybackBlocked(true);
-        },
-        // A shared AudioContext becoming runnable proves only this mixer's state. Retry the exact
-        // tile so another stream cannot hide an overlay over a still-blocked/paused video.
-        onPlaybackReady: retry,
-        // A tile can be the first tree/P2P target created after Settings already accepted an
-        // output device. Re-run the aggregate switch if that inherited route is now unavailable.
-        onOutputRouteFailure: () => {
-          const currentEngine = getEngine();
-          if (currentEngine !== E) return false;
-          void currentEngine.applyOutput();
-          return true;
-        },
-      });
-      controller.setGain(desiredStreamGainRef.current);
-      audioControllerRef.current = controller;
-    } else v.muted = true; // local preview and LiveKit video use a separate screen-audio track
-
-    // Establish the exact audio owner before attach. WebKit can start autoplay synchronously when
-    // srcObject is assigned; muting every stream first made an ordinary desktop/tree stream stay
-    // silent even though its audio track and saved non-zero gain were already available. The tree
-    // controller keeps iOS volume-locked media muted and owns WebAudio before this same boundary.
-    try { (track as any).attach(v); }
-    catch {
-      if (!isLocal) E.recordWatchPlaybackOutcome(
-        identity, streamKey, playbackGeneration, 'failed', mediaStream ? false : undefined,
-      );
-      setPlaybackBlocked(true);
-      const controller = audioControllerRef.current;
-      audioControllerRef.current = null;
-      controller?.dispose();
-      return;
-    }
-
-    let exactVideoFrames: ExactVideoTrackFrameObserver | null = null;
-    const finishDecoded = (candidate?: MediaStreamTrack) => {
-      if (isLocal || !v.videoWidth || v.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
-      if (document.visibilityState === 'hidden') {
-        E.recordWatchPlaybackOutcome(
-          identity, streamKey, playbackGeneration, 'waiting',
-          mediaStream ? desiredStreamGainRef.current <= 0 : undefined,
-        );
-        if (candidate) E.confirmWatchPlayback(identity, streamKey, playbackGeneration, candidate);
-        return;
-      }
-      void attemptPlayback(false, candidate);
-    };
-    if (!isLocal) {
-      // LiveKit gives each tile a RemoteTrack rather than Tree's stable combined MediaStream. Wrap
-      // that exact physical candidate only for frame ownership; replacing the same TrackSid changes
-      // `transportTrack`, tears this observer down and attaches the replacement before it can confirm.
-      const observedStream = mediaStream || (exactLiveKitVideo ? new MediaStream([exactLiveKitVideo]) : null);
-      if (observedStream) {
-        exactVideoFrames = new ExactVideoTrackFrameObserver(v, observedStream, finishDecoded);
-        exactVideoFrameObserverRef.current = exactVideoFrames;
-      }
-    }
-    const visible = () => {
-      if (document.visibilityState !== 'visible') return;
-      if (exactVideoFrames) exactVideoFrames.requestCurrentFrame();
-      retry();
-    };
-    // Декодированный кадр = поток доехал. Это доказательство соединения, и оно не зависит
-    // от того, разрешил ли браузер автозапуск: у заблокированного видео первый кадр есть,
-    // просто оно стоит на паузе.
-    const confirmDecoded = () => {
-      if (exactVideoFrames) { exactVideoFrames.requestCurrentFrame(); return; }
-      finishDecoded();
-    };
-    const playable = () => {
-      v.classList.add('ready');
-      confirmDecoded();
-    };
-    const playing = () => {
-      v.classList.add('ready');
-      confirmDecoded();
-      retry();
-    };
-    v.addEventListener('loadeddata', playable);
-    v.addEventListener('loadedmetadata', retry);
-    v.addEventListener('canplay', playable);
-    v.addEventListener('playing', playing);
-    // resize — канонический сигнал появления первого кадра у MediaStream: videoWidth 0 → N.
-    v.addEventListener('resize', confirmDecoded);
-    mediaStream?.addEventListener('addtrack', retry);
-    window.addEventListener('pageshow', retry);
-    document.addEventListener('visibilitychange', visible);
-    if (v.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) playable();
-    confirmDecoded();
-    queueMicrotask(retry);
-
-    return () => {
-      ++playAttemptSeq.current;
-      v.removeEventListener('loadeddata', playable);
-      v.removeEventListener('loadedmetadata', retry);
-      v.removeEventListener('canplay', playable);
-      v.removeEventListener('playing', playing);
-      v.removeEventListener('resize', confirmDecoded);
-      mediaStream?.removeEventListener('addtrack', retry);
-      window.removeEventListener('pageshow', retry);
-      document.removeEventListener('visibilitychange', visible);
-      const controller = audioControllerRef.current;
-      audioControllerRef.current = null;
-      controller?.dispose();
-      if (exactVideoFrameObserverRef.current === exactVideoFrames) exactVideoFrameObserverRef.current = null;
-      exactVideoFrames?.dispose();
-      videoPlayCoordinatorRef.current.forget(v);
-      try { (track as any).detach(v); } catch { /**/ }
-    };
-  }, [streamKey, isLocal, E, attemptPlayback, identity, playbackGeneration, transportTrack]);
+    (track as any).attach(v); v.muted = isLocal;
+    const ready = () => v.classList.add('ready'); v.addEventListener('loadeddata', ready, { once: true });
+    return () => { try { (track as any).detach(v); } catch { /**/ } };
+  }, [streamKey, isLocal, E]);
 
   useEffect(() => E.onEmote((sid, emoteId, by, x, size) => {
     if (sid !== identity) return;
@@ -3263,110 +3030,60 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
   }), [identity, E]);
 
   useEffect(() => {
-    if (!statsOn) { setStats(''); return; }
-    let cancelled = false;
-    let timer: number | null = null;
-    const schedule = (delay: number) => {
-      if (cancelled || timer !== null) return;
-      timer = window.setTimeout(() => { timer = null; void tick(); }, delay);
-    };
-    const tick = async () => {
-      try {
-        if (isLocal) {
-          const value = await E.getScreenStats();
-          if (!cancelled) setStats(value || '');
-          return;
+    if (isLocal) {
+      const t = setInterval(async () => { const s = await E.getScreenStats(); setStats(s || ''); }, 1500);
+      return () => clearInterval(t);
+    }
+    // Зритель (лист/ретранслятор дерева, Э2.1): разрешение+fps+dropped из RTP-статистики
+    // входящего трека, позиция в дереве — из tree-info с сервера (см. treeVideo.ts).
+    const t = setInterval(async () => {
+      const rtp = await E.getWatchRtpStats(identity);
+      const tree = E.getTreeInfo(identity);
+      if (!rtp && !tree) { setStats(''); return; }
+      const parts: string[] = [];
+      if (rtp) parts.push(`${rtp.width}×${rtp.height} · ${rtp.fps.toFixed(0)} fps · дропы ${rtp.framesDropped}`);
+      // Оценка задержки: сеть = сумма rtt/2 по цепочке хопов до вещателя (rtt линков
+      // сервер собирает в топологию из RTCP-отчётов родителей) + локальный джиттер-буфер
+      // декодера. Энкод/декод не учтены — это нижняя оценка, не точное e2e.
+      const topo = E.getStreamTopology(identity);
+      let netMs = 0;
+      if (topo?.you) {
+        let cur = topo.nodes.find((n) => n.id === topo.you);
+        let hops = 0;
+        while (cur && !cur.broadcaster && hops++ < 8) {
+          netMs += (cur.rtt || 0) / 2;
+          cur = cur.parentId ? topo.nodes.find((n) => n.id === cur!.parentId) : undefined;
         }
-        // Зритель (лист/ретранслятор дерева, Э2.1): разрешение+fps+dropped из RTP-статистики
-        // входящего трека, позиция в дереве — из tree-info с сервера (см. treeVideo.ts).
-        const rtp = await E.getWatchRtpStats(identity);
-        if (cancelled) return;
-        const tree = E.getTreeInfo(identity);
-        if (!rtp && !tree) { setStats(''); return; }
-        const parts: string[] = [];
-        if (rtp) parts.push(`${rtp.width}×${rtp.height} · ${rtp.fps.toFixed(0)} fps · дропы ${rtp.framesDropped}`);
-        // Оценка задержки: сеть = сумма rtt/2 по цепочке хопов до вещателя (rtt линков
-        // сервер собирает в топологию из RTCP-отчётов родителей) + локальный джиттер-буфер
-        // декодера. Энкод/декод не учтены — это нижняя оценка, не точное e2e.
-        const topo = E.getStreamTopology(identity);
-        let netMs = 0;
-        if (topo?.you) {
-          let cur = topo.nodes.find((n) => n.id === topo.you);
-          let hops = 0;
-          while (cur && !cur.broadcaster && hops++ < 8) {
-            netMs += (cur.rtt || 0) / 2;
-            cur = cur.parentId ? topo.nodes.find((n) => n.id === cur!.parentId) : undefined;
-          }
-        }
-        const latency = Math.round(netMs + (rtp?.jitterBufferMs || 0));
-        if (latency > 0) parts.push(`задержка ≈${latency} мс (сеть ${Math.round(netMs)} + буфер ${Math.round(rtp?.jitterBufferMs || 0)})`);
-        if (tree) parts.push(`дерево: глубина ${tree.myDepth}${tree.children ? `, ретранслируешь на ${tree.children}` : ''}`);
-        setStats(parts.join('<br>'));
-      } finally {
-        // Schedule after real settlement. A browser getStats promise that ignores radio/page
-        // cancellation can hold one optional sample, never stack another every interval tick.
-        schedule(isLocal ? 1500 : 2000);
       }
-    };
-    void tick();
-    return () => {
-      cancelled = true;
-      if (timer !== null) window.clearTimeout(timer);
-    };
-  }, [isLocal, identity, E, statsOn]);
+      const latency = Math.round(netMs + (rtp?.jitterBufferMs || 0));
+      if (latency > 0) parts.push(`задержка ≈${latency} мс (сеть ${Math.round(netMs)} + буфер ${Math.round(rtp?.jitterBufferMs || 0)})`);
+      if (tree) parts.push(`дерево: глубина ${tree.myDepth}${tree.children ? `, ретранслируешь на ${tree.children}` : ''}`);
+      setStats(parts.join('<br>'));
+    }, 2000);
+    return () => clearInterval(t);
+  }, [isLocal, identity, E]);
 
   const watchers = eng.watchers[identity] || [];
-  const armStreamVolumeGesture = (event: { nativeEvent: Event }) => {
-    if (streamVolumeGestureDeduperRef.current.accept(event.nativeEvent)) streamVolumeGesturePendingRef.current = true;
-  };
-  const setVol = (v: number, explicitGesture = false) => {
-    setSvol(v);
-    E.setStreamVol(identity, v / 100);
-    const controller = audioControllerRef.current;
-    if (v > 0 && controller) void controller.resume(1_500, explicitGesture).then((ready) => {
-      if (audioControllerRef.current === controller && !ready) setPlaybackBlocked(true);
-    });
-  };
-  const changeStreamVolume = (value: number) => {
-    const explicitGesture = streamVolumeGesturePendingRef.current;
-    streamVolumeGesturePendingRef.current = false;
-    setVol(value, explicitGesture);
-  };
-  const toggleMute = () => { if (svol > 0) { setPrevVol(svol); setVol(0, true); } else setVol(prevVol || 100, true); };
+  const [svol, setSvol] = useState(() => Math.round(E.streamVolOf(identity) * 100));
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [prevVol, setPrevVol] = useState(100);
+  const setVol = (v: number) => { setSvol(v); E.setStreamVol(identity, v / 100); };
+  const toggleMute = () => { if (svol > 0) { setPrevVol(svol); setVol(0); } else setVol(prevVol || 100); };
 
-  // iPhone locks HTMLMediaElement.volume, so the tree controller keeps the video
-  // muted and applies master × per-stream gain through WebAudio. Other browsers
-  // retain the direct media-element fallback. LiveKit audio remains a separate
-  // engine-owned ScreenShareAudio track.
+  // Звук p2p-трансляции (Э5) идёт прямо в тег <video> (единый MediaStream от
+  // transport'а), отдельного <audio>-элемента для него, в отличие от LiveKit-пути
+  // (screenAudioEls), нет — громкость/мут крутим на самом видео-элементе.
   useEffect(() => {
     const v = vidRef.current; if (!v) return;
-    const controller = audioControllerRef.current;
-    if (controller) controller.setGain(desiredStreamGain);
-    else v.muted = true; // local preview and LiveKit video never own the audible screen-audio track
-  }, [desiredStreamGain, streamKey]);
-  const resumeStreamAudioFromGesture = () => {
-    // Use the same exact video+audio attempt as the overlay. AudioContext success alone must not
-    // hide a still-paused video, and both play()/resume() are entered inside the user gesture.
-    void attemptPlayback(true);
-  };
-  const toggleFs = () => {
-    const wrap = wrapRef.current, video = vidRef.current;
-    if (wrap && video) { resumeStreamAudioFromGesture(); void toggleStreamFullscreen(wrap, video); }
-  };
-  const togglePip = () => {
-    const video = vidRef.current;
-    if (video) { resumeStreamAudioFromGesture(); void toggleStreamPictureInPicture(video); }
-  };
+    v.muted = isLocal || eng.deafened || svol === 0;
+    v.volume = svol / 100;
+  }, [svol, isLocal, eng.deafened, streamKey]);
+  const toggleFs = () => { document.fullscreenElement ? document.exitFullscreen() : wrapRef.current?.requestFullscreen().catch(() => {}); };
+  const togglePip = () => { if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => {}); else vidRef.current?.requestPictureInPicture().catch(() => {}); };
 
   return (
     <div className={'vwrap' + (idle ? ' idle' : '')} ref={wrapRef} onDoubleClick={toggleFs} onMouseMove={resetIdle} onMouseEnter={resetIdle}>
       <video ref={vidRef} autoPlay playsInline />
-      {playbackBlocked ? (
-        <button type="button" className="stream-play-unlock" onDoubleClick={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); void attemptPlayback(true); }}>
-          <Icon name="speaker" />
-          <span>Нажми, чтобы запустить видео и звук</span>
-        </button>
-      ) : null}
       <div className="lbl" title={appName ? `${name} · ${appName}` : name}>
         {appIcon
           ? <img src={`data:image/png;base64,${appIcon}`} width={16} height={16} style={{ borderRadius: 3, verticalAlign: 'text-bottom', marginRight: 4, objectFit: 'contain' }} alt="" />
@@ -3397,9 +3114,7 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
         {!isLocal ? (
           <>
             <button className="vb-btn" aria-label={svol === 0 ? 'Включить звук трансляции' : 'Заглушить трансляцию'} data-tip={svol === 0 ? 'Включить звук' : 'Заглушить'} onClick={toggleMute}><Icon name={svol === 0 ? 'volume-off' : 'speaker'} sm /></button>
-            <input className="vb-vol" aria-label="Громкость трансляции" type="range" min={0} max={100} value={svol}
-              onPointerDown={armStreamVolumeGesture} onTouchStart={armStreamVolumeGesture} onKeyDown={armStreamVolumeGesture}
-              onChange={(e) => changeStreamVolume(+e.target.value)} />
+            <input className="vb-vol" aria-label="Громкость трансляции" type="range" min={0} max={100} value={svol} onChange={(e) => setVol(+e.target.value)} />
             <span className="vb-pct">{svol}%</span>
           </>
         ) : <span className="vb-lbl">🖥 Твоя трансляция</span>}
@@ -3599,10 +3314,10 @@ function Channels() {
 
 function useResizable(key: string, def: number, min: number, max: number, edge: 'right' | 'left') {
   const [w, setW] = useState<number>(() => {
-    const s = Number(safeLocalStorageGet(key));
+    const s = Number(localStorage.getItem(key));
     return s >= min && s <= max ? s : def;
   });
-  useEffect(() => { safeLocalStorageSet(key, String(w)); }, [key, w]);
+  useEffect(() => { localStorage.setItem(key, String(w)); }, [key, w]);
   const onDown = (e: ReactMouseEvent) => {
     e.preventDefault();
     const sx = e.clientX, sw = w;
@@ -3638,8 +3353,8 @@ export function ServerView() {
   const chan = useResizable('w:channels', 292, 264, 360, 'right');
   const mem = useResizable('w:members', 304, 264, 360, 'left');
   const chatW = useResizable('w:chat', 340, 260, 640, 'left');
-  const [membersOpen, setMembersOpen] = useState(() => safeLocalStorageGet('membersOpen') !== '0');
-  useEffect(() => { safeLocalStorageSet('membersOpen', membersOpen ? '1' : '0'); }, [membersOpen]);
+  const [membersOpen, setMembersOpen] = useState(() => localStorage.getItem('membersOpen') !== '0');
+  useEffect(() => { localStorage.setItem('membersOpen', membersOpen ? '1' : '0'); }, [membersOpen]);
   const [supportOpen, setSupportOpen] = useState(false);
   const [mediumWorkspace, setMediumWorkspace] = useState(() => window.innerWidth > 900 && window.innerWidth <= 1240);
   useEffect(() => {
@@ -3648,8 +3363,8 @@ export function ServerView() {
     sync(); mq.addEventListener('change', sync);
     return () => mq.removeEventListener('change', sync);
   }, []);
-  const [channelsOpen, setChannelsOpen] = useState(() => safeLocalStorageGet('channelsOpen') !== '0');
-  useEffect(() => { safeLocalStorageSet('channelsOpen', channelsOpen ? '1' : '0'); }, [channelsOpen]);
+  const [channelsOpen, setChannelsOpen] = useState(() => localStorage.getItem('channelsOpen') !== '0');
+  useEffect(() => { localStorage.setItem('channelsOpen', channelsOpen ? '1' : '0'); }, [channelsOpen]);
   const [showChat, setShowChat] = useState(false);
   useEffect(() => { if (!split) setShowChat(false); }, [split]);
   const [singlePaneWorkspace, setSinglePaneWorkspace] = useState(() => window.matchMedia('(max-width:900px)').matches);

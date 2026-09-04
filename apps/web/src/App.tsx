@@ -20,9 +20,7 @@ import { initNotifications } from './notify';
 import { TooltipLayer } from './components/TooltipLayer';
 import { ConnectivityBanner } from './components/ConnectivityBanner';
 import { NotificationPermissionPrompt } from './components/NotificationPermissionPrompt';
-import { IosPwaInstallPrompt } from './components/IosPwaInstallPrompt';
 import { QuickSwitcher, ShortcutHelp, rememberServerDestination } from './components/CommandOverlays';
-import { safeLocalStorageGet } from './safeStorage';
 
 // версия принудительного сброса хоткеев на новые дефолты — см. эффект хоткеев ниже
 const HK_RESET_V = 1;
@@ -79,7 +77,7 @@ function Rail() {
         {servers.map((s) => {
           const un = activeId === s.id ? 0 : (unread[s.id] || 0); // активный не бейджим (читаем его)
           return (
-          <button key={s.id} className={'railbtn tip-l' + (activeId === s.id ? ' active' : '') + (eng.voiceServerId === s.id && activeId !== s.id ? ' connected' : '') + (un ? ' unread' : '') + (s.iconUrl ? '' : ' av-fill')}
+          <button key={s.id} className={'railbtn tip-l' + (activeId === s.id ? ' active' : '') + (eng.voiceServerId === s.id && activeId !== s.id ? ' connected' : '') + (un ? ' unread' : '')}
             aria-label={s.name + (eng.voiceServerId === s.id && activeId !== s.id ? ' — вы в голосовом канале' : '') + (draftServers.has(s.id) ? ' — есть черновик' : '')}
             aria-current={activeId === s.id ? 'page' : undefined}
             data-tip={eng.voiceServerId === s.id && activeId !== s.id ? s.name + ' · в голосе' : s.name}
@@ -105,7 +103,7 @@ function Rail() {
         {/* Настройки — глобально в рейле (доступны и на главной, не только внутри сервера) */}
         <button className={'railbtn rail-set tip-l' + (modal === 'settings' ? ' active' : '')} aria-label="Настройки" aria-pressed={modal === 'settings'} data-tip="Настройки" onClick={() => setModal('settings')}><Icon name="gear" /></button>
         <button className={'railbtn rail-dl tip-l' + (modal === 'downloads' ? ' active' : '')} aria-label="Загрузки" aria-pressed={modal === 'downloads'} data-tip="Загрузки" onClick={() => setModal('downloads')}><Icon name="download" /></button>
-        <button className={'railbtn rail-me tip-l' + (modal === 'profile' ? ' active' : '') + (me.avatarUrl ? '' : ' av-fill')} aria-label="Профиль" aria-pressed={modal === 'profile'} data-tip="Профиль" style={{ background: me.avatarUrl ? '#0000' : avColor(me.displayName, me.avatarColor) }} onClick={() => setModal('profile')}>{me.avatarUrl ? <img className="avimg" src={resolveUploadUrl(me.avatarUrl)} alt="" /> : initial(me.displayName)}</button>
+        <button className={'railbtn rail-me tip-l' + (modal === 'profile' ? ' active' : '')} aria-label="Профиль" aria-pressed={modal === 'profile'} data-tip="Профиль" style={{ background: me.avatarUrl ? '#0000' : avColor(me.displayName, me.avatarColor) }} onClick={() => setModal('profile')}>{me.avatarUrl ? <img className="avimg" src={resolveUploadUrl(me.avatarUrl)} alt="" /> : initial(me.displayName)}</button>
       </div>
     </nav>
   );
@@ -116,16 +114,14 @@ function Rail() {
 // Ширины берём из тех же localStorage-ключей, что и настоящий ServerView (иначе колонки скакнут).
 function ServerSkeleton() {
   const entryTab = useStore((s) => s.serverEntryTab);
-  const storedChW = Number(safeLocalStorageGet('w:channels'));
-  const storedMemW = Number(safeLocalStorageGet('w:members'));
-  const chW = storedChW >= 264 && storedChW <= 360 ? storedChW : 292;
-  const memW = storedMemW >= 264 && storedMemW <= 360 ? storedMemW : 304;
+  const chW = +(localStorage.getItem('w:channels') || 292);
+  const memW = +(localStorage.getItem('w:members') || 304);
   const singlePane = window.innerWidth <= 900;
   const compactDesktop = window.innerWidth >= 1241 && window.innerWidth <= 1360;
   const skeletonChW = compactDesktop ? Math.min(chW, 280) : chW;
   const skeletonMemW = compactDesktop ? Math.min(memW, 220) : memW;
-  const chOpen = window.innerWidth <= 1240 || safeLocalStorageGet('channelsOpen') !== '0';
-  const memOpen = safeLocalStorageGet('membersOpen') !== '0';
+  const chOpen = window.innerWidth <= 1240 || localStorage.getItem('channelsOpen') !== '0';
+  const memOpen = localStorage.getItem('membersOpen') !== '0';
   const showChannels = singlePane ? entryTab === 'channels' : chOpen;
   const showMain = !singlePane || entryTab === 'main';
   const showMembers = singlePane ? entryTab === 'members' : memOpen;
@@ -176,8 +172,8 @@ export function App() {
   // только после явного действия в нашем предварительном запросе или в настройках.
   useEffect(() => {
     if (!me) return;
-    initNotifications(me.id).then((result) => {
-      if (result.welcomed) useStore.getState().toast('Уведомления включены — отключить можно в Настройках → Уведомления', 'info');
+    initNotifications().then((welcomed) => {
+      if (welcomed) useStore.getState().toast('Уведомления включены — отключить можно в Настройках → Уведомления', 'info');
     }).catch(() => {});
     // натив: подтягиваем аллоулист игр Discord (сервер дистиллирует) → Rust матчит процессы для детекта
     if (isTauri) api.detectableGames().then((d) => { if (d?.games?.length) setDetectableGames(d.games); }).catch(() => {});
@@ -267,7 +263,7 @@ export function App() {
           }
         });
       }
-      if (s.mode === 'ptt' && !typing && !e.repeat && e.code === s.pttKey) E.pttPress('keyboard');
+      if (s.mode === 'ptt' && !typing && e.code === s.pttKey) E.pttPress();
     };
     const ku = (e: KeyboardEvent) => {
       const E = getEngine(); if (!E) return;
@@ -275,7 +271,7 @@ export function App() {
       const nk = normKey(e.code);
       pressed.delete(nk);
       (Object.keys(armed) as KeybindAction[]).forEach((action) => { if (s.keybinds[action].map(normKey).includes(nk)) armed[action] = false; });
-      if (s.mode === 'ptt' && e.code === s.pttKey) E.pttRelease('keyboard');
+      if (s.mode === 'ptt' && e.code === s.pttKey) E.pttRelease();
     };
     const releasePtt = () => {
       pressed.clear();
@@ -361,7 +357,6 @@ export function App() {
       <Toasts />
       <TooltipLayer />
       {me ? <ConnectivityBanner /> : null}
-      {me ? <IosPwaInstallPrompt /> : null}
       {me ? <NotificationPermissionPrompt /> : null}
       {me ? <QuickSwitcher open={quickSwitcherOpen} onClose={() => setQuickSwitcherOpen(false)} /> : null}
       {me ? <ShortcutHelp open={shortcutHelpOpen} onClose={() => setShortcutHelpOpen(false)} /> : null}

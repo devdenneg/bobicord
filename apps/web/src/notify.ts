@@ -1,11 +1,10 @@
-// Системные уведомления: Tauri plugin-notification либо Notifications API через service worker.
-// Web Push/VAPID подключается здесь только после подтверждённой сервером подписки; на iOS фоновые
-// уведомления доступны установленной Home Screen PWA, но фоновый микрофон Safari всё равно замораживает.
+// Системные (локальные) уведомления: натив (Tauri plugin-notification) + PWA/веб (Notifications API
+// через service worker). Фоновый push (приложение закрыто / iOS PWA в фоне) — отдельная инфра
+// (Web Push/VAPID), тут не реализован: на iOS свёрнутая PWA JS не исполняет, локальные уведомления
+// там не сработают вообще.
 import { isTauri, foregroundFullscreen } from './native';
-import {
-  getNotificationPushPrefs, getSettings, NOTIFICATION_PUSH_PREFS_CHANGED_EVENT, setSettings,
-} from './settings';
-import { ensurePushSubscribed, pushSetupErrorMessage, pushSupported, unsubscribePush } from './push';
+import { getSettings, setSettings } from './settings';
+import { ensurePushSubscribed } from './push';
 import { playSound } from './sounds';
 import { visibleChatServer } from './chatVisibility';
 import {
@@ -26,287 +25,19 @@ const KIND_PREF: Record<NotifKind, keyof AudioSettings> = { mention: 'notifMenti
 const FOCUS_GATED: Record<NotifKind, boolean> = { mention: true, stream: false, update: false };
 
 export function notifSupported(): boolean {
-  return isTauri || (typeof window !== 'undefined' && 'Notification' in window && pushSupported());
+  return isTauri || (typeof window !== 'undefined' && 'Notification' in window);
 }
 export function notifPermission(): 'default' | 'granted' | 'denied' {
   if (typeof Notification === 'undefined') return 'default';
   return Notification.permission;
 }
 
-export interface NotificationEnableResult {
-  enabled: boolean;
-  error?: string;
-  permissionDenied?: boolean;
-}
-
-let pushRecoveryUserId = '';
-let pushRecoveryInstalled = false;
-let pushRecoveryIntentEpoch = 0;
-let pushRecoveryLastAttemptAt = 0;
-let pushRecoveryConfirmed = false;
-let pushRecoveryRun: Promise<void> | null = null;
-let pushRecoveryTimer: number | null = null;
-let pushPreferencesGeneration = 0;
-const PUSH_MAINTENANCE_INTERVAL_MS = 60_000;
-const PUSH_RECOVERY_RETRY_INTERVAL_MS = 3_000;
-let notificationOptOutMemory = false;
-let notificationOptOutMemoryDirty = false;
-let notificationIntentEpoch = 0;
-let notificationIntentUserId = '';
-
-function invalidateNotificationIntent(clearUser = false): void {
-  notificationIntentEpoch += 1;
-  if (clearUser) notificationIntentUserId = '';
-}
-
-function beginNotificationIntent(userId: string): number {
-  notificationIntentUserId = userId;
-  notificationIntentEpoch += 1;
-  return notificationIntentEpoch;
-}
-
-function notificationIntentCurrent(epoch: number, userId: string): boolean {
-  if (notificationOptedOut()) return false;
-  return epoch === notificationIntentEpoch && userId === notificationIntentUserId;
-}
-
-export function notificationOptedOut(): boolean {
-  if (notificationOptOutMemoryDirty) {
-    // A failed disable remains authoritative in memory, while a failed enable must not overrule a
-    // restrictive durable value (possibly written by another tab while this one was frozen).
-    try { return notificationOptOutMemory || localStorage.getItem('notifOptOut') === '1'; }
-    catch { return notificationOptOutMemory; }
-  }
-  try {
-    const next = localStorage.getItem('notifOptOut') === '1';
-    if (next !== notificationOptOutMemory) {
-      notificationOptOutMemory = next;
-      invalidateNotificationIntent(next);
-      if (next) { pushRecoveryUserId = ''; pushRecoveryIntentEpoch = 0; }
-    }
-    return notificationOptOutMemory;
-  } catch { return notificationOptOutMemory; }
-}
-
-export function setNotificationOptOut(optedOut: boolean): void {
-  notificationOptOutMemory = optedOut;
-  invalidateNotificationIntent(optedOut);
-  if (optedOut) {
-    pushRecoveryUserId = '';
-    pushRecoveryIntentEpoch = 0;
-    cancelPushRecoveryTimer();
-    setSettings({ notif: false });
-  }
-  try {
-    if (optedOut) localStorage.setItem('notifOptOut', '1');
-    else localStorage.removeItem('notifOptOut');
-    notificationOptOutMemoryDirty = false;
-  } catch {
-    // A readable-but-unwritable storage area must not immediately overwrite this exact in-process
-    // choice with its stale value on the next recovery/read.
-    notificationOptOutMemoryDirty = true;
-  }
-}
-
-export function suspendNotificationPushRecovery(userId: string): void {
-  if (pushRecoveryUserId === userId) {
-    pushRecoveryUserId = '';
-    pushRecoveryIntentEpoch = 0;
-    cancelPushRecoveryTimer();
-  }
-  invalidateNotificationIntent(true);
-}
-
-function reconcileNotificationOptOut(): void {
-  if (notificationOptedOut()) {
-    pushRecoveryUserId = '';
-    pushRecoveryIntentEpoch = 0;
-    cancelPushRecoveryTimer();
-    if (getSettings().notif) setSettings({ notif: false });
-  }
-}
-
-if (typeof window !== 'undefined') {
-  // Install before the first subscription request: settings can change while init/permission flows
-  // are awaiting the backend, and that request must never confirm an older preference generation.
-  window.addEventListener(NOTIFICATION_PUSH_PREFS_CHANGED_EVENT, resyncPushPreferences);
-  window.addEventListener('storage', (event) => {
-    if (event.key !== 'notifOptOut') return;
-    const externalOptOut = event.newValue === '1';
-    if (notificationOptOutMemoryDirty) {
-      notificationOptOutMemory = notificationOptOutMemory || externalOptOut;
-      // Retain only an unpersisted restrictive local choice; every state matching durable storage
-      // can safely return to ordinary cross-tab reconciliation.
-      notificationOptOutMemoryDirty = notificationOptOutMemory && !externalOptOut;
-    } else notificationOptOutMemory = externalOptOut;
-    invalidateNotificationIntent(notificationOptOutMemory);
-    if (notificationOptOutMemory) {
-      pushRecoveryUserId = '';
-      pushRecoveryIntentEpoch = 0;
-      cancelPushRecoveryTimer();
-    }
-    if (notificationOptOutMemory) reconcileNotificationOptOut();
-  });
-  // A frozen iOS/BFCache page can miss `storage`; reconcile before it resumes local notifications.
-  window.addEventListener('pageshow', reconcileNotificationOptOut);
-  try {
-    document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible') reconcileNotificationOptOut();
-    });
-  } catch { /** document can be absent in unit/worker-like environments */ }
-}
-
-function cancelPushRecoveryTimer(): void {
-  if (pushRecoveryTimer === null || typeof window === 'undefined') return;
-  try { window.clearTimeout(pushRecoveryTimer); } catch { /**/ }
-  pushRecoveryTimer = null;
-}
-
-function schedulePushRecovery(): void {
-  if (pushRecoveryTimer !== null || isTauri || typeof window === 'undefined'
-    || typeof window.setTimeout !== 'function') return;
-  const userId = pushRecoveryUserId;
-  const intentEpoch = pushRecoveryIntentEpoch;
-  if (!userId || !notificationIntentCurrent(intentEpoch, userId)) return;
-  const cadence = pushRecoveryConfirmed ? PUSH_MAINTENANCE_INTERVAL_MS : PUSH_RECOVERY_RETRY_INTERVAL_MS;
-  const delay = Math.max(0, cadence - Math.max(0, Date.now() - pushRecoveryLastAttemptAt));
-  pushRecoveryTimer = window.setTimeout(() => {
-    pushRecoveryTimer = null;
-    retryPushRecovery();
-  }, delay);
-}
-
-function retryPushRecovery(): void {
-  const currentUserId = pushRecoveryUserId;
-  const currentIntentEpoch = pushRecoveryIntentEpoch;
-  const currentPreferencesGeneration = pushPreferencesGeneration;
-  if (!currentUserId || notificationOptedOut()
-    || typeof Notification === 'undefined' || Notification.permission !== 'granted'
-    || !notificationIntentCurrent(currentIntentEpoch, currentUserId)) return;
-  const now = Date.now();
-  const cadence = pushRecoveryConfirmed ? PUSH_MAINTENANCE_INTERVAL_MS : PUSH_RECOVERY_RETRY_INTERVAL_MS;
-  if (pushRecoveryRun || now - pushRecoveryLastAttemptAt < cadence) {
-    schedulePushRecovery();
-    return;
-  }
-  cancelPushRecoveryTimer();
-  pushRecoveryLastAttemptAt = now;
-  let run: Promise<void>;
-  run = ensurePushSubscribed(currentUserId).then(() => {
-    if (pushRecoveryUserId !== currentUserId || pushRecoveryIntentEpoch !== currentIntentEpoch
-      || !notificationIntentCurrent(currentIntentEpoch, currentUserId)) return;
-    if (pushPreferencesGeneration !== currentPreferencesGeneration) return;
-    pushRecoveryConfirmed = true;
-    pushRecoveryLastAttemptAt = Date.now();
-    setSettings({ notif: true });
-  }).catch(() => {
-    if (pushRecoveryUserId === currentUserId && pushRecoveryIntentEpoch === currentIntentEpoch)
-      pushRecoveryConfirmed = false;
-  }).finally(() => {
-    if (pushRecoveryRun === run) pushRecoveryRun = null;
-    if (pushPreferencesGeneration !== currentPreferencesGeneration
-      && pushRecoveryUserId === currentUserId && pushRecoveryIntentEpoch === currentIntentEpoch
-      && notificationIntentCurrent(currentIntentEpoch, currentUserId)) {
-      pushRecoveryConfirmed = false;
-      pushRecoveryLastAttemptAt = 0;
-      cancelPushRecoveryTimer();
-      retryPushRecovery();
-      return;
-    }
-    schedulePushRecovery();
-  });
-  pushRecoveryRun = run;
-}
-
-function retryPushRecoveryAfterControllerChange(): void {
-  // A rolling legacy worker intentionally has no session-state ACK. As soon as the staged current
-  // worker takes control, bypass maintenance cadence and confirm its durable state immediately.
-  // The generation also fences a legacy request already in flight: its late success cannot mark
-  // the replacement controller confirmed and the existing finally path starts a fresh run.
-  pushPreferencesGeneration += 1;
-  pushRecoveryConfirmed = false;
-  pushRecoveryLastAttemptAt = 0;
-  cancelPushRecoveryTimer();
-  retryPushRecovery();
-}
-
-function resyncPushPreferences(): void {
-  pushPreferencesGeneration += 1;
-  if (!pushRecoveryUserId || notificationOptedOut()) return;
-  // Privacy and per-kind preferences are stored on the exact endpoint. Do not wait for the normal
-  // maintenance cadence after a settings change, otherwise a lock-screen banner could use stale
-  // server policy for up to a minute.
-  pushRecoveryConfirmed = false;
-  pushRecoveryLastAttemptAt = 0;
-  cancelPushRecoveryTimer();
-  retryPushRecovery();
-}
-
-async function confirmCurrentPushPreferences(userId: string, intentEpoch: number): Promise<boolean> {
-  // A settings event can race the backend response after push.ts captured its payload. Reconfirm a
-  // bounded number of generations synchronously; continuous UI churn falls back to recovery.
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const generation = pushPreferencesGeneration;
-    await ensurePushSubscribed(userId);
-    if (!notificationIntentCurrent(intentEpoch, userId)) return false;
-    if (generation === pushPreferencesGeneration) return true;
-  }
-  return false;
-}
-
-function armPushRecovery(userId: string, intentEpoch: number, confirmed = false): void {
-  if (!notificationIntentCurrent(intentEpoch, userId)) return;
-  pushRecoveryUserId = userId;
-  pushRecoveryIntentEpoch = intentEpoch;
-  pushRecoveryConfirmed = confirmed;
-  pushRecoveryLastAttemptAt = confirmed ? Date.now() : 0;
-  cancelPushRecoveryTimer();
-  schedulePushRecovery();
-  if (!pushRecoveryInstalled && !isTauri && typeof window !== 'undefined') {
-    pushRecoveryInstalled = true;
-    window.addEventListener('online', retryPushRecovery);
-    window.addEventListener('pageshow', retryPushRecovery);
-    try {
-      document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible') retryPushRecovery();
-      });
-    } catch { /** document can be absent in unit/worker-like environments */ }
-    try { navigator.serviceWorker?.addEventListener('controllerchange', retryPushRecoveryAfterControllerChange); } catch { /**/ }
-  }
-}
-
 // запрос разрешения + включение мастера (вызывать по клику пользователя в настройках)
-export async function enableNotifications(userId: string): Promise<NotificationEnableResult> {
-  setNotificationOptOut(false);
-  const intentEpoch = beginNotificationIntent(userId);
+export async function enableNotifications(): Promise<boolean> {
   const granted = await requestNotificationPermission();
-  if (!notificationIntentCurrent(intentEpoch, userId)) return { enabled: false };
-  if (!granted) {
-    setSettings({ notif: false });
-    return { enabled: false, permissionDenied: notifPermission() === 'denied' };
-  }
-  if (isTauri) {
-    setSettings({ notif: true });
-    return { enabled: true };
-  }
-  try {
-    const preferencesCurrent = await confirmCurrentPushPreferences(userId, intentEpoch);
-    if (!notificationIntentCurrent(intentEpoch, userId)) return { enabled: false };
-    if (!preferencesCurrent) {
-      setSettings({ notif: false });
-      armPushRecovery(userId, intentEpoch);
-      retryPushRecovery();
-      return { enabled: false, error: 'Настройки уведомлений ещё синхронизируются' };
-    }
-    setSettings({ notif: true });
-    armPushRecovery(userId, intentEpoch, true);
-    return { enabled: true };
-  } catch (error) {
-    if (!notificationIntentCurrent(intentEpoch, userId)) return { enabled: false };
-    setSettings({ notif: false });
-    armPushRecovery(userId, intentEpoch);
-    return { enabled: false, error: pushSetupErrorMessage(error) };
-  }
+  setSettings({ notif: granted });
+  if (granted) ensurePushSubscribed(); // подписка на фоновый web-push (PWA/браузер)
+  return granted;
 }
 export async function requestNotificationPermission(): Promise<boolean> {
   if (isTauri) {
@@ -336,58 +67,23 @@ export async function notificationPermissionGranted(): Promise<boolean> {
 // запрос допустим только из enableNotifications() после явного клика. Возвращает true ровно
 // один раз — при первом успешном включении — чтобы UI
 // показал приветственный тост «включены, отключить можно в настройках».
-export interface NotificationInitResult {
-  welcomed: boolean;
-  ready: boolean;
-  error?: string;
-}
-
-export async function initNotifications(userId: string): Promise<NotificationInitResult> {
-  const intentEpoch = beginNotificationIntent(userId);
-  if (!notifSupported()) return { welcomed: false, ready: false };
-  if (notificationOptedOut()) {
-    setSettings({ notif: false });
-    void unsubscribePush(userId); // retry any offline backend/local cleanup without blocking app boot
-    return { welcomed: false, ready: false };
-  }
+export async function initNotifications(): Promise<boolean> {
+  if (!notifSupported()) return false;
+  if (localStorage.getItem('notifOptOut') === '1') return false; // юзер сам выключил — не пристаём
   if (!isTauri && notifPermission() === 'denied') {
     if (getSettings().notif) setSettings({ notif: false });
-    return { welcomed: false, ready: false };
+    return false;
   }
   const granted = await notificationPermissionGranted();
-  if (!notificationIntentCurrent(intentEpoch, userId)) return { welcomed: false, ready: false };
   if (!granted) {
     if (getSettings().notif) setSettings({ notif: false });
-    return { welcomed: false, ready: false };
+    return false;
   }
-  if (!isTauri) {
-    try {
-      const preferencesCurrent = await confirmCurrentPushPreferences(userId, intentEpoch);
-      if (!notificationIntentCurrent(intentEpoch, userId)) return { welcomed: false, ready: false };
-      if (!preferencesCurrent) {
-        setSettings({ notif: false });
-        armPushRecovery(userId, intentEpoch);
-        retryPushRecovery();
-        return { welcomed: false, ready: false, error: 'Настройки уведомлений ещё синхронизируются' };
-      }
-    }
-    catch (error) {
-      if (!notificationIntentCurrent(intentEpoch, userId)) return { welcomed: false, ready: false };
-      setSettings({ notif: false });
-      armPushRecovery(userId, intentEpoch);
-      return { welcomed: false, ready: false, error: pushSetupErrorMessage(error) };
-    }
-  }
-  if (!notificationIntentCurrent(intentEpoch, userId)) return { welcomed: false, ready: false };
   setSettings({ notif: true });
-  if (!isTauri) {
-    armPushRecovery(userId, intentEpoch, true);
-  }
-  try {
-    if (localStorage.getItem('notifWelcomed') === '1') return { welcomed: false, ready: true };
-    localStorage.setItem('notifWelcomed', '1');
-  } catch { /** unavailable storage may show the harmless one-time toast again after reload */ }
-  return { welcomed: true, ready: true };
+  ensurePushSubscribed(); // фоновый web-push: подписываем при каждом старте (подписка могла ротироваться)
+  if (localStorage.getItem('notifWelcomed') === '1') return false;
+  localStorage.setItem('notifWelcomed', '1');
+  return true;
 }
 
 function focused(): boolean {
@@ -495,27 +191,13 @@ export interface RelayNotificationOptions {
 
 export async function notify(kind: NotifKind, opts: RelayNotificationOptions): Promise<boolean> {
   try {
-    // Point-of-use opt-out check: a frozen tab may receive queued realtime work before pageshow or
-    // its missed storage event. Do this before remembering a destination, playing sound or showing
-    // any banner, and reconcile the stale master switch for the rest of the UI.
-    if (notificationOptedOut()) {
-      if (getSettings().notif) setSettings({ notif: false });
-      return false;
-    }
-    // A frozen/BFCache tab can receive queued realtime work before its lifecycle events are
-    // delivered. Re-read the restrictive durable intersection at the point of presentation so a
-    // missed storage event cannot expose content or revive a disabled device-local kind.
-    const pushPrefs = getNotificationPushPrefs();
     const s = getSettings();
     const destination = rememberNotificationDestination(
       opts.tag,
       opts.destination || notificationDestinationFromTag(opts.tag),
     );
-    const shownContent = notificationPresentation(kind, opts.title, opts.body, pushPrefs.notifPrivacy, opts.sender);
-    const kindEnabled = kind === 'mention' ? pushPrefs.notifMention
-      : kind === 'stream' ? pushPrefs.notifStream
-        : !!s[KIND_PREF[kind]];
-    if (!s.notif || !kindEnabled) return false; // мастер или тип выключены — тихо
+    const shownContent = notificationPresentation(kind, opts.title, opts.body, s.notifPrivacy, opts.sender);
+    if (!s.notif || !s[KIND_PREF[kind]]) return false; // мастер или тип выключены — тихо
     // Mention/@all — звук-пинг ВСЕГДА (даже когда смотришь чат): быть @упомянутым/в @all важно (как Discord).
     // Визуальную карточку ниже фокус-гейтим и не показываем поверх фуллскрин-игры — но звук уже дан.
     if (kind === 'mention') playSound('tag');

@@ -35,23 +35,8 @@ export interface SessionResponse {
   account: AccountStatus;
 }
 
-export interface PersistentAuthFields {
-  protocol?: 'persistent-v1';
-  accessToken?: string;
-  accessExpiresAt?: number;
-  sessionId?: string;
-}
-
-export interface AuthResponse extends SessionResponse, PersistentAuthFields {
+export interface AuthResponse extends SessionResponse {
   token: string;
-}
-
-export interface PersistentSessionResponse extends SessionResponse {
-  protocol: 'persistent-v1';
-  token: string;
-  accessToken: string;
-  accessExpiresAt: number;
-  sessionId: string;
 }
 
 export interface ChallengeResponse {
@@ -101,119 +86,6 @@ export interface AdminUser {
   isAdmin: boolean; emailVerified?: boolean; created: number; serverCount: number; ownedCount: number;
 }
 export interface AdminOverview { stats: { servers: number; users: number }; servers: AdminServer[]; users: AdminUser[] }
-
-export type VoiceDiagnosticIncident =
-  | 'manual' | 'join_stuck' | 'connection_failed' | 'reconnect_loop' | 'uplink_silent'
-  | 'inbound_silent' | 'mute_divergence' | 'mic_failed' | 'playback_blocked'
-  | 'output_route_failed' | 'ui_stall' | 'session_ended'
-  | 'stream_watch_succeeded' | 'stream_watch_failed' | 'stream_watch_recovered';
-export type VoiceDiagnosticClientKind = 'web' | 'native';
-export type VoiceDiagnosticWatchEndReason =
-  | 'user_close' | 'view_switch' | 'server_exit' | 'auth_handoff' | 'session_terminal'
-  | 'logout' | 'engine_dispose' | 'connection_loss' | 'stream_ended' | 'quality_change'
-  | 'recovery_failed' | 'playback_timeout' | 'superseded' | 'unknown';
-export interface VoiceDiagnosticClient {
-  kind: VoiceDiagnosticClientKind;
-  platform: 'ios' | 'ipados' | 'android' | 'macos' | 'windows' | 'linux' | 'other' | 'unknown';
-  installMode: 'browser' | 'standalone' | 'native' | 'unknown';
-  networkType: 'slow-2g' | '2g' | '3g' | '4g' | 'wifi' | 'ethernet' | 'cellular' | 'other' | 'unknown';
-  appVersion?: string;
-}
-export interface VoiceDiagnosticEvent {
-  atMs: number;
-  kind: 'join_started' | 'intent_finished' | 'hub_connected' | 'lease_claimed'
-    | 'media_token_received' | 'media_connected' | 'media_activated' | 'join_completed'
-    | 'join_failed' | 'mic_capture_finished' | 'mic_published' | 'mic_recovery_started'
-    | 'mic_recovery_finished' | 'mute_changed' | 'deafen_changed' | 'background'
-    | 'foreground' | 'network_changed' | 'reconnecting' | 'reconnected' | 'disconnected'
-    | 'playback_blocked' | 'output_route_failed' | 'ui_stall' | 'rtc_sample'
-    | 'uplink_stalled' | 'inbound_stalled' | 'left'
-    | 'stream_watch_started' | 'stream_watch_step' | 'stream_watch_retry' | 'stream_watch_finished';
-  stage?: 'intent' | 'hub' | 'claim' | 'media_token' | 'media_connect' | 'activation'
-    | 'mic_capture' | 'mic_publish' | 'mic_recovery' | 'playback' | 'output_route' | 'rtc' | 'ui'
-    | 'watch_intent' | 'watch_auth' | 'watch_listeners' | 'watch_native_start'
-    | 'watch_signaling' | 'watch_join' | 'watch_parent' | 'watch_negotiation'
-    | 'watch_track' | 'watch_playback' | 'watch_recovery';
-  outcome?: 'started' | 'ok' | 'failed' | 'timed_out' | 'blocked' | 'unsupported'
-    | 'cancelled' | 'superseded' | 'stalled' | 'recovered';
-  code?: 'none' | 'timeout' | 'network' | 'offline' | 'auth' | 'permission' | 'device_lost'
-    | 'media_blocked' | 'disconnected' | 'sdk' | 'unsupported' | 'aborted' | 'invalid_state' | 'unknown'
-    | 'session_closing'
-    | 'signaling_unauthorized' | 'signaling_forbidden' | 'listener_failed'
-    | 'native_start_failed' | 'signaling_closed' | 'no_parent' | 'negotiation_failed'
-    | 'ice_failed' | 'track_missing' | 'decode_timeout' | 'playback_waiting';
-  httpStatus?: number;
-  connectionState?: 'new' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected' | 'closed' | 'unknown';
-  iceState?: 'new' | 'checking' | 'connected' | 'completed' | 'failed' | 'disconnected' | 'closed' | 'unknown';
-  trackState?: 'live' | 'ended' | 'missing' | 'unknown';
-  audioContextState?: 'running' | 'suspended' | 'interrupted' | 'closed' | 'missing' | 'unknown';
-  outputRoute?: 'default' | 'custom' | 'system' | 'unsupported' | 'unknown';
-  outputTarget?: 'voice_mixer' | 'media_element' | 'stream_mixer' | 'context_recovery';
-  outputOperation?: 'enumerate' | 'set_sink' | 'create_context' | 'rebind' | 'resume' | 'start_audio';
-  micMode?: 'voice' | 'ptt' | 'unknown';
-  streamTransport?: 'livekit' | 'tree_web' | 'tree_native';
-  watchEndReason?: VoiceDiagnosticWatchEndReason;
-  networkType?: VoiceDiagnosticClient['networkType'];
-  documentHidden?: boolean;
-  online?: boolean;
-  micEnabled?: boolean;
-  publicationMuted?: boolean;
-  upstreamPaused?: boolean;
-  deafened?: boolean;
-  pushToTalk?: boolean;
-  speechDetected?: boolean;
-  canPlaybackAudio?: boolean;
-  rttMs?: number;
-  jitterMs?: number;
-  packetsLostDelta?: number;
-  packetsReceivedDelta?: number;
-  packetsSentDelta?: number;
-  bytesReceivedDelta?: number;
-  bytesSentDelta?: number;
-  concealedSamplesDelta?: number;
-  audioLevel?: number;
-  eventLoopLagMs?: number;
-  joinElapsedMs?: number;
-  reconnectCount?: number;
-  participantCount?: number;
-}
-export interface VoiceDiagnosticReport {
-  schemaVersion: 1;
-  /** Random, non-secret idempotency key. Older deployed clients may omit it. */
-  clientReportId?: string;
-  incident: VoiceDiagnosticIncident;
-  client: VoiceDiagnosticClient;
-  durationMs: number;
-  events: VoiceDiagnosticEvent[];
-  truncated?: boolean;
-}
-export interface AdminVoiceDiagnosticSummary {
-  id: string;
-  userId: string;
-  username: string;
-  incident: VoiceDiagnosticIncident;
-  client: VoiceDiagnosticClientKind;
-  platform: VoiceDiagnosticClient['platform'];
-  createdAt: number;
-  eventCount: number;
-  durationMs: number;
-  truncated: boolean;
-}
-export interface AdminVoiceDiagnosticCursor {
-  createdAt: number;
-  id: string;
-}
-export interface AdminVoiceDiagnosticsPage {
-  items: AdminVoiceDiagnosticSummary[];
-  nextCursor: AdminVoiceDiagnosticCursor | null;
-}
-export interface AdminVoiceDiagnosticDetail {
-  id: string;
-  userId: string;
-  username: string;
-  createdAt: number;
-  report: VoiceDiagnosticReport;
-}
 
 // права роли (битовая маска, синхронно с server/index.js PERM)
 export const PERM = { MANAGE_SERVER: 1, MANAGE_ROLES: 2, MANAGE_MEMBERS: 4, MANAGE_MESSAGES: 8, CREATE_INVITE: 16, MANAGE_CHANNELS: 32 } as const;
@@ -389,9 +261,6 @@ export interface HistoryMessage {
   kind?: string; // 'levelup' — карточка достижения
   level?: number; // достигнутый уровень (для kind='levelup')
   release?: ReleaseNote; // metadata системного kind='release'
-  // Канонический client key из HTTP-истории/realtime created-event: позволяет
-  // ровно своему optimistic-сообщению усыновить sid без дедупа по одинаковому тексту.
-  mkey?: string;
 }
 
 // Рейтинг сервера (экспериментальная фича, off по умолчанию). Категории: уровень (overall), голос, эфир.

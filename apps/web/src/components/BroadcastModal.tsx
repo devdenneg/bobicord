@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { getEngine, useStore } from '../store';
+import { useStore } from '../store';
 import { useEngine } from '../hooks';
 import { api } from '../api';
 import { Icon } from '../Icon';
@@ -10,7 +10,6 @@ import type { MonitorInfo, WindowInfo, BroadcastStats } from '../native';
 import { pickPreset, PRESETS, widthCapForHeight } from '../presets';
 import { measureUpload, getCachedProbe, clearCachedProbe, type ProbeResult } from '../transport/probe';
 import { FIXED_LABELS, QUALITY_FIXED, DIRECT_MIN, DIRECT_MAX, loadConfig, saveConfig, buildSource, deriveAudioPid, type SavedConfig } from '../broadcastSource';
-import { NativeBroadcastStartOwner } from '../nativeBroadcastStart';
 
 /** base64 PNG иконки окна в data-URI (без префикса приходит из Rust) или null. */
 function iconSrc(icon: string | null | undefined): string | null {
@@ -73,21 +72,12 @@ export function BroadcastModal() {
   const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
   const [windows, setWindows] = useState<WindowInfo[]>([]);
   const [busy, setBusy] = useState(false);
-  const [starting, setStarting] = useState(false);
   const [err, setErr] = useState('');
   const [stats, setStats] = useState<BroadcastStats | null>(null);
   // Замер upload (probe) — нужен для 'auto' (пресет по 0.75×BWE). Кэш переживает открытия (TTL сутки).
   const [probe, setProbe] = useState<ProbeResult | null>(() => getCachedProbe());
   const [measuring, setMeasuring] = useState(false);
   const [measurePhase, setMeasurePhase] = useState('');
-  const mounted = useRef(true);
-  const startOwner = useRef<NativeBroadcastStartOwner | null>(null);
-  if (!startOwner.current) startOwner.current = new NativeBroadcastStartOwner();
-
-  useEffect(() => {
-    mounted.current = true;
-    return () => { mounted.current = false; startOwner.current?.dispose(); };
-  }, []);
 
   const usefulKbps = probe ? Math.round(probe.bweKbps * 0.75) : null;
   // Итоговые параметры кодирования по выбранному качеству. 'auto' → пресет по замеру (без замера —
@@ -158,15 +148,7 @@ export function BroadcastModal() {
   }, [cfg.sourceKind, cfg.windowHwnd, windows]);
 
   async function start() {
-    if (busy) return;
-    const targetEngine = getEngine();
-    const bcSrv = eng.voiceServerId;
-    if (!targetEngine || !eng.inVoice || !bcSrv) {
-      setErr('Сначала подключись к голосовому каналу');
-      return;
-    }
     setBusy(true); setErr('');
-    setStarting(true);
     try {
       const e = resolveEncode();
       const bitrateBps = e.bitrateKbps * 1000;
@@ -178,33 +160,19 @@ export function BroadcastModal() {
       // Трансляция идёт на ГОЛОСОВОЙ сервер (voiceServerId), а не на смотримый: вещать можно только
       // будучи в голосовом, и дерево стрима живёт на его сервере (иначе при браузинге по серверам
       // трансляция уходила бы в чужую комнату). Фолбэк на active.id — только если вне голоса (не должно).
+      const bcSrv = eng.voiceServerId || active.id;
       // Д8: server-first — единственный слот корня отдан vrelay (maxChildren=1). Opt-in
       // «прямые подключения» открывает N слотов вещателя: maxChildren = 1 (vrelay) + N.
       const directSlots = cfg.allowDirectPeers ? 1 + cfg.maxDirectChildren : 1;
       // maxWidth — кап под 32:9 (widthCapForHeight), не 16:9-ширина пресета: иначе ultrawide
       // резался по вертикали (21:9 → 2560×1070 вместо 3440×1440). Высота (e.h) остаётся целью.
-      await startOwner.current!.start({
-        start: () => startNativeBroadcast(me.username, me.username, bcSrv, { source, maxWidth: widthCapForHeight(e.h), maxHeight: e.h, fps: e.fps, bitrateBps, autoBitrate: true, audioTargetPid, maxDirectChildren: directSlots, presetMode: 'smooth' }),
-        stop: stopNativeBroadcast,
-        isCurrent: () => {
-          const state = useStore.getState();
-          const snapshot = targetEngine.getSnapshot();
-          return mounted.current && getEngine() === targetEngine && state.me?.id === me.id
-            && snapshot.inVoice && snapshot.voiceServerId === bcSrv && !state.broadcastLive;
-        },
-        publish: () => {
-          // streamId вещателя == me.username. Сессия закроется в любой из трёх точек стопа.
-          startBroadcasterSession(me.username);
-          saveConfig(cfg);
-          useStore.getState().setBroadcastLive(true);
-          void api.streamStart(bcSrv).catch(() => {}); // фоновый push участникам не в комнате
-        },
-      });
-    } catch (e: any) {
-      if (mounted.current) setErr(String(e?.message || e));
-    } finally {
-      if (mounted.current) { setBusy(false); setStarting(false); }
-    }
+      await startNativeBroadcast(me.username, me.username, bcSrv, { source, maxWidth: widthCapForHeight(e.h), maxHeight: e.h, fps: e.fps, bitrateBps, autoBitrate: true, audioTargetPid, maxDirectChildren: directSlots, presetMode: 'smooth' });
+      // streamId вещателя == me.username. Сессия закроется в любой из трёх точек стопа.
+      startBroadcasterSession(me.username);
+      saveConfig(cfg);
+      useStore.getState().setBroadcastLive(true);
+      api.streamStart(bcSrv).catch(() => {}); // фоновый push участникам не в комнате
+    } catch (e: any) { setErr(String(e?.message || e)); } finally { setBusy(false); }
   }
 
   // Смена источника (и звука) на лету — трансляция не рвётся, дерево зрителей живёт.
@@ -274,7 +242,7 @@ export function BroadcastModal() {
     </Backdrop>;
   }
 
-  return <Backdrop onClose={close} label="Начать трансляцию" dismissible={!starting}>
+  return <Backdrop onClose={close} label="Начать трансляцию">
     <h2><Icon name="screen" />Трансляция экрана</h2>
     {sourceFields}
 
@@ -345,7 +313,7 @@ export function BroadcastModal() {
     </details>
 
     <div className="rowbtns">
-      <button className="ghost" style={{ margin: 0 }} disabled={starting} onClick={close}>Отмена</button>
+      <button className="ghost" style={{ margin: 0 }} onClick={close}>Отмена</button>
       <button className="primary" style={{ margin: 0 }} disabled={busy || (cfg.sourceKind === 'window' && cfg.windowHwnd == null) || (cfg.audioMode === 'include' && cfg.audioPid == null)} onClick={start}>Начать трансляцию</button>
     </div>
     <div className="err">{err}</div>

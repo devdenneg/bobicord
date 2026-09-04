@@ -1,10 +1,11 @@
 import { RnnoiseWorkletNode, loadRnnoise } from '@sapphi-red/web-noise-suppressor';
 
-// Exact content hashes bind the host library, worklet and WASM to one build. The owning Service
-// Worker precaches these paths, so a day-old tab can still lazy-load its versions after a deploy.
-const rnnoiseWorkletPath = __RNNOISE_WORKLET_URL__;
-const rnnoiseWasmPath = __RNNOISE_WASM_URL__;
-const rnnoiseSimdWasmPath = __RNNOISE_SIMD_WASM_URL__;
+// Стабильные имена вместо `?url` (хешированный ассет). Файлы кладёт плагин rnnoiseStableAssets
+// в vite.config.ts — и в dev, и в сборку. Причина та же, что у /vad-worklet.js: догрузка ленивая,
+// а деплой меняет хеш, поэтому вкладка, открытая до выкатки, получала 404 и теряла шумодав.
+const rnnoiseWorkletPath = '/rnnoise-worklet.js';
+const rnnoiseWasmPath = '/rnnoise.wasm';
+const rnnoiseSimdWasmPath = '/rnnoise_simd.wasm';
 
 // Единственная точка контакта с RNNoise (изоляция third-party). WASM-бинарь общий на процесс
 // (фетчится/подбирает SIMD-вариант один раз); addModule — per-AudioContext, т.к. воркет-глобалка

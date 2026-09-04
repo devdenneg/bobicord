@@ -1,35 +1,8 @@
 // IPC bridge to Tauri native shell (apps/native). No-op in browser.
+import { getToken } from './api';
 import { normalizeExternalHttpUrl } from './linkify';
-import { BoundedKeyedOperations } from './boundedAsync';
-import { freshTreeWsUrl } from './treeAuth';
 
 export const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
-
-const NATIVE_TREE_AUTH_TERMINAL = 'TREE_AUTH_TERMINAL';
-const NATIVE_TREE_AUTH_TRANSIENT = 'TREE_AUTH_TRANSIENT';
-
-class NativeTreeStartError extends Error {
-  constructor(readonly terminal: boolean) {
-    super(terminal
-      ? 'Сессия завершена — войдите снова'
-      : 'Не удалось обновить доступ к трансляции');
-    this.name = 'NativeTreeStartError';
-  }
-}
-
-function normalizeNativeTreeStartError(error: unknown): never {
-  const code = typeof error === 'string'
-    ? error
-    : (error && typeof error === 'object' && typeof (error as { message?: unknown }).message === 'string'
-      ? (error as { message: string }).message : '');
-  if (code === NATIVE_TREE_AUTH_TERMINAL) throw new NativeTreeStartError(true);
-  if (code === NATIVE_TREE_AUTH_TRANSIENT) throw new NativeTreeStartError(false);
-  throw error;
-}
-
-export function isTerminalNativeTreeStartError(error: unknown): boolean {
-  return error instanceof NativeTreeStartError && error.terminal;
-}
 
 export async function pingNative(): Promise<string | null> {
   if (!isTauri) return null;
@@ -183,21 +156,29 @@ export async function onBroadcastStopped(cb: (info: BroadcastStopInfo) => void):
   return unlisten;
 }
 
+/// Тот же ws-адрес дерева, что и `treeVideo.ts` (Evolution-TZ Э2/Э3): базовый
+/// URL из VITE_TREE_WS_URL (в native-сборке — реальный сервер, т.к. локальный
+/// bundle грузится без reverse-proxy), плюс session-JWT в query.
+function treeWsUrl(): string {
+  const override = (import.meta as any).env?.VITE_TREE_WS_URL as string | undefined;
+  // В нативе location.host = tauri://localhost (нет reverse-proxy) — тот же дефолт на
+  // прод-сервер, что и API_BASE в api.ts (см. там). Явный VITE_TREE_WS_URL переопределяет.
+  const nativeDefault = isTauri ? 'wss://reelay.online/tree' : null;
+  const base = override || nativeDefault || ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/tree');
+  const token = getToken() || '';
+  return base + (base.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
+}
+
 export async function startNativeBroadcast(streamId: string, identity: string, serverId: string, config: StreamConfig): Promise<void> {
-  // Access JWTs live for 15 minutes. Refresh before handing the initial URL to Rust; Rust owns
-  // secure refreshes for every later signalling reconnect (see native_tree_ws_url in lib.rs).
-  const wsUrl = await freshTreeWsUrl();
   const { invoke } = await import('@tauri-apps/api/core');
-  try {
-    await invoke('start_broadcast', {
-      streamId, wsUrl, identity, serverId,
-      source: config.source, maxWidth: config.maxWidth, maxHeight: config.maxHeight, fps: config.fps, bitrateBps: config.bitrateBps,
-      autoBitrate: config.autoBitrate ?? true,
-      audioTargetPid: config.audioTargetPid ?? null,
-      maxDirectChildren: config.maxDirectChildren ?? null,
-      presetMode: config.presetMode ?? 'manual',
-    });
-  } catch (error) { normalizeNativeTreeStartError(error); }
+  await invoke('start_broadcast', {
+    streamId, wsUrl: treeWsUrl(), identity, serverId,
+    source: config.source, maxWidth: config.maxWidth, maxHeight: config.maxHeight, fps: config.fps, bitrateBps: config.bitrateBps,
+    autoBitrate: config.autoBitrate ?? true,
+    audioTargetPid: config.audioTargetPid ?? null,
+    maxDirectChildren: config.maxDirectChildren ?? null,
+    presetMode: config.presetMode ?? 'manual',
+  });
 }
 
 /** Э5.3: смена источника (и звука) на лету — без остановки трансляции, дерево зрителей
@@ -212,75 +193,43 @@ export async function stopNativeBroadcast(): Promise<void> {
   await invoke('stop_broadcast');
 }
 
-// Logout/stale-start cleanup must not hang page teardown, and repeated owners must not stack native
-// stop invokes behind the same stuck Rust command. Capacity is released only when the physical IPC
-// really settles; logical callers are released after the deadline.
-let nativeBroadcastStopFlight: { actual: Promise<void>; bounded: Promise<void> } | null = null;
-export function stopNativeBroadcastBounded(timeoutMs = 2_000): Promise<void> {
-  if (!isTauri) return Promise.resolve();
-  if (nativeBroadcastStopFlight) return nativeBroadcastStopFlight.bounded;
-  const actual = Promise.resolve().then(stopNativeBroadcast);
-  let timer: ReturnType<typeof globalThis.setTimeout> | null = null;
-  let settled = false;
-  const bounded = new Promise<void>((resolve) => {
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      if (timer !== null) globalThis.clearTimeout(timer);
-      resolve();
-    };
-    timer = globalThis.setTimeout(finish, timeoutMs);
-    actual.then(finish, finish);
-  });
-  const flight = { actual, bounded };
-  nativeBroadcastStopFlight = flight;
-  void actual.then(
-    () => { if (nativeBroadcastStopFlight === flight) nativeBroadcastStopFlight = null; },
-    () => { if (nativeBroadcastStopFlight === flight) nativeBroadcastStopFlight = null; },
-  );
-  return bounded;
-}
-
 /* ---------- Э8: нативный relay-viewer (Rust держит видео, webview рендерит через IPC) ---------- */
 
 /** Стартует нативный relay-watch: Rust джойнится в дерево (viewer, native), ретранслирует
  *  детям и шлёт локальный offer в webview (событие relay-watch-offer). */
-export async function startNativeWatch(streamId: string, generation: number, identity: string, serverId: string, maxChildren: number, quality: string = 'source', pinned: boolean = false, availableOutgoing: number = 0): Promise<void> {
-  const wsUrl = await freshTreeWsUrl();
+export async function startNativeWatch(streamId: string, identity: string, serverId: string, maxChildren: number, quality: string = 'source', pinned: boolean = false, availableOutgoing: number = 0): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');
   // Roadmap-flow-стриминга Д6: реальный upload зрителя (из Д5-probe-кэша) — сервер по нему
   // решает ёмкость (ветвление 1→2). 0 = не измерен, сервер даёт консервативную ёмкость 1.
-  try {
-    await invoke('start_watch', { streamId, generation, wsUrl, identity, serverId, maxChildren, quality, pinned, availableOutgoing });
-  } catch (error) { normalizeNativeTreeStartError(error); }
+  await invoke('start_watch', { streamId, wsUrl: treeWsUrl(), identity, serverId, maxChildren, quality, pinned, availableOutgoing });
 }
-export async function stopNativeWatch(streamId: string, generation: number): Promise<void> {
+export async function stopNativeWatch(streamId: string): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');
-  await invoke('stop_watch', { streamId, generation });
+  await invoke('stop_watch', { streamId });
 }
 /** Ответ webview на локальный offer relay-показа. streamId — какой слот грида (Rust держит HashMap). */
-export async function nativeWatchAnswer(streamId: string, generation: number, sdp: string): Promise<void> {
+export async function nativeWatchAnswer(streamId: string, sdp: string): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');
-  await invoke('watch_answer', { streamId, generation, sdp });
+  await invoke('watch_answer', { streamId, sdp });
 }
-export async function nativeWatchIce(streamId: string, generation: number, candidate: any): Promise<void> {
+export async function nativeWatchIce(streamId: string, candidate: any): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');
-  await invoke('watch_ice', { streamId, generation, candidate });
+  await invoke('watch_ice', { streamId, candidate });
 }
 /** Ручной выбор пира (target) или авто-миграция (null). */
-export async function nativeWatchReparent(streamId: string, generation: number, target: string | null): Promise<void> {
+export async function nativeWatchReparent(streamId: string, target: string | null): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');
-  await invoke('watch_reparent', { streamId, generation, target });
+  await invoke('watch_reparent', { streamId, target });
 }
 
-export async function onNativeWatchOffer(cb: (streamId: string, generation: number, sdp: string) => void): Promise<() => void> {
+export async function onNativeWatchOffer(cb: (streamId: string, sdp: string) => void): Promise<() => void> {
   const { listen } = await import('@tauri-apps/api/event');
-  const un = await listen<{ streamId: string; generation: number; sdp: string }>('relay-watch-offer', (e) => cb(e.payload.streamId, e.payload.generation, e.payload.sdp));
+  const un = await listen<{ streamId: string; sdp: string }>('relay-watch-offer', (e) => cb(e.payload.streamId, e.payload.sdp));
   return un;
 }
-export async function onNativeWatchIce(cb: (streamId: string, generation: number, candidate: any) => void): Promise<() => void> {
+export async function onNativeWatchIce(cb: (streamId: string, candidate: any) => void): Promise<() => void> {
   const { listen } = await import('@tauri-apps/api/event');
-  const un = await listen<{ streamId: string; generation: number; candidate: any }>('relay-watch-ice', (e) => cb(e.payload.streamId, e.payload.generation, e.payload.candidate));
+  const un = await listen<{ streamId: string; candidate: any }>('relay-watch-ice', (e) => cb(e.payload.streamId, e.payload.candidate));
   return un;
 }
 export async function onNativeTopology(cb: (payload: any) => void): Promise<() => void> {
@@ -291,73 +240,9 @@ export async function onNativeTopology(cb: (payload: any) => void): Promise<() =
 /** Rust-relay сам определил конец стрима (сирота без родителя >20с, см. relay.rs) —
  *  webview должен снести watch (nativeUnwatch), иначе повисший кадр. Страховка на случай,
  *  когда discovery-сокет webview пропустил stream-end. */
-export async function onNativeWatchEnded(cb: (streamId: string, generation: number) => void): Promise<() => void> {
+export async function onNativeWatchEnded(cb: (streamId: string) => void): Promise<() => void> {
   const { listen } = await import('@tauri-apps/api/event');
-  const un = await listen<{ streamId: string; generation: number }>('relay-watch-ended', (e) => cb(e.payload.streamId, e.payload.generation));
-  return un;
-}
-
-export type NativeWatchStatusStage =
-  | 'watch_native_start' | 'watch_signaling' | 'watch_parent'
-  | 'watch_negotiation' | 'watch_track' | 'watch_recovery';
-export type NativeWatchStatusOutcome = 'started' | 'ok' | 'failed' | 'stalled' | 'recovered';
-export type NativeWatchStatusCode =
-  | 'none' | 'native_start_failed' | 'signaling_unauthorized' | 'signaling_forbidden'
-  | 'signaling_closed' | 'no_parent' | 'negotiation_failed' | 'ice_failed' | 'track_missing';
-export interface NativeWatchStatus {
-  /** Local routing key only. Strip it before building any server diagnostic event. */
-  streamId: string;
-  generation: number;
-  stage: NativeWatchStatusStage;
-  outcome: NativeWatchStatusOutcome;
-  code: NativeWatchStatusCode;
-  reconnectCount?: number;
-}
-
-const NATIVE_WATCH_STATUS_STAGES = new Set<NativeWatchStatusStage>([
-  'watch_native_start', 'watch_signaling', 'watch_parent',
-  'watch_negotiation', 'watch_track', 'watch_recovery',
-]);
-const NATIVE_WATCH_STATUS_OUTCOMES = new Set<NativeWatchStatusOutcome>([
-  'started', 'ok', 'failed', 'stalled', 'recovered',
-]);
-const NATIVE_WATCH_STATUS_CODES = new Set<NativeWatchStatusCode>([
-  'none', 'native_start_failed', 'signaling_unauthorized', 'signaling_forbidden',
-  'signaling_closed', 'no_parent', 'negotiation_failed', 'ice_failed', 'track_missing',
-]);
-
-/** Accept only the fixed Rust wire vocabulary and construct a fresh object. Unknown fields (which
- * could accidentally contain SDP/ICE, an address or a raw error) never cross this bridge. */
-export function normalizeNativeWatchStatusPayload(value: unknown): NativeWatchStatus | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const raw = value as Record<string, unknown>;
-  if (typeof raw.streamId !== 'string' || !raw.streamId || raw.streamId.length > 128) return null;
-  if (!Number.isSafeInteger(raw.generation) || Number(raw.generation) <= 0) return null;
-  if (!NATIVE_WATCH_STATUS_STAGES.has(raw.stage as NativeWatchStatusStage)
-    || !NATIVE_WATCH_STATUS_OUTCOMES.has(raw.outcome as NativeWatchStatusOutcome)
-    || !NATIVE_WATCH_STATUS_CODES.has(raw.code as NativeWatchStatusCode)) return null;
-  const status: NativeWatchStatus = {
-    streamId: raw.streamId,
-    generation: Number(raw.generation),
-    stage: raw.stage as NativeWatchStatusStage,
-    outcome: raw.outcome as NativeWatchStatusOutcome,
-    code: raw.code as NativeWatchStatusCode,
-  };
-  if (raw.reconnectCount !== undefined) {
-    if (!Number.isSafeInteger(raw.reconnectCount) || Number(raw.reconnectCount) < 0) return null;
-    status.reconnectCount = Number(raw.reconnectCount);
-  }
-  return status;
-}
-
-/** Structured native watch telemetry. `streamId` is only for selecting the current local watch;
- * consumers must not include it in the diagnostic event sent to the server. */
-export async function onNativeWatchStatus(cb: (status: NativeWatchStatus) => void): Promise<() => void> {
-  const { listen } = await import('@tauri-apps/api/event');
-  const un = await listen<unknown>('relay-watch-status', (e) => {
-    const status = normalizeNativeWatchStatusPayload(e.payload);
-    if (status) cb(status);
-  });
+  const un = await listen<{ streamId: string }>('relay-watch-ended', (e) => cb(e.payload.streamId));
   return un;
 }
 
@@ -424,12 +309,8 @@ export async function revealInFolder(path: string): Promise<void> {
 }
 
 /** Батч-проверка наличия файлов на диске (по индексам, как paths). [] в браузере. */
-const pathExistChecks = new BoundedKeyedOperations<boolean[]>({ timeoutMs: 4_000, maxInFlight: 3 });
 export async function pathsExist(paths: string[]): Promise<boolean[]> {
   if (!isTauri || !paths.length) return [];
-  const key = JSON.stringify(paths);
-  return pathExistChecks.run(key, async () => {
-    const { invoke } = await import('@tauri-apps/api/core');
-    return invoke<boolean[]>('paths_exist', { paths });
-  });
+  const { invoke } = await import('@tauri-apps/api/core');
+  return invoke<boolean[]>('paths_exist', { paths });
 }

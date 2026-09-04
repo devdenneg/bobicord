@@ -42,19 +42,4 @@ assert.equal(readCatWallpaper(unavailableStorage), false);
 assert.doesNotThrow(() => writeCatWallpaper(true, unavailableStorage));
 assert.doesNotThrow(() => writeCatWallpaper(false, unavailableStorage));
 
-const originalLocalStorageDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
-try {
-  Object.defineProperty(globalThis, 'localStorage', {
-    configurable: true,
-    get() { throw new Error('origin storage getter blocked'); },
-  });
-  assert.equal(readCatWallpaper(), false,
-    'a throwing global localStorage getter is caught inside the optional wallpaper read');
-  assert.doesNotThrow(() => writeCatWallpaper(true),
-    'a throwing global localStorage getter cannot crash the server view');
-} finally {
-  if (originalLocalStorageDescriptor) Object.defineProperty(globalThis, 'localStorage', originalLocalStorageDescriptor);
-  else delete globalThis.localStorage;
-}
-
 console.log('chat wallpaper: ok');

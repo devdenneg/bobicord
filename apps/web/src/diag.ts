@@ -15,7 +15,6 @@
 
 import { api, diagSessionKeepalive } from './api';
 import { diagHwInfo, diagTakeLog, isTauri, onBroadcastStats, type BroadcastStats } from './native';
-import { sampleRtcStats } from './rtcStatsSampler';
 
 const CLIENT: 'native' | 'web' = isTauri ? 'native' : 'web';
 
@@ -102,8 +101,8 @@ function pushSample(s: Session, sample: unknown) {
 /** Снимок входящего видео. Числа кумулятивные (кроме fps/размера) — дельты считаем при
  *  разборе, здесь важнее не потерять абсолютные значения на границах окна. */
 async function sampleInbound(pc: RTCPeerConnection): Promise<unknown | null> {
-  const report = await sampleRtcStats(pc);
-  if (!report) return null;
+  let report: RTCStatsReport;
+  try { report = await pc.getStats(); } catch { return null; }
   let v: any = null;
   let pair: any = null;
   const byId = new Map<string, any>();
@@ -188,40 +187,15 @@ export function startViewerSession(streamId: string, getPc: () => RTCPeerConnect
   hookUnload();
   // Прогрев кэша: на `pagehide` ждать IPC нельзя, а env хочется и в keepalive-теле.
   void collectEnv().catch(() => null);
-  let timer: number | null = null;
-  let stopped = false;
-  let session: Session;
-  const schedule = () => {
-    if (stopped || timer !== null || sessions.get(k) !== session) return;
-    timer = window.setTimeout(() => { timer = null; void tick(); }, SAMPLE_INTERVAL_MS);
-  };
-  const tick = async () => {
-    if (stopped || sessions.get(k) !== session) return;
+  const timer = window.setInterval(async () => {
+    const s = sessions.get(k);
+    if (!s) return;
     const pc = getPc();
-    try {
-      if (!pc) return;
-      const sample = await sampleInbound(pc);
-      // The same stream id may already have a replacement parent/session. Old diagnostics are not
-      // allowed into its bounded sample window after the exact native stats await.
-      if (stopped || sessions.get(k) !== session || getPc() !== pc) return;
-      if (sample) pushSample(session, sample);
-    } finally {
-      schedule(); // settle-driven: a hung browser getStats cannot stack another diagnostic call
-    }
-  };
-  session = {
-    streamId,
-    role: 'viewer',
-    startedAt: Date.now(),
-    samples: [],
-    stop: () => {
-      stopped = true;
-      if (timer !== null) window.clearTimeout(timer);
-      timer = null;
-    },
-  };
-  sessions.set(k, session);
-  schedule();
+    if (!pc) return;
+    const sample = await sampleInbound(pc);
+    if (sample) pushSample(s, sample);
+  }, SAMPLE_INTERVAL_MS);
+  sessions.set(k, { streamId, role: 'viewer', startedAt: Date.now(), samples: [], stop: () => window.clearInterval(timer) });
 }
 
 export function endViewerSession(streamId: string) {
@@ -324,17 +298,8 @@ function savePending(payload: any) {
 /** Дослать всё, что не ушло в прошлый раз (сеть моргнула, апп закрыли). Зовётся после
  *  авторизации: без токена сервер вернёт 401 и очередь очистилась бы впустую. */
 export async function flushPendingDiag() {
-  const pending = readPending();
-  if (!pending.length) return;
-  // Viewer attempts moved to the bounded fixed-schema voice diagnostics. Never replay viewer
-  // payloads left by an older bundle: those legacy bodies may contain a stream id and raw native
-  // transport lines. Broadcaster sessions retain the detailed encoder diagnostics they need.
-  const queue = pending.filter((payload) => payload && typeof payload === 'object'
-    && payload.role === 'broadcaster');
-  if (!queue.length) {
-    try { localStorage.removeItem(PENDING_KEY); } catch { /**/ }
-    return;
-  }
+  const queue = readPending();
+  if (!queue.length) return;
   const left: any[] = [];
   for (const payload of queue) {
     try { await api.diagSession(payload); }
