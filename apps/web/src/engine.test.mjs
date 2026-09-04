@@ -5,6 +5,9 @@ import vm from 'node:vm';
 import ts from 'typescript';
 
 const source = readFileSync(new URL('engine.ts', import.meta.url), 'utf8');
+const audioSessionJs = ts.transpileModule(readFileSync(new URL('appleMobileAudioSession.ts', import.meta.url), 'utf8'), {
+  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+}).outputText;
 const deferred = () => {
   let resolve, reject;
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
@@ -19,6 +22,11 @@ class Events {
   removeEventListener(type, fn) { this.listeners.get(type)?.delete(fn); }
   fire(type) { for (const fn of this.listeners.get(type) || []) fn({ type }); }
   listenerCount() { return [...this.listeners.values()].reduce((sum, set) => sum + set.size, 0); }
+}
+class AudioSession extends Events {
+  state = 'active'; category = 'auto'; writes = [];
+  get type() { return this.category; }
+  set type(value) { this.category = value; this.writes.push(value); }
 }
 class MediaTrack extends Events {
   readyState = 'live'; muted = false; enabled = true;
@@ -50,7 +58,7 @@ class AudioNode {
 
 function fixture(engineSource = source, costs = {}, options = {}) {
   let time = 1000, timerId = 1, captureCalls = 0, denoiseCalls = 0, inventoryRefreshes = 0;
-  const sources = [], contexts = [], vadNodes = [], diagnosticEvents = [];
+  const sources = [], contexts = [], vadNodes = [], diagnosticEvents = [], reports = [];
   const timers = new Map();
   const schedule = (fn, delay = 0, repeat = false) => {
     const id = timerId++; timers.set(id, { fn, at: time + delay, repeat }); return id;
@@ -63,6 +71,7 @@ function fixture(engineSource = source, costs = {}, options = {}) {
   const document = new Events(); document.hidden = false;
   document.querySelectorAll = () => []; document.getElementById = () => null;
   const devices = new Events();
+  const navigator = { mediaDevices: devices, audioSession: options.audioSession };
   let capture = async () => { await delay('capture'); return new Stream(); };
   devices.getUserMedia = (...args) => { captureCalls++; return capture(...args); };
   const storage = new Map();
@@ -129,12 +138,15 @@ function fixture(engineSource = source, costs = {}, options = {}) {
     './audioDevices': { currentAppleMobilePlatform: () => !!options.appleMobile },
     './audioDeviceInventory': { notifyAudioCaptureChanged: () => { inventoryRefreshes++; } },
     './voiceDiagnostics': {
-      VoiceDiagnosticsRecorder: class { active = false; start() { this.active = true; } record(event) { diagnosticEvents.push(event); } reset() { this.active = false; } buildReport() { return {}; } },
+      VoiceDiagnosticsRecorder: class { active = false; start() { this.active = true; } record(event) { diagnosticEvents.push(event); } reset() { this.active = false; } buildReport(incident) { return { incident, events: diagnosticEvents.map((event) => ({ ...event })) }; } },
       VoiceEventLoopStallMonitor: class { start() {} stop() {} },
     },
-    './diagnosticOutbox': { DiagnosticReportOutbox: class { start() {} dispose() {} enqueue() {} } },
+    './diagnosticOutbox': { DiagnosticReportOutbox: class { start() {} dispose() {} enqueue(report) { reports.push(report); } } },
     './voiceDiagnosticStats': { summarizeVoiceDiagnosticStats: () => ({ state: {}, event: { kind: 'rtc_sample' } }) },
   };
+  const audioSessionExports = {};
+  vm.runInNewContext(audioSessionJs, { exports: audioSessionExports, navigator, require: (id) => dependencies[id] });
+  dependencies['./appleMobileAudioSession'] = audioSessionExports;
   const exported = {};
   const js = ts.transpileModule(engineSource, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
@@ -149,7 +161,7 @@ function fixture(engineSource = source, costs = {}, options = {}) {
     require: (id) => { assert.ok(id in dependencies, `unmocked engine dependency ${id}`); return dependencies[id]; },
     console, TextEncoder, TextDecoder, Uint8Array, Map, Set, WeakMap, WeakSet, Promise,
     performance: { now: () => time }, Date, document, window,
-    navigator: { mediaDevices: devices },
+    navigator,
     localStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
     AudioContext: Context, MediaStream: Stream,
     requestAnimationFrame: (fn) => schedule(fn, 16), cancelAnimationFrame: (id) => timers.delete(id),
@@ -195,7 +207,7 @@ function fixture(engineSource = source, costs = {}, options = {}) {
     if (error) throw error;
     return value;
   }
-  return { e, room, publication, settings, document, devices, Context, LocalAudioTrack, activeVoice, finish, timers, sources, contexts, vadNodes, diagnosticEvents,
+  return { e, room, publication, settings, document, devices, navigator, api, Context, LocalAudioTrack, activeVoice, finish, timers, sources, contexts, vadNodes, diagnosticEvents, reports,
     setCapture(fn) { capture = fn; }, get captureCalls() { return captureCalls; },
     get denoiseCalls() { return denoiseCalls; },
     get inventoryRefreshes() { return inventoryRefreshes; },
@@ -737,6 +749,107 @@ for (const cancellation of ['choice', 'stop']) {
   f.e.stopLevelMeter(); const late = new Stream(); pending.resolve(late); await preview;
   assert.equal(late.getAudioTracks()[0].readyState, 'ended'); assert.equal(f.settings.input, 'removed-mic');
   assert.equal(f.inventoryRefreshes, 0); assert.equal(f.e.levelStream, null);
+}
+
+// The actual session helper is pinned before capture and retained across microphone
+// replacement, same-server channel switch and cross-server handoff, until terminal leave.
+{
+  const session = new AudioSession(); const f = fixture(source, {}, { appleMobile: true, audioSession: session }); f.activeVoice(null);
+  f.setCapture(async () => { assert.equal(session.type, 'play-and-record'); return new Stream(); });
+  await f.e.startMic(); const owner = f.e.voiceAudioSessionOwner;
+  await f.e.reapplyMic(); assert.equal(f.e.voiceAudioSessionOwner, owner);
+  await f.e.switchVoice('second'); assert.equal(f.e.voiceAudioSessionOwner, owner);
+  f.e.viewServerId = 'other-server'; await f.e.joinVoice('third');
+  assert.notEqual(f.e.voiceAudioSessionOwner, owner);
+  assert.deepEqual(session.writes, ['play-and-record'], 'handoff never temporarily restores auto');
+  await f.e.leaveVoice(); assert.equal(session.type, 'auto'); assert.equal(f.e.voiceAudioSessionOwners.size, 0);
+}
+
+// Capture rejection and pre-capture join rejection both release their category lease.
+{
+  const session = new AudioSession(); const f = fixture(source, {}, { appleMobile: true, audioSession: session }); f.activeVoice(null);
+  f.setCapture(async () => { throw captureError('NotAllowedError'); });
+  await assert.rejects(f.e.startMic()); assert.equal(session.type, 'auto'); assert.equal(f.e.voiceAudioSessionOwners.size, 0);
+}
+{
+  const session = new AudioSession(); const f = fixture(source, {}, { appleMobile: true, audioSession: session });
+  f.e.viewRoom = f.room; f.e.viewServerId = 'server'; f.e.readyRooms.add(f.room);
+  f.api.mintVoiceIntent = async () => ({ accepted: false });
+  await f.e.joinVoice('channel'); assert.equal(session.type, 'auto'); assert.equal(f.captureCalls, 0);
+}
+
+// A stale old join cannot release the current join's category; disconnect also releases
+// a local handoff lease still awaiting the old room's asynchronous teardown.
+{
+  const session = new AudioSession(); const f = fixture(source, {}, { appleMobile: true, audioSession: session });
+  f.e.viewRoom = f.room; f.e.viewServerId = 'server'; f.e.readyRooms.add(f.room);
+  const pending = deferred(); let calls = 0;
+  f.setCapture(() => ++calls === 1 ? pending.promise : Promise.resolve(new Stream()));
+  const old = f.e.joinVoice('old'); await flush(); await f.e.joinVoice('new');
+  const late = new Stream(); pending.resolve(late); await old; await flush();
+  assert.equal(late.getAudioTracks()[0].readyState, 'ended'); assert.equal(session.type, 'play-and-record');
+  assert.equal(f.e.voiceAudioSessionOwners.size, 1); await f.e.leaveVoice(); assert.equal(session.type, 'auto');
+}
+{
+  const session = new AudioSession(); const f = fixture(source, {}, { appleMobile: true, audioSession: session }); f.activeVoice(null);
+  await f.e.startMic(); f.e.viewServerId = 'other';
+  const pending = deferred(); f.room.localParticipant.unpublishTrack = () => pending.promise;
+  const switching = f.e.joinVoice('new'); await flush(); assert.equal(f.e.voiceAudioSessionOwners.size, 1);
+  assert.equal(session.type, 'play-and-record', 'the pending new intent retains its lease after synchronous old leave');
+  f.e.disconnect(); assert.equal(session.type, 'auto'); assert.equal(f.e.voiceAudioSessionOwners.size, 0);
+  pending.resolve(); await switching; assert.equal(session.type, 'auto');
+}
+
+// Preview restarts and preview-to-voice transfer have no category gap. A cancelled
+// preview's late capture cleanup cannot release the replacement voice lease.
+{
+  const session = new AudioSession(); const f = fixture(source, {}, { appleMobile: true, audioSession: session });
+  f.e.levelListeners.add(() => {}); await f.e.startLevelMeter();
+  f.e.restartLevelMeter(); await flush(); assert.deepEqual(session.writes, ['play-and-record']);
+  f.e.stopLevelMeter(); assert.equal(session.type, 'auto');
+  const pending = deferred(); let calls = 0;
+  f.setCapture(() => ++calls === 1 ? pending.promise : Promise.resolve(new Stream()));
+  const preview = f.e.startLevelMeter(); f.activeVoice(null); await f.e.startMic();
+  const late = new Stream(); pending.resolve(late); await preview;
+  assert.equal(late.getAudioTracks()[0].readyState, 'ended'); assert.equal(session.type, 'play-and-record');
+  await f.e.leaveVoice(); assert.equal(session.type, 'auto');
+}
+{
+  const session = new AudioSession(); const f = fixture(source, {}, { appleMobile: true, audioSession: session });
+  f.e.levelListeners.add(() => {}); f.setCapture(async () => { throw captureError('NotAllowedError'); });
+  await f.e.startLevelMeter(); assert.equal(session.type, 'auto'); assert.equal(f.e.levelAudioSessionRelease, null);
+}
+
+// Hidden source/session interruption produces evidence before the recovery guard,
+// with bounded deferred reports and no extra capture, resume or network operation.
+{
+  const session = new AudioSession(); const f = fixture(source, {}, { appleMobile: true, audioSession: session }); f.activeVoice(null);
+  await f.e.startMic(); await flush(); f.e.diagnostics.start(); f.document.hidden = true;
+  let recovered = 0; f.e.checkMicAlive = async () => { recovered++; }; f.e.ensureVoiceAudioRunning = () => { recovered++; };
+  const raw = f.e.micRaw.getAudioTracks()[0]; raw.muted = true;
+  raw.fire('mute'); session.state = 'interrupted'; session.fire('statechange');
+  raw.muted = false; raw.fire('unmute'); raw.stop(); raw.fire('ended');
+  assert.equal(recovered, 0); assert.equal(f.captureCalls, 1); assert.equal(f.reports.length, 0);
+  const events = f.diagnosticEvents.filter((event) => event.kind === 'mic_source_changed');
+  assert.deepEqual(events.map((event) => event.captureEvent), ['mute', 'session_state', 'unmute', 'ended']);
+  assert.equal(events[0].rawTrackMuted, true); assert.equal(events[0].rawTrackEnabled, true);
+  assert.equal(events[0].publishedTrackEnabled, true); assert.equal(events[0].documentHidden, true);
+  assert.equal(events[1].audioSessionState, 'interrupted'); assert.equal(events[1].audioSessionType, 'play-and-record');
+  const reports = [...f.timers.entries()].filter(([, timer]) => !timer.repeat && timer.at === f.time);
+  assert.equal(reports.length, 1, 'multiple interruption events share the bounded report cooldown');
+  for (const [id, timer] of reports) { f.timers.delete(id); timer.fn(); }
+  assert.equal(f.reports.length, 1); assert.equal(f.reports[0].events.at(-1).captureEvent, 'mute');
+  const stale = [...session.listeners.get('statechange')][0];
+  await f.e.stopMic(); assert.equal(session.listenerCount(), 0);
+  const count = f.diagnosticEvents.length; stale(); raw.fire('mute');
+  assert.equal(f.diagnosticEvents.length, count, 'stale source/session events cannot describe a newer pipeline');
+  f.e.disconnect(); assert.equal(session.type, 'auto');
+}
+{
+  const session = { get state() { throw new Error('Optional getter'); }, get type() { throw new Error('Optional getter'); } };
+  const f = fixture(source, {}, { appleMobile: true, audioSession: session }); f.activeVoice(null);
+  await f.e.startMic(); assert.doesNotThrow(() => f.e.recordVoiceDiagnostic({ kind: 'background' }));
+  await f.e.leaveVoice();
 }
 
 function gateStress(engineSource) {

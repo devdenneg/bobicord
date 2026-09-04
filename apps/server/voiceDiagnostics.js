@@ -24,7 +24,7 @@ const EVENT_KINDS = new Set([
   'playback_blocked', 'output_route_failed', 'ui_stall', 'rtc_sample',
   'uplink_stalled', 'inbound_stalled', 'left', 'stream_watch_started',
   'stream_watch_step', 'stream_watch_retry', 'stream_watch_finished',
-  'auth_request_started', 'auth_request_finished',
+  'auth_request_started', 'auth_request_finished', 'mic_source_changed',
 ]);
 const STAGES = new Set([
   'intent', 'hub', 'claim', 'media_token', 'media_connect', 'activation',
@@ -50,6 +50,9 @@ const CONNECTION_STATES = new Set(['new', 'connecting', 'connected', 'reconnecti
 const ICE_STATES = new Set(['new', 'checking', 'connected', 'completed', 'failed', 'disconnected', 'closed', 'unknown']);
 const TRACK_STATES = new Set(['live', 'ended', 'missing', 'unknown']);
 const AUDIO_CONTEXT_STATES = new Set(['running', 'suspended', 'interrupted', 'closed', 'missing', 'unknown']);
+const AUDIO_SESSION_STATES = new Set(['active', 'inactive', 'interrupted']);
+const AUDIO_SESSION_TYPES = new Set(['auto', 'play-and-record', 'playback', 'ambient', 'transient', 'transient-solo']);
+const CAPTURE_EVENTS = new Set(['mute', 'unmute', 'ended', 'session_state']);
 const OUTPUT_ROUTES = new Set(['default', 'custom', 'system', 'unsupported', 'unknown']);
 const OUTPUT_TARGETS = new Set(['voice_mixer', 'media_element', 'stream_mixer', 'context_recovery']);
 const OUTPUT_OPERATIONS = new Set([
@@ -68,6 +71,7 @@ const CONTROL_INCIDENTS = new Set(['join_succeeded', 'session_ended', 'stream_wa
 const BOOLEAN_FIELDS = [
   'documentHidden', 'online', 'micEnabled', 'publicationMuted', 'upstreamPaused',
   'deafened', 'pushToTalk', 'speechDetected', 'canPlaybackAudio',
+  'rawTrackMuted', 'rawTrackEnabled', 'publishedTrackEnabled',
 ];
 const NUMBER_FIELDS = Object.freeze({
   requestElapsedMs: [0, 120_000],
@@ -166,6 +170,9 @@ function sanitizeVoiceDiagnosticReport(raw, { maxPayloadBytes = VOICE_DIAGNOSTIC
     const iceState = enumValue(source.iceState, ICE_STATES);
     const trackState = enumValue(source.trackState, TRACK_STATES);
     const audioContextState = enumValue(source.audioContextState, AUDIO_CONTEXT_STATES);
+    const audioSessionState = enumValue(source.audioSessionState, AUDIO_SESSION_STATES);
+    const audioSessionType = enumValue(source.audioSessionType, AUDIO_SESSION_TYPES);
+    const captureEvent = enumValue(source.captureEvent, CAPTURE_EVENTS);
     const outputRoute = enumValue(source.outputRoute, OUTPUT_ROUTES);
     const outputTarget = enumValue(source.outputTarget, OUTPUT_TARGETS);
     const outputOperation = enumValue(source.outputOperation, OUTPUT_OPERATIONS);
@@ -181,6 +188,9 @@ function sanitizeVoiceDiagnosticReport(raw, { maxPayloadBytes = VOICE_DIAGNOSTIC
     if (iceState) event.iceState = iceState;
     if (trackState) event.trackState = trackState;
     if (audioContextState) event.audioContextState = audioContextState;
+    if (audioSessionState) event.audioSessionState = audioSessionState;
+    if (audioSessionType) event.audioSessionType = audioSessionType;
+    if (captureEvent) event.captureEvent = captureEvent;
     if (outputRoute) event.outputRoute = outputRoute;
     if (outputTarget) event.outputTarget = outputTarget;
     if (outputOperation) event.outputOperation = outputOperation;

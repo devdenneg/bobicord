@@ -117,6 +117,41 @@ test('microphone capture path is a fixed enum and survives the admin storage rou
   db.close();
 });
 
+test('system capture diagnostics round-trip fixed enums and booleans without device or OS details', () => {
+  const audioSessionTypes = ['auto', 'play-and-record', 'playback', 'ambient', 'transient', 'transient-solo'];
+  const audioSessionStates = ['active', 'inactive', 'interrupted'];
+  const captureEvents = ['mute', 'unmute', 'ended', 'session_state'];
+  const events = audioSessionTypes.map((audioSessionType, index) => ({
+    atMs: index, kind: 'mic_source_changed', stage: 'mic_capture', documentHidden: true,
+    rawTrackMuted: true, rawTrackEnabled: true, publishedTrackEnabled: false,
+    audioSessionType, audioSessionState: audioSessionStates[index % 3], captureEvent: captureEvents[index % 4],
+    label: 'PRIVATE_CAPTURE_DETAIL', deviceId: 'PRIVATE_CAPTURE_DETAIL', osStatus: 'PRIVATE_CAPTURE_DETAIL',
+  }));
+  events.push({ atMs: 6, kind: 'background', rawTrackMuted: false, rawTrackEnabled: false, publishedTrackEnabled: true });
+  events.push({
+    atMs: 7, kind: 'mic_source_changed', audioSessionState: 'PRIVATE_CAPTURE_DETAIL', audioSessionType: 'PRIVATE_CAPTURE_DETAIL',
+    captureEvent: 'PRIVATE_CAPTURE_DETAIL', rawTrackMuted: 'true', rawTrackEnabled: 1, publishedTrackEnabled: null,
+  });
+  const db = new Database(':memory:');
+  const store = createVoiceDiagnosticsStore(db, { now: () => 20_000 });
+  const saved = store.save({ userId: 'owner', username: 'owner', raw: validReport({ incident: 'mic_failed', events }) });
+  const report = store.detail(saved.id).report;
+  assert.deepEqual(report.events.slice(0, 6).map((event) => event.audioSessionType), audioSessionTypes);
+  assert.deepEqual(report.events.slice(0, 3).map((event) => event.audioSessionState), audioSessionStates);
+  assert.deepEqual(report.events.slice(0, 4).map((event) => event.captureEvent), captureEvents);
+  assert.deepEqual(report.events[0], {
+    atMs: 0, kind: 'mic_source_changed', stage: 'mic_capture', documentHidden: true,
+    rawTrackMuted: true, rawTrackEnabled: true, publishedTrackEnabled: false,
+    audioSessionType: 'auto', audioSessionState: 'active', captureEvent: 'mute',
+  });
+  assert.deepEqual(report.events[6], {
+    atMs: 6, kind: 'background', rawTrackMuted: false, rawTrackEnabled: false, publishedTrackEnabled: true,
+  });
+  assert.deepEqual(report.events[7], { atMs: 7, kind: 'mic_source_changed' });
+  assert.doesNotMatch(JSON.stringify(report), /PRIVATE_CAPTURE_DETAIL/);
+  db.close();
+});
+
 test('authentication diagnostics retain bounded request metrics, never credentials or response content', () => {
   const secret = 'AUTH_SECRET_MUST_NOT_BE_STORED';
   const codes = ['auth', 'network', 'timeout', 'aborted', 'unknown', 'rate_limited', 'server', 'invalid_response'];

@@ -100,6 +100,39 @@ const {
 }
 
 {
+  const recorder = new VoiceDiagnosticsRecorder({ now: () => 0 });
+  recorder.start();
+  const audioSessionTypes = ['auto', 'play-and-record', 'playback', 'ambient', 'transient', 'transient-solo'];
+  const audioSessionStates = ['active', 'inactive', 'interrupted'];
+  const captureEvents = ['mute', 'unmute', 'ended', 'session_state'];
+  for (const [index, audioSessionType] of audioSessionTypes.entries()) {
+    recorder.record({
+      kind: 'mic_source_changed', stage: 'mic_capture', documentHidden: true,
+      rawTrackMuted: true, rawTrackEnabled: true, publishedTrackEnabled: false,
+      audioSessionType, audioSessionState: audioSessionStates[index % 3], captureEvent: captureEvents[index % 4],
+      label: 'PRIVATE_CAPTURE_DETAIL', deviceId: 'PRIVATE_CAPTURE_DETAIL', osStatus: 'PRIVATE_CAPTURE_DETAIL',
+    });
+  }
+  recorder.record({ kind: 'background', rawTrackMuted: false, rawTrackEnabled: false, publishedTrackEnabled: true });
+  recorder.record({
+    kind: 'mic_source_changed', audioSessionState: 'PRIVATE_CAPTURE_DETAIL', audioSessionType: 'PRIVATE_CAPTURE_DETAIL',
+    captureEvent: 'PRIVATE_CAPTURE_DETAIL', rawTrackMuted: 'true', rawTrackEnabled: 1, publishedTrackEnabled: null,
+  });
+  const report = recorder.buildReport('mic_failed');
+  assert.deepEqual(report.events.slice(0, 6).map((event) => event.audioSessionType), audioSessionTypes);
+  assert.deepEqual(report.events[0], {
+    atMs: 0, kind: 'mic_source_changed', stage: 'mic_capture', documentHidden: true,
+    rawTrackMuted: true, rawTrackEnabled: true, publishedTrackEnabled: false,
+    audioSessionType: 'auto', audioSessionState: 'active', captureEvent: 'mute',
+  });
+  assert.deepEqual(report.events[6], {
+    atMs: 0, kind: 'background', rawTrackMuted: false, rawTrackEnabled: false, publishedTrackEnabled: true,
+  }, 'the same fixed fields also survive common diagnostic snapshots');
+  assert.deepEqual(report.events[7], { atMs: 0, kind: 'mic_source_changed' });
+  assert.doesNotMatch(JSON.stringify(report), /PRIVATE_CAPTURE_DETAIL/);
+}
+
+{
   let now = 100;
   const recorder = new VoiceDiagnosticsRecorder({
     now: () => now,

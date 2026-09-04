@@ -28,7 +28,7 @@ const EVENT_KINDS = new Set<VoiceDiagnosticEvent['kind']>([
   'playback_blocked', 'output_route_failed', 'ui_stall', 'rtc_sample',
   'uplink_stalled', 'inbound_stalled', 'left', 'stream_watch_started',
   'stream_watch_step', 'stream_watch_retry', 'stream_watch_finished',
-  'auth_request_started', 'auth_request_finished',
+  'auth_request_started', 'auth_request_finished', 'mic_source_changed',
 ]);
 const PLATFORMS = new Set<VoiceDiagnosticClient['platform']>([
   'ios', 'ipados', 'android', 'macos', 'windows', 'linux', 'other', 'unknown',
@@ -71,6 +71,15 @@ const TRACK_STATES = new Set<NonNullable<VoiceDiagnosticEvent['trackState']>>([
 const AUDIO_CONTEXT_STATES = new Set<NonNullable<VoiceDiagnosticEvent['audioContextState']>>([
   'running', 'suspended', 'interrupted', 'closed', 'missing', 'unknown',
 ]);
+const AUDIO_SESSION_STATES = new Set<NonNullable<VoiceDiagnosticEvent['audioSessionState']>>([
+  'active', 'inactive', 'interrupted',
+]);
+const AUDIO_SESSION_TYPES = new Set<NonNullable<VoiceDiagnosticEvent['audioSessionType']>>([
+  'auto', 'play-and-record', 'playback', 'ambient', 'transient', 'transient-solo',
+]);
+const CAPTURE_EVENTS = new Set<NonNullable<VoiceDiagnosticEvent['captureEvent']>>([
+  'mute', 'unmute', 'ended', 'session_state',
+]);
 const OUTPUT_ROUTES = new Set<NonNullable<VoiceDiagnosticEvent['outputRoute']>>([
   'default', 'custom', 'system', 'unsupported', 'unknown',
 ]);
@@ -94,6 +103,7 @@ const WATCH_END_REASONS = new Set<NonNullable<VoiceDiagnosticEvent['watchEndReas
 const BOOLEAN_FIELDS = [
   'documentHidden', 'online', 'micEnabled', 'publicationMuted', 'upstreamPaused',
   'deafened', 'pushToTalk', 'speechDetected', 'canPlaybackAudio',
+  'rawTrackMuted', 'rawTrackEnabled', 'publishedTrackEnabled',
 ] as const satisfies readonly (keyof VoiceDiagnosticEvent)[];
 
 const NUMBER_FIELDS = {
@@ -238,6 +248,9 @@ function sanitizeEvent(input: VoiceDiagnosticEventInput, atMs: number): VoiceDia
   const iceState = enumValue(source.iceState, ICE_STATES);
   const trackState = enumValue(source.trackState, TRACK_STATES);
   const audioContextState = enumValue(source.audioContextState, AUDIO_CONTEXT_STATES);
+  const audioSessionState = enumValue(source.audioSessionState, AUDIO_SESSION_STATES);
+  const audioSessionType = enumValue(source.audioSessionType, AUDIO_SESSION_TYPES);
+  const captureEvent = enumValue(source.captureEvent, CAPTURE_EVENTS);
   const outputRoute = enumValue(source.outputRoute, OUTPUT_ROUTES);
   const outputTarget = enumValue(source.outputTarget, OUTPUT_TARGETS);
   const outputOperation = enumValue(source.outputOperation, OUTPUT_OPERATIONS);
@@ -253,6 +266,9 @@ function sanitizeEvent(input: VoiceDiagnosticEventInput, atMs: number): VoiceDia
   if (iceState) event.iceState = iceState;
   if (trackState) event.trackState = trackState;
   if (audioContextState) event.audioContextState = audioContextState;
+  if (audioSessionState) event.audioSessionState = audioSessionState;
+  if (audioSessionType) event.audioSessionType = audioSessionType;
+  if (captureEvent) event.captureEvent = captureEvent;
   if (outputRoute) event.outputRoute = outputRoute;
   if (outputTarget) event.outputTarget = outputTarget;
   if (outputOperation) event.outputOperation = outputOperation;

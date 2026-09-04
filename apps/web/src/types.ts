@@ -26,7 +26,7 @@ export interface VoiceDiagnosticEvent {
     | 'playback_blocked' | 'output_route_failed' | 'ui_stall' | 'rtc_sample'
     | 'uplink_stalled' | 'inbound_stalled' | 'left'
     | 'stream_watch_started' | 'stream_watch_step' | 'stream_watch_retry' | 'stream_watch_finished'
-    | 'auth_request_started' | 'auth_request_finished';
+    | 'auth_request_started' | 'auth_request_finished' | 'mic_source_changed';
   stage?: 'intent' | 'hub' | 'claim' | 'media_token' | 'media_connect' | 'activation'
     | 'mic_capture' | 'mic_publish' | 'mic_recovery' | 'playback' | 'output_route' | 'rtc' | 'ui'
     | 'watch_intent' | 'watch_auth' | 'watch_listeners' | 'watch_native_start'
@@ -47,6 +47,9 @@ export interface VoiceDiagnosticEvent {
   iceState?: 'new' | 'checking' | 'connected' | 'completed' | 'failed' | 'disconnected' | 'closed' | 'unknown';
   trackState?: 'live' | 'ended' | 'missing' | 'unknown';
   audioContextState?: 'running' | 'suspended' | 'interrupted' | 'closed' | 'missing' | 'unknown';
+  audioSessionState?: 'active' | 'inactive' | 'interrupted';
+  audioSessionType?: 'auto' | 'play-and-record' | 'playback' | 'ambient' | 'transient' | 'transient-solo';
+  captureEvent?: 'mute' | 'unmute' | 'ended' | 'session_state';
   outputRoute?: 'default' | 'custom' | 'system' | 'unsupported' | 'unknown';
   outputTarget?: 'voice_mixer' | 'media_element' | 'stream_mixer' | 'context_recovery';
   outputOperation?: 'enumerate' | 'set_sink' | 'create_context' | 'rebind' | 'resume' | 'start_audio';
@@ -58,6 +61,9 @@ export interface VoiceDiagnosticEvent {
   documentHidden?: boolean;
   online?: boolean;
   micEnabled?: boolean;
+  rawTrackMuted?: boolean;
+  rawTrackEnabled?: boolean;
+  publishedTrackEnabled?: boolean;
   publicationMuted?: boolean;
   upstreamPaused?: boolean;
   deafened?: boolean;
