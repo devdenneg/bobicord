@@ -17,10 +17,12 @@ const {
   ExactAsyncActionCoordinator,
   ExactMediaOutputRouteGate,
   ExactMediaPlayCoordinator,
+  ExactVideoTrackFrameObserver,
   StreamWatchPlaybackGate,
   TreeStreamAudioController,
   applyExactScreenAudioGain,
   audioSinkRoutesConfirmed,
+  boundedWatchRecoveryDeadline,
   effectiveStreamGain,
   isAutoplayBlocked,
   mediaElementVolumeLocked,
@@ -39,6 +41,12 @@ assert.equal(effectiveStreamGain(50, 0.4), 0.2);
 assert.equal(effectiveStreamGain(100, 1, true), 0);
 assert.equal(effectiveStreamGain(150, 2), 1);
 assert.equal(effectiveStreamGain(Number.NaN, Number.NaN), 1);
+assert.equal(boundedWatchRecoveryDeadline(0, 20_000, 1_000, 15_000, 30_000), 20_000,
+  'an early recovery never shortens the original first-frame deadline');
+assert.equal(boundedWatchRecoveryDeadline(0, 20_000, 12_000, 15_000, 30_000), 27_000,
+  'a stalled-media recovery receives enough bounded time for a fresh ICE path');
+assert.equal(boundedWatchRecoveryDeadline(0, 27_000, 25_000, 15_000, 30_000), 30_000,
+  'the absolute watch cap prevents a recovery loop from waiting forever');
 assert.equal(audioSinkRoutesConfirmed('default', ['applied', 'unsupported']), true,
   'a setSinkId-less path already confirms the logical system default');
 assert.equal(audioSinkRoutesConfirmed('default', ['applied', 'failed']), false,
@@ -124,6 +132,274 @@ assert.equal(watchGate.confirms('alice', 'new-track', firstWatch), false,
   'even the same identity and accepted track require the current generation');
 assert.equal(isAutoplayBlocked({ name: 'NotAllowedError' }), true);
 assert.equal(isAutoplayBlocked({ name: 'AbortError' }), false);
+
+{
+  class ListenerTarget {
+    listeners = new Map();
+    addEventListener(type, listener) {
+      const listeners = this.listeners.get(type) || new Set();
+      listeners.add(listener);
+      this.listeners.set(type, listeners);
+    }
+    removeEventListener(type, listener) { this.listeners.get(type)?.delete(listener); }
+    dispatch(type, event = {}) { for (const listener of [...(this.listeners.get(type) || [])]) listener(event); }
+    listenerCount(type) { return this.listeners.get(type)?.size || 0; }
+  }
+  class ExactTrack extends ListenerTarget {
+    constructor(id, muted) {
+      super();
+      this.id = id;
+      this.kind = 'video';
+      this.readyState = 'live';
+      this.muted = muted;
+    }
+    unmute() { this.muted = false; this.dispatch('unmute'); }
+    end() { this.readyState = 'ended'; this.dispatch('ended'); }
+  }
+  class ExactStream extends ListenerTarget {
+    constructor(track) { super(); this.track = track; }
+    getVideoTracks() { return this.track ? [this.track] : []; }
+    replace(track) {
+      const previous = this.track;
+      this.track = track;
+      if (previous) this.dispatch('removetrack', { track: previous });
+      if (track) this.dispatch('addtrack', { track });
+    }
+  }
+  class FrameVideo {
+    videoWidth = 1280;
+    readyState = 2;
+    nextId = 1;
+    callbacks = new Map();
+    cancelled = [];
+    requestVideoFrameCallback(callback) {
+      const id = this.nextId++;
+      this.callbacks.set(id, callback);
+      return id;
+    }
+    cancelVideoFrameCallback(id) { this.cancelled.push(id); this.callbacks.delete(id); }
+  }
+
+  const oldTrack = new ExactTrack('old', false);
+  const stream = new ExactStream(oldTrack);
+  const video = new FrameVideo();
+  const confirmed = [];
+  const observer = new ExactVideoTrackFrameObserver(video, stream, (track) => confirmed.push(track.id));
+  const staleFrame = video.callbacks.get(1);
+  assert.equal(typeof staleFrame, 'function');
+
+  const replacement = new ExactTrack('replacement', true);
+  stream.replace(replacement);
+  assert.deepEqual(video.cancelled, [1],
+    'replacing a track physically cancels its pending video-frame callback');
+  assert.equal(oldTrack.listenerCount('unmute'), 0,
+    'the retired track cannot retain an unmute listener');
+  staleFrame(0, {});
+  assert.deepEqual(confirmed, [],
+    'a browser-delivered callback that escaped cancellation is rejected by exact-track generation');
+
+  replacement.unmute();
+  const replacementFrameId = video.nextId - 1;
+  const replacementFrame = video.callbacks.get(replacementFrameId);
+  assert.equal(typeof replacementFrame, 'function',
+    'the replacement unmute edge arms one fresh decoded-frame callback');
+  replacementFrame(0, {});
+  assert.deepEqual(confirmed, ['replacement'],
+    'only a frame submitted after the exact replacement unmuted can confirm playback');
+
+  observer.requestCurrentFrame();
+  const cleanupFrameId = video.nextId - 1;
+  observer.dispose();
+  assert.ok(video.cancelled.includes(cleanupFrameId));
+  assert.equal(stream.listenerCount('addtrack'), 0);
+  assert.equal(stream.listenerCount('removetrack'), 0);
+  assert.equal(replacement.listenerCount('unmute'), 0);
+  assert.equal(replacement.listenerCount('ended'), 0,
+    'tile cleanup removes every exact-track listener and outstanding frame callback');
+
+  const late = new ExactTrack('late', false);
+  stream.replace(late);
+  late.unmute();
+  assert.deepEqual(confirmed, ['replacement'],
+    'a disposed tile cannot observe or confirm later MediaStream replacements');
+
+  const fallbackTrack = new ExactTrack('fallback', true);
+  const fallbackStream = new ExactStream(fallbackTrack);
+  const fallbackConfirmed = [];
+  const fallbackObserver = new ExactVideoTrackFrameObserver(
+    { videoWidth: 640, readyState: 2 },
+    fallbackStream,
+    (track) => fallbackConfirmed.push(track.id),
+  );
+  assert.deepEqual(fallbackConfirmed, []);
+  fallbackTrack.unmute();
+  assert.deepEqual(fallbackConfirmed, ['fallback'],
+    'WebKit without RVFC uses only the exact replacement unmute edge, never retained dimensions alone');
+
+  const alreadyUnmutedReplacement = new ExactTrack('already-unmuted-replacement', false);
+  fallbackStream.replace(alreadyUnmutedReplacement);
+  fallbackObserver.requestCurrentFrame();
+  assert.deepEqual(fallbackConfirmed, ['fallback'],
+    'an already-unmuted replacement cannot confirm from the predecessor frame retained by the video element');
+  alreadyUnmutedReplacement.muted = true;
+  alreadyUnmutedReplacement.unmute();
+  assert.deepEqual(fallbackConfirmed, ['fallback', 'already-unmuted-replacement'],
+    'the exact replacement becomes confirmable only after its own later unmute edge');
+  fallbackObserver.dispose();
+
+  const createCounterPollHarness = () => {
+    let clock = 0;
+    let nextTimer = 1;
+    const timers = new Map();
+    return {
+      timers,
+      options: {
+        now: () => clock,
+        setTimer: (callback, delayMs) => {
+          const timer = nextTimer++;
+          timers.set(timer, { callback, delayMs });
+          return timer;
+        },
+        clearTimer: (timer) => { timers.delete(timer); },
+        intervalMs: 10,
+        timeoutMs: 40,
+      },
+      first() { return timers.keys().next().value; },
+      capture(timer = this.first()) { return timers.get(timer)?.callback; },
+      fire(timer = this.first()) {
+        const pending = timers.get(timer);
+        assert.ok(pending, `counter timer ${timer} must still be owned`);
+        timers.delete(timer);
+        clock += pending.delayMs;
+        pending.callback();
+      },
+      elapse(ms) { clock += ms; },
+    };
+  };
+
+  class CounterVideo {
+    videoWidth = 640;
+    readyState = 2;
+    standardFrames = 10;
+    webkitDecodedFrameCount = 1_000;
+    getVideoPlaybackQuality() { return { totalVideoFrames: this.standardFrames }; }
+  }
+
+  const counterHarness = createCounterPollHarness();
+  const counterTrack = new ExactTrack('counter-initial', false);
+  const counterStream = new ExactStream(counterTrack);
+  const counterVideo = new CounterVideo();
+  const counterConfirmed = [];
+  const counterObserver = new ExactVideoTrackFrameObserver(
+    counterVideo,
+    counterStream,
+    (track) => counterConfirmed.push(track.id),
+    counterHarness.options,
+  );
+  assert.equal(counterHarness.timers.size, 1,
+    'an already-unmuted no-RVFC track owns one bounded decoded-frame poll');
+  counterObserver.requestCurrentFrame();
+  assert.equal(counterHarness.timers.size, 1,
+    'repeated playback events share the exact candidate polling owner');
+
+  counterVideo.webkitDecodedFrameCount++;
+  counterHarness.fire();
+  assert.deepEqual(counterConfirmed, [],
+    'webkitDecodedFrameCount cannot bypass an available standard totalVideoFrames counter');
+  assert.equal(counterHarness.timers.size, 1);
+  counterVideo.standardFrames++;
+  counterHarness.fire();
+  assert.deepEqual(counterConfirmed, ['counter-initial'],
+    'only a strict post-baseline standard frame increment confirms an already-unmuted track');
+  assert.equal(counterHarness.timers.size, 0);
+
+  counterObserver.requestCurrentFrame();
+  const retiredTimer = counterHarness.first();
+  const escapedRetiredPoll = counterHarness.capture(retiredTimer);
+  const counterReplacement = new ExactTrack('counter-replacement', false);
+  counterStream.replace(counterReplacement);
+  assert.equal(counterHarness.timers.has(retiredTimer), false,
+    'replacing the exact candidate cancels its physical counter timer');
+  assert.equal(counterHarness.timers.size, 1,
+    'the replacement owns exactly one fresh counter timer');
+  escapedRetiredPoll();
+  assert.deepEqual(counterConfirmed, ['counter-initial'],
+    'a retired timer callback that escaped cancellation is rejected by candidate generation');
+  assert.equal(counterHarness.timers.size, 1,
+    'a stale callback cannot cancel or duplicate the replacement polling owner');
+
+  counterVideo.standardFrames = 0;
+  counterHarness.fire();
+  assert.deepEqual(counterConfirmed, ['counter-initial'],
+    'a counter reset is only a new baseline, never a decoded-frame confirmation');
+  counterVideo.standardFrames = 1;
+  counterHarness.fire();
+  assert.deepEqual(counterConfirmed, ['counter-initial', 'counter-replacement'],
+    'the first strict increment after a reset confirms the exact replacement');
+
+  counterObserver.requestCurrentFrame();
+  counterHarness.elapse(100);
+  counterHarness.fire();
+  assert.equal(counterHarness.timers.size, 0,
+    'counter polling stops at its absolute deadline instead of surviving a stuck stream');
+  assert.deepEqual(counterConfirmed, ['counter-initial', 'counter-replacement']);
+  counterObserver.requestCurrentFrame();
+  const disposedPoll = counterHarness.capture();
+  counterObserver.dispose();
+  assert.equal(counterHarness.timers.size, 0, 'dispose cancels the exact counter polling owner');
+  disposedPoll();
+  assert.deepEqual(counterConfirmed, ['counter-initial', 'counter-replacement'],
+    'a polling callback that escaped dispose remains generation-fenced');
+
+  const webkitHarness = createCounterPollHarness();
+  const webkitTrack = new ExactTrack('webkit-counter', false);
+  const webkitStream = new ExactStream(webkitTrack);
+  const webkitVideo = {
+    videoWidth: 640,
+    readyState: 2,
+    webkitDecodedFrameCount: 7,
+    getVideoPlaybackQuality() { throw new Error('partial WebKit implementation'); },
+  };
+  const webkitConfirmed = [];
+  const webkitObserver = new ExactVideoTrackFrameObserver(
+    webkitVideo,
+    webkitStream,
+    (track) => webkitConfirmed.push(track.id),
+    webkitHarness.options,
+  );
+  webkitVideo.webkitDecodedFrameCount++;
+  webkitHarness.fire();
+  assert.deepEqual(webkitConfirmed, ['webkit-counter'],
+    'a throwing standard API safely falls back to a strict webkitDecodedFrameCount increment');
+  webkitObserver.dispose();
+
+  const unmuteCounterHarness = createCounterPollHarness();
+  const mutedCounterTrack = new ExactTrack('counter-after-unmute', true);
+  const mutedCounterStream = new ExactStream(mutedCounterTrack);
+  const mutedCounterVideo = new CounterVideo();
+  const mutedCounterConfirmed = [];
+  const mutedCounterObserver = new ExactVideoTrackFrameObserver(
+    mutedCounterVideo,
+    mutedCounterStream,
+    (track) => mutedCounterConfirmed.push(track.id),
+    unmuteCounterHarness.options,
+  );
+  mutedCounterTrack.unmute();
+  assert.deepEqual(mutedCounterConfirmed, [],
+    'an exact unmute cannot skip the stronger counter proof when that counter is available');
+  mutedCounterVideo.standardFrames = Number.NaN;
+  mutedCounterVideo.webkitDecodedFrameCount = Number.NaN;
+  unmuteCounterHarness.fire();
+  assert.deepEqual(mutedCounterConfirmed, [],
+    'a counter that disappears cannot fall back to an older, already-consumed unmute edge');
+  assert.equal(unmuteCounterHarness.timers.size, 0);
+  mutedCounterVideo.standardFrames = 10;
+  mutedCounterObserver.requestCurrentFrame();
+  mutedCounterVideo.standardFrames++;
+  unmuteCounterHarness.fire();
+  assert.deepEqual(mutedCounterConfirmed, ['counter-after-unmute']);
+  mutedCounterObserver.dispose();
+}
 
 assert.equal(await playMediaElement({ play: async () => {} }), 'playing');
 assert.equal(await playMediaElement({ play: async () => { throw { name: 'NotAllowedError' }; } }), 'blocked');
@@ -986,8 +1262,10 @@ const sounds = readSource('sounds.ts');
 }
 assert.match(engine, /const WATCH_VIDEO_DEADLINE_MS = 20_000/,
   'a first mobile watch has a bounded 20 second video deadline');
+assert.match(engine, /const WATCH_VIDEO_RECOVERY_GRACE_MS = 20_000;[\s\S]*const WATCH_VIDEO_MAX_DEADLINE_MS = 30_000/,
+  'a proven parent recovery receives a full cellular retry window under the absolute cap');
 const serverView = readSource('components', 'ServerView.tsx');
-const streamTileSetup = serverView.match(/useEffect\(\(\) => \{\n    const track = E\.getVideoTrack\(streamKey\)[\s\S]*?\n    const visible =/)?.[0] || '';
+const streamTileSetup = serverView.match(/useEffect\(\(\) => \{\n    const track = transportTrack[\s\S]*?\n    const visible =/)?.[0] || '';
 assert.ok(streamTileSetup.indexOf('const mediaStream =') < streamTileSetup.indexOf('(track as any).attach(v)'),
   'StreamTile identifies the combined tree MediaStream before the autoplay attach boundary');
 assert.ok(streamTileSetup.indexOf('new TreeStreamAudioController') < streamTileSetup.indexOf('(track as any).attach(v)'),
@@ -1004,14 +1282,20 @@ assert.match(serverView, /catch \{[\s\S]*recordWatchPlaybackOutcome\([\s\S]*'fai
   'an element attach failure is visible to diagnostics and leaves a recoverable UI state');
 assert.match(engine, /audioReady\?: boolean[\s\S]*audioReady === undefined \? \{\} : \{ canPlaybackAudio: audioReady \}/,
   'unknown separate LiveKit audio is omitted instead of being reported as playable');
-// Просмотр подтверждается ДЕКОДИРОВАННЫМ КАДРОМ, а не началом воспроизведения. Раньше
-// подтверждение приходило только с события 'playing', то есть требовало разрешённого
-// автозапуска: пока зритель не нажал кнопку запуска, дедлайн watch (20 с) обрывал
-// исправное соединение с ошибкой «Не удалось подключиться к трансляции».
-// videoWidth > 0 доказывает наличие кадра, поэтому аудио-only и мёртвый поток
-// по-прежнему упираются в дедлайн — там подтверждать нечего.
-assert.match(serverView, /const confirmDecoded = \(\) => \{[\s\S]*?!v\.videoWidth[\s\S]*?confirmWatchPlayback/,
-  'a decoded video frame confirms the watch without waiting for autoplay permission');
+// Просмотр подтверждается ДЕКОДИРОВАННЫМ КАДРОМ, а не началом воспроизведения. При
+// бесшовной замене старые videoWidth/readyState сохраняются, поэтому tree дополнительно
+// привязывает доказательство к exact-треку и его новому RVFC/unmute поколению.
+assert.match(serverView,
+  /new ExactVideoTrackFrameObserver\(v, observedStream, finishDecoded\)[\s\S]*exactVideoFrames\.requestCurrentFrame\(\)/,
+  'tree and LiveKit streams recheck their exact replacement track on a fresh decoded frame');
+assert.match(serverView,
+  /const finishDecoded = \(candidate\?: MediaStreamTrack\) => \{[\s\S]*if \(candidate\) E\.confirmWatchPlayback\(identity, streamKey, playbackGeneration, candidate\)/,
+  'a decoded frame carries its exact MediaStreamTrack owner into transport confirmation');
+assert.match(serverView,
+  /const transportTrack = E\.getVideoTrack\(streamKey\)[\s\S]*const track = transportTrack[\s\S]*\[streamKey,[^\]]*transportTrack\]/,
+  'a same-key LiveKit replacement tears down and reattaches the exact physical track');
+assert.doesNotMatch(serverView, /attemptPlayback\(false, exactLiveKitVideo\)/,
+  'ordinary LiveKit play success cannot confirm retained predecessor dimensions as a new frame');
 assert.match(serverView, /v\.addEventListener\('resize', confirmDecoded\)/,
   'the first frame of a MediaStream (videoWidth 0 -> N) confirms the watch');
 assert.ok(/const playable = \(\) => \{[\s\S]*?confirmDecoded\(\)/.test(serverView),
@@ -1020,7 +1304,32 @@ assert.match(engine, /remoteAudioPlays\.request\(el,[\s\S]*explicitGesture/,
   'voice and screen audio share exact-element ordinary and gesture play owners');
 assert.match(engine, /remoteAudioPlays\.forget\(entry\.el\)/,
   'detaching an audible element invalidates its late play continuation');
-assert.match(engine, /confirmWatchPlayback\(identity: string, streamKey: string, generation: number\)[\s\S]*watchPlaybackGate\.confirms/,
+const engineTrackSubscribedBody = engine.match(
+  /private onSub = \(track: RemoteTrack,[\s\S]*?\n  private onUnsub =/,
+)?.[0] || '';
+assert.match(engineTrackSubscribedBody,
+  /isScreen && room === this\.viewRoom[\s\S]*this\.watchT\.get\(u\) === this\.liveKitT[\s\S]*acceptsScreenAudio\?\.\(u, p, pub\)[\s\S]*acceptsScreenAudio\?\.\(u, p, pub, track\)/,
+  'screen audio is accepted only through the exact active LiveKit watch owner');
+const rejectedScreenAudio = engineTrackSubscribedBody.indexOf('if (!ownsTrack)');
+const rejectedPublication = engineTrackSubscribedBody.indexOf('if (!ownsPublication)', rejectedScreenAudio);
+const staleUnsubscribe = engineTrackSubscribedBody.indexOf('setSubscribed(false)', rejectedPublication);
+const exactStaleDetach = engineTrackSubscribedBody.indexOf(
+  'removeScreenAudio(u, p.identity, track)', staleUnsubscribe,
+);
+const currentAudioReplacement = engineTrackSubscribedBody.indexOf(
+  'this.removeScreenAudio(u);', exactStaleDetach,
+);
+assert.ok(rejectedScreenAudio >= 0 && rejectedPublication > rejectedScreenAudio
+    && staleUnsubscribe > rejectedPublication && exactStaleDetach > staleUnsubscribe
+    && currentAudioReplacement > exactStaleDetach,
+  'a retired current-publication track is detached without unsubscribing its replacement, while a stale publication is rejected');
+const engineTrackUnsubscribedBody = engine.match(
+  /private onUnsub = \(track: RemoteTrack,[\s\S]*?\n\n  \/\* ---------- streams/,
+)?.[0] || '';
+assert.match(engineTrackUnsubscribedBody,
+  /pub\.source === Track\.Source\.ScreenShareAudio[\s\S]*this\.watchT\.get\(u\) === this\.liveKitT[\s\S]*acceptsScreenAudio\?\.\(u, p, pub, track\)[\s\S]*removeScreenAudio\(u, p\.identity, track\)[\s\S]*if \(!exactOwner\)/,
+  'late screen-audio unsubscribe removes only its exact stale element and cannot touch the active replacement');
+assert.match(engine, /confirmWatchPlayback\([\s\S]*candidate\?: MediaStreamTrack,[\s\S]*watchPlaybackGate\.confirms/,
   'the pending spinner accepts only its exact watch generation and track');
 assert.match(engine, /beginStreamWatchDiagnostic\(identity, t, playbackGeneration\)/,
   'every accepted watch click starts one account-scoped structured report');
@@ -1083,12 +1392,14 @@ assert.equal((ensureVoicePlaybackBody.match(/configureVoiceAudio\(entry, p!\)/g)
   'steady reconciliation configures output only when an exact audio element is attached');
 assert.doesNotMatch(engine, /await ctx\.setSinkId|await setSinkId\.call/,
   'no raw browser sink promise can hold the Engine output queues forever');
-assert.match(engine, /onSeamlessSwitchFailed\?\.\(\(sid\) => \{[\s\S]*finishStreamWatchDiagnostic\(sid, 'stream_watch_failed',[\s\S]*watch_recovery[\s\S]*decode_timeout[\s\S]*this\.closeWatch\(sid\)/,
+assert.match(engine, /const onWatchRecoveryFailed = \(sid: string\) => \{[\s\S]*finishStreamWatchDiagnostic\(sid, 'stream_watch_failed',[\s\S]*watch_recovery[\s\S]*decode_timeout[\s\S]*this\.closeWatch\(sid, 'recovery_failed'\)/,
   'a failed seamless switch persists its exact timeout before clearing ownership for a retry');
+assert.match(engine, /for \(const \[source, t\] of transports\) \{[\s\S]*t\.onSeamlessSwitchFailed\?\.\(onWatchRecoveryFailed\)/,
+  'both tree and LiveKit terminal recovery paths release the shared Engine watch owner');
 const watchBody = engine.match(/watch\(identity: string, quality: string = 'source'\)[\s\S]*?\n  }\n  closeWatch/)?.[0] || '';
 assert.doesNotMatch(watchBody, /localStorage\./,
   'blocked mobile storage cannot strand a pending stream watch');
-assert.ok(watchBody.indexOf('this.watchTimers.set(identity, timer)') < watchBody.indexOf('safeLocalStorageGet'),
+assert.ok(watchBody.indexOf('this.armWatchDeadline(') < watchBody.indexOf('safeLocalStorageGet'),
   'the exact stream watchdog is armed before optional first-use tip persistence');
 const screenGainBody = engine.match(/private applyScreenAudioGain\([\s\S]*?\n  }\n  private applyAllStreamVolumes/)?.[0] || '';
 assert.match(screenGainBody, /setVolume\(gain, Track\.Source\.ScreenShareAudio\)/,

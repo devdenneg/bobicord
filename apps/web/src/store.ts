@@ -27,6 +27,7 @@ import { isTauri, stopNativeBroadcastBounded } from './native';
 import { endAnyBroadcasterSession, flushPendingDiag } from './diag';
 import { OwnedLatestRefresh } from './serverListRefresh';
 import { clearTerminalAuthSession, getAccessToken } from './authSession';
+import { shouldCoalesceServerConnect } from './serverConnectionLifecycle';
 import type { User, ServerSummary, Member, ServerDetail, Toast, ToastKind, AccountStatus, ReleaseHistoryItem } from './types';
 
 let engine: Engine | null = null;
@@ -363,7 +364,7 @@ function scheduleAuthBootstrapRetry(userId: string) {
           viewEpoch++;
           stopMemberPoll();
           serverListRefresh.invalidate();
-          engine?.disconnect(true);
+          engine?.disconnect(true, 'session_terminal');
           engine = null;
           volumePreferences?.dispose();
           volumePreferences = null;
@@ -424,7 +425,7 @@ export const useStore = create<AppState>((set, get) => ({
     set({ pendingUser: null, accountGate: null, sessionError: '', view: 'loading', modal: null });
     try { await get().afterAuth(user); }
     catch (error) {
-      engine?.disconnect(true); engine = null;
+      engine?.disconnect(true, 'session_terminal'); engine = null;
       volumePreferences?.dispose(); volumePreferences = null;
       set({
         view: 'auth', me: null, pendingUser: null, accountGate: null,
@@ -514,7 +515,18 @@ export const useStore = create<AppState>((set, get) => ({
         // нового токена. Автоматический retry здесь успел бы запросить LiveKit-token со старым
         // JWT. Handoff сам восстановит нужные комнаты после setToken(newJwt).
         if (authSessionHandoffActive() || !wasViewing || get().viewServerId !== serverId) return;
-        if (get().view === 'server') { void get().connectServer(serverId); return; }
+        if (get().view === 'server') {
+          // A terminal disconnect can arrive while the server metadata request is still in flight.
+          // That request captured whether the old voice room was reused, so allowing its loading
+          // marker to coalesce this recovery may leave the finished request believing the now-dead
+          // room still owns realtime. Release the exact marker first: the fresh connect bumps
+          // viewEpoch, fences the stale response and recomputes reuse against the surviving room.
+          if (get().loadingServerId === serverId) {
+            set({ loadingServer: false, loadingServerId: null });
+          }
+          void get().connectServer(serverId);
+          return;
+        }
         // Мы ушли на главную (goHome намеренно не рвёт соединение), и оно умерло уже там. Реконнект в
         // фоне не нужен, но и мёртвый viewServerId оставлять нельзя: повторный клик по серверу уходит
         // в showConnectedServer (store.ts:500) — «показать без реконнекта», — и сервер открывается с
@@ -700,7 +712,7 @@ export const useStore = create<AppState>((set, get) => ({
     suspendNotificationPushRecovery(logoutUserId);
     cancelAuthBootstrapRetry();
     invalidateAuthSessionHandoff(false);
-    viewEpoch++; stopMemberPoll(); engine?.disconnect(true);
+    viewEpoch++; stopMemberPoll(); engine?.disconnect(true, 'logout');
     volumePreferences?.dispose(); volumePreferences = null;
     // A retained offline endpoint may still receive already queued account pushes. Persist the
     // worker's logged-out floor before cleanup/reload so those mandatory banners stay generic.
@@ -767,6 +779,14 @@ export const useStore = create<AppState>((set, get) => ({
 
   // Фактический (ре)коннект: рвём прошлое соединение и поднимаем новое.
   connectServer: async (id) => {
+    const current = get();
+    if (shouldCoalesceServerConnect({
+      requestedServerId: id,
+      currentViewServerId: current.viewServerId,
+      loadingServerId: current.loadingServerId,
+      engineAvailable: engine !== null,
+      engineOwnsRequestedView: engine?.ownsViewConnection(id) === true,
+    })) return;
     const myEpoch = ++viewEpoch; // новый коннект — предыдущие async-хвосты устаревают
     stopMemberPoll();
     // Вход на СВОЙ голосовой сервер → реюз живой голосовой комнаты как смотримой (без 2-го коннекта к тому же
@@ -862,7 +882,8 @@ export const useStore = create<AppState>((set, get) => ({
     // Покидаю СМОТРИМЫЙ сервер (leave/delete/ошибка). Если я в голосе ИМЕННО на нём — выхожу и из голоса
     // (полный teardown); иначе голос на другом сервере — оставляем, отцепляем только просмотр.
     const voiceSrv = engine?.getSnapshot().voiceServerId;
-    if (voiceSrv && voiceSrv === get().viewServerId) engine?.disconnect(); else engine?.detachView();
+    if (voiceSrv && voiceSrv === get().viewServerId) engine?.disconnect(false, 'server_exit');
+    else engine?.detachView(undefined, 'server_exit');
     set({ active: null, members: [], loadingServer: false, loadingServerId: null, viewServerId: null, view: 'home' });
     get().refreshServers();
   },
@@ -922,7 +943,11 @@ export async function completeAuthSessionHandoff(plan: AuthSessionHandoff, token
       // переиспользуем: создаём её заново только после того, как api.ts уже видит новый JWT.
       viewEpoch++;
       stopMemberPoll();
-      engine?.disconnect();
+      // The invalidated connect may still own this marker until its stale async response returns.
+      // Clear it synchronously before the forced same-server reconnect; otherwise the ordinary
+      // duplicate-navigation guard coalesces with that dead owner and leaves the UI loading forever.
+      useStore.setState({ loadingServer: false, loadingServerId: null });
+      engine?.disconnect(false, 'auth_handoff');
     }
 
     if (!stillCurrent()) return;

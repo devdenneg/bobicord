@@ -61,6 +61,20 @@ export function effectiveStreamGain(masterPercent: number, streamVolume: number,
   return master * personal;
 }
 
+/** Extends one pending first-frame deadline without ever shortening it or exceeding a hard cap. */
+export function boundedWatchRecoveryDeadline(
+  startedAt: number,
+  currentDeadlineAt: number,
+  recoveryAt: number,
+  recoveryGraceMs: number,
+  maxDurationMs: number,
+): number {
+  return Math.min(
+    startedAt + Math.max(0, maxDurationMs),
+    Math.max(currentDeadlineAt, recoveryAt + Math.max(0, recoveryGraceMs)),
+  );
+}
+
 type VolumeTrack = { setVolume?: (value: number) => void };
 
 /** Applies gain to the exact attached LiveKit track; a same-username stale participant is ignored. */
@@ -322,6 +336,237 @@ export class ExactMediaOutputRouteGate<TTarget extends object = object> {
 
   forget(target: TTarget): void {
     this.desired.delete(target);
+  }
+}
+
+/**
+ * Waits for a frame owned by the exact current video track inside a stable MediaStream.
+ *
+ * Tree reparenting deliberately keeps the MediaStream and video element alive so fullscreen and
+ * the last good frame survive the handoff. That also means ordinary `loadeddata`/`playing` events
+ * can describe the retained predecessor. The frame callback is therefore generation-fenced to the
+ * replacement track. Older WebKit versions without requestVideoFrameCallback first require a
+ * strict decoded-frame counter increment; only builds without either counter may use the exact
+ * track's own mute-to-unmute edge as the final fail-closed fallback.
+ */
+export class ExactVideoTrackFrameObserver {
+  private static readonly COUNTER_POLL_INTERVAL_MS = 100;
+  private static readonly COUNTER_POLL_TIMEOUT_MS = 30_000;
+  private candidate: MediaStreamTrack | null = null;
+  private candidateUnmute: EventListener | null = null;
+  private candidateEnded: EventListener | null = null;
+  private frameRequest: number | null = null;
+  private counterPollTimer: number | null = null;
+  private counterPollDeadline = 0;
+  private counterBaseline: { source: 'standard' | 'webkit'; value: number } | null = null;
+  private fallbackUnmuteGeneration: number | null = null;
+  private generation = 0;
+  private disposed = false;
+
+  private readonly onAddTrack = (event: Event) => {
+    const track = (event as Event & { track?: MediaStreamTrack }).track;
+    if (track?.kind === 'video') this.adopt(track);
+  };
+
+  private readonly onRemoveTrack = (event: Event) => {
+    const track = (event as Event & { track?: MediaStreamTrack }).track;
+    if (track === this.candidate && !this.stream.getVideoTracks().includes(track)) this.clearCandidate();
+  };
+
+  constructor(
+    private readonly video: HTMLVideoElement,
+    private readonly stream: MediaStream,
+    private readonly onFrame: (track: MediaStreamTrack) => void,
+    private readonly counterPolling: {
+      now?: () => number;
+      setTimer?: (callback: () => void, delayMs: number) => number;
+      clearTimer?: (timer: number) => void;
+      intervalMs?: number;
+      timeoutMs?: number;
+    } = {},
+  ) {
+    stream.addEventListener('addtrack', this.onAddTrack);
+    stream.addEventListener('removetrack', this.onRemoveTrack);
+    const current = stream.getVideoTracks()[0];
+    if (current) this.adopt(current);
+  }
+
+  private owns(track: MediaStreamTrack, generation: number): boolean {
+    return !this.disposed && this.generation === generation && this.candidate === track
+      && track.readyState === 'live' && !track.muted
+      && this.stream.getVideoTracks().includes(track);
+  }
+
+  private cancelFrameRequest() {
+    const request = this.frameRequest;
+    this.frameRequest = null;
+    if (request === null || typeof this.video.cancelVideoFrameCallback !== 'function') return;
+    try { this.video.cancelVideoFrameCallback(request); } catch { /** stale browser callback is generation-fenced */ }
+  }
+
+  private cancelCounterPoll() {
+    const timer = this.counterPollTimer;
+    this.counterPollTimer = null;
+    this.counterPollDeadline = 0;
+    this.counterBaseline = null;
+    if (timer === null) return;
+    const clearTimer = this.counterPolling.clearTimer ?? ((handle: number) => globalThis.clearTimeout(handle));
+    try { clearTimer(timer); } catch { /** a stale callback remains generation-fenced */ }
+  }
+
+  private decodedFrameCounter(): { source: 'standard' | 'webkit'; value: number } | null {
+    try {
+      const quality = this.video.getVideoPlaybackQuality?.();
+      const value = quality?.totalVideoFrames;
+      if (Number.isFinite(value) && value! >= 0) return { source: 'standard', value: value! };
+    } catch { /** older WebKit may expose a throwing partial implementation */ }
+    const value = (this.video as HTMLVideoElement & { webkitDecodedFrameCount?: number }).webkitDecodedFrameCount;
+    return Number.isFinite(value) && value! >= 0 ? { source: 'webkit', value: value! } : null;
+  }
+
+  private scheduleCounterPoll(track: MediaStreamTrack, generation: number) {
+    if (this.counterPollTimer !== null || !this.owns(track, generation)) return;
+    const now = this.counterPolling.now ?? Date.now;
+    if (!this.counterPollDeadline) {
+      const timeoutMs = Number.isFinite(this.counterPolling.timeoutMs)
+        ? Math.max(0, this.counterPolling.timeoutMs!)
+        : ExactVideoTrackFrameObserver.COUNTER_POLL_TIMEOUT_MS;
+      this.counterPollDeadline = now() + timeoutMs;
+    }
+    if (now() >= this.counterPollDeadline) {
+      this.counterPollDeadline = 0;
+      this.counterBaseline = null;
+      return;
+    }
+    const intervalMs = Number.isFinite(this.counterPolling.intervalMs)
+      ? Math.max(0, this.counterPolling.intervalMs!)
+      : ExactVideoTrackFrameObserver.COUNTER_POLL_INTERVAL_MS;
+    const setTimer = this.counterPolling.setTimer
+      ?? ((callback: () => void, delayMs: number) => globalThis.setTimeout(callback, delayMs));
+    let timer: number | null = null;
+    timer = setTimer(() => {
+      if (timer === null || this.counterPollTimer !== timer) return;
+      this.counterPollTimer = null;
+      if (!this.owns(track, generation)) return;
+      const current = this.decodedFrameCounter();
+      if (!current) {
+        this.counterPollDeadline = 0;
+        this.counterBaseline = null;
+        // A counter disappearing mid-flight must not turn retained element dimensions into proof.
+        // Only an unconsumed exact mute -> unmute edge may finish without a decoded-frame counter.
+        this.requestCounterFallback(track, generation);
+        return;
+      }
+      const baseline = this.counterBaseline;
+      if (!baseline || baseline.source !== current.source || current.value < baseline.value) {
+        // Some WebKit versions reset the element counter when a MediaStream swaps its video track.
+        // Treat that as a new baseline; the first strictly later frame is the proof we need.
+        this.counterBaseline = current;
+      } else if (current.value > baseline.value
+        && this.video.videoWidth > 0 && this.video.readyState >= 2) {
+        this.counterPollDeadline = 0;
+        this.counterBaseline = null;
+        this.fallbackUnmuteGeneration = null;
+        this.onFrame(track);
+        return;
+      }
+      this.scheduleCounterPoll(track, generation);
+    }, intervalMs);
+    this.counterPollTimer = timer;
+  }
+
+  private requestCounterFallback(track: MediaStreamTrack, generation: number) {
+    if (!this.owns(track, generation)) return;
+    if (this.counterPollTimer !== null) return;
+    const baseline = this.decodedFrameCounter();
+    if (baseline) {
+      // When a decoded-frame counter exists it is stronger than an unmute notification: wait for
+      // a strict increment after this exact candidate became observable.
+      this.fallbackUnmuteGeneration = null;
+      this.counterBaseline = baseline;
+      this.counterPollDeadline = 0;
+      this.scheduleCounterPoll(track, generation);
+      return;
+    }
+    if (this.fallbackUnmuteGeneration !== generation) return;
+    // No counter exists in this WebKit build. The exact candidate's own mute -> unmute edge is the
+    // last safe proof available; consume it only after dimensions are ready, never for a later
+    // rewatch of an already-unmuted track.
+    if (this.video.videoWidth <= 0 || this.video.readyState < 2) return;
+    this.fallbackUnmuteGeneration = null;
+    this.onFrame(track);
+  }
+
+  private clearCandidate() {
+    const track = this.candidate;
+    if (track && this.candidateUnmute) track.removeEventListener('unmute', this.candidateUnmute);
+    if (track && this.candidateEnded) track.removeEventListener('ended', this.candidateEnded);
+    this.candidate = null;
+    this.candidateUnmute = null;
+    this.candidateEnded = null;
+    this.fallbackUnmuteGeneration = null;
+    ++this.generation;
+    this.cancelFrameRequest();
+    this.cancelCounterPoll();
+  }
+
+  private adopt(track: MediaStreamTrack) {
+    if (this.disposed || track.kind !== 'video' || !this.stream.getVideoTracks().includes(track)) return;
+    if (this.candidate === track) { this.requestCurrentFrame(); return; }
+    this.clearCandidate();
+    this.candidate = track;
+    const generation = this.generation;
+    this.candidateUnmute = () => {
+      if (!this.owns(track, generation)) return;
+      this.fallbackUnmuteGeneration = generation;
+      // A callback registered while the receiver was muted can remain pending forever in WebKit.
+      // Re-arm it at the exact first-packet edge instead of accumulating another native callback.
+      this.cancelFrameRequest();
+      this.requestCurrentFrame();
+    };
+    this.candidateEnded = () => {
+      if (this.candidate === track && this.generation === generation) this.clearCandidate();
+    };
+    track.addEventListener('unmute', this.candidateUnmute);
+    track.addEventListener('ended', this.candidateEnded, { once: true });
+    this.requestCurrentFrame();
+  }
+
+  requestCurrentFrame() {
+    const track = this.candidate;
+    const generation = this.generation;
+    if (!track || !this.owns(track, generation)) return;
+    const request = this.video.requestVideoFrameCallback;
+    if (typeof request !== 'function') {
+      // Dimensions/readyState belong to the stable element and may describe its retained previous
+      // frame. A strict post-adopt decoded-frame counter increment or this track's own unmute edge
+      // is required before the replacement can become authoritative.
+      this.requestCounterFallback(track, generation);
+      return;
+    }
+    this.cancelCounterPoll();
+    if (this.frameRequest !== null) return;
+    let requestId: number | null = null;
+    try {
+      requestId = request.call(this.video, () => {
+        if (requestId !== null && this.frameRequest === requestId) this.frameRequest = null;
+        if (!this.owns(track, generation)) return;
+        if (this.video.videoWidth > 0 && this.video.readyState >= 2) this.onFrame(track);
+      });
+      this.frameRequest = requestId;
+    } catch {
+      // Treat a throwing partial RVFC implementation like an unavailable one. The fallback still
+      // requires the exact track's unmute edge or a post-baseline decoded-frame counter increment.
+      this.requestCounterFallback(track, generation);
+    }
+  }
+
+  dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.stream.removeEventListener('addtrack', this.onAddTrack);
+    this.stream.removeEventListener('removetrack', this.onRemoveTrack);
+    this.clearCandidate();
   }
 }
 

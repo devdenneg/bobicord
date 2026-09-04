@@ -627,6 +627,115 @@ const UP_CONNECTED: u8 = 1;
 const UP_DISCONNECTED: u8 = 2;
 const UP_FAILED: u8 = 3;
 const UPSTREAM_MEDIA_SEEN_BIT: u64 = 1;
+const AUTO_REPARENT_COOLDOWN_MS: u64 = 10_000;
+const UPSTREAM_MEDIA_RECOVERY_MAX_ATTEMPTS: u8 = 2;
+// Successful cold starts can deliver their first upstream packet at about 8s. At 12s the same
+// watchdog tick reports the missing track and requests recovery, leaving about 8s for the server's
+// track-missing cooldown bypass, reparent/reattach and fresh ICE before the 20s renderer deadline.
+const UPSTREAM_MEDIA_MISSING_MS: u64 = 12_000;
+const TRACK_MISSING_REPARENT_REASON: &str = "track-missing";
+
+#[derive(Debug, Default)]
+struct UpstreamMediaRecovery {
+    reported_epoch: u64,
+    requested_epoch: u64,
+    consecutive_requests: u8,
+    awaiting_rejoin_assignment: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UpstreamMediaRecoveryDecision {
+    report_missing: bool,
+    request_reparent: bool,
+}
+
+/// The missing-media repair must not inherit the ordinary ICE migration's cooldown: that request
+/// may have been rejected by the server while a fresh vrelay child was still draining. A successful
+/// missing-media request does suppress an immediately adjacent ordinary request, avoiding two
+/// topology changes from independent watchdog ticks at the same instant.
+#[derive(Debug, Default)]
+struct ReparentCooldowns {
+    ordinary_at_ms: u64,
+    track_missing_at_ms: u64,
+}
+
+impl ReparentCooldowns {
+    fn ordinary_elapsed(&self, now_ms: u64) -> u64 {
+        now_ms.saturating_sub(self.ordinary_at_ms)
+    }
+
+    fn track_missing_elapsed(&self, now_ms: u64) -> u64 {
+        now_ms.saturating_sub(self.track_missing_at_ms)
+    }
+
+    fn mark_ordinary(&mut self, now_ms: u64) {
+        self.ordinary_at_ms = now_ms;
+    }
+
+    fn mark_track_missing(&mut self, now_ms: u64) {
+        self.track_missing_at_ms = now_ms;
+        self.ordinary_at_ms = now_ms;
+    }
+}
+
+impl UpstreamMediaRecovery {
+    /// A signaling rejoin creates a new server-side node. Any request counted for the old node can
+    /// no longer be accepted against the fresh assignment-age fence, so the new node receives its
+    /// own bounded budget. Recovery remains disarmed until its corresponding assign-parent arrives;
+    /// otherwise a media tick between `join` and that assignment could immediately spend attempt 1
+    /// against the stale local parent id.
+    fn on_signaling_rejoined(&mut self) {
+        self.reported_epoch = 0;
+        self.requested_epoch = 0;
+        self.consecutive_requests = 0;
+        self.awaiting_rejoin_assignment = true;
+    }
+
+    fn on_parent_assignment(&mut self) {
+        self.awaiting_rejoin_assignment = false;
+    }
+
+    fn evaluate(
+        &mut self,
+        media_epoch: u64,
+        media_seen: bool,
+        media_elapsed_ms: u64,
+        parent_assigned: bool,
+        reparent_cooldown_elapsed_ms: u64,
+    ) -> UpstreamMediaRecoveryDecision {
+        if self.awaiting_rejoin_assignment || media_epoch == 0 {
+            return UpstreamMediaRecoveryDecision::default();
+        }
+        if media_seen {
+            // A real upstream video packet proves the path recovered. Only that media evidence,
+            // rather than another offer/ICE epoch, replenishes the bounded recovery budget.
+            self.consecutive_requests = 0;
+            return UpstreamMediaRecoveryDecision::default();
+        }
+        if media_elapsed_ms < UPSTREAM_MEDIA_MISSING_MS {
+            return UpstreamMediaRecoveryDecision::default();
+        }
+
+        let report_missing = self.reported_epoch != media_epoch;
+        if report_missing {
+            self.reported_epoch = media_epoch;
+        }
+
+        let request_reparent = parent_assigned
+            && reparent_cooldown_elapsed_ms >= AUTO_REPARENT_COOLDOWN_MS
+            && self.consecutive_requests < UPSTREAM_MEDIA_RECOVERY_MAX_ATTEMPTS
+            && self.requested_epoch != media_epoch;
+        if request_reparent {
+            self.requested_epoch = media_epoch;
+            self.consecutive_requests += 1;
+        }
+
+        UpstreamMediaRecoveryDecision {
+            report_missing,
+            request_reparent,
+        }
+    }
+}
 
 fn begin_upstream_media_epoch(state: &AtomicU64) -> u64 {
     let previous_epoch = state.load(Ordering::Relaxed) & !UPSTREAM_MEDIA_SEEN_BIT;
@@ -1632,8 +1741,11 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
         mgr.start_webview().await;
 
         let mut stats_tick = tokio::time::interval(Duration::from_secs(2));
-        // Cooldown авто-reparent по обрыву upstream (не чаще 10с — совпадает с серверным).
-        let mut last_reparent_ms: u64 = 0;
+        let mut media_tick = tokio::time::interval(Duration::from_secs(1));
+        // Independent clocks: an ordinary ICE request (possibly rejected by the server's fresh-node
+        // drain cooldown) must never postpone the first missing-media repair.
+        let mut reparent_cooldowns = ReparentCooldowns::default();
+        let mut upstream_media_recovery = UpstreamMediaRecovery::default();
         // idle-exit: отсчёт с запуска (grace на первый assign-child = сам таймаут).
         let mut idle_since_ms: u64 = now_ms();
         // Терминальный сирота (только натив, idle_exit=None): без родителя дольше таймаута =
@@ -1642,8 +1754,6 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
         // репарентит, а teardown ждёт stop_watch из webview, который тоже мог пропустить конец.
         let mut orphan_since_ms: Option<u64> = None;
         const ORPHAN_EXIT_MS: u64 = 20_000;
-        const TRACK_MISSING_STATUS_MS: u64 = 12_000;
-        let mut track_missing_reported_epoch = 0u64;
         // true после break = конец стрима, а не явный Stop — сообщаем webview, чтобы он снёс watch.
         let mut watch_ended = false;
         loop {
@@ -1667,6 +1777,7 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
                                 None,
                             );
                             mgr.on_assign_parent(parent_id).await;
+                            upstream_media_recovery.on_parent_assignment();
                         }
                         Some(TreeEvent::AssignChild { child_id }) => mgr.on_assign_child(child_id).await,
                         Some(TreeEvent::SdpOffer { from, sdp }) => mgr.on_parent_offer(from, sdp).await,
@@ -1689,6 +1800,7 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
                         // пришлёт assign-parent (settleOrphans) — upstream пересоздастся. Старые
                         // child-PC живут, пока дети не пересоздадут соединения (sweep дочистит).
                         Some(TreeEvent::Rejoined) => {
+                            upstream_media_recovery.on_signaling_rejoined();
                             log::warn!("relay: сигналинг реджойнился — жду свежий assign-parent");
                             let _ = emit_watch_status(
                                 mgr.ui.as_ref(), &mgr.stream_id, WatchStatusStage::Recovery,
@@ -1705,7 +1817,13 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
                     match ctrl {
                         Some(RelayControl::WebviewAnswer { sdp }) => mgr.on_webview_answer(sdp).await,
                         Some(RelayControl::WebviewIce { candidate }) => mgr.on_webview_ice(candidate).await,
-                        Some(RelayControl::RequestReparent { target }) => { let _ = mgr.cmd_tx.send(TreeCmd::RequestReparent { target }); }
+                        Some(RelayControl::RequestReparent { target }) => {
+                            let _ = mgr.cmd_tx.send(TreeCmd::RequestReparent {
+                                target,
+                                reason: None,
+                                failed_parent_id: None,
+                            });
+                        }
                         // Д2: транскод-рендишн на ingest-сессии (только vrelay дёргает).
                         Some(RelayControl::StartRendition { rendition, bitrate, reply }) => {
                             let res = mgr.start_rendition(rendition, bitrate).await;
@@ -1715,39 +1833,70 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
                         Some(RelayControl::Stop) | None => break,
                     }
                 }
+                _ = media_tick.tick() => {
+                    let now = now_ms();
+                    let failed_parent_id = mgr.parent_id.clone();
+                    let (media_epoch, media_seen) = upstream_media_snapshot(&mgr.upstream_media_state);
+                    let media_elapsed_ms = now.saturating_sub(
+                        mgr.upstream_media_since_ms.load(Ordering::Acquire),
+                    );
+                    let decision = upstream_media_recovery.evaluate(
+                        media_epoch,
+                        media_seen,
+                        media_elapsed_ms,
+                        failed_parent_id.is_some(),
+                        reparent_cooldowns.track_missing_elapsed(now),
+                    );
+                    if decision.report_missing {
+                        let _ = emit_watch_status(
+                            mgr.ui.as_ref(), &mgr.stream_id, WatchStatusStage::Track,
+                            WatchStatusOutcome::Stalled, WatchStatusCode::TrackMissing, None,
+                        );
+                    }
+                    // A server-assigned parent without the first video RTP is not self-healing,
+                    // even when its SDP offer or local PC never materialized. Ask for another
+                    // parent (or same-parent reattach) after the dedicated media cooldown; an
+                    // ordinary ICE request cannot consume or postpone this epoch's bounded repair.
+                    if decision.request_reparent {
+                        reparent_cooldowns.mark_track_missing(now);
+                        log::warn!(
+                            "relay: upstream media epoch={media_epoch} без video RTP — авто-reparent"
+                        );
+                        let _ = emit_watch_status(
+                            mgr.ui.as_ref(), &mgr.stream_id, WatchStatusStage::Recovery,
+                            WatchStatusOutcome::Started, WatchStatusCode::TrackMissing, None,
+                        );
+                        let _ = mgr.cmd_tx.send(TreeCmd::RequestReparent {
+                            target: None,
+                            reason: Some(TRACK_MISSING_REPARENT_REASON),
+                            failed_parent_id,
+                        });
+                    }
+                }
                 _ = stats_tick.tick() => {
                     mgr.sweep_dead_children().await;
                     if let Some(hub) = &mgr.fanout { hub.log_health(); }
+                    let now = now_ms();
                     // Watchdog upstream: ICE упал (Failed сразу / Disconnected дольше 6с), а WS
                     // жив — сервер не знает об обрыве, зритель фризит. Просим reparent (мы
                     // answerer, restart_ice не применим — сервер даст нового/того же родителя).
                     if mgr.upstream.is_some() {
                         let st = mgr.upstream_state.load(Ordering::Relaxed);
-                        let now = now_ms();
                         let since = mgr.upstream_since_ms.load(Ordering::Relaxed);
                         let bad = st == UP_FAILED || (st == UP_DISCONNECTED && now.saturating_sub(since) >= 6000);
-                        if bad && now.saturating_sub(last_reparent_ms) >= 10_000 {
-                            last_reparent_ms = now;
+                        if bad && reparent_cooldowns.ordinary_elapsed(now) >= AUTO_REPARENT_COOLDOWN_MS {
+                            reparent_cooldowns.mark_ordinary(now);
                             log::warn!("relay: upstream state={st} — авто-reparent");
                             let _ = emit_watch_status(
                                 mgr.ui.as_ref(), &mgr.stream_id, WatchStatusStage::Recovery,
                                 WatchStatusOutcome::Started, WatchStatusCode::IceFailed, None,
                             );
-                            let _ = mgr.cmd_tx.send(TreeCmd::RequestReparent { target: None });
+                            let _ = mgr.cmd_tx.send(TreeCmd::RequestReparent {
+                                target: None,
+                                reason: None,
+                                failed_parent_id: None,
+                            });
                         }
-                    }
-                    let (media_epoch, media_seen) = upstream_media_snapshot(&mgr.upstream_media_state);
-                    if media_epoch != 0
-                        && !media_seen
-                        && track_missing_reported_epoch != media_epoch
-                        && now_ms().saturating_sub(mgr.upstream_media_since_ms.load(Ordering::Acquire))
-                            >= TRACK_MISSING_STATUS_MS
-                    {
-                        track_missing_reported_epoch = media_epoch;
-                        let _ = emit_watch_status(
-                            mgr.ui.as_ref(), &mgr.stream_id, WatchStatusStage::Track,
-                            WatchStatusOutcome::Stalled, WatchStatusCode::TrackMissing, None,
-                        );
                     }
                     // Терминальный сирота (натив): родителя нет дольше ORPHAN_EXIT_MS — дерево
                     // умерло (settleOrphans/vrelay дали бы родителя за секунды). Выходим и
@@ -1791,7 +1940,11 @@ pub fn start(ui: Option<UiSink>, cfg: RelayConfig) -> RelayHandle {
         }
         let _ = mgr.cmd_tx.send(TreeCmd::Leave);
         let (media_epoch, media_seen) = upstream_media_snapshot(&mgr.upstream_media_state);
-        if watch_ended && media_epoch != 0 && !media_seen && track_missing_reported_epoch != media_epoch {
+        if watch_ended
+            && media_epoch != 0
+            && !media_seen
+            && upstream_media_recovery.reported_epoch != media_epoch
+        {
             let _ = emit_watch_status(
                 mgr.ui.as_ref(), &mgr.stream_id, WatchStatusStage::Track,
                 WatchStatusOutcome::Failed, WatchStatusCode::TrackMissing, None,
@@ -1893,8 +2046,10 @@ mod tests {
     use super::{
         begin_upstream_media_epoch, mark_first_upstream_video_packet, upstream_media_snapshot,
         watch_status_payload, IngestMonitor, PendingDownstreamIce, PendingUpstreamIce,
-        QueuePendingIce, RtpContinuity, WatchStatusCode, WatchStatusOutcome, WatchStatusStage,
-        PENDING_ICE_MAX,
+        QueuePendingIce, ReparentCooldowns, RtpContinuity, UpstreamMediaRecovery,
+        UpstreamMediaRecoveryDecision, WatchStatusCode, WatchStatusOutcome, WatchStatusStage,
+        AUTO_REPARENT_COOLDOWN_MS, PENDING_ICE_MAX, UPSTREAM_MEDIA_MISSING_MS,
+        UPSTREAM_MEDIA_RECOVERY_MAX_ATTEMPTS,
     };
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
@@ -1942,6 +2097,260 @@ mod tests {
         assert_eq!(upstream_media_snapshot(&state), (replacement_epoch, false));
         assert!(mark_first_upstream_video_packet(&state, replacement_epoch));
         assert_eq!(upstream_media_snapshot(&state), (replacement_epoch, true));
+    }
+
+    #[test]
+    fn upstream_media_recovery_is_rate_limited_once_per_epoch() {
+        assert_eq!(UPSTREAM_MEDIA_MISSING_MS, 12_000);
+
+        let mut recovery = UpstreamMediaRecovery::default();
+        assert_eq!(
+            recovery.evaluate(
+                0,
+                false,
+                UPSTREAM_MEDIA_MISSING_MS,
+                true,
+                AUTO_REPARENT_COOLDOWN_MS,
+            ),
+            UpstreamMediaRecoveryDecision::default(),
+        );
+        assert_eq!(
+            recovery.evaluate(
+                2,
+                false,
+                UPSTREAM_MEDIA_MISSING_MS - 1,
+                true,
+                AUTO_REPARENT_COOLDOWN_MS,
+            ),
+            UpstreamMediaRecoveryDecision::default(),
+        );
+        assert_eq!(
+            recovery.evaluate(
+                2,
+                true,
+                UPSTREAM_MEDIA_MISSING_MS,
+                true,
+                AUTO_REPARENT_COOLDOWN_MS,
+            ),
+            UpstreamMediaRecoveryDecision::default(),
+        );
+
+        // At the 12s boundary the status and reasoned recovery are emitted in the same tick.
+        assert_eq!(
+            recovery.evaluate(
+                2,
+                false,
+                UPSTREAM_MEDIA_MISSING_MS,
+                true,
+                AUTO_REPARENT_COOLDOWN_MS,
+            ),
+            UpstreamMediaRecoveryDecision {
+                report_missing: true,
+                request_reparent: true,
+            },
+        );
+        assert_eq!(
+            recovery.evaluate(
+                2,
+                false,
+                UPSTREAM_MEDIA_MISSING_MS * 10,
+                true,
+                AUTO_REPARENT_COOLDOWN_MS * 10,
+            ),
+            UpstreamMediaRecoveryDecision::default(),
+        );
+
+        // Waiting for the shared cooldown must not consume the new epoch's one request.
+        assert_eq!(
+            recovery.evaluate(
+                4,
+                false,
+                UPSTREAM_MEDIA_MISSING_MS,
+                true,
+                AUTO_REPARENT_COOLDOWN_MS - 1,
+            ),
+            UpstreamMediaRecoveryDecision {
+                report_missing: true,
+                request_reparent: false,
+            },
+        );
+        assert_eq!(
+            recovery.evaluate(
+                4,
+                false,
+                UPSTREAM_MEDIA_MISSING_MS + AUTO_REPARENT_COOLDOWN_MS,
+                true,
+                AUTO_REPARENT_COOLDOWN_MS,
+            ),
+            UpstreamMediaRecoveryDecision {
+                report_missing: false,
+                request_reparent: true,
+            },
+        );
+        assert_eq!(
+            recovery.evaluate(4, false, u64::MAX, true, u64::MAX),
+            UpstreamMediaRecoveryDecision::default(),
+        );
+
+        // A fresh offer creates a new epoch, but must not create an unbounded headless-vrelay
+        // reattach loop while the broadcaster still produces no video RTP.
+        assert_eq!(UPSTREAM_MEDIA_RECOVERY_MAX_ATTEMPTS, 2);
+        assert_eq!(
+            recovery.evaluate(
+                6,
+                false,
+                UPSTREAM_MEDIA_MISSING_MS,
+                true,
+                AUTO_REPARENT_COOLDOWN_MS,
+            ),
+            UpstreamMediaRecoveryDecision {
+                report_missing: true,
+                request_reparent: false,
+            },
+        );
+
+        // Only observed media replenishes the budget for a later genuine outage.
+        assert_eq!(
+            recovery.evaluate(6, true, UPSTREAM_MEDIA_MISSING_MS, true, u64::MAX),
+            UpstreamMediaRecoveryDecision::default(),
+        );
+        assert_eq!(
+            recovery.evaluate(
+                8,
+                false,
+                UPSTREAM_MEDIA_MISSING_MS,
+                true,
+                AUTO_REPARENT_COOLDOWN_MS,
+            ),
+            UpstreamMediaRecoveryDecision {
+                report_missing: true,
+                request_reparent: true,
+            },
+        );
+
+        // Missing media without even a server-assigned parent may be diagnosed, but must not
+        // reparent. A parent assignment itself is enough: an offer/PC which never materialized is
+        // exactly one of the dead paths this watchdog must repair.
+        assert_eq!(
+            recovery.evaluate(
+                10,
+                false,
+                UPSTREAM_MEDIA_MISSING_MS,
+                false,
+                AUTO_REPARENT_COOLDOWN_MS,
+            ),
+            UpstreamMediaRecoveryDecision {
+                report_missing: true,
+                request_reparent: false,
+            },
+        );
+    }
+
+    #[test]
+    fn assigned_parent_without_offer_or_upstream_pc_is_recoverable() {
+        let mut recovery = UpstreamMediaRecovery::default();
+        let parent_id = Some("parent-a");
+        let upstream_pc_present = false;
+        assert!(!upstream_pc_present, "fixture deliberately models a lost offer");
+        assert_eq!(
+            recovery.evaluate(
+                2,
+                false,
+                UPSTREAM_MEDIA_MISSING_MS,
+                parent_id.is_some(),
+                AUTO_REPARENT_COOLDOWN_MS,
+            ),
+            UpstreamMediaRecoveryDecision {
+                report_missing: true,
+                request_reparent: true,
+            },
+        );
+    }
+
+    #[test]
+    fn signaling_rejoin_waits_for_assignment_and_restores_two_media_attempts() {
+        let mut recovery = UpstreamMediaRecovery::default();
+
+        // One request was counted locally just before the signaling socket disappeared.
+        assert!(
+            recovery
+                .evaluate(
+                    2,
+                    false,
+                    UPSTREAM_MEDIA_MISSING_MS,
+                    true,
+                    AUTO_REPARENT_COOLDOWN_MS,
+                )
+                .request_reparent
+        );
+
+        recovery.on_signaling_rejoined();
+        assert_eq!(
+            recovery.evaluate(
+                2,
+                false,
+                UPSTREAM_MEDIA_MISSING_MS * 10,
+                true,
+                AUTO_REPARENT_COOLDOWN_MS * 10,
+            ),
+            UpstreamMediaRecoveryDecision::default(),
+            "a tick between join and assign-parent cannot spend the fresh budget on the old parent",
+        );
+
+        recovery.on_parent_assignment();
+        assert!(
+            recovery
+                .evaluate(
+                    4,
+                    false,
+                    UPSTREAM_MEDIA_MISSING_MS,
+                    true,
+                    AUTO_REPARENT_COOLDOWN_MS,
+                )
+                .request_reparent,
+            "the first post-rejoin media epoch gets attempt one",
+        );
+        assert!(
+            recovery
+                .evaluate(
+                    6,
+                    false,
+                    UPSTREAM_MEDIA_MISSING_MS,
+                    true,
+                    AUTO_REPARENT_COOLDOWN_MS,
+                )
+                .request_reparent,
+            "the recreated post-rejoin epoch gets attempt two",
+        );
+        assert!(
+            !recovery
+                .evaluate(
+                    8,
+                    false,
+                    UPSTREAM_MEDIA_MISSING_MS,
+                    true,
+                    AUTO_REPARENT_COOLDOWN_MS,
+                )
+                .request_reparent,
+            "the post-rejoin budget remains bounded after two attempts",
+        );
+    }
+
+    #[test]
+    fn ordinary_ice_reparent_does_not_delay_track_missing_recovery() {
+        let mut cooldowns = ReparentCooldowns::default();
+        let ordinary_at = 11_000;
+        let media_recovery_at = ordinary_at + 1_000;
+        cooldowns.mark_ordinary(ordinary_at);
+
+        assert!(cooldowns.ordinary_elapsed(media_recovery_at) < AUTO_REPARENT_COOLDOWN_MS);
+        assert!(cooldowns.track_missing_elapsed(media_recovery_at) >= AUTO_REPARENT_COOLDOWN_MS,
+            "the independent missing-media clock remains ready after an ordinary ICE request");
+
+        cooldowns.mark_track_missing(media_recovery_at);
+        assert_eq!(cooldowns.track_missing_elapsed(media_recovery_at), 0);
+        assert_eq!(cooldowns.ordinary_elapsed(media_recovery_at), 0,
+            "one missing-media repair suppresses an immediate duplicate ICE repair");
     }
 
     // ---- upstream trickle ICE до SDP offer ----

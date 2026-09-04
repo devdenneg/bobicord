@@ -34,7 +34,14 @@ for (const mutatingVoiceCall of ['joinVoice', 'mintVoiceIntent', 'claimVoiceLeas
 const reconnects = calls.filter((call) => call.name === 'connectServer');
 assert.deepEqual(reconnects.map((call) => call.args), [['plan.viewedServerId']],
   'auth handoff may reconnect only the previously viewed room');
-assert.match(declaration.getText(file), /Голосовая связь отключена — подключись к каналу снова/,
+const handoffBody = declaration.getText(file);
+const staleLoadingClearAt = handoffBody.indexOf("useStore.setState({ loadingServer: false, loadingServerId: null })");
+const oldRoomDisconnectAt = handoffBody.indexOf("engine?.disconnect(false, 'auth_handoff')");
+const forcedReconnectAt = handoffBody.indexOf('connectServer(plan.viewedServerId)');
+assert.ok(staleLoadingClearAt >= 0 && staleLoadingClearAt < oldRoomDisconnectAt
+  && oldRoomDisconnectAt < forcedReconnectAt,
+  'token rotation clears the stale loading owner before its forced same-server reconnect');
+assert.match(handoffBody, /Голосовая связь отключена — подключись к каналу снова/,
   'a previously active voice session must get a manual reconnect prompt');
 
 assert.equal(bootstrap.isRecoverableAcceptedSessionBootstrapError({ code: 'NETWORK_ERROR', status: 0 }), true);

@@ -1,4 +1,4 @@
-import type { Room, LocalVideoTrack, RemoteTrack } from 'livekit-client';
+import type { Room, LocalVideoTrack, RemoteParticipant, RemoteTrack, TrackPublication } from 'livekit-client';
 import type { StreamInfo } from '../engine';
 
 /**
@@ -91,6 +91,7 @@ export type StreamWatchTransportDiagnosticStage =
   | 'watch_parent'
   | 'watch_negotiation'
   | 'watch_track'
+  | 'watch_playback'
   | 'watch_recovery';
 
 export type StreamWatchTransportDiagnosticOutcome =
@@ -188,6 +189,18 @@ export interface VideoTransport {
    *  качества = unwatch+watch. LiveKit игнорирует quality (SFU-путь, деревьев нет). */
   watch(streamId: string, quality?: string, pinned?: boolean): void;
   unwatch(streamId: string): void;
+  /** Confirms that the exact attached stream produced a decoded frame. Tree transports use this
+   *  stronger signal (rather than ontrack) to reset recovery backoff and retained-frame timers.
+   *  `false` rejects a stale retained-frame notification from an earlier tree generation. */
+  confirmPlayback?(streamId: string, candidate?: MediaStreamTrack): boolean;
+  /** LiveKit-only exact ownership check for the separately attached ScreenShareAudio track. Omitting
+   *  `candidate` checks the current publication; providing it also fences a late old track callback. */
+  acceptsScreenAudio?(
+    streamId: string,
+    participant: RemoteParticipant,
+    publication: TrackPublication,
+    candidate?: RemoteTrack,
+  ): boolean;
 
   /** Д4: сменить качество зрителя (меню Авто/Source/1080/720/480/360). mode='auto' — снять
    *  pin, сервер адаптирует; иначе pin на рендишн. Реализовано как unwatch+watch. Только tree. */
@@ -196,8 +209,8 @@ export interface VideoTransport {
   getQualityMode?(streamId: string): string | null;
   /** Д4: рендишн недоступен (агент отказал/кап/апскейл) — reason для тоста + фолбэк на source. */
   onRenditionUnavailable?(cb: (streamId: string, rendition: string, reason: string) => void): () => void;
-  /** Бесшовное переключение (смена качества/reparent/reconnect) не доехало за failsafe-таймаут:
-   *  плитка закрыта, чтобы не морозить последний кадр навсегда. Reason для тоста. Только tree. */
+  /** Бесшовное переключение/восстановление не доехало за конечный транспортный бюджет:
+   *  Engine обязан освободить логического владельца плитки, чтобы явный повторный watch не был no-op. */
   onSeamlessSwitchFailed?(cb: (streamId: string) => void): () => void;
 
   /** Только TreeVideoTransport (Э2.1) — позиция в дереве и живая RTP-статистика

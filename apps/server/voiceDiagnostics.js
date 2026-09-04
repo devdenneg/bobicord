@@ -55,6 +55,11 @@ const OUTPUT_OPERATIONS = new Set([
 ]);
 const MIC_MODES = new Set(['voice', 'ptt', 'unknown']);
 const STREAM_TRANSPORTS = new Set(['livekit', 'tree_web', 'tree_native']);
+const WATCH_END_REASONS = new Set([
+  'user_close', 'view_switch', 'server_exit', 'auth_handoff', 'session_terminal',
+  'logout', 'engine_dispose', 'connection_loss', 'stream_ended', 'quality_change',
+  'recovery_failed', 'playback_timeout', 'superseded', 'unknown',
+]);
 const CONTROL_INCIDENTS = new Set(['stream_watch_succeeded']);
 
 const BOOLEAN_FIELDS = [
@@ -162,6 +167,7 @@ function sanitizeVoiceDiagnosticReport(raw, { maxPayloadBytes = VOICE_DIAGNOSTIC
     const outputOperation = enumValue(source.outputOperation, OUTPUT_OPERATIONS);
     const micMode = enumValue(source.micMode, MIC_MODES);
     const streamTransport = enumValue(source.streamTransport, STREAM_TRANSPORTS);
+    const watchEndReason = enumValue(source.watchEndReason, WATCH_END_REASONS);
     const networkType = enumValue(source.networkType, NETWORK_TYPES);
     if (stage) event.stage = stage;
     if (outcome) event.outcome = outcome;
@@ -175,6 +181,7 @@ function sanitizeVoiceDiagnosticReport(raw, { maxPayloadBytes = VOICE_DIAGNOSTIC
     if (outputOperation) event.outputOperation = outputOperation;
     if (micMode) event.micMode = micMode;
     if (streamTransport) event.streamTransport = streamTransport;
+    if (watchEndReason) event.watchEndReason = watchEndReason;
     if (networkType) event.networkType = networkType;
     if (Number.isInteger(source.httpStatus) && source.httpStatus >= 100 && source.httpStatus <= 599) {
       event.httpStatus = source.httpStatus;

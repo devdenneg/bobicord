@@ -143,11 +143,13 @@ const {
       outcome: index === stages.length - 1 ? 'recovered' : 'started',
       code: codes[index],
       streamTransport: transports[index % transports.length],
+      ...(index === 7 ? { watchEndReason: 'auth_handoff' } : {}),
     }), true);
   }
   recorder.record({
     kind: 'stream_watch_step', stage: 'watch_signaling', outcome: 'failed',
     code: 'signaling_closed', streamTransport: 'raw-peer-route',
+    watchEndReason: 'raw-lifecycle-detail',
     streamId: 'DO_NOT_STORE_STREAM_ID', sdp: 'DO_NOT_STORE_SDP', error: 'DO_NOT_STORE_ERROR',
   });
   for (const incident of ['stream_watch_succeeded', 'stream_watch_failed', 'stream_watch_recovered']) {
@@ -159,7 +161,9 @@ const {
     assert.deepEqual(report.events.slice(0, stages.length).map((event) => event.code), codes);
     assert.deepEqual(report.events.slice(0, stages.length).map((event) => event.streamTransport),
       stages.map((_, index) => transports[index % transports.length]));
+    assert.equal(report.events[7].watchEndReason, 'auth_handoff');
     assert.equal('streamTransport' in report.events.at(-1), false, 'unknown transport values are discarded');
+    assert.equal('watchEndReason' in report.events.at(-1), false, 'unknown lifecycle reasons are discarded');
     assert.doesNotMatch(JSON.stringify(report), /DO_NOT_STORE/,
       'stream identity, SDP and raw errors never enter the fixed report');
   }

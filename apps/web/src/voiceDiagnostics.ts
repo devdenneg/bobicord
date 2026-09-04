@@ -80,6 +80,11 @@ const MIC_MODES = new Set<NonNullable<VoiceDiagnosticEvent['micMode']>>(['voice'
 const STREAM_TRANSPORTS = new Set<NonNullable<VoiceDiagnosticEvent['streamTransport']>>([
   'livekit', 'tree_web', 'tree_native',
 ]);
+const WATCH_END_REASONS = new Set<NonNullable<VoiceDiagnosticEvent['watchEndReason']>>([
+  'user_close', 'view_switch', 'server_exit', 'auth_handoff', 'session_terminal',
+  'logout', 'engine_dispose', 'connection_loss', 'stream_ended', 'quality_change',
+  'recovery_failed', 'playback_timeout', 'superseded', 'unknown',
+]);
 
 const BOOLEAN_FIELDS = [
   'documentHidden', 'online', 'micEnabled', 'publicationMuted', 'upstreamPaused',
@@ -232,6 +237,7 @@ function sanitizeEvent(input: VoiceDiagnosticEventInput, atMs: number): VoiceDia
   const outputOperation = enumValue(source.outputOperation, OUTPUT_OPERATIONS);
   const micMode = enumValue(source.micMode, MIC_MODES);
   const streamTransport = enumValue(source.streamTransport, STREAM_TRANSPORTS);
+  const watchEndReason = enumValue(source.watchEndReason, WATCH_END_REASONS);
   const networkType = enumValue(source.networkType, NETWORK_TYPES);
   if (stage) event.stage = stage;
   if (outcome) event.outcome = outcome;
@@ -245,6 +251,7 @@ function sanitizeEvent(input: VoiceDiagnosticEventInput, atMs: number): VoiceDia
   if (outputOperation) event.outputOperation = outputOperation;
   if (micMode) event.micMode = micMode;
   if (streamTransport) event.streamTransport = streamTransport;
+  if (watchEndReason) event.watchEndReason = watchEndReason;
   if (networkType) event.networkType = networkType;
   if (typeof source.httpStatus === 'number' && Number.isInteger(source.httpStatus)
     && source.httpStatus >= 100 && source.httpStatus <= 599) event.httpStatus = source.httpStatus;

@@ -2,7 +2,7 @@ import type { Room } from 'livekit-client';
 import type {
   VideoTransport, TreeInfo, RtpStats, TreeTopology,
   StreamWatchTransportDiagnostic, StreamWatchTransportConnectionState,
-  StreamWatchTransportIceState, StreamWatchTransportTrackState,
+  StreamWatchTransportDiagnosticCode, StreamWatchTransportIceState, StreamWatchTransportTrackState,
 } from './videoTransport';
 import { MediaStreamVideoHandle } from './videoTransport';
 import type { StreamInfo } from '../engine';
@@ -28,6 +28,20 @@ const DISCOVERY_HELLO_INTERVAL_MS = 10_000;
 const STATS_UNAVAILABLE_BACKOFF_BASE_MS = 30_000;
 const STATS_UNAVAILABLE_BACKOFF_MAX_MS = 5 * 60_000;
 const STATS_UNAVAILABLE_GLOBAL_GAP_MS = 3_000;
+// The server records the exact assign-parent generation before delivering it. If that parent has
+// not produced its SDP offer by this deadline, both sides have enough evidence to rebuild the
+// upstream even while the fresh-child topology cooldown is still active.
+const BROWSER_PARENT_OFFER_TIMEOUT_MS = 8_000;
+// An SDP offer and even an ontrack event do not prove that the relay is carrying video. The media
+// VPS can have a healthy audio leg while its static video sender receives zero RTP. Only a decoded
+// frame clears this second deadline.
+const BROWSER_PARENT_MEDIA_TIMEOUT_MS = 12_000;
+// Retained-frame cleanup is renewed when a bounded recovery request is actually sent, giving a
+// slow 4G/TURN replacement its own full response window without keeping failed tiles forever.
+const SEAMLESS_SWITCH_FAILSAFE_MS = 15_000;
+// A decoded frame resets this budget. A succession of tracks which end before decoding must not
+// keep rebuilding native/Rust/WebRTC owners forever after Engine's initial deadline has completed.
+const NATIVE_WATCH_RECOVERY_MAX_ATTEMPTS = 3;
 
 interface NativeWatchState {
   generation: number;            // exact async start/stop owner; Rust rejects stale generations
@@ -83,6 +97,8 @@ interface WatchState {
   parentGeneration: number;       // assign-parent владеет ICE, включая ICE-before-offer
   offerGeneration: number;        // новый offer навсегда инвалидирует async-работу старого
   joinFallbackTimer: number | null;
+  parentOfferTimer: number | null;
+  parentMediaTimer: number | null;
   reparentTimer: number | null;
 }
 
@@ -192,6 +208,10 @@ export class TreeVideoTransport implements VideoTransport {
   private iceServers: RTCIceServer[] = DEFAULT_ICE_SERVERS;
 
   private videoTracks = new Map<string, MediaStreamVideoHandle>();
+  // Exact current transport track allowed to confirm a decoded frame. The retained container may
+  // still hold a live-looking frozen track while its native/browser owner is reconnecting; that
+  // stale frame must not reset backoff or cancel the replacement deadline.
+  private playbackCandidates = new Map<string, MediaStreamTrack>();
   // Бесшовная смена качества/reparent/reconnect: контейнер-MediaStream на streamId живёт
   // ПОВЕРХ PC. ontrack не создаёт новый handle, а подменяет треки ВНУТРИ контейнера
   // (removeTrack старого kind + addTrack) — <video>.srcObject остаётся тем же объектом,
@@ -272,8 +292,12 @@ export class TreeVideoTransport implements VideoTransport {
 
   private clearWatchStateTimers(st: WatchState) {
     if (st.joinFallbackTimer !== null) clearTimeout(st.joinFallbackTimer);
+    if (st.parentOfferTimer !== null) clearTimeout(st.parentOfferTimer);
+    if (st.parentMediaTimer !== null) clearTimeout(st.parentMediaTimer);
     if (st.reparentTimer !== null) clearTimeout(st.reparentTimer);
     st.joinFallbackTimer = null;
+    st.parentOfferTimer = null;
+    st.parentMediaTimer = null;
     st.reparentTimer = null;
   }
 
@@ -290,6 +314,81 @@ export class TreeVideoTransport implements VideoTransport {
   private clearWatchReparentTimer(st: WatchState) {
     if (st.reparentTimer !== null) clearTimeout(st.reparentTimer);
     st.reparentTimer = null;
+  }
+
+  private clearParentOfferTimer(st: WatchState) {
+    if (st.parentOfferTimer !== null) clearTimeout(st.parentOfferTimer);
+    st.parentOfferTimer = null;
+  }
+
+  private armParentOfferTimer(
+    streamId: string,
+    st: WatchState,
+    delayMs = BROWSER_PARENT_OFFER_TIMEOUT_MS,
+  ) {
+    this.clearParentOfferTimer(st);
+    const parentId = st.parentId;
+    const parentGeneration = st.parentGeneration;
+    if (!parentId) return;
+    const timer = window.setTimeout(() => {
+      if (st.parentOfferTimer !== timer) return;
+      st.parentOfferTimer = null;
+      if (st.closed || this.watches.get(streamId) !== st || st.parentId !== parentId
+        || st.parentGeneration !== parentGeneration || st.pc) return;
+      const attempt = this.webReconnectAttempts.get(streamId) || 0;
+      this.webReconnectAttempts.set(streamId, attempt + 1);
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_negotiation', outcome: 'stalled', code: 'track_missing',
+        trackState: 'missing', reconnectCount: attempt + 1,
+      });
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_recovery', outcome: 'started', code: 'track_missing',
+        trackState: 'missing', reconnectCount: attempt + 1,
+      });
+      if (this.videoTracks.has(streamId)) this.armVideoFailsafe(streamId);
+      this.requestReparent(streamId, null, 'track-missing', parentId);
+    }, delayMs);
+    st.parentOfferTimer = timer;
+  }
+
+  private clearParentMediaTimer(st: WatchState) {
+    if (st.parentMediaTimer !== null) clearTimeout(st.parentMediaTimer);
+    st.parentMediaTimer = null;
+  }
+
+  private armParentMediaTimer(
+    streamId: string,
+    st: WatchState,
+    parentId: string,
+    parentGeneration: number,
+    offerGeneration: number,
+    pc: RTCPeerConnection,
+  ) {
+    this.clearParentMediaTimer(st);
+    const timer = window.setTimeout(() => {
+      if (st.parentMediaTimer !== timer) return;
+      st.parentMediaTimer = null;
+      if (st.closed || this.watches.get(streamId) !== st || st.pc !== pc
+        || st.parentId !== parentId || st.parentGeneration !== parentGeneration
+        || st.offerGeneration !== offerGeneration) return;
+      const attempt = this.webReconnectAttempts.get(streamId) || 0;
+      this.webReconnectAttempts.set(streamId, attempt + 1);
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_playback', outcome: 'stalled', code: 'decode_timeout',
+        connectionState: diagnosticConnectionState(pc.connectionState),
+        iceState: diagnosticIceState(pc.iceConnectionState), trackState: 'missing',
+        reconnectCount: attempt + 1,
+      });
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_recovery', outcome: 'started', code: 'decode_timeout',
+        connectionState: diagnosticConnectionState(pc.connectionState),
+        iceState: diagnosticIceState(pc.iceConnectionState), trackState: 'missing',
+        reconnectCount: attempt + 1,
+      });
+      if (this.videoTracks.has(streamId)) this.armVideoFailsafe(streamId);
+      this.requestReparent(streamId, null, 'track-missing', parentId);
+    }, BROWSER_PARENT_MEDIA_TIMEOUT_MS);
+    st.parentMediaTimer = timer;
   }
 
   private scheduleDiscoveryReconnect(delay = 3000) {
@@ -404,6 +503,7 @@ export class TreeVideoTransport implements VideoTransport {
     this.intended.clear();
     this.liveStreams.clear();
     this.videoTracks.clear();
+    this.playbackCandidates.clear();
     this.containers.clear();
     this.videoFailsafe.forEach((t) => clearTimeout(t));
     this.videoFailsafe.clear();
@@ -565,17 +665,19 @@ export class TreeVideoTransport implements VideoTransport {
       // A cancelled attempt (or its replacement) owns a different recorder. A late auth rejection
       // from this abandoned generation must not contaminate the new timeline for the same stream.
       if (!ownsStart()) return;
+      const code: StreamWatchTransportDiagnosticCode = isTerminalSessionError(error)
+        ? 'signaling_unauthorized'
+        : (typeof navigator !== 'undefined' && navigator.onLine === false ? 'offline' : 'auth');
       this.emitWatchDiagnostic(streamId, {
         stage: 'watch_auth', outcome: 'failed',
-        code: isTerminalSessionError(error) ? 'signaling_unauthorized'
-          : (typeof navigator !== 'undefined' && navigator.onLine === false ? 'offline' : 'auth'),
+        code,
       });
       if (isTerminalSessionError(error)) {
         // A terminal refresh owns the same cleanup as an explicit cancellation: no orphan intent
         // or diagnostic timer may survive after the account session is gone.
         if (this.browserWatchStarts.get(streamId) === owner) this.unwatch(streamId);
       } else {
-        this.scheduleBrowserWatchStartRetry(streamId, quality, pinned, owner);
+        this.scheduleBrowserWatchStartRetry(streamId, quality, pinned, owner, code);
       }
       return;
     }
@@ -585,17 +687,19 @@ export class TreeVideoTransport implements VideoTransport {
     let ws: WebSocket;
     try { ws = new WebSocket(wsUrl); }
     catch {
+      const code: StreamWatchTransportDiagnosticCode = typeof navigator !== 'undefined'
+        && navigator.onLine === false ? 'offline' : 'network';
       this.emitWatchDiagnostic(streamId, {
         stage: 'watch_signaling', outcome: 'failed',
-        code: typeof navigator !== 'undefined' && navigator.onLine === false ? 'offline' : 'network',
+        code,
       });
-      this.scheduleBrowserWatchStartRetry(streamId, quality, pinned, owner);
+      this.scheduleBrowserWatchStartRetry(streamId, quality, pinned, owner, code);
       return;
     }
     const st: WatchState = {
       ws, pc: null, parentId: null, closed: false, iceServers: this.iceServers, pendingIce: [],
       maxChildren: 0, joined: false, quality, pinned, parentGeneration: 0, offerGeneration: 0,
-      joinFallbackTimer: null, reparentTimer: null,
+      joinFallbackTimer: null, parentOfferTimer: null, parentMediaTimer: null, reparentTimer: null,
     };
     if (this.browserWatchStarts.get(streamId) !== owner) { try { ws.close(); } catch { /**/ } return; }
     this.browserWatchStarts.delete(streamId);
@@ -618,10 +722,11 @@ export class TreeVideoTransport implements VideoTransport {
     ws.onclose = (ev) => {
       if (st.closed) return;
       if (ev.code === 4001) markTreeAccessRejected(wsUrl);
+      const code: StreamWatchTransportDiagnosticCode = ev.code === 4001 ? 'signaling_unauthorized'
+        : ev.code === 4003 ? 'signaling_forbidden' : 'signaling_closed';
       this.emitWatchDiagnostic(streamId, {
         stage: 'watch_signaling', outcome: 'failed',
-        code: ev.code === 4001 ? 'signaling_unauthorized'
-          : ev.code === 4003 ? 'signaling_forbidden' : 'signaling_closed',
+        code,
         connectionState: 'closed', reconnectCount: this.webReconnectAttempts.get(streamId) || 0,
       });
       // Стрим ещё жив → бесшовный реконнект: плитку держим (keepVideo), взводим failsafe.
@@ -636,7 +741,7 @@ export class TreeVideoTransport implements VideoTransport {
         const attempt = this.webReconnectAttempts.get(streamId) || 0;
         this.webReconnectAttempts.set(streamId, attempt + 1);
         this.emitWatchDiagnostic(streamId, {
-          stage: 'watch_recovery', outcome: 'started', code: 'none', reconnectCount: attempt + 1,
+          stage: 'watch_recovery', outcome: 'started', code, reconnectCount: attempt + 1,
           connectionState: 'closed',
         });
         const delay = Math.min(30_000, 1500 * 2 ** Math.min(attempt, 5));
@@ -658,12 +763,18 @@ export class TreeVideoTransport implements VideoTransport {
     };
   }
 
-  private scheduleBrowserWatchStartRetry(streamId: string, quality: string, pinned: boolean, owner: symbol) {
+  private scheduleBrowserWatchStartRetry(
+    streamId: string,
+    quality: string,
+    pinned: boolean,
+    owner: symbol,
+    code: StreamWatchTransportDiagnosticCode,
+  ) {
     if (this.closed || !this.intended.has(streamId) || this.browserWatchStarts.get(streamId) !== owner) return;
     const attempt = this.webReconnectAttempts.get(streamId) || 0;
     this.webReconnectAttempts.set(streamId, attempt + 1);
     this.emitWatchDiagnostic(streamId, {
-      stage: 'watch_recovery', outcome: 'started', code: 'none', reconnectCount: attempt + 1,
+      stage: 'watch_recovery', outcome: 'started', code, reconnectCount: attempt + 1,
     });
     const delay = Math.min(30_000, 1500 * 2 ** Math.min(attempt, 5));
     this.scheduleWatchRetry(streamId, delay, () => {
@@ -741,17 +852,34 @@ export class TreeVideoTransport implements VideoTransport {
     try { st.ws.close(); } catch { /**/ }
     if (st.pc) { try { st.pc.close(); } catch { /**/ } }
     this.watches.delete(streamId);
+    this.playbackCandidates.delete(streamId);
     this.treeInfoByStream.delete(streamId);
     this.topologyByStream.delete(streamId); // как в nativeUnwatch: устаревшая топология правит jitter-буфер
     this.lastJb.delete(streamId);
     this.clearDropState(streamId);
     if (!keep) this.dropVideo(streamId);
   }
+  confirmPlayback(streamId: string, candidate?: MediaStreamTrack) {
+    // ontrack alone is not success: a dead/audio-only track can arrive without a single decoded
+    // frame. A replacement MediaStream can also retain the previous frame while its new remote
+    // track is muted; reject that stale DOM confirmation until current-parent RTP is flowing.
+    const currentVideo = this.playbackCandidates.get(streamId);
+    if (!currentVideo || candidate !== currentVideo || currentVideo.readyState !== 'live'
+      || currentVideo.muted
+      || !this.containers.get(streamId)?.getVideoTracks().includes(currentVideo)) return false;
+    this.reWatchAttempts.delete(streamId);
+    this.webReconnectAttempts.delete(streamId);
+    const browserWatch = this.watches.get(streamId);
+    if (browserWatch) this.clearParentMediaTimer(browserWatch);
+    this.clearVideoFailsafe(streamId);
+    return true;
+  }
   private teardownWatch(streamId: string, st: WatchState, keepVideo = false) {
     st.closed = true;
     this.clearWatchStateTimers(st);
     if (st.pc) { try { st.pc.close(); } catch { /**/ } st.pc = null; }
     this.watches.delete(streamId);
+    this.playbackCandidates.delete(streamId);
     this.treeInfoByStream.delete(streamId);
     if (!keepVideo) this.topologyByStream.delete(streamId);
     this.lastJb.delete(streamId);
@@ -765,6 +893,7 @@ export class TreeVideoTransport implements VideoTransport {
     this.webReconnectAttempts.delete(streamId);
     this.statsRecoveryBackoff.delete(streamId);
     this.clearVideoFailsafe(streamId);
+    this.playbackCandidates.delete(streamId);
     this.containers.delete(streamId);
     this.delVideo(streamId);
   }
@@ -893,6 +1022,17 @@ export class TreeVideoTransport implements VideoTransport {
     const quality = current?.quality ?? 'source';
     const pinned = current?.pinned ?? false;
     console.warn(`[tree] self-heal: RTC stats ${reason} — re-watch ${streamId}`);
+    const reconnectCount = (this.nativeWatches.has(streamId)
+      ? this.reWatchAttempts.get(streamId) : this.webReconnectAttempts.get(streamId)) || 0;
+    const nextReconnectCount = reconnectCount + 1;
+    const code: StreamWatchTransportDiagnosticCode = reason === 'timeout' ? 'timeout' : 'sdk';
+    if (this.nativeWatches.has(streamId)) this.reWatchAttempts.set(streamId, nextReconnectCount);
+    else this.webReconnectAttempts.set(streamId, nextReconnectCount);
+    this.emitWatchDiagnostic(streamId, {
+      stage: 'watch_recovery', outcome: 'started', code, reconnectCount: nextReconnectCount,
+      connectionState: diagnosticConnectionState(pc.connectionState),
+      iceState: diagnosticIceState(pc.iceConnectionState), trackState: 'unknown',
+    });
     this.unwatch(streamId, { keepVideo: true });
     this.watch(streamId, quality, pinned);
     this.armVideoFailsafe(streamId);
@@ -947,6 +1087,24 @@ export class TreeVideoTransport implements VideoTransport {
         const cur = this.watches.get(streamId) || this.nativeWatches.get(streamId);
         const q = cur?.quality ?? 'source'; const p = cur?.pinned ?? false;
         console.warn(`[tree] self-heal: framesDecoded замер — re-watch ${streamId}`);
+        const native = this.nativeWatches.has(streamId);
+        const reconnectCount = (native
+          ? this.reWatchAttempts.get(streamId) : this.webReconnectAttempts.get(streamId)) || 0;
+        const nextReconnectCount = reconnectCount + 1;
+        if (native) this.reWatchAttempts.set(streamId, nextReconnectCount);
+        else this.webReconnectAttempts.set(streamId, nextReconnectCount);
+        this.emitWatchDiagnostic(streamId, {
+          stage: 'watch_playback', outcome: 'stalled', code: 'decode_timeout',
+          connectionState: diagnosticConnectionState(pc.connectionState),
+          iceState: diagnosticIceState(pc.iceConnectionState), trackState: 'missing',
+          reconnectCount: nextReconnectCount,
+        });
+        this.emitWatchDiagnostic(streamId, {
+          stage: 'watch_recovery', outcome: 'started', code: 'decode_timeout',
+          connectionState: diagnosticConnectionState(pc.connectionState),
+          iceState: diagnosticIceState(pc.iceConnectionState), trackState: 'missing',
+          reconnectCount: nextReconnectCount,
+        });
         this.unwatch(streamId, { keepVideo: true });
         this.watch(streamId, q, p);
         this.armVideoFailsafe(streamId);
@@ -988,6 +1146,11 @@ export class TreeVideoTransport implements VideoTransport {
         // страхует, если новый родитель не подаёт трек. Раньше delVideo здесь ронял окно на
         // каждый reparent (чёрный пропад, вылет из фуллскрина).
         this.clearWatchReparentTimer(st);
+        this.clearParentOfferTimer(st);
+        this.clearParentMediaTimer(st);
+        // Keep the old frame visible during the handoff, but revoke its authority immediately:
+        // a late pageshow/playing event from that track must not confirm the new parent generation.
+        this.playbackCandidates.delete(streamId);
         st.parentGeneration += 1;
         st.offerGeneration += 1;
         if (st.pc) { try { st.pc.close(); } catch { /**/ } st.pc = null; this.armVideoFailsafe(streamId); }
@@ -997,6 +1160,7 @@ export class TreeVideoTransport implements VideoTransport {
           stage: 'watch_parent', outcome: st.parentId ? 'ok' : 'stalled',
           code: st.parentId ? 'none' : 'no_parent',
         });
+        this.armParentOfferTimer(streamId, st);
         break;
       }
       case 'assign-child': {
@@ -1009,6 +1173,7 @@ export class TreeVideoTransport implements VideoTransport {
       case 'sdp': {
         // Единственный upstream — от родителя (мы всегда лист, детей не обслуживаем).
         if (msg.from === st.parentId && msg.type === 'offer') {
+          this.clearParentOfferTimer(st);
           this.emitWatchDiagnostic(streamId, { stage: 'watch_negotiation', outcome: 'started', code: 'none' });
           void this.onParentOffer(streamId, st, msg.sdp);
         }
@@ -1101,6 +1266,13 @@ export class TreeVideoTransport implements VideoTransport {
     // Бесшовно: сносим watch, но контейнер/handle держим — <video> продолжает показывать
     // последний кадр, пока новый трек не приедет в тот же srcObject. Failsafe снимет плитку,
     // если трек так и не пришёл (рендишн не поднялся / оборвался).
+    const reconnectCount = Math.max(
+      this.webReconnectAttempts.get(streamId) || 0,
+      this.reWatchAttempts.get(streamId) || 0,
+    ) + 1;
+    this.emitWatchDiagnostic(streamId, {
+      stage: 'watch_recovery', outcome: 'started', code: 'none', reconnectCount,
+    });
     this.unwatch(streamId, { keepVideo: true });
     this.watch(streamId, quality, pinned);
     this.armVideoFailsafe(streamId);
@@ -1120,22 +1292,74 @@ export class TreeVideoTransport implements VideoTransport {
     if (!parentId) return;
     const parentGeneration = st.parentGeneration;
     const offerGeneration = ++st.offerGeneration;
+    this.clearParentOfferTimer(st);
     this.clearWatchReparentTimer(st);
+    // A same-parent re-offer is a new exact PC owner too. Never let its predecessor clear the
+    // replacement decoded-frame watchdog while the stable MediaStream retains the last frame.
+    this.playbackCandidates.delete(streamId);
     if (st.pc) { try { st.pc.close(); } catch { /**/ } }
+    st.pc = null;
     let pc: RTCPeerConnection;
     try {
       pc = new RTCPeerConnection({ iceServers: st.iceServers.length ? st.iceServers : DEFAULT_ICE_SERVERS });
     } catch {
+      const attempt = this.webReconnectAttempts.get(streamId) || 0;
+      this.webReconnectAttempts.set(streamId, attempt + 1);
       this.emitWatchDiagnostic(streamId, {
         stage: 'watch_negotiation', outcome: 'failed', code: 'negotiation_failed',
         connectionState: 'unknown', iceState: 'unknown',
       });
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_recovery', outcome: 'started', code: 'negotiation_failed',
+        connectionState: 'unknown', iceState: 'unknown', trackState: 'missing',
+        reconnectCount: attempt + 1,
+      });
+      if (this.videoTracks.has(streamId)) this.armVideoFailsafe(streamId);
+      // Construction can fail transiently on WebKit after sleep/radio changes. The server has
+      // already observed this parent's SDP offer, so its stricter no-media evidence gate applies:
+      // wait that full deadline before asking for a fresh exact-parent PC.
+      this.armParentOfferTimer(streamId, st, BROWSER_PARENT_MEDIA_TIMEOUT_MS);
       return;
     }
     st.pc = pc;
     const ownsOffer = () => !st.closed && this.watches.get(streamId) === st && st.pc === pc
       && st.parentId === parentId && st.parentGeneration === parentGeneration
       && st.offerGeneration === offerGeneration;
+    let recoveryRequested = false;
+    const requestParentRecovery = (code: 'ice_failed' | 'negotiation_failed' | 'disconnected') => {
+      if (recoveryRequested || !ownsOffer()) return;
+      recoveryRequested = true;
+      const attempt = this.webReconnectAttempts.get(streamId) || 0;
+      this.webReconnectAttempts.set(streamId, attempt + 1);
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_recovery', outcome: 'started', code, reconnectCount: attempt + 1,
+        connectionState: diagnosticConnectionState(pc.connectionState),
+        iceState: diagnosticIceState(pc.iceConnectionState), trackState: 'missing',
+      });
+      this.armVideoFailsafe(streamId);
+      this.requestReparent(streamId, null);
+      // If the server rejects this ordinary request during its fresh-parent cooldown, retain one
+      // exact media backstop. A still-running initial deadline is intentionally not extended.
+      if (st.parentMediaTimer === null) {
+        this.armParentMediaTimer(streamId, st, parentId, parentGeneration, offerGeneration, pc);
+      }
+    };
+    const scheduleDisconnectedRecovery = () => {
+      if (recoveryRequested || st.reparentTimer !== null || !ownsOffer()) return;
+      const timer = window.setTimeout(() => {
+        if (st.reparentTimer !== timer) return;
+        st.reparentTimer = null;
+        if (!ownsOffer()) return;
+        const peerFailed = pc.connectionState === 'failed' || pc.iceConnectionState === 'failed';
+        const peerDisconnected = pc.connectionState === 'disconnected'
+          || pc.iceConnectionState === 'disconnected';
+        if (peerFailed || peerDisconnected) {
+          requestParentRecovery(peerFailed ? 'ice_failed' : 'disconnected');
+        }
+      }, 5000);
+      st.reparentTimer = timer;
+    };
+    this.armParentMediaTimer(streamId, st, parentId, parentGeneration, offerGeneration, pc);
     pc.onicecandidate = (e) => {
       if (!e.candidate || !ownsOffer()) return;
       try { st.ws.send(JSON.stringify({ t: 'ice', streamId, to: parentId, candidate: e.candidate })); }
@@ -1165,21 +1389,16 @@ export class TreeVideoTransport implements VideoTransport {
       });
       if (pc.connectionState === 'failed') {
         this.clearWatchReparentTimer(st);
-        this.requestReparent(streamId, null);
+        requestParentRecovery('ice_failed');
       }
       else if (pc.connectionState === 'disconnected') {
         // `disconnected` may flap repeatedly before the server assigns a replacement parent. Keep
         // one exact-PC deadline; a recovered/retired peer cancels it instead of leaving a batch of
         // stale callbacks which can all request reparent after the next radio outage.
-        if (st.reparentTimer !== null) return;
-        const timer = window.setTimeout(() => {
-          if (st.reparentTimer !== timer) return;
-          st.reparentTimer = null;
-          if (ownsOffer() && (pc.connectionState === 'disconnected' || pc.connectionState === 'failed'))
-            this.requestReparent(streamId, null);
-        }, 5000);
-        st.reparentTimer = timer;
-      } else this.clearWatchReparentTimer(st);
+        scheduleDisconnectedRecovery();
+      } else if (pc.iceConnectionState !== 'disconnected' && pc.iceConnectionState !== 'failed') {
+        this.clearWatchReparentTimer(st);
+      }
     };
     pc.oniceconnectionstatechange = () => {
       if (!ownsOffer()) return;
@@ -1194,34 +1413,60 @@ export class TreeVideoTransport implements VideoTransport {
           : pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'closed' ? 'disconnected' : 'none',
         connectionState: diagnosticConnectionState(pc.connectionState), iceState,
       });
+      if (pc.iceConnectionState === 'failed') {
+        this.clearWatchReparentTimer(st);
+        requestParentRecovery('ice_failed');
+      } else if (pc.iceConnectionState === 'disconnected') {
+        scheduleDisconnectedRecovery();
+      } else if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        // Aggregate connectionState can lag the ICE callback. Keep its deadline only while it still
+        // independently reports a broken path; otherwise the healthy ICE edge cancels it.
+        if (pc.connectionState !== 'disconnected' && pc.connectionState !== 'failed') {
+          this.clearWatchReparentTimer(st);
+        }
+      }
     };
     pc.ontrack = (e) => {
       if (!ownsOffer()) return;
       const reconnectCount = this.webReconnectAttempts.get(streamId) || 0;
-      this.webReconnectAttempts.delete(streamId);
-      this.applyJitter(streamId);
-      // Оба kind в контейнер: аудио стрима едет тем же <video> (см. upsertTrack).
-      this.upsertTrack(streamId, e.track);
       if (e.track.kind === 'video') {
+        // Publish exact confirmation ownership before MediaStream.addTrack: older WebKit without
+        // RVFC can synchronously use the already-unmuted replacement edge from that addtrack event.
+        // Its confirmation must see this owner, never the predecessor or an empty candidate slot.
+        this.playbackCandidates.set(streamId, e.track);
         this.emitWatchDiagnostic(streamId, {
           stage: 'watch_track', outcome: 'ok', code: 'none',
           connectionState: diagnosticConnectionState(pc.connectionState),
           iceState: diagnosticIceState(pc.iceConnectionState),
           trackState: diagnosticTrackState(e.track), reconnectCount,
         });
-        if (reconnectCount > 0) this.emitWatchDiagnostic(streamId, {
-          stage: 'watch_recovery', outcome: 'recovered', code: 'none', reconnectCount,
-          connectionState: diagnosticConnectionState(pc.connectionState),
-          iceState: diagnosticIceState(pc.iceConnectionState), trackState: diagnosticTrackState(e.track),
-        });
+        this.applyJitter(streamId);
+        this.upsertTrack(streamId, e.track);
+        // ontrack is not recovery success: an audio-only/zero-RTP relay can still expose a static
+        // video receiver. Engine closes recovery only after the exact tile confirms a real frame.
         e.track.addEventListener('ended', () => {
           if (!ownsOffer()) return;
+          if (this.playbackCandidates.get(streamId) === e.track) {
+            this.playbackCandidates.delete(streamId);
+          }
           this.emitWatchDiagnostic(streamId, {
             stage: 'watch_track', outcome: 'stalled', code: 'track_missing', trackState: 'ended',
             connectionState: diagnosticConnectionState(pc.connectionState),
             iceState: diagnosticIceState(pc.iceConnectionState),
           });
+          // A successfully decoded stream has already cleared its initial deadline. Re-arm the
+          // exact-PC media watchdog so an ended video track cannot leave a connected WS/ICE pair
+          // displaying the retained frame forever. A still-pending first frame keeps its earlier
+          // deadline rather than extending itself on the same failure.
+          if (st.parentMediaTimer === null) {
+            this.armParentMediaTimer(streamId, st, parentId, parentGeneration, offerGeneration, pc);
+          }
+          this.armVideoFailsafe(streamId);
         }, { once: true });
+      } else {
+        // Audio shares the same combined container but cannot confirm video playback.
+        this.applyJitter(streamId);
+        this.upsertTrack(streamId, e.track);
       }
     };
     try {
@@ -1257,6 +1502,7 @@ export class TreeVideoTransport implements VideoTransport {
         connectionState: diagnosticConnectionState(pc.connectionState),
         iceState: diagnosticIceState(pc.iceConnectionState),
       });
+      requestParentRecovery('negotiation_failed');
     }
   }
 
@@ -1314,7 +1560,7 @@ export class TreeVideoTransport implements VideoTransport {
       // залипла (полуоткрытый discovery-сокет), круг «watch → сразу ended → watch» повторялся бы
       // бесконечно с постоянной частотой, каждый раз поднимая нативный watch-слот и сессию заново.
       // Счётчик сбрасывается, как только приезжает трек, то есть успешный просмотр историю обнуляет.
-      this.scheduleNativeWatchRetry(streamId, st.quality, st.pinned);
+      this.scheduleNativeWatchRetry(streamId, st.quality, st.pinned, 'signaling_closed');
     };
     const ownsStream = () => !st.closed && this.nativeWatches.get(streamId) === st;
     const statusCb = (status: Parameters<Parameters<typeof onNativeWatchStatus>[0]>[0]) => {
@@ -1362,7 +1608,7 @@ export class TreeVideoTransport implements VideoTransport {
       this.nativeUnwatch(streamId, st, live);
       if (live) {
         this.armVideoFailsafe(streamId, 15_000);
-        this.scheduleNativeWatchRetry(streamId, st.quality, st.pinned);
+        this.scheduleNativeWatchRetry(streamId, st.quality, st.pinned, 'listener_failed');
       }
       return;
     }
@@ -1410,10 +1656,11 @@ export class TreeVideoTransport implements VideoTransport {
         return;
       }
       const terminal = isTerminalSessionError(error) || isTerminalNativeTreeStartError(error);
+      const code: StreamWatchTransportDiagnosticCode = terminal ? 'signaling_unauthorized'
+        : (typeof navigator !== 'undefined' && navigator.onLine === false ? 'offline' : 'native_start_failed');
       this.emitWatchDiagnostic(streamId, {
         stage: terminal ? 'watch_auth' : 'watch_native_start', outcome: 'failed',
-        code: terminal ? 'signaling_unauthorized'
-          : (typeof navigator !== 'undefined' && navigator.onLine === false ? 'offline' : 'native_start_failed'),
+        code,
         reconnectCount: this.reWatchAttempts.get(streamId) || 0,
       });
       const live = !terminal && !this.closed && this.intended.has(streamId)
@@ -1422,16 +1669,32 @@ export class TreeVideoTransport implements VideoTransport {
       this.nativeUnwatch(streamId, st, live);
       if (live) {
         this.armVideoFailsafe(streamId, 15_000);
-        this.scheduleNativeWatchRetry(streamId, st.quality, st.pinned);
+        this.scheduleNativeWatchRetry(streamId, st.quality, st.pinned, code);
       }
     }
   }
 
-  private scheduleNativeWatchRetry(streamId: string, quality: string, pinned: boolean) {
+  private scheduleNativeWatchRetry(
+    streamId: string,
+    quality: string,
+    pinned: boolean,
+    code: StreamWatchTransportDiagnosticCode,
+  ) {
     const attempt = this.reWatchAttempts.get(streamId) || 0;
+    if (attempt >= NATIVE_WATCH_RECOVERY_MAX_ATTEMPTS) {
+      this.emitWatchDiagnostic(streamId, {
+        stage: 'watch_recovery', outcome: 'timed_out', code,
+        reconnectCount: attempt, trackState: 'missing',
+      });
+      this.intended.delete(streamId);
+      this.clearWatchRetry(streamId);
+      this.dropVideo(streamId);
+      this.switchFailedCbs.forEach((cb) => cb(streamId));
+      return;
+    }
     this.reWatchAttempts.set(streamId, attempt + 1);
     this.emitWatchDiagnostic(streamId, {
-      stage: 'watch_recovery', outcome: 'started', code: 'none', reconnectCount: attempt + 1,
+      stage: 'watch_recovery', outcome: 'started', code, reconnectCount: attempt + 1,
     });
     const delay = Math.min(30_000, 1500 * 2 ** Math.min(attempt, 5));
     this.scheduleWatchRetry(streamId, delay, () => {
@@ -1464,7 +1727,7 @@ export class TreeVideoTransport implements VideoTransport {
     this.nativeUnwatch(streamId, st, live);
     if (live) {
       this.armVideoFailsafe(streamId, 15_000);
-      this.scheduleNativeWatchRetry(streamId, st.quality, st.pinned);
+      this.scheduleNativeWatchRetry(streamId, st.quality, st.pinned, code);
     }
     return true;
   }
@@ -1538,29 +1801,47 @@ export class TreeVideoTransport implements VideoTransport {
     pc.ontrack = (e) => {
       if (!ownsOffer()) return;
       const reconnectCount = this.reWatchAttempts.get(streamId) || 0;
-      this.reWatchAttempts.delete(streamId); // картинка пошла — прошлые неудачные круги не в счёт
-      this.applyJitter(streamId);
-      this.upsertTrack(streamId, e.track);
       if (e.track.kind === 'video') {
+        let endedHandled = false;
+        const recoverEndedTrack = () => {
+          if (endedHandled || !ownsOffer()) return;
+          endedHandled = true;
+          this.emitWatchDiagnostic(streamId, {
+            stage: 'watch_track', outcome: 'stalled', code: 'track_missing', trackState: 'ended',
+            connectionState: diagnosticConnectionState(pc.connectionState),
+            iceState: diagnosticIceState(pc.iceConnectionState),
+          });
+          // A current loopback video track cannot recover in place after `ended`. Retire only
+          // this exact JS/Rust generation; an old track naturally ending during a re-offer is
+          // rejected by ownsOffer() above and cannot tear down its replacement peer.
+          const live = !this.closed && this.intended.has(streamId) && this.liveStreams.has(streamId);
+          this.nativeUnwatch(streamId, st, live);
+          if (live) {
+            this.armVideoFailsafe(streamId, 15_000);
+            this.scheduleNativeWatchRetry(streamId, st.quality, st.pinned, 'track_missing');
+          }
+        };
+        // Register before observing readyState so a track which ended before or during ontrack
+        // cannot slip between the state check and listener installation.
+        e.track.addEventListener('ended', recoverEndedTrack, { once: true });
+        if (e.track.readyState === 'ended') {
+          recoverEndedTrack();
+          return;
+        }
+        // As above, an exact candidate owns confirmation before synchronous MediaStream addtrack.
+        this.playbackCandidates.set(streamId, e.track);
         this.emitWatchDiagnostic(streamId, {
           stage: 'watch_track', outcome: 'ok', code: 'none',
           connectionState: diagnosticConnectionState(pc.connectionState),
           iceState: diagnosticIceState(pc.iceConnectionState),
           trackState: diagnosticTrackState(e.track), reconnectCount,
         });
-        if (reconnectCount > 0) this.emitWatchDiagnostic(streamId, {
-          stage: 'watch_recovery', outcome: 'recovered', code: 'none', reconnectCount,
-          connectionState: diagnosticConnectionState(pc.connectionState),
-          iceState: diagnosticIceState(pc.iceConnectionState), trackState: diagnosticTrackState(e.track),
-        });
-        e.track.addEventListener('ended', () => {
-          if (!ownsOffer()) return;
-          this.emitWatchDiagnostic(streamId, {
-            stage: 'watch_track', outcome: 'stalled', code: 'track_missing', trackState: 'ended',
-            connectionState: diagnosticConnectionState(pc.connectionState),
-            iceState: diagnosticIceState(pc.iceConnectionState),
-          });
-        }, { once: true });
+        this.applyJitter(streamId);
+        this.upsertTrack(streamId, e.track);
+        // The matching decoded-frame confirmation is the only recovery-success boundary.
+      } else {
+        this.applyJitter(streamId);
+        this.upsertTrack(streamId, e.track);
       }
     };
     try {
@@ -1611,6 +1892,7 @@ export class TreeVideoTransport implements VideoTransport {
     }
     if (!ownsStream) return;
     this.nativeWatches.delete(streamId);
+    this.playbackCandidates.delete(streamId);
     this.treeInfoByStream.delete(streamId);
     this.lastJb.delete(streamId);
     this.topologyByStream.delete(streamId);
@@ -1645,13 +1927,20 @@ export class TreeVideoTransport implements VideoTransport {
     if (!topo || !topo.you) return null;
     return topo.nodes.find((n) => n.id === topo.you)?.parentId ?? null;
   }
-  requestReparent(streamId: string, targetId: string | null, reason?: string) {
+  requestReparent(streamId: string, targetId: string | null, reason?: string, failedParentId?: string) {
     // Натив: reason в IPC не пробрасывается (нативную отбраковку по дропам делает сервер —
     // frameDropReparent); тут только ручной/ICE-fail reparent через Rust.
     const native = this.nativeWatches.get(streamId);
     if (native) { nativeWatchReparent(streamId, native.generation, targetId).catch(() => {}); return; }
     const st = this.watches.get(streamId);
-    if (st) { try { st.ws.send(JSON.stringify({ t: 'request-reparent', streamId, targetParentId: targetId, reason })); } catch { /**/ } }
+    if (st) {
+      try {
+        st.ws.send(JSON.stringify({
+          t: 'request-reparent', streamId, targetParentId: targetId, reason,
+          ...(failedParentId ? { failedParentId } : {}),
+        }));
+      } catch { /**/ }
+    }
   }
   onTopology(cb: (streamId: string) => void) { this.topologyCbs.add(cb); return () => { this.topologyCbs.delete(cb); }; }
   onReparentDenied(cb: (streamId: string, reason: string) => void) { this.reparentDeniedCbs.add(cb); return () => { this.reparentDeniedCbs.delete(cb); }; }
@@ -1680,7 +1969,6 @@ export class TreeVideoTransport implements VideoTransport {
     for (const old of c.getTracks()) if (old.kind === track.kind && old !== track) c.removeTrack(old);
     if (!c.getTracks().includes(track)) c.addTrack(track);
     if (track.kind === 'video') {
-      this.clearVideoFailsafe(streamId);
       // Audio can arrive first on mobile WebRTC. A watch is complete only when
       // an actual video track exists; otherwise the engine would stop its
       // deadline and render a permanently audio-only black tile.
@@ -1689,7 +1977,7 @@ export class TreeVideoTransport implements VideoTransport {
   }
   /** Взвести failsafe бесшовного переключения: трек не пришёл за ms → снос плитки + тост
    *  (иначе вечный замороженный кадр). Перевзводится на каждый вызов; снимает upsertTrack. */
-  private armVideoFailsafe(streamId: string, ms = 10_000) {
+  private armVideoFailsafe(streamId: string, ms = SEAMLESS_SWITCH_FAILSAFE_MS) {
     this.clearVideoFailsafe(streamId);
     this.videoFailsafe.set(streamId, window.setTimeout(() => {
       this.videoFailsafe.delete(streamId);

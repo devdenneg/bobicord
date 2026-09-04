@@ -17,6 +17,20 @@ const NATIVE_CAPACITY = 4;    // дефолт для нативного relay-у
 const BROWSER_CAPACITY = 0;   // дефолт для браузера: лист (пока treeVideo не пришлёт maxChildren>0)
 const MAX_CHILDREN_CAP = 10;  // жёсткий потолок на объявленную ёмкость (защита от абьюза; = максимум слайдера в UI)
 const REPARENT_COOLDOWN_MS = 10_000; // гистерезис авто-миграции — не мигрировать чаще
+// Relay-core и browser decoded-frame watchdog просят этот recovery после 12с без первого video
+// RTP/кадра. Отдельный лимит позволяет обойти более длинный DRAIN_COOLDOWN свежего vrelay-child,
+// но не превращает повторные track-missing сообщения в цикл пересоздания PC.
+const TRACK_MISSING_REPARENT_COOLDOWN_MS = 8_000;
+// Глобальный circuit нельзя открывать по клиентскому утверждению: селективный viewer-сбой не
+// доказывает, что server-first ingest пуст для всех. Достаточное доказательство — только две
+// bounded попытки самого trusted vrelay (его virtual-флаг разрешён только service JWT).
+const TRACK_MISSING_EVIDENCE_MAX = 2;
+const TRACK_MISSING_PARENT_WINDOW_MS = 60_000;
+// Browser/PWA has no trusted native watchdog, so its public reason is accepted only when the
+// exact assignment has aged enough. No-offer is provable by the server after 8s; once an offer
+// arrived, the decoded-frame watchdog gets the same bounded recovery only after its 12s deadline.
+const TRACK_MISSING_NO_OFFER_MS = 8_000;
+const TRACK_MISSING_NO_MEDIA_MS = 12_000;
 // Карантин отбракованного родителя (frameDropReparent). Cooldown узла тут НЕ спасает: он
 // запрещает двигать узел часто, но не мешает через 10с вернуть его ТУДА ЖЕ — а корень со
 // свободными слотами всегда «лучший» по scoreParent (глубина 0). Отсюда орбита
@@ -68,6 +82,7 @@ const DRAIN_COOLDOWN_MS = 15_000;  // гистерезис: свежепосаж
 const VRELAY_ACTIVATE_TIMEOUT_MS = 15_000; // активация «в полёте»: не слать повторный activate, пока не истёк
 const VRELAY_UID = 'virtual-relay'; // JWT-uid агента: флагу virtual в join верим только при нём
 const VRELAY_TARGET = 'vrelay';    // сентинел targetParentId в request-reparent = «хочу через сервер»
+const STREAM_FALLBACK_CAPACITY_CLOSE_CODE = 4013;
 
 function rejectPeer(ws, code, reason) {
   try {
@@ -435,6 +450,10 @@ class TreeManager {
   // превысить MAX_DEPTH ниже по ветке.
   pickParent(t, forNode, excludeParentId = null) {
     if (!t.broadcasterId || !t.nodes.get(t.broadcasterId)) return null;
+    // During atomic circuit teardown a duplicate virtual socket can still be a child of the
+    // reported vrelay. It must become an orphan for the few synchronous removal steps, never
+    // consume the freshly freed broadcaster slot before it is removed too.
+    if (forNode.virtual && t.vrelayMediaCircuitOpen) return null;
     const banned = this.descendants(t, forNode.id);
     banned.add(forNode.id);
     if (excludeParentId) banned.add(excludeParentId);
@@ -458,6 +477,10 @@ class TreeManager {
       let best = null, bestScore = Infinity;
       for (const cand of t.nodes.values()) {
         if (banned.has(cand.id)) continue;
+        // Терминальный track-missing circuit относится ко всему server-first медиапути этой
+        // трансляции. В отличие от per-viewer badParents его нельзя смягчать для сироты: новый
+        // зритель иначе снова сядет на уже доказанно пустой vrelay.
+        if (cand.virtual && t.vrelayMediaCircuitOpen) continue;
         if (honorQuarantine && quarantined(cand.id)) continue;
         if (cand.children.length >= this.capacityOf(cand)) continue;
         if (cand.depth + 1 + height > MAX_DEPTH) continue;
@@ -515,7 +538,7 @@ class TreeManager {
   // Миграция узла к новому родителю. targetId задан — ручной выбор зрителя (жёсткая
   // валидация); null — авто (best-peer, с гистерезисом-cooldown). Возвращает
   // {ok, oldParentId, newParentId} либо {ok:false, reason}.
-  reparent(streamId, nodeId, targetId, now) {
+  reparent(streamId, nodeId, targetId, now, { bypassCooldown = false } = {}) {
     const t = this.trees.get(streamId);
     if (!t) return { ok: false, reason: 'no-tree' };
     const node = t.nodes.get(nodeId);
@@ -534,10 +557,14 @@ class TreeManager {
       const height = this.subtreeHeight(t, nodeId);
       if (target.depth + 1 + height > MAX_DEPTH) return { ok: false, reason: 'too-deep' };
     } else {
-      if (node.reparentCooldownUntil && now < node.reparentCooldownUntil) return { ok: false, reason: 'cooldown' };
+      if (!bypassCooldown && node.reparentCooldownUntil && now < node.reparentCooldownUntil) {
+        return { ok: false, reason: 'cooldown' };
+      }
       target = this.pickParent(t, node, node.parent);
       if (!target) return { ok: false, reason: 'no-candidate' };
-      node.reparentCooldownUntil = now + REPARENT_COOLDOWN_MS;
+      // A track-missing recovery may run inside DRAIN_COOLDOWN, so never shorten that existing
+      // protection for the ordinary drain/manual/frame-drop paths while moving the node now.
+      node.reparentCooldownUntil = Math.max(node.reparentCooldownUntil || 0, now + REPARENT_COOLDOWN_MS);
     }
 
     const oldParentId = node.parent;
@@ -777,6 +804,14 @@ function attachTreeServer(httpServer, opts) {
 
   function send(peerId, obj) {
     const p = peers.get(peerId);
+    // Server-side evidence for the web/PWA no-offer watchdog. Every assign-parent starts a fresh
+    // exact-parent generation; only an SDP offer from that parent can satisfy it (see onSignal).
+    // Keeping this in the single send path covers join, reparent, orphan placement and leave.
+    if (p && obj && obj.t === 'assign-parent') {
+      p.parentOfferExpectedFrom = obj.parentId ? String(obj.parentId) : null;
+      p.parentAssignedAt = obj.parentId ? Date.now() : 0;
+      p.parentOfferAt = 0;
+    }
     if (p && p.ws.readyState === p.ws.OPEN) { try { p.ws.send(JSON.stringify(obj)); } catch { /**/ } }
   }
 
@@ -808,6 +843,13 @@ function attachTreeServer(httpServer, opts) {
     if (parseTreeKey(key).rendition !== DEFAULT_RENDITION) return false;
     const t = mgr.trees.get(key);
     if (!t || !t.broadcasterId) return false;
+    // Circuit breaker живёт ровно столько же, сколько уникальное дерево вещания. Новый
+    // streamId создаст новый Tree и снова штатно включит server-first; текущий не запускает
+    // циклы release -> ingest -> release после доказанного отсутствия видеотрафика.
+    if (t.serverFirst && t.vrelayMediaCircuitOpen) {
+      tlog(`[${key}] vrelay-ingest подавлен: медиапуть помещён в карантин до конца трансляции`);
+      return false;
+    }
     if (findVirtual(t)) return true;
     const now = Date.now();
     if (t.vrelayActivateAt && now - t.vrelayActivateAt < VRELAY_ACTIVATE_TIMEOUT_MS) return true;
@@ -839,6 +881,7 @@ function attachTreeServer(httpServer, opts) {
   function ensureVirtualAttached(key) {
     const t = mgr.trees.get(key);
     if (!t || !t.broadcasterId) return;
+    if (t.serverFirst && t.vrelayMediaCircuitOpen) return;
     const virt = findVirtual(t);
     if (!virt) return;
     const bc = t.nodes.get(t.broadcasterId);
@@ -899,9 +942,34 @@ function attachTreeServer(httpServer, opts) {
       send(parentId, { t: 'assign-child', streamId: sid, childId: node.id });
     }
     if (placed.length) { broadcastTreeInfo(key); broadcastTopology(key); }
+    const t = mgr.trees.get(key);
+    if (t && t.vrelayMediaCircuitOpen) {
+      // The quarantined vrelay cannot come back for this unique broadcast tree. Any node which an
+      // exhaustive placeOrphans pass still cannot connect to the broadcaster would otherwise stay
+      // registered forever with parent=null (browser/PWA leaves make this easy to hit when the
+      // broadcaster deliberately exposes one direct slot). Respect that upload limit and fail only
+      // the exact unserviceable watch sockets. `stream-end` is understood by old web and native
+      // clients and is not discovery-broadcast, so it neither hides the still-live stream nor drops
+      // viewers which did receive a real P2P path.
+      const broadcaster = t.nodes.get(t.broadcasterId);
+      const stranded = [...t.nodes.values()]
+        .filter((node) => node.id !== t.broadcasterId && !mgr.attachedToRoot(t, node))
+        .sort((left, right) => right.depth - left.depth); // detach descendants before their owners
+      for (const node of stranded) {
+        tlog(`[${key}] terminal fallback refusal ${node.id} (${node.identity}): no P2P capacity after vrelay quarantine`);
+        send(node.id, { t: 'reparent-denied', streamId: sid, reason: 'no-fallback-capacity' });
+        send(node.id, {
+          t: 'stream-end', streamId: sid,
+          identity: broadcaster ? broadcaster.identity : sid,
+          reason: 'no-fallback-capacity',
+        });
+        onLeave(node.id, 'no fallback capacity', { settle: false });
+        rejectPeer(node.ws, STREAM_FALLBACK_CAPACITY_CLOSE_CODE, 'stream fallback capacity unavailable');
+      }
+      return;
+    }
     // Э9: сироты остались (кандидатов нет вовсе) — будим виртуальный fallback-relay.
     // (requestVrelayActivation сам откажет не-source-дереву — рендишн-сироты просто ждут, Д4.)
-    const t = mgr.trees.get(key);
     if (t && t.broadcasterId && !findVirtual(t)) {
       for (const n of t.nodes.values()) {
         if (n.id !== t.broadcasterId && !n.parent) { requestVrelayActivation(key); break; }
@@ -946,6 +1014,7 @@ function attachTreeServer(httpServer, opts) {
   function renditionsOf(baseSid) {
     const srcTree = mgr.trees.get(treeKey(baseSid, DEFAULT_RENDITION));
     if (!srcTree) return [DEFAULT_RENDITION];
+    if (srcTree.vrelayMediaCircuitOpen) return [DEFAULT_RENDITION];
     const agent = findVrelayAgent();
     if (!agent || !(agent.vrelayMaxTranscodes > 0)) return [DEFAULT_RENDITION];
     return availableRungs(srcTree);
@@ -970,6 +1039,7 @@ function attachTreeServer(httpServer, opts) {
   function ensureRendition(baseSid, rendition, preset) {
     const srcTree = mgr.trees.get(treeKey(baseSid, DEFAULT_RENDITION));
     if (!srcTree || !srcTree.broadcasterId) return false;
+    if (srcTree.vrelayMediaCircuitOpen) return false;
     if (rendition === DEFAULT_RENDITION || !RENDITIONS.has(rendition)) return false;
     if (!renditionAvailable(srcTree, rendition)) return false; // без апскейла
     if (!srcTree.renditions) srcTree.renditions = new Map();
@@ -1057,7 +1127,8 @@ function attachTreeServer(httpServer, opts) {
     });
     // badParents тоже сбрасываем: дерево обрушилось, вещатель ушёл — карантин по старым
     // peer-id бессмыслен, а новый корень получит новый id и под запрет не попадёт в любом случае.
-    p.parent = null; p.children = []; p.depth = 0; p.reparentCooldownUntil = 0; p.badParents = null;
+    p.parent = null; p.children = []; p.depth = 0; p.reparentCooldownUntil = 0;
+    p.trackMissingRecoveryUntil = 0; p.badParents = null;
     p.rendition = target; p.treeKey = newKey; p.qualityPinned = !!opts.pinned;
     const { parent } = mgr.join(newKey, p);
     if (parent) {
@@ -1326,6 +1397,21 @@ function attachTreeServer(httpServer, opts) {
       rejectPeer(node.ws, 4003, 'server membership required');
       return;
     }
+    // Once source ingest is quarantined, every derived rendition depends on a media path which
+    // has already been proven empty. Reject stale menu selections and racing ffmpeg roots before
+    // they enter a tree; otherwise an orphan consumer would keep a dead RS_LIVE rung alive.
+    const sourceTree = rendition === DEFAULT_RENDITION
+      ? null
+      : mgr.trees.get(treeKey(streamId, DEFAULT_RENDITION));
+    if (sourceTree && sourceTree.vrelayMediaCircuitOpen) {
+      if (role === 'viewer') {
+        send(id, { t: 'rendition-unavailable', streamId, rendition, reason: 'source-quarantined' });
+      } else {
+        send(id, { t: 'stream-end', streamId, identity: identity || streamId });
+        rejectPeer(node.ws, 4012, 'source media quarantined');
+      }
+      return;
+    }
     if (role === 'broadcaster') {
       const existing = mgr.trees.get(key);
       if (existing && existing.broadcasterId) {
@@ -1360,6 +1446,19 @@ function attachTreeServer(httpServer, opts) {
     // объявить себя «сервером» (получил бы приоритетный трафик и увидел бы vrelay-release).
     node.virtual = !!msg.virtual && node.ws.__uid === VRELAY_UID;
     node.vrelayPinned = false;
+    // Старый stream-сокет vrelay может переподключиться после release. Не возвращаем его в
+    // уже деградировавшее дерево: иначе ensureVirtualAttached снова вытеснит рабочий P2P-root
+    // и circuit breaker превратится в бесконечную петлю.
+    {
+      const existingTree = mgr.trees.get(key);
+      if (node.virtual && existingTree && existingTree.serverFirst && existingTree.vrelayMediaCircuitOpen) {
+        tlog(`[${key}] отклоняю повторный join vrelay ${id}: медиапуть в карантине до конца трансляции`);
+        send(id, { t: 'vrelay-release', streamId });
+        node.streamId = null; node.rendition = null; node.treeKey = null;
+        rejectPeer(node.ws, 4012, 'vrelay media quarantined');
+        return;
+      }
+    }
     // Д4: ручной выбор качества (pin) переживает пересоздание watch-сокета (смена качества =
     // unwatch+watch на клиенте): pin приходит в join нового дерева. Авто-ABR pinned не трогает.
     node.qualityPinned = role === 'viewer' && !!msg.pinned;
@@ -1459,6 +1558,8 @@ function attachTreeServer(httpServer, opts) {
     // Нельзя использовать tree-сокет как произвольный межсерверный прокси:
     // адресат обязан находиться в том же конкретном дереве, что и отправитель.
     if (!target || !target.streamId || target.treeKey !== p.treeKey) return;
+    if (msg.t === 'sdp' && msg.type === 'offer' && target.parent === id
+      && target.parentOfferExpectedFrom === id) target.parentOfferAt = Date.now();
     send(target.id, { t: msg.t, streamId: p.streamId, from: id, type: msg.type, sdp: msg.sdp, candidate: msg.candidate });
   }
 
@@ -1524,6 +1625,50 @@ function attachTreeServer(httpServer, opts) {
     settleOrphans(key); // миграция могла освободить слот — подхватываем сирот
   }
 
+  // Терминально выводит доказанно пустой server-first медиапуть из конкретного дерева. Все
+  // racing virtual-сокеты удаляются до общего settle: иначе orphan-дубликат мог тут же занять
+  // освободившийся root-slot. Relay-capable дети идут первыми и дают слоты browser-листьям.
+  function openVrelayMediaCircuit(key, virt, reporter, evidence) {
+    const t = mgr.trees.get(key);
+    if (!t || !t.serverFirst || !virt || !virt.virtual || t.vrelayMediaCircuitOpen) return false;
+    t.vrelayMediaCircuitOpen = true;
+    t.vrelayActivateAt = 0;
+    const sid = parseTreeKey(key).streamId;
+    tlog(`[track-missing] [${key}] открываю vrelay circuit (${evidence || 'corroborated'}): ${virt.id} не отдал видео; reporter ${reporter.id} (${reporter.identity}); переход на P2P до конца трансляции`);
+    if (t.vrelayPending && t.vrelayPending.size) {
+      for (const pendingId of t.vrelayPending) {
+        send(pendingId, { t: 'reparent-denied', streamId: sid, reason: 'no-vrelay' });
+      }
+      t.vrelayPending.clear();
+    }
+
+    // Derived qualities consume the same ingest. Remove their advertised/live state immediately;
+    // existing viewers receive rendition-unavailable and fall back to source, while late roots are
+    // rejected by onJoin and cannot resurrect a dead rung.
+    const stoppedRenditions = t.renditions ? [...t.renditions.keys()] : [];
+    for (const rendition of stoppedRenditions) {
+      teardownRendition(sid, rendition, 'source-quarantined');
+    }
+    if (stoppedRenditions.length) reannounceRenditions();
+
+    const virtuals = [...t.nodes.values()].filter((node) => node.virtual);
+    for (const node of virtuals) {
+      node.children.sort((leftId, rightId) => {
+        const left = t.nodes.get(leftId), right = t.nodes.get(rightId);
+        const capacityDelta = (right ? mgr.capacityOf(right) : 0) - (left ? mgr.capacityOf(left) : 0);
+        if (capacityDelta) return capacityDelta;
+        return (right?.availableOutgoing || 0) - (left?.availableOutgoing || 0);
+      });
+      send(node.id, { t: 'vrelay-release', streamId: sid });
+    }
+    for (const node of virtuals) {
+      onLeave(node.id, 'track-missing circuit', { settle: false });
+      rejectPeer(node.ws, 4012, 'vrelay media quarantined');
+    }
+    settleOrphans(key);
+    return true;
+  }
+
   // Э9: зритель явно попросил «смотреть через сервер» (targetParentId='vrelay'). Виртуал
   // уже в дереве — обычный ручной reparent на него; нет — будим агента и запоминаем
   // запрос (исполнится в onJoin виртуала). Pin защищает от дренажа: раз выбрал сам —
@@ -1559,17 +1704,106 @@ function attachTreeServer(httpServer, opts) {
   // Э8: узел просит миграцию. targetParentId — ручной выбор зрителя из дерева (жёсткая
   // валидация в mgr.reparent); отсутствует — авто по деградации (best-peer + cooldown).
   // Э9: targetParentId='vrelay' — запрос «через сервер» (см. onRequestVrelay).
+  function recordVrelayTrackMissingEvidence(t, reporter, now) {
+    if (!t.vrelayTrackMissingWindowAt
+      || now - t.vrelayTrackMissingWindowAt > TRACK_MISSING_PARENT_WINDOW_MS) {
+      t.vrelayTrackMissingWindowAt = now;
+      t.vrelayTrustedFailures = 0;
+    }
+    if (!reporter.virtual) return null;
+    t.vrelayTrustedFailures = (t.vrelayTrustedFailures || 0) + 1;
+    if ((t.vrelayTrustedFailures || 0) >= TRACK_MISSING_EVIDENCE_MAX) return 'trusted-vrelay';
+    return null;
+  }
+
+  function reattachCurrentParent(key, p, now, label) {
+    const t = mgr.trees.get(key);
+    const parent = t && p.parent && t.nodes.get(p.parent);
+    if (!parent) return false;
+    p.reparentCooldownUntil = Math.max(p.reparentCooldownUntil || 0, now + REPARENT_COOLDOWN_MS);
+    tlog(`${label || ''}[${key}] reattach ${p.id} (${p.identity}) к тому же родителю ${p.parent} (fresh PC)`);
+    send(p.parent, { t: 'drop-peer', streamId: p.streamId, peerId: p.id });
+    send(p.id, { t: 'assign-parent', streamId: p.streamId, parentId: p.parent });
+    send(p.parent, { t: 'assign-child', streamId: p.streamId, childId: p.id });
+    return true;
+  }
+
   function onRequestReparent(id, msg) {
     const p = peers.get(id);
     if (!p || !p.treeKey) return;
     if (msg.targetParentId === VRELAY_TARGET) return onRequestVrelay(id);
     const key = p.treeKey;
     const now = Date.now();
+    // Every media recovery is bound to the exact current assignment. A delayed request retained
+    // across a WS reconnect or racing a newer reparent must not penalize/rebuild the new parent.
+    // Browser no-offer is eligible after 8s of server evidence; decoded-frame/native watchdogs
+    // wait 12s. Only these targetless requests can bypass the ordinary topology cooldown.
+    const requestedTrackMissing = msg.reason === 'track-missing' && !msg.targetParentId;
+    let trackMissingRecovery = false;
+    let serverNoOffer = false;
+    if (requestedTrackMissing) {
+      const failedParentId = typeof msg.failedParentId === 'string' ? msg.failedParentId : '';
+      if (!p.parent || !failedParentId || failedParentId !== p.parent) {
+        tlog(`[track-missing] reparent-denied ${id} (${p.identity}) в [${key}] reason=stale-parent`);
+        send(id, { t: 'reparent-denied', streamId: p.streamId, reason: 'stale-parent' });
+        return;
+      }
+      const exactAssignment = p.parentOfferExpectedFrom === p.parent && !!p.parentAssignedAt;
+      serverNoOffer = exactAssignment && !p.parentOfferAt;
+      const minimumAge = !p.native && serverNoOffer
+        ? TRACK_MISSING_NO_OFFER_MS
+        : TRACK_MISSING_NO_MEDIA_MS;
+      if (!exactAssignment || now - p.parentAssignedAt < minimumAge) {
+        tlog(`[track-missing] reparent-denied ${id} (${p.identity}) в [${key}] reason=cooldown`);
+        send(id, { t: 'reparent-denied', streamId: p.streamId, reason: 'cooldown' });
+        return;
+      }
+      trackMissingRecovery = true;
+    }
+    if (trackMissingRecovery && p.trackMissingRecoveryUntil && now < p.trackMissingRecoveryUntil) {
+      tlog(`[track-missing] reparent-denied ${id} (${p.identity}) в [${key}] reason=cooldown`);
+      send(id, { t: 'reparent-denied', streamId: p.streamId, reason: 'cooldown' });
+      return;
+    }
+    if (trackMissingRecovery) {
+      p.trackMissingRecoveryUntil = now + TRACK_MISSING_REPARENT_COOLDOWN_MS;
+      tlog(`[track-missing] request-reparent ${id} (${p.identity}) в [${key}] от родителя ${p.parent}`);
+      const t = mgr.trees.get(key);
+      const parent = t && t.nodes.get(p.parent);
+      const trustedIngestReporter = !!(p.virtual && t && p.parent === t.broadcasterId);
+      const failedVirtual = trustedIngestReporter ? p : !p.virtual && parent?.virtual ? parent : null;
+      if (t && t.serverFirst && failedVirtual) {
+        // A browser/PWA can prove only that its own assigned link has no usable media. Even two
+        // independent viewers may share a local/browser failure while vrelay remains healthy for
+        // everybody else, so their reports reattach/reparent only that viewer. Global quarantine
+        // is owned exclusively by the service-authenticated direct ingest watchdog.
+        const evidence = trustedIngestReporter
+          ? recordVrelayTrackMissingEvidence(t, p, now)
+          : null;
+        if (evidence && openVrelayMediaCircuit(key, failedVirtual, p, evidence)) return;
+        // A trusted ingest node must remain a direct child of the broadcaster. Generic best-peer
+        // could otherwise move it under an unrelated viewer after its first missing-media epoch.
+        if (p.virtual) {
+          if (!reattachCurrentParent(key, p, now, '[track-missing] ')) {
+            send(id, { t: 'reparent-denied', streamId: p.streamId, reason: 'no-candidate' });
+          }
+          return;
+        }
+      }
+      // A racing duplicate virtual socket may temporarily sit below the real ingest. It is not
+      // trusted evidence about broadcaster -> vrelay video and must not enter generic best-peer.
+      if (t && t.serverFirst && p.virtual && !trustedIngestReporter) {
+        send(id, { t: 'reparent-denied', streamId: p.streamId, reason: 'not-ingest-parent' });
+        return;
+      }
+    }
     // Д7: браузерный зритель просит миграцию по дропам кадров (отбраковка плохого родителя).
     // Диагностический grep-префикс. Текущий родитель уже исключается в reparent(...,null) →
     // pickParent(t, node, node.parent) (см. mgr.reparent), так что авто-выбор не вернёт того же.
     if (msg.reason === 'frame-drops') tlog(`[frame-drops] request-reparent ${id} (${p.identity}) в [${key}] от родителя ${p.parent || '-'}`);
-    const res = mgr.reparent(key, id, msg.targetParentId || null, now);
+    const res = mgr.reparent(key, id, msg.targetParentId || null, now, {
+      bypassCooldown: trackMissingRecovery,
+    });
     if (!res.ok) {
       // Реаттач к тому же родителю. Кейс «корень + единственный зритель»: pickParent
       // исключает текущего родителя, других кандидатов нет → no-candidate, и зритель с
@@ -1580,13 +1814,8 @@ function attachTreeServer(httpServer, opts) {
       if (!msg.targetParentId && res.reason === 'no-candidate' && p.parent) {
         const t = mgr.trees.get(key);
         const parent = t && t.nodes.get(p.parent);
-        if (parent && (!p.reparentCooldownUntil || now >= p.reparentCooldownUntil)) {
-          p.reparentCooldownUntil = now + REPARENT_COOLDOWN_MS;
-          tlog(`[${key}] reattach ${id} (${p.identity}) к тому же родителю ${p.parent} (ICE-restart, no-candidate)`);
-          send(p.parent, { t: 'drop-peer', streamId: p.streamId, peerId: id });      // родитель закрывает старый child-PC
-          send(id, { t: 'assign-parent', streamId: p.streamId, parentId: p.parent }); // узел сбрасывает upstream, ждёт offer
-          send(p.parent, { t: 'assign-child', streamId: p.streamId, childId: id });   // родитель поднимает свежий PC + offer
-          return;
+        if (parent && (trackMissingRecovery || !p.reparentCooldownUntil || now >= p.reparentCooldownUntil)) {
+          if (reattachCurrentParent(key, p, now, trackMissingRecovery ? '[track-missing] ' : '')) return;
         }
       }
       tlog(`[${key}] reparent-denied ${id} (${p.identity}) target=${msg.targetParentId || 'auto'} reason=${res.reason}`);
@@ -1617,6 +1846,10 @@ function attachTreeServer(httpServer, opts) {
     for (const [key, t] of mgr.trees) {
       if (!t.broadcasterId || findVirtual(t)) continue;
       let needs = !!(t.vrelayPending && t.vrelayPending.size);
+      // The control socket may arrive after the broadcaster's one-shot activation attempt.
+      // A live server-first tree itself is sufficient demand; the circuit guard in
+      // requestVrelayActivation prevents resurrecting a quarantined ingest.
+      if (!needs && t.serverFirst && !t.vrelayMediaCircuitOpen) needs = true;
       if (!needs) for (const n of t.nodes.values()) { if (n.id !== t.broadcasterId && !n.parent) { needs = true; break; } }
       if (needs) requestVrelayActivation(key); // сам откажет не-source-дереву
     }
@@ -1684,7 +1917,7 @@ function attachTreeServer(httpServer, opts) {
     }
   }
 
-  function onLeave(id, reason = 'leave') {
+  function onLeave(id, reason = 'leave', { settle = true } = {}) {
     const p = peers.get(id);
     // Д-фикс: агент vrelay держит control-сокет БЕЗ treeKey (в дерево не joins). Его отвал
     // схлопывает рендишн-лестницу в ['source'] — ре-анонсим, иначе у клиента залипает меню.
@@ -1727,7 +1960,7 @@ function attachTreeServer(httpServer, opts) {
     });
     broadcastTreeInfo(key);
     broadcastTopology(key);
-    settleOrphans(key); // ушедший освободил ёмкость — подхватываем сирот
+    if (settle) settleOrphans(key); // ушедший освободил ёмкость — подхватываем сирот
   }
 
   wss.on('connection', (ws) => {
@@ -1741,6 +1974,8 @@ function attachTreeServer(httpServer, opts) {
       id, ws, streamId: null, treeKey: null, rendition: null, role: null, native: false, identity: id, serverId: null,
       parent: null, children: [], depth: 0,
       maxChildren: undefined, maxBitrate: 0, abr: false, availableOutgoing: 0, linkRtt: 0, linkLoss: 0, reparentCooldownUntil: 0,
+      trackMissingRecoveryUntil: 0,
+      parentOfferExpectedFrom: null, parentAssignedAt: 0, parentOfferAt: 0,
       framesDroppedPct: 0, framesDropAt: 0, dropBadTicks: 0, // Д7: серверная отбраковка родителя (натив)
     });
     ws.on('message', (raw) => {

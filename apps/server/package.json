@@ -3,7 +3,7 @@
   "version": "3.0.0",
   "private": true,
   "scripts": {
-    "test": "npm run test:bootstrap-admin && npm run test:auth && npm run test:auth-sessions && npm run test:mailer && npm run test:vrelay-auth && npm run test:runtime-revocation && npm run test:push-subscriptions && npm run test:server-settings && npm run test:release-notes && npm run test:voice-lease && npm run test:voice-media && npm run test:voice-media-revocations && npm run test:voice-auth-registry && npm run test:deploy-contract && npm run test:voice-token-policy && npm run test:chat-realtime && npm run test:legacy-chat-bridge && npm run test:tree-ws-error && npm run test:tree-auth && npm run test:seventv-proxy && npm run test:diag-store && npm run test:voice-diagnostics && npm run test:uploads-gc",
+    "test": "npm run test:bootstrap-admin && npm run test:auth && npm run test:auth-sessions && npm run test:mailer && npm run test:vrelay-auth && npm run test:runtime-revocation && npm run test:push-subscriptions && npm run test:server-settings && npm run test:release-notes && npm run test:voice-lease && npm run test:voice-media && npm run test:voice-media-revocations && npm run test:voice-auth-registry && npm run test:deploy-contract && npm run test:voice-token-policy && npm run test:chat-realtime && npm run test:legacy-chat-bridge && npm run test:tree-ws-error && npm run test:tree-track-missing && npm run test:tree-auth && npm run test:seventv-proxy && npm run test:diag-store && npm run test:voice-diagnostics && npm run test:uploads-gc",
     "bootstrap:admin": "node bootstrap-admin.js",
     "test:bootstrap-admin": "node --test bootstrap-admin-test.js",
     "test:auth": "node auth-test.js",
@@ -23,6 +23,7 @@
     "test:chat-realtime": "node --test chat-realtime-test.js",
     "test:legacy-chat-bridge": "node --test legacy-chat-bridge-test.js",
     "test:tree-ws-error": "node tree-ws-error-test.js",
+    "test:tree-track-missing": "node --test tree-track-missing-test.js",
     "test:tree-auth": "node --test tree-auth-test.js",
     "test:seventv-proxy": "node --test seventv-proxy-test.js",
     "test:diag-store": "node --test diagStore-test.js",

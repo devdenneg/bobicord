@@ -113,6 +113,56 @@ async function importTypeScript(relative) {
   return import('data:text/javascript,' + encodeURIComponent(output));
 }
 
+// Duplicate same-server navigation must share the exact view owner. A terminal LiveKit loss clears
+// that owner before the store callback, so the same persisted server id must still reconnect.
+{
+  const { shouldCoalesceServerConnect } = await importTypeScript('serverConnectionLifecycle.ts');
+  const state = (overrides = {}) => ({
+    requestedServerId: 'server-a',
+    currentViewServerId: 'server-a',
+    loadingServerId: null,
+    engineAvailable: true,
+    engineOwnsRequestedView: true,
+    ...overrides,
+  });
+
+  assert.equal(shouldCoalesceServerConnect(state()), true,
+    'a healthy or still-connecting same-server Engine room keeps its media/watch ownership');
+  assert.equal(shouldCoalesceServerConnect(state({
+    currentViewServerId: null,
+    loadingServerId: 'server-a',
+    engineOwnsRequestedView: false,
+  })), true, 'the metadata-loading phase remains single-flight before Engine creates its room');
+  assert.equal(shouldCoalesceServerConnect(state({ engineOwnsRequestedView: false })), false,
+    'a terminal room loss reconnects even while the store still names the same server');
+  assert.equal(shouldCoalesceServerConnect(state({
+    requestedServerId: 'server-b',
+    engineOwnsRequestedView: false,
+  })), false, 'a real server switch is never coalesced');
+  assert.equal(shouldCoalesceServerConnect(state({
+    currentViewServerId: null,
+    loadingServerId: 'server-a',
+    engineAvailable: false,
+    engineOwnsRequestedView: false,
+  })), false,
+    'a stale loading marker cannot suppress Engine creation/recovery');
+}
+
+const connectGuardAt = store.indexOf('shouldCoalesceServerConnect({');
+const connectDetachAt = store.indexOf('engine?.detachView(id)', connectGuardAt);
+assert.ok(connectGuardAt >= 0 && connectDetachAt > connectGuardAt,
+  'same-server ownership is checked before detachView can stop native watches');
+assert.match(read('engine.ts'), /ownsViewConnection\(serverId: string\)[\s\S]*this\.viewServerId === serverId[\s\S]*this\.viewRoom !== null/,
+  'the coalescing gate reads the synchronous exact Engine room owner');
+
+const terminalViewRecovery = store.match(
+  /connectionLost: \(serverId,[\s\S]*?if \(get\(\)\.view === 'server'\) \{[\s\S]*?void get\(\)\.connectServer\(serverId\);[\s\S]*?return;/,
+)?.[0] || '';
+const releaseDeadLoadingOwnerAt = terminalViewRecovery.indexOf("set({ loadingServer: false, loadingServerId: null })");
+const reconnectAfterTerminalAt = terminalViewRecovery.indexOf('get().connectServer(serverId)');
+assert.ok(releaseDeadLoadingOwnerAt >= 0 && reconnectAfterTerminalAt > releaseDeadLoadingOwnerAt,
+  'terminal room loss releases an in-flight same-server metadata owner before reconnecting');
+
 const deferred = () => {
   let resolve;
   let reject;

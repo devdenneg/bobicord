@@ -7,6 +7,7 @@ const nativeSource = readFileSync(new URL('./native.ts', import.meta.url), 'utf8
 const treeSource = readFileSync(new URL('./transport/treeVideo.ts', import.meta.url), 'utf8');
 const videoTransportSource = readFileSync(new URL('./transport/videoTransport.ts', import.meta.url), 'utf8');
 const livekitSource = readFileSync(new URL('./transport/livekitVideo.ts', import.meta.url), 'utf8');
+const serverViewSource = readFileSync(new URL('./components/ServerView.tsx', import.meta.url), 'utf8');
 const probeSource = readFileSync(new URL('./transport/probe.ts', import.meta.url), 'utf8');
 const nativeLibSource = readFileSync(new URL('../../native/src-tauri/src/lib.rs', import.meta.url), 'utf8');
 const relaySource = readFileSync(new URL('../../relay-core/src/relay.rs', import.meta.url), 'utf8');
@@ -41,7 +42,7 @@ const stringUnion = (file, name) => {
 };
 assert.deepEqual(stringUnion(videoTransportFile, 'StreamWatchTransportDiagnosticStage'), [
   'watch_auth', 'watch_listeners', 'watch_native_start', 'watch_signaling', 'watch_join',
-  'watch_parent', 'watch_negotiation', 'watch_track', 'watch_recovery',
+  'watch_parent', 'watch_negotiation', 'watch_track', 'watch_playback', 'watch_recovery',
 ]);
 assert.deepEqual(stringUnion(videoTransportFile, 'StreamWatchTransportDiagnosticCode'), [
   'none', 'timeout', 'network', 'offline', 'auth', 'permission', 'device_lost',
@@ -180,15 +181,22 @@ assert.match(treeMethod('scheduleNativeWatchRetry'), /this\.scheduleWatchRetry\(
   'native reconnects use the same per-stream reconnect owner');
 assert.doesNotMatch(treeMethod('scheduleNativeWatchRetry'), /\bsetTimeout\(/,
   'native reconnects cannot leave unowned timers');
+assert.match(treeMethod('scheduleNativeWatchRetry'),
+  /attempt >= NATIVE_WATCH_RECOVERY_MAX_ATTEMPTS[\s\S]*outcome: 'timed_out'[\s\S]*intended\.delete\(streamId\)[\s\S]*switchFailedCbs/,
+  'native recovery has a terminal consecutive-failure budget even after initial playback');
+assert.match(treeMethod('confirmPlayback'),
+  /candidate !== currentVideo[\s\S]*currentVideo\.muted[\s\S]*return false[\s\S]*reWatchAttempts\.delete\(streamId\)[\s\S]*webReconnectAttempts\.delete\(streamId\)[\s\S]*clearVideoFailsafe\(streamId\)[\s\S]*return true/,
+  'a retained DOM frame can reset recovery only for the exact current transport track');
 assert.match(treeMethod('detach'),
   /watchRetryTimers\.forEach\(\(timer\) => clearTimeout\(timer\)\)[\s\S]*watchRetryTimers\.clear\(\)/,
   'transport teardown cancels every reconnect callback before releasing stream state');
 const parentOffer = treeMethod('onParentOffer');
 assert.match(parentOffer,
-  /const ownsOffer = \(\) =>[\s\S]*st\.pc === pc[\s\S]*if \(st\.reparentTimer !== null\) return;[\s\S]*st\.reparentTimer !== timer[\s\S]*ownsOffer\(\)/,
+  /const ownsOffer = \(\) =>[\s\S]*st\.pc === pc[\s\S]*const scheduleDisconnectedRecovery[\s\S]*recoveryRequested \|\| st\.reparentTimer !== null \|\| !ownsOffer\(\)[\s\S]*st\.reparentTimer !== timer[\s\S]*!ownsOffer\(\)/,
   'one exact peer owns at most one delayed reparent request');
-assert.match(parentOffer, /else this\.clearWatchReparentTimer\(st\)/,
-  'a recovered peer cancels its pending reparent deadline');
+assert.match(parentOffer,
+  /pc\.iceConnectionState !== 'disconnected' && pc\.iceConnectionState !== 'failed'[\s\S]*clearWatchReparentTimer\(st\)[\s\S]*pc\.connectionState !== 'disconnected' && pc\.connectionState !== 'failed'[\s\S]*clearWatchReparentTimer\(st\)/,
+  'a recovered peer cancels its pending reparent deadline only after both state views are healthy');
 assert.match(parentOffer,
   /const parentId = st\.parentId[\s\S]*const parentGeneration = st\.parentGeneration[\s\S]*const offerGeneration = \+\+st\.offerGeneration[\s\S]*await pc\.setRemoteDescription[\s\S]*if \(!ownsOffer\(\)\) return;[\s\S]*st\.pendingIce\.splice\(0\)/,
   'a stale offer is rejected before it can consume pending ICE owned by its replacement');
@@ -206,6 +214,17 @@ assert.match(treeMethod('unwatch'),
 assert.match(treeMethod('armWatchJoinFallback'),
   /st\.joinFallbackTimer !== timer[\s\S]*this\.watches\.get\(streamId\) === st/,
   'the welcome fallback is fenced to the exact current watch generation');
+assert.match(treeMethod('armParentOfferTimer'),
+  /delayMs = BROWSER_PARENT_OFFER_TIMEOUT_MS[\s\S]*st\.parentId !== parentId[\s\S]*st\.parentGeneration !== parentGeneration[\s\S]*code: 'track_missing'[\s\S]*requestReparent\(streamId, null, 'track-missing', parentId\)[\s\S]*}, delayMs/,
+  'a browser parent which never offers SDP gets one exact-generation track-missing recovery');
+assert.match(treeMethod('armParentMediaTimer'),
+  /st\.pc !== pc[\s\S]*st\.parentId !== parentId[\s\S]*st\.offerGeneration !== offerGeneration[\s\S]*code: 'decode_timeout'[\s\S]*watch_recovery[\s\S]*code: 'decode_timeout'[\s\S]*requestReparent\(streamId, null, 'track-missing', parentId\)[\s\S]*BROWSER_PARENT_MEDIA_TIMEOUT_MS/,
+  'an offered browser stream which never decodes video reports its exact failed parent');
+assert.match(treeMethod('onWatchMessage'),
+  /case 'assign-parent':[\s\S]*armParentOfferTimer\(streamId, st\)[\s\S]*case 'sdp':[\s\S]*clearParentOfferTimer\(st\)/,
+  'each browser parent assignment owns an offer watchdog which its exact SDP offer cancels');
+assert.match(treeMethod('clearWatchStateTimers'), /parentOfferTimer[\s\S]*parentMediaTimer[\s\S]*reparentTimer/,
+  'watch teardown cancels both parent watchdogs together with the other exact-state timers');
 assert.match(treeMethod('openDiscovery'),
   /discoveryBacklogTimer !== backlogTimer[\s\S]*this\.discoveryWs !== ws/,
   'discovery backlog cleanup is single-owned and exact-socket fenced');
@@ -234,19 +253,58 @@ assert.match(nativeWatchMethod,
   /retainListener\(onNativeWatchOffer[\s\S]*retainListener\(onNativeWatchIce[\s\S]*retainListener\(onNativeWatchEnded[\s\S]*retainListener\(onNativeWatchStatus[\s\S]*catch \{[\s\S]*nativeUnwatch\(streamId, st, live\)[\s\S]*armVideoFailsafe[\s\S]*scheduleNativeWatchRetry/,
   'a missing mandatory Tauri listener fails closed and retries only through the bounded watch owner');
 assert.match(treeMethod('onParentOffer'),
-  /onconnectionstatechange[\s\S]*oniceconnectionstatechange[\s\S]*watch_track[\s\S]*track_missing/,
-  'browser watch diagnostics cover peer state, ICE state, first video and ended video');
+  /requestParentRecovery[\s\S]*watch_recovery[\s\S]*code[\s\S]*scheduleDisconnectedRecovery[\s\S]*onconnectionstatechange[\s\S]*requestParentRecovery\('ice_failed'\)[\s\S]*scheduleDisconnectedRecovery\(\)[\s\S]*oniceconnectionstatechange[\s\S]*requestParentRecovery\('ice_failed'\)[\s\S]*scheduleDisconnectedRecovery\(\)[\s\S]*watch_track[\s\S]*track_missing/,
+  'browser watch diagnostics recover from aggregate or ICE-only failure without duplicate owners');
 assert.match(treeMethod('onNativeOffer'),
   /onconnectionstatechange[\s\S]*oniceconnectionstatechange[\s\S]*watch_track[\s\S]*nativeWatchAnswer/,
   'native loopback diagnostics cover local peer state, first video and answer delivery');
+assert.match(treeMethod('onNativeOffer'),
+  /addEventListener\('ended', recoverEndedTrack[\s\S]*readyState === 'ended'[\s\S]*recoverEndedTrack\(\)[\s\S]*upsertTrack/,
+  'an already-ended native video track is recovered before it can clear retry protection');
 assert.match(treeMethod('armVideoFailsafe'), /watch_recovery[\s\S]*decode_timeout/,
   'a seamless recovery which never delivers a replacement frame is reported before its tile closes');
 assert.match(livekitMethod('watch'), /watch_signaling[\s\S]*subscribeWatchSession/,
   'LiveKit selection reports its room and subscription path');
-assert.match(livekitMethod('onSub'), /watch_track[\s\S]*watch_recovery/,
-  'LiveKit reports the subscribed video track and successful recovery');
+assert.match(livekitMethod('onSub'),
+  /pub\.source !== Track\.Source\.ScreenShare[\s\S]*isExactWatchOwner[\s\S]*pub\.track !== track[\s\S]*candidateTrack = track[\s\S]*watch_track/,
+  'LiveKit accepts only the exact current screen publication and waits for decoded playback');
+assert.match(livekitMethod('confirmPlayback'),
+  /candidate !== mediaTrack[\s\S]*isExactWatchOwner[\s\S]*remotePublicationByKey[\s\S]*cancelWatchRetry[\s\S]*watch_recovery[\s\S]*recovered/,
+  'LiveKit replenishes its recovery budget only after the exact media track decodes');
+assert.match(livekitMethod('acceptsScreenAudio'),
+  /baseUid\(participant\.identity\) === streamId[\s\S]*publication\.source === Track\.Source\.ScreenShareAudio[\s\S]*owner\.participant === participant[\s\S]*isExactWatchOwner[\s\S]*getTrackPublication\(Track\.Source\.ScreenShareAudio\) === publication[\s\S]*publication\.track === candidate/,
+  'LiveKit accepts screen audio only from the exact current watch owner, publication and track');
 assert.match(livekitMethod('onRemoteUnpub'), /watch_track[\s\S]*beginWatchRecovery[\s\S]*subscribeWatchSession/,
   'LiveKit reports a lost selected publication before selecting its replacement');
+assert.match(livekitMethod('onUnsub'), /watch_track[\s\S]*beginWatchRecovery\(username, 'track_missing'\)[\s\S]*subscribeWatchSession/,
+  'an unexpected active LiveKit unsubscribe is diagnosed and re-subscribed');
+assert.doesNotMatch(livekitMethod('scheduleWatchRetry'), /cancelWatchRetry/,
+  'a repeated LiveKit unsubscribe cannot reset the bounded recovery budget');
+assert.match(livekitMethod('scheduleWatchRetry'),
+  /delay === undefined[\s\S]*setTimeout[\s\S]*isExactWatchOwner[\s\S]*exhaustWatchRecovery/,
+  'the final LiveKit subscription attempt owns one bounded asynchronous delivery window');
+assert.match(livekitMethod('exhaustWatchRecovery'),
+  /outcome: 'timed_out'[\s\S]*switchFailedCbs\.forEach/,
+  'an exhausted LiveKit recovery reports terminal failure so Engine can release its watch owner');
+assert.match(livekitMethod('onSeamlessSwitchFailed'), /switchFailedCbs\.add\(cb\)[\s\S]*switchFailedCbs\.delete\(cb\)/,
+  'LiveKit terminal recovery listeners have explicit subscription ownership');
+assert.match(livekitMethod('armWatchDecodeTimer'),
+  /state\.candidateTrack !== track[\s\S]*state\.publication\.track !== track[\s\S]*isExactWatchOwner[\s\S]*decode_timeout[\s\S]*scheduleWatchRetry/,
+  'a subscribed-but-undecoded LiveKit track advances the same exact bounded recovery episode');
+assert.match(serverViewSource,
+  /exactLiveKitVideo[\s\S]*mediaStreamTrack[\s\S]*new MediaStream\(\[exactLiveKitVideo\]\)[\s\S]*ExactVideoTrackFrameObserver/,
+  'the LiveKit tile observes frames against its exact media track');
+assert.match(serverViewSource,
+  /const finishDecoded = \(candidate\?: MediaStreamTrack\)[\s\S]*if \(candidate\) E\.confirmWatchPlayback/,
+  'only the observer-provided decoded candidate can confirm LiveKit playback');
+assert.doesNotMatch(serverViewSource, /attemptPlayback\(false, exactLiveKitVideo\)/,
+  'retained element dimensions cannot reset LiveKit recovery from an ordinary play attempt');
+assert.match(treeMethod('scheduleBrowserWatchStartRetry'),
+  /code: StreamWatchTransportDiagnosticCode[\s\S]*watch_recovery[\s\S]*code, reconnectCount/,
+  'browser auth and signaling retries preserve their causal code');
+assert.match(treeMethod('scheduleNativeWatchRetry'),
+  /code: StreamWatchTransportDiagnosticCode[\s\S]*watch_recovery[\s\S]*code, reconnectCount/,
+  'native retries preserve their causal code');
 
 // Exercise the actual private timer owners after stripping imports. TypeScript `private` methods
 // remain callable in the emitted JavaScript, while unrelated browser/native dependencies are only
@@ -273,6 +331,8 @@ const previousWindowAddEventListener = globalThis.window.addEventListener;
 const previousWindowRemoveEventListener = globalThis.window.removeEventListener;
 const previousWindowSetInterval = globalThis.window.setInterval;
 const previousClearInterval = globalThis.clearInterval;
+const previousMediaStream = globalThis.MediaStream;
+const previousMediaStreamVideoHandle = globalThis.MediaStreamVideoHandle;
 const previousNextNativeWatchGeneration = globalThis.nextNativeWatchGeneration;
 const previousOnNativeWatchOffer = globalThis.onNativeWatchOffer;
 const previousOnNativeWatchIce = globalThis.onNativeWatchIce;
@@ -422,6 +482,7 @@ try {
     constructor() { peerConnections.push(this); }
     close() { this.connectionState = 'closed'; }
     getTransceivers() { return []; }
+    getReceivers() { return []; }
     async setRemoteDescription(description) {
       const gate = remoteDescriptionGates.get(description.sdp);
       if (gate) await gate.promise;
@@ -432,6 +493,123 @@ try {
     async setLocalDescription(answer) { this.localDescription = answer; }
   }
   globalThis.RTCPeerConnection = FakePeerConnection;
+
+  const browserConstructorFailure = new TreeVideoTransport();
+  const browserConstructorFailureDiagnostics = [];
+  const browserConstructorFailureWatch = {
+    ws: { send: () => {} },
+    pc: null,
+    parentId: 'constructor-parent',
+    closed: false,
+    iceServers: [],
+    maxChildren: 0,
+    joined: true,
+    quality: 'source',
+    pinned: false,
+    pendingIce: [],
+    parentGeneration: 1,
+    offerGeneration: 0,
+    joinFallbackTimer: null,
+    parentOfferTimer: null,
+    parentMediaTimer: null,
+    reparentTimer: null,
+  };
+  browserConstructorFailure.watches.set('constructor-failure', browserConstructorFailureWatch);
+  browserConstructorFailure.onWatchDiagnostic((event) => browserConstructorFailureDiagnostics.push(event));
+  globalThis.RTCPeerConnection = class {
+    constructor() { throw new Error('transient resource exhaustion'); }
+  };
+  await browserConstructorFailure.onParentOffer('constructor-failure', browserConstructorFailureWatch, 'offer');
+  assert.equal(browserConstructorFailureWatch.pc, null,
+    'a failed WebKit peer construction cannot retain its already-closed predecessor');
+  assert.equal(timers.get(browserConstructorFailureWatch.parentOfferTimer)?.delay, 12000,
+    'a transient peer construction failure waits for the server no-media gate before retrying');
+  assert.ok(browserConstructorFailureDiagnostics.some((event) => event.stage === 'watch_recovery'
+    && event.outcome === 'started' && event.code === 'negotiation_failed'));
+  browserConstructorFailure.teardownWatch('constructor-failure', browserConstructorFailureWatch);
+  globalThis.RTCPeerConnection = FakePeerConnection;
+
+  const noOfferRecovery = new TreeVideoTransport();
+  const noOfferSent = [];
+  const noOfferDiagnostics = [];
+  const noOfferWatch = {
+    ws: { send: (payload) => noOfferSent.push(JSON.parse(payload)) },
+    pc: null,
+    parentId: null,
+    closed: false,
+    iceServers: [],
+    maxChildren: 0,
+    joined: true,
+    quality: 'source',
+    pinned: false,
+    pendingIce: [],
+    parentGeneration: 0,
+    offerGeneration: 0,
+    joinFallbackTimer: null,
+    parentOfferTimer: null,
+    parentMediaTimer: null,
+    reparentTimer: null,
+  };
+  noOfferRecovery.watches.set('no-offer', noOfferWatch);
+  noOfferRecovery.onWatchDiagnostic((event) => noOfferDiagnostics.push(event));
+  noOfferRecovery.onWatchMessage('no-offer', noOfferWatch, {
+    data: JSON.stringify({ t: 'assign-parent', parentId: 'silent-parent-a' }),
+  });
+  const staleNoOfferTimer = noOfferWatch.parentOfferTimer;
+  assert.equal(timers.get(staleNoOfferTimer)?.delay, 8000,
+    'a browser parent gets the server-agreed bounded SDP offer deadline');
+  noOfferRecovery.onWatchMessage('no-offer', noOfferWatch, {
+    data: JSON.stringify({ t: 'assign-parent', parentId: 'silent-parent-b' }),
+  });
+  assert.equal(timers.has(staleNoOfferTimer), false,
+    'a replacement parent physically cancels the previous no-offer owner');
+  assert.equal(timers.size, 1);
+  fire(noOfferWatch.parentOfferTimer);
+  assert.deepEqual(noOfferSent, [{
+    t: 'request-reparent', streamId: 'no-offer', targetParentId: null,
+    reason: 'track-missing', failedParentId: 'silent-parent-b',
+  }], 'the no-offer recovery names the exact failed parent and cannot report its replacement');
+  assert.ok(noOfferDiagnostics.some((event) => event.stage === 'watch_recovery'
+    && event.outcome === 'started' && event.code === 'track_missing'
+    && event.reconnectCount === 1 && event.streamTransport === 'tree_web'),
+  'the browser no-offer recovery reaches the bounded Engine diagnostic path');
+  noOfferRecovery.onWatchMessage('no-offer', noOfferWatch, {
+    data: JSON.stringify({ t: 'assign-parent', parentId: 'offering-parent' }),
+  });
+  assert.equal(timers.size, 1);
+  noOfferRecovery.onWatchMessage('no-offer', noOfferWatch, {
+    data: JSON.stringify({ t: 'sdp', from: 'offering-parent', type: 'offer', sdp: 'offering-sdp' }),
+  });
+  assert.equal(noOfferWatch.parentOfferTimer, null,
+    'the exact parent offer cancels its signaling deadline before asynchronous negotiation');
+  assert.equal(timers.get(noOfferWatch.parentMediaTimer)?.delay, 12000,
+    'the exact parent offer replaces its signaling deadline with a decoded-frame deadline');
+  await Promise.resolve();
+  await Promise.resolve();
+  const zeroRtpVideo = { kind: 'video', readyState: 'live', muted: true };
+  noOfferRecovery.playbackCandidates.set('no-offer', zeroRtpVideo);
+  noOfferRecovery.containers.set('no-offer', { getVideoTracks: () => [zeroRtpVideo] });
+  assert.equal(noOfferRecovery.confirmPlayback('no-offer', zeroRtpVideo), false,
+    'a static zero-RTP receiver cannot borrow the retained frame to confirm playback');
+  fire(noOfferWatch.parentMediaTimer);
+  assert.deepEqual(noOfferSent.at(-1), {
+    t: 'request-reparent', streamId: 'no-offer', targetParentId: null,
+    reason: 'track-missing', failedParentId: 'offering-parent',
+  }, 'an audio-only/offered relay is reported only after its exact video decode deadline');
+  assert.ok(noOfferDiagnostics.some((event) => event.stage === 'watch_playback'
+    && event.outcome === 'stalled' && event.code === 'decode_timeout'
+    && event.reconnectCount === 2),
+  'the administrator can distinguish an SDP no-offer from an offered stream with no decoded frame');
+  noOfferRecovery.playbackCandidates.set('no-offer', { kind: 'video', readyState: 'live', muted: false });
+  noOfferRecovery.onWatchMessage('no-offer', noOfferWatch, {
+    data: JSON.stringify({ t: 'assign-parent', parentId: 'replacement-parent' }),
+  });
+  assert.equal(noOfferRecovery.playbackCandidates.has('no-offer'), false,
+    'a live track from the retired parent cannot confirm the replacement generation');
+  assert.deepEqual([...timers.values()].map((task) => task.delay).sort((a, b) => a - b), [8000, 15000],
+    'the exact-parent watchdog reports failure before the seamless frozen-tile failsafe');
+  noOfferRecovery.teardownWatch('no-offer', noOfferWatch);
+
   const reparents = new TreeVideoTransport();
   const sent = [];
   const watch = {
@@ -448,30 +626,96 @@ try {
     parentGeneration: 1,
     offerGeneration: 0,
     joinFallbackTimer: null,
+    parentOfferTimer: null,
     reparentTimer: null,
   };
   reparents.watches.set('stream', watch);
   await reparents.onParentOffer('stream', watch, 'offer');
   const peer = watch.pc;
+  let endBrowserTrack = null;
+  const browserTrack = {
+    kind: 'video', readyState: 'live', muted: false,
+    addEventListener(type, listener) { if (type === 'ended') endBrowserTrack = listener; },
+  };
+  const browserTracks = [];
+  reparents.containers.set('stream', {
+    getTracks: () => browserTracks,
+    getVideoTracks: () => browserTracks.filter((track) => track.kind === 'video'),
+    addTrack: (track) => browserTracks.push(track),
+    removeTrack: (track) => { const index = browserTracks.indexOf(track); if (index >= 0) browserTracks.splice(index, 1); },
+  });
+  reparents.videoTracks.set('stream', {});
+  peer.ontrack({ track: browserTrack });
+  assert.equal(reparents.confirmPlayback('stream', { kind: 'video', readyState: 'live', muted: false }), false,
+    'a late frame callback owned by the retired track cannot confirm its replacement');
+  assert.notEqual(watch.parentMediaTimer, null,
+    'rejecting a stale track keeps the replacement decoded-frame deadline armed');
+  assert.equal(reparents.confirmPlayback('stream', browserTrack), true);
+  assert.equal(watch.parentMediaTimer, null,
+    'the first current-parent frame clears its initial media deadline');
+  browserTrack.readyState = 'ended';
+  endBrowserTrack();
+  assert.equal(reparents.playbackCandidates.has('stream'), false,
+    'an ended browser track immediately loses playback-confirmation authority');
+  assert.equal(timers.get(watch.parentMediaTimer)?.delay, 12000,
+    'an ended browser track re-arms exact-parent media recovery');
+  assert.equal([...timers.values()].some((task) => task.delay === 15000), true,
+    'an ended browser track has a bounded retained-frame failsafe');
   peer.connectionState = 'disconnected';
   peer.onconnectionstatechange();
   peer.onconnectionstatechange();
-  assert.equal(timers.size, 1,
+  assert.equal([...timers.values()].filter((task) => task.delay === 5000).length, 1,
     'repeated disconnected notifications share one exact-peer reparent timeout');
   peer.connectionState = 'connected';
   peer.onconnectionstatechange();
-  assert.equal(timers.size, 0,
+  assert.equal([...timers.values()].filter((task) => task.delay === 5000).length, 0,
     'connection recovery physically cancels its delayed reparent');
   peer.connectionState = 'disconnected';
   peer.onconnectionstatechange();
-  fire([...timers.keys()][0]);
+  const disconnectedTimer = [...timers.entries()].find(([, task]) => task.delay === 5000)?.[0];
+  fire(disconnectedTimer);
   assert.equal(sent.filter((message) => message.t === 'request-reparent').length, 1,
     'a sustained disconnect emits one reparent request');
   peer.onconnectionstatechange();
-  assert.equal(timers.size, 1);
-  reparents.teardownWatch('stream', watch, true);
+  assert.equal([...timers.values()].filter((task) => task.delay === 5000).length, 0,
+    'a committed recovery cannot arm another disconnected deadline for the same peer');
+  reparents.teardownWatch('stream', watch);
   assert.equal(timers.size, 0,
     'retiring the watch physically cancels its pending reparent timeout');
+
+  const iceOnly = new TreeVideoTransport();
+  const iceOnlySent = [];
+  const iceOnlyWatch = {
+    ...watch,
+    ws: { send: (payload) => iceOnlySent.push(JSON.parse(payload)) },
+    pc: null,
+    parentId: 'ice-parent',
+    closed: false,
+    pendingIce: [],
+    parentGeneration: 1,
+    offerGeneration: 0,
+    joinFallbackTimer: null,
+    parentOfferTimer: null,
+    parentMediaTimer: null,
+    reparentTimer: null,
+  };
+  iceOnly.watches.set('ice-only', iceOnlyWatch);
+  await iceOnly.onParentOffer('ice-only', iceOnlyWatch, 'offer');
+  const icePeer = iceOnlyWatch.pc;
+  icePeer.connectionState = 'connected';
+  icePeer.iceConnectionState = 'disconnected';
+  icePeer.oniceconnectionstatechange();
+  const iceDisconnectedTimer = [...timers.entries()].find(([, task]) => task.delay === 5000)?.[0];
+  assert.notEqual(iceDisconnectedTimer, undefined,
+    'an ICE-only disconnected edge gets the same bounded recovery deadline');
+  fire(iceDisconnectedTimer);
+  assert.equal(iceOnlySent.filter((message) => message.t === 'request-reparent').length, 1,
+    'sustained ICE-only failure requests exactly one replacement parent');
+  icePeer.oniceconnectionstatechange();
+  assert.equal([...timers.values()].filter((task) => task.delay === 5000).length, 0,
+    'the committed ICE recovery cannot create a second timer for the same peer');
+  iceOnly.teardownWatch('ice-only', iceOnlyWatch);
+  assert.equal(timers.size, 0);
 
   const offerA = deferred();
   const offerB = deferred();
@@ -523,6 +767,9 @@ try {
   assert.deepEqual(overlapSent.filter((message) => message.t === 'sdp').map((message) => message.to), ['parent-b'],
     'only offer B can publish an SDP answer, addressed to its captured parent');
   assert.equal(peerConnections.includes(peerA) && peerConnections.includes(peerB), true);
+  overlap.teardownWatch('overlap', overlappingWatch, true);
+  assert.equal(timers.size, 0,
+    'retiring overlapping offers also cancels the current decoded-frame deadline');
 
   const nativeOfferA = deferred();
   const nativeOfferB = deferred();
@@ -770,6 +1017,187 @@ try {
   assert.equal(statusDiagnostics.filter((event) => event.code === 'signaling_forbidden').length, 1,
     'a retired native generation cannot append a late Rust status');
   assert.equal(timers.size, 0);
+
+  class FakeMediaStream {
+    tracks = [];
+    getTracks() { return this.tracks; }
+    getVideoTracks() { return this.tracks.filter((track) => track.kind === 'video'); }
+    addTrack(track) { this.tracks.push(track); }
+    removeTrack(track) { this.tracks = this.tracks.filter((candidate) => candidate !== track); }
+  }
+  globalThis.MediaStream = FakeMediaStream;
+  globalThis.MediaStreamVideoHandle = class {
+    constructor(stream) { this.stream = stream; }
+  };
+  const audioFirstStarts = [];
+  const audioFirstStartWaiters = [];
+  const audioFirstStops = [];
+  globalThis.onNativeWatchOffer = async () => () => {};
+  globalThis.onNativeWatchIce = async () => () => {};
+  globalThis.onNativeTopology = async () => () => {};
+  globalThis.onNativeWatchEnded = async () => () => {};
+  globalThis.onNativeWatchStatus = async () => () => {};
+  globalThis.startNativeWatch = async (...args) => {
+    audioFirstStarts.push(args);
+    audioFirstStartWaiters.shift()?.();
+  };
+  globalThis.stopNativeWatch = async (...args) => { audioFirstStops.push(args); };
+  const waitForAudioFirstStart = () => new Promise((resolve) => audioFirstStartWaiters.push(resolve));
+  const audioFirstRecovery = new TreeVideoTransport();
+  const audioFirstDiagnostics = [];
+  audioFirstRecovery.onWatchDiagnostic((event) => audioFirstDiagnostics.push(event));
+  audioFirstRecovery.liveStreams.set('audio-first-recovery', {});
+  const firstNativeStart = waitForAudioFirstStart();
+  audioFirstRecovery.watch('audio-first-recovery');
+  await firstNativeStart;
+  const firstAudioFirstState = audioFirstRecovery.nativeWatches.get('audio-first-recovery');
+  assert.ok(firstAudioFirstState);
+  await audioFirstRecovery.onNativeOffer('audio-first-recovery', firstAudioFirstState, 'first-offer');
+  firstAudioFirstState.pc.connectionState = 'failed';
+  firstAudioFirstState.pc.onconnectionstatechange();
+  assert.equal(audioFirstRecovery.reWatchAttempts.get('audio-first-recovery'), 1);
+  const firstAudioFirstRetry = audioFirstRecovery.watchRetryTimers.get('audio-first-recovery');
+  assert.equal(timers.get(firstAudioFirstRetry)?.delay, 1500,
+    'the first native negotiation failure uses the initial recovery delay');
+
+  const secondNativeStart = waitForAudioFirstStart();
+  fire(firstAudioFirstRetry);
+  await secondNativeStart;
+  const secondAudioFirstState = audioFirstRecovery.nativeWatches.get('audio-first-recovery');
+  assert.ok(secondAudioFirstState);
+  await audioFirstRecovery.onNativeOffer('audio-first-recovery', secondAudioFirstState, 'second-offer');
+  secondAudioFirstState.pc.ontrack({ track: { kind: 'audio' } });
+  assert.equal(audioFirstRecovery.reWatchAttempts.get('audio-first-recovery'), 1,
+    'audio arriving before video does not erase the failed native recovery attempt');
+  secondAudioFirstState.pc.connectionState = 'failed';
+  secondAudioFirstState.pc.onconnectionstatechange();
+  assert.equal(audioFirstRecovery.reWatchAttempts.get('audio-first-recovery'), 2,
+    'a repeated failure after audio-first negotiation advances the reconnect count');
+  const secondAudioFirstRetry = audioFirstRecovery.watchRetryTimers.get('audio-first-recovery');
+  assert.equal(timers.get(secondAudioFirstRetry)?.delay, 3000,
+    'audio-first negotiation preserves exponential backoff for the next native retry');
+  assert.deepEqual(audioFirstDiagnostics.filter((event) => event.stage === 'watch_recovery'
+    && event.outcome === 'started').map((event) => event.reconnectCount), [1, 2]);
+  assert.equal(audioFirstStarts.length, 2);
+  assert.equal(audioFirstStops.length, 2);
+  audioFirstRecovery.unwatch('audio-first-recovery');
+  assert.equal(timers.size, 0);
+
+  const endedStops = [];
+  globalThis.stopNativeWatch = async (...args) => { endedStops.push(args); };
+  const endedRecovery = new TreeVideoTransport();
+  const endedRecoveryDiagnostics = [];
+  endedRecovery.onWatchDiagnostic((event) => endedRecoveryDiagnostics.push(event));
+  const endedState = seedNativeAttempt(endedRecovery, 'ended-recovery', 807);
+  const makeVideoTrack = (readyState = 'live') => {
+    let endedListener = null;
+    return {
+      kind: 'video',
+      readyState,
+      addEventListener(type, listener) {
+        if (type === 'ended') endedListener = listener;
+      },
+      end() {
+        this.readyState = 'ended';
+        endedListener?.();
+      },
+    };
+  };
+  await endedRecovery.onNativeOffer('ended-recovery', endedState, 'ended-offer-a');
+  const replacedPeer = endedState.pc;
+  const replacedTrack = makeVideoTrack();
+  replacedPeer.ontrack({ track: replacedTrack });
+  await endedRecovery.onNativeOffer('ended-recovery', endedState, 'ended-offer-b');
+  const currentPeer = endedState.pc;
+  replacedTrack.end();
+  assert.equal(endedRecovery.nativeWatches.get('ended-recovery'), endedState,
+    'a video track ending naturally on a replaced peer cannot retire its exact-owner successor');
+  assert.equal(endedRecovery.watchRetryTimers.has('ended-recovery'), false);
+  assert.deepEqual(endedStops, []);
+
+  const currentTrack = makeVideoTrack();
+  endedRecovery.reWatchAttempts.set('ended-recovery', 2);
+  const retainedFailsafe = globalThis.window.setTimeout(() => {}, 15_000);
+  endedRecovery.videoFailsafe.set('ended-recovery', retainedFailsafe);
+  currentPeer.ontrack({ track: currentTrack });
+  assert.equal(endedRecovery.reWatchAttempts.get('ended-recovery'), 2,
+    'ontrack alone cannot erase consecutive recovery history before a decoded frame');
+  assert.equal(endedRecovery.videoFailsafe.has('ended-recovery'), true,
+    'a merely attached track cannot disarm the retained-frame deadline');
+  endedRecovery.confirmPlayback('ended-recovery', currentTrack);
+  assert.equal(endedRecovery.reWatchAttempts.has('ended-recovery'), false,
+    'a decoded frame replenishes the native recovery budget');
+  assert.equal(endedRecovery.videoFailsafe.has('ended-recovery'), false,
+    'a decoded frame disarms the exact retained-frame deadline');
+  currentTrack.end();
+  assert.equal(endedState.closed, true,
+    'an ended video track retires the current native watch owner');
+  assert.equal(endedRecovery.nativeWatches.has('ended-recovery'), false);
+  assert.equal(endedRecovery.reWatchAttempts.get('ended-recovery'), 1);
+  const endedRetry = endedRecovery.watchRetryTimers.get('ended-recovery');
+  assert.equal(timers.get(endedRetry)?.delay, 1500,
+    'an ended current native video track starts bounded recovery without waiting for decode timeout');
+  assert.deepEqual(endedStops, [['ended-recovery', 807]]);
+  assert.equal(endedRecovery.playbackCandidates.has('ended-recovery'), false,
+    'retiring the native owner invalidates its retained live-looking playback candidate');
+  endedRecovery.confirmPlayback('ended-recovery', currentTrack);
+  assert.equal(endedRecovery.reWatchAttempts.get('ended-recovery'), 1,
+    'a stale media-element callback cannot reset recovery after its exact video track ended');
+  currentTrack.end();
+  assert.equal(endedRecovery.reWatchAttempts.get('ended-recovery'), 1,
+    'a repeated ended callback from the retired owner cannot schedule a duplicate recovery');
+  assert.deepEqual(endedStops, [['ended-recovery', 807]]);
+
+  endedRecovery.clearWatchRetry('ended-recovery');
+  const secondEndedState = seedNativeAttempt(endedRecovery, 'ended-recovery', 808);
+  await endedRecovery.onNativeOffer('ended-recovery', secondEndedState, 'ended-offer-c');
+  const secondEndedTrack = makeVideoTrack();
+  secondEndedState.pc.ontrack({ track: secondEndedTrack });
+  secondEndedTrack.end();
+  assert.equal(endedRecovery.reWatchAttempts.get('ended-recovery'), 2);
+  const secondEndedRetry = endedRecovery.watchRetryTimers.get('ended-recovery');
+  assert.equal(timers.get(secondEndedRetry)?.delay, 3000,
+    'a second pre-decode ended track advances native recovery backoff');
+
+  endedRecovery.clearWatchRetry('ended-recovery');
+  const thirdEndedState = seedNativeAttempt(endedRecovery, 'ended-recovery', 809);
+  await endedRecovery.onNativeOffer('ended-recovery', thirdEndedState, 'ended-offer-d');
+  const thirdEndedTrack = makeVideoTrack();
+  thirdEndedState.pc.ontrack({ track: thirdEndedTrack });
+  thirdEndedTrack.end();
+  assert.equal(endedRecovery.reWatchAttempts.get('ended-recovery'), 3);
+  const thirdEndedRetry = endedRecovery.watchRetryTimers.get('ended-recovery');
+  assert.equal(timers.get(thirdEndedRetry)?.delay, 6000,
+    'a third pre-decode ended track receives the final bounded retry');
+
+  endedRecovery.clearWatchRetry('ended-recovery');
+  const exhaustedEndedState = seedNativeAttempt(endedRecovery, 'ended-recovery', 810);
+  await endedRecovery.onNativeOffer('ended-recovery', exhaustedEndedState, 'ended-offer-e');
+  const exhaustedEndedTrack = makeVideoTrack();
+  exhaustedEndedState.pc.ontrack({ track: exhaustedEndedTrack });
+  exhaustedEndedTrack.end();
+  assert.equal(endedRecovery.watchRetryTimers.has('ended-recovery'), false,
+    'the exhausted recovery budget cannot create a fourth native retry');
+  assert.equal(endedRecovery.intended.has('ended-recovery'), false,
+    'terminal recovery removes the transport watch intent');
+  assert.ok(endedRecoveryDiagnostics.some((event) => event.stage === 'watch_recovery'
+    && event.outcome === 'timed_out' && event.code === 'track_missing'
+    && event.reconnectCount === 3),
+  'terminal ended-track recovery is diagnosable with its exact bounded count');
+  endedRecovery.unwatch('ended-recovery');
+  assert.equal(timers.size, 0);
+
+  const immediateEnded = new TreeVideoTransport();
+  const immediateEndedState = seedNativeAttempt(immediateEnded, 'already-ended', 811);
+  await immediateEnded.onNativeOffer('already-ended', immediateEndedState, 'already-ended-offer');
+  immediateEndedState.pc.ontrack({ track: makeVideoTrack('ended') });
+  assert.equal(immediateEnded.nativeWatches.has('already-ended'), false,
+    'a video track already ended at ontrack retires its exact native owner immediately');
+  assert.equal(immediateEnded.videoTracks.has('already-ended'), false,
+    'an already-ended video track never becomes the visible stream handle');
+  assert.equal(timers.get(immediateEnded.watchRetryTimers.get('already-ended'))?.delay, 1500);
+  immediateEnded.unwatch('already-ended');
+  assert.equal(timers.size, 0);
 } finally {
   if (previousWindowSetTimeout === undefined) delete globalThis.window.setTimeout;
   else globalThis.window.setTimeout = previousWindowSetTimeout;
@@ -791,6 +1219,10 @@ try {
   if (previousWindowSetInterval === undefined) delete globalThis.window.setInterval;
   else globalThis.window.setInterval = previousWindowSetInterval;
   globalThis.clearInterval = previousClearInterval;
+  if (previousMediaStream === undefined) delete globalThis.MediaStream;
+  else globalThis.MediaStream = previousMediaStream;
+  if (previousMediaStreamVideoHandle === undefined) delete globalThis.MediaStreamVideoHandle;
+  else globalThis.MediaStreamVideoHandle = previousMediaStreamVideoHandle;
   const restoreGlobal = (name, previous) => {
     if (previous === undefined) delete globalThis[name];
     else globalThis[name] = previous;
@@ -820,7 +1252,23 @@ const executableLivekitJs = ts.transpileModule(executableLivekitSource, {
 const previousExactPeerStatsSampler = globalThis.ExactPeerStatsSampler;
 const previousTrack = globalThis.Track;
 const previousBaseUid = globalThis.baseUid;
+const previousLivekitWindowSetTimeout = globalThis.window.setTimeout;
+const previousLivekitWindowClearTimeout = globalThis.window.clearTimeout;
 try {
+  let nextLivekitTimer = 0;
+  const livekitTimers = new Map();
+  globalThis.window.setTimeout = (callback, delay) => {
+    const id = ++nextLivekitTimer;
+    livekitTimers.set(id, { callback, delay });
+    return id;
+  };
+  globalThis.window.clearTimeout = (id) => { livekitTimers.delete(Number(id)); };
+  const fireLivekitTimer = (id) => {
+    const task = livekitTimers.get(id);
+    assert.ok(task, `LiveKit timer ${id} must still be owned`);
+    livekitTimers.delete(id);
+    task.callback();
+  };
   globalThis.ExactPeerStatsSampler = class {};
   globalThis.Track = {
     Source: { ScreenShare: 'screen', ScreenShareAudio: 'screen-audio' },
@@ -831,26 +1279,35 @@ try {
     `data:text/javascript;base64,${Buffer.from(executableLivekitJs).toString('base64')}`
   );
   const subscriptionCalls = [];
-  const videoPublication = {
-    source: 'screen', trackSid: 'video-one',
-    setSubscribed: (value) => subscriptionCalls.push(['video-one', value]),
-  };
-  const audioPublication = {
-    source: 'screen-audio', trackSid: 'audio-one',
-    setSubscribed: (value) => subscriptionCalls.push(['audio-one', value]),
-  };
+  const publication = (trackSid, source = 'screen') => ({
+    source, trackSid, track: null,
+    setSubscribed: (value) => subscriptionCalls.push([trackSid, value]),
+  });
+  const videoPublication = publication('video-one');
+  const audioPublication = publication('audio-one', 'screen-audio');
   const participant = {
     identity: 'local-watch-key:session-one',
-    getTrackPublication: (source) => source === 'screen' ? videoPublication
-      : source === 'screen-audio' ? audioPublication : undefined,
+    screenPublication: videoPublication,
+    audioPublication,
+    getTrackPublication(source) {
+      return source === 'screen' ? this.screenPublication
+        : source === 'screen-audio' ? this.audioPublication : undefined;
+    },
   };
   const remoteParticipants = new Map([[participant.identity, participant]]);
   const livekit = new LiveKitVideoTransport();
   livekit.room = { remoteParticipants };
   const livekitDiagnostics = [];
   const livekitVideoTracks = [];
+  const livekitTerminalFailures = [];
   livekit.onWatchDiagnostic((event) => livekitDiagnostics.push(event));
   livekit.onVideoTrack((key, track, identity) => livekitVideoTracks.push({ key, track, identity }));
+  livekit.onSeamlessSwitchFailed((identity) => {
+    livekitTerminalFailures.push(identity);
+    // Mirrors Engine's terminal callback: the broadcaster remains discoverable, while the failed
+    // logical watch is fully released so a later explicit click can start a new generation.
+    livekit.unwatch(identity);
+  });
   livekit.watch('local-watch-key');
   assert.deepEqual(livekitDiagnostics.slice(0, 4).map(({ stage, outcome, code }) => (
     [stage, outcome, code]
@@ -862,53 +1319,270 @@ try {
   ], 'LiveKit reports room selection and screen publication subscription');
   assert.deepEqual(subscriptionCalls, [['video-one', true], ['audio-one', true]]);
 
+  const firstMediaTrack = { readyState: 'live', muted: false };
   const firstTrack = {
-    kind: 'video', mediaStreamTrack: { readyState: 'live' }, detach: () => [],
+    kind: 'video', mediaStreamTrack: firstMediaTrack, detach: () => [],
   };
+  videoPublication.track = firstTrack;
   livekit.onSub(firstTrack, videoPublication, participant);
   assert.ok(livekitDiagnostics.some((event) => event.stage === 'watch_track'
     && event.outcome === 'ok' && event.trackState === 'live'));
+  assert.equal(livekit.confirmPlayback('local-watch-key', firstMediaTrack), true,
+    'the exact first decoded LiveKit track confirms the initial watch');
 
   remoteParticipants.delete(participant.identity);
   livekit.onRemoteUnpub(videoPublication, participant);
   assert.ok(livekitDiagnostics.some((event) => event.stage === 'watch_recovery'
     && event.outcome === 'started' && event.reconnectCount === 1));
 
-  const replacementPublication = {
-    source: 'screen', trackSid: 'video-two',
-    setSubscribed: (value) => subscriptionCalls.push(['video-two', value]),
-  };
+  const replacementPublication = publication('video-two');
   const replacement = {
     identity: 'local-watch-key:session-two',
-    getTrackPublication: (source) => source === 'screen' ? replacementPublication : undefined,
+    screenPublication: replacementPublication,
+    audioPublication: undefined,
+    getTrackPublication(source) {
+      return source === 'screen' ? this.screenPublication
+        : source === 'screen-audio' ? this.audioPublication : undefined;
+    },
   };
   remoteParticipants.set(replacement.identity, replacement);
   livekit.onRemotePub(replacementPublication, replacement);
-  livekit.onSub({
-    kind: 'video', mediaStreamTrack: { readyState: 'live' }, detach: () => [],
-  }, replacementPublication, replacement);
+  const replacementMediaTrack = { readyState: 'live', muted: false };
+  const replacementTrack = {
+    kind: 'video', mediaStreamTrack: replacementMediaTrack, detach: () => [],
+  };
+  replacementPublication.track = replacementTrack;
+  livekit.onSub(replacementTrack, replacementPublication, replacement);
+  assert.equal(livekitDiagnostics.some((event) => event.stage === 'watch_recovery'
+    && event.outcome === 'recovered'), false,
+  'TrackSubscribed alone cannot report a recovered stream before a decoded frame');
+  assert.equal(livekit.confirmPlayback('local-watch-key', firstMediaTrack), false,
+    'a decoded callback from the retired LiveKit session cannot confirm its replacement');
+  assert.equal(livekit.confirmPlayback('local-watch-key', replacementMediaTrack), true,
+    'the exact replacement decoded frame closes the structured recovery sequence');
   assert.ok(livekitDiagnostics.some((event) => event.stage === 'watch_recovery'
-    && event.outcome === 'recovered' && event.reconnectCount === 1),
-  'a replacement LiveKit session closes the structured recovery sequence');
+    && event.outcome === 'recovered' && event.reconnectCount === 1));
   const acceptedTrackCount = livekitVideoTracks.length;
-  livekit.onSub({
-    kind: 'video', mediaStreamTrack: { readyState: 'live' }, detach: () => [],
-  }, videoPublication, participant);
+  livekit.onSub(firstTrack, videoPublication, participant);
   assert.equal(livekitVideoTracks.length, acceptedTrackCount,
     'a late subscribed track from the retired LiveKit session never reaches Engine');
   assert.equal(subscriptionCalls.at(-1)?.[1], false,
     'a late subscribed track from the retired LiveKit session is unsubscribed again');
 
-  const discoveryPublication = { source: 'screen', trackSid: 'discovery-video' };
+  const callsBeforeUnexpectedUnsub = subscriptionCalls.length;
+  livekit.onUnsub(replacementTrack, replacementPublication, replacement);
+  assert.equal(subscriptionCalls.length, callsBeforeUnexpectedUnsub,
+    'an unexpected LiveKit unsubscribe does not synchronously recurse into setSubscribed');
+  const retryState = livekit.watchRetryStates.get('local-watch-key');
+  assert.equal(livekitTimers.get(retryState?.timer)?.delay, 250,
+    'the exact publication receives one queued bounded resubscribe owner');
+  fireLivekitTimer(retryState.timer);
+  assert.deepEqual(subscriptionCalls.slice(-1), [['video-two', true]],
+    'the first bounded retry re-subscribes the current exact publication');
+  assert.equal([...livekitTimers.values()].some(({ delay }) => delay === 1000), true,
+    'a missing TrackSubscribed edge schedules only the next bounded retry');
+  replacementPublication.track = replacementTrack;
+  livekit.onSub(replacementTrack, replacementPublication, replacement);
+  assert.equal(livekit.watchRetryStates.get('local-watch-key')?.attempts, 1,
+    'TrackSubscribed retains the consumed recovery budget until a decoded frame');
+  assert.equal(livekitTimers.get(livekit.watchRetryStates.get('local-watch-key')?.timer)?.delay, 4000,
+    'a subscribed recovery track owns one bounded decoded-frame deadline');
+  assert.equal(livekitDiagnostics.filter((event) => event.stage === 'watch_recovery'
+    && event.outcome === 'recovered').length, 1,
+  'a subscribed-but-not-decoded track does not emit another recovered event');
+
+  livekit.onUnsub(replacementTrack, replacementPublication, replacement);
+  const secondRetry = livekit.watchRetryStates.get('local-watch-key');
+  assert.equal(livekitTimers.get(secondRetry?.timer)?.delay, 1000,
+    'Sub→Unsub resumes at the second delay instead of resetting to 250 ms');
+  fireLivekitTimer(secondRetry.timer);
+  assert.equal(secondRetry.attempts, 2);
+  const secondMediaTrack = { readyState: 'live', muted: false };
+  const secondTrack = { kind: 'video', mediaStreamTrack: secondMediaTrack, detach: () => [] };
+  replacementPublication.track = secondTrack;
+  livekit.onSub(secondTrack, replacementPublication, replacement);
+  const noDecodeTimer = livekit.watchRetryStates.get('local-watch-key')?.timer;
+  assert.equal(livekitTimers.get(noDecodeTimer)?.delay, 4000);
+  fireLivekitTimer(noDecodeTimer);
+  const thirdRetry = livekit.watchRetryStates.get('local-watch-key');
+  assert.equal(livekitTimers.get(thirdRetry?.timer)?.delay, 2500);
+  assert.ok(livekitDiagnostics.some((event) => event.stage === 'watch_playback'
+    && event.outcome === 'stalled' && event.code === 'decode_timeout'),
+  'a TrackSubscribed event without a decoded confirmation continues bounded recovery');
+  fireLivekitTimer(thirdRetry.timer);
+  assert.equal(thirdRetry.attempts, 3);
+  assert.equal(thirdRetry.exhausted, false);
+  assert.equal(livekitTimers.get(thirdRetry.timer)?.delay, 4000,
+    'the last physical resubscribe gets a bounded window for asynchronous TrackSubscribed delivery');
+  assert.deepEqual(livekitTerminalFailures, []);
+
+  const oldAudioTrack = { kind: 'audio', detach: () => [] };
+  audioPublication.track = oldAudioTrack;
+  const replacementAudioPublication = publication('audio-two', 'screen-audio');
+  const replacementAudioTrack = { kind: 'audio', detach: () => [] };
+  replacementAudioPublication.track = replacementAudioTrack;
+  replacement.audioPublication = replacementAudioPublication;
+  assert.equal(livekit.acceptsScreenAudio(
+    'local-watch-key', participant, audioPublication, oldAudioTrack,
+  ), false, 'a late screen-audio track from the retired same-username session is rejected');
+  assert.equal(livekit.acceptsScreenAudio(
+    'local-watch-key', replacement, replacementAudioPublication,
+  ), true, 'the exact replacement watch owner may attach its current screen-audio publication');
+  assert.equal(livekit.acceptsScreenAudio(
+    'local-watch-key', replacement, replacementAudioPublication, replacementAudioTrack,
+  ), true, 'the exact replacement screen-audio track passes the full ownership fence');
+  assert.equal(livekit.acceptsScreenAudio(
+    'local-watch-key', replacement, replacementAudioPublication, oldAudioTrack,
+  ), false, 'an old track callback cannot impersonate the current screen-audio publication');
+
+  fireLivekitTimer(thirdRetry.timer);
+  assert.equal(thirdRetry.exhausted, true);
+  assert.equal(thirdRetry.timer, null);
+  assert.deepEqual(livekitTerminalFailures, ['local-watch-key']);
+  assert.equal(livekit.watchRetryStates.has('local-watch-key'), false,
+    'terminal recovery callback releases the exact retry owner');
+  assert.equal(livekit.watchedUsers.has('local-watch-key'), false,
+    'terminal recovery callback releases the logical watch guard');
+  assert.equal(livekit.acceptsScreenAudio(
+    'local-watch-key', replacement, replacementAudioPublication, replacementAudioTrack,
+  ), false, 'terminal unwatch invalidates even the formerly exact screen-audio owner');
+  assert.ok(subscriptionCalls.some(([trackSid, subscribed]) => (
+    trackSid === 'audio-two' && subscribed === false
+  )), 'terminal unwatch unsubscribes the exact current screen-audio publication');
+  const timedOutCount = livekitDiagnostics.filter((event) => event.stage === 'watch_recovery'
+    && event.outcome === 'timed_out').length;
+  livekit.onUnsub(secondTrack, replacementPublication, replacement);
+  assert.equal(livekitTimers.size, 0,
+    'a duplicate unsubscribe cannot restart an exhausted recovery episode');
+  assert.equal(livekitDiagnostics.filter((event) => event.stage === 'watch_recovery'
+    && event.outcome === 'timed_out').length, timedOutCount,
+  'an exhausted recovery episode reports its timeout exactly once');
+
+  const lateMediaTrack = { readyState: 'live', muted: false };
+  const lateTrack = { kind: 'video', mediaStreamTrack: lateMediaTrack, detach: () => [] };
+  const subscribeCountBeforeRewatch = subscriptionCalls.length;
+  livekit.watch('local-watch-key');
+  assert.equal(livekit.watchedUsers.has('local-watch-key'), true);
+  assert.ok(subscriptionCalls.length > subscribeCountBeforeRewatch,
+    'an explicit click after terminal exhaustion starts a fresh physical subscription');
+  replacementPublication.track = lateTrack;
+  livekit.onSub(lateTrack, replacementPublication, replacement);
+  assert.equal(livekit.confirmPlayback('local-watch-key', lateMediaTrack), true,
+    'the exact decoded frame confirms the new explicit watch generation');
+  assert.equal(livekit.watchRetryStates.has('local-watch-key'), false);
+  livekit.onUnsub(lateTrack, replacementPublication, replacement);
+  assert.equal(livekitTimers.get(livekit.watchRetryStates.get('local-watch-key')?.timer)?.delay, 250,
+    'after an exact decoded recovery, a later genuine outage receives a fresh bounded budget');
+
+  const acceptedBeforeEnded = livekitVideoTracks.length;
+  const endedTrack = {
+    kind: 'video', mediaStreamTrack: { readyState: 'ended', muted: true }, detach: () => [],
+  };
+  replacementPublication.track = endedTrack;
+  livekit.onSub(endedTrack, replacementPublication, replacement);
+  assert.equal(livekitVideoTracks.length, acceptedBeforeEnded,
+    'an already-ended LiveKit track cannot reach Engine or confirm recovery');
+  assert.equal([...livekitTimers.values()].some(({ delay }) => delay === 250), true,
+    'an already-ended current publication joins the existing bounded recovery path');
+  const retiredRetryCallback = livekitTimers.get(
+    livekit.watchRetryStates.get('local-watch-key')?.timer,
+  )?.callback;
+  livekit.unwatch('local-watch-key');
+  assert.equal(livekitTimers.size, 0,
+    'explicit unwatch cancels every queued LiveKit resubscribe before SDK unsubscribe callbacks');
+  const callsAfterUnwatch = subscriptionCalls.length;
+  retiredRetryCallback?.();
+  assert.equal(subscriptionCalls.length, callsAfterUnwatch,
+    'a physically late timer callback cannot resubscribe after unwatch');
+
+  let lateDetachCount = 0;
+  const discoveryPublication = publication('discovery-video');
   const discoveryParticipant = {
     identity: 'unwatched-user:session-one',
     getTrackPublication: () => discoveryPublication,
   };
-  livekit.onSub({
-    kind: 'video', mediaStreamTrack: { readyState: 'live' }, detach: () => [],
-  }, discoveryPublication, discoveryParticipant);
-  assert.equal(livekitVideoTracks.at(-1)?.identity, 'unwatched-user',
-    'an unwatched LiveKit publication keeps the existing discovery behavior');
+  remoteParticipants.set(discoveryParticipant.identity, discoveryParticipant);
+  const discoveryTrack = {
+    kind: 'video', mediaStreamTrack: { readyState: 'live', muted: false },
+    detach: () => { lateDetachCount += 1; return []; },
+  };
+  discoveryPublication.track = discoveryTrack;
+  const beforeUnwatched = livekitVideoTracks.length;
+  livekit.onSub(discoveryTrack, discoveryPublication, discoveryParticipant);
+  assert.equal(livekitVideoTracks.length, beforeUnwatched,
+    'a late ScreenShare subscription after unwatch never resurrects a tile');
+  assert.equal(lateDetachCount, 1);
+  assert.deepEqual(subscriptionCalls.at(-1), ['discovery-video', false]);
+
+  const cameraPublication = publication('camera-video', 'camera');
+  const cameraTrack = {
+    kind: 'video', mediaStreamTrack: { readyState: 'live', muted: false }, detach: () => [],
+  };
+  cameraPublication.track = cameraTrack;
+  const callsBeforeCamera = subscriptionCalls.length;
+  livekit.onSub(cameraTrack, cameraPublication, discoveryParticipant);
+  assert.equal(livekitVideoTracks.length, beforeUnwatched,
+    'a camera track cannot enter the screen-share registry');
+  assert.equal(subscriptionCalls.length, callsBeforeCamera,
+    'screen transport does not mutate an unrelated camera subscription');
+
+  const republishCalls = [];
+  const republishA = {
+    source: 'screen', trackSid: 'same-track-sid', track: null,
+    setSubscribed: (value) => republishCalls.push(['a', value]),
+  };
+  const republishB = {
+    source: 'screen', trackSid: 'same-track-sid', track: null,
+    setSubscribed: (value) => republishCalls.push(['b', value]),
+  };
+  const republisher = {
+    identity: 'republisher:one', screenPublication: republishA,
+    getTrackPublication(source) { return source === 'screen' ? this.screenPublication : undefined; },
+  };
+  const republishRoom = { remoteParticipants: new Map([[republisher.identity, republisher]]) };
+  const republish = new LiveKitVideoTransport();
+  republish.room = republishRoom;
+  const republishDiagnostics = [];
+  const republishStops = [];
+  republish.onWatchDiagnostic((event) => republishDiagnostics.push(event));
+  republish.onStreamStop((identity) => republishStops.push(identity));
+  republish.watch('republisher');
+  const mediaA = { readyState: 'live', muted: false };
+  const trackA = { kind: 'video', mediaStreamTrack: mediaA, detach: () => [] };
+  republishA.track = trackA;
+  republish.onSub(trackA, republishA, republisher);
+  assert.equal(republish.confirmPlayback('republisher', mediaA), true);
+  republisher.screenPublication = republishB;
+  republish.onRemotePub(republishB, republisher);
+  const mediaB = { readyState: 'live', muted: false };
+  const trackB = { kind: 'video', mediaStreamTrack: mediaB, detach: () => [] };
+  republishB.track = trackB;
+  republish.onSub(trackB, republishB, republisher);
+  const recoveryCountBeforeStale = republishDiagnostics.filter((event) => event.stage === 'watch_recovery').length;
+  republish.onUnsub(trackA, republishA, republisher);
+  republish.onRemoteUnpub(republishA, republisher);
+  assert.equal(republish.getVideoTrack('same-track-sid'), trackB,
+    'late events from an old same-SID publication cannot delete the replacement tile');
+  assert.equal(republishDiagnostics.filter((event) => event.stage === 'watch_recovery').length,
+    recoveryCountBeforeStale, 'same-participant republish does not manufacture recovery');
+  assert.deepEqual(republishStops, [],
+    'old Unpublished cannot announce stream stop while the same participant still shares');
+  assert.equal(republishCalls.some(([owner, value]) => owner === 'b' && value === false), false,
+    'old publication cleanup never unsubscribes the exact current replacement');
+  const mediaB2 = { readyState: 'live', muted: false };
+  const trackB2 = { kind: 'video', mediaStreamTrack: mediaB2, detach: () => [] };
+  republishB.track = trackB2;
+  republish.onSub(trackB2, republishB, republisher);
+  const callsBeforeOldTrack = republishCalls.length;
+  republish.onSub(trackB, republishB, republisher);
+  assert.equal(republishCalls.length, callsBeforeOldTrack,
+    'a late old-track callback on the current publication cannot unsubscribe its replacement');
+  assert.equal(republish.getVideoTrack('same-track-sid'), trackB2,
+    'a late old-track callback cannot delete the current same-publication track');
+  assert.equal(republish.confirmPlayback('republisher', mediaA), false);
+  assert.equal(republish.confirmPlayback('republisher', mediaB), false);
+  assert.equal(republish.confirmPlayback('republisher', mediaB2), true);
+  republish.unwatch('republisher');
   const allowedDiagnosticKeys = new Set([
     'streamId', 'stage', 'outcome', 'code', 'connectionState', 'iceState', 'trackState',
     'reconnectCount', 'streamTransport',
@@ -925,6 +1599,10 @@ try {
   else globalThis.Track = previousTrack;
   if (previousBaseUid === undefined) delete globalThis.baseUid;
   else globalThis.baseUid = previousBaseUid;
+  if (previousLivekitWindowSetTimeout === undefined) delete globalThis.window.setTimeout;
+  else globalThis.window.setTimeout = previousLivekitWindowSetTimeout;
+  if (previousLivekitWindowClearTimeout === undefined) delete globalThis.window.clearTimeout;
+  else globalThis.window.clearTimeout = previousLivekitWindowClearTimeout;
 }
 
 assert.match(treeSource, /\[\.\.\.this\.browserWatchStarts\.keys\(\)\][\s\S]*this\.unwatch\(streamId\)/,

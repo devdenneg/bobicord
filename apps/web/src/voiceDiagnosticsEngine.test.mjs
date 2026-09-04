@@ -7,6 +7,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 // Git may check the source out with CRLF on the Windows Tauri runner. Normalize it before
 // structural source assertions so CI validates the code rather than the host line-ending policy.
 const engine = readFileSync(join(here, 'engine.ts'), 'utf8').replace(/\r\n?/g, '\n');
+const store = readFileSync(join(here, 'store.ts'), 'utf8').replace(/\r\n?/g, '\n');
 
 assert.match(engine, /VoiceDiagnosticsRecorder[\s\S]*VoiceEventLoopStallMonitor[\s\S]*detectVoiceDiagnosticNetworkType/,
   'Engine uses the bounded client recorder and foreground-only stall monitor');
@@ -27,18 +28,53 @@ assert.match(engine, /beginStreamWatchDiagnostic[\s\S]*stream_watch_started[\s\S
   'one structured timeline starts at the exact viewer click and receives transport progress');
 assert.match(engine, /finishStreamWatchDiagnostic[\s\S]*streamDiagnosticOutbox\.enqueue/,
   'a terminal stream result is persisted before its upload starts');
-assert.match(engine, /const attempt = this\.streamWatchDiagnostics\.get\(event\.streamId\);[\s\S]*attempt\.recorder\.record\(\{[\s\S]*kind:/,
+assert.match(engine, /let attempt = this\.streamWatchDiagnostics\.get\(event\.streamId\);[\s\S]*attempt\.recorder\.record\(\{[\s\S]*kind:/,
   'the broadcaster identity is consumed only as a local routing key');
 assert.match(engine, /confirmWatchPlayback[\s\S]*stream_watch_recovered[\s\S]*stream_watch_succeeded/,
   'the first playable frame always emits a success or recovered control report');
 assert.match(engine, /decode_timeout[\s\S]*clearWatch\(identity, true\)/,
   'the exact 20 second watch owner records its terminal timeout before cleanup');
-assert.match(engine, /closeWatch\(identity: string\)[\s\S]*pendingWatch\.has\(identity\)[\s\S]*stream_watch_failed[\s\S]*outcome: 'cancelled'[\s\S]*code: 'aborted'[\s\S]*clearWatch\(identity, true\)/,
-  'closing a still-pending tile preserves the failed attempt before exact transport cleanup');
-assert.match(engine, /clearAllWatches\([\s\S]*const failure = unexpectedFailure \?\?[\s\S]*outcome: 'cancelled'[\s\S]*code: 'aborted'[\s\S]*finishStreamWatchDiagnostic\(identity, 'stream_watch_failed', failure\)/,
+assert.match(engine, /closeWatch\(identity: string, watchEndReason:[\s\S]*streamWatchDiagnostics\.has\(identity\)[\s\S]*stream_watch_failed[\s\S]*outcome: 'cancelled'[\s\S]*code: 'aborted'[\s\S]*watchEndReason[\s\S]*clearWatch\(identity, true\)/,
+  'closing an initial or in-place recovery attempt preserves it before exact transport cleanup');
+assert.match(engine, /clearAllWatches\([\s\S]*const failure = unexpectedFailure \?\?[\s\S]*outcome: 'cancelled'[\s\S]*code: 'aborted'[\s\S]*finishStreamWatchDiagnostic\(identity, 'stream_watch_failed',[\s\S]*watchEndReason/,
   'server exit and ordinary engine teardown preserve every pending watch timeline');
 assert.match(engine, /if \(wasViewing\)[\s\S]*clearAllWatches\(\{[\s\S]*watch_signaling[\s\S]*signaling_closed/,
   'an unexpected room loss persists pending watch attempts before transport teardown');
+assert.match(engine, /clearAllWatches\(\{[\s\S]*signaling_closed[\s\S]*}, 'connection_loss'\)/,
+  'terminal room loss labels the exact reason instead of looking like a user cancellation');
+assert.match(engine, /watchEndReason: 'playback_timeout'/,
+  'the first-frame deadline is distinguishable from lifecycle teardown');
+assert.match(engine, /event\.stage === 'watch_recovery' && event\.outcome === 'started'[\s\S]*attempt\.streamTransport === 'tree_native' \|\| attempt\.streamTransport === 'tree_web'[\s\S]*event\.code === 'track_missing' \|\| event\.code === 'decode_timeout'[\s\S]*extendWatchDeadlineForRecovery/,
+  'native zero-RTP and server-confirmed browser no-offer recovery extend the exact pending first-frame attempt');
+assert.match(engine, /const beginsPostSuccessRecovery = event\.stage === 'watch_recovery' && event\.outcome === 'started'[\s\S]*!attempt && beginsPostSuccessRecovery && this\.watching\.has\(event\.streamId\)[\s\S]*beginStreamWatchDiagnostic\(event\.streamId, transport, playbackGeneration, true\)/,
+  'only an actual transport recovery opens a post-success report; transient ICE observations do not manufacture failures');
+assert.doesNotMatch(engine, /isPostSuccessStreamWatchRecoveryCause/,
+  'raw failed or stalled observations cannot own a delayed post-success timeout');
+assert.match(engine, /watchPlaybackGenerations\.get\(event\.streamId\)[\s\S]*playbackGeneration > 0/,
+  'post-success recovery uses the logical watch generation even when LiveKit replaces its TrackSid');
+assert.doesNotMatch(engine, /const playbackGeneration = this\.watchPlaybackGate\.generationFor\(event\.streamId, event\.streamId\)/,
+  'a tree-shaped identity lookup cannot suppress LiveKit recovery reports');
+assert.match(engine, /STREAM_WATCH_RECOVERY_REPORT_DEADLINE_MS = 30_000/,
+  'post-success recovery diagnostics have an independent finite terminal deadline');
+assert.match(engine, /armStreamWatchRecoveryTimer[\s\S]*const generation = attempt\.diagnosticGeneration[\s\S]*owner\.generation !== generation[\s\S]*current\.diagnosticGeneration !== generation[\s\S]*finishStreamWatchDiagnostic\(identity, 'stream_watch_failed'/,
+  'a late recovery timer can finish only its exact diagnostic generation');
+assert.match(engine, /finishStreamWatchDiagnostic[\s\S]*cancelStreamWatchRecoveryTimer\(identity, attempt\.diagnosticGeneration\)[\s\S]*streamWatchDiagnostics\.delete\(identity\)/,
+  'success, failure, end and replacement cleanup retire the exact post-success timer');
+assert.match(engine, /if \(!this\.pendingWatch\.has\(identity\)\) return;[\s\S]*boundedWatchRecoveryDeadline[\s\S]*if \(deadlineAt <= attempt\.deadlineAt\) return;[\s\S]*armWatchDeadline\(identity, deadlineAt\)/,
+  'successive proven recoveries may extend the deadline only while the tested absolute cap advances');
+assert.match(engine, /confirmWatchPlayback\([\s\S]*candidate\?: MediaStreamTrack,[\s\S]*watchPlaybackGate\.confirms[\s\S]*const accepted = [^\n]*confirmPlayback\?\.\(identity, candidate\);[\s\S]*if \(accepted === false\) return;[\s\S]*const attempt = this\.streamWatchDiagnostics\.get\(identity\);[\s\S]*if \(!attempt\) return/,
+  'a stale retained tree frame cannot complete the replacement watch or reset its recovery owner');
+for (const reason of ['session_terminal', 'logout', 'server_exit', 'auth_handoff']) {
+  assert.match(store, new RegExp(`(?:disconnect|detachView)\\([^\\n]*'${reason}'`),
+    `store teardown records the ${reason} watch end reason`);
+}
+const disconnectBody = engine.match(/disconnect\([\s\S]*?\n  }\n\n  \/\/ Уйти со СМОТРИМОГО сервера/)?.[0] || '';
+const logoutOutboxDisposeAt = disconnectBody.indexOf('if (discardVoiceDiagnostics) this.streamDiagnosticOutbox.dispose(true)');
+const terminalWatchFlushAt = disconnectBody.indexOf('this.clearAllWatches(undefined, watchEndReason)');
+const retainedOutboxDisposeAt = disconnectBody.indexOf('if (!discardVoiceDiagnostics) this.streamDiagnosticOutbox.dispose(false)');
+assert.ok(logoutOutboxDisposeAt >= 0 && logoutOutboxDisposeAt < terminalWatchFlushAt
+  && terminalWatchFlushAt < retainedOutboxDisposeAt,
+  'logout revokes old-account ownership first, while non-logout persists terminal watch reports before stopping delivery');
 
 for (const event of [
   'join_started', 'intent_finished', 'hub_connected', 'lease_claimed',
@@ -105,7 +141,7 @@ assert.match(engine, /finishVoiceDiagnostics[\s\S]*resetVoiceDiagnostics\(\)/,
   'a failed upload survives the exact voice exit that produced it');
 assert.match(engine, /voiceDiagnosticRetryHandler = \(\) => this\.retryPendingVoiceDiagnostic\(\)[\s\S]*addEventListener\('online', this\.voiceDiagnosticRetryHandler\)[\s\S]*addEventListener\('visibilitychange', this\.voiceDiagnosticRetryHandler\)[\s\S]*addEventListener\('pageshow', this\.voiceDiagnosticRetryHandler\)/,
   'the account-scoped Engine retries an offline or hidden report after any foreground edge');
-assert.match(engine, /disconnect\(discardVoiceDiagnostics = false\)[\s\S]*if \(discardVoiceDiagnostics\)[\s\S]*voiceDiagnosticAccountActive = false[\s\S]*clearVoiceDiagnosticPendingReport\(\)[\s\S]*if \(discardVoiceDiagnostics && this\.voiceDiagnosticRetryHandler\)[\s\S]*removeEventListener\('online', this\.voiceDiagnosticRetryHandler\)[\s\S]*removeEventListener\('visibilitychange', this\.voiceDiagnosticRetryHandler\)[\s\S]*removeEventListener\('pageshow', this\.voiceDiagnosticRetryHandler\)/,
+assert.match(engine, /disconnect\([\s\S]*discardVoiceDiagnostics = false,[\s\S]*if \(discardVoiceDiagnostics\)[\s\S]*voiceDiagnosticAccountActive = false[\s\S]*clearVoiceDiagnosticPendingReport\(\)[\s\S]*if \(discardVoiceDiagnostics && this\.voiceDiagnosticRetryHandler\)[\s\S]*removeEventListener\('online', this\.voiceDiagnosticRetryHandler\)[\s\S]*removeEventListener\('visibilitychange', this\.voiceDiagnosticRetryHandler\)[\s\S]*removeEventListener\('pageshow', this\.voiceDiagnosticRetryHandler\)/,
   'only explicit logout invalidates the retained report while transport-only teardown preserves it');
 assert.match(engine, /if \(discardVoiceDiagnostics\)[\s\S]*clearVoiceDiagnosticPendingReport\(\)[\s\S]*clearVoiceDiagnosticQueuedReport\(\)/,
   'explicit logout discards every report snapshot owned by the old account');

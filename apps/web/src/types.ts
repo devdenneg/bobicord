@@ -108,6 +108,10 @@ export type VoiceDiagnosticIncident =
   | 'output_route_failed' | 'ui_stall' | 'session_ended'
   | 'stream_watch_succeeded' | 'stream_watch_failed' | 'stream_watch_recovered';
 export type VoiceDiagnosticClientKind = 'web' | 'native';
+export type VoiceDiagnosticWatchEndReason =
+  | 'user_close' | 'view_switch' | 'server_exit' | 'auth_handoff' | 'session_terminal'
+  | 'logout' | 'engine_dispose' | 'connection_loss' | 'stream_ended' | 'quality_change'
+  | 'recovery_failed' | 'playback_timeout' | 'superseded' | 'unknown';
 export interface VoiceDiagnosticClient {
   kind: VoiceDiagnosticClientKind;
   platform: 'ios' | 'ipados' | 'android' | 'macos' | 'windows' | 'linux' | 'other' | 'unknown';
@@ -148,6 +152,7 @@ export interface VoiceDiagnosticEvent {
   outputOperation?: 'enumerate' | 'set_sink' | 'create_context' | 'rebind' | 'resume' | 'start_audio';
   micMode?: 'voice' | 'ptt' | 'unknown';
   streamTransport?: 'livekit' | 'tree_web' | 'tree_native';
+  watchEndReason?: VoiceDiagnosticWatchEndReason;
   networkType?: VoiceDiagnosticClient['networkType'];
   documentHidden?: boolean;
   online?: boolean;

@@ -5,7 +5,7 @@ import {
 import { isWindowIdle, onWindowIdle } from './windowIdle';
 import type {
   User, Member, ChatMessage, Emote, HistoryMessage, ReplyRef, Attachment, Reaction, ReleaseNote,
-  VoiceDiagnosticEvent, VoiceDiagnosticIncident, VoiceDiagnosticReport,
+  VoiceDiagnosticEvent, VoiceDiagnosticIncident, VoiceDiagnosticReport, VoiceDiagnosticWatchEndReason,
 } from './types';
 import { baseUid } from './util';
 import { notify } from './notify';
@@ -66,6 +66,7 @@ import {
   StreamWatchPlaybackGate,
   applyExactScreenAudioGain,
   audioSinkRoutesConfirmed,
+  boundedWatchRecoveryDeadline,
   exactWebAudioMixContext,
   effectiveStreamGain,
   rebindExactWebAudioMixContexts,
@@ -184,6 +185,13 @@ const VAD_WATCHDOG_MS = 700; // как часто перепроверяем п�
 const OUTPUT_CONTEXT_RECOVERY_TIMEOUT_MS = 8_000;
 const WATCH_MAX = 4; // грид: сколько чужих стримов зритель смотрит разом (веб — tree-WS/PC на стрим, натив — Rust relay-слот на стрим)
 const WATCH_VIDEO_DEADLINE_MS = 20_000; // cellular signaling + TURN may be slow, but an attempt must never spin forever
+// Once the transport has proved that it is replacing a dead parent, give the fresh 4G/TURN path
+// a full bounded ICE+decode window. The absolute cap below still prevents an endless spinner.
+const WATCH_VIDEO_RECOVERY_GRACE_MS = 20_000;
+const WATCH_VIDEO_MAX_DEADLINE_MS = 30_000;
+// Initial playback owns the functional watch deadline above. A later in-place recovery keeps the
+// tile alive, but its diagnostic report still needs an independent finite terminal boundary.
+const STREAM_WATCH_RECOVERY_REPORT_DEADLINE_MS = 30_000;
 const STREAM_EDGE_GRACE_MS = 500;
 const STREAM_MESSAGE_AGGREGATE_MS = 30_000;
 const VOICE_DIAGNOSTIC_REPORT_COOLDOWN_MS = 15_000;
@@ -240,9 +248,14 @@ interface VoiceDiagnosticRtcTotals {
 
 interface StreamWatchDiagnosticAttempt {
   recorder: VoiceDiagnosticsRecorder;
+  diagnosticGeneration: number;
   playbackGeneration: number;
   reconnectCount: number;
+  hadRecovery: boolean;
+  postSuccessRecovery: boolean;
   streamTransport: NonNullable<VoiceDiagnosticEvent['streamTransport']>;
+  startedAt: number;
+  deadlineAt: number;
 }
 
 // Error objects never enter a report. Only an allowlisted category and, for API responses, a
@@ -499,7 +512,10 @@ export class Engine {
   private pttPointerDown = false;
   private watchTimers = new Map<string, number>();
   private watchPlaybackGate = new StreamWatchPlaybackGate();
+  private watchPlaybackGenerations = new Map<string, number>();
   private streamWatchDiagnostics = new Map<string, StreamWatchDiagnosticAttempt>();
+  private streamWatchDiagnosticGeneration = 0;
+  private streamWatchRecoveryTimers = new Map<string, { generation: number; timer: number }>();
   private streamDiagnosticOutbox: DiagnosticReportOutbox;
 
   // mic pipeline: raw device -> [denoise?] -> gain (громкость/мут) -> published track
@@ -721,6 +737,20 @@ export class Engine {
     };
     const onStreamStart = (source: StreamSource, identity: string, silent: boolean) => this.onStreamSourceStart(source, identity, silent);
     const onStreamStop = (source: StreamSource, identity: string) => this.onStreamSourceStop(source, identity);
+    const onWatchRecoveryFailed = (sid: string) => {
+      // emitWatchDiagnostic has already appended the transport timeout synchronously. Seal that
+      // attempt before closeWatch performs the ordinary user-cancel cleanup, otherwise the most
+      // useful failed recovery trace would be discarded together with the frozen tile.
+      this.finishStreamWatchDiagnostic(sid, 'stream_watch_failed', {
+        stage: 'watch_recovery', outcome: 'timed_out', code: 'decode_timeout', trackState: 'missing',
+        watchEndReason: 'recovery_failed',
+      });
+      // The transport has exhausted its exact recovery owner. Clear matching Engine ownership too;
+      // otherwise watching.has(sid) makes every explicit retry a permanent no-op. This is deliberately
+      // not streamStop: the broadcaster remains discoverable and can be watched again immediately.
+      this.closeWatch(sid, 'recovery_failed');
+      this.hooks.toast('Не удалось восстановить трансляцию — можно подключиться снова', 'warn');
+    };
     const transports: Array<[StreamSource, VideoTransport]> = [['livekit', this.liveKitT], ['tree', this.treeT]];
     for (const [source, t] of transports) {
       t.onVideoTrack(onVideoTrack as any);
@@ -728,6 +758,7 @@ export class Engine {
       t.onStreamStart((identity, silent) => onStreamStart(source, identity, silent));
       t.onStreamStop((identity) => onStreamStop(source, identity));
       t.onWatchDiagnostic?.((event) => this.recordStreamWatchTransportDiagnostic(event));
+      t.onSeamlessSwitchFailed?.(onWatchRecoveryFailed);
     }
     // Э8: топология дерева меняется (join/leave/reparent) — перерисовать UI пикера пиров.
     this.treeT.onTopology?.(() => this.emit());
@@ -750,20 +781,6 @@ export class Engine {
       this.treeT.setQuality?.(sid, 'source');
       this.emit();
     });
-    // Бесшовное переключение (смена качества/reparent/reconnect) не доехало за failsafe —
-    // плитка закрыта, чтобы не морозить последний кадр. Тост + рефреш стримов.
-    this.treeT.onSeamlessSwitchFailed?.((sid) => {
-      // emitWatchDiagnostic has already appended the transport timeout synchronously. Seal that
-      // attempt before closeWatch performs the ordinary user-cancel cleanup, otherwise the most
-      // useful failed recovery trace would be discarded together with the frozen tile.
-      this.finishStreamWatchDiagnostic(sid, 'stream_watch_failed', {
-        stage: 'watch_recovery', outcome: 'timed_out', code: 'decode_timeout', trackState: 'missing',
-      });
-      // The transport already removed its failed tile. Clear the matching Engine ownership too;
-      // otherwise watching.has(sid) makes every explicit retry a permanent no-op.
-      this.closeWatch(sid);
-      this.hooks.toast('Не удалось переключить качество — стрим прервался, можно подключиться снова', 'warn');
-    });
     this.ensureOutputLifecycleListeners();
     this.ensureInputLifecycleListener();
     this.snap = this.build();
@@ -783,30 +800,96 @@ export class Engine {
     return isTauri ? 'tree_native' : 'tree_web';
   }
 
+  private cancelStreamWatchRecoveryTimer(identity: string, generation?: number): void {
+    const owner = this.streamWatchRecoveryTimers.get(identity);
+    if (!owner || (generation !== undefined && owner.generation !== generation)) return;
+    window.clearTimeout(owner.timer);
+    this.streamWatchRecoveryTimers.delete(identity);
+  }
+
+  private cancelAllStreamWatchRecoveryTimers(): void {
+    this.streamWatchRecoveryTimers.forEach(({ timer }) => window.clearTimeout(timer));
+    this.streamWatchRecoveryTimers.clear();
+  }
+
+  private armStreamWatchRecoveryTimer(identity: string, attempt: StreamWatchDiagnosticAttempt): void {
+    this.cancelStreamWatchRecoveryTimer(identity);
+    const generation = attempt.diagnosticGeneration;
+    const timer = window.setTimeout(() => {
+      const owner = this.streamWatchRecoveryTimers.get(identity);
+      if (!owner || owner.generation !== generation || owner.timer !== timer) return;
+      this.streamWatchRecoveryTimers.delete(identity);
+      const current = this.streamWatchDiagnostics.get(identity);
+      if (!current || current.diagnosticGeneration !== generation || !current.postSuccessRecovery) return;
+      // This deadline closes diagnostics only. Functional recovery/failsafe ownership stays in the
+      // transport, so logging can never tear down a stream which recovered at the boundary.
+      this.finishStreamWatchDiagnostic(identity, 'stream_watch_failed', {
+        stage: 'watch_recovery', outcome: 'timed_out', code: 'decode_timeout', trackState: 'missing',
+        watchEndReason: 'recovery_failed',
+      });
+    }, STREAM_WATCH_RECOVERY_REPORT_DEADLINE_MS);
+    this.streamWatchRecoveryTimers.set(identity, { generation, timer });
+  }
+
   private beginStreamWatchDiagnostic(
     identity: string,
     transport: VideoTransport,
     playbackGeneration: number,
+    postSuccessRecovery = false,
   ): void {
+    // A replacement logical attempt owns a fresh report generation. Its predecessor's timer cannot
+    // finish or mutate this recorder even if the browser delivers the old callback late.
+    this.cancelStreamWatchRecoveryTimer(identity);
     const recorder = new VoiceDiagnosticsRecorder();
     recorder.start();
+    const startedAt = Date.now();
+    const diagnosticGeneration = ++this.streamWatchDiagnosticGeneration;
     const streamTransport = this.streamWatchTransportFor(transport);
     recorder.record({
       kind: 'stream_watch_started', stage: 'watch_intent', outcome: 'started', code: 'none',
       streamTransport, ...this.streamWatchDiagnosticPageState(),
     });
-    this.streamWatchDiagnostics.set(identity, {
-      recorder, playbackGeneration, reconnectCount: 0, streamTransport,
-    });
+    const attempt: StreamWatchDiagnosticAttempt = {
+      recorder, diagnosticGeneration, playbackGeneration, reconnectCount: 0,
+      hadRecovery: postSuccessRecovery, postSuccessRecovery, streamTransport,
+      startedAt, deadlineAt: startedAt + WATCH_VIDEO_DEADLINE_MS,
+    };
+    this.streamWatchDiagnostics.set(identity, attempt);
+    if (postSuccessRecovery) this.armStreamWatchRecoveryTimer(identity, attempt);
   }
 
   private recordStreamWatchTransportDiagnostic(event: StreamWatchTransportDiagnostic): void {
     // streamId is deliberately consumed only as a local map key. It is never spread into the
     // recorder, so broadcaster identity cannot leave this device in the structured report.
-    const attempt = this.streamWatchDiagnostics.get(event.streamId);
+    let attempt = this.streamWatchDiagnostics.get(event.streamId);
+    // Initial success seals its report. A later incident starts only when the transport actually
+    // commits to a recovery operation. Raw ICE/add-candidate failures and brief `disconnected`
+    // states can recover in place; opening a report for those observations would manufacture a
+    // timeout 30 seconds later even though playback never stopped. Recovery-start carries the
+    // allowlisted causal code, so the useful reason is retained without persisting raw errors.
+    const beginsPostSuccessRecovery = event.stage === 'watch_recovery' && event.outcome === 'started';
+    if (!attempt && beginsPostSuccessRecovery && this.watching.has(event.streamId)) {
+      const transport = this.watchT.get(event.streamId);
+      // LiveKit's accepted stream key is a TrackSid rather than the broadcaster identity. Keep the
+      // logical watch generation separately so a post-success LiveKit failure can open its report
+      // before the replacement TrackSid exists; final playback is still checked by the exact gate.
+      const playbackGeneration = this.watchPlaybackGenerations.get(event.streamId) || 0;
+      if (transport && playbackGeneration > 0
+        && this.streamWatchTransportFor(transport) === event.streamTransport) {
+        this.beginStreamWatchDiagnostic(event.streamId, transport, playbackGeneration, true);
+        attempt = this.streamWatchDiagnostics.get(event.streamId);
+      }
+    }
     if (!attempt || event.streamTransport !== attempt.streamTransport) return;
     if (event.reconnectCount !== undefined) {
       attempt.reconnectCount = Math.max(attempt.reconnectCount, event.reconnectCount);
+    }
+    if (event.stage === 'watch_recovery' && event.outcome === 'started') {
+      attempt.hadRecovery = true;
+      if ((attempt.streamTransport === 'tree_native' || attempt.streamTransport === 'tree_web')
+        && (event.code === 'track_missing' || event.code === 'decode_timeout')) {
+        this.extendWatchDeadlineForRecovery(event.streamId, attempt);
+      }
     }
     attempt.recorder.record({
       kind: event.stage === 'watch_recovery' && event.outcome === 'started'
@@ -828,10 +911,12 @@ export class Engine {
     identity: string,
     incident: Extract<VoiceDiagnosticIncident,
       'stream_watch_succeeded' | 'stream_watch_failed' | 'stream_watch_recovered'>,
-    event: Pick<VoiceDiagnosticEvent, 'stage' | 'outcome' | 'code' | 'trackState' | 'canPlaybackAudio'>,
+    event: Pick<VoiceDiagnosticEvent,
+      'stage' | 'outcome' | 'code' | 'trackState' | 'canPlaybackAudio' | 'watchEndReason'>,
   ): void {
     const attempt = this.streamWatchDiagnostics.get(identity);
     if (!attempt) return;
+    this.cancelStreamWatchRecoveryTimer(identity, attempt.diagnosticGeneration);
     this.streamWatchDiagnostics.delete(identity);
     attempt.recorder.record({
       kind: 'stream_watch_finished',
@@ -1639,6 +1724,11 @@ export class Engine {
   /* ---------- subscription (useSyncExternalStore) ---------- */
   subscribe = (cb: () => void) => { this.subs.add(cb); return () => { this.subs.delete(cb); }; };
   getSnapshot = () => this.snap;
+  // Read the synchronous owner rather than Snapshot: connect() deliberately emits only after the
+  // LiveKit handshake, while duplicate navigation can arrive during that in-flight interval.
+  ownsViewConnection(serverId: string): boolean {
+    return !!serverId && this.viewServerId === serverId && this.viewRoom !== null;
+  }
   private emit() { this.snap = this.build(); this.subs.forEach((f) => f()); }
 
   private build(): Snapshot {
@@ -2921,7 +3011,7 @@ export class Engine {
         stage: 'watch_signaling', outcome: 'failed',
         code: typeof navigator === 'object' && navigator.onLine === false ? 'offline' : 'signaling_closed',
         trackState: 'missing',
-      });
+      }, 'connection_loss');
       ++this.connectEpoch;
       this.roomReady = false;
       this.viewRoom = null; this.viewServerId = '';
@@ -2971,7 +3061,10 @@ export class Engine {
   }
 
   // Полный teardown (logout / выход с сервера, где я в голосе): рвём ОБЕ комнаты + всё состояние.
-  disconnect(discardVoiceDiagnostics = false) {
+  disconnect(
+    discardVoiceDiagnostics = false,
+    watchEndReason: VoiceDiagnosticWatchEndReason = discardVoiceDiagnostics ? 'logout' : 'engine_dispose',
+  ) {
     // Fences every deferred voice-exit/settings-preview continuation before any asynchronous room
     // teardown. Logout/full disconnect must never resurrect microphone capture afterwards.
     this.engineLifecycleActive = false;
@@ -2984,7 +3077,6 @@ export class Engine {
       this.clearVoiceDiagnosticPendingReport();
       this.clearVoiceDiagnosticQueuedReport();
     }
-    this.streamDiagnosticOutbox.dispose(discardVoiceDiagnostics);
     this.cancelPendingVoiceJoin();
     if (this.deviceChangeHandler) {
       navigator.mediaDevices?.removeEventListener?.('devicechange', this.deviceChangeHandler);
@@ -3040,7 +3132,12 @@ export class Engine {
     document.querySelectorAll('#audioSink audio').forEach((a) => a.remove());
     this.clearVoiceAudio();
     this.clearScreenAudio();
-    this.clearAllWatches();
+    // A transport-only teardown must persist its terminal watch reports while this account still
+    // owns the outbox. Explicit logout reverses that order so neither queued nor just-finished data
+    // can escape after ownership has been revoked.
+    if (discardVoiceDiagnostics) this.streamDiagnosticOutbox.dispose(true);
+    this.clearAllWatches(undefined, watchEndReason);
+    if (!discardVoiceDiagnostics) this.streamDiagnosticOutbox.dispose(false);
     this.liveKitT.detach(); this.treeT.detach();
     this.streamWatchers.clear();
     this.perMuteByServer.clear(); this.volsByServer.clear(); this.messages = []; this.reactions.clear(); this.reactionWrites.clear(); this.reactionWriteSeq.clear(); this.reactionWriteDesired.clear(); this.pendingSend.clear(); this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0; this.chatPrepended = 0; this.chatRetentionLimit = CHAT_SESSION_MESSAGE_LIMIT; ++this.chatGeneration;
@@ -3072,7 +3169,7 @@ export class Engine {
 
   // Уйти со СМОТРИМОГО сервера (браузинг на другой / на главную-с-выходом), НЕ трогая голос: чистим
   // view-состояние (чат/стримы/presence-хинты/typing) и рвём viewRoom, ТОЛЬКО если она не голосовая.
-  detachView(nextServerId?: string) {
+  detachView(nextServerId?: string, watchEndReason: VoiceDiagnosticWatchEndReason = 'view_switch') {
     // A terminal reconnect replaces viewRoom before the store asks for a fresh token. Preserve an
     // explicit queued channel tap only when that retry targets the same server; ordinary browsing,
     // exit and a switch to another server still cancel it and release its gesture-owned context.
@@ -3084,7 +3181,7 @@ export class Engine {
     this.resetStreamEdges();
     this.messages = []; this.reactions.clear(); this.reactionWrites.clear(); this.reactionWriteSeq.clear(); this.reactionWriteDesired.clear(); this.pendingSend.clear(); this.chatMore = false; this.oldestSid = null; this.trimmedFront = 0; this.chatPrepended = 0; this.chatRetentionLimit = CHAT_SESSION_MESSAGE_LIMIT; ++this.chatGeneration;
     this.chatStateServerId = ''; this.chatRevision = 0; this.chatLastClearRevision = 0; this.chatRevisionKnown = false; this.canonicalSnapshotEstablished = false; this.chatEventBuffer = []; this.chatEventBufferOverflow = false; this.chatSnapshotSeenSids.clear(); this.canonicalMentionDeliveries.clear(); this.chatMentionFenceEstablished = false; this.chatSyncAgain = false; this.chatSyncFailures = 0; this.chatSyncPromise = null; this.chatMutationSeq.clear(); this.chatMutationWrites.clear(); this.chatEditDesired.clear(); ++this.chatSyncGeneration;
-    this.clearAllWatches(); this.streamWatchers.clear();
+    this.clearAllWatches(undefined, watchEndReason); this.streamWatchers.clear();
     // presence-хинты и typing принадлежат ПРЕДЫДУЩЕМУ смотримому серверу
     this.onlineHint.clear(); this.awayHint.clear(); this.voiceHint = {}; this.typingUsers.clear();
     this.liveKitT.detach(); this.treeT.detach();
@@ -3639,7 +3736,7 @@ export class Engine {
       const wasLive = this.stableStreams.has(username);
       if (!live) {
         // Teardown only after the union of LiveKit + tree stayed down through the grace window.
-        this.clearWatch(username);
+        this.clearWatch(username, false, 'stream_ended');
       }
       if (live === wasLive) { this.emit(); return; }
       if (live) {
@@ -6335,9 +6432,22 @@ export class Engine {
       const isScreen = pub.source === Track.Source.ScreenShareAudio;
       const u = baseUid(p.identity);
       if (isScreen && room === this.viewRoom) {
-        // A late TrackSubscribed from a replaced publication must not revive the old audio.
-        if (p.getTrackPublication(Track.Source.ScreenShareAudio)?.track !== track) {
-          try { track.detach().forEach((el) => el.remove()); } catch { /**/ }
+        // Screen audio is attached separately from its video, but it still belongs to the exact
+        // LiveKit watch owner. A late old-session callback (or one delivered during terminal
+        // unwatch) must not replace the audible entry selected by the current video publication.
+        const ownsPublication = this.watchT.get(u) === this.liveKitT
+          && this.liveKitT.acceptsScreenAudio?.(u, p, pub) === true;
+        const ownsTrack = ownsPublication
+          && this.liveKitT.acceptsScreenAudio?.(u, p, pub, track) === true;
+        if (!ownsTrack) {
+          // Do not unsubscribe a current publication merely because this callback belongs to its
+          // retired RemoteTrack: setSubscribed(false) would also turn off the exact replacement.
+          if (!ownsPublication) {
+            try { (pub as any).setSubscribed(false); } catch { /** stale publication */ }
+          }
+          if (!this.removeScreenAudio(u, p.identity, track)) {
+            try { track.detach().forEach((el) => el.remove()); } catch { /** stale track */ }
+          }
           this.emit(); return;
         }
         this.removeScreenAudio(u);
@@ -6372,10 +6482,16 @@ export class Engine {
     const u = baseUid(p.identity);
     this.clearSubscriptionRetries(p.identity, (pub as any).trackSid || (pub as any).sid, room);
     if (pub.source === Track.Source.ScreenShareAudio) {
-      // An old publication can unsubscribe after its replacement has already attached. Remove
-      // only the exact entry so that the new stream audio keeps playing.
+      const exactOwner = room === this.viewRoom && this.watchT.get(u) === this.liveKitT
+        && this.liveKitT.acceptsScreenAudio?.(u, p, pub, track) === true;
+      // An old publication can unsubscribe after its replacement has already attached. Always
+      // remove/detach only its exact entry; the owner predicate prevents this stale edge from being
+      // interpreted as a failure of the active video/audio session.
       if (!this.removeScreenAudio(u, p.identity, track)) {
         try { track.detach().forEach((el) => el.remove()); } catch { /**/ }
+      }
+      if (!exactOwner) {
+        this.emit(); return;
       }
     } else {
       try { track.detach().forEach((el) => el.remove()); } catch { /**/ }
@@ -6397,6 +6513,36 @@ export class Engine {
     this.watchTimers.forEach((timer) => window.clearTimeout(timer));
     this.watchTimers.clear();
   }
+  private armWatchDeadline(identity: string, deadlineAt: number) {
+    this.cancelWatchTimer(identity);
+    const timer = window.setTimeout(() => {
+      // A cancelled/replaced attempt is not allowed to tear down its successor.
+      if (this.watchTimers.get(identity) !== timer) return;
+      this.watchTimers.delete(identity);
+      if (this.pendingWatch.has(identity)) {
+        this.finishStreamWatchDiagnostic(identity, 'stream_watch_failed', {
+          stage: 'watch_playback', outcome: 'timed_out', code: 'decode_timeout', trackState: 'missing',
+          watchEndReason: 'playback_timeout',
+        });
+        this.clearWatch(identity, true);
+        this.hooks.toast('Не удалось подключиться к трансляции', 'err'); this.emit();
+      }
+    }, Math.max(0, deadlineAt - Date.now()));
+    this.watchTimers.set(identity, timer);
+  }
+  private extendWatchDeadlineForRecovery(identity: string, attempt: StreamWatchDiagnosticAttempt) {
+    if (!this.pendingWatch.has(identity)) return;
+    const deadlineAt = boundedWatchRecoveryDeadline(
+      attempt.startedAt,
+      attempt.deadlineAt,
+      Date.now(),
+      WATCH_VIDEO_RECOVERY_GRACE_MS,
+      WATCH_VIDEO_MAX_DEADLINE_MS,
+    );
+    if (deadlineAt <= attempt.deadlineAt) return;
+    attempt.deadlineAt = deadlineAt;
+    this.armWatchDeadline(identity, deadlineAt);
+  }
   private completeWatch(identity: string) {
     this.cancelWatchTimer(identity);
     this.pendingWatch.delete(identity);
@@ -6404,36 +6550,63 @@ export class Engine {
   watchPlaybackGeneration(identity: string, streamKey: string): number {
     return this.watchPlaybackGate.generationFor(identity, streamKey);
   }
-  confirmWatchPlayback(identity: string, streamKey: string, generation: number) {
-    if (!this.pendingWatch.has(identity) || !this.watchPlaybackGate.confirms(identity, streamKey, generation)) return;
+  confirmWatchPlayback(
+    identity: string,
+    streamKey: string,
+    generation: number,
+    candidate?: MediaStreamTrack,
+  ) {
+    if (!this.watchPlaybackGate.confirms(identity, streamKey, generation)) return;
+    // A decoded frame is the only safe point at which the tree transport may forget consecutive
+    // track/connection failures. Keep doing this after the initial diagnostic is complete so a
+    // later in-place stream recovery cannot remain stuck at the maximum backoff forever.
+    const accepted = this.watchT.get(identity)?.confirmPlayback?.(identity, candidate);
+    if (accepted === false) return;
     const attempt = this.streamWatchDiagnostics.get(identity);
+    if (!attempt) return;
+    const recovered = !!attempt && (attempt.hadRecovery || attempt.reconnectCount > 0);
     this.finishStreamWatchDiagnostic(
       identity,
-      attempt && attempt.reconnectCount > 0 ? 'stream_watch_recovered' : 'stream_watch_succeeded',
-      { stage: 'watch_playback', outcome: attempt && attempt.reconnectCount > 0 ? 'recovered' : 'ok', code: 'none', trackState: 'live' },
+      recovered ? 'stream_watch_recovered' : 'stream_watch_succeeded',
+      { stage: 'watch_playback', outcome: recovered ? 'recovered' : 'ok', code: 'none', trackState: 'live' },
     );
-    this.completeWatch(identity);
+    if (this.pendingWatch.has(identity)) this.completeWatch(identity);
     this.emit();
   }
-  private clearWatch(identity: string, discardDiagnostic = false) {
+  private clearWatch(
+    identity: string,
+    discardDiagnostic = false,
+    watchEndReason: VoiceDiagnosticWatchEndReason = 'unknown',
+  ) {
     const transport = this.watchT.get(identity) ?? this.transportFor(identity);
-    if (discardDiagnostic) this.streamWatchDiagnostics.delete(identity);
-    else if (this.pendingWatch.has(identity)) this.finishStreamWatchDiagnostic(
+    if (discardDiagnostic) {
+      const attempt = this.streamWatchDiagnostics.get(identity);
+      if (attempt) this.cancelStreamWatchRecoveryTimer(identity, attempt.diagnosticGeneration);
+      this.streamWatchDiagnostics.delete(identity);
+    }
+    else if (this.streamWatchDiagnostics.has(identity)) this.finishStreamWatchDiagnostic(
       identity, 'stream_watch_failed',
-      { stage: 'watch_track', outcome: 'failed', code: 'track_missing', trackState: 'missing' },
+      {
+        stage: 'watch_track', outcome: 'failed', code: 'track_missing', trackState: 'missing',
+        watchEndReason,
+      },
     );
     this.cancelWatchTimer(identity);
     this.watching.delete(identity);
     this.pendingWatch.delete(identity);
     this.watchPlaybackGate.end(identity);
+    this.watchPlaybackGenerations.delete(identity);
     transport.unwatch(identity);
     this.watchT.delete(identity);
   }
   private clearAllWatches(
     unexpectedFailure?: Pick<VoiceDiagnosticEvent, 'stage' | 'outcome' | 'code' | 'trackState'>,
+    watchEndReason: VoiceDiagnosticWatchEndReason = 'unknown',
   ) {
     this.cancelAllWatchTimers();
-    const identities = new Set([...this.watching, ...this.pendingWatch, ...this.watchT.keys()]);
+    const identities = new Set([
+      ...this.watching, ...this.pendingWatch, ...this.watchT.keys(), ...this.streamWatchDiagnostics.keys(),
+    ]);
     // Leaving/reloading the viewed server can race the 20-second first-frame deadline. Preserve a
     // terminal snapshot for every still-pending attempt instead of silently deleting the exact
     // timeline the administrator needs. Explicit logout has already discarded the account outbox,
@@ -6445,8 +6618,11 @@ export class Engine {
       trackState: 'missing' as const,
     };
     identities.forEach((identity) => {
-      if (this.pendingWatch.has(identity)) {
-        this.finishStreamWatchDiagnostic(identity, 'stream_watch_failed', failure);
+      if (this.streamWatchDiagnostics.has(identity)) {
+        this.finishStreamWatchDiagnostic(identity, 'stream_watch_failed', {
+          ...failure,
+          watchEndReason,
+        });
       }
     });
     identities.forEach((identity) => {
@@ -6457,7 +6633,9 @@ export class Engine {
     this.pendingWatch.clear();
     this.watchT.clear();
     this.watchPlaybackGate.clear();
+    this.watchPlaybackGenerations.clear();
     this.streamWatchDiagnostics.clear();
+    this.cancelAllStreamWatchRecoveryTimers();
   }
 
   // Д3: quality пробрасывается в транспорт (выбор рендишн-дерева). Дефолт 'source' — UI-ключ
@@ -6479,31 +6657,24 @@ export class Engine {
     // existence is the VideoTransport's job (it no-ops safely on an unknown identity).
     this.watching.add(identity); this.pendingWatch.add(identity);
     const playbackGeneration = this.watchPlaybackGate.begin(identity);
+    this.watchPlaybackGenerations.set(identity, playbackGeneration);
     const t = this.transportFor(identity);
     this.watchT.set(identity, t); // пин: unwatch/статы пойдут в тот же транспорт, даже если объявление пропадёт
     this.beginStreamWatchDiagnostic(identity, t, playbackGeneration);
-    const timer = window.setTimeout(() => {
-      // A cancelled/replaced attempt is not allowed to tear down its successor.
-      if (this.watchTimers.get(identity) !== timer) return;
-      this.watchTimers.delete(identity);
-      if (this.pendingWatch.has(identity)) {
-        this.finishStreamWatchDiagnostic(identity, 'stream_watch_failed', {
-          stage: 'watch_playback', outcome: 'timed_out', code: 'decode_timeout', trackState: 'missing',
-        });
-        this.clearWatch(identity, true);
-        this.hooks.toast('Не удалось подключиться к трансляции', 'err'); this.emit();
-      }
-    }, WATCH_VIDEO_DEADLINE_MS);
-    this.watchTimers.set(identity, timer);
+    this.armWatchDeadline(
+      identity,
+      this.streamWatchDiagnostics.get(identity)?.deadlineAt ?? Date.now() + WATCH_VIDEO_DEADLINE_MS,
+    );
     try { t.watch(identity, quality); }
     catch (error) {
       const classified = classifyVoiceDiagnosticError(error);
       this.finishStreamWatchDiagnostic(identity, 'stream_watch_failed', {
         stage: 'watch_signaling', outcome: 'failed', code: classified.code || 'unknown', trackState: 'missing',
+        watchEndReason: 'recovery_failed',
       });
       this.cancelWatchTimer(identity);
       this.watching.delete(identity); this.pendingWatch.delete(identity);
-      this.watchPlaybackGate.end(identity); this.watchT.delete(identity);
+      this.watchPlaybackGate.end(identity); this.watchPlaybackGenerations.delete(identity); this.watchT.delete(identity);
       this.hooks.toast('Не удалось начать подключение к трансляции', 'err'); this.emit();
       return;
     }
@@ -6513,14 +6684,17 @@ export class Engine {
     }
     this.emit();
   }
-  closeWatch(identity: string) {
+  closeWatch(identity: string, watchEndReason: VoiceDiagnosticWatchEndReason = 'user_close') {
     // A real viewer action can arrive before the 20-second watchdog (for example after the native
     // client already surfaced a listener/signaling/ICE error). Preserve that bounded attempt before
     // the ordinary transport cleanup removes its local routing key. Successful/already-finalized
     // watches have no pending recorder here, so closing a healthy tile creates no extra incident.
-    if (this.pendingWatch.has(identity)) this.finishStreamWatchDiagnostic(
+    if (this.streamWatchDiagnostics.has(identity)) this.finishStreamWatchDiagnostic(
       identity, 'stream_watch_failed',
-      { stage: 'watch_playback', outcome: 'cancelled', code: 'aborted', trackState: 'missing' },
+      {
+        stage: 'watch_playback', outcome: 'cancelled', code: 'aborted', trackState: 'missing',
+        watchEndReason,
+      },
     );
     this.clearWatch(identity, true);
     const m = this.streamWatchers.get(identity); if (m) { m.delete(this.me.username); }
@@ -6624,7 +6798,7 @@ export class Engine {
   }
   private wset(sid: string) { let m = this.streamWatchers.get(sid); if (!m) { m = new Map(); this.streamWatchers.set(sid, m); } return m; }
   private cleanupWatchers() { const now = Date.now(); let ch = false; this.streamWatchers.forEach((m) => m.forEach((v, wid) => { if (now - v.ts > 9000) { m.delete(wid); ch = true; } })); if (ch) this.emit(); }
-  private cleanupPeer(id: string) { this.streamWatchers.delete(id); this.streamWatchers.forEach((m) => m.delete(id)); this.clearWatch(id); this.removeScreenAudio(id); } // voice analyser принадлежит media-room и снимается только её exact track event
+  private cleanupPeer(id: string) { this.streamWatchers.delete(id); this.streamWatchers.forEach((m) => m.delete(id)); this.clearWatch(id, false, 'stream_ended'); this.removeScreenAudio(id); } // voice analyser принадлежит media-room и снимается только её exact track event
 
   /* ---------- volumes ---------- */
   private volsFor(serverId: string | null | undefined) {

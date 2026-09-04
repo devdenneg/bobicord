@@ -26,6 +26,7 @@ import { readCatWallpaper, writeCatWallpaper } from '../chatWallpaper';
 import { fetchDownloadBlob } from '../downloadFetch';
 import {
   ExactMediaPlayCoordinator,
+  ExactVideoTrackFrameObserver,
   TreeStreamAudioController,
   effectiveStreamGain,
   playMediaElementCoordinated,
@@ -3053,6 +3054,7 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
   const [pickAnchor, setPickAnchor] = useState<DOMRect | null | undefined>(undefined);
   const sprayRef = useRef<HTMLButtonElement>(null);
   const audioControllerRef = useRef<TreeStreamAudioController | null>(null);
+  const exactVideoFrameObserverRef = useRef<ExactVideoTrackFrameObserver | null>(null);
   const videoPlayCoordinatorRef = useRef(new ExactMediaPlayCoordinator<HTMLVideoElement>());
   const streamVolumeGestureDeduperRef = useRef(new AudioUnlockGestureDeduper());
   const streamVolumeGesturePendingRef = useRef(false);
@@ -3062,6 +3064,7 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
   const wrapRef = useRef<HTMLDivElement>(null);
   const [prevVol, setPrevVol] = useState(100);
   const playbackGeneration = E.watchPlaybackGeneration(identity, streamKey);
+  const transportTrack = E.getVideoTrack(streamKey);
   const desiredStreamGain = effectiveStreamGain(getSettings().master, svol / 100, eng.deafened || isLocal);
   const desiredStreamGainRef = useRef(desiredStreamGain);
   desiredStreamGainRef.current = desiredStreamGain;
@@ -3078,7 +3081,10 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
   const floatSeq = useRef(1);
   const name = members.find((m) => m.username === identity)?.displayName || identity;
 
-  const attemptPlayback = useCallback(async (explicitGesture = false) => {
+  const attemptPlayback = useCallback(async (
+    explicitGesture = false,
+    decodedVideoCandidate?: MediaStreamTrack,
+  ) => {
     const v = vidRef.current;
     if (!v || document.visibilityState === 'hidden') return;
     const attempt = ++playAttemptSeq.current;
@@ -3103,7 +3109,14 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
     // A decoded frame still proves transport success when autoplay is blocked, but the same report
     // must explain why the viewer saw the explicit Retry control.
     if (!isLocal && v.videoWidth > 0 && v.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-      E.confirmWatchPlayback(identity, streamKey, playbackGeneration);
+      // Only the observer callback carries decoded-frame authority. An ordinary play()/gesture can
+      // see videoWidth retained from the predecessor after a LiveKit resubscribe or tree reparent;
+      // in that case request a fresh exact-generation frame instead of confirming stale pixels.
+      if (decodedVideoCandidate) {
+        E.confirmWatchPlayback(identity, streamKey, playbackGeneration, decodedVideoCandidate);
+      } else {
+        exactVideoFrameObserverRef.current?.requestCurrentFrame();
+      }
     }
     // WebKit иногда оставляет play() pending вместо NotAllowedError. После bounded
     // ожидания это такой же recoverable gesture-case: не прячем единственную кнопку Retry.
@@ -3111,7 +3124,7 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
   }, [E, identity, isLocal, playbackGeneration, streamKey]);
 
   useEffect(() => {
-    const track = E.getVideoTrack(streamKey); if (!track || !vidRef.current) return;
+    const track = transportTrack; if (!track || !vidRef.current) return;
     const v = vidRef.current;
     v.autoplay = true;
     v.playsInline = true;
@@ -3122,7 +3135,12 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
     const mediaStream = typeof streamHandle.getMediaStream === 'function'
       ? streamHandle.getMediaStream()
       : null;
-    const retry = () => { if (document.visibilityState !== 'hidden') void attemptPlayback(); };
+    const exactLiveKitVideo = !mediaStream && !isLocal
+      ? (track as unknown as { mediaStreamTrack?: MediaStreamTrack }).mediaStreamTrack
+      : undefined;
+    const retry = () => {
+      if (document.visibilityState !== 'hidden') void attemptPlayback(false);
+    };
     if (mediaStream && !isLocal) {
       const controller = new TreeStreamAudioController(v, mediaStream, {
         onNeedsUnlock: () => {
@@ -3160,21 +3178,40 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
       return;
     }
 
-    const visible = () => { if (document.visibilityState === 'visible') retry(); };
-    // Декодированный кадр = поток доехал. Это доказательство соединения, и оно не зависит
-    // от того, разрешил ли браузер автозапуск: у заблокированного видео первый кадр есть,
-    // просто оно стоит на паузе.
-    const confirmDecoded = () => {
+    let exactVideoFrames: ExactVideoTrackFrameObserver | null = null;
+    const finishDecoded = (candidate?: MediaStreamTrack) => {
       if (isLocal || !v.videoWidth || v.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
       if (document.visibilityState === 'hidden') {
         E.recordWatchPlaybackOutcome(
           identity, streamKey, playbackGeneration, 'waiting',
           mediaStream ? desiredStreamGainRef.current <= 0 : undefined,
         );
-        E.confirmWatchPlayback(identity, streamKey, playbackGeneration);
+        if (candidate) E.confirmWatchPlayback(identity, streamKey, playbackGeneration, candidate);
         return;
       }
-      void attemptPlayback();
+      void attemptPlayback(false, candidate);
+    };
+    if (!isLocal) {
+      // LiveKit gives each tile a RemoteTrack rather than Tree's stable combined MediaStream. Wrap
+      // that exact physical candidate only for frame ownership; replacing the same TrackSid changes
+      // `transportTrack`, tears this observer down and attaches the replacement before it can confirm.
+      const observedStream = mediaStream || (exactLiveKitVideo ? new MediaStream([exactLiveKitVideo]) : null);
+      if (observedStream) {
+        exactVideoFrames = new ExactVideoTrackFrameObserver(v, observedStream, finishDecoded);
+        exactVideoFrameObserverRef.current = exactVideoFrames;
+      }
+    }
+    const visible = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (exactVideoFrames) exactVideoFrames.requestCurrentFrame();
+      retry();
+    };
+    // Декодированный кадр = поток доехал. Это доказательство соединения, и оно не зависит
+    // от того, разрешил ли браузер автозапуск: у заблокированного видео первый кадр есть,
+    // просто оно стоит на паузе.
+    const confirmDecoded = () => {
+      if (exactVideoFrames) { exactVideoFrames.requestCurrentFrame(); return; }
+      finishDecoded();
     };
     const playable = () => {
       v.classList.add('ready');
@@ -3182,6 +3219,7 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
     };
     const playing = () => {
       v.classList.add('ready');
+      confirmDecoded();
       retry();
     };
     v.addEventListener('loadeddata', playable);
@@ -3210,10 +3248,12 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
       const controller = audioControllerRef.current;
       audioControllerRef.current = null;
       controller?.dispose();
+      if (exactVideoFrameObserverRef.current === exactVideoFrames) exactVideoFrameObserverRef.current = null;
+      exactVideoFrames?.dispose();
       videoPlayCoordinatorRef.current.forget(v);
       try { (track as any).detach(v); } catch { /**/ }
     };
-  }, [streamKey, isLocal, E, attemptPlayback, identity, playbackGeneration]);
+  }, [streamKey, isLocal, E, attemptPlayback, identity, playbackGeneration, transportTrack]);
 
   useEffect(() => E.onEmote((sid, emoteId, by, x, size) => {
     if (sid !== identity) return;

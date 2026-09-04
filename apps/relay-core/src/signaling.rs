@@ -2,7 +2,7 @@
 // нативного узла. Роль broadcaster (корень: offerer детям) ИЛИ viewer (relay: answerer
 // родителю, offerer детям). Формат сообщений — см. tree.js.
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::future::Future;
 use std::pin::Pin;
@@ -82,8 +82,36 @@ pub enum TreeCmd {
     Ice { to: String, candidate: Value },
     Stats { to_child: Vec<Value>, available_outgoing: u32 },
     RequestKeyframe,                           // relay просит keyframe у корня (через сервер)
-    RequestReparent { target: Option<String> }, // авто-миграция (None) / ручной выбор пира (Some)
+    // `reason` задаёт только внутренний watchdog; UI/manual запросы его не получают.
+    RequestReparent {
+        target: Option<String>,
+        reason: Option<&'static str>,
+        // Media watchdog reports are valid only for the exact parent generation which stalled.
+        // Manual/ICE recovery requests leave this unset and retain the ordinary server policy.
+        failed_parent_id: Option<String>,
+    },
     Leave,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingReparent {
+    target: Option<String>,
+    reason: Option<&'static str>,
+    failed_parent_id: Option<String>,
+}
+
+impl PendingReparent {
+    fn new(
+        target: Option<String>,
+        reason: Option<&'static str>,
+        failed_parent_id: Option<String>,
+    ) -> Self {
+        Self { target, reason, failed_parent_id }
+    }
+
+    fn is_track_missing_recovery(&self) -> bool {
+        self.reason == Some("track-missing")
+    }
 }
 
 /// Параметры join: роль и ёмкость узла.
@@ -232,13 +260,23 @@ impl From<String> for WsUrl {
 /// Ожидание перед реконнектом с дренажом команд: unbounded-канал иначе копил бы
 /// Stats/Ice (слать некуда — дропаем), а Leave/дроп консьюмера должны завершать задачу.
 /// false = пора выходить совсем.
-async fn wait_backoff(cmd_rx: &mut mpsc::UnboundedReceiver<TreeCmd>, secs: u64) -> bool {
+async fn wait_backoff(
+    cmd_rx: &mut mpsc::UnboundedReceiver<TreeCmd>,
+    secs: u64,
+    pending_reparent: &mut Option<PendingReparent>,
+) -> bool {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => return true,
             cmd = cmd_rx.recv() => match cmd {
                 None | Some(TreeCmd::Leave) => return false,
+                Some(TreeCmd::RequestReparent { target, reason, failed_parent_id }) => {
+                    // Keep one latest request while disconnected. Once a new join succeeds,
+                    // generation-bound media recovery is discarded (and its relay budget reset),
+                    // while ordinary/manual requests retain the historic replay behavior.
+                    *pending_reparent = Some(PendingReparent::new(target, reason, failed_parent_id));
+                }
                 _ => {} // офлайн — команду некуда отправить
             }
         }
@@ -321,6 +359,72 @@ fn confirm_welcome_status(
     })
 }
 
+fn request_reparent_payload(
+    stream_id: &str,
+    target: Option<String>,
+    reason: Option<&str>,
+    failed_parent_id: Option<String>,
+) -> Value {
+    let mut payload = json!({
+        "t": "request-reparent",
+        "streamId": stream_id,
+        "targetParentId": target,
+    });
+    if let (Some(reason), Some(object)) = (reason, payload.as_object_mut()) {
+        object.insert("reason".into(), Value::from(reason));
+    }
+    if let (Some(failed_parent_id), Some(object)) = (failed_parent_id, payload.as_object_mut()) {
+        object.insert("failedParentId".into(), Value::from(failed_parent_id));
+    }
+    payload
+}
+
+async fn send_or_retain_reparent<S>(
+    write: &mut S,
+    stream_id: &str,
+    pending_reparent: &mut Option<PendingReparent>,
+    request: PendingReparent,
+) -> bool
+where
+    S: Sink<Message> + Unpin,
+{
+    let message = request_reparent_payload(
+        stream_id,
+        request.target.clone(),
+        request.reason,
+        request.failed_parent_id.clone(),
+    );
+    if write
+        .send(Message::Text(message.to_string().into()))
+        .await
+        .is_ok()
+    {
+        true
+    } else {
+        *pending_reparent = Some(request);
+        false
+    }
+}
+
+/// A reconnecting socket joins as a new server-side node and receives a fresh parent assignment.
+/// A media request captured before that join describes the old assignment, so sending it directly
+/// after `join` can only race/violate the server's fresh-assignment age fence. Drop just that
+/// generation-bound request; ordinary/manual requests retain their existing reconnect behavior.
+fn discard_stale_media_reparent_after_rejoin(
+    pending_reparent: &mut Option<PendingReparent>,
+    rejoined: bool,
+) -> bool {
+    if !rejoined
+        || !pending_reparent
+            .as_ref()
+            .is_some_and(PendingReparent::is_track_missing_recovery)
+    {
+        return false;
+    }
+    pending_reparent.take();
+    true
+}
+
 /// Поднимает ws-соединение и держит его в отдельной tokio-задаче. Возвращает канал
 /// команд (на отправку) и канал событий (на приём) — остальной код не трогает
 /// сериализацию протокола напрямую.
@@ -379,6 +483,7 @@ fn connect_inner(
         let mut connects = 0u32; // сколько раз успешно джойнились (>=1 => дальше Rejoined)
         let mut attempts = 0u32;
         let mut backoff = 1u64;
+        let mut pending_reparent: Option<PendingReparent> = None;
         'outer: loop {
             let reconnect_count = attempts;
             attempts = attempts.saturating_add(1);
@@ -399,7 +504,7 @@ fn connect_inner(
                         reconnect_count,
                     );
                     if e.is_terminal() || !reconnect { break 'outer; }
-                    if !wait_backoff(&mut cmd_rx, backoff).await { break 'outer; }
+                    if !wait_backoff(&mut cmd_rx, backoff, &mut pending_reparent).await { break 'outer; }
                     backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX_SEC);
                     continue;
                 }
@@ -436,7 +541,7 @@ fn connect_inner(
                         reconnect_count,
                     );
                     if failure.terminal || !reconnect { break 'outer; }
-                    if !wait_backoff(&mut cmd_rx, backoff).await { break 'outer; }
+                    if !wait_backoff(&mut cmd_rx, backoff, &mut pending_reparent).await { break 'outer; }
                     backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX_SEC);
                     continue;
                 }
@@ -450,11 +555,39 @@ fn connect_inner(
                     reconnect_count,
                 );
                 if !reconnect { break 'outer; }
-                if !wait_backoff(&mut cmd_rx, backoff).await { break 'outer; }
+                if !wait_backoff(&mut cmd_rx, backoff, &mut pending_reparent).await { break 'outer; }
                 backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX_SEC);
                 continue;
             }
-            if connects > 0 {
+            let rejoined = connects > 0;
+            // The join above creates a new server-side assignment generation. A track-missing
+            // request retained from the old socket is now necessarily stale/too young; the relay's
+            // Rejoined handler replenishes its bounded budget and waits for the fresh assign-parent
+            // before starting a new 12s media epoch. Other request kinds keep their old semantics.
+            if discard_stale_media_reparent_after_rejoin(&mut pending_reparent, rejoined) {
+                log::warn!("tree ws: отбросил stale track-missing после свежего join ({stream_id})");
+            }
+            // A failed write keeps an ordinary/manual request for the next connection.
+            if let Some(request) = pending_reparent.take() {
+                if !send_or_retain_reparent(
+                    &mut write,
+                    &stream_id,
+                    &mut pending_reparent,
+                    request,
+                ).await {
+                    emit_signaling_status(
+                        &status,
+                        if reconnect { SignalingStatusOutcome::Stalled } else { SignalingStatusOutcome::Failed },
+                        SignalingStatusCode::Closed,
+                        reconnect_count,
+                    );
+                    if !reconnect { break 'outer; }
+                    if !wait_backoff(&mut cmd_rx, backoff, &mut pending_reparent).await { break 'outer; }
+                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX_SEC);
+                    continue;
+                }
+            }
+            if rejoined {
                 log::warn!("tree ws: переподключение #{connects} — реджойн {stream_id}");
                 if evt_tx.send(TreeEvent::Rejoined).is_err() { break 'outer; }
             }
@@ -576,9 +709,22 @@ fn connect_inner(
                                 let msg = json!({ "t": "request-keyframe", "streamId": stream_id });
                                 let _ = write.send(Message::Text(msg.to_string().into())).await;
                             }
-                            Some(TreeCmd::RequestReparent { target }) => {
-                                let msg = json!({ "t": "request-reparent", "streamId": stream_id, "targetParentId": target });
-                                let _ = write.send(Message::Text(msg.to_string().into())).await;
+                            Some(TreeCmd::RequestReparent { target, reason, failed_parent_id }) => {
+                                let request = PendingReparent::new(target, reason, failed_parent_id);
+                                if !send_or_retain_reparent(
+                                    &mut write,
+                                    &stream_id,
+                                    &mut pending_reparent,
+                                    request,
+                                ).await {
+                                    emit_signaling_status(
+                                        &status,
+                                        if reconnect { SignalingStatusOutcome::Stalled } else { SignalingStatusOutcome::Failed },
+                                        SignalingStatusCode::Closed,
+                                        reconnect_count,
+                                    );
+                                    break;
+                                }
                             }
                             Some(TreeCmd::Leave) => {
                                 let _ = write.send(Message::Text(json!({"t":"leave"}).to_string().into())).await;
@@ -592,7 +738,7 @@ fn connect_inner(
             }
             if terminal || !reconnect { break 'outer; }
             log::warn!("tree ws оборвался ({stream_id}) — реконнект через {backoff}с (медиа-PC живут)");
-            if !wait_backoff(&mut cmd_rx, backoff).await { break 'outer; }
+            if !wait_backoff(&mut cmd_rx, backoff, &mut pending_reparent).await { break 'outer; }
             backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX_SEC);
         }
         let _ = evt_tx.send(TreeEvent::Closed);
@@ -644,7 +790,30 @@ fn parse_event(v: &Value, stream_id: &str) -> Option<TreeEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::task::{Context, Poll};
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct RejectSink;
+
+    impl futures_util::Sink<Message> for RejectSink {
+        type Error = ();
+
+        fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Err(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            Err(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Err(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     /// Регрессия инцидента 2026-07-30: URL сигналинга собирался ОДИН раз на старте сессии,
     /// поэтому реконнект позже TTL токена (у vrelay 5 минут) вечно получал 401. `dynamic`
@@ -760,6 +929,110 @@ mod tests {
         assert_eq!(
             confirm_welcome_status(&json!({ "t": "welcome" }), &mut reconnect_confirmed, 2),
             Some(SignalingStatusOutcome::Recovered),
+        );
+    }
+
+    #[test]
+    fn track_missing_reparent_reason_is_explicit_and_internal() {
+        let recovery = request_reparent_payload(
+            "stream",
+            None,
+            Some("track-missing"),
+            Some("parent-generation-a".into()),
+        );
+        assert_eq!(recovery.get("reason").and_then(Value::as_str), Some("track-missing"));
+        assert_eq!(recovery.get("targetParentId"), Some(&Value::Null));
+        assert_eq!(
+            recovery.get("failedParentId").and_then(Value::as_str),
+            Some("parent-generation-a"),
+        );
+
+        let ordinary = request_reparent_payload("stream", None, None, None);
+        assert!(!ordinary.as_object().unwrap().contains_key("reason"));
+        assert!(!ordinary.as_object().unwrap().contains_key("failedParentId"));
+    }
+
+    #[tokio::test]
+    async fn reasoned_reparent_survives_backoff_and_failed_write() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(TreeCmd::Stats { to_child: Vec::new(), available_outgoing: 0 }).unwrap();
+        tx.send(TreeCmd::RequestReparent {
+            target: None,
+            reason: Some("track-missing"),
+            failed_parent_id: Some("parent-generation-a".into()),
+        }).unwrap();
+        tx.send(TreeCmd::Leave).unwrap();
+
+        let mut pending = None;
+        assert!(!wait_backoff(&mut rx, 60, &mut pending).await);
+        let retained = pending.expect("reasoned recovery must not be drained with stale traffic");
+        assert_eq!(
+            retained,
+            PendingReparent::new(
+                None,
+                Some("track-missing"),
+                Some("parent-generation-a".into()),
+            ),
+        );
+
+        let mut retry_after_write = None;
+        assert!(!send_or_retain_reparent(
+            &mut RejectSink,
+            "stream",
+            &mut retry_after_write,
+            retained,
+        ).await);
+        assert_eq!(
+            retry_after_write,
+            Some(PendingReparent::new(
+                None,
+                Some("track-missing"),
+                Some("parent-generation-a".into()),
+            )),
+            "a failed websocket write must put the exact request back into the reconnect slot",
+        );
+    }
+
+    #[test]
+    fn successful_rejoin_discards_only_old_assignment_media_recovery() {
+        let media_recovery = PendingReparent::new(
+            None,
+            Some("track-missing"),
+            Some("parent-generation-a".into()),
+        );
+
+        let mut initial_connect = Some(media_recovery.clone());
+        assert!(!discard_stale_media_reparent_after_rejoin(
+            &mut initial_connect,
+            false,
+        ));
+        assert_eq!(
+            initial_connect,
+            Some(media_recovery.clone()),
+            "an initial connection has not minted a replacement server assignment",
+        );
+
+        let mut rejoined = Some(media_recovery);
+        assert!(discard_stale_media_reparent_after_rejoin(
+            &mut rejoined,
+            true,
+        ));
+        assert_eq!(
+            rejoined,
+            None,
+            "the old failedParentId must never be replayed immediately after a fresh join",
+        );
+
+        let ordinary = PendingReparent::new(Some("manual-parent".into()), None, None);
+        let mut manual_after_rejoin = Some(ordinary.clone());
+        assert!(!discard_stale_media_reparent_after_rejoin(
+            &mut manual_after_rejoin,
+            true,
+        ));
+        assert_eq!(
+            manual_after_rejoin,
+            Some(ordinary),
+            "the media generation fence must not silently change manual reconnect behavior",
         );
     }
 

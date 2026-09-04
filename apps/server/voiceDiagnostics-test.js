@@ -157,6 +157,7 @@ test('sanitizer accepts bounded stream-watch stages while discarding identities 
     outcome: index === stages.length - 1 ? 'recovered' : 'started',
     code: codes[index],
     streamTransport: transports[index % transports.length],
+    ...(index === 7 ? { watchEndReason: 'auth_handoff' } : {}),
     streamId: forbidden,
     streamer: forbidden,
     url: forbidden,
@@ -179,6 +180,7 @@ test('sanitizer accepts bounded stream-watch stages while discarding identities 
     assert.deepEqual(report.events.map((event) => event.code), codes);
     assert.deepEqual(report.events.map((event) => event.streamTransport),
       stages.map((_, index) => transports[index % transports.length]));
+    assert.equal(report.events[7].watchEndReason, 'auth_handoff');
     assert.equal(JSON.stringify(report).includes(forbidden), false,
       'viewer identity comes from server auth and raw media/signaling values are discarded');
   }
@@ -188,12 +190,50 @@ test('sanitizer accepts bounded stream-watch stages while discarding identities 
     events: [{
       atMs: 20_000, kind: 'stream_watch_finished', stage: 'watch_playback',
       outcome: 'timed_out', code: 'decode_timeout', streamTransport: 'peer-id-from-client',
+      watchEndReason: 'private-lifecycle-detail',
     }],
   }));
   assert.deepEqual(unknownTransport.events[0], {
     atMs: 20_000, kind: 'stream_watch_finished', stage: 'watch_playback',
     outcome: 'timed_out', code: 'decode_timeout',
   });
+
+  const endReasons = [
+    'user_close', 'view_switch', 'server_exit', 'auth_handoff', 'session_terminal',
+    'logout', 'engine_dispose', 'connection_loss', 'stream_ended', 'quality_change',
+    'recovery_failed', 'playback_timeout', 'superseded', 'unknown',
+  ];
+  const reasonReport = sanitizeVoiceDiagnosticReport(validReport({
+    incident: 'stream_watch_failed',
+    events: endReasons.map((watchEndReason, index) => ({
+      atMs: index, kind: 'stream_watch_finished', stage: 'watch_playback',
+      outcome: 'cancelled', code: 'aborted', watchEndReason,
+    })),
+  }));
+  assert.deepEqual(reasonReport.events.map((event) => event.watchEndReason), endReasons,
+    'only the fixed privacy-safe lifecycle taxonomy survives server validation');
+});
+
+test('store persists the sanitized watch end reason in admin detail', () => {
+  const db = new Database(':memory:');
+  const store = createVoiceDiagnosticsStore(db, {
+    now: () => 10_000,
+    randomId: () => '000000000000000000000001',
+  });
+  const saved = store.save({
+    userId: 'viewer',
+    username: 'viewer',
+    raw: validReport({
+      incident: 'stream_watch_failed',
+      events: [{
+        atMs: 120, kind: 'stream_watch_finished', stage: 'watch_playback',
+        outcome: 'cancelled', code: 'aborted', watchEndReason: 'view_switch',
+      }],
+    }),
+  });
+
+  assert.equal(store.detail(saved.id).report.events[0].watchEndReason, 'view_switch');
+  db.close();
 });
 
 test('sanitizer preserves a bounded multi-day call timeline', () => {
