@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { useStore, getEngine } from './store';
 import { getSettings, setSettings, subscribeSettings } from './settings';
 import { avColor, initial, normKey } from './util';
@@ -21,6 +21,8 @@ import { TooltipLayer } from './components/TooltipLayer';
 import { ConnectivityBanner } from './components/ConnectivityBanner';
 import { NotificationPermissionPrompt } from './components/NotificationPermissionPrompt';
 import { QuickSwitcher, ShortcutHelp, rememberServerDestination } from './components/CommandOverlays';
+import { NativeUpdateGate } from './components/NativeUpdateGate';
+import { nativeUpdateController } from './nativeUpdate';
 
 // версия принудительного сброса хоткеев на новые дефолты — см. эффект хоткеев ниже
 const HK_RESET_V = 1;
@@ -158,6 +160,12 @@ function ServerSkeleton() {
 }
 
 export function App() {
+  const startup = useSyncExternalStore(nativeUpdateController.subscribe, nativeUpdateController.getSnapshot);
+  if (!startup.authAllowed) return <NativeUpdateGate state={startup} />;
+  return <Application />;
+}
+
+function Application() {
   const view = useStore((s) => s.view);
   const loadingServer = useStore((s) => s.loadingServer);
   const me = useStore((s) => s.me);

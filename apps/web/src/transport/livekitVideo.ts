@@ -16,7 +16,11 @@ export class LiveKitVideoTransport implements VideoTransport {
   private room: Room | null = null;         // attached-комната для событий/watch/discovery (= смотримая, viewRoom)
   private broadcastRoom: Room | null = null; // S5: комната ВЕЩАНИЯ (голосовая); null → вещаем в this.room (shared)
   private me = '';
-  setBroadcastRoom(room: Room | null) { this.broadcastRoom = room; }
+  private broadcastGeneration = 0;
+  setBroadcastRoom(room: Room | null) {
+    if (this.broadcastRoom !== room) this.broadcastGeneration++;
+    this.broadcastRoom = room;
+  }
   private bcRoom(): Room | null { return this.broadcastRoom || this.room; }
 
   private videoTracks = new Map<string, LocalVideoTrack | RemoteTrack>();
@@ -35,6 +39,7 @@ export class LiveKitVideoTransport implements VideoTransport {
 
   /* ---------- lifecycle ---------- */
   attach(room: Room, ctx: { me: string; serverId: string }) {
+    if (this.room) this.detach();
     this.room = room;
     this.me = ctx.me;
     room
@@ -77,30 +82,52 @@ export class LiveKitVideoTransport implements VideoTransport {
   /* ---------- broadcasting (local) ---------- */
   async startBroadcast(_streamId: string, source: MediaStream) {
     const room = this.bcRoom(); if (!room) return; // вещаем в ГОЛОСОВУЮ комнату, не в смотримую
+    const generation = ++this.broadcastGeneration;
+    const current = () => generation === this.broadcastGeneration && this.bcRoom() === room;
     const vt = source.getVideoTracks()[0];
     const lvt = new LocalVideoTrack(vt);
-    await room.localParticipant.publishTrack(lvt, {
-      source: Track.Source.ScreenShare,
-      videoEncoding: { maxBitrate: 8_000_000, maxFramerate: 60 },
-      videoCodec: 'vp8',
-      simulcast: false,
-      degradationPreference: 'maintain-framerate' as any,
-    });
-    const at = source.getAudioTracks()[0];
-    if (at) {
-      const lat = new LocalAudioTrack(at);
-      await room.localParticipant.publishTrack(lat, { source: Track.Source.ScreenShareAudio, dtx: false, red: false });
+    let lat: LocalAudioTrack | null = null;
+    const cleanup = async () => {
+      await Promise.all([lvt, lat].filter((track) => track !== null).map(async (track) => {
+        try { await room.localParticipant.unpublishTrack(track!, true); } catch { /**/ }
+        try { track!.stop(); } catch { /**/ }
+      }));
+      for (const track of [...source.getVideoTracks(), ...source.getAudioTracks()]) {
+        try { track.stop(); } catch { /**/ }
+      }
+    };
+    try {
+      await room.localParticipant.publishTrack(lvt, {
+        source: Track.Source.ScreenShare,
+        videoEncoding: { maxBitrate: 8_000_000, maxFramerate: 60 },
+        videoCodec: 'vp8',
+        simulcast: false,
+        degradationPreference: 'maintain-framerate' as any,
+      });
+      if (!current()) { await cleanup(); return; }
+      const at = source.getAudioTracks()[0];
+      if (at) {
+        lat = new LocalAudioTrack(at);
+        await room.localParticipant.publishTrack(lat, { source: Track.Source.ScreenShareAudio, dtx: false, red: false });
+        if (!current()) await cleanup();
+      }
+    } catch (error) {
+      await cleanup();
+      throw error;
     }
     // Если вещаю В смотримую комнату (shared) — LocalTrackPublished сам зарегистрирует превью. Если в
     // ДРУГУЮ (голосовую при браузинге) — событие туда не долетит (слушаем viewRoom), но превью там и не
     // нужно (смотрю другой сервер); при возврате на голосовой onRoomConnected перерегистрирует локальный трек.
   }
   async stopBroadcast(_streamId: string) {
+    this.broadcastGeneration++;
     const room = this.bcRoom(); if (!room) return;
     const v = room.localParticipant.getTrackPublication(Track.Source.ScreenShare);
-    if (v && v.track) { try { await room.localParticipant.unpublishTrack(v.track, true); } catch { /**/ } }
     const a = room.localParticipant.getTrackPublication(Track.Source.ScreenShareAudio);
-    if (a && a.track) { try { await room.localParticipant.unpublishTrack(a.track, true); } catch { /**/ } }
+    // Capture both publications before awaiting: a newer start may publish during stop.
+    await Promise.all([v?.track, a?.track].filter(Boolean).map(async (track) => {
+      try { await room.localParticipant.unpublishTrack(track!, true); } catch { /**/ }
+    }));
   }
   isBroadcasting(_streamId: string) { const room = this.bcRoom(); return !!(room && room.localParticipant.isScreenShareEnabled); }
   private participantsByUser(username: string): RemoteParticipant[] {
@@ -232,12 +259,15 @@ export class LiveKitVideoTransport implements VideoTransport {
     if (this.announcedScreenSessions.delete(p.identity)) this.streamStopCbs.forEach((cb) => cb(p.identity));
   };
   private onSub = (track: RemoteTrack, pub: TrackPublication, p: RemoteParticipant) => {
-    if (track.kind !== Track.Kind.Video) return;
-    this.addVideo(pub.trackSid, track, baseUid(p.identity), false);
+    if (track.kind !== Track.Kind.Video || pub.source !== Track.Source.ScreenShare) return;
+    const username = baseUid(p.identity);
+    if (!this.watchedUsers.has(username) || this.activeWatchSession.get(username) !== p.identity || this.room?.remoteParticipants.get(p.identity) !== p) return;
+    this.addVideo(pub.trackSid, track, username, false);
   };
   private onUnsub = (track: RemoteTrack, pub: TrackPublication) => {
     if (track.kind !== Track.Kind.Video) return;
     track.detach().forEach((el) => el.remove());
+    if (this.videoTracks.get(pub.trackSid) !== track) return;
     this.delVideo(pub.trackSid);
   };
   private onLocalPub = (pub: TrackPublication) => {

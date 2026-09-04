@@ -689,12 +689,21 @@ function SettingsModal() {
   const [binding, setBinding] = useState(false);
   const [captureAction, setCaptureAction] = useState<KeybindAction | null>(null);
   useEffect(() => {
-    Promise.all([Room.getLocalDevices('audioinput'), Room.getLocalDevices('audiooutput')]).then(([inputs, outputs]) => {
+    let disposed = false, generation = 0;
+    const load = () => {
+      const requestGeneration = ++generation;
+      // Enumeration must not start/stop an extra capture on iOS while a call owns the mic.
+      void Promise.all([Room.getLocalDevices('audioinput', false), Room.getLocalDevices('audiooutput', false)]).then(([inputs, outputs]) => {
+      if (disposed || generation !== requestGeneration) return;
       setIns(audioDeviceChoices(inputs));
       const output = audioOutputChoices(appleMobile, inputs, outputs);
       setOuts(output.choices);
       setOutputViaInput(output.viaInput);
     }).catch(() => {});
+    };
+    load();
+    navigator.mediaDevices?.addEventListener?.('devicechange', load);
+    return () => { disposed = true; navigator.mediaDevices?.removeEventListener?.('devicechange', load); };
   }, [appleMobile]);
   useEffect(() => { if (!binding) return; const k = (e: KeyboardEvent) => { e.preventDefault(); setSettings({ pttKey: e.code }); setBinding(false); rerender(); }; window.addEventListener('keydown', k, { once: true }); return () => window.removeEventListener('keydown', k); }, [binding]);
   const E = getEngine();

@@ -9,6 +9,9 @@ import { setVisibleChatServer } from './chatVisibility';
 import { useStore, getEngine } from './store';
 
 let ws: WebSocket | null = null;
+let socketToken: string | null = null;
+let connectTimer: number | null = null;
+let pongTimer: number | null = null;
 let reconnectTimer: number | null = null;
 let closed = false;
 let reconnectPaused = false;
@@ -24,6 +27,8 @@ let activeChatServerId: string | null = null; // сервер, чей чат р�
 // СВОИМ ping-фреймом: сервер отвечает {t:'pong'}, любой входящий фрейм обновляет lastRxAt.
 const HEARTBEAT_MS = 30000;
 const DEAD_AFTER_MS = 90000; // три пропущенных ответа подряд
+const CONNECT_TIMEOUT_MS = 10000;
+const PONG_TIMEOUT_MS = 8000;
 let lastRxAt = 0;
 let heartbeatTimer: number | null = null;
 
@@ -36,25 +41,41 @@ function socketLooksDead(): boolean {
 function dropDeadSocket(): void {
   const current = ws;
   ws = null;
+  socketToken = null;
   lastRxAt = 0;
   stopHeartbeat();
   if (current) { try { current.close(); } catch { /**/ } }
 }
 
 function stopHeartbeat(): void {
-  if (heartbeatTimer) { clearTimeout(heartbeatTimer); heartbeatTimer = null; }
+  if (heartbeatTimer !== null) { clearTimeout(heartbeatTimer); heartbeatTimer = null; }
+  if (connectTimer !== null) { clearTimeout(connectTimer); connectTimer = null; }
+  if (pongTimer !== null) { clearTimeout(pongTimer); pongTimer = null; }
+}
+
+function probeSocket(): void {
+  const current = ws;
+  if (!current || current.readyState !== WebSocket.OPEN || pongTimer !== null) return;
+  pongTimer = window.setTimeout(() => {
+    pongTimer = null;
+    if (ws !== current) return;
+    dropDeadSocket();
+    scheduleReconnect();
+  }, PONG_TIMEOUT_MS);
+  try { current.send(JSON.stringify({ t: 'ping' })); }
+  catch { dropDeadSocket(); scheduleReconnect(); }
 }
 
 // setTimeout-цепочка вместо setInterval: в фоне таймер троттлится, и накопленные тики setInterval
 // выстрелили бы пачкой при возврате на вкладку. Троттлинг здесь безвреден — проверка просто реже,
 // а мгновенную проверку по возвращении делает kickReconnect.
 function scheduleHeartbeat(): void {
-  stopHeartbeat();
+  if (heartbeatTimer !== null) clearTimeout(heartbeatTimer);
   heartbeatTimer = window.setTimeout(() => {
     heartbeatTimer = null;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     if (socketLooksDead()) { dropDeadSocket(); scheduleReconnect(); return; }
-    try { ws.send(JSON.stringify({ t: 'ping' })); } catch { /**/ }
+    probeSocket();
     scheduleHeartbeat();
   }, HEARTBEAT_MS);
 }
@@ -77,18 +98,19 @@ function onVisibilityChange(): void {
 document.addEventListener('visibilitychange', onVisibilityChange);
 // Сеть вернулась/окно снова в фокусе — пробуем сразу, а не через бэкофф: уведомления по НЕ подключённым
 // серверам ходят только этим сокетом, и лишняя минута молчания = молча пропущенное упоминание.
-window.addEventListener('online', () => kickReconnect());
+window.addEventListener('online', () => kickReconnect(true));
 window.addEventListener('focus', () => kickReconnect());
 
 // Сессия отозвана ИМЕННО этим токеном. Свежий логин выдаёт другой — тогда запрет снимается сам.
 function revoked(): boolean { return !!revokedToken && revokedToken === getToken(); }
 
 // Немедленная попытка вне расписания бэкоффа (счётчик при этом не сбрасываем — успех сбросит его сам).
-function kickReconnect(): void {
+function kickReconnect(networkChanged = false): void {
   if (closed || reconnectPaused || revoked()) return;
   // Вернулись на вкладку/в сеть — это ровно тот момент, когда сокет мог протухнуть незаметно.
-  if (ws && ws.readyState === WebSocket.OPEN && socketLooksDead()) dropDeadSocket();
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  if (ws && (networkChanged || socketToken !== getToken() || (ws.readyState === WebSocket.OPEN && socketLooksDead()))) dropDeadSocket();
+  if (ws && ws.readyState === WebSocket.OPEN) { probeSocket(); return; }
+  if (ws && ws.readyState === WebSocket.CONNECTING) return;
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   connectNotifyWs();
 }
@@ -129,16 +151,34 @@ export function connectNotifyWs() {
   closed = false;
   if (reconnectPaused) return;
   const token = getToken();
-  if (!token) return;
+  if (!token || revoked()) return;
+  if (ws && socketToken !== token) dropDeadSocket();
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  if (reconnectTimer !== null) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   const url = webOrigin().replace(/^http/, 'ws') + '/ws?token=' + encodeURIComponent(token);
   let current: WebSocket;
-  try { current = new WebSocket(url); ws = current; } catch { scheduleReconnect(); return; }
-  current.onopen = () => { if (ws !== current) { try { current.close(); } catch { /**/ } return; } reconnectAttempt = 0; lastRxAt = Date.now(); scheduleHeartbeat(); sendPresenceFrame(); }; // переотправляем idle + реально открытый чат
+  try { current = new WebSocket(url); ws = current; socketToken = token; } catch { scheduleReconnect(); return; }
+  connectTimer = window.setTimeout(() => {
+    connectTimer = null;
+    if (ws !== current) return;
+    dropDeadSocket();
+    scheduleReconnect();
+  }, CONNECT_TIMEOUT_MS);
+  current.onopen = () => {
+    if (ws !== current) { try { current.close(); } catch { /**/ } return; }
+    if (getToken() !== token) { dropDeadSocket(); connectNotifyWs(); return; }
+    if (connectTimer !== null) { clearTimeout(connectTimer); connectTimer = null; }
+    reconnectAttempt = 0;
+    lastRxAt = Date.now();
+    scheduleHeartbeat();
+    sendPresenceFrame();
+  }; // переотправляем idle + реально открытый чат
   current.onmessage = (ev) => {
     if (ws !== current) return;
     lastRxAt = Date.now(); // любой входящий фрейм = сокет жив
+    if (pongTimer !== null) { clearTimeout(pongTimer); pongTimer = null; }
     let d: any; try { d = JSON.parse(ev.data); } catch { return; }
+    if (!d || typeof d !== 'object') return;
     if (d && d.t === 'pong') return; // ответ на наш heartbeat, больше ничего не значит
     // кросс-девайс: прочитано на другом устройстве этого юзера → сбрасываем unread локально (и для
     // ПОДКЛЮЧЁННОГО сервера — тут дедуп по viewServerId НЕ применяем, чтение общее по БД).
@@ -161,7 +201,7 @@ export function connectNotifyWs() {
     }
     if (d.t === 'server-refresh') {
       const st = useStore.getState();
-      if (d.serverId && st.viewServerId === d.serverId) void st.refreshServer();
+      if (d.serverId && st.viewServerId === d.serverId) void st.refreshServer().catch(() => {});
       return;
     }
     // Серверный owner голосовой сессии. При reconnect приходит только snapshot; явный claim другого
@@ -196,13 +236,15 @@ export function connectNotifyWs() {
   current.onclose = (ev) => {
     if (ws !== current) return;
     ws = null;
+    socketToken = null;
     lastRxAt = 0;
     stopHeartbeat();
     // 4001 = сервер отозвал сессию (смена пароля, подтверждение почты, удаление аккаунта на другом
     // устройстве). Этим токеном сокет уже никогда не откроется — раньше клиент бесконечно долбился
     // мёртвым JWT и молча оставался без уведомлений, ничего не сказав пользователю.
     if (ev && ev.code === 4001) {
-      revokedToken = getToken() || null;
+      if (getToken() !== token) { if (!closed) connectNotifyWs(); return; }
+      revokedToken = token;
       try { useStore.getState().toast('Сеанс завершён на другом устройстве — войди заново', 'warn'); } catch { /**/ }
       return;
     }
@@ -219,7 +261,7 @@ export function pauseNotifyWsReconnect() {
   reconnectPaused = true;
   stopHeartbeat();
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  if (ws) { const current = ws; ws = null; try { current.close(); } catch { /**/ } }
+  dropDeadSocket();
 }
 
 export function resumeNotifyWsReconnect() {
@@ -234,5 +276,5 @@ export function disconnectNotifyWs() {
   activeChatServerId = null;
   sendPresenceFrame();
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  if (ws) { const w = ws; ws = null; try { w.close(); } catch { /**/ } }
+  dropDeadSocket();
 }

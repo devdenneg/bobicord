@@ -17,6 +17,11 @@ import { TreeVideoTransport } from './transport/treeVideo';
 import { createDenoiseNode, destroyDenoiseNode } from './denoise';
 import { createVadNode, destroyVadNode, type VadNode } from './vad';
 import { userVolumeToGain } from './volumeCurve';
+import { createMicrophoneAudioContext } from './microphoneAudioContext';
+import { VoiceDiagnosticsRecorder, VoiceEventLoopStallMonitor, type VoiceDiagnosticEventInput } from './voiceDiagnostics';
+import { DiagnosticReportOutbox } from './diagnosticOutbox';
+import { summarizeVoiceDiagnosticStats, type VoiceDiagnosticStatsState } from './voiceDiagnosticStats';
+import type { VoiceDiagnosticIncident } from './types';
 import {
   CHAT_SESSION_MESSAGE_LIMIT,
   chatAppendFrontTrim,
@@ -180,6 +185,12 @@ export class Engine {
   private voiceEpoch = 0; // поколение пользовательского voice-intent; инвалидирует старые async join/leave/switch
   private micEpoch = 0;   // поколение mic pipeline; старый gUM/RNNoise/publish не имеет права ожить после stop/restart
   private micReapplyEpoch = 0; // последнее ручное переключение input/мобильного аудиомаршрута
+  private micReapplying = false;
+  private micStartTask: { epoch: number; generation: number; promise: Promise<boolean>; cancel: () => void } | null = null;
+  private micReapplyTask: { epoch: number; promise: Promise<void> } | null = null;
+  private micStateWrites = new WeakMap<LocalAudioTrack, Promise<void>>();
+  private micHealthCleanup: (() => void) | null = null;
+  private micGateTarget: number | null = null;
   private connectEpoch = 0; // поколение view-connect; протухший r.connect не помечает новую комнату готовой
   private voiceLeaseEpoch = 0; // серверный ownership fence текущей локальной voice-сессии
   private voiceLeaseSession = '';
@@ -226,7 +237,6 @@ export class Engine {
   private micVadDest: MediaStreamAudioDestinationNode | null = null;
   private manualMute = localStorage.getItem('voiceMute') === '1'; // персист: пред-установка «мут мика» до входа (Discord-стиль)
   private saveVoicePrefs() { try { localStorage.setItem('voiceMute', this.manualMute ? '1' : '0'); localStorage.setItem('voiceDeaf', this.deafened ? '1' : '0'); } catch { /**/ } }
-  private deafToggling = false; // окно подавления mute/unmute-звука от track.mute()/unmute() при оглушении (deaf сам играет fullMute/unmute)
 
   // Оба транспорта живут одновременно (не выбор build-флагом): нативный вещатель
   // публикует только в дерево, браузер — только в LiveKit (старый путь, инвариант 2
@@ -278,6 +288,8 @@ export class Engine {
   private keepCtx: AudioContext | null = null;
   private keepOsc: OscillatorNode | null = null;
   private screenStream: MediaStream | null = null;
+  private shareGeneration = 0;
+  private sharePending = false;
   private presenceTimer: number | null = null;
   private viewServerId = '';                   // сервер, который смотрю (viewRoom) — теги notify чата/стримов
   private voiceServerId: string | null = null; // сервер, где я в голосовом (voiceRoom) — broadcast + снапшот; null вне войса
@@ -298,6 +310,7 @@ export class Engine {
   // switch can never be mistaken for a successful one.
   private outputCtx: SinkableAudioContext | null = null;
   private outputSwitch: Promise<void> = Promise.resolve();
+  private elementOutputWrites = new WeakMap<HTMLMediaElement, Promise<void>>();
   private outputGeneration = 0;
   private voiceOutputPending: { room: Room; sink: string } | null = null;
   private outputDeviceTimer: number | null = null;
@@ -305,6 +318,16 @@ export class Engine {
   private emoteListeners = new Set<EmoteListener>();
   private subs = new Set<() => void>();
   private snap: Snapshot;
+  private diagnostics = new VoiceDiagnosticsRecorder();
+  private diagnosticOutbox: DiagnosticReportOutbox;
+  private diagnosticIncidents = new Map<VoiceDiagnosticIncident, number>();
+  private diagnosticJoinTimer: number | null = null;
+  private diagnosticSample: { track: unknown; state: VoiceDiagnosticStatsState } | null = null;
+  private pingSampleTask: object | null = null;
+  private stallMonitor = new VoiceEventLoopStallMonitor((eventLoopLagMs) => {
+    this.recordVoiceDiagnostic({ kind: 'ui_stall', stage: 'ui', eventLoopLagMs });
+    this.reportVoiceDiagnostic('ui_stall');
+  });
 
   // VAD-гейт микрофона (режим "активация голосом"): передаём звук только выше порога чувствительности
   private vadOpen = false;
@@ -333,9 +356,28 @@ export class Engine {
   constructor(me: User, hooks: EngineHooks) {
     this.me = me;
     this.hooks = hooks;
+    this.diagnosticOutbox = new DiagnosticReportOutbox(me.id, (report) => api.submitVoiceDiagnostic(report));
+    this.startEngineObservers();
+    const onVideoTrack = (_key: string, _track: unknown, identity: string, isLocal: boolean) => {
+      if (!isLocal) this.completeWatch(baseUid(identity));
+      this.emit();
+    };
+    const onStreamStart = (source: StreamSource, identity: string, silent: boolean) => this.onStreamSourceStart(source, identity, silent);
+    const onStreamStop = (source: StreamSource, identity: string) => this.onStreamSourceStop(source, identity);
+    this.attachTransportObservers(onVideoTrack, onStreamStart, onStreamStop);
+    this.snap = this.build();
+  }
+
+  private startEngineObservers() {
+    this.diagnosticOutbox.start();
+    window.addEventListener('online', this.onVoiceNetworkChange);
+    window.addEventListener('offline', this.onVoiceNetworkChange);
+    window.addEventListener('pagehide', this.onVoicePageHide);
+    document.addEventListener('freeze', this.onVoiceFreeze);
+    navigator.mediaDevices?.addEventListener?.('devicechange', this.onAudioDevicesChanged);
     // Индикаторы «говорит» считаются только когда на окно смотрят: под полноэкранной игрой этот
     // rAF-цикл крутился 60 раз в секунду впустую и не давал заснуть кадровому конвейеру целиком.
-    this.stopIdleWatch = onWindowIdle((idle) => {
+    this.stopIdleWatch ??= onWindowIdle((idle) => {
       if (idle) {
         // Полностью гасить индикаторы «говорит» нельзя: окно без фокуса ещё не значит, что его не
         // видно — типовой случай это приложение на втором мониторе, пока человек играет. Уходим с
@@ -348,12 +390,13 @@ export class Engine {
       if (this.spIdleTimer) { clearInterval(this.spIdleTimer); this.spIdleTimer = null; }
       if (!this.spRAF && this.analysers.size) this.spRAF = requestAnimationFrame(() => this.spLoop());
     });
-    const onVideoTrack = (_key: string, _track: unknown, identity: string, isLocal: boolean) => {
-      if (!isLocal) this.completeWatch(baseUid(identity));
-      this.emit();
-    };
-    const onStreamStart = (source: StreamSource, identity: string, silent: boolean) => this.onStreamSourceStart(source, identity, silent);
-    const onStreamStop = (source: StreamSource, identity: string) => this.onStreamSourceStop(source, identity);
+  }
+
+  private attachTransportObservers(
+    onVideoTrack: (_key: string, _track: unknown, identity: string, isLocal: boolean) => void,
+    onStreamStart: (source: StreamSource, identity: string, silent: boolean) => void,
+    onStreamStop: (source: StreamSource, identity: string) => void,
+  ) {
     const transports: Array<[StreamSource, VideoTransport]> = [['livekit', this.liveKitT], ['tree', this.treeT]];
     for (const [source, t] of transports) {
       t.onVideoTrack(onVideoTrack as any);
@@ -391,16 +434,49 @@ export class Engine {
     // Headsets/Bluetooth outputs may disappear without touching the settings
     // UI. Re-verify both output routing and the captured mic immediately; the
     // regular watchdog remains the fallback for browsers without devicechange.
-    navigator.mediaDevices?.addEventListener?.('devicechange', () => {
-      if (this.outputDeviceTimer) clearTimeout(this.outputDeviceTimer);
-      this.outputDeviceTimer = window.setTimeout(() => {
-        this.outputDeviceTimer = null;
-        if (this.viewRoom || this.voiceRoom) void this.applyOutput();
-        if (this.inVoice) void this.checkMicAlive(true);
-      }, 200);
-    });
-    this.snap = this.build();
   }
+
+  private onAudioDevicesChanged = () => {
+    if (this.outputDeviceTimer) clearTimeout(this.outputDeviceTimer);
+    this.outputDeviceTimer = window.setTimeout(() => {
+      this.outputDeviceTimer = null;
+      if (this.viewRoom || this.voiceRoom) void this.applyOutput();
+      if (this.inVoice) void this.checkMicAlive(true);
+    }, 200);
+  };
+
+  private recordVoiceDiagnostic(event: VoiceDiagnosticEventInput) {
+    this.diagnostics.record({ documentHidden: document.hidden, online: navigator.onLine,
+      micEnabled: !this.manualMute, deafened: this.deafened, pushToTalk: this.pttDown,
+      micMode: getSettings().mode, publicationMuted: this.micPub()?.isMuted,
+      trackState: this.micRaw?.getAudioTracks()[0]?.readyState ?? 'missing',
+      audioContextState: (this.micActx?.state ?? 'missing') as VoiceDiagnosticEventInput['audioContextState'],
+      canPlaybackAudio: this.voiceRoom?.canPlaybackAudio, ...event });
+  }
+  private reportVoiceDiagnostic(incident: VoiceDiagnosticIncident, completed = false) {
+    if (!this.diagnostics.active) return;
+    const now = Date.now();
+    if (!completed && now - (this.diagnosticIncidents.get(incident) ?? -Infinity) < 30_000) return;
+    this.diagnosticIncidents.set(incident, now);
+    const report = this.diagnostics.buildReport(incident);
+    // Persistence and HTTP run after this event turn, never in the join/button critical path.
+    window.setTimeout(() => this.diagnosticOutbox.enqueue(report), 0);
+  }
+  private onVoiceNetworkChange = () => {
+    this.recordVoiceDiagnostic({ kind: 'network_changed', code: navigator.onLine ? 'network' : 'offline' });
+    if (!navigator.onLine && this.inVoice) { this.forcePttRelease(); this.reportVoiceDiagnostic('connection_failed'); }
+    if (navigator.onLine && this.inVoice) this.onVisible();
+  };
+  private onVoiceFreeze = () => { this.stallMonitor.stop(); this.forcePttRelease(); };
+  private onVoicePageHide = (event: PageTransitionEvent) => {
+    if (event.persisted) this.onVoiceFreeze();
+    else {
+      // Timers may never run again on a real page exit. Persist the bounded, sanitized report
+      // now; disconnect immediately disposes the outbox before its HTTP microtask can start.
+      if (this.diagnostics.active) this.diagnosticOutbox.enqueue(this.diagnostics.buildReport('session_ended'));
+      this.disconnect();
+    }
+  };
 
   setMe(me: User) { this.me = me; }
   setMembers(m: Member[]) { this.members = m; this.emit(); }
@@ -478,7 +554,7 @@ export class Engine {
       // здесь читается как «мик включён», и человек видел красную кнопку мута рядом с бейджем «говорю».
       // Для чужих правило прежнее: !mp = «пока не знаем», иначе у всех мигал бы ложный бейдж мута.
       const micMuted = m.username === this.me.username
-        ? (this.localMicMuted() || deaf)
+        ? (this.localMicMuted() || this.noMic || deaf)
         : ((!!mp && mp.isMuted) || (p as any)?.attributes?.mic === '0' || deaf);
       presence[m.username] = { online, inVoice: inV, micMuted, streaming, deafened: deaf, away, game };
     }
@@ -563,11 +639,15 @@ export class Engine {
 
   /* ---------- connection ---------- */
   async connect(url: string, token: string, serverId: string, sessionId: string) {
+    this.startEngineObservers();
     const connectEpoch = ++this.connectEpoch;
     this.resetStreamEdges();
     const outputCtx = this.getOutputContext();
     const r = new Room({
       adaptiveStream: true, dynacast: true,
+      // Freezing a mobile tab is not leaving a call. Own pagehide cleanup so a cached/frozen
+      // page can resume; the SDK otherwise treats freeze as an intentional terminal disconnect.
+      disconnectOnPageLeave: false,
       // UI разрешает индивидуальное усиление до 200%. Без WebAudio mixer LiveKit пишет это
       // в HTMLMediaElement.volume (диапазон только 0..1), получает IndexSizeError и может оставить 0.
       webAudioMix: outputCtx ? { audioContext: outputCtx } : true,
@@ -609,8 +689,9 @@ export class Engine {
       // звук мута слышен только самому мутящемуся — играем при локальном событии МОЕГО голосового трека
       // micRestarting — пересъём мика watchdog-ом: пере-публикация в муте не должна щёлкать пользователю
       // «мут/размут», он ничего не нажимал (симптом «микрофон сам включается и выключается»).
-      .on(RoomEvent.TrackMuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.voiceRoom?.localParticipant && !this.deafToggling && !this.micRestarting) playSound('mute'); this.emit(); })
+      .on(RoomEvent.TrackMuted, () => this.emit())
       .on(RoomEvent.Reconnecting, () => {
+        if (r === this.voiceRoom) this.recordVoiceDiagnostic({ kind: 'reconnecting', connectionState: 'reconnecting' });
         if (r !== this.viewRoom && r !== this.voiceRoom) return;
         this.reconnectingRooms.add(r);
         this.reconnecting = this.reconnectingRooms.size > 0;
@@ -627,6 +708,7 @@ export class Engine {
         this.hooks.toast('Связь потеряна — переподключаюсь…', 'warn'); this.emit();
       })
       .on(RoomEvent.Reconnected, () => {
+        if (r === this.voiceRoom) this.recordVoiceDiagnostic({ kind: 'reconnected', connectionState: 'connected' });
         if (r !== this.viewRoom && r !== this.voiceRoom) return;
         this.reconnectingRooms.delete(r);
         this.reconnecting = this.reconnectingRooms.size > 0;
@@ -646,7 +728,7 @@ export class Engine {
       })
       .on(RoomEvent.Disconnected, () => this.handleRoomDisconnected(r, serverId))
       // размут мика слышен только самому; при оглушении звук даёт toggleDeaf, тут глушим
-      .on(RoomEvent.TrackUnmuted, (pub, p) => { if (this.inVoice && pub.source === Track.Source.Microphone && p === this.voiceRoom?.localParticipant && !this.deafToggling && !this.micRestarting) playSound('unmute'); this.emit(); })
+      .on(RoomEvent.TrackUnmuted, () => this.emit())
       // качество/пинг — метрика ГОЛОСОВОГО соединения (voiceRoom)
       .on(RoomEvent.ConnectionQualityChanged, (q, p) => { if (r === this.voiceRoom && p === r.localParticipant) { this.connQuality = mapQuality(q); this.emit(); } })
       .on(RoomEvent.AudioPlaybackStatusChanged, () => { if (r === this.voiceRoom) this.ensureVoiceAudioRunning(); })
@@ -726,6 +808,10 @@ export class Engine {
     }
   }
   private handleRoomDisconnected(room: Room, serverId: string) {
+    if (room === this.voiceRoom && this.inVoice && !this.intentionalDisconnects.has(room)) {
+      this.recordVoiceDiagnostic({ kind: 'disconnected', code: 'disconnected' });
+      this.reportVoiceDiagnostic('connection_failed');
+    }
     if (this.intentionalDisconnects.has(room)) { this.intentionalDisconnects.delete(room); return; }
     const wasViewing = room === this.viewRoom;
     const wasVoice = room === this.voiceRoom;
@@ -797,6 +883,15 @@ export class Engine {
 
   // Полный teardown (logout / выход с сервера, где я в голосе): рвём ОБЕ комнаты + всё состояние.
   disconnect() {
+    window.removeEventListener('online', this.onVoiceNetworkChange);
+    window.removeEventListener('offline', this.onVoiceNetworkChange);
+    window.removeEventListener('pagehide', this.onVoicePageHide);
+    document.removeEventListener('freeze', this.onVoiceFreeze);
+    this.diagnosticOutbox.dispose();
+    this.diagnostics.reset();
+    ++this.shareGeneration; this.sharePending = false;
+    this.screenStream?.getTracks().forEach((track) => track.stop());
+    navigator.mediaDevices?.removeEventListener?.('devicechange', this.onAudioDevicesChanged);
     this.stopIdleWatch?.(); this.stopIdleWatch = null; // движок выбрасывается — подписка не должна его удерживать
     if (this.spIdleTimer) { clearInterval(this.spIdleTimer); this.spIdleTimer = null; }
     ++this.voiceEpoch; ++this.connectEpoch;
@@ -817,6 +912,10 @@ export class Engine {
     this.vadOpen = false;
     this.stopLevelMeter();
     this.keepAliveOff();
+    ++this.outputGeneration;
+    this.outputSwitch = Promise.resolve();
+    for (const ctx of [this.spCtx, this.outputCtx, this.keepCtx]) { if (ctx) void ctx.close().catch(() => {}); }
+    this.spCtx = null; this.outputCtx = null; this.keepCtx = null;
     document.querySelectorAll('#audioSink audio').forEach((a) => a.remove());
     this.clearVoiceAudio();
     this.clearAllWatches();
@@ -1142,6 +1241,7 @@ export class Engine {
       if (!this.voiceIntentCurrent(voiceEpoch, room, channelId) || this.voiceClaimPending !== 0) return false;
       try {
         await this.setVoiceAttributes(room, expected, true);
+        if (!this.voiceIntentCurrent(voiceEpoch, room, channelId) || this.voiceClaimPending !== 0) return false;
         if (matches()) return true;
       } catch { /** retry below while the intent is still current */ }
       await new Promise((resolve) => window.setTimeout(resolve, 120 * (attempt + 1)));
@@ -1174,7 +1274,7 @@ export class Engine {
       // Интент мута транслируем пирам отдельным атрибутом, как deaf. Бейдж мута у пиров считается по
       // публикации мик-трека, а её нет вовсе, когда микрофон недоступен (listen-only) или пересобирается
       // watchdog-ом — и такой участник бессрочно выглядел у всех как «мик включён».
-      mic: active && this.localMicMuted() ? '0' : '',
+      mic: active && (this.localMicMuted() || this.noMic) ? '0' : '',
       vcAt: active && this.myVcAt ? String(this.myVcAt) : '',
       voiceSession: active ? this.voiceLeaseSession : '',
       voiceEpoch: active && this.voiceLeaseEpoch > 0 ? String(this.voiceLeaseEpoch) : '',
@@ -1196,7 +1296,7 @@ export class Engine {
     // voiceRoom: держим мой vc=currentVc + deaf, пока в войсе (гонка/rate-limit могли не долить setAttributes).
     if (this.voiceRoom && this.inVoice) {
       const wantDeaf = this.deafened ? '1' : '';
-      const wantMic = this.localMicMuted() ? '0' : '';
+      const wantMic = this.localMicMuted() || this.noMic ? '0' : '';
       const a = this.voiceRoom.localParticipant.attributes || {};
       if ((a.vc || '') !== (this.currentVc || '') || (a.deaf || '') !== wantDeaf || (a.mic || '') !== wantMic
         || (a.voiceSession || '') !== this.voiceLeaseSession || (a.voiceEpoch || '') !== (this.voiceLeaseEpoch > 0 ? String(this.voiceLeaseEpoch) : '')) {
@@ -1324,7 +1424,7 @@ export class Engine {
     return this.watchT.get(identity) ?? (this.treeT.isRemoteBroadcasting(identity) ? this.treeT : this.liveKitT);
   }
   private nameOf(identity: string): string { const p = this.partOf(identity); return (p && p.name) || identity; }
-  private localMicMuted(): boolean { return this.manualMute || this.noMic; } // noMic (зашёл без мика) = тоже «нет звука наружу»
+  private localMicMuted(): boolean { return this.manualMute || this.deafened; }
   private micPub() { return this.voiceRoom && this.voiceRoom.localParticipant.getTrackPublication(Track.Source.Microphone); }
   // Ждём, пока комната реально ПОДКЛЮЧИТСЯ (roomReady). Нужно, когда после свитча серверов WebRTC-connect
   // ещё идёт в фоне: объект Room есть, но публиковать в него нельзя. Резолвит true при готовности, false —
@@ -1345,7 +1445,7 @@ export class Engine {
   // клика уже потеряна. Подготавливаем оба контекста синхронно в начале первого входа; startMic ниже
   // заберёт micActx и построит на нём pipeline после завершения сетевой части.
   private prepareVoiceAudio() {
-    if (!this.micRaw && !this.micActx) this.micActx = new AudioContext();
+    if (!this.micRaw && !this.micActx) this.micActx = createMicrophoneAudioContext();
     this.spCtx = this.spCtx || new AudioContext();
     this.micActx?.resume?.().catch(() => {});
     this.spCtx.resume?.().catch(() => {});
@@ -1354,6 +1454,7 @@ export class Engine {
   /* ---------- VOICE join/leave/switch (несколько каналов на сервер) ---------- */
   // подключиться к голосовому каналу channelId; если уже в другом — переключиться без переподнятия микрофона
   async joinVoice(channelId: string) {
+    this.startEngineObservers();
     const targetRoom = this.viewRoom;
     const targetServer = this.viewServerId; // вход в голос — на СМОТРИМОМ сервере (его каналы в ServerView)
     if (!channelId || !targetRoom || !targetServer) return;
@@ -1363,6 +1464,11 @@ export class Engine {
       if (this.currentVc === channelId && !this.voiceConnecting) return;
       if (!this.voiceConnecting) { await this.switchVoice(channelId); return; }
     }
+    const joinStartedAt = performance.now();
+    const joinDiagnostics = new VoiceDiagnosticsRecorder();
+    joinDiagnostics.start();
+    joinDiagnostics.record({ kind: 'join_started', stage: 'intent', outcome: 'started' });
+    if (this.readyRooms.has(targetRoom)) joinDiagnostics.record({ kind: 'hub_connected', stage: 'hub', outcome: 'ok' });
     // Важно вызвать ДО первого await и только для первого входа: текущий рабочий pipeline при переходе
     // между серверами трогать нельзя. Для уже разблокированной голосовой сессии остаётся обычный startMic.
     if (!this.inVoice) this.prepareVoiceAudio();
@@ -1372,7 +1478,10 @@ export class Engine {
     // Start the global device/tab ordering fence before teardown, room-ready
     // waits, attributes or microphone setup can delay the eventual claim.
     const ticketPromise = session
-      ? api.mintVoiceIntent(session, targetServer, channelId, clientIntent).catch(() => null)
+      ? api.mintVoiceIntent(session, targetServer, channelId, clientIntent).then((event) => {
+        joinDiagnostics.record({ kind: 'intent_finished', stage: 'intent', outcome: event.accepted === false ? 'failed' : 'ok' });
+        return event;
+      }).catch(() => { joinDiagnostics.record({ kind: 'intent_finished', stage: 'intent', outcome: 'failed', code: 'network' }); return null; })
       : Promise.resolve(null);
     if (this.inVoice && this.voiceServerId !== targetServer) {
       await this.leaveVoice();
@@ -1380,6 +1489,11 @@ export class Engine {
       if (this.viewRoom !== targetRoom || this.viewServerId !== targetServer || this.voiceClientIntent !== clientIntent) return;
     }
     const epoch = ++this.voiceEpoch;
+    this.diagnostics = joinDiagnostics;
+    if (this.diagnosticJoinTimer !== null) clearTimeout(this.diagnosticJoinTimer);
+    this.diagnosticJoinTimer = window.setTimeout(() => {
+      if (this.voiceEpoch === epoch && this.voiceConnecting) this.reportVoiceDiagnostic('join_stuck');
+    }, Math.max(0, 8000 - (performance.now() - joinStartedAt)));
     this.voiceClaimPending = epoch; this.deferredVoiceLease = null; this.matchedVoiceLease = null;
     this.voiceLeaseVerifying = false; ++this.voiceLeaseVerifySeq;
     const replacingPendingJoin = this.inVoice && this.voiceRoom === targetRoom && this.voiceConnecting;
@@ -1406,9 +1520,15 @@ export class Engine {
     // по UI, по факту нет. Ждём готовности, показывая «подключение»; не поднялась за таймаут — откат.
     if (!this.readyRooms.has(targetRoom)) {
       const ready = await this.waitRoomReady(targetRoom, epoch, 15000);
+      if (ready && this.voiceIntentCurrent(epoch, targetRoom, channelId)) this.recordVoiceDiagnostic({ kind: 'hub_connected', stage: 'hub', outcome: 'ok' });
       if (!this.voiceIntentCurrent(epoch, targetRoom, channelId)) return;
       if (!ready) {
+        this.recordVoiceDiagnostic({ kind: 'join_failed', stage: 'hub', outcome: 'timed_out', code: 'timeout' });
+        this.reportVoiceDiagnostic('connection_failed');
         await this.stopMic(targetRoom); // закрывает заранее подготовленный AudioContext
+        if (!this.voiceIntentCurrent(epoch, targetRoom, channelId)) return;
+        if (this.diagnosticJoinTimer !== null) clearTimeout(this.diagnosticJoinTimer);
+        this.diagnosticJoinTimer = null;
         this.voiceClaimPending = 0; this.deferredVoiceLease = null; this.matchedVoiceLease = null;
         this.inVoice = false; this.currentVc = null; this.voiceConnecting = false; this.voiceRoom = null; this.voiceServerId = null;
         this.liveKitT.setBroadcastRoom?.(null);
@@ -1420,6 +1540,7 @@ export class Engine {
     const ticketEvent = await ticketPromise;
     if (!this.voiceIntentCurrent(epoch, targetRoom, channelId) || this.voiceClientIntent !== clientIntent) return;
     if (!ticketEvent || ticketEvent.accepted === false || !Number.isSafeInteger(ticketEvent.ticket) || ticketEvent.ticket < 1) {
+      this.reportVoiceDiagnostic('connection_failed');
       if (this.voiceClaimPending === epoch) this.voiceClaimPending = 0;
       this.hooks.toast('Не удалось согласовать вход между устройствами — попробуй ещё раз', 'warn');
       await this.leaveVoice();
@@ -1444,10 +1565,13 @@ export class Engine {
       return;
     }
     if (!leaseEvent || !this.acceptVoiceLease(leaseEvent, targetServer, channelId)) {
+      this.recordVoiceDiagnostic({ kind: 'lease_claimed', stage: 'claim', outcome: 'failed' });
+      this.reportVoiceDiagnostic('connection_failed');
       this.hooks.toast('Не удалось закрепить голосовую сессию — попробуй ещё раз', 'warn');
       await this.leaveVoice();
       return;
     }
+    this.recordVoiceDiagnostic({ kind: 'lease_claimed', stage: 'claim', outcome: 'ok' });
     if (deferredLease) {
       this.onVoiceLease(deferredLease);
       if (!this.voiceIntentCurrent(epoch, targetRoom, channelId)) return;
@@ -1455,6 +1579,8 @@ export class Engine {
     // deaf по пред-установке — сразу заявляем пирам (иначе зашёл «оглохшим», а бейджа deaf у них нет)
     if (!await this.commitVoiceAttributes(targetRoom, epoch, channelId)) {
       if (this.voiceIntentCurrent(epoch, targetRoom, channelId)) {
+        this.recordVoiceDiagnostic({ kind: 'join_failed', stage: 'activation', outcome: 'failed', code: 'sdk' });
+        this.reportVoiceDiagnostic('connection_failed');
         this.hooks.toast('Не удалось синхронизировать голос — подключись ещё раз', 'warn');
         await this.leaveVoice();
       }
@@ -1462,6 +1588,7 @@ export class Engine {
     }
     // Claim отправляем ДО медленного gUM/RNNoise: окно с двумя активными устройствами минимально.
     this.lastVclaim = Date.now();
+    this.recordVoiceDiagnostic({ kind: 'media_activated', stage: 'activation', outcome: 'ok' });
     this.dataSend({ t: 'vclaim', uid: this.me.id, session, epoch: this.voiceLeaseEpoch });
     // Микрофон недоступен (нет устройства/отказ в доступе) — НЕ отменяем вход: заходим слушателем
     // (listen-only). В канале, слышим всех, но нас не слышно. Как в Discord. noMic сбросится при
@@ -1469,11 +1596,24 @@ export class Engine {
     this.noMic = false;
     try {
       const started = await this.startMic(epoch);
-      if (!started || !this.voiceIntentCurrent(epoch, targetRoom, channelId)) return;
+      if (!started) {
+        // A device selection can replace capture while this join owns channel setup. Wait for
+        // that replacement, then finish this same join (including listen-only after failure).
+        while (this.voiceIntentCurrent(epoch, targetRoom, channelId)) {
+          const replacement = this.micReapplyTask;
+          if (!replacement || replacement.epoch !== epoch) break;
+          await replacement.promise;
+          if (this.micReapplyTask === replacement) break;
+        }
+        if (!this.micRaw && !this.noMic) return;
+      }
+      if (!this.voiceIntentCurrent(epoch, targetRoom, channelId)) return;
     }
     catch {
       if (!this.voiceIntentCurrent(epoch, targetRoom, channelId)) return;
       this.noMic = true;
+      this.recordVoiceDiagnostic({ kind: 'mic_capture_finished', stage: 'mic_capture', outcome: 'failed' });
+      this.reportVoiceDiagnostic('mic_failed');
       this.micRetryAt = Date.now() + 5000; this.micFailureNotified = true;
       this.hooks.toast('Микрофон недоступен — ты в канале, но тебя не слышно', 'warn');
     }
@@ -1481,6 +1621,12 @@ export class Engine {
     this.reconcileChannelSounds(); // состав уже посеян в начале join — тут озвучиваем тех, кто зашёл ПОКА я входил
     this.startConnPoll();
     this.voiceConnecting = false;
+    if (this.diagnosticJoinTimer !== null) clearTimeout(this.diagnosticJoinTimer);
+    this.diagnosticJoinTimer = null;
+    const joinElapsedMs = performance.now() - joinStartedAt;
+    this.recordVoiceDiagnostic({ kind: 'join_completed', outcome: 'ok', joinElapsedMs });
+    if (joinElapsedMs > 4000) this.reportVoiceDiagnostic('join_stuck', true);
+    else this.reportVoiceDiagnostic('join_succeeded');
     this.lostVoiceServerId = null; this.lostVoiceChannel = null;
     playSound('entry'); // сам зашедший тоже слышит вход (остальные в канале — через onRemotePub)
     this.emit();
@@ -1561,6 +1707,8 @@ export class Engine {
   }
   async leaveVoice() {
     if (!this.voiceRoom || !this.inVoice) return;
+    this.recordVoiceDiagnostic({ kind: 'left' });
+    this.reportVoiceDiagnostic('session_ended');
     const epoch = ++this.voiceEpoch;
     this.voiceClaimPending = 0; this.deferredVoiceLease = null; this.matchedVoiceLease = null;
     this.voiceLeaseVerifying = false; ++this.voiceLeaseVerifySeq;
@@ -1609,11 +1757,21 @@ export class Engine {
   private startConnPoll() {
     if (this.connTimer) return;
     document.addEventListener('visibilitychange', this.onVisible);
+    window.addEventListener('pageshow', this.onVisible);
+    window.addEventListener('focus', this.onVisible);
+    if (!document.hidden) this.stallMonitor.start();
     this.pollPing();
     this.connTimer = window.setInterval(() => this.pollPing(), 2500);
   }
   private stopConnPoll() {
+    this.stallMonitor.stop();
+    this.diagnosticSample = null;
+    this.pingSampleTask = null;
+    if (this.diagnosticJoinTimer !== null) clearTimeout(this.diagnosticJoinTimer);
+    this.diagnosticJoinTimer = null;
     document.removeEventListener('visibilitychange', this.onVisible);
+    window.removeEventListener('pageshow', this.onVisible);
+    window.removeEventListener('focus', this.onVisible);
     if (this.connTimer) { clearInterval(this.connTimer); this.connTimer = null; }
     this.pingMs = null; this.connQuality = 'unknown'; this.voiceLeaseAuditTick = 0;
   }
@@ -1636,6 +1794,7 @@ export class Engine {
   }
   // RTT до сервера из WebRTC-статистики микрофонного трека (remote-inbound-rtp), фолбэк — candidate-pair
   private async pollPing() {
+    const room = this.voiceRoom, epoch = this.voiceEpoch;
     // Watchdog: контекст публикации мика мог родиться/остаться 'suspended' (getUserMedia-промпт съел
     // user-activation) → пиры не слышат, хотя локально «всё работает». Держим его running, пока в войсе.
     if (this.inVoice && ((this.micActx && this.micActx.state !== 'running') || (this.spCtx && this.spCtx.state !== 'running')
@@ -1644,9 +1803,16 @@ export class Engine {
     if (this.inVoice && ++this.voiceLeaseAuditTick % 4 === 0) void this.auditVoiceLease();
     if (this.inVoice) this.ensureRemoteVoicePlayback();
     const track = this.voiceRoom?.localParticipant.getTrackPublication(Track.Source.Microphone)?.track;
-    if (!track) return;
+    if (!track || this.pingSampleTask) return;
+    const sampleTask = this.pingSampleTask = {};
     try {
       const rep: RTCStatsReport = await (track as any).getRTCStatsReport();
+      if (!room || !this.voiceIntentCurrent(epoch, room) || this.micPub()?.track !== track) return;
+      const sample = summarizeVoiceDiagnosticStats(rep, this.diagnosticSample?.track === track ? this.diagnosticSample.state : null);
+      this.diagnosticSample = { track, state: sample.state };
+      this.recordVoiceDiagnostic(sample.event);
+      const lost = sample.event.packetsLostDelta ?? 0, sent = sample.event.packetsSentDelta ?? 0;
+      if ((sample.event.rttMs ?? 0) >= 1000 || (sent >= 20 && lost / sent >= 0.1)) this.reportVoiceDiagnostic('connection_failed');
       let rtt: number | null = null, cand: number | null = null;
       rep.forEach((s: any) => {
         if (s.type === 'remote-inbound-rtp' && s.roundTripTime != null) rtt = s.roundTripTime;
@@ -1679,6 +1845,7 @@ export class Engine {
       if (cq !== this.connQuality) { this.connQuality = cq; changed = true; }
       if (changed) this.emit();
     } catch { /**/ }
+    finally { if (this.pingSampleTask === sampleTask) this.pingSampleTask = null; }
   }
 
   /* ---------- MIC / DEAFEN / PTT ---------- */
@@ -1698,7 +1865,20 @@ export class Engine {
   //                                                     \-> vadDest (VAD/метр, ДО гейта — иначе
   //                                                         гейт слушает уже замолченный gain=0 сигнал
   //                                                         и залипает закрытым)
-  private async startMic(expectedVoiceEpoch = this.voiceEpoch): Promise<boolean> {
+  private startMic(expectedVoiceEpoch = this.voiceEpoch): Promise<boolean> {
+    const active = this.micStartTask;
+    if (active?.epoch === expectedVoiceEpoch && active.generation === this.micEpoch) return active.promise;
+    let cancel!: () => void;
+    const cancelled = new Promise<boolean>((resolve) => { cancel = () => resolve(false); });
+    const promise = Promise.race([this.startMicPipeline(expectedVoiceEpoch), cancelled]);
+    const task = { epoch: expectedVoiceEpoch, generation: this.micEpoch, promise, cancel };
+    this.micStartTask = task;
+    const done = () => { if (this.micStartTask === task) this.micStartTask = null; };
+    void promise.then(done, done);
+    return promise;
+  }
+
+  private async startMicPipeline(expectedVoiceEpoch: number): Promise<boolean> {
     const room = this.voiceRoom;
     if (!room || !this.voiceIntentCurrent(expectedVoiceEpoch, room)) return false;
     if (this.micRaw && this.micActx && this.micPub()?.track) return true;
@@ -1720,24 +1900,26 @@ export class Engine {
     const dispose = async (unpublish: boolean) => {
       if (disposed) return;
       disposed = true;
-      if (unpublish && lat) { try { await room.localParticipant.unpublishTrack(lat, true); } catch { try { lat.stop(); } catch { /**/ } } }
-      else if (lat) { try { lat.stop(); } catch { /**/ } }
+      const waits: Promise<unknown>[] = [];
+      if (unpublish && lat) { try { waits.push(room.localParticipant.unpublishTrack(lat, true)); } catch { /**/ } }
+      if (lat) { try { lat.stop(); } catch { /**/ } }
       raw?.getTracks().forEach((t) => t.stop());
       destroyDenoiseNode(denoise);
       if (vadDest) { try { vadDest.disconnect(); } catch { /**/ } }
-      if (ctx) { try { await ctx.close(); } catch { /**/ } }
+      if (ctx) { try { waits.push(ctx.close()); } catch { /**/ } }
+      await Promise.allSettled(waits);
     };
     // Первый вход и ручная смена устройства заранее создают контекст непосредственно в обработчике
     // клика (prepareVoiceAudio/reapplyMic): после сетевых await пользовательская активация уже потеряна.
     // Автовосстановление без пользовательского жеста создаёт новый контекст здесь и страхуется unlock.
-    ctx = (!this.micRaw && this.micActx) || new AudioContext();
+    ctx = (!this.micRaw && this.micActx) || createMicrophoneAudioContext();
     if (this.micActx === ctx) this.micActx = null; // pipeline локален до успешного publish/commit
-    try { await ctx.resume?.(); } catch { /**/ }
+    void ctx.resume().catch(() => {});
     if (!current()) { await dispose(false); return false; }
     // spCtx тоже заранее подготавливается на первом входе: именно его анализатор открывает VAD-гейт.
     // При восстановлении без подготовленного контекста resume + gesture-unlock/watchdog остаются подстраховкой.
     this.spCtx = this.spCtx || new AudioContext();
-    try { await this.spCtx.resume?.(); } catch { /**/ }
+    void this.spCtx.resume().catch(() => {});
     try {
       raw = await navigator.mediaDevices.getUserMedia({ audio: this.micCapture() });
     } catch (e) {
@@ -1746,6 +1928,8 @@ export class Engine {
       throw e;
     }
     if (!current()) { await dispose(false); return false; }
+    this.recordVoiceDiagnostic({ kind: 'mic_capture_finished', stage: 'mic_capture', outcome: 'ok', trackState: raw.getAudioTracks()[0]?.readyState ?? 'missing', audioContextState: ctx.state });
+    try {
     const src = ctx.createMediaStreamSource(raw);
     let preGate: AudioNode = src;
     if (getSettings().nsMode === 'rnnoise') {
@@ -1789,14 +1973,17 @@ export class Engine {
     }
     if (!current()) { await dispose(true); return false; }
     // Состояние мута могло смениться, пока шёл publish (пользователь кликнул мик) — досводим.
-    if ((this.manualMute || this.deafened) !== lat.isMuted) { try { (this.manualMute || this.deafened) ? lat.mute() : lat.unmute(); } catch { /**/ } }
     // Коммитим pipeline только после успешного publish и последней проверки generation. Старый async
     // хвост никогда не перезапишет ресурсы более свежего микрофона.
     this.micRaw = raw;
     this.micActx = ctx;
     this.micGain = gain;
+    this.micGateTarget = null;
     this.micDenoise = denoise;
     this.micVadDest = vadDest;
+    this.recordVoiceDiagnostic({ kind: 'mic_published', stage: 'mic_publish', outcome: 'ok' });
+    this.watchMicHealth(raw.getAudioTracks()[0], lat, ctx, op);
+    void this.syncMicState();
     this.micLevelAt = performance.now(); // отсчёт протухания стартует с момента запуска мика, а не с нуля
     this.startVadWatchdog();
     // индикатор «говорит» + VAD на rAF-анализаторе — сразу (рабочий на переднем плане и на время загрузки
@@ -1805,10 +1992,16 @@ export class Engine {
     this.applyGate();
     this.ensureVoiceAudioRunning(); // добить, если контекст всё ещё suspended (анлок на первый жест + watchdog)
     this.noMic = false;
+    void this.setVoiceAttributes(room, this.wantedVoiceAttributes(room));
     // VAD на аудио-потоке (не на rAF): гейт активации голосом должен работать и в фоновой вкладке, где
     // requestAnimationFrame заморожен и spLoop не двигал бы vadOpen (микрофон молча гейтился в тишину).
     void this.setupVadWorklet(ctx, preGate, op);
     return true;
+    } catch (error) {
+      await dispose(true);
+      if (!current()) return false;
+      throw error;
+    }
   }
   // Поднять VAD-ворклет и передать ему владение vadOpen. Тап строго на preGate (после денойза, канал 0),
   // не на micGain — иначе детектор слушал бы уже замолченный (gain=0) сигнал и залипал закрытым. При
@@ -1890,26 +2083,50 @@ export class Engine {
   private micMutedTicks = 0;
   private micRetryAt = 0;
   private micFailureNotified = false;
+  private watchMicHealth(raw: MediaStreamTrack, published: LocalAudioTrack, ctx: AudioContext, generation: number) {
+    this.micHealthCleanup?.();
+    const changed = () => {
+      if (this.micEpoch !== generation || document.hidden) return;
+      this.ensureVoiceAudioRunning();
+      void this.checkMicAlive(false);
+    };
+    const tracks = [raw, published.mediaStreamTrack];
+    for (const track of tracks) for (const event of ['ended', 'mute', 'unmute']) track.addEventListener(event, changed);
+    ctx.addEventListener('statechange', changed);
+    this.micHealthCleanup = () => {
+      for (const track of tracks) for (const event of ['ended', 'mute', 'unmute']) track.removeEventListener(event, changed);
+      ctx.removeEventListener('statechange', changed);
+    };
+  }
   private async checkMicAlive(fromWatchdog = false) {
     const room = this.voiceRoom;
-    if (!this.inVoice || !room || this.micRestarting || (fromWatchdog && Date.now() < this.micRetryAt)) return;
+    if (!this.inVoice || !room || document.hidden || this.voiceConnecting || this.voiceReconnecting
+      || this.micRestarting || this.micReapplying || this.micStartTask || (fromWatchdog && Date.now() < this.micRetryAt)) return;
     const voiceEpoch = this.voiceEpoch;
+    const reapplyEpoch = this.micReapplyEpoch;
     const t = this.micRaw?.getAudioTracks()[0];
     const publication = room.localParticipant.getTrackPublication(Track.Source.Microphone);
-    const ended = !this.micActx || !t || t.readyState === 'ended' || !publication?.track;
-    if (!ended && t && t.muted && fromWatchdog) this.micMutedTicks++;
-    else if (t && !t.muted) this.micMutedTicks = 0;
+    const processed = publication?.track?.mediaStreamTrack;
+    const ended = !this.micActx || this.micActx.state === 'closed' || !t || t.readyState === 'ended' || !processed || processed.readyState === 'ended';
+    const interrupted = t?.muted || processed?.muted || (this.micActx && this.micActx.state !== 'running');
+    if (!ended && interrupted && fromWatchdog) this.micMutedTicks++;
+    else if (!interrupted) this.micMutedTicks = 0;
+    if (!ended && !interrupted) {
+      void this.syncMicState();
+      if (publication?.track?.isUpstreamPaused) void publication.track.resumeUpstream().catch(() => {});
+    }
     if (!ended && this.micMutedTicks < 2) return;
     this.micRestarting = true; this.micMutedTicks = 0;
+    this.recordVoiceDiagnostic({ kind: 'mic_recovery_started', stage: 'mic_recovery', outcome: 'started' });
     try {
       await this.stopMic(room);
-      if (!this.voiceIntentCurrent(voiceEpoch, room)) return;
+      if (reapplyEpoch !== this.micReapplyEpoch || !this.voiceIntentCurrent(voiceEpoch, room)) return;
       let started = false;
       try { started = await this.startMic(voiceEpoch); }
       catch (error) {
         const name = String((error as any)?.name || '');
         const selectedDeviceGone = !!getSettings().input && (name === 'NotFoundError' || name === 'OverconstrainedError');
-        if (!selectedDeviceGone || !this.voiceIntentCurrent(voiceEpoch, room)) throw error;
+        if (!selectedDeviceGone || reapplyEpoch !== this.micReapplyEpoch || !this.voiceIntentCurrent(voiceEpoch, room)) throw error;
         setSettings({ input: '' });
         started = await this.startMic(voiceEpoch);
         if (started && this.voiceIntentCurrent(voiceEpoch, room)) this.hooks.toast('Выбранный микрофон отключён — включён системный', 'warn');
@@ -1917,12 +2134,15 @@ export class Engine {
       // started===false при живом voice-intent значит одно: pipeline перехватила более свежая операция
       // (reapplyMic/toggleMic) — она и владеет состоянием. Писать сюда noMic нельзя, это протухшая
       // запись поверх нового владельца (ложное «микрофон недоступен» на каждой смене устройства).
-      if (!started || !this.voiceIntentCurrent(voiceEpoch, room)) return;
+      if (!started || reapplyEpoch !== this.micReapplyEpoch || !this.voiceIntentCurrent(voiceEpoch, room)) return;
       this.noMic = false; this.micRetryAt = 0; this.micFailureNotified = false;
+      this.recordVoiceDiagnostic({ kind: 'mic_recovery_finished', stage: 'mic_recovery', outcome: 'recovered' });
       this.emit();
     } catch {
-      if (!this.voiceIntentCurrent(voiceEpoch, room)) return;
+      if (reapplyEpoch !== this.micReapplyEpoch || !this.voiceIntentCurrent(voiceEpoch, room)) return;
       this.noMic = true;
+      this.recordVoiceDiagnostic({ kind: 'mic_recovery_finished', stage: 'mic_recovery', outcome: 'failed' });
+      this.reportVoiceDiagnostic('mic_failed');
       this.micRetryAt = Date.now() + 5000;
       if (!this.micFailureNotified) {
         this.micFailureNotified = true;
@@ -1936,10 +2156,13 @@ export class Engine {
   // (не ждём до 2.5с следующего watchdog-тика). muted-рестарт тут не делаем — только ended.
   private onVisible = () => {
     if (!this.inVoice) return;
+    this.recordVoiceDiagnostic({ kind: document.hidden ? 'background' : 'foreground' });
     // Уход в фон — момент, когда замирает requestAnimationFrame. Если гейт держится на spLoop
     // (ворклет не поднялся), замер протухнет именно сейчас, поэтому пересчитываем гейт сразу, не
     // дожидаясь троттлящегося таймера-сторожа. Возврат на вкладку пересчитает его тем же путём.
-    if (document.hidden) { window.setTimeout(() => this.applyGate(), VAD_STALE_MS + 50); return; }
+    if (document.hidden) { this.stallMonitor.stop(); this.forcePttRelease(); this.applyGate(); return; }
+    this.stallMonitor.start();
+    this.micMutedTicks = 0;
     this.micActx?.resume?.().catch(() => {});
     this.spCtx?.resume?.().catch(() => {});
     this.applyGate();
@@ -1948,6 +2171,10 @@ export class Engine {
   };
   private async stopMic(room: Room | null = this.voiceRoom): Promise<void> {
     ++this.micEpoch; // первым действием отменяем любой незавершённый gUM/RNNoise/publish
+    this.micStartTask?.cancel();
+    this.micHealthCleanup?.(); this.micHealthCleanup = null;
+    if (this.micGain) { this.micGain.gain.cancelScheduledValues(0); this.micGain.gain.value = 0; }
+    this.micGateTarget = null;
     const p = room?.localParticipant.getTrackPublication(Track.Source.Microphone);
     const publishedTrack = p?.track;
     const raw = this.micRaw; this.micRaw = null;
@@ -1986,11 +2213,20 @@ export class Engine {
     let target = 1;
     // Нет подтверждённого ownership — нет звука наружу. Особенно важно во время handoff и switch:
     // notify/HTTP/LiveKit-атрибуты могут прийти в разном порядке на разных устройствах.
-    if (this.voiceLeaseVerifying || this.voiceClaimPending !== 0 || this.voiceLeaseEpoch <= 0 || this.voiceLeaseSession !== this.sessionId()) target = 0;
+    if (!this.inVoice || this.voiceReconnecting || this.voiceLeaseVerifying || this.voiceClaimPending !== 0 || this.voiceLeaseEpoch <= 0 || this.voiceLeaseSession !== this.sessionId()) target = 0;
     else if (this.manualMute || this.deafened) target = 0;
     else if (s.mode === 'ptt') target = this.pttDown ? 1 : 0;
-    else if (!this.vadOpen && !this.vadStale()) target = 0; // "активация голосом": ниже порога чувствительности — не передаём
-    try { this.micGain.gain.setTargetAtTime(target, this.micActx.currentTime, 0.015); } catch { this.micGain.gain.value = target; }
+    else if (!document.hidden && !this.vadOpen && !this.vadStale()) target = 0;
+    if (target === this.micGateTarget) return;
+    this.micGateTarget = target;
+    const param = this.micGain.gain;
+    // Keep the automation timeline bounded. Repeated watchdog/speech updates must not accumulate
+    // thousands of ramps, and a manual mute must silence the local graph in the same event turn.
+    try {
+      param.cancelScheduledValues(0);
+      if (!target) param.setValueAtTime(0, this.micActx.currentTime);
+      else param.setTargetAtTime(1, this.micActx.currentTime, 0.015);
+    } catch { param.value = target; }
   }
   // Сторож фейл-опена: сам по себе гейт пересчитывается только на событиях (замер уровня, мут, PTT),
   // а протухание — состояние без события. В фоне таймер троттлится, поэтому visibilitychange (onVisible
@@ -2064,7 +2300,7 @@ export class Engine {
       if (this.levelStream === stream) this.levelStream = null;
     };
     try {
-      const ctx = this.levelCtx = this.levelCtx || new AudioContext();
+      const ctx = this.levelCtx = this.levelCtx || createMicrophoneAudioContext();
       ctx.resume?.().catch(() => {});
       src = ctx.createMediaStreamSource(stream);
       let preAnalyser: AudioNode = src;
@@ -2115,7 +2351,15 @@ export class Engine {
     if (this.levelStream) { this.levelStream.getTracks().forEach((t) => t.stop()); this.levelStream = null; }
     if (this.levelCtx) { try { this.levelCtx.close(); } catch { /**/ } this.levelCtx = null; }
   }
-  async reapplyMic(target: 'input' | 'route' = 'input') {
+  reapplyMic(target: 'input' | 'route' = 'input'): Promise<void> {
+    const promise = this.reapplyMicPipeline(target);
+    const task = { epoch: this.voiceEpoch, promise };
+    this.micReapplyTask = task;
+    const done = () => { if (this.micReapplyTask === task) this.micReapplyTask = null; };
+    void promise.then(done, done);
+    return promise;
+  }
+  private async reapplyMicPipeline(target: 'input' | 'route') {
     const route = target === 'route';
     if (!this.voiceRoom || !this.inVoice) {
       this.hooks.toast(route ? 'Вывод звука применится при подключении к голосовому' : 'Микрофон применится при подключении к голосовому');
@@ -2125,9 +2369,11 @@ export class Engine {
     // рождался только после stopMic/unpublish и оставался suspended; следующий тап будил предыдущую
     // попытку, поэтому на iOS маршрут начинал работать лишь после нескольких переключений по кругу.
     const reapplyEpoch = ++this.micReapplyEpoch;
+    this.micReapplying = true;
+    try {
     let preparedCtx: AudioContext | null = null;
     try {
-      preparedCtx = new AudioContext();
+      preparedCtx = createMicrophoneAudioContext();
       preparedCtx.resume?.().catch(() => {});
       this.spCtx?.resume?.().catch(() => {});
       this.outputCtx?.resume?.().catch(() => {});
@@ -2142,75 +2388,87 @@ export class Engine {
     this.micActx = preparedCtx;
     preparedCtx = null; // startMic заберёт и закроет при любой ошибке до commit
     try {
-      if (!await this.startMic(voiceEpoch) || !this.voiceIntentCurrent(voiceEpoch, room)) return;
+      if (!await this.startMic(voiceEpoch) || reapplyEpoch !== this.micReapplyEpoch || !this.voiceIntentCurrent(voiceEpoch, room)) return;
       this.noMic = false; this.micRetryAt = 0; this.micFailureNotified = false;
       this.hooks.toast(route ? 'Вывод звука переключён' : 'Микрофон переключён', 'ok');
     }
     catch {
-      if (!this.voiceIntentCurrent(voiceEpoch, room)) return;
+      if (reapplyEpoch !== this.micReapplyEpoch || !this.voiceIntentCurrent(voiceEpoch, room)) return;
       // На iPhone/iPad встроенный маршрут вывода WebKit предоставляет как связанный audioinput,
       // поэтому и обычный микрофон, и мобильный аудиомаршрут откатываются одним input reset.
       setSettings({ input: '' });
       try {
-        if (!await this.startMic(voiceEpoch) || !this.voiceIntentCurrent(voiceEpoch, room)) return;
+        if (!await this.startMic(voiceEpoch) || reapplyEpoch !== this.micReapplyEpoch || !this.voiceIntentCurrent(voiceEpoch, room)) return;
         this.noMic = false; this.micRetryAt = 0; this.micFailureNotified = false;
         this.hooks.toast(route ? 'Аудиомаршрут недоступен — включён системный' : 'Выбранный микрофон недоступен — включён дефолтный', 'warn');
       }
       catch {
-        if (!this.voiceIntentCurrent(voiceEpoch, room)) return;
+        if (reapplyEpoch !== this.micReapplyEpoch || !this.voiceIntentCurrent(voiceEpoch, room)) return;
         this.noMic = true; this.micRetryAt = Date.now() + 5000;
         this.hooks.toast(route ? 'Не удалось переключить вывод звука' : 'Не удалось включить микрофон', 'err');
       }
     }
     this.emit();
+    } finally { if (reapplyEpoch === this.micReapplyEpoch) this.micReapplying = false; }
   }
-  async toggleMic() {
-    // Зашёл в голосовой БЕЗ мика → клик = попытка получить доступ (дал разрешение позже / воткнул микрофон).
-    if (this.inVoice && this.noMic) {
-      const prevMute = this.manualMute; // не удалось поднять мик — интент мута обязан вернуться как был
-      this.manualMute = false; // клик по мику = «хочу говорить»
-      const room = this.voiceRoom;
-      const voiceEpoch = this.voiceEpoch;
-      try {
-        if (!room || !await this.startMic(voiceEpoch) || !this.voiceIntentCurrent(voiceEpoch, room)) { this.manualMute = prevMute; this.emit(); return; }
-        this.noMic = false; this.micRetryAt = 0; this.micFailureNotified = false;
-        this.saveVoicePrefs(); this.hooks.toast('Микрофон подключён');
+  private syncMicState(): Promise<void> {
+    const room = this.voiceRoom;
+    const track = this.micPub()?.track as LocalAudioTrack | undefined;
+    if (!room || !track) return Promise.resolve();
+    const active = this.micStateWrites.get(track);
+    if (active) return active;
+    const current = () => this.inVoice && this.voiceRoom === room && this.micPub()?.track === track;
+    const run = Promise.resolve().then(async () => {
+      while (current()) {
+        const muted = this.manualMute || this.deafened;
+        if (track.isMuted === muted) break;
+        try { await (muted ? track.mute() : track.unmute()); }
+        catch { break; } // watchdog retries; never spin on a failed network operation
       }
-      catch { this.manualMute = prevMute; this.hooks.toast('Микрофон всё ещё недоступен', 'warn'); }
-      this.emit(); return;
-    }
-    // Работает и ВНЕ голоса: пред-установка мута (Discord-стиль) — применится на входе (startMic мьютит
-    // при manualMute). В голосе — сразу мьютим/размьючиваем трек. Всегда персистим.
-    this.manualMute = !this.manualMute;
+    }).finally(() => { if (this.micStateWrites.get(track) === run) this.micStateWrites.delete(track); });
+    this.micStateWrites.set(track, run);
+    return run;
+  }
+
+  async toggleMic() {
+    // Intent changes synchronously. Device recovery must never restore a value saved before a click.
+    const retryMissing = this.inVoice && this.noMic && !this.manualMute && !this.micStartTask && !this.micRestarting && !this.micReapplying;
+    this.manualMute = retryMissing ? false : !this.manualMute;
+    this.recordVoiceDiagnostic({ kind: 'mute_changed' });
     this.saveVoicePrefs();
-    if (this.inVoice && this.voiceRoom) {
-      const p = this.micPub();
-      // пока фулл-мут (deafened) активен, трек должен оставаться замьюченным на уровне LiveKit
-      // независимо от ручного тогла — иначе снятие ручного мута во время deafen паразитно
-      // размучивает трек (звук всё равно молчит через applyGate/gain=0, но у пиров и у себя
-      // пропадает бейдж мута, будто фулл-мута больше нет).
-      if (p && p.track) { (this.manualMute || this.deafened) ? p.track.mute() : p.track.unmute(); } // ручной мут виден другим
-      // Публикации может не быть (listen-only/рестарт мика) — тогда пиры узнают о муте только атрибутом.
-      void this.setVoiceAttributes(this.voiceRoom, this.wantedVoiceAttributes(this.voiceRoom));
-      this.applyGate();
-    }
+    this.forcePttRelease();
+    this.applyGate();
     this.emit();
+    if (this.inVoice) playSound(this.manualMute ? 'mute' : 'unmute');
+    if (this.inVoice && this.voiceRoom) {
+      void this.setVoiceAttributes(this.voiceRoom, this.wantedVoiceAttributes(this.voiceRoom));
+      void this.syncMicState();
+      if (this.noMic && !this.manualMute && !this.voiceConnecting && !this.micRestarting && !this.micReapplying) {
+        const room = this.voiceRoom, epoch = this.voiceEpoch, reapply = this.micReapplyEpoch;
+        this.prepareVoiceAudio();
+        try {
+          if (!await this.startMic(epoch) || reapply !== this.micReapplyEpoch || !this.voiceIntentCurrent(epoch, room)) return;
+          this.noMic = false; this.micRetryAt = 0; this.micFailureNotified = false;
+        } catch {
+          if (reapply !== this.micReapplyEpoch || !this.voiceIntentCurrent(epoch, room)) return;
+          this.hooks.toast('Микрофон всё ещё недоступен', 'warn');
+        }
+        this.emit();
+      }
+    }
   }
   toggleDeaf() {
     // Работает и ВНЕ голоса: пред-установка «оглох» — применится на входе (joinVoice ставит deaf-атрибут,
     // reconcile не подпишется). Всегда персистим.
     this.deafened = !this.deafened;
+    this.recordVoiceDiagnostic({ kind: 'deafen_changed' });
     this.saveVoicePrefs();
+    this.forcePttRelease();
+    this.applyGate();
     if (this.inVoice) {
-      // оглушение внутри мьютит/размьютит мик-трек → RoomEvent.TrackMuted/Unmuted. Глушим их
-      // паразитный mute/unmute-звук на ~250мс: свой звук (fullMute/unmute) играем явно ниже.
-      this.deafToggling = true;
-      window.setTimeout(() => { this.deafToggling = false; }, 250);
       // транслируем пирам, чтобы у них статус-бейдж отличался от простого мута мика (см. build())
       if (this.voiceRoom) void this.setVoiceAttributes(this.voiceRoom, this.wantedVoiceAttributes(this.voiceRoom));
-      const p = this.micPub();
-      if (this.deafened) { if (p && p.track) p.track.mute(); }
-      else { if (p && p.track && !this.manualMute) p.track.unmute(); }
+      void this.syncMicState();
       // deafen → отписка от всех миков (want=false при deafened), undeafen → переподписка. Отписка
       // надёжнее глушения громкостью: нет трека = точно тишина, и размут пира не воскресит звук.
       this.reconcileAllAudio();
@@ -2338,13 +2596,36 @@ export class Engine {
     // Размьют element создал бы обход gain (двойной звук и сломанный local mute).
     this.applyVolumeToParticipant(p);
     this.ensureVoiceOutput();
-    const sink = getSettings().output || 'default';
-    if ((el as any).setSinkId) void (el as any).setSinkId(sink).catch(() => {
-      // Выбранный output исчез/недоступен — возвращаем этот element на системный default.
-      if (sink !== 'default') void (el as any).setSinkId('default').catch(() => {});
-    });
+    void this.routeAudioElement(el);
     // `autoplay=true` недостаточно: браузер может оставить element paused после background/device switch.
-    void el.play().catch(() => { this.ensureVoiceAudioRunning(); });
+    if (el.paused) void el.play().catch(() => {
+      this.recordVoiceDiagnostic({ kind: 'playback_blocked', stage: 'playback', outcome: 'blocked', code: 'media_blocked' });
+      this.reportVoiceDiagnostic('playback_blocked');
+      this.ensureVoiceAudioRunning();
+    });
+  }
+  private routeAudioElement(el: HTMLMediaElement): Promise<void> {
+    const sinkable = el as HTMLMediaElement & { setSinkId?: (id: string) => Promise<void>; sinkId?: string };
+    if (!sinkable.setSinkId) return Promise.resolve();
+    const active = this.elementOutputWrites.get(el);
+    if (active) return active;
+    const run = Promise.resolve().then(async () => {
+      while (el.isConnected) {
+        const sink = getSettings().output || 'default';
+        if (sinkable.sinkId === sink || (sink === 'default' && !sinkable.sinkId)) return;
+        try { await sinkable.setSinkId!(sink); }
+        catch {
+          if ((getSettings().output || 'default') !== sink) continue;
+          if (sink !== 'default' && el.isConnected) {
+            try { await sinkable.setSinkId!('default'); } catch { /** next explicit device change retries */ }
+          }
+          if ((getSettings().output || 'default') === sink) return;
+        }
+        if ((getSettings().output || 'default') === sink) return;
+      }
+    }).finally(() => { if (this.elementOutputWrites.get(el) === run) this.elementOutputWrites.delete(el); });
+    this.elementOutputWrites.set(el, run);
+    return run;
   }
   private ensureVoiceOutput(force = false) {
     const room = this.voiceRoom;
@@ -2405,7 +2686,7 @@ export class Engine {
       if (isScreen && room === this.viewRoom) {
         const a = track.attach() as HTMLMediaElement; a.autoplay = true; a.setAttribute('data-origin', 'view');
         document.getElementById('audioSink')?.appendChild(a);
-        const sink = getSettings().output || 'default'; if ((a as any).setSinkId) void (a as any).setSinkId(sink).catch(() => {});
+        void this.routeAudioElement(a);
         this.screenAudioEls.set(u, a);
         try { (p as any).setVolume(this.deafened ? 0 : this.streamVolOf(u), Track.Source.ScreenShareAudio); } catch { /**/ }
         void a.play().catch(() => {});
@@ -2424,12 +2705,14 @@ export class Engine {
     this.emit();
   };
   private onUnsub = (track: RemoteTrack, pub: TrackPublication, p: RemoteParticipant, _room?: Room) => {
-    track.detach().forEach((el) => el.remove());
+    const detached = track.detach();
+    detached.forEach((el) => el.remove());
     const u = baseUid(p.identity);
     this.clearSubscriptionRetries(p.identity, (pub as any).trackSid || (pub as any).sid);
-    if (pub.source === Track.Source.ScreenShareAudio) this.screenAudioEls.delete(u);
+    if (pub.source === Track.Source.ScreenShareAudio && detached.includes(this.screenAudioEls.get(u)!)) this.screenAudioEls.delete(u);
     // Unsubscribe старой multi-device сессии не должен снести анализатор уже активной новой сессии.
-    if (pub.source === Track.Source.Microphone && (p === this.partOf(u, this.voiceRoom) || !this.partOf(u, this.voiceRoom))) {
+    if (pub.source === Track.Source.Microphone && (!this.voiceAudioEls.has(u) || this.voiceAudioEls.get(u)?.track === track)
+      && (p === this.partOf(u, this.voiceRoom) || !this.partOf(u, this.voiceRoom))) {
       this.removeVoiceAudio(u, p.identity);
       this.detachAnalyser(u);
     }
@@ -2516,22 +2799,37 @@ export class Engine {
   async share() {
     if (!this.inVoice) { this.hooks.toast('Сначала подключись к голосовому', 'warn'); return; }
     if (!navigator.mediaDevices?.getDisplayMedia) { this.hooks.toast('Трансляция экрана не поддерживается на этом устройстве (нужен десктопный браузер)', 'warn'); return; }
-    if (this.liveKitT.isBroadcasting(this.me.username)) { await this.stopShare(); this.hooks.toast('Трансляция остановлена'); return; }
+    if (this.sharePending || this.screenStream || this.liveKitT.isBroadcasting(this.me.username)) { await this.stopShare(); this.hooks.toast('Трансляция остановлена'); return; }
+    const generation = ++this.shareGeneration;
+    const room = this.voiceRoom, epoch = this.voiceEpoch;
+    const current = () => generation === this.shareGeneration && !!room && this.voiceIntentCurrent(epoch, room);
+    this.sharePending = true;
+    let stream: MediaStream;
     try {
-      this.screenStream = await navigator.mediaDevices.getDisplayMedia({
+      stream = await navigator.mediaDevices.getDisplayMedia({
         video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60 }, displaySurface: 'browser' } as any,
         audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false } as any,
         // @ts-ignore
         systemAudio: 'include', selfBrowserSurface: 'exclude',
       });
-    } catch { this.screenStream = null; return; }
-    const vt = this.screenStream.getVideoTracks()[0];
+    } catch { if (generation === this.shareGeneration) this.sharePending = false; return; }
+    if (!current()) { stream.getTracks().forEach((track) => track.stop()); return; }
+    this.screenStream = stream;
+    const vt = stream.getVideoTracks()[0];
+    if (!vt) { await this.stopShare(); return; }
     try { await vt.applyConstraints({ frameRate: { ideal: 60, min: 30 } } as any); } catch { try { await vt.applyConstraints({ frameRate: { ideal: 60 } } as any); } catch { /**/ } }
     try { (vt as any).contentHint = 'motion'; } catch { /**/ }
-    vt.addEventListener('ended', () => this.stopShare());
-    try { await this.liveKitT.startBroadcast(this.me.username, this.screenStream); }
-    catch { this.hooks.toast('Не удалось начать трансляцию', 'err'); this.screenStream.getTracks().forEach((t) => t.stop()); this.screenStream = null; return; }
-    if (!this.screenStream.getAudioTracks()[0]) this.hooks.toast('Звук экрана не захвачен — включи галку «Поделиться аудио»', 'warn');
+    if (!current()) { stream.getTracks().forEach((track) => track.stop()); return; }
+    vt.addEventListener('ended', () => { if (this.screenStream === stream && current()) void this.stopShare(); });
+    try { await this.liveKitT.startBroadcast(this.me.username, stream); }
+    catch {
+      stream.getTracks().forEach((track) => track.stop());
+      if (current()) { this.sharePending = false; this.screenStream = null; this.hooks.toast('Не удалось начать трансляцию', 'err'); }
+      return;
+    }
+    if (!current()) { stream.getTracks().forEach((track) => track.stop()); return; }
+    this.sharePending = false;
+    if (!stream.getAudioTracks()[0]) this.hooks.toast('Звук экрана не захвачен — включи галку «Поделиться аудио»', 'warn');
     this.keepAliveOn();
     const surf = (vt.getSettings() as any).displaySurface || '';
     if (surf === 'monitor' || surf === 'window') this.hooks.toast('Выбран экран/окно (~15fps). Для 60fps выбирай «Вкладка Chrome»', 'warn'); else this.hooks.toast('Трансляция запущена', 'ok');
@@ -2540,10 +2838,13 @@ export class Engine {
     this.emit();
   }
   async stopShare() {
-    if (!this.voiceRoom) return;
+    const generation = ++this.shareGeneration;
+    this.sharePending = false;
+    const stream = this.screenStream; this.screenStream = null;
+    stream?.getTracks().forEach((track) => track.stop());
     const wasBroadcasting = this.liveKitT.isBroadcasting(this.me.username); // leaveVoice зовёт stopShare всегда — streamOff только если реально вещали
     await this.liveKitT.stopBroadcast(this.me.username);
-    if (this.screenStream) { this.screenStream.getTracks().forEach((t) => t.stop()); this.screenStream = null; }
+    if (generation !== this.shareGeneration) return;
     this.keepAliveOff();
     if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => {});
     if (wasBroadcasting) playSound('streamOff'); // сам вещатель слышит стоп (остальные на сервере — через onStreamStop)
@@ -2685,7 +2986,7 @@ export class Engine {
     const effectiveSink = await this.switchContextOutput(sink);
     if (!effectiveSink) return; // a newer device selection owns the queue
     document.querySelectorAll('#audioSink audio').forEach((a) => {
-      if ((a as any).setSinkId) void (a as any).setSinkId(effectiveSink).catch(() => effectiveSink === 'default' ? undefined : (a as any).setSinkId('default').catch(() => {}));
+      void this.routeAudioElement(a as HTMLMediaElement);
       void (a as HTMLMediaElement).play().catch(() => {});
     });
     this.ensureRemoteVoicePlayback();

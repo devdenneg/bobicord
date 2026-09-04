@@ -10,8 +10,13 @@
     "test:chat-scroll": "node src/chatScroll.test.mjs",
     "test:chat-wallpaper": "node src/chatWallpaper.test.mjs",
     "test:audio-devices": "node src/audioDevices.test.mjs",
+    "test:denoise": "node src/denoise.test.mjs",
+    "test:voice-engine": "node src/engine.test.mjs",
     "test:version-entry": "node src/versionEntry.test.mjs",
-    "build": "npm run test:links && npm run test:volume && npm run test:chat-scroll && npm run test:chat-wallpaper && npm run test:audio-devices && npm run test:version-entry && tsc --noEmit && vite build",
+    "test:updates": "node --test src/nativeUpdate.test.mjs",
+    "test:network-races": "node --test src/transport/networkRaces.test.mjs",
+    "test:voice-diagnostics": "node src/voiceDiagnostics.test.mjs && node src/voiceDiagnosticStats.test.mjs && node src/diagnosticOutbox.test.mjs && node src/adminDiagnosticsAccess.test.mjs",
+    "build": "npm run test:links && npm run test:volume && npm run test:chat-scroll && npm run test:chat-wallpaper && npm run test:audio-devices && npm run test:denoise && npm run test:voice-engine && npm run test:version-entry && npm run test:updates && npm run test:network-races && npm run test:voice-diagnostics && tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

@@ -2,6 +2,8 @@ import type {
   User, ServerSummary, Member, ServerDetail, InvitePreview, HistoryMessage, Role, VoiceChannel,
   Attachment, AdminOverview, Emote, AuthResponse, ChallengeResponse,
   RegistrationInvite, ReleaseHistoryResponse, SessionResponse,
+  AdminVoiceDiagnosticCursor, AdminVoiceDiagnosticDetail, AdminVoiceDiagnosticsPage,
+  VoiceDiagnosticClientKind, VoiceDiagnosticIncident, VoiceDiagnosticReport,
 } from './types';
 
 let token: string | null = localStorage.getItem('sess');
@@ -302,6 +304,29 @@ export const api = {
   // аллоулист игр Discord (дистиллят с сервера) — натив матчит запущенные процессы для детекта игры
   detectableGames: () => req<{ games: { name: string; exes: string[] }[] }>('GET', '/detectable-games'),
   // --- Админка (denis + кому выдали) ---
+  // Строго структурированная диагностика голоса: тип намеренно не содержит raw log/error,
+  // URL, ICE/SDP, device id/label, токенов, текста чата или аудиоданных.
+  submitVoiceDiagnostic: (payload: VoiceDiagnosticReport) => req<{ ok: true; reportId: string; createdAt: number }>(
+    'POST', '/diag/voice', payload,
+  ),
+  adminVoiceDiagnostics: (options: {
+    limit?: number; cursor?: AdminVoiceDiagnosticCursor;
+    incident?: VoiceDiagnosticIncident; client?: VoiceDiagnosticClientKind;
+  } = {}) => {
+    const query = new URLSearchParams();
+    if (options.limit != null) query.set('limit', String(options.limit));
+    if (options.cursor) {
+      query.set('beforeCreated', String(options.cursor.createdAt));
+      query.set('beforeId', options.cursor.id);
+    }
+    if (options.incident) query.set('incident', options.incident);
+    if (options.client) query.set('client', options.client);
+    const suffix = query.toString();
+    return req<AdminVoiceDiagnosticsPage>('GET', `/admin/diagnostics/voice${suffix ? `?${suffix}` : ''}`);
+  },
+  adminVoiceDiagnostic: (id: string) => req<AdminVoiceDiagnosticDetail>(
+    'GET', `/admin/diagnostics/voice/${encodeURIComponent(id)}`,
+  ),
   adminOverview: () => req<AdminOverview>('GET', '/admin/overview'),
   adminDeleteServer: (id: string) => req<{ ok: boolean }>('DELETE', `/admin/servers/${id}`),
   adminRemoveMember: (serverId: string, userId: string) => req<{ ok: boolean }>('DELETE', `/admin/servers/${serverId}/members/${userId}`),

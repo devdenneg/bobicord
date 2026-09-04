@@ -759,6 +759,8 @@ function attachTreeServer(httpServer, opts) {
     catch (e) { tlog(`ws 401 (${e.message}) from ${req.socket.remoteAddress}`); socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
     wss.handleUpgrade(req, socket, head, (ws) => {
       ws.__uid = payload.id || payload.u || 'anon';
+      ws.__authSessionId = payload.sid || '';
+      ws.__authTokenHash = payload.tokenHash || '';
       wss.emit('connection', ws, req);
     });
   });

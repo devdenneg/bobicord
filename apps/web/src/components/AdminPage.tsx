@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from 'react';
 import { api, resolveUploadUrl } from '../api';
 import { useStore } from '../store';
 import { Icon } from '../Icon';
+import { canViewVoiceDiagnostics } from '../adminDiagnosticsAccess';
+import { AdminVoiceDiagnostics } from './AdminVoiceDiagnostics';
 import { avColor, initial } from '../util';
 import type { AdminOverview, AdminServer, AdminMember, AdminUser, RegistrationInvite } from '../types';
 
@@ -47,14 +49,14 @@ export function AdminPage() {
   const [data, setData] = useState<AdminOverview | null>(null);
   const [err, setErr] = useState('');
   const [loading, setLoading] = useState(true);
-  const [tab, setTab] = useState<'servers' | 'users' | 'access'>('servers');
+  const [tab, setTab] = useState<'servers' | 'users' | 'access' | 'diagnostics'>('servers');
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [registrationInvite, setRegistrationInvite] = useState<RegistrationInvite | null>(null);
   const [inviteError, setInviteError] = useState('');
   const [inviteLoading, setInviteLoading] = useState(false);
   const [now, setNow] = useState(Date.now());
   const [bindingSupport, setBindingSupport] = useState<{ user: AdminUser; code: string; expiresAt: number } | null>(null);
-  const isBootstrapAdmin = me?.username === 'denis';
+  const isBootstrapAdmin = canViewVoiceDiagnostics(me);
 
   const load = useCallback(() => {
     setLoading(true); setErr('');
@@ -136,6 +138,7 @@ export function AdminPage() {
             <button className={tab === 'servers' ? 'on' : ''} onClick={() => setTab('servers')}>Серверы</button>
             <button className={tab === 'users' ? 'on' : ''} onClick={() => setTab('users')}>Юзеры</button>
             {isBootstrapAdmin ? <button className={tab === 'access' ? 'on' : ''} onClick={() => setTab('access')}>Доступ</button> : null}
+            {isBootstrapAdmin ? <button className={tab === 'diagnostics' ? 'on' : ''} onClick={() => setTab('diagnostics')}>Диагностика</button> : null}
           </div>
 
           {tab === 'servers' ? (
@@ -196,7 +199,7 @@ export function AdminPage() {
                 );
               })}
             </div>
-          ) : isBootstrapAdmin ? (
+          ) : tab === 'diagnostics' && isBootstrapAdmin ? <AdminVoiceDiagnostics /> : isBootstrapAdmin ? (
             <section className="admin-access" aria-labelledby="admin-access-title" aria-busy={inviteLoading || undefined}>
               <div className="admin-access-head">
                 <span className="admin-access-icon"><Icon name="shield" /></span>

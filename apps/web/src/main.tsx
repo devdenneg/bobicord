@@ -7,7 +7,7 @@ import { api, getToken, isApiError, setToken } from './api';
 import { loadGlobalEmotes } from './emotes';
 import { isTauri, pingNative } from './native';
 import { watchForUpdates } from './version';
-import { checkNativeUpdate, startNativeUpdatePolling } from './nativeUpdate';
+import { waitForNativeStartup, startNativeUpdatePolling } from './nativeUpdate';
 import { applyStoredTheme } from './theme';
 import { startWindowIdleWatch } from './windowIdle';
 import {
@@ -69,8 +69,6 @@ if (isTauri) pingNative().then((r) => console.log('[native] ipc bridge:', r)).ca
 startWindowIdleWatch(); // до первой отрисовки: если окно открыто в фоне, анимации не должны стартовать вовсе
 createRoot(document.getElementById('root')!).render(<StrictMode><App /></StrictMode>);
 watchForUpdates();
-checkNativeUpdate(); // разовая проверка на старте
-startNativeUpdatePolling(); // + периодическая проверка (5 мин), баннер всегда показывает актуальную версию
 
 function passwordResetTokenFromHash(): string {
   const fragment = location.hash.replace(/^#/, '');
@@ -102,6 +100,10 @@ function cleanEntryUrl(removeHash = false) {
 
 // boot: resume session + handle invite/reset deep-links
 (async function boot() {
+  // Desktop checks the public signed manifest before session/auth calls or mounting Auth.
+  // A known update keeps this pending until restart; an unknown/offline result offers retry/continue.
+  await waitForNativeStartup();
+  startNativeUpdatePolling();
   const resetFragment = passwordResetTokenFromHash();
   const resetToken = PASSWORD_RESET_TOKEN_RE.test(resetFragment) ? resetFragment : storedPasswordResetToken();
   if (resetFragment) cleanEntryUrl(true);

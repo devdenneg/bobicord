@@ -20,14 +20,15 @@ function NativeBroadcastButton() {
   const live = useStore((s) => s.broadcastLive);
   useEffect(() => {
     let unlisten: (() => void) | undefined;
+    let disposed = false;
     onBroadcastStopped((info) => {
       useStore.getState().setBroadcastLive(false);
       if (info.reason) useStore.getState().toast('Трансляция остановлена: ' + info.reason, 'err');
       // Трансляция умерла сама — самый интересный случай для разбора: сдаём лог сессии,
       // где причина (`reason`) уже записана строками энкодера/захвата.
       stopNativeBroadcast().catch(() => {}).finally(() => endAnyBroadcasterSession());
-    }).then((u) => (unlisten = u));
-    return () => unlisten?.();
+    }).then((u) => { if (disposed) u(); else unlisten = u; });
+    return () => { disposed = true; unlisten?.(); };
   }, []);
   if (!eng.inVoice) return null;
   return (
@@ -93,13 +94,16 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
   };
   useEffect(() => {
     if (!open) return;
+    let generation = 0, disposed = false;
     const load = () => {
+      const requestGeneration = ++generation;
       const request = kind === 'output' && appleMobile
-        ? Promise.all([Room.getLocalDevices('audioinput'), Room.getLocalDevices('audiooutput')])
+        ? Promise.all([Room.getLocalDevices('audioinput', false), Room.getLocalDevices('audiooutput', false)])
           .then(([inputs, outputs]) => audioOutputChoices(true, inputs, outputs))
-        : Room.getLocalDevices(kind === 'input' ? 'audioinput' : 'audiooutput')
+        : Room.getLocalDevices(kind === 'input' ? 'audioinput' : 'audiooutput', false)
           .then((devices) => ({ choices: audioDeviceChoices(devices), viaInput: false }));
       request.then(({ choices, viaInput }) => {
+        if (disposed || generation !== requestGeneration) return;
         setDevs(choices);
         setOutputViaInput(kind === 'output' && viaInput);
         const selectedId = kind === 'input' || viaInput ? getSettings().input : getSettings().output;
@@ -120,6 +124,7 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
     document.addEventListener('pointerdown', onDoc, true);
     navigator.mediaDevices?.addEventListener?.('devicechange', load);
     return () => {
+      disposed = true;
       document.removeEventListener('pointerdown', onDoc, true);
       navigator.mediaDevices?.removeEventListener?.('devicechange', load);
     };
@@ -276,7 +281,7 @@ export function VoiceControls({ up }: { up?: boolean }) {
   const connection = eng.voiceConnection ?? (eng.reconnecting ? 'reconnecting' : (eng.voiceConnecting ? 'connecting' : (eng.inVoice ? 'connected' : 'disconnected')));
   const pttLive = ptt && eng.pttDown && !muted && connection === 'connected';
   const pttIdle = ptt && !pttLive;
-  const micClosed = muted || pttIdle;
+  const micClosed = muted || eng.micUnavailable || pttIdle;
   const micClass = 'vd-btn' + (muted ? ' danger-on' : (pttLive ? ' ptt-live' : (pttIdle ? ' ptt-idle' : '')));
   // «Недоступен» и «я себя замутил» — разные состояния: раньше оба выглядели как обычный мут, и когда
   // микрофон пропадал и возвращался сам, это читалось как «кнопка переключается сама по себе».

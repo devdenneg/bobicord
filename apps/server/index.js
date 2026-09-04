@@ -10,6 +10,11 @@ const { WebSocketServer } = require('ws');
 const { attachTreeServer } = require('./tree');
 const { createVoiceLeaseStore, voiceLeaseEvent, selectVoiceState } = require('./voiceLease');
 const { installRuntimeRevocationSchema } = require('./runtimeRevocation');
+const {
+  VoiceDiagnosticValidationError, createVoiceDiagnosticGlobalLimiter, createVoiceDiagnosticUserLimiter,
+  createVoiceDiagnosticsStore, isVoiceDiagnosticControlIncident, isVoiceDiagnosticsAdmin,
+  sanitizeVoiceDiagnosticReport,
+} = require('./voiceDiagnostics');
 const { planUploadSweep, uploadUrlsOfMessageRows, normalizeUploadRef, UPLOAD_REF_RE } = require('./uploadsGc'); // квоты и уборка пользовательских файлов
 const {
   installReleaseSchema, listReleaseHistory, parseReleaseMeta, prepareRelease, finalizeRelease,
@@ -19,6 +24,7 @@ const {
   passwordPrehash, formatPasswordHash, verifiedEmailForOwner,
 } = require('./auth');
 const { createSmtpMailer } = require('./mailer');
+const { createNativeAuthCompatibility, nativeAuthRequested, requireNativeAuthTransport, nativeRefreshCredential } = require('./nativeAuthCompat');
 const {
   VRELAY_UID,
   isStrongVrelaySecret,
@@ -60,7 +66,7 @@ app.use((req, res, next) => {
   // Без него в нативе (кросс-доменный запрос, tauri://localhost → прод-API) CORS-preflight не
   // пропускал бы заголовок → реальный POST блокировался браузером ещё до отправки («ошибка загрузки»
   // на любой файл). В вебе не всплывало — там same-origin через Caddy, CORS не участвует вовсе.
-  res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Attachment-Name');
+  res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Attachment-Name,X-Relay-Auth-Protocol,X-Relay-Auth-Transport');
   res.header('Access-Control-Max-Age', '600');
   if (req.method === 'OPTIONS') return allowed ? res.sendStatus(204) : res.sendStatus(403);
   next();
@@ -74,6 +80,9 @@ const jsonSmall = express.json({ limit: '32kb' });
 const jsonDiag = express.json({ limit: DIAG_MAX_BODY });
 const jsonRelease = express.json({ limit: '512kb' });
 app.use((req, res, next) => {
+  if (req.path === '/api/diag/voice' || req.path.startsWith('/api/admin/diagnostics/voice')) {
+    res.setHeader('Cache-Control', 'no-store');
+  }
   const parser = req.path === '/api/diag/session'
     ? jsonDiag
     : (req.path.startsWith('/internal/releases/') ? jsonRelease : jsonSmall);
@@ -300,6 +309,13 @@ CREATE INDEX IF NOT EXISTS idx_roles_server ON roles(server_id);
 CREATE INDEX IF NOT EXISTS idx_mroles ON member_roles(server_id, user_id);
 `);
 const voiceLeases = createVoiceLeaseStore(db);
+const voiceDiagnostics = createVoiceDiagnosticsStore(db);
+try { voiceDiagnostics.prune(); } catch { console.error('[voice-diag] initial prune failed'); }
+const voiceDiagnosticsPruneTimer = setInterval(() => {
+  try { voiceDiagnostics.prune(); }
+  catch { console.error('[voice-diag] prune failed'); }
+}, 10 * 60_000);
+voiceDiagnosticsPruneTimer.unref?.();
 installReleaseSchema(db);
 installAuthSchema(db);
 installRuntimeRevocationSchema(db);
@@ -406,6 +422,7 @@ function hashColor(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 3
 const UNAME = /^[a-zA-Z0-9_]{3,20}$/;
 const norm = u => String(u || '').trim().toLowerCase();
 let authManager = null;
+let nativeAuthCompat = null;
 
 function bearerToken(req) {
   const header = req.headers.authorization || '';
@@ -451,6 +468,7 @@ function requireSession(req, res, next) {
     const context = authManager.verifySession(bearerToken(req));
     req.user = context.user;
     req.authState = context.state;
+    req.authPayload = context.payload;
     return next();
   } catch (error) {
     if (error instanceof AuthError) return sendAuthError(res, error);
@@ -464,6 +482,7 @@ function requireAuth(req, res, next) {
     const context = authManager.verifySession(bearerToken(req), { requireVerified: true });
     req.user = context.user;
     req.authState = context.state;
+    req.authPayload = context.payload;
     return next();
   } catch (error) {
     if (error instanceof AuthError) return sendAuthError(res, error);
@@ -482,6 +501,19 @@ function requireAdmin(req, res, next) {
   });
 }
 const rsc = new RoomServiceClient(WS_URL.replace('wss://', 'https://'), KEY, SECRET);
+function requireDiagnosticsAdmin(req, res, next) {
+  return requireAuth(req, res, (error) => {
+    if (error) return next(error);
+    if (!isVoiceDiagnosticsAdmin(req.user, BOOTSTRAP_ADMIN)) {
+      return res.status(403).json({ error: { code: 'DIAGNOSTICS_ADMIN_ONLY', message: 'Диагностика доступна только владельцу.' } });
+    }
+    return next();
+  });
+}
+function noStoreResponse(req, res, next) {
+  res.setHeader('Cache-Control', 'no-store');
+  return next();
+}
 // LiveKit identity = `username#<nonce>` (уникально на сессию — иначе второй девайс кикает первого).
 // Наружу (presence/voice) отдаём БАЗОВЫЙ username, дедуплицируя несколько сессий одного юзера.
 const baseIdentity = id => { const s = String(id || ''); const i = s.indexOf('#'); return i < 0 ? s : s.slice(0, i); };
@@ -695,6 +727,41 @@ function publicAccountState(state) {
 function sessionPayload(user, state = authManager.sessionState(user)) {
   return { user: ownUser(user), account: publicAccountState(state) };
 }
+
+function sendNativeAuthBundle(res, bundle, extra = {}) {
+  const { user, ...credentials } = bundle;
+  res.setHeader('Cache-Control', 'no-store');
+  return res.json({ ...credentials, ...sessionPayload(user), ...extra });
+}
+
+function sendLoginSession(req, res, user, extra = {}) {
+  if (nativeAuthRequested(req)) {
+    requireNativeAuthTransport(req);
+    return sendNativeAuthBundle(res, nativeAuthCompat.create(user), extra);
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  return res.json({ token: authManager.issueSession(user), ...sessionPayload(user), ...extra });
+}
+
+function closeNativeAuthSession(subject, body) {
+  if (!subject) return {};
+  const matches = (sessionId, tokenHash) => (subject.sessionId && sessionId === subject.sessionId)
+    || (subject.legacyTokenHash && tokenHash === subject.legacyTokenHash);
+  for (const ws of notifyConns.get(subject.userId) || []) {
+    if (matches(ws._authSessionId, ws._authTokenHash)) { try { ws.close(4001, 'session-revoked'); } catch { /**/ } }
+  }
+  for (const peer of treeSrv.peers.values()) {
+    if (peer.ws && matches(peer.ws.__authSessionId, peer.ws.__authTokenHash)) { try { peer.ws.close(4001, 'session-revoked'); } catch { /**/ } }
+  }
+  const endpoints = [];
+  // A client can request cleanup only of endpoints owned by the authenticated logout subject.
+  for (const item of (Array.isArray(body?.pushCleanups) ? body.pushCleanups.slice(0, 32) : [])) {
+    if (item?.userId !== subject.userId || typeof item.endpoint !== 'string' || item.endpoint.length > 4096) continue;
+    db.prepare('DELETE FROM push_subs WHERE user_id=? AND endpoint=?').run(subject.userId, item.endpoint);
+    endpoints.push(item.endpoint);
+  }
+  return { pushCleanup: { userId: subject.userId, endpoints } };
+}
 // Имена всегда выпускает наш upload route: 12 random bytes + расширение из проверенного MIME.
 // Узкий regexp не пропускает `..`, произвольные имена и не-image расширения в профили/чат.
 const UPLOAD_RE = /^\/api\/uploads\/[a-f0-9]{24}\.(?:png|jpg|gif|webp)$/;
@@ -786,6 +853,7 @@ function purgeUser(uid) {
     try { db.prepare(`DELETE FROM ${t} WHERE user_id=?`).run(uid); } catch (e) { /* таблицы-миграции могло не быть */ }
   }
   if (authManager) authManager.purgeUser(uid);
+  voiceDiagnostics.purgeUser(uid);
   db.prepare('DELETE FROM voice_session_intents WHERE user_id=?').run(uid);
   db.prepare('DELETE FROM voice_user_intents WHERE user_id=?').run(uid);
   db.prepare('DELETE FROM voice_leases WHERE user_id=?').run(uid);
@@ -1213,6 +1281,37 @@ app.get('/api/auth/session', requireSession, (req, res) => {
   res.json(sessionPayload(req.user, req.authState));
 });
 
+app.post('/api/auth/session/refresh', authRoute((req, res) => {
+  const token = nativeRefreshCredential(req);
+  if (!nativeAuthCompat) throw new AuthError(503, 'AUTH_STARTING', 'Авторизация запускается. Попробуйте ещё раз.');
+  nativeAuthCompat.limit(req);
+  return sendNativeAuthBundle(res, nativeAuthCompat.refresh(token));
+}));
+
+app.post('/api/auth/session/logout', authRoute((req, res) => {
+  const token = nativeRefreshCredential(req);
+  if (!nativeAuthCompat) throw new AuthError(503, 'AUTH_STARTING', 'Авторизация запускается. Попробуйте ещё раз.');
+  nativeAuthCompat.limit(req);
+  const subject = nativeAuthCompat.logout(token);
+  res.setHeader('Cache-Control', 'no-store');
+  return res.json({ ok: true, ...closeNativeAuthSession(subject, req.body) });
+}));
+
+app.post('/api/auth/session/upgrade', requireSession, authRoute((req, res) => {
+  requireNativeAuthTransport(req);
+  nativeAuthCompat.limit(req);
+  if (req.authPayload.sid) throw new AuthError(409, 'SESSION_ALREADY_UPGRADED', 'Сессия уже обновлена.');
+  return sendNativeAuthBundle(res, nativeAuthCompat.create(req.user, bearerToken(req)));
+}));
+
+app.post('/api/auth/session/logout-legacy', requireSession, authRoute((req, res) => {
+  if (req.authPayload.sid) throw new AuthError(409, 'SESSION_ALREADY_UPGRADED', 'Используйте защищённый выход текущей сессии.');
+  nativeAuthCompat.limit(req);
+  const subject = nativeAuthCompat.logoutLegacy(bearerToken(req), req.user);
+  res.setHeader('Cache-Control', 'no-store');
+  return res.json({ ok: true, ...closeNativeAuthSession(subject, req.body) });
+}));
+
 // Старый прямой endpoint больше не создаёт аккаунты: регистрация атомарно завершается только
 // после проверки суточного приглашения и кода из письма.
 app.post('/api/register', (req, res) => res.status(410).json({
@@ -1223,6 +1322,7 @@ app.post('/api/register', (req, res) => res.status(410).json({
 }));
 
 app.post('/api/login', authRoute(async (req, res) => {
+  if (nativeAuthRequested(req)) requireNativeAuthTransport(req);
   const uname = norm(req.body.username);
   const pass = String(req.body.password || '');
   authManager.checkLoginRate({ username: uname, ip: req.ip });
@@ -1242,9 +1342,7 @@ app.post('/api/login', authRoute(async (req, res) => {
     const changed = db.prepare('UPDATE users SET passhash=? WHERE id=? AND passhash=?').run(upgraded, u.id, u.passhash);
     if (changed.changes === 1) u.passhash = upgraded;
   }
-  const state = authManager.sessionState(u);
-  res.setHeader('Cache-Control', 'no-store');
-  res.json({ token: authManager.issueSession(u), ...sessionPayload(u, state), username: u.username });
+  return sendLoginSession(req, res, u, { username: u.username });
 }));
 
 app.post('/api/auth/register/start', authRoute(async (req, res) => {
@@ -1261,10 +1359,10 @@ app.post('/api/auth/register/start', authRoute(async (req, res) => {
 }));
 
 app.post('/api/auth/register/verify', authRoute((req, res) => {
+  if (nativeAuthRequested(req)) requireNativeAuthTransport(req);
   const result = authManager.verifyRegistration({ flowId: req.body.flowId, code: req.body.code, ip: req.ip });
   const user = db.prepare('SELECT * FROM users WHERE id=?').get(result.user.id);
-  res.setHeader('Cache-Control', 'no-store');
-  res.json({ token: authManager.issueSession(user), ...sessionPayload(user) });
+  return sendLoginSession(req, res, user);
 }));
 
 app.post('/api/auth/register/resend', authRoute(async (req, res) => {
@@ -1287,6 +1385,7 @@ app.post('/api/auth/email/start', requireSession, authRoute(async (req, res) => 
 }));
 
 app.post('/api/auth/email/verify', requireSession, authRoute(async (req, res) => {
+  if (nativeAuthRequested(req)) requireNativeAuthTransport(req);
   const result = authManager.verifyEmailBinding({
     userId: req.user.id,
     flowId: req.body.flowId,
@@ -1294,7 +1393,10 @@ app.post('/api/auth/email/verify', requireSession, authRoute(async (req, res) =>
     ip: req.ip,
   });
   const user = db.prepare('SELECT * FROM users WHERE id=?').get(result.user.id);
+  const nativeBundle = nativeAuthRequested(req)
+    ? nativeAuthCompat.preserveAfterSecurityChange(req.authPayload.sid, user, req.authPayload.sv) : null;
   await revokeRuntimeSessions(user.id, user.username, 'email-verified');
+  if (nativeBundle) return sendNativeAuthBundle(res, nativeBundle);
   res.setHeader('Cache-Control', 'no-store');
   res.json({ token: authManager.issueSession(user), ...sessionPayload(user) });
 }));
@@ -1334,6 +1436,7 @@ app.post('/api/auth/password/reset', authRoute(async (req, res) => {
 }));
 
 app.post('/api/auth/password/change', requireAuth, authRoute(async (req, res) => {
+  if (nativeAuthRequested(req)) requireNativeAuthTransport(req);
   const result = await authManager.changePassword({
     userId: req.user.id,
     currentPassword: req.body.currentPassword,
@@ -1341,7 +1444,10 @@ app.post('/api/auth/password/change', requireAuth, authRoute(async (req, res) =>
     ip: req.ip,
   });
   const user = db.prepare('SELECT * FROM users WHERE id=?').get(result.userId);
+  const nativeBundle = nativeAuthRequested(req)
+    ? nativeAuthCompat.preserveAfterSecurityChange(req.authPayload.sid, user, req.authPayload.sv) : null;
   await revokeRuntimeSessions(user.id, user.username, 'password-changed');
+  if (nativeBundle) return sendNativeAuthBundle(res, nativeBundle);
   res.setHeader('Cache-Control', 'no-store');
   res.json({ token: authManager.issueSession(user), ...sessionPayload(user) });
 }));
@@ -1611,6 +1717,99 @@ function sanitizeDiagEnv(raw) {
   if (Array.isArray(raw.gpus)) out.gpus = raw.gpus.slice(0, 4).map((g) => String(g).slice(0, 120));
   return Object.keys(out).length ? out : null;
 }
+
+const voiceDiagIncidentRateLimiter = createVoiceDiagnosticUserLimiter({ burstLimit: 4, hourlyLimit: 20 });
+const voiceDiagControlRateLimiter = createVoiceDiagnosticUserLimiter({ burstLimit: 8, hourlyLimit: 60 });
+const voiceDiagIncidentGlobalLimiter = createVoiceDiagnosticGlobalLimiter();
+const voiceDiagControlGlobalLimiter = createVoiceDiagnosticGlobalLimiter({ limit: 240 });
+
+
+// В отличие от legacy stream-diag эта ручка никогда не принимает строки логов. Store собирает
+// новый объект только из известных enum/number/boolean полей; неизвестные ключи не попадают в БД.
+app.post('/api/diag/voice', noStoreResponse, requireAuth, (req, res) => {
+  let report;
+  try {
+    report = sanitizeVoiceDiagnosticReport(req.body);
+  } catch (error) {
+    if (error instanceof VoiceDiagnosticValidationError) {
+      return res.status(400).json({ error: { code: 'BAD_VOICE_DIAGNOSTIC', message: 'Некорректный формат диагностики.' } });
+    }
+    console.error('[voice-diag] validation failed');
+    return res.status(500).json({ error: 'Не удалось проверить диагностику' });
+  }
+
+  // A retry after a lost HTTP response is already durable and must not spend another rate-limit
+  // slot. Identity is scoped to the authenticated account, never to a client supplied username.
+  let existing;
+  try {
+    existing = report.clientReportId
+      ? voiceDiagnostics.findExisting(req.user.id, report.clientReportId)
+      : null;
+  } catch {
+    console.error('[voice-diag] retry lookup failed');
+    return res.status(500).json({ error: 'Не удалось проверить сохранённую диагностику' });
+  }
+  if (existing) {
+    return res.status(200).json({ ok: true, reportId: existing.id, createdAt: existing.createdAt });
+  }
+
+  const control = isVoiceDiagnosticControlIncident(report.incident);
+  const rate = (control ? voiceDiagControlRateLimiter : voiceDiagIncidentRateLimiter).consume(req.user.id);
+  if (!rate.allowed) {
+    res.setHeader('Retry-After', String(Math.max(1, Math.ceil(rate.retryAfterMs / 1000))));
+    return res.status(429).json({ error: 'Слишком много диагностических отчётов' });
+  }
+  const globalRate = (control ? voiceDiagControlGlobalLimiter : voiceDiagIncidentGlobalLimiter).consume();
+  if (!globalRate.allowed) {
+    res.setHeader('Retry-After', String(Math.max(1, Math.ceil(globalRate.retryAfterMs / 1000))));
+    return res.status(429).json({ error: 'Диагностика временно перегружена' });
+  }
+  try {
+    const saved = voiceDiagnostics.save({
+      userId: req.user.id,
+      username: req.user.username,
+      raw: report,
+    });
+    // SQLite + the diagnostics admin API are the authoritative log. Do not mirror per-report
+    // metadata into Docker stdout: its size-based rotation cannot guarantee the three-day TTL.
+    return res.status(201).json({ ok: true, reportId: saved.id, createdAt: saved.createdAt });
+  } catch (error) {
+    if (error instanceof VoiceDiagnosticValidationError) {
+      return res.status(400).json({ error: { code: 'BAD_VOICE_DIAGNOSTIC', message: 'Некорректный формат диагностики.' } });
+    }
+    console.error('[voice-diag] save failed');
+    return res.status(500).json({ error: 'Не удалось сохранить диагностику' });
+  }
+});
+
+app.get('/api/admin/diagnostics/voice', noStoreResponse, requireDiagnosticsAdmin, (req, res) => {
+  const rawLimit = String(req.query.limit || '50');
+  const rawBeforeCreated = req.query.beforeCreated == null ? '' : String(req.query.beforeCreated);
+  const rawBeforeId = req.query.beforeId == null ? '' : String(req.query.beforeId);
+  const limit = Number(rawLimit);
+  const hasCompleteCursor = Boolean(rawBeforeCreated && rawBeforeId);
+  if (!/^\d{1,3}$/u.test(rawLimit) || !Number.isInteger(limit) || limit < 1 || limit > 100
+    || Boolean(rawBeforeCreated) !== Boolean(rawBeforeId)
+    || (hasCompleteCursor && (!/^\d{1,13}$/u.test(rawBeforeCreated) || !/^[a-f0-9]{24}$/u.test(rawBeforeId)))
+    || (req.query.incident != null && typeof req.query.incident !== 'string')
+    || (req.query.client != null && typeof req.query.client !== 'string')) {
+    return res.status(400).json({ error: 'Некорректная пагинация' });
+  }
+  const page = voiceDiagnostics.list({
+    limit,
+    beforeCreated: hasCompleteCursor ? Number(rawBeforeCreated) : undefined,
+    beforeId: hasCompleteCursor ? rawBeforeId : undefined,
+    incident: typeof req.query.incident === 'string' ? req.query.incident : undefined,
+    client: typeof req.query.client === 'string' ? req.query.client : undefined,
+  });
+  return res.json(page);
+});
+
+app.get('/api/admin/diagnostics/voice/:id', noStoreResponse, requireDiagnosticsAdmin, (req, res) => {
+  const detail = voiceDiagnostics.detail(String(req.params.id || ''));
+  if (!detail) return res.status(404).json({ error: 'Отчёт не найден' });
+  return res.json(detail);
+});
 
 app.post('/api/diag/session', requireAuth, (req, res) => {
   const b = req.body || {};
@@ -2951,7 +3150,10 @@ if (process.env.NODE_ENV !== 'production') {
 /* JSON errors for body-parser / static failures */
 app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
-  if (err && (err.type === 'entity.too.large' || err.status === 413)) return res.status(413).json({ error: 'Файл больше 10 МБ' });
+  if (err && (err.type === 'entity.too.large' || err.status === 413)) {
+    if (req.path === '/api/diag/voice') return res.status(413).json({ error: { code: 'PAYLOAD_TOO_LARGE', message: 'Тело запроса слишком большое' } });
+    return res.status(413).json({ error: 'Файл больше 10 МБ' });
+  }
   if (err && err.status === 404) return res.status(404).json({ error: 'Не найдено' });
   if (err && (err.type === 'entity.parse.failed' || (err.status === 400 && err instanceof SyntaxError))) {
     return res.status(400).json({ error: { code: 'INVALID_JSON', message: 'Некорректный JSON.' } });
@@ -2978,7 +3180,7 @@ const treeSrv = attachTreeServer(server, {
     }
     if (!authManager) throw new Error('auth is starting');
     const context = authManager.verifySession(encoded, { requireVerified: true });
-    return { id: context.user.id, u: context.user.username };
+    return { id: context.user.id, u: context.user.username, sid: context.payload.sid || '', tokenHash: nativeAuthCompat.tokenHash(encoded) };
   },
   path: '/tree',
   stunServers: STUN_URLS.map((urls) => ({ urls })),
@@ -3006,6 +3208,8 @@ server.on('upgrade', (req, socket, head) => {
     ws._away = false; // idle-статус сессии: клиент шлёт {t:'presence',away} при бездействии. Юзер «away» (жёлтый), если ВСЕ его сокеты idle.
     ws._activeServerId = '';
     ws._userId = uid;
+    ws._authSessionId = context.payload.sid || '';
+    ws._authTokenHash = nativeAuthCompat.tokenHash(url.searchParams.get('token') || '');
     ws._releaseRefreshAckSids = new Set();
     ws._releaseRefreshSentAt = new Map();
     ws._isAlive = true;
@@ -3136,6 +3340,9 @@ async function startServer() {
       inviteMaxSends: boundedIntegerEnv('REGISTRATION_INVITE_MAX_EMAILS', 50, 1, 2000),
     },
   });
+  nativeAuthCompat = createNativeAuthCompatibility({ db, sessionSecret: SESSION_SECRET });
+  const verifySession = authManager.verifySession;
+  authManager.verifySession = (token, options) => nativeAuthCompat.verifyContext(verifySession(token, options), token);
   const bootstrapAdmin = db.prepare("SELECT is_admin,email_verified_at FROM users WHERE username='denis'").get();
   if (process.env.NODE_ENV === 'production' && !bootstrapAdmin) {
     throw new Error('Администратор denis отсутствует; остановите API и выполните npm run bootstrap:admin');

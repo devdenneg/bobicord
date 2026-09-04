@@ -5,12 +5,14 @@
   "scripts": {
     "bootstrap:admin": "node bootstrap-admin.js",
     "test:bootstrap-admin": "node --test bootstrap-admin-test.js",
-    "test:auth": "node auth-test.js",
+    "test:auth": "node auth-test.js && node --test nativeAuthCompat-test.js",
+    "test:native-auth-compat": "node --test nativeAuthCompat-test.js",
     "test:mailer": "node --test mailer-test.js",
     "test:vrelay-auth": "node --test vrelay-auth-test.js",
     "test:runtime-revocation": "node --test runtime-revocation-test.js",
     "test:release-notes": "node release-notes-test.js",
     "test:voice-lease": "node voice-lease-test.js",
+    "test:voice-diagnostics": "node --test voiceDiagnostics-test.js",
     "test:tree-ws-error": "node tree-ws-error-test.js",
     "test:uploads-gc": "node uploads-gc-test.js"
   },
