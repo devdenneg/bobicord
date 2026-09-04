@@ -269,7 +269,7 @@ fn describe_source(source: &CaptureSource) -> String {
 pub async fn start(
     app: Option<AppHandle>,
     stream_id: String,
-    ws_url: signaling::WsUrl,
+    ws_url: String,
     identity: String,
     server_id: String,
     source: CaptureSource,
@@ -332,9 +332,10 @@ pub async fn start(
         pinned: false, // вещатель не «зритель с пином»
     };
     // reconnect=true: деплой рестартит сервер — вещание переживает обрыв WS (реджойн),
-    // энкод/захват не прерываются, зрители переджойнятся сами. NativeAuthState supplies a cached
-    // fresh 15-minute access JWT on every attempt; relay-core never freezes it for the session.
-    let (cmd_tx, evt_rx) = signaling::connect(ws_url, join, true);
+    // энкод/захват не прерываются, зрители переджойнятся сами.
+    // fixed: у натива в URL session-JWT на недели — пересобирать нечего (в отличие от
+    // 5-минутного service-токена vrelay, см. signaling::WsUrl).
+    let (cmd_tx, evt_rx) = signaling::connect(signaling::WsUrl::fixed(ws_url), join, true);
 
     let mgr = peer::PeerManager::new(&stream_id, cmd_tx.clone(), force_keyframe.clone(), stats.clone())?;
     let video_track = mgr.video_track.clone();

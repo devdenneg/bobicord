@@ -2,10 +2,8 @@
 // нативного узла. Роль broadcaster (корень: offerer детям) ИЛИ viewer (relay: answerer
 // родителю, offerer детям). Формат сообщений — см. tree.js.
 
-use futures_util::{Sink, SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -35,83 +33,14 @@ pub enum TreeEvent {
     Closed,
 }
 
-/// Sanitized lifecycle telemetry for a native relay-viewer. It deliberately carries neither the
-/// authenticated URL nor close reason/server text: callers may forward it to the renderer and then
-/// to diagnostics without leaking credentials, SDP/ICE, IP addresses or peer identifiers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SignalingStatusOutcome {
-    Started,
-    Ok,
-    Failed,
-    Stalled,
-    Recovered,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SignalingStatusCode {
-    None,
-    Unauthorized,
-    Forbidden,
-    Closed,
-}
-
-#[cfg(test)]
-impl SignalingStatusCode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Unauthorized => "signaling_unauthorized",
-            Self::Forbidden => "signaling_forbidden",
-            Self::Closed => "signaling_closed",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SignalingStatus {
-    pub outcome: SignalingStatusOutcome,
-    pub code: SignalingStatusCode,
-    pub reconnect_count: u32,
-}
-
-pub type SignalingStatusSink = Arc<dyn Fn(SignalingStatus) + Send + Sync>;
-
 pub enum TreeCmd {
     Offer { to: String, sdp: String },        // мы offerer (корень/relay → ребёнок)
     Answer { to: String, sdp: String },        // мы answerer (relay-viewer → родитель)
     Ice { to: String, candidate: Value },
     Stats { to_child: Vec<Value>, available_outgoing: u32 },
     RequestKeyframe,                           // relay просит keyframe у корня (через сервер)
-    // `reason` задаёт только внутренний watchdog; UI/manual запросы его не получают.
-    RequestReparent {
-        target: Option<String>,
-        reason: Option<&'static str>,
-        // Media watchdog reports are valid only for the exact parent generation which stalled.
-        // Manual/ICE recovery requests leave this unset and retain the ordinary server policy.
-        failed_parent_id: Option<String>,
-    },
+    RequestReparent { target: Option<String> }, // авто-миграция (None) / ручной выбор пира (Some)
     Leave,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PendingReparent {
-    target: Option<String>,
-    reason: Option<&'static str>,
-    failed_parent_id: Option<String>,
-}
-
-impl PendingReparent {
-    fn new(
-        target: Option<String>,
-        reason: Option<&'static str>,
-        failed_parent_id: Option<String>,
-    ) -> Self {
-        Self { target, reason, failed_parent_id }
-    }
-
-    fn is_track_missing_recovery(&self) -> bool {
-        self.reason == Some("track-missing")
-    }
 }
 
 /// Параметры join: роль и ёмкость узла.
@@ -159,96 +88,27 @@ const RECONNECT_BACKOFF_MAX_SEC: u64 = 15; // деплой рестартит с
 /// из дерева, считая себя подключённым. 35с = 3 пропущенных пинга.
 const READ_IDLE_TIMEOUT_SEC: u64 = 35;
 
-/// Источник URL сигналинга. Токен лежит в query и может потребовать асинхронного обновления перед
-/// каждой попыткой: service-JWT vrelay минтится синхронно, а нативный 15-минутный access JWT —
-/// через защищённый refresh broker. Фиксировать короткий JWT на всю медиа-сессию нельзя: первый
-/// реконнект после TTL навсегда получает 401.
-type WsUrlFuture = Pin<Box<dyn Future<Output = Result<String, WsUrlError>> + Send>>;
-
-/// Opaque, allow-listed URL-provider failure. It deliberately cannot carry a URL, JWT, upstream
-/// body or arbitrary error message into logs. Terminal credential state ends the media session;
-/// transient network/upstream state follows the normal bounded reconnect backoff.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WsUrlError {
-    code: &'static str,
-    terminal: bool,
-}
-
-impl WsUrlError {
-    pub fn transient(code: &'static str) -> Self {
-        Self { code: allowlisted_ws_url_error(code, false), terminal: false }
-    }
-    pub fn terminal(code: &'static str) -> Self {
-        Self { code: allowlisted_ws_url_error(code, true), terminal: true }
-    }
-    fn code(self) -> &'static str { self.code }
-    fn is_terminal(self) -> bool { self.terminal }
-}
-
-fn allowlisted_ws_url_error(code: &'static str, terminal: bool) -> &'static str {
-    match code {
-        "native-auth-network" | "native-auth-timeout" | "native-auth-rate-limit"
-        | "native-auth-upstream" | "native-auth-session-ended"
-        | "native-auth-logout-pending" | "native-auth-storage"
-        | "native-auth-invalid-response" => code,
-        _ if terminal => "tree-url-terminal",
-        _ => "tree-url-transient",
-    }
-}
-
-fn close_invalidates_access(code: u16) -> bool { code == 4001 }
-
+/// Источник URL сигналинга. Токен лежит в query, а у service-JWT vrelay TTL 5 минут —
+/// поэтому URL пересобирается на КАЖДУЮ попытку подключения, а не фиксируется на всю жизнь
+/// сессии. Иначе первый же реконнект позже TTL получает вечный 401: ровно так vrelay выпал
+/// из дерева на трое суток (2026-07-30, DNS-блип на медиа-VPS → реконнект с протухшим токеном).
 #[derive(Clone)]
-pub struct WsUrl {
-    make: Arc<dyn Fn() -> WsUrlFuture + Send + Sync>,
-    invalidate: Arc<dyn Fn(&str) + Send + Sync>,
-}
+pub struct WsUrl(Arc<dyn Fn() -> String + Send + Sync>);
 
 impl WsUrl {
-    /// URL whose credential is genuinely long-lived for the complete connection lifetime.
+    /// URL с долгоживущим токеном (натив: session-JWT на недели) — пересборка не нужна.
     pub fn fixed(url: String) -> Self {
-        Self {
-            make: Arc::new(move || {
-                let current = url.clone();
-                Box::pin(async move { Ok(current) })
-            }),
-            invalidate: Arc::new(|_| {}),
-        }
+        Self(Arc::new(move || url.clone()))
     }
 
     /// URL пересобирается на каждую попытку (короткоживущий service-токен vrelay).
     pub fn dynamic(make: impl Fn() -> String + Send + Sync + 'static) -> Self {
-        Self {
-            make: Arc::new(move || {
-                let current = make();
-                Box::pin(async move { Ok(current) })
-            }),
-            invalidate: Arc::new(|_| {}),
-        }
+        Self(Arc::new(make))
     }
 
-    /// URL/credential renewal may perform protected I/O (native Credential Manager + auth API).
-    pub fn dynamic_async<F, Fut>(make: F) -> Self
-    where
-        F: Fn() -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<String, WsUrlError>> + Send + 'static,
-    {
-        Self { make: Arc::new(move || Box::pin(make())), invalidate: Arc::new(|_| {}) }
+    fn get(&self) -> String {
+        (self.0)()
     }
-
-    /// Asynchronous provider with an exact cache invalidator. A 401 from tree signalling calls the
-    /// invalidator before retry so a remotely rejected access JWT is renewed immediately.
-    pub fn dynamic_async_with_invalidator<F, Fut, I>(make: F, invalidate: I) -> Self
-    where
-        F: Fn() -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<String, WsUrlError>> + Send + 'static,
-        I: Fn(&str) + Send + Sync + 'static,
-    {
-        Self { make: Arc::new(move || Box::pin(make())), invalidate: Arc::new(invalidate) }
-    }
-
-    async fn get(&self) -> Result<String, WsUrlError> { (self.make)().await }
-    fn invalidate(&self, rejected_url: &str) { (self.invalidate)(rejected_url); }
 }
 
 impl From<String> for WsUrl {
@@ -260,169 +120,17 @@ impl From<String> for WsUrl {
 /// Ожидание перед реконнектом с дренажом команд: unbounded-канал иначе копил бы
 /// Stats/Ice (слать некуда — дропаем), а Leave/дроп консьюмера должны завершать задачу.
 /// false = пора выходить совсем.
-async fn wait_backoff(
-    cmd_rx: &mut mpsc::UnboundedReceiver<TreeCmd>,
-    secs: u64,
-    pending_reparent: &mut Option<PendingReparent>,
-) -> bool {
+async fn wait_backoff(cmd_rx: &mut mpsc::UnboundedReceiver<TreeCmd>, secs: u64) -> bool {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => return true,
             cmd = cmd_rx.recv() => match cmd {
                 None | Some(TreeCmd::Leave) => return false,
-                Some(TreeCmd::RequestReparent { target, reason, failed_parent_id }) => {
-                    // Keep one latest request while disconnected. Once a new join succeeds,
-                    // generation-bound media recovery is discarded (and its relay budget reset),
-                    // while ordinary/manual requests retain the historic replay behavior.
-                    *pending_reparent = Some(PendingReparent::new(target, reason, failed_parent_id));
-                }
                 _ => {} // офлайн — команду некуда отправить
             }
         }
     }
-}
-
-fn emit_signaling_status(
-    sink: &Option<SignalingStatusSink>,
-    outcome: SignalingStatusOutcome,
-    code: SignalingStatusCode,
-    reconnect_count: u32,
-) {
-    if let Some(sink) = sink {
-        sink(SignalingStatus { outcome, code, reconnect_count });
-    }
-}
-
-/// Only numeric protocol codes and an allow-listed server error code influence telemetry. Close
-/// reasons and arbitrary server messages are intentionally ignored because they can contain data
-/// that must never cross the native diagnostics bridge.
-fn close_status_code(code: Option<u16>) -> SignalingStatusCode {
-    match code {
-        Some(4001) => SignalingStatusCode::Unauthorized,
-        Some(4003) => SignalingStatusCode::Forbidden,
-        _ => SignalingStatusCode::Closed,
-    }
-}
-
-fn server_error_status_code(value: &Value) -> Option<SignalingStatusCode> {
-    if value.get("t").and_then(Value::as_str) != Some("error") { return None; }
-    Some(match value.get("code").and_then(Value::as_str) {
-        Some("FORBIDDEN") => SignalingStatusCode::Forbidden,
-        Some("UNAUTHORIZED") => SignalingStatusCode::Unauthorized,
-        _ => SignalingStatusCode::Closed,
-    })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct HttpConnectFailure {
-    code: SignalingStatusCode,
-    invalidates_access: bool,
-    terminal: bool,
-}
-
-fn classify_http_connect_failure(status: Option<u16>) -> HttpConnectFailure {
-    match status {
-        // A rejected access JWT may be refreshed by WsUrl and retried without ending the watch.
-        Some(401) => HttpConnectFailure {
-            code: SignalingStatusCode::Unauthorized,
-            invalidates_access: true,
-            terminal: false,
-        },
-        // Membership/server authorization cannot be repaired by refreshing the global session.
-        Some(403) => HttpConnectFailure {
-            code: SignalingStatusCode::Forbidden,
-            invalidates_access: false,
-            terminal: true,
-        },
-        _ => HttpConnectFailure {
-            code: SignalingStatusCode::Closed,
-            invalidates_access: false,
-            terminal: false,
-        },
-    }
-}
-
-fn confirm_welcome_status(
-    value: &Value,
-    already_confirmed: &mut bool,
-    reconnect_count: u32,
-) -> Option<SignalingStatusOutcome> {
-    if *already_confirmed || value.get("t").and_then(Value::as_str) != Some("welcome") {
-        return None;
-    }
-    *already_confirmed = true;
-    Some(if reconnect_count == 0 {
-        SignalingStatusOutcome::Ok
-    } else {
-        SignalingStatusOutcome::Recovered
-    })
-}
-
-fn request_reparent_payload(
-    stream_id: &str,
-    target: Option<String>,
-    reason: Option<&str>,
-    failed_parent_id: Option<String>,
-) -> Value {
-    let mut payload = json!({
-        "t": "request-reparent",
-        "streamId": stream_id,
-        "targetParentId": target,
-    });
-    if let (Some(reason), Some(object)) = (reason, payload.as_object_mut()) {
-        object.insert("reason".into(), Value::from(reason));
-    }
-    if let (Some(failed_parent_id), Some(object)) = (failed_parent_id, payload.as_object_mut()) {
-        object.insert("failedParentId".into(), Value::from(failed_parent_id));
-    }
-    payload
-}
-
-async fn send_or_retain_reparent<S>(
-    write: &mut S,
-    stream_id: &str,
-    pending_reparent: &mut Option<PendingReparent>,
-    request: PendingReparent,
-) -> bool
-where
-    S: Sink<Message> + Unpin,
-{
-    let message = request_reparent_payload(
-        stream_id,
-        request.target.clone(),
-        request.reason,
-        request.failed_parent_id.clone(),
-    );
-    if write
-        .send(Message::Text(message.to_string().into()))
-        .await
-        .is_ok()
-    {
-        true
-    } else {
-        *pending_reparent = Some(request);
-        false
-    }
-}
-
-/// A reconnecting socket joins as a new server-side node and receives a fresh parent assignment.
-/// A media request captured before that join describes the old assignment, so sending it directly
-/// after `join` can only race/violate the server's fresh-assignment age fence. Drop just that
-/// generation-bound request; ordinary/manual requests retain their existing reconnect behavior.
-fn discard_stale_media_reparent_after_rejoin(
-    pending_reparent: &mut Option<PendingReparent>,
-    rejoined: bool,
-) -> bool {
-    if !rejoined
-        || !pending_reparent
-            .as_ref()
-            .is_some_and(PendingReparent::is_track_missing_recovery)
-    {
-        return false;
-    }
-    pending_reparent.take();
-    true
 }
 
 /// Поднимает ws-соединение и держит его в отдельной tokio-задаче. Возвращает канал
@@ -435,26 +143,6 @@ fn discard_stale_media_reparent_after_rejoin(
 /// консьюмера. `reconnect=false` — старое поведение (первый обрыв = Closed); нужен
 /// vrelay-сессиям: агент сам переактивируется по vrelay-activate.
 pub fn connect(ws_url: WsUrl, join: JoinParams, reconnect: bool) -> (mpsc::UnboundedSender<TreeCmd>, mpsc::UnboundedReceiver<TreeEvent>) {
-    connect_inner(ws_url, join, reconnect, None)
-}
-
-/// Same wire protocol as [`connect`], with an optional side-channel containing only sanitized
-/// lifecycle states. The callback never affects reconnect or media behavior.
-pub fn connect_with_status(
-    ws_url: WsUrl,
-    join: JoinParams,
-    reconnect: bool,
-    status: Option<SignalingStatusSink>,
-) -> (mpsc::UnboundedSender<TreeCmd>, mpsc::UnboundedReceiver<TreeEvent>) {
-    connect_inner(ws_url, join, reconnect, status)
-}
-
-fn connect_inner(
-    ws_url: WsUrl,
-    join: JoinParams,
-    reconnect: bool,
-    status: Option<SignalingStatusSink>,
-) -> (mpsc::UnboundedSender<TreeCmd>, mpsc::UnboundedReceiver<TreeEvent>) {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<TreeCmd>();
     let (evt_tx, evt_rx) = mpsc::unbounded_channel::<TreeEvent>();
 
@@ -481,113 +169,26 @@ fn connect_inner(
         });
 
         let mut connects = 0u32; // сколько раз успешно джойнились (>=1 => дальше Rejoined)
-        let mut attempts = 0u32;
         let mut backoff = 1u64;
-        let mut pending_reparent: Option<PendingReparent> = None;
         'outer: loop {
-            let reconnect_count = attempts;
-            attempts = attempts.saturating_add(1);
-            emit_signaling_status(
-                &status,
-                SignalingStatusOutcome::Started,
-                SignalingStatusCode::None,
-                reconnect_count,
-            );
-            let next_url = match ws_url.get().await {
-                Ok(url) => url,
-                Err(e) => {
-                    log::warn!("tree ws credential refresh failed: {}", e.code());
-                    emit_signaling_status(
-                        &status,
-                        if e.is_terminal() || !reconnect { SignalingStatusOutcome::Failed } else { SignalingStatusOutcome::Stalled },
-                        if e.is_terminal() { SignalingStatusCode::Unauthorized } else { SignalingStatusCode::Closed },
-                        reconnect_count,
-                    );
-                    if e.is_terminal() || !reconnect { break 'outer; }
-                    if !wait_backoff(&mut cmd_rx, backoff, &mut pending_reparent).await { break 'outer; }
-                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX_SEC);
-                    continue;
-                }
-            };
-            let (ws_stream, _) = match tokio_tungstenite::connect_async(&next_url).await {
+            let (ws_stream, _) = match tokio_tungstenite::connect_async(&ws_url.get()).await {
                 Ok(v) => v,
-                Err(error) => {
-                    let http_status = match &error {
-                        tokio_tungstenite::tungstenite::Error::Http(response) => {
-                            Some(response.status().as_u16())
-                        }
-                        _ => None,
-                    };
-                    let failure = classify_http_connect_failure(http_status);
-                    if failure.invalidates_access {
-                        ws_url.invalidate(&next_url);
-                    }
-                    // Never format the transport error itself: HTTP/TLS implementations may embed
-                    // the request URI, including its access JWT, or an arbitrary upstream body.
-                    let safe_kind = match failure.code {
-                        SignalingStatusCode::Unauthorized => "unauthorized",
-                        SignalingStatusCode::Forbidden => "forbidden",
-                        _ => "transport",
-                    };
-                    log::warn!("tree ws connect failed: {safe_kind}");
-                    emit_signaling_status(
-                        &status,
-                        if failure.terminal || !reconnect {
-                            SignalingStatusOutcome::Failed
-                        } else {
-                            SignalingStatusOutcome::Stalled
-                        },
-                        failure.code,
-                        reconnect_count,
-                    );
-                    if failure.terminal || !reconnect { break 'outer; }
-                    if !wait_backoff(&mut cmd_rx, backoff, &mut pending_reparent).await { break 'outer; }
+                Err(e) => {
+                    log::warn!("tree ws connect failed: {e}");
+                    if !reconnect { break 'outer; }
+                    if !wait_backoff(&mut cmd_rx, backoff).await { break 'outer; }
                     backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX_SEC);
                     continue;
                 }
             };
             let (mut write, mut read) = ws_stream.split();
             if write.send(Message::Text(join_msg.to_string().into())).await.is_err() {
-                emit_signaling_status(
-                    &status,
-                    if reconnect { SignalingStatusOutcome::Stalled } else { SignalingStatusOutcome::Failed },
-                    SignalingStatusCode::Closed,
-                    reconnect_count,
-                );
                 if !reconnect { break 'outer; }
-                if !wait_backoff(&mut cmd_rx, backoff, &mut pending_reparent).await { break 'outer; }
+                if !wait_backoff(&mut cmd_rx, backoff).await { break 'outer; }
                 backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX_SEC);
                 continue;
             }
-            let rejoined = connects > 0;
-            // The join above creates a new server-side assignment generation. A track-missing
-            // request retained from the old socket is now necessarily stale/too young; the relay's
-            // Rejoined handler replenishes its bounded budget and waits for the fresh assign-parent
-            // before starting a new 12s media epoch. Other request kinds keep their old semantics.
-            if discard_stale_media_reparent_after_rejoin(&mut pending_reparent, rejoined) {
-                log::warn!("tree ws: отбросил stale track-missing после свежего join ({stream_id})");
-            }
-            // A failed write keeps an ordinary/manual request for the next connection.
-            if let Some(request) = pending_reparent.take() {
-                if !send_or_retain_reparent(
-                    &mut write,
-                    &stream_id,
-                    &mut pending_reparent,
-                    request,
-                ).await {
-                    emit_signaling_status(
-                        &status,
-                        if reconnect { SignalingStatusOutcome::Stalled } else { SignalingStatusOutcome::Failed },
-                        SignalingStatusCode::Closed,
-                        reconnect_count,
-                    );
-                    if !reconnect { break 'outer; }
-                    if !wait_backoff(&mut cmd_rx, backoff, &mut pending_reparent).await { break 'outer; }
-                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX_SEC);
-                    continue;
-                }
-            }
-            if rejoined {
+            if connects > 0 {
                 log::warn!("tree ws: переподключение #{connects} — реджойн {stream_id}");
                 if evt_tx.send(TreeEvent::Rejoined).is_err() { break 'outer; }
             }
@@ -596,14 +197,12 @@ fn connect_inner(
 
             // terminal=true — уходим совсем (Leave / консьюмер пропал); false — обрыв WS.
             let mut terminal = false;
-            let mut welcome_status_confirmed = false;
             // Дедлайн тишины: сбрасывается ЛЮБЫМ входящим кадром (ping сервера в том числе).
             let mut idle_deadline = tokio::time::Instant::now() + Duration::from_secs(READ_IDLE_TIMEOUT_SEC);
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep_until(idle_deadline) => {
                         log::warn!("tree ws: тишина {READ_IDLE_TIMEOUT_SEC}с ({stream_id}) — сокет полуоткрыт, реконнект");
-                        emit_signaling_status(&status, SignalingStatusOutcome::Stalled, SignalingStatusCode::Closed, reconnect_count);
                         break;
                     }
                     incoming = read.next() => {
@@ -611,21 +210,6 @@ fn connect_inner(
                         match incoming {
                             Some(Ok(Message::Text(txt))) => {
                                 if let Ok(v) = serde_json::from_str::<Value>(&txt) {
-                                    if let Some(outcome) = confirm_welcome_status(
-                                        &v,
-                                        &mut welcome_status_confirmed,
-                                        reconnect_count,
-                                    ) {
-                                        emit_signaling_status(
-                                            &status,
-                                            outcome,
-                                            SignalingStatusCode::None,
-                                            reconnect_count,
-                                        );
-                                    }
-                                    if let Some(code) = server_error_status_code(&v) {
-                                        emit_signaling_status(&status, SignalingStatusOutcome::Failed, code, reconnect_count);
-                                    }
                                     if let Some(evt) = parse_event(&v, &stream_id) {
                                         if evt_tx.send(evt).is_err() { terminal = true; break; }
                                     }
@@ -637,44 +221,8 @@ fn connect_inner(
                                 // явно, иначе нативное вещание/relay рвалось бы каждые ~20с.
                                 let _ = write.send(Message::Pong(data)).await;
                             }
-                            Some(Ok(Message::Close(frame))) => {
-                                // 4001 is exact auth-session revocation. Invalidate only the access
-                                // used by this socket; a delayed close from token A must not erase a
-                                // newer token B already shared by another watch/broadcast. 4003 is
-                                // membership/server authorization and must not touch global auth.
-                                let close_code = frame.as_ref().map(|close| u16::from(close.code));
-                                if close_code.is_some_and(close_invalidates_access) {
-                                    ws_url.invalidate(&next_url);
-                                }
-                                emit_signaling_status(
-                                    &status,
-                                    if reconnect { SignalingStatusOutcome::Stalled } else { SignalingStatusOutcome::Failed },
-                                    close_status_code(close_code),
-                                    reconnect_count,
-                                );
-                                break;
-                            }
-                            None => {
-                                emit_signaling_status(
-                                    &status,
-                                    if reconnect { SignalingStatusOutcome::Stalled } else { SignalingStatusOutcome::Failed },
-                                    SignalingStatusCode::Closed,
-                                    reconnect_count,
-                                );
-                                break;
-                            }
-                            Some(Err(_)) => {
-                                // As above, transport errors are deliberately opaque because some
-                                // backend error strings include the full authenticated request URI.
-                                log::warn!("tree ws transport error");
-                                emit_signaling_status(
-                                    &status,
-                                    if reconnect { SignalingStatusOutcome::Stalled } else { SignalingStatusOutcome::Failed },
-                                    SignalingStatusCode::Closed,
-                                    reconnect_count,
-                                );
-                                break;
-                            }
+                            Some(Ok(Message::Close(_))) | None => break,
+                            Some(Err(e)) => { log::warn!("tree ws error: {e}"); break; }
                             _ => {}
                         }
                     }
@@ -682,24 +230,15 @@ fn connect_inner(
                         match cmd {
                             Some(TreeCmd::Offer { to, sdp }) => {
                                 let msg = json!({ "t": "sdp", "streamId": stream_id, "to": to, "type": "offer", "sdp": sdp });
-                                if write.send(Message::Text(msg.to_string().into())).await.is_err() {
-                                    emit_signaling_status(&status, SignalingStatusOutcome::Stalled, SignalingStatusCode::Closed, reconnect_count);
-                                    break;
-                                }
+                                if write.send(Message::Text(msg.to_string().into())).await.is_err() { break; }
                             }
                             Some(TreeCmd::Answer { to, sdp }) => {
                                 let msg = json!({ "t": "sdp", "streamId": stream_id, "to": to, "type": "answer", "sdp": sdp });
-                                if write.send(Message::Text(msg.to_string().into())).await.is_err() {
-                                    emit_signaling_status(&status, SignalingStatusOutcome::Stalled, SignalingStatusCode::Closed, reconnect_count);
-                                    break;
-                                }
+                                if write.send(Message::Text(msg.to_string().into())).await.is_err() { break; }
                             }
                             Some(TreeCmd::Ice { to, candidate }) => {
                                 let msg = json!({ "t": "ice", "streamId": stream_id, "to": to, "candidate": candidate });
-                                if write.send(Message::Text(msg.to_string().into())).await.is_err() {
-                                    emit_signaling_status(&status, SignalingStatusOutcome::Stalled, SignalingStatusCode::Closed, reconnect_count);
-                                    break;
-                                }
+                                if write.send(Message::Text(msg.to_string().into())).await.is_err() { break; }
                             }
                             Some(TreeCmd::Stats { to_child, available_outgoing }) => {
                                 let msg = json!({ "t": "stats", "streamId": stream_id, "toChild": to_child, "availableOutgoing": available_outgoing });
@@ -709,22 +248,9 @@ fn connect_inner(
                                 let msg = json!({ "t": "request-keyframe", "streamId": stream_id });
                                 let _ = write.send(Message::Text(msg.to_string().into())).await;
                             }
-                            Some(TreeCmd::RequestReparent { target, reason, failed_parent_id }) => {
-                                let request = PendingReparent::new(target, reason, failed_parent_id);
-                                if !send_or_retain_reparent(
-                                    &mut write,
-                                    &stream_id,
-                                    &mut pending_reparent,
-                                    request,
-                                ).await {
-                                    emit_signaling_status(
-                                        &status,
-                                        if reconnect { SignalingStatusOutcome::Stalled } else { SignalingStatusOutcome::Failed },
-                                        SignalingStatusCode::Closed,
-                                        reconnect_count,
-                                    );
-                                    break;
-                                }
+                            Some(TreeCmd::RequestReparent { target }) => {
+                                let msg = json!({ "t": "request-reparent", "streamId": stream_id, "targetParentId": target });
+                                let _ = write.send(Message::Text(msg.to_string().into())).await;
                             }
                             Some(TreeCmd::Leave) => {
                                 let _ = write.send(Message::Text(json!({"t":"leave"}).to_string().into())).await;
@@ -738,7 +264,7 @@ fn connect_inner(
             }
             if terminal || !reconnect { break 'outer; }
             log::warn!("tree ws оборвался ({stream_id}) — реконнект через {backoff}с (медиа-PC живут)");
-            if !wait_backoff(&mut cmd_rx, backoff, &mut pending_reparent).await { break 'outer; }
+            if !wait_backoff(&mut cmd_rx, backoff).await { break 'outer; }
             backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX_SEC);
         }
         let _ = evt_tx.send(TreeEvent::Closed);
@@ -790,269 +316,30 @@ fn parse_event(v: &Value, stream_id: &str) -> Option<TreeEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::task::{Context, Poll};
     use std::sync::atomic::{AtomicU32, Ordering};
-
-    struct RejectSink;
-
-    impl futures_util::Sink<Message> for RejectSink {
-        type Error = ();
-
-        fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Err(()))
-        }
-
-        fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
-            Err(())
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Err(()))
-        }
-
-        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-    }
 
     /// Регрессия инцидента 2026-07-30: URL сигналинга собирался ОДИН раз на старте сессии,
     /// поэтому реконнект позже TTL токена (у vrelay 5 минут) вечно получал 401. `dynamic`
     /// обязан звать фабрику на КАЖДОЕ обращение — иначе токен снова замёрзнет.
-    #[tokio::test]
-    async fn dynamic_url_rebuilt_on_every_attempt() {
+    #[test]
+    fn dynamic_url_rebuilt_on_every_attempt() {
         let calls = Arc::new(AtomicU32::new(0));
         let seen = calls.clone();
         let url = WsUrl::dynamic(move || {
             let n = seen.fetch_add(1, Ordering::SeqCst);
             format!("wss://host/tree?token=tok{n}")
         });
-        assert_eq!(url.get().await.unwrap(), "wss://host/tree?token=tok0");
-        assert_eq!(url.get().await.unwrap(), "wss://host/tree?token=tok1");
-        assert_eq!(url.get().await.unwrap(), "wss://host/tree?token=tok2");
+        assert_eq!(url.get(), "wss://host/tree?token=tok0");
+        assert_eq!(url.get(), "wss://host/tree?token=tok1");
+        assert_eq!(url.get(), "wss://host/tree?token=tok2");
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
-    #[tokio::test]
-    async fn async_url_renews_access_on_every_reconnect_attempt() {
-        let calls = Arc::new(AtomicU32::new(0));
-        let seen = calls.clone();
-        let url = WsUrl::dynamic_async(move || {
-            let n = seen.fetch_add(1, Ordering::SeqCst);
-            async move { Ok(format!("wss://host/tree?token=access{n}")) }
-        });
-        assert_eq!(url.get().await.unwrap(), "wss://host/tree?token=access0");
-        assert_eq!(url.get().await.unwrap(), "wss://host/tree?token=access1");
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn async_url_invalidation_replaces_a_rejected_cached_access() {
-        let generation = Arc::new(AtomicU32::new(0));
-        let read = generation.clone();
-        let invalidate = generation.clone();
-        let url = WsUrl::dynamic_async_with_invalidator(move || {
-            let current = read.load(Ordering::SeqCst);
-            async move { Ok(format!("wss://host/tree?token=access{current}")) }
-        }, move |rejected| {
-            assert_eq!(rejected, "wss://host/tree?token=access0");
-            invalidate.fetch_add(1, Ordering::SeqCst);
-        });
-        assert_eq!(url.get().await.unwrap(), "wss://host/tree?token=access0");
-        url.invalidate("wss://host/tree?token=access0");
-        assert_eq!(url.get().await.unwrap(), "wss://host/tree?token=access1");
-    }
-
+    /// Натив (session-JWT на недели) пересборки не требует — `fixed` отдаёт то же значение.
     #[test]
-    fn credential_errors_classify_terminal_and_transient_without_payloads() {
-        let ended = WsUrlError::terminal("native-auth-session-ended");
-        let offline = WsUrlError::transient("native-auth-network");
-        assert!(ended.is_terminal());
-        assert!(!offline.is_terminal());
-        assert_eq!(ended.code(), "native-auth-session-ended");
-        assert_eq!(WsUrlError::transient("unexpected-upstream-payload").code(), "tree-url-transient");
-        assert_eq!(WsUrlError::terminal("unexpected-upstream-payload").code(), "tree-url-terminal");
-    }
-
-    #[test]
-    fn only_session_revocation_close_invalidates_global_access() {
-        assert!(close_invalidates_access(4001));
-        assert!(!close_invalidates_access(4003));
-        assert!(!close_invalidates_access(1006));
-    }
-
-    #[test]
-    fn native_watch_close_statuses_are_numeric_and_allowlisted() {
-        assert_eq!(close_status_code(Some(4001)), SignalingStatusCode::Unauthorized);
-        assert_eq!(close_status_code(Some(4003)), SignalingStatusCode::Forbidden);
-        assert_eq!(close_status_code(Some(1006)), SignalingStatusCode::Closed);
-        assert_eq!(close_status_code(None), SignalingStatusCode::Closed);
-        assert_eq!(SignalingStatusCode::Unauthorized.as_str(), "signaling_unauthorized");
-        assert_eq!(SignalingStatusCode::Forbidden.as_str(), "signaling_forbidden");
-        assert_eq!(SignalingStatusCode::Closed.as_str(), "signaling_closed");
-    }
-
-    #[test]
-    fn http_forbidden_is_terminal_without_invalidating_global_access() {
-        let unauthorized = classify_http_connect_failure(Some(401));
-        assert_eq!(unauthorized.code, SignalingStatusCode::Unauthorized);
-        assert!(unauthorized.invalidates_access);
-        assert!(!unauthorized.terminal);
-
-        let forbidden = classify_http_connect_failure(Some(403));
-        assert_eq!(forbidden.code, SignalingStatusCode::Forbidden);
-        assert!(!forbidden.invalidates_access);
-        assert!(forbidden.terminal);
-
-        let transport = classify_http_connect_failure(Some(503));
-        assert_eq!(transport.code, SignalingStatusCode::Closed);
-        assert!(!transport.invalidates_access);
-        assert!(!transport.terminal);
-    }
-
-    #[test]
-    fn signaling_success_requires_the_first_welcome_of_each_connection() {
-        let mut initial_confirmed = false;
-        assert_eq!(
-            confirm_welcome_status(&json!({ "t": "assign-parent" }), &mut initial_confirmed, 0),
-            None,
-        );
-        assert_eq!(
-            confirm_welcome_status(&json!({ "t": "welcome" }), &mut initial_confirmed, 0),
-            Some(SignalingStatusOutcome::Ok),
-        );
-        assert_eq!(
-            confirm_welcome_status(&json!({ "t": "welcome" }), &mut initial_confirmed, 0),
-            None,
-        );
-
-        let mut reconnect_confirmed = false;
-        assert_eq!(
-            confirm_welcome_status(&json!({ "t": "welcome" }), &mut reconnect_confirmed, 2),
-            Some(SignalingStatusOutcome::Recovered),
-        );
-    }
-
-    #[test]
-    fn track_missing_reparent_reason_is_explicit_and_internal() {
-        let recovery = request_reparent_payload(
-            "stream",
-            None,
-            Some("track-missing"),
-            Some("parent-generation-a".into()),
-        );
-        assert_eq!(recovery.get("reason").and_then(Value::as_str), Some("track-missing"));
-        assert_eq!(recovery.get("targetParentId"), Some(&Value::Null));
-        assert_eq!(
-            recovery.get("failedParentId").and_then(Value::as_str),
-            Some("parent-generation-a"),
-        );
-
-        let ordinary = request_reparent_payload("stream", None, None, None);
-        assert!(!ordinary.as_object().unwrap().contains_key("reason"));
-        assert!(!ordinary.as_object().unwrap().contains_key("failedParentId"));
-    }
-
-    #[tokio::test]
-    async fn reasoned_reparent_survives_backoff_and_failed_write() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        tx.send(TreeCmd::Stats { to_child: Vec::new(), available_outgoing: 0 }).unwrap();
-        tx.send(TreeCmd::RequestReparent {
-            target: None,
-            reason: Some("track-missing"),
-            failed_parent_id: Some("parent-generation-a".into()),
-        }).unwrap();
-        tx.send(TreeCmd::Leave).unwrap();
-
-        let mut pending = None;
-        assert!(!wait_backoff(&mut rx, 60, &mut pending).await);
-        let retained = pending.expect("reasoned recovery must not be drained with stale traffic");
-        assert_eq!(
-            retained,
-            PendingReparent::new(
-                None,
-                Some("track-missing"),
-                Some("parent-generation-a".into()),
-            ),
-        );
-
-        let mut retry_after_write = None;
-        assert!(!send_or_retain_reparent(
-            &mut RejectSink,
-            "stream",
-            &mut retry_after_write,
-            retained,
-        ).await);
-        assert_eq!(
-            retry_after_write,
-            Some(PendingReparent::new(
-                None,
-                Some("track-missing"),
-                Some("parent-generation-a".into()),
-            )),
-            "a failed websocket write must put the exact request back into the reconnect slot",
-        );
-    }
-
-    #[test]
-    fn successful_rejoin_discards_only_old_assignment_media_recovery() {
-        let media_recovery = PendingReparent::new(
-            None,
-            Some("track-missing"),
-            Some("parent-generation-a".into()),
-        );
-
-        let mut initial_connect = Some(media_recovery.clone());
-        assert!(!discard_stale_media_reparent_after_rejoin(
-            &mut initial_connect,
-            false,
-        ));
-        assert_eq!(
-            initial_connect,
-            Some(media_recovery.clone()),
-            "an initial connection has not minted a replacement server assignment",
-        );
-
-        let mut rejoined = Some(media_recovery);
-        assert!(discard_stale_media_reparent_after_rejoin(
-            &mut rejoined,
-            true,
-        ));
-        assert_eq!(
-            rejoined,
-            None,
-            "the old failedParentId must never be replayed immediately after a fresh join",
-        );
-
-        let ordinary = PendingReparent::new(Some("manual-parent".into()), None, None);
-        let mut manual_after_rejoin = Some(ordinary.clone());
-        assert!(!discard_stale_media_reparent_after_rejoin(
-            &mut manual_after_rejoin,
-            true,
-        ));
-        assert_eq!(
-            manual_after_rejoin,
-            Some(ordinary),
-            "the media generation fence must not silently change manual reconnect behavior",
-        );
-    }
-
-    #[test]
-    fn native_watch_server_error_status_ignores_message_and_unknown_codes() {
-        let forbidden = json!({
-            "t": "error",
-            "code": "FORBIDDEN",
-            "message": "must-not-cross-the-status-bridge",
-        });
-        let unknown = json!({ "t": "error", "code": "SERVER_SUPPLIED", "message": "secret" });
-        assert_eq!(server_error_status_code(&forbidden), Some(SignalingStatusCode::Forbidden));
-        assert_eq!(server_error_status_code(&unknown), Some(SignalingStatusCode::Closed));
-        assert_eq!(server_error_status_code(&json!({ "t": "welcome" })), None);
-    }
-
-    #[tokio::test]
-    async fn fixed_url_is_stable() {
+    fn fixed_url_is_stable() {
         let url = WsUrl::fixed("wss://host/tree?token=session".into());
-        assert_eq!(url.get().await.unwrap(), url.get().await.unwrap());
-        assert_eq!(url.get().await.unwrap(), "wss://host/tree?token=session");
+        assert_eq!(url.get(), url.get());
+        assert_eq!(url.get(), "wss://host/tree?token=session");
     }
 }

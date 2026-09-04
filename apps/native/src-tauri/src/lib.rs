@@ -5,10 +5,8 @@ mod branding;
 pub mod diag;
 mod hotkeys;
 mod hwinfo;
-mod native_auth;
 
 use std::collections::HashMap;
-use tauri::Manager;
 use tokio::sync::Mutex;
 use windows::core::{w, PCWSTR};
 use windows::Win32::UI::Shell::ShellExecuteW;
@@ -164,246 +162,7 @@ struct BroadcastState(Mutex<Option<broadcast::BroadcastHandle>>);
 // Грид: до WATCH_MAX (кап держит JS engine) одновременных watch-слотов, ключ — stream_id.
 // Раньше был один Option-слот (один просмотр за раз); теперь каждый стрим грида — свой RelayHandle,
 // а команды answer/ice/reparent маршрутизируются по stream_id (relay-core уже тегирует свои webview-события).
-struct NativeWatchSlot {
-  generation: u64,
-  handle: broadcast::relay::RelayHandle,
-}
-
-#[derive(Default)]
-struct NativeWatchRegistry {
-  slots: HashMap<String, NativeWatchSlot>,
-  // Per-stream tombstone/owner fence. A stop which wins while start_watch is awaiting auth must
-  // still reject that delayed start instead of letting it resurrect a Rust relay slot afterwards.
-  latest_generation: HashMap<String, u64>,
-}
-
-struct WatchState(Mutex<NativeWatchRegistry>);
-
-#[derive(Clone, Copy)]
-enum NativeWatchStartStatus {
-  Started,
-  Unauthorized,
-  SignalingClosed,
-  Failed,
-}
-
-fn emit_native_watch_status(
-  app: &tauri::AppHandle,
-  stream_id: &str,
-  generation: u64,
-  status: NativeWatchStartStatus,
-) {
-  use tauri::Emitter;
-  // Exhaustive local enums are the only source of wire strings. Never forward a native auth error,
-  // URL, token or other transport detail through this renderer-facing event.
-  let (outcome, code) = match status {
-    NativeWatchStartStatus::Started => ("started", "none"),
-    NativeWatchStartStatus::Unauthorized => ("failed", "signaling_unauthorized"),
-    NativeWatchStartStatus::SignalingClosed => ("failed", "signaling_closed"),
-    NativeWatchStartStatus::Failed => ("failed", "native_start_failed"),
-  };
-  let _ = app.emit("relay-watch-status", serde_json::json!({
-    "streamId": stream_id,
-    "generation": generation,
-    "stage": "watch_native_start",
-    "outcome": outcome,
-    "code": code,
-  }));
-}
-
-fn native_watch_generation_is_newer(
-  registry: &NativeWatchRegistry,
-  stream_id: &str,
-  generation: u64,
-) -> bool {
-  generation > registry.latest_generation.get(stream_id).copied().unwrap_or(0)
-}
-
-fn claim_native_watch_generation(
-  registry: &mut NativeWatchRegistry,
-  stream_id: &str,
-  generation: u64,
-) -> bool {
-  if !native_watch_generation_is_newer(registry, stream_id, generation) { return false; }
-  registry.latest_generation.insert(stream_id.to_string(), generation);
-  true
-}
-
-fn fence_native_watch_generation(
-  registry: &mut NativeWatchRegistry,
-  stream_id: &str,
-  generation: u64,
-) {
-  let latest = registry.latest_generation.entry(stream_id.to_string()).or_insert(0);
-  *latest = (*latest).max(generation);
-}
-
-fn validated_native_tree_url(raw: &str) -> Result<(reqwest::Url, String), String> {
-  let mut url = reqwest::Url::parse(raw).map_err(|_| "Некорректный адрес медиасервера".to_string())?;
-  let host = url.host_str().unwrap_or("");
-  // Keep production stricter than URL-parser equivalence. In particular an explicitly supplied
-  // default port, encoded path or alternative spelling must not silently become an auth-capable
-  // origin after normalization.
-  let raw_base = raw.split_once('?').map_or(raw, |(base, _)| base);
-  let prod = raw_base == "wss://reelay.online/tree"
-    && url.scheme() == "wss" && host == "reelay.online" && url.port().is_none();
-  #[cfg(debug_assertions)]
-  let debug_loopback = url.scheme() == "ws"
-    && matches!(host, "127.0.0.1" | "localhost") && url.port().is_some();
-  #[cfg(not(debug_assertions))]
-  let debug_loopback = false;
-  if (!prod && !debug_loopback)
-    || url.path() != "/tree" || url.username() != "" || url.password().is_some()
-    || url.fragment().is_some()
-  {
-    return Err("Адрес медиасервера не разрешён".into());
-  }
-  let query: Vec<(String, String)> = url.query_pairs()
-    .map(|(key, value)| (key.into_owned(), value.into_owned())).collect();
-  if query.len() != 1 || query[0].0 != "token" || query[0].1.is_empty() {
-    return Err("Некорректная авторизация медиасервера".into());
-  }
-  let token = query[0].1.clone();
-  url.set_query(None);
-  Ok((url, token))
-}
-
-fn tree_url_with_token(base: &reqwest::Url, token: &str) -> String {
-  let mut url = base.clone();
-  url.query_pairs_mut().append_pair("token", token);
-  url.to_string()
-}
-
-fn native_tree_url_error(error: &native_auth::NativeAuthError) -> broadcast::signaling::WsUrlError {
-  let (code, terminal) = error.tree_refresh_failure();
-  if terminal {
-    broadcast::signaling::WsUrlError::terminal(code)
-  } else {
-    broadcast::signaling::WsUrlError::transient(code)
-  }
-}
-
-async fn native_tree_ws_url(
-  app: tauri::AppHandle,
-  renderer_url: String,
-) -> Result<broadcast::signaling::WsUrl, String> {
-  let (base, _renderer_token) = validated_native_tree_url(&renderer_url)?;
-  // Eager refresh/cache check makes a terminal logout/revocation visible to the initiating UI
-  // instead of starting capture/watch and failing later in a background reconnect loop.
-  let initial_token = app.state::<native_auth::NativeAuthState>()
-    .refresh_tree_access_token().await
-    .map_err(|error| {
-      let (_, terminal) = error.tree_refresh_failure();
-      // Opaque, allow-listed IPC markers: do not serialize NativeAuthError (which may contain an
-      // upstream message/details) into an ordinary media command error.
-      if terminal { "TREE_AUTH_TERMINAL".to_string() }
-      else { "TREE_AUTH_TRANSIENT".to_string() }
-    })?;
-  let initial_url = tree_url_with_token(&base, &initial_token);
-  let first = std::sync::Arc::new(std::sync::Mutex::new(Some(initial_url)));
-  let first_get = first.clone();
-  let get_app = app.clone();
-  let get_base = base.clone();
-  let invalidate_app = app;
-  Ok(broadcast::signaling::WsUrl::dynamic_async_with_invalidator(move || {
-    let first_get = first_get.clone();
-    let get_app = get_app.clone();
-    let get_base = get_base.clone();
-    async move {
-      // The eager URL is consumed exactly once. Later attempts share NativeAuthState's cache and
-      // rotate only inside its 30-second expiry skew, never once per watch/reconnect.
-      let initial = {
-        let mut first = first_get.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        first.take()
-      };
-      if let Some(url) = initial {
-        return Ok(url);
-      }
-      let token = get_app.state::<native_auth::NativeAuthState>()
-        .refresh_tree_access_token().await.map_err(|error| native_tree_url_error(&error))?;
-      Ok(tree_url_with_token(&get_base, &token))
-    }
-  }, move |rejected_url| {
-    // Parse through the same exact-origin allow-list, then compare-and-clear only that access JWT.
-    if let Ok((_base, rejected_token)) = validated_native_tree_url(rejected_url) {
-      invalidate_app.state::<native_auth::NativeAuthState>()
-        .invalidate_rejected_tree_access(&rejected_token);
-    }
-  }))
-}
-
-#[cfg(test)]
-mod native_tree_auth_tests {
-  use super::{
-    claim_native_watch_generation, fence_native_watch_generation,
-    native_watch_generation_is_newer, tree_url_with_token, validated_native_tree_url,
-    NativeWatchRegistry,
-  };
-
-  #[test]
-  fn production_tree_origin_is_exact_and_renderer_token_is_discarded() {
-    let (base, renderer_token) = validated_native_tree_url(
-      "wss://reelay.online/tree?token=renderer-old",
-    ).unwrap();
-    assert_eq!(renderer_token, "renderer-old");
-    assert_eq!(base.as_str(), "wss://reelay.online/tree");
-
-    let refreshed = tree_url_with_token(&base, "fresh access/+?=");
-    let parsed = reqwest::Url::parse(&refreshed).unwrap();
-    let pairs: Vec<_> = parsed.query_pairs().collect();
-    assert_eq!(pairs.len(), 1);
-    assert_eq!(pairs[0].0, "token");
-    assert_eq!(pairs[0].1, "fresh access/+?=");
-    assert!(!refreshed.contains("renderer-old"));
-  }
-
-  #[test]
-  fn production_tree_origin_rejects_every_credential_smuggling_variant() {
-    for rejected in [
-      "ws://reelay.online/tree?token=x",
-      "wss://reelay.online:443/tree?token=x",
-      "wss://reelay.online.evil/tree?token=x",
-      "wss://user@reelay.online/tree?token=x",
-      "wss://reelay.online/tree/?token=x",
-      "wss://reelay.online/%74ree?token=x",
-      "wss://reelay.online/tree#fragment?token=x",
-      "wss://reelay.online/tree",
-      "wss://reelay.online/tree?token=",
-      "wss://reelay.online/tree?token=x&extra=y",
-      "wss://reelay.online/tree?token=x&token=y",
-    ] {
-      assert!(validated_native_tree_url(rejected).is_err(), "unexpectedly allowed {rejected}");
-    }
-  }
-
-  #[cfg(debug_assertions)]
-  #[test]
-  fn debug_tree_origin_allows_only_explicit_loopback_port_and_exact_path() {
-    assert!(validated_native_tree_url("ws://127.0.0.1:4000/tree?token=x").is_ok());
-    assert!(validated_native_tree_url("ws://localhost:4000/tree?token=x").is_ok());
-    assert!(validated_native_tree_url("ws://127.0.0.1/tree?token=x").is_err());
-    assert!(validated_native_tree_url("ws://0.0.0.0:4000/tree?token=x").is_err());
-    assert!(validated_native_tree_url("ws://localhost:4000/tree/extra?token=x").is_err());
-  }
-
-  #[test]
-  fn cancelled_or_out_of_order_native_watch_start_cannot_resurrect_a_slot() {
-    let mut registry = NativeWatchRegistry::default();
-    assert!(native_watch_generation_is_newer(&registry, "stream", 1));
-
-    // stop(1) wins while start(1) is awaiting auth: the delayed completion must be rejected.
-    fence_native_watch_generation(&mut registry, "stream", 1);
-    assert!(!claim_native_watch_generation(&mut registry, "stream", 1));
-
-    // A newer quality/watch owner may start, and neither the old completion nor old stop can move
-    // its generation fence backwards.
-    assert!(claim_native_watch_generation(&mut registry, "stream", 2));
-    fence_native_watch_generation(&mut registry, "stream", 1);
-    assert!(!claim_native_watch_generation(&mut registry, "stream", 1));
-    assert!(!claim_native_watch_generation(&mut registry, "stream", 2));
-    assert!(claim_native_watch_generation(&mut registry, "stream", 3));
-  }
-}
+struct WatchState(Mutex<HashMap<String, broadcast::relay::RelayHandle>>);
 
 #[tauri::command]
 async fn start_broadcast(
@@ -425,7 +184,6 @@ async fn start_broadcast(
   // отключают клиентскую QualityLadder (адаптация зрителей — через серверные рендишны Д4).
   preset_mode: Option<String>,
 ) -> Result<(), String> {
-  let signalling = native_tree_ws_url(app.clone(), ws_url).await?;
   let mut slot = state.0.lock().await;
   if let Some(h) = slot.as_ref() {
     if h.is_alive() {
@@ -459,7 +217,7 @@ async fn start_broadcast(
     max_direct_children: max_direct_children.unwrap_or(4).clamp(1, 10),
     ladder_enabled: manual && auto,
   };
-  let handle = broadcast::start(Some(app), stream_id, signalling, identity, server_id, source, config).await?;
+  let handle = broadcast::start(Some(app), stream_id, ws_url, identity, server_id, source, config).await?;
   *slot = Some(handle);
   Ok(())
 }
@@ -472,7 +230,6 @@ async fn start_watch(
   app: tauri::AppHandle,
   state: tauri::State<'_, WatchState>,
   stream_id: String,
-  generation: u64,
   ws_url: String,
   identity: String,
   server_id: String,
@@ -481,53 +238,24 @@ async fn start_watch(
   pinned: Option<bool>,
   available_outgoing: Option<u32>,
 ) -> Result<(), String> {
-  if generation == 0 { return Err("Некорректное поколение просмотра".into()); }
-  {
-    let registry = state.0.lock().await;
-    if !native_watch_generation_is_newer(&registry, &stream_id, generation) {
-      return Ok(()); // cancelled/replaced before this command reached the auth gate
-    }
-  }
-  emit_native_watch_status(&app, &stream_id, generation, NativeWatchStartStatus::Started);
-  let signalling = match native_tree_ws_url(app.clone(), ws_url).await {
-    Ok(signalling) => signalling,
-    Err(error) => {
-      let status = match error.as_str() {
-        "TREE_AUTH_TERMINAL" => NativeWatchStartStatus::Unauthorized,
-        "TREE_AUTH_TRANSIENT" => NativeWatchStartStatus::SignalingClosed,
-        _ => NativeWatchStartStatus::Failed,
-      };
-      emit_native_watch_status(&app, &stream_id, generation, status);
-      return Err(error);
-    }
-  };
   let key = stream_id.clone();
-  let mut registry = state.0.lock().await;
-  if !claim_native_watch_generation(&mut registry, &key, generation) {
-    return Ok(()); // stop/newer start won while protected refresh was in flight
-  }
+  let mut slots = state.0.lock().await;
   // Ре-watch того же стрима (смена качества/реконнект) — гасим прежний слот этого же ключа,
   // ЧУЖИЕ слоты грида не трогаем.
-  if let Some(old) = registry.slots.remove(&key) { old.handle.stop(); }
+  if let Some(old) = slots.remove(&key) { old.stop(); }
   // Буфер диага один на процесс — сбрасываем только на ПЕРВЫЙ watch грида, иначе открытие
   // второй плитки затёрло бы лог первой (см. start_broadcast).
-  if registry.slots.is_empty() { diag::reset(); }
+  if slots.is_empty() { diag::reset(); }
   // UiSink: relay-ядро (relay-core) не знает про Tauri — события webview (relay-watch-offer/
   // -ice, relay-topology) уходят через колбэк-обёртку над app.emit.
-  let ui_app = app;
   let ui: broadcast::relay::UiSink = {
     use tauri::Emitter;
-    std::sync::Arc::new(move |evt: &str, mut payload: serde_json::Value| {
-      if let Some(object) = payload.as_object_mut() {
-        object.insert("generation".into(), serde_json::Value::from(generation));
-      }
-      let _ = ui_app.emit(evt, payload);
-    })
+    std::sync::Arc::new(move |evt: &str, payload: serde_json::Value| { let _ = app.emit(evt, payload); })
   };
   let handle = broadcast::relay::start(Some(ui), broadcast::relay::RelayConfig {
     stream_id, identity, server_id,
-    // Every reconnect resolves a shared, cached short-lived access JWT through NativeAuthState.
-    ws_url: signalling,
+    // fixed: session-JWT натива живёт неделями — пересобирать URL не нужно (см. signaling::WsUrl).
+    ws_url: broadcast::signaling::WsUrl::fixed(ws_url),
     max_children: max_children.unwrap_or(4).clamp(0, 10),
     virtual_relay: false,
     // Д3: рендишн, который смотрит зритель (`streamId::quality`). Дефолт "source" — старый
@@ -543,51 +271,34 @@ async fn start_watch(
     idle_exit: None, // натив смотрит стрим сам — уходим только по Stop
     reconnect: true, // рестарт сервера (деплой) не рвёт просмотр
   });
-  registry.slots.insert(key, NativeWatchSlot { generation, handle });
+  slots.insert(key, handle);
   Ok(())
 }
 
 #[tauri::command]
-async fn stop_watch(
-  state: tauri::State<'_, WatchState>,
-  stream_id: String,
-  generation: Option<u64>,
-) -> Result<(), String> {
-  let mut registry = state.0.lock().await;
-  let requested = generation.unwrap_or_else(|| {
-    registry.slots.get(&stream_id).map(|slot| slot.generation).unwrap_or(1)
-  });
-  fence_native_watch_generation(&mut registry, &stream_id, requested);
-  if registry.slots.get(&stream_id).is_some_and(|slot| slot.generation == requested) {
-    if let Some(slot) = registry.slots.remove(&stream_id) { slot.handle.stop(); }
-  }
+async fn stop_watch(state: tauri::State<'_, WatchState>, stream_id: String) -> Result<(), String> {
+  if let Some(h) = state.0.lock().await.remove(&stream_id) { h.stop(); }
   Ok(())
 }
 
 // Ответ webview на локальный offer relay-показа (см. relay-watch-offer). Маршрут по stream_id —
 // у грида несколько активных relay-слотов, answer относится к конкретному.
 #[tauri::command]
-async fn watch_answer(state: tauri::State<'_, WatchState>, stream_id: String, generation: u64, sdp: String) -> Result<(), String> {
-  if let Some(slot) = state.0.lock().await.slots.get(&stream_id).filter(|slot| slot.generation == generation) {
-    slot.handle.webview_answer(sdp);
-  }
+async fn watch_answer(state: tauri::State<'_, WatchState>, stream_id: String, sdp: String) -> Result<(), String> {
+  if let Some(h) = state.0.lock().await.get(&stream_id) { h.webview_answer(sdp); }
   Ok(())
 }
 
 #[tauri::command]
-async fn watch_ice(state: tauri::State<'_, WatchState>, stream_id: String, generation: u64, candidate: serde_json::Value) -> Result<(), String> {
-  if let Some(slot) = state.0.lock().await.slots.get(&stream_id).filter(|slot| slot.generation == generation) {
-    slot.handle.webview_ice(candidate);
-  }
+async fn watch_ice(state: tauri::State<'_, WatchState>, stream_id: String, candidate: serde_json::Value) -> Result<(), String> {
+  if let Some(h) = state.0.lock().await.get(&stream_id) { h.webview_ice(candidate); }
   Ok(())
 }
 
 // Э8: ручной выбор пира зрителем из UI дерева (target=Some) или авто-миграция (target=None).
 #[tauri::command]
-async fn watch_reparent(state: tauri::State<'_, WatchState>, stream_id: String, generation: u64, target: Option<String>) -> Result<(), String> {
-  if let Some(slot) = state.0.lock().await.slots.get(&stream_id).filter(|slot| slot.generation == generation) {
-    slot.handle.request_reparent(target);
-  }
+async fn watch_reparent(state: tauri::State<'_, WatchState>, stream_id: String, target: Option<String>) -> Result<(), String> {
+  if let Some(h) = state.0.lock().await.get(&stream_id) { h.request_reparent(target); }
   Ok(())
 }
 
@@ -727,8 +438,7 @@ pub fn run() {
       }
     })
     .manage(BroadcastState(Mutex::new(None)))
-    .manage(WatchState(Mutex::new(NativeWatchRegistry::default())))
-    .manage(native_auth::NativeAuthState::new().expect("failed to initialize native auth broker"))
+    .manage(WatchState(Mutex::new(HashMap::new())))
     .setup(|app| {
       // Раньше висело за cfg!(debug_assertions) — в релизном билде (то, что реально
       // ставят и тестируют) log::info!/warn!/error! по всему broadcast:: были
@@ -773,7 +483,7 @@ pub fn run() {
       std::thread::spawn(branding::fix_shortcuts);
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![ping, open_external_url, list_monitors, list_windows, detect_game, foreground_fullscreen, set_detectable_games, start_broadcast, set_broadcast_source, stop_broadcast, set_preview_interval, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys, open_file, reveal_in_folder, paths_exist, diag::diag_take_log, hwinfo::diag_hw, native_auth::native_auth_resume, native_auth::native_auth_refresh, native_auth::native_auth_login, native_auth::native_auth_register_verify, native_auth::native_auth_email_verify, native_auth::native_auth_password_change, native_auth::native_auth_begin_logout, native_auth::native_auth_drain_logout])
+    .invoke_handler(tauri::generate_handler![ping, open_external_url, list_monitors, list_windows, detect_game, foreground_fullscreen, set_detectable_games, start_broadcast, set_broadcast_source, stop_broadcast, set_preview_interval, start_watch, stop_watch, watch_answer, watch_ice, watch_reparent, set_global_hotkeys, open_file, reveal_in_folder, paths_exist, diag::diag_take_log, hwinfo::diag_hw])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }
