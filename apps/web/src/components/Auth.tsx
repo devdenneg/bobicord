@@ -191,7 +191,13 @@ export function Auth() {
   const initialScreen: AuthScreen = resetToken ? 'reset-inspect' : sessionError ? 'session-retry' : restoredRegistration ? 'register-verify' : 'login';
   const [screen, setScreen] = useState<AuthScreen>(initialScreen);
   const [failure, setFailure] = useState<FormFailure | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusyState] = useState(false);
+  const busyRef = useRef(false);
+  function setBusy(value: boolean) {
+    // State/disabled render on the next frame; the ref locks a second submit in this frame too.
+    busyRef.current = value;
+    setBusyState(value);
+  }
   const [now, setNow] = useState(Date.now());
 
   const [loginUser, setLoginUser] = useState('');
@@ -256,8 +262,15 @@ export function Auth() {
 
   function switchScreen(next: AuthScreen) {
     setFailure(null);
-    setBusy(false);
     setScreen(next);
+  }
+
+  function navigate(next: AuthScreen, before?: () => void) {
+    // Only user navigation takes this guard. A pending request can still finish with an internal
+    // transition (for example an explicit 401), and its finally is the only place to release busy.
+    if (busyRef.current) return;
+    before?.();
+    switchScreen(next);
   }
 
   function clearRegistrationFlow() {
@@ -283,12 +296,13 @@ export function Auth() {
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Не удалось загрузить аккаунт';
       useStore.setState({ view: 'auth', sessionError: message });
-      setScreen('session-retry');
+      setScreen(getToken() ? 'session-retry' : 'login');
       setFailure({ message });
     }
   }
 
   async function retrySession() {
+    if (busyRef.current) return;
     setBusy(true); setFailure(null);
     try {
       try {
@@ -310,6 +324,7 @@ export function Auth() {
 
   async function submitLogin(event: React.FormEvent) {
     event.preventDefault();
+    if (busyRef.current) return;
     const username = loginUser.trim();
     if (!username) { setFailure({ message: 'Введите логин', field: 'username' }); focusById('auth-login-user'); return; }
     if (!loginPassword) { setFailure({ message: 'Введите пароль', field: 'password' }); focusById('auth-login-password'); return; }
@@ -327,6 +342,7 @@ export function Auth() {
 
   async function submitRegistration(event: React.FormEvent) {
     event.preventDefault();
+    if (busyRef.current) return;
     const username = registerUser.trim();
     const email = registerEmail.trim();
     const inviteCode = registerInvite.trim();
@@ -355,6 +371,7 @@ export function Auth() {
 
   async function submitRegistrationCode(event: React.FormEvent) {
     event.preventDefault();
+    if (busyRef.current) return;
     if (!registrationChallenge) { switchScreen('register'); return; }
     if (registrationCode.length !== 4) { setFailure({ message: 'Введите четыре цифры', field: 'code' }); focusById('auth-register-code'); return; }
     setBusy(true); setFailure(null);
@@ -406,7 +423,7 @@ export function Auth() {
   }
 
   async function resendRegistrationCode() {
-    if (!registrationChallenge || registrationWait > 0 || busy) return;
+    if (!registrationChallenge || registrationWait > 0 || busyRef.current) return;
     setBusy(true); setFailure(null);
     try {
       const response = await api.registerResend(registrationChallenge.id);
@@ -426,6 +443,7 @@ export function Auth() {
 
   async function sendRecovery(event?: React.FormEvent) {
     event?.preventDefault();
+    if (busyRef.current) return;
     const email = forgotEmail.trim();
     if (!EMAIL_RE.test(email)) { setFailure({ message: 'Введите корректный адрес почты', field: 'email' }); focusById('auth-forgot-email'); return; }
     setBusy(true); setFailure(null);
@@ -442,6 +460,7 @@ export function Auth() {
 
   async function submitReset(event: React.FormEvent) {
     event.preventDefault();
+    if (busyRef.current) return;
     if (!resetToken) { setScreen('reset-invalid'); return; }
     const passwordFailure = validateNewPassword(resetPassword);
     if (passwordFailure) { setFailure(passwordFailure); focusById('auth-reset-password'); return; }
@@ -480,6 +499,7 @@ export function Auth() {
   }
 
   async function returnToExistingSession() {
+    if (busyRef.current) return;
     if (!getToken()) { switchScreen('login'); return; }
     setBusy(true); setFailure(null);
     try {
@@ -530,8 +550,8 @@ export function Auth() {
 
         {(screen === 'login' || screen === 'register') ? (
           <div className="tabs2" role="group" aria-label="Способ входа">
-            <button type="button" aria-pressed={screen === 'login'} className={screen === 'login' ? 'active' : ''} onClick={() => switchScreen('login')}>Вход</button>
-            <button type="button" aria-pressed={screen === 'register'} className={screen === 'register' ? 'active' : ''} onClick={() => switchScreen('register')}>Регистрация</button>
+            <button type="button" disabled={busy} aria-pressed={screen === 'login'} className={screen === 'login' ? 'active' : ''} onClick={() => navigate('login')}>Вход</button>
+            <button type="button" disabled={busy} aria-pressed={screen === 'register'} className={screen === 'register' ? 'active' : ''} onClick={() => navigate('register')}>Регистрация</button>
           </div>
         ) : null}
 
@@ -540,7 +560,7 @@ export function Auth() {
             <span className="auth-state-icon"><Icon name="refresh" /></span>
             <p>Сохранённый вход не потерян. Проверьте интернет и попробуйте ещё раз.</p>
             <button type="button" className="primary" disabled={busy} onClick={retrySession}>{busy ? <span className="spin" /> : null}Повторить</button>
-            <button type="button" className="link" onClick={() => { setToken(null); useStore.setState({ sessionError: '' }); switchScreen('login'); }}>Войти в другой аккаунт</button>
+            <button type="button" className="link" disabled={busy} onClick={() => navigate('login', () => { setToken(null); useStore.setState({ sessionError: '' }); })}>Войти в другой аккаунт</button>
           </div>
         ) : null}
 
@@ -554,7 +574,7 @@ export function Auth() {
               <InlineError id="auth-login-user-error">{fieldError('username')}</InlineError>
             </div>
             <div className="row">
-              <div className="auth-label-line"><label htmlFor="auth-login-password">Пароль</label><button type="button" onClick={() => switchScreen('forgot')}>Забыли пароль?</button></div>
+              <div className="auth-label-line"><label htmlFor="auth-login-password">Пароль</label><button type="button" disabled={busy} onClick={() => navigate('forgot')}>Забыли пароль?</button></div>
               <PasswordInput id="auth-login-password" label="Пароль" value={loginPassword} autoComplete="current-password"
                 invalid={Boolean(fieldError('password'))} describedBy={fieldError('password') ? 'auth-login-password-error' : undefined}
                 onChange={(value) => { setLoginPassword(value); if (failure) setFailure(null); }} />
@@ -615,7 +635,7 @@ export function Auth() {
             </div>
             <button type="submit" className="primary" disabled={busy || !registrationChallenge.delivered || registrationExpired || registrationCode.length !== 4}>{busy ? <span className="spin" /> : null}Подтвердить и войти</button>
             <div className="auth-secondary-row">
-              <button type="button" className="link" onClick={() => restartRegistration()}>Изменить данные</button>
+              <button type="button" className="link" disabled={busy} onClick={() => { if (!busyRef.current) restartRegistration(); }}>Изменить данные</button>
               <button type="button" className="link" disabled={busy || registrationWait > 0} onClick={resendRegistrationCode}>
                 {registrationWait > 0
                   ? `Новый код через ${formatWait(registrationWait)}`
@@ -635,7 +655,7 @@ export function Auth() {
               <InlineError id="auth-forgot-email-error">{fieldError('email')}</InlineError>
             </div>
             <button type="submit" className="primary" disabled={busy}>{busy ? <span className="spin" /> : null}Отправить письмо</button>
-            <button type="button" className="link" onClick={() => switchScreen('login')}>Вернуться ко входу</button>
+            <button type="button" className="link" disabled={busy} onClick={() => navigate('login')}>Вернуться ко входу</button>
           </form>
         ) : null}
 
@@ -646,7 +666,7 @@ export function Auth() {
             <button type="button" className="primary" disabled={busy || forgotWait > 0} onClick={() => sendRecovery()}>
               {forgotWait > 0 ? `Повторить через ${formatWait(forgotWait)}` : busy ? <><span className="spin" />Отправляю</> : 'Отправить ещё раз'}
             </button>
-            <button type="button" className="link" onClick={() => switchScreen('login')}>Вернуться ко входу</button>
+            <button type="button" className="link" disabled={busy} onClick={() => navigate('login')}>Вернуться ко входу</button>
           </div>
         ) : null}
 
@@ -676,7 +696,7 @@ export function Auth() {
           <div className="auth-state">
             <span className="auth-state-icon success"><Icon name="check" /></span>
             <p>Пароль обновлён. Для безопасности выполнен выход на всех устройствах.</p>
-            <button type="button" className="primary" onClick={() => { setLoginUser(resetUsername); switchScreen('login'); }}>Перейти ко входу</button>
+            <button type="button" className="primary" disabled={busy} onClick={() => navigate('login', () => setLoginUser(resetUsername))}>Перейти ко входу</button>
           </div>
         ) : null}
 
@@ -684,9 +704,9 @@ export function Auth() {
           <div className="auth-state">
             <span className="auth-state-icon danger"><Icon name="warn" /></span>
             <p>Ссылка уже использована или срок её действия истёк. Запросите новое письмо.</p>
-            <button type="button" className="primary" onClick={() => { setPasswordResetToken(null); switchScreen('forgot'); }}>Запросить новую ссылку</button>
+            <button type="button" className="primary" disabled={busy} onClick={() => navigate('forgot', () => setPasswordResetToken(null))}>Запросить новую ссылку</button>
             {getToken() ? <button type="button" className="link" disabled={busy} onClick={returnToExistingSession}>Вернуться в приложение</button> : null}
-            <button type="button" className="link" onClick={() => { setPasswordResetToken(null); switchScreen('login'); }}>Вернуться ко входу</button>
+            <button type="button" className="link" disabled={busy} onClick={() => navigate('login', () => setPasswordResetToken(null))}>Вернуться ко входу</button>
           </div>
         ) : null}
 

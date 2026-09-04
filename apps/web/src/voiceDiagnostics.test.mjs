@@ -19,6 +19,53 @@ const {
 } = await import('data:text/javascript,' + encodeURIComponent(js));
 
 {
+  let now = 0;
+  const secret = 'AUTH_SECRET_MUST_NOT_BE_RECORDED';
+  const recorder = new VoiceDiagnosticsRecorder({
+    now: () => now,
+    createReportId: () => '333333333333333333333333',
+    client: { kind: 'web', platform: 'ios', installMode: 'browser', networkType: 'wifi' },
+  });
+  recorder.start();
+  const stages = ['auth_login', 'auth_session', 'auth_profile'];
+  const codes = ['auth', 'network', 'timeout', 'aborted', 'unknown', 'rate_limited', 'server', 'invalid_response'];
+  for (const [index, code] of codes.entries()) {
+    const stage = stages[index % stages.length];
+    recorder.record({ kind: 'auth_request_started', stage, outcome: 'started' });
+    now += 250;
+    recorder.record({
+      kind: 'auth_request_finished', stage, outcome: 'failed', code,
+      httpStatus: index === 0 ? 401 : 0, requestElapsedMs: 250,
+      username: secret, password: secret, token: secret, refreshToken: secret,
+      url: secret, body: { password: secret }, headers: { Authorization: secret }, error: secret,
+    });
+  }
+  for (const incident of ['auth_failed', 'auth_recovered']) {
+    const report = recorder.buildReport(incident);
+    assert.equal(report.durationMs, 2_000);
+    assert.deepEqual(report.events[1], {
+      atMs: 250, kind: 'auth_request_finished', stage: 'auth_login', outcome: 'failed',
+      code: 'auth', httpStatus: 401, requestElapsedMs: 250,
+    });
+    assert.equal(report.events[3].httpStatus, 0, 'a network failure records no HTTP response');
+    assert.doesNotMatch(JSON.stringify(report), /AUTH_SECRET_MUST_NOT_BE_RECORDED/);
+  }
+  recorder.reset();
+  recorder.start();
+  const invalidStatuses = [-1, 600, 401.5, '401', NaN, Infinity];
+  const elapsedInputs = [-1, 120_001, 1.6, '250', NaN, Infinity];
+  for (const [index, httpStatus] of invalidStatuses.entries()) {
+    recorder.record({
+      kind: 'auth_request_finished', stage: secret, code: secret, httpStatus,
+      requestElapsedMs: elapsedInputs[index],
+    });
+  }
+  const bounded = recorder.buildReport('auth_failed');
+  assert.deepEqual(bounded.events.map((event) => event.requestElapsedMs), [0, 120_000, 2, undefined, undefined, undefined]);
+  assert.equal(bounded.events.some((event) => 'httpStatus' in event || 'stage' in event || 'code' in event), false);
+}
+
+{
   const ios = detectVoiceDiagnosticClient({
     userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)',
     platform: 'iPhone',
@@ -39,6 +86,17 @@ const {
   }, 'native mode wins and an unsafe version is omitted');
   assert.equal(detectVoiceDiagnosticNetworkType({ connectionType: 'vpn', effectiveNetworkType: '5g' }), 'other');
   assert.equal(detectVoiceDiagnosticNetworkType({}), 'unknown');
+}
+
+{
+  const recorder = new VoiceDiagnosticsRecorder({ now: () => 0 });
+  recorder.start();
+  for (const micCapturePath of ['direct', 'webaudio', 'PRIVATE_DEVICE_PATH']) {
+    recorder.record({ kind: 'mic_capture_finished', stage: 'mic_capture', micCapturePath });
+  }
+  const report = recorder.buildReport('mic_failed');
+  assert.deepEqual(report.events.map((event) => event.micCapturePath), ['direct', 'webaudio', undefined]);
+  assert.doesNotMatch(JSON.stringify(report), /PRIVATE_DEVICE_PATH/);
 }
 
 {

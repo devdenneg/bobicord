@@ -1,5 +1,11 @@
 import { create } from 'zustand';
-import { api, setToken } from './api';
+import { api, getToken, setToken } from './api';
+import { authDiagnostics } from './authDiagnostics';
+import {
+  AUTH_BOOTSTRAP_RETRY_DELAYS_MS,
+  isRecoverableAcceptedSessionBootstrapError,
+  isTerminalAuthBootstrapError,
+} from './authBootstrap';
 import { isWindowIdle } from './windowIdle';
 import { Engine } from './engine';
 import { emoteMap } from './emotes';
@@ -253,6 +259,99 @@ function mergeUnread(map: Record<string, number>) {
 let unreadTimer: number | null = null;
 let releaseHistoryTimer: number | null = null;
 let releaseHistoryRequest = 0;
+let acceptedSessionGeneration = 0;
+let authBootstrapRetryTimer: number | null = null;
+
+interface AuthBootstrapOwner {
+  generation: number;
+  token: string | null;
+  userId: string;
+  engine: Engine | null;
+}
+
+function acceptedSessionOwner(): AuthBootstrapOwner {
+  return {
+    generation: acceptedSessionGeneration, token: getToken(),
+    userId: useStore.getState().me?.id || '', engine,
+  };
+}
+
+function ownsAcceptedAccount(owner: AuthBootstrapOwner): boolean {
+  return owner.generation === acceptedSessionGeneration
+    && owner.userId === useStore.getState().me?.id && owner.engine === engine;
+}
+
+function ownsAcceptedSession(owner: AuthBootstrapOwner): boolean {
+  return ownsAcceptedAccount(owner) && owner.token === getToken();
+}
+
+function cancelAuthBootstrapRetry() {
+  if (authBootstrapRetryTimer !== null) window.clearTimeout(authBootstrapRetryTimer);
+  authBootstrapRetryTimer = null;
+}
+
+function invalidateAcceptedSession() {
+  acceptedSessionGeneration += 1;
+  cancelAuthBootstrapRetry();
+  if (unreadTimer !== null) window.clearInterval(unreadTimer);
+  unreadTimer = null;
+  if (releaseHistoryTimer !== null) window.clearInterval(releaseHistoryTimer);
+  releaseHistoryTimer = null;
+  releaseHistoryRequest += 1;
+}
+
+function disconnectAcceptedSession() {
+  invalidateAuthSessionHandoff(false);
+  viewEpoch += 1;
+  memberPollRequestSeq += 1;
+  if (memberTimer !== null) window.clearInterval(memberTimer);
+  memberTimer = null;
+  if (saveTimer !== null) window.clearTimeout(saveTimer);
+  saveTimer = null;
+  const previousEngine = engine;
+  engine = null;
+  previousEngine?.disconnect();
+  disconnectNotifyWs();
+}
+
+function rejectAcceptedSession(error: unknown) {
+  invalidateAcceptedSession();
+  disconnectAcceptedSession();
+  if (isTerminalAuthBootstrapError(error)) setToken(null);
+  useStore.setState({
+    view: 'auth', me: null, pendingUser: null, accountGate: null,
+    sessionError: error instanceof Error ? error.message : 'Не удалось загрузить аккаунт',
+    servers: [], active: null, members: [], unread: {}, lastRead: {}, releaseUnread: 0,
+    loadingServer: false, loadingServerId: null, viewServerId: null,
+  });
+}
+
+function scheduleAuthBootstrapRetry(owner: AuthBootstrapOwner) {
+  cancelAuthBootstrapRetry();
+  let attempt = 0;
+  const schedule = () => {
+    if (!ownsAcceptedSession(owner)) return;
+    if (attempt >= AUTH_BOOTSTRAP_RETRY_DELAYS_MS.length) {
+      useStore.getState().toast('Не удалось загрузить список серверов. Вход сохранён — попробуйте обновить страницу позже.', 'warn');
+      return;
+    }
+    authBootstrapRetryTimer = window.setTimeout(async () => {
+      authBootstrapRetryTimer = null;
+      if (!ownsAcceptedSession(owner)) return;
+      try {
+        await useStore.getState().loadMe();
+      } catch (error) {
+        if (!ownsAcceptedSession(owner)) return;
+        if (!isRecoverableAcceptedSessionBootstrapError(error)) {
+          rejectAcceptedSession(error);
+          return;
+        }
+        schedule();
+      }
+    }, AUTH_BOOTSTRAP_RETRY_DELAYS_MS[attempt++]);
+  };
+  schedule();
+}
 
 let toastSeq = 1;
 
@@ -280,6 +379,10 @@ export const useStore = create<AppState>((set, get) => ({
   setEmoteSize: (s) => { localStorage.setItem('emoteSize', s); set({ emoteSize: s }); },
 
   acceptSession: async (user, account = { state: 'ready' }) => {
+    invalidateAcceptedSession();
+    disconnectAcceptedSession();
+    const generation = acceptedSessionGeneration, token = getToken();
+    set({ me: null, servers: [], active: null, members: [], unread: {}, lastRead: {}, loadingServer: false, loadingServerId: null, viewServerId: null });
     if (account.state !== 'ready') {
       set({
         view: 'auth', me: null, pendingUser: user, accountGate: account,
@@ -288,14 +391,19 @@ export const useStore = create<AppState>((set, get) => ({
       });
       return;
     }
+    try { authDiagnostics.accept(user, (report) => api.submitVoiceDiagnostic(report)); }
+    catch { /* diagnostics must not reject an authenticated account */ }
     set({ pendingUser: null, accountGate: null, sessionError: '', view: 'loading', modal: null });
-    try { await get().afterAuth(user); }
+    let targetEngine: Engine | null = null;
+    try {
+      const bootstrap = get().afterAuth(user);
+      targetEngine = engine;
+      await bootstrap;
+    }
     catch (error) {
-      engine?.disconnect(); engine = null;
-      set({
-        view: 'auth', me: null, pendingUser: null, accountGate: null,
-        sessionError: error instanceof Error ? error.message : 'Не удалось загрузить аккаунт', releaseUnread: 0,
-      });
+      // A logout/new login can complete while the previous /me is still pending.
+      if (generation !== acceptedSessionGeneration || token !== getToken() || targetEngine !== engine) return;
+      rejectAcceptedSession(error);
       throw error;
     }
   },
@@ -376,7 +484,15 @@ export const useStore = create<AppState>((set, get) => ({
     });
     engine.onEmoteResolve = (name, id) => emoteMap.set(name, id);
     set({ me: user, pendingUser: null, accountGate: null, sessionError: '', releaseUnread: 0 });
-    await get().loadMe();
+    const owner = acceptedSessionOwner();
+    let retryBootstrap = false;
+    try { await get().loadMe(); }
+    catch (error) {
+      if (!ownsAcceptedSession(owner)) return;
+      if (!isRecoverableAcceptedSessionBootstrapError(error)) throw error;
+      retryBootstrap = true;
+    }
+    if (!ownsAcceptedSession(owner)) return;
     set({ view: 'home' });
     // Web-push: перепривязываем подписку к ТЕКУЩЕМУ аккаунту (endpoint переживает смену юзера/reload,
     // на сервере ON CONFLICT перезапишет user_id). Зовём НАПРЯМУЮ, минуя глобальный notifOptOut-гейт
@@ -386,6 +502,10 @@ export const useStore = create<AppState>((set, get) => ({
     connectNotifyWs(); // глобальный live-канал уведомлений (любой сервер, даже не подключённый)
     startIdleWatch();  // away-детект: апп давно не трогали → жёлтый статус (шлётся по notify-WS)
     preloadSounds(); // прогреть звуки (fetch+decode+нормализация громкости) — первый проигрыш без задержки
+    if (retryBootstrap) {
+      get().toast('Связь с сервером временно недоступна — вход сохранён, повторяем загрузку', 'warn');
+      scheduleAuthBootstrapRetry(owner);
+    }
     const pend = sessionStorage.getItem('pendingInvite');
     const pendingOpenServer = sessionStorage.getItem('pendingOpenServer');
     if (pend) {
@@ -398,18 +518,42 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   loadMe: async () => {
-    const d = await api.me();
-    engine?.setMe(d.user);
+    const owner = acceptedSessionOwner();
+    if (!owner.userId) return;
+    let d: Awaited<ReturnType<typeof api.me>>;
+    try { d = await api.me(); }
+    catch (error) { if (ownsAcceptedSession(owner)) throw error; else return; }
+    if (!ownsAcceptedSession(owner)) return;
+    if (d.user.id !== owner.userId) {
+      throw Object.assign(new Error('Сервер вернул другой аккаунт. Войдите заново.'), { status: 401, code: 'AUTH_CONTEXT_CHANGED' });
+    }
+    cancelAuthBootstrapRetry();
+    owner.engine?.setMe(d.user);
     set((st) => { const lr = { ...st.lastRead }; for (const s of d.servers) if (lr[s.id] === undefined) lr[s.id] = s.lastRead || 0; return { me: d.user, servers: d.servers, lastRead: lr }; });
     mergeUnread(Object.fromEntries(d.servers.map((s) => [s.id, s.unread || 0])));
     // лёгкий поллинг непрочитанного по всем серверам (для НЕ активных — активный ведёт клиент)
     if (unreadTimer) clearInterval(unreadTimer);
-    unreadTimer = window.setInterval(async () => { try { mergeUnread(await api.getUnread()); } catch { /**/ } }, 30000);
+    unreadTimer = window.setInterval(async () => {
+      if (!ownsAcceptedAccount(owner)) return;
+      // The same account can rotate its JWT after changing a password. Capture the token per
+      // request so old responses are fenced without permanently disabling the account's poll.
+      const requestOwner = acceptedSessionOwner();
+      try { const unread = await api.getUnread(); if (ownsAcceptedSession(requestOwner)) mergeUnread(unread); } catch { /**/ }
+    }, 30000);
     if (releaseHistoryTimer) clearInterval(releaseHistoryTimer);
     void get().refreshReleaseHistoryUnread().catch(() => {});
-    releaseHistoryTimer = window.setInterval(() => { void get().refreshReleaseHistoryUnread().catch(() => {}); }, 60000);
+    releaseHistoryTimer = window.setInterval(() => { if (ownsAcceptedAccount(owner)) void get().refreshReleaseHistoryUnread().catch(() => {}); }, 60000);
   },
-  refreshServers: async () => { try { const d = await api.me(); set({ servers: d.servers }); mergeUnread(Object.fromEntries(d.servers.map((s) => [s.id, s.unread || 0]))); } catch { /**/ } },
+  refreshServers: async () => {
+    const owner = acceptedSessionOwner();
+    if (!owner.userId) return;
+    try {
+      const d = await api.me();
+      if (!ownsAcceptedSession(owner) || d.user.id !== owner.userId) return;
+      set({ servers: d.servers });
+      mergeUnread(Object.fromEntries(d.servers.map((s) => [s.id, s.unread || 0])));
+    } catch { /**/ }
+  },
   markRead: (serverId, lastId, all) => {
     set((s) => ({ lastRead: { ...s.lastRead, [serverId]: Math.max(s.lastRead[serverId] || 0, lastId) } }));
     const hadUnread = (get().unread[serverId] || 0) > 0;
@@ -433,11 +577,12 @@ export const useStore = create<AppState>((set, get) => ({
   refreshReleaseHistoryUnread: async () => {
     const userId = get().me?.id;
     if (!userId) return [];
+    const owner = acceptedSessionOwner();
     const request = ++releaseHistoryRequest;
     const response = await api.releaseHistory();
     const releases = Array.isArray(response.releases) ? response.releases.slice(0, 10) : [];
     // Ответ прошлого аккаунта/запроса не должен перезаписать бейдж после relogin.
-    if (request === releaseHistoryRequest && get().me?.id === userId) {
+    if (request === releaseHistoryRequest && ownsAcceptedSession(owner)) {
       set({ releaseUnread: countUnreadReleases(userId, releases) });
       updateAppBadge();
     }
@@ -498,12 +643,15 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   logout: async () => {
-    invalidateAuthSessionHandoff(false);
-    viewEpoch++; engine?.disconnect();
+    invalidateAcceptedSession();
+    disconnectAcceptedSession();
+    const generation = acceptedSessionGeneration, token = getToken();
+    set({ view: 'auth', me: null, pendingUser: null, accountGate: null, sessionError: '', servers: [], active: null, members: [], unread: {}, lastRead: {}, releaseUnread: 0, loadingServer: false, loadingServerId: null, viewServerId: null });
     // отписываем web-push ПОКА токен ещё текущего юзера (api.pushUnsubscribe шлёт Bearer) —
     // иначе endpoint остаётся привязан к нему на сервере и его push летели бы следующему юзеру.
     // cap 2с, чтобы разлогин не подвисал на мёртвой сети.
     try { await Promise.race([unsubscribePush(), new Promise((r) => setTimeout(r, 2000))]); } catch { /**/ }
+    if (generation !== acceptedSessionGeneration || token !== getToken()) return;
     disconnectNotifyWs();
     setToken(null); location.reload();
   },

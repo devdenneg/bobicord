@@ -92,7 +92,7 @@ function encodedBytes(value: unknown): number {
 }
 
 function reportPriority(report: VoiceDiagnosticReport): number {
-  if (report.incident === 'stream_watch_succeeded' || report.incident === 'join_succeeded' || report.incident === 'session_ended') return 0;
+  if (report.incident === 'stream_watch_succeeded' || report.incident === 'join_succeeded' || report.incident === 'session_ended' || report.incident === 'auth_recovered') return 0;
   if (report.incident === 'stream_watch_recovered') return 1;
   return 2;
 }

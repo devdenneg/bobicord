@@ -223,7 +223,7 @@ test('main boot does not request or accept a saved session before the update gat
     react: { StrictMode() {} }, 'react/jsx-runtime': { jsx: () => null },
     'react-dom/client': { createRoot: () => ({ render() {} }) }, './styles.css': {}, './App': { App() {} },
     './store': { PASSWORD_RESET_STORAGE_KEY: 'reset', useStore: { getState: () => state, setState() {} } },
-    './api': { getToken: () => 'saved-token', api: { authSession: async () => { authRequests++; return { user: {}, account: {} }; } }, isApiError: () => false },
+    './api': { getToken: () => 'saved-token', getAuthRequestGeneration: () => 0, api: { authSession: async () => { authRequests++; return { user: {}, account: {} }; } }, isApiError: () => false },
     './emotes': { loadGlobalEmotes() {} }, './native': { isTauri: false },
     './version': { watchForUpdates() {} }, './nativeUpdate': { waitForNativeStartup: () => h.controller.waitForStartup(), startNativeUpdatePolling: () => { polls++; } },
     './theme': { applyStoredTheme() {} }, './windowIdle': { startWindowIdleWatch() {} },

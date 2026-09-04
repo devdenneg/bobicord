@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import './styles.css';
 import { App } from './App';
 import { PASSWORD_RESET_STORAGE_KEY, useStore } from './store';
-import { api, getToken, isApiError, setToken } from './api';
+import { api, getToken, getAuthRequestGeneration, isApiError, setToken } from './api';
 import { loadGlobalEmotes } from './emotes';
 import { isTauri, pingNative } from './native';
 import { watchForUpdates } from './version';
@@ -127,18 +127,24 @@ function cleanEntryUrl(removeHash = false) {
   }
   if (invite || openSrv) cleanEntryUrl();
   if (getToken()) {
+    const savedToken = getToken(), generation = getAuthRequestGeneration();
+    const current = () => savedToken === getToken() && generation === getAuthRequestGeneration();
     try {
       const d = await api.authSession();
+      if (!current()) return;
       await useStore.getState().acceptSession(d.user, d.account);
     } catch (error) {
+      if (!current()) return;
       if (isApiError(error) && (error.status === 404 || error.status === 410)) {
         // Desktop/web releases can briefly lead the API rollout. The pre-email server has no
         // /auth/session yet, but /me still validates the same saved bearer token.
         try {
           const legacy = await api.me();
+          if (!current()) return;
           await useStore.getState().acceptSession(legacy.user, { state: 'ready' });
           return;
         } catch (legacyError) {
+          if (!current()) return;
           if (isApiError(legacyError) && legacyError.status === 401) {
             setToken(null);
             useStore.setState({ view: 'auth', sessionError: '', accountGate: null, pendingUser: null });

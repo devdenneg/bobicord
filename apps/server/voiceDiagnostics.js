@@ -9,7 +9,7 @@ const INCIDENTS = new Set([
   'manual', 'join_succeeded', 'join_stuck', 'connection_failed', 'reconnect_loop', 'uplink_silent',
   'inbound_silent', 'mute_divergence', 'mic_failed', 'playback_blocked',
   'output_route_failed', 'ui_stall', 'session_ended', 'stream_watch_succeeded',
-  'stream_watch_failed', 'stream_watch_recovered',
+  'stream_watch_failed', 'stream_watch_recovered', 'auth_failed', 'auth_recovered',
 ]);
 const CLIENT_KINDS = new Set(['web', 'native']);
 const PLATFORMS = new Set(['ios', 'ipados', 'android', 'macos', 'windows', 'linux', 'other', 'unknown']);
@@ -24,6 +24,7 @@ const EVENT_KINDS = new Set([
   'playback_blocked', 'output_route_failed', 'ui_stall', 'rtc_sample',
   'uplink_stalled', 'inbound_stalled', 'left', 'stream_watch_started',
   'stream_watch_step', 'stream_watch_retry', 'stream_watch_finished',
+  'auth_request_started', 'auth_request_finished',
 ]);
 const STAGES = new Set([
   'intent', 'hub', 'claim', 'media_token', 'media_connect', 'activation',
@@ -31,6 +32,7 @@ const STAGES = new Set([
   'watch_intent', 'watch_auth', 'watch_listeners', 'watch_native_start',
   'watch_signaling', 'watch_join', 'watch_parent', 'watch_negotiation',
   'watch_track', 'watch_playback', 'watch_recovery',
+  'auth_login', 'auth_session', 'auth_profile',
 ]);
 const OUTCOMES = new Set([
   'started', 'ok', 'failed', 'timed_out', 'blocked', 'unsupported', 'cancelled',
@@ -39,7 +41,7 @@ const OUTCOMES = new Set([
 const ERROR_CODES = new Set([
   'none', 'timeout', 'network', 'offline', 'auth', 'permission', 'device_lost',
   'media_blocked', 'disconnected', 'sdk', 'unsupported', 'aborted', 'invalid_state', 'unknown',
-  'session_closing',
+  'session_closing', 'rate_limited', 'server', 'invalid_response',
   'signaling_unauthorized', 'signaling_forbidden', 'listener_failed',
   'native_start_failed', 'signaling_closed', 'no_parent', 'negotiation_failed',
   'ice_failed', 'track_missing', 'decode_timeout', 'playback_waiting',
@@ -54,19 +56,21 @@ const OUTPUT_OPERATIONS = new Set([
   'enumerate', 'set_sink', 'create_context', 'rebind', 'resume', 'start_audio',
 ]);
 const MIC_MODES = new Set(['voice', 'ptt', 'unknown']);
+const MIC_CAPTURE_PATHS = new Set(['direct', 'webaudio']);
 const STREAM_TRANSPORTS = new Set(['livekit', 'tree_web', 'tree_native']);
 const WATCH_END_REASONS = new Set([
   'user_close', 'view_switch', 'server_exit', 'auth_handoff', 'session_terminal',
   'logout', 'engine_dispose', 'connection_loss', 'stream_ended', 'quality_change',
   'recovery_failed', 'playback_timeout', 'superseded', 'unknown',
 ]);
-const CONTROL_INCIDENTS = new Set(['join_succeeded', 'session_ended', 'stream_watch_succeeded']);
+const CONTROL_INCIDENTS = new Set(['join_succeeded', 'session_ended', 'stream_watch_succeeded', 'auth_recovered']);
 
 const BOOLEAN_FIELDS = [
   'documentHidden', 'online', 'micEnabled', 'publicationMuted', 'upstreamPaused',
   'deafened', 'pushToTalk', 'speechDetected', 'canPlaybackAudio',
 ];
 const NUMBER_FIELDS = Object.freeze({
+  requestElapsedMs: [0, 120_000],
   rttMs: [0, 120_000],
   jitterMs: [0, 120_000],
   packetsLostDelta: [0, 10_000_000],
@@ -166,6 +170,7 @@ function sanitizeVoiceDiagnosticReport(raw, { maxPayloadBytes = VOICE_DIAGNOSTIC
     const outputTarget = enumValue(source.outputTarget, OUTPUT_TARGETS);
     const outputOperation = enumValue(source.outputOperation, OUTPUT_OPERATIONS);
     const micMode = enumValue(source.micMode, MIC_MODES);
+    const micCapturePath = enumValue(source.micCapturePath, MIC_CAPTURE_PATHS);
     const streamTransport = enumValue(source.streamTransport, STREAM_TRANSPORTS);
     const watchEndReason = enumValue(source.watchEndReason, WATCH_END_REASONS);
     const networkType = enumValue(source.networkType, NETWORK_TYPES);
@@ -180,10 +185,11 @@ function sanitizeVoiceDiagnosticReport(raw, { maxPayloadBytes = VOICE_DIAGNOSTIC
     if (outputTarget) event.outputTarget = outputTarget;
     if (outputOperation) event.outputOperation = outputOperation;
     if (micMode) event.micMode = micMode;
+    if (micCapturePath) event.micCapturePath = micCapturePath;
     if (streamTransport) event.streamTransport = streamTransport;
     if (watchEndReason) event.watchEndReason = watchEndReason;
     if (networkType) event.networkType = networkType;
-    if (Number.isInteger(source.httpStatus) && source.httpStatus >= 100 && source.httpStatus <= 599) {
+    if (Number.isInteger(source.httpStatus) && source.httpStatus >= 0 && source.httpStatus <= 599) {
       event.httpStatus = source.httpStatus;
     }
     for (const field of BOOLEAN_FIELDS) if (typeof source[field] === 'boolean') event[field] = source[field];
@@ -337,12 +343,12 @@ function createVoiceDiagnosticsStore(db, {
   const deleteExpired = db.prepare('DELETE FROM voice_diagnostics WHERE created < ?');
   const deleteUserOverflow = db.prepare(`DELETE FROM voice_diagnostics WHERE id IN (
     SELECT id FROM voice_diagnostics WHERE user_id=?
-      ORDER BY CASE WHEN incident IN ('join_succeeded','session_ended','stream_watch_succeeded') THEN 0 ELSE 1 END DESC,
+      ORDER BY CASE WHEN incident IN ('join_succeeded','session_ended','stream_watch_succeeded','auth_recovered') THEN 0 ELSE 1 END DESC,
         created DESC, id DESC LIMIT -1 OFFSET ?
   )`);
   const deleteGlobalOverflow = db.prepare(`DELETE FROM voice_diagnostics WHERE id IN (
     SELECT id FROM voice_diagnostics
-      ORDER BY CASE WHEN incident IN ('join_succeeded','session_ended','stream_watch_succeeded') THEN 0 ELSE 1 END DESC,
+      ORDER BY CASE WHEN incident IN ('join_succeeded','session_ended','stream_watch_succeeded','auth_recovered') THEN 0 ELSE 1 END DESC,
         created DESC, id DESC LIMIT -1 OFFSET ?
   )`);
   const insert = db.prepare(`INSERT INTO voice_diagnostics(

@@ -2,7 +2,8 @@ export type VoiceDiagnosticIncident =
   | 'manual' | 'join_succeeded' | 'join_stuck' | 'connection_failed' | 'reconnect_loop' | 'uplink_silent'
   | 'inbound_silent' | 'mute_divergence' | 'mic_failed' | 'playback_blocked'
   | 'output_route_failed' | 'ui_stall' | 'session_ended'
-  | 'stream_watch_succeeded' | 'stream_watch_failed' | 'stream_watch_recovered';
+  | 'stream_watch_succeeded' | 'stream_watch_failed' | 'stream_watch_recovered'
+  | 'auth_failed' | 'auth_recovered';
 export type VoiceDiagnosticClientKind = 'web' | 'native';
 export type VoiceDiagnosticWatchEndReason =
   | 'user_close' | 'view_switch' | 'server_exit' | 'auth_handoff' | 'session_terminal'
@@ -24,21 +25,24 @@ export interface VoiceDiagnosticEvent {
     | 'foreground' | 'network_changed' | 'reconnecting' | 'reconnected' | 'disconnected'
     | 'playback_blocked' | 'output_route_failed' | 'ui_stall' | 'rtc_sample'
     | 'uplink_stalled' | 'inbound_stalled' | 'left'
-    | 'stream_watch_started' | 'stream_watch_step' | 'stream_watch_retry' | 'stream_watch_finished';
+    | 'stream_watch_started' | 'stream_watch_step' | 'stream_watch_retry' | 'stream_watch_finished'
+    | 'auth_request_started' | 'auth_request_finished';
   stage?: 'intent' | 'hub' | 'claim' | 'media_token' | 'media_connect' | 'activation'
     | 'mic_capture' | 'mic_publish' | 'mic_recovery' | 'playback' | 'output_route' | 'rtc' | 'ui'
     | 'watch_intent' | 'watch_auth' | 'watch_listeners' | 'watch_native_start'
     | 'watch_signaling' | 'watch_join' | 'watch_parent' | 'watch_negotiation'
-    | 'watch_track' | 'watch_playback' | 'watch_recovery';
+    | 'watch_track' | 'watch_playback' | 'watch_recovery'
+    | 'auth_login' | 'auth_session' | 'auth_profile';
   outcome?: 'started' | 'ok' | 'failed' | 'timed_out' | 'blocked' | 'unsupported'
     | 'cancelled' | 'superseded' | 'stalled' | 'recovered';
   code?: 'none' | 'timeout' | 'network' | 'offline' | 'auth' | 'permission' | 'device_lost'
     | 'media_blocked' | 'disconnected' | 'sdk' | 'unsupported' | 'aborted' | 'invalid_state' | 'unknown'
-    | 'session_closing'
+    | 'session_closing' | 'rate_limited' | 'server' | 'invalid_response'
     | 'signaling_unauthorized' | 'signaling_forbidden' | 'listener_failed'
     | 'native_start_failed' | 'signaling_closed' | 'no_parent' | 'negotiation_failed'
     | 'ice_failed' | 'track_missing' | 'decode_timeout' | 'playback_waiting';
   httpStatus?: number;
+  requestElapsedMs?: number;
   connectionState?: 'new' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected' | 'closed' | 'unknown';
   iceState?: 'new' | 'checking' | 'connected' | 'completed' | 'failed' | 'disconnected' | 'closed' | 'unknown';
   trackState?: 'live' | 'ended' | 'missing' | 'unknown';
@@ -47,6 +51,7 @@ export interface VoiceDiagnosticEvent {
   outputTarget?: 'voice_mixer' | 'media_element' | 'stream_mixer' | 'context_recovery';
   outputOperation?: 'enumerate' | 'set_sink' | 'create_context' | 'rebind' | 'resume' | 'start_audio';
   micMode?: 'voice' | 'ptt' | 'unknown';
+  micCapturePath?: 'direct' | 'webaudio';
   streamTransport?: 'livekit' | 'tree_web' | 'tree_native';
   watchEndReason?: VoiceDiagnosticWatchEndReason;
   networkType?: VoiceDiagnosticClient['networkType'];

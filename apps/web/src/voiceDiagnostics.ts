@@ -17,7 +17,7 @@ const INCIDENTS = new Set<VoiceDiagnosticIncident>([
   'manual', 'join_succeeded', 'join_stuck', 'connection_failed', 'reconnect_loop', 'uplink_silent',
   'inbound_silent', 'mute_divergence', 'mic_failed', 'playback_blocked',
   'output_route_failed', 'ui_stall', 'session_ended', 'stream_watch_succeeded',
-  'stream_watch_failed', 'stream_watch_recovered',
+  'stream_watch_failed', 'stream_watch_recovered', 'auth_failed', 'auth_recovered',
 ]);
 const EVENT_KINDS = new Set<VoiceDiagnosticEvent['kind']>([
   'join_started', 'intent_finished', 'hub_connected', 'lease_claimed',
@@ -28,6 +28,7 @@ const EVENT_KINDS = new Set<VoiceDiagnosticEvent['kind']>([
   'playback_blocked', 'output_route_failed', 'ui_stall', 'rtc_sample',
   'uplink_stalled', 'inbound_stalled', 'left', 'stream_watch_started',
   'stream_watch_step', 'stream_watch_retry', 'stream_watch_finished',
+  'auth_request_started', 'auth_request_finished',
 ]);
 const PLATFORMS = new Set<VoiceDiagnosticClient['platform']>([
   'ios', 'ipados', 'android', 'macos', 'windows', 'linux', 'other', 'unknown',
@@ -44,6 +45,7 @@ const STAGES = new Set<NonNullable<VoiceDiagnosticEvent['stage']>>([
   'watch_intent', 'watch_auth', 'watch_listeners', 'watch_native_start',
   'watch_signaling', 'watch_join', 'watch_parent', 'watch_negotiation',
   'watch_track', 'watch_playback', 'watch_recovery',
+  'auth_login', 'auth_session', 'auth_profile',
 ]);
 const OUTCOMES = new Set<NonNullable<VoiceDiagnosticEvent['outcome']>>([
   'started', 'ok', 'failed', 'timed_out', 'blocked', 'unsupported', 'cancelled',
@@ -52,7 +54,7 @@ const OUTCOMES = new Set<NonNullable<VoiceDiagnosticEvent['outcome']>>([
 const ERROR_CODES = new Set<NonNullable<VoiceDiagnosticEvent['code']>>([
   'none', 'timeout', 'network', 'offline', 'auth', 'permission', 'device_lost',
   'media_blocked', 'disconnected', 'sdk', 'unsupported', 'aborted', 'invalid_state', 'unknown',
-  'session_closing',
+  'session_closing', 'rate_limited', 'server', 'invalid_response',
   'signaling_unauthorized', 'signaling_forbidden', 'listener_failed',
   'native_start_failed', 'signaling_closed', 'no_parent', 'negotiation_failed',
   'ice_failed', 'track_missing', 'decode_timeout', 'playback_waiting',
@@ -79,6 +81,7 @@ const OUTPUT_OPERATIONS = new Set<NonNullable<VoiceDiagnosticEvent['outputOperat
   'enumerate', 'set_sink', 'create_context', 'rebind', 'resume', 'start_audio',
 ]);
 const MIC_MODES = new Set<NonNullable<VoiceDiagnosticEvent['micMode']>>(['voice', 'ptt', 'unknown']);
+const MIC_CAPTURE_PATHS = new Set<NonNullable<VoiceDiagnosticEvent['micCapturePath']>>(['direct', 'webaudio']);
 const STREAM_TRANSPORTS = new Set<NonNullable<VoiceDiagnosticEvent['streamTransport']>>([
   'livekit', 'tree_web', 'tree_native',
 ]);
@@ -94,6 +97,7 @@ const BOOLEAN_FIELDS = [
 ] as const satisfies readonly (keyof VoiceDiagnosticEvent)[];
 
 const NUMBER_FIELDS = {
+  requestElapsedMs: [0, 120_000, true],
   rttMs: [0, 120_000, true],
   jitterMs: [0, 120_000, true],
   packetsLostDelta: [0, 10_000_000, true],
@@ -238,6 +242,7 @@ function sanitizeEvent(input: VoiceDiagnosticEventInput, atMs: number): VoiceDia
   const outputTarget = enumValue(source.outputTarget, OUTPUT_TARGETS);
   const outputOperation = enumValue(source.outputOperation, OUTPUT_OPERATIONS);
   const micMode = enumValue(source.micMode, MIC_MODES);
+  const micCapturePath = enumValue(source.micCapturePath, MIC_CAPTURE_PATHS);
   const streamTransport = enumValue(source.streamTransport, STREAM_TRANSPORTS);
   const watchEndReason = enumValue(source.watchEndReason, WATCH_END_REASONS);
   const networkType = enumValue(source.networkType, NETWORK_TYPES);
@@ -252,11 +257,12 @@ function sanitizeEvent(input: VoiceDiagnosticEventInput, atMs: number): VoiceDia
   if (outputTarget) event.outputTarget = outputTarget;
   if (outputOperation) event.outputOperation = outputOperation;
   if (micMode) event.micMode = micMode;
+  if (micCapturePath) event.micCapturePath = micCapturePath;
   if (streamTransport) event.streamTransport = streamTransport;
   if (watchEndReason) event.watchEndReason = watchEndReason;
   if (networkType) event.networkType = networkType;
   if (typeof source.httpStatus === 'number' && Number.isInteger(source.httpStatus)
-    && source.httpStatus >= 100 && source.httpStatus <= 599) event.httpStatus = source.httpStatus;
+    && source.httpStatus >= 0 && source.httpStatus <= 599) event.httpStatus = source.httpStatus;
   for (const field of BOOLEAN_FIELDS) {
     if (typeof source[field] === 'boolean') (event as unknown as Record<string, unknown>)[field] = source[field];
   }

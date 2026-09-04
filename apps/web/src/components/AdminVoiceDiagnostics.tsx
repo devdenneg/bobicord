@@ -15,6 +15,8 @@ const PAGE_SIZE = 50;
 
 const INCIDENT_LABELS: Record<VoiceDiagnosticIncident, string> = {
   manual: 'Ручной отчёт',
+  auth_failed: 'Ошибка входа в аккаунт',
+  auth_recovered: 'Вход в аккаунт восстановлен',
   join_succeeded: 'Голосовой канал подключён',
   join_stuck: 'Медленное или зависшее подключение',
   connection_failed: 'Ошибка подключения',
@@ -33,6 +35,8 @@ const INCIDENT_LABELS: Record<VoiceDiagnosticIncident, string> = {
 };
 
 const EVENT_LABELS: Partial<Record<VoiceDiagnosticEvent['kind'], string>> = {
+  auth_request_started: 'Запрос авторизации начат',
+  auth_request_finished: 'Запрос авторизации завершён',
   join_started: 'Подключение начато',
   intent_finished: 'Запрос на вход выполнен',
   hub_connected: 'Служебное соединение установлено',
@@ -69,8 +73,10 @@ const EVENT_LABELS: Partial<Record<VoiceDiagnosticEvent['kind'], string>> = {
 
 const FIELD_LABELS: Record<string, string> = {
   stage: 'этап', outcome: 'результат', code: 'код', httpStatus: 'HTTP',
+  requestElapsedMs: 'запрос, мс',
   connectionState: 'соединение', iceState: 'ICE', trackState: 'трек',
   audioContextState: 'аудиоконтекст', outputRoute: 'выход', micMode: 'режим микрофона',
+  micCapturePath: 'путь микрофона',
   outputTarget: 'источник вывода', outputOperation: 'операция вывода',
   watchEndReason: 'причина завершения просмотра',
   networkType: 'сеть', documentHidden: 'в фоне', online: 'браузер онлайн',
@@ -87,6 +93,11 @@ const FIELD_LABELS: Record<string, string> = {
 };
 
 const VALUE_LABELS: Record<string, string> = {
+  auth_login: 'вход в аккаунт',
+  auth_session: 'проверка сессии',
+  auth_profile: 'загрузка профиля',
+  direct: 'прямой аудиотрек',
+  webaudio: 'обработка WebAudio',
   intent: 'запрос на вход',
   hub: 'служебное соединение',
   claim: 'выбор голосового канала',
@@ -126,6 +137,9 @@ const VALUE_LABELS: Record<string, string> = {
   network: 'ошибка сети',
   offline: 'устройство офлайн',
   auth: 'ошибка авторизации',
+  rate_limited: 'слишком много запросов',
+  server: 'ошибка сервера',
+  invalid_response: 'некорректный ответ',
   permission: 'нет разрешения',
   media_blocked: 'медиа заблокировано браузером',
   disconnected: 'соединение разорвано',
@@ -193,7 +207,8 @@ function eventFacts(event: VoiceDiagnosticEvent): { label: string; value: string
     .filter(([key, value]) => key !== 'atMs' && key !== 'kind' && value !== undefined)
     .map(([key, value]) => ({
       label: FIELD_LABELS[key] || key,
-      value: typeof value === 'boolean' ? (value ? 'да' : 'нет') : (VALUE_LABELS[String(value)] || String(value)),
+      value: key === 'httpStatus' && value === 0 ? 'нет ответа'
+        : typeof value === 'boolean' ? (value ? 'да' : 'нет') : (VALUE_LABELS[String(value)] || String(value)),
     }));
 }
 
@@ -294,7 +309,7 @@ export function AdminVoiceDiagnostics() {
           return (
             <article className={'admin-diag-card' + (expanded ? ' open' : '')} key={item.id}>
               <button type="button" className="admin-diag-summary" onClick={() => open(item.id)} aria-expanded={expanded}>
-                <span className={'admin-diag-severity' + (item.incident === 'join_succeeded' || item.incident === 'stream_watch_succeeded' ? ' success' : '')} aria-hidden="true" />
+                <span className={'admin-diag-severity' + (item.incident === 'join_succeeded' || item.incident === 'stream_watch_succeeded' || item.incident === 'auth_recovered' ? ' success' : '')} aria-hidden="true" />
                 <span className="admin-diag-main">
                   <b>{INCIDENT_LABELS[item.incident]}</b>
                   <small>@{item.username} · {item.client}/{item.platform} · {item.eventCount} событий</small>

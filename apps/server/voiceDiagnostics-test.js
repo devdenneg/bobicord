@@ -102,6 +102,85 @@ test('sanitizer persists only fixed technical fields and canonical values', () =
   }
 });
 
+test('microphone capture path is a fixed enum and survives the admin storage roundtrip', () => {
+  const db = new Database(':memory:');
+  const store = createVoiceDiagnosticsStore(db, { now: () => 20_000 });
+  const saved = store.save({ userId: 'owner', username: 'owner', raw: validReport({
+    incident: 'mic_failed',
+    events: ['direct', 'webaudio', 'PRIVATE_DEVICE_PATH'].map((micCapturePath) => ({
+      atMs: 0, kind: 'mic_capture_finished', stage: 'mic_capture', micCapturePath,
+    })),
+  }) });
+  const detail = store.detail(saved.id);
+  assert.deepEqual(detail.report.events.map((event) => event.micCapturePath), ['direct', 'webaudio', undefined]);
+  assert.doesNotMatch(JSON.stringify(detail), /PRIVATE_DEVICE_PATH/);
+  db.close();
+});
+
+test('authentication diagnostics retain bounded request metrics, never credentials or response content', () => {
+  const secret = 'AUTH_SECRET_MUST_NOT_BE_STORED';
+  const codes = ['auth', 'network', 'timeout', 'aborted', 'unknown', 'rate_limited', 'server', 'invalid_response'];
+  const stages = ['auth_login', 'auth_session', 'auth_profile'];
+  const events = codes.flatMap((code, index) => [
+    { atMs: index * 250, kind: 'auth_request_started', stage: stages[index % 3], outcome: 'started' },
+    {
+      atMs: (index + 1) * 250, kind: 'auth_request_finished', stage: stages[index % 3],
+      outcome: 'failed', code, httpStatus: index === 0 ? 401 : 0, requestElapsedMs: 250,
+      username: secret, password: secret, token: secret, refreshToken: secret,
+      url: secret, body: { password: secret }, headers: { Authorization: secret }, error: secret,
+    },
+  ]);
+  const db = new Database(':memory:');
+  const store = createVoiceDiagnosticsStore(db, { now: () => 20_000 });
+  for (const incident of ['auth_failed', 'auth_recovered']) {
+    const report = validReport({
+      incident, durationMs: 2_000, events, userId: secret, username: secret,
+      password: secret, body: secret, headers: secret, url: secret, token: secret,
+    });
+    const saved = store.save({ userId: 'authenticated-owner', username: 'owner', raw: report });
+    const detail = store.detail(saved.id);
+    assert.equal(detail.userId, 'authenticated-owner');
+    assert.equal(detail.username, 'owner');
+    assert.equal(detail.report.incident, incident);
+    assert.equal(detail.report.durationMs, 2_000);
+    assert.deepEqual(detail.report.events[1], {
+      atMs: 250, kind: 'auth_request_finished', stage: 'auth_login', outcome: 'failed',
+      code: 'auth', httpStatus: 401, requestElapsedMs: 250,
+    });
+    assert.equal(detail.report.events[3].httpStatus, 0);
+    assert.deepEqual(detail.report.events.filter((event) => event.kind === 'auth_request_finished').map((event) => event.code), codes);
+    assert.doesNotMatch(JSON.stringify(detail), /AUTH_SECRET_MUST_NOT_BE_STORED/);
+    assert.equal(store.list({ incident }).items.length, 1);
+  }
+  const invalidStatuses = [-1, 600, 401.5, '401', NaN, Infinity];
+  const elapsedInputs = [-1, 120_001, 1.6, '250', NaN, Infinity];
+  const bounded = sanitizeVoiceDiagnosticReport(validReport({
+    incident: 'auth_failed',
+    events: invalidStatuses.map((httpStatus, index) => ({
+      atMs: index, kind: 'auth_request_finished', stage: secret, code: secret,
+      httpStatus, requestElapsedMs: elapsedInputs[index],
+    })),
+  }));
+  assert.deepEqual(bounded.events.map((event) => event.requestElapsedMs), [0, 120_000, 2, undefined, undefined, undefined]);
+  assert.equal(bounded.events.some((event) => 'httpStatus' in event || 'stage' in event || 'code' in event), false);
+  db.close();
+});
+
+test('authentication recoveries use control admission and never evict failures at storage capacity', () => {
+  assert.equal(isVoiceDiagnosticControlIncident('auth_recovered'), true);
+  assert.equal(isVoiceDiagnosticControlIncident('auth_failed'), false);
+  for (const limits of [{ maxRows: 10, maxRowsPerUser: 1 }, { maxRows: 1, maxRowsPerUser: 10 }]) {
+    const db = new Database(':memory:');
+    let now = 20_000;
+    const store = createVoiceDiagnosticsStore(db, { now: () => now++, ...limits });
+    const failed = store.save({ userId: 'owner', username: 'owner', raw: validReport({ incident: 'auth_failed' }) });
+    const recovered = store.save({ userId: 'owner', username: 'owner', raw: validReport({ incident: 'auth_recovered' }) });
+    assert.deepEqual(store.list().items.map((item) => item.id), [failed.id]);
+    assert.equal(store.detail(recovered.id), null);
+    db.close();
+  }
+});
+
 test('output diagnostics preserve only privacy-safe source and operation categories', () => {
   const forbidden = 'raw-output-detail-that-must-not-be-stored';
   const report = sanitizeVoiceDiagnosticReport(validReport({

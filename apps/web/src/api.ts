@@ -5,10 +5,15 @@ import type {
   AdminVoiceDiagnosticCursor, AdminVoiceDiagnosticDetail, AdminVoiceDiagnosticsPage,
   VoiceDiagnosticClientKind, VoiceDiagnosticIncident, VoiceDiagnosticReport,
 } from './types';
+import { authDiagnostics, type AuthDiagnosticStage } from './authDiagnostics';
 
 let token: string | null = localStorage.getItem('sess');
+let authRequestGeneration = 0;
 export const getToken = () => token;
+export const getAuthRequestGeneration = () => authRequestGeneration;
 export function setToken(t: string | null) {
+  if (!t || t !== token) authRequestGeneration++;
+  if (!t) { try { authDiagnostics.dispose(); } catch { /* diagnostics never block logout */ } }
   token = t;
   if (t) localStorage.setItem('sess', t);
   else localStorage.removeItem('sess');
@@ -195,10 +200,33 @@ async function req<T>(method: string, path: string, body?: unknown, options: Req
   return d as T;
 }
 
+// Fixed-stage metadata only; no URL, body, credentials or exception message enters a report.
+async function tracedAuthRequest<T>(stage: AuthDiagnosticStage, request: () => Promise<T>): Promise<T> {
+  let finished: ReturnType<typeof authDiagnostics.request> = () => {};
+  try { finished = authDiagnostics.request(stage); } catch { /* best-effort metadata */ }
+  try {
+    const response = await request();
+    try { finished(undefined, 200); } catch { /* telemetry cannot turn a login into a failure */ }
+    return response;
+  } catch (error) {
+    try { finished(error); } catch { /* preserve the original request failure */ }
+    throw error;
+  }
+}
+
 export const api = {
-  authSession: () => req<SessionResponse>('GET', '/auth/session'),
-  login: (username: string, password: string) =>
-    req<AuthResponse>('POST', '/login', { username, password }, { auth: false }),
+  authSession: () => {
+    try { if (!authDiagnostics.active) authDiagnostics.startAttempt(); } catch { /* best-effort metadata */ }
+    return tracedAuthRequest('auth_session', () => req<SessionResponse>('GET', '/auth/session'));
+  },
+  login: async (username: string, password: string) => {
+    const generation = ++authRequestGeneration;
+    try { authDiagnostics.startAttempt(username); } catch { /* best-effort metadata */ }
+    const response = await tracedAuthRequest('auth_login', () =>
+      req<AuthResponse>('POST', '/login', { username, password }, { auth: false }));
+    if (generation !== authRequestGeneration) throw new ApiError('Запрос входа отменён', { code: 'REQUEST_ABORTED' });
+    return response;
+  },
   registerStart: (payload: { username: string; email: string; password: string; inviteCode: string; requestId: string }) =>
     req<ChallengeResponse>('POST', '/auth/register/start', payload, { auth: false }),
   registerVerify: (flowId: string, code: string) =>
@@ -219,7 +247,7 @@ export const api = {
     req<{ ok?: boolean; username?: string }>('POST', '/auth/password/reset', { token, password }, { auth: false }),
   changePassword: (currentPassword: string, newPassword: string) =>
     req<AuthResponse>('POST', '/auth/password/change', { currentPassword, newPassword }),
-  me: () => req<{ user: User; servers: ServerSummary[] }>('GET', '/me'),
+  me: () => tracedAuthRequest('auth_profile', () => req<{ user: User; servers: ServerSummary[] }>('GET', '/me')),
   releaseHistory: (signal?: AbortSignal) => req<ReleaseHistoryResponse>('GET', '/releases/history', undefined, { signal }),
   updateMe: (patch: { displayName?: string; bio?: string; avatarColor?: number; avatarUrl?: string; profileBannerUrl?: string }) =>
     req<{ user: User }>('PATCH', '/me', patch),
