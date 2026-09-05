@@ -22,7 +22,12 @@ class AudioElement {
   play() { this.paused = false; return Promise.resolve(); }
   pause() { this.paused = true; }
 }
-const globals = { MediaStream: Stream, HTMLAudioElement: AudioElement, HTMLVideoElement: class {} };
+// Node 20 (CI) has no global navigator. Newer Node versions provide one, which
+// must not accidentally stand in for the browser fixture used by LiveKit.
+const globals = {
+  navigator: { userAgent: '', product: 'Gecko' },
+  MediaStream: Stream, HTMLAudioElement: AudioElement, HTMLVideoElement: class {},
+};
 const previousGlobals = Object.fromEntries(Object.keys(globals).map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
 for (const [key, value] of Object.entries(globals)) Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 after(() => {
