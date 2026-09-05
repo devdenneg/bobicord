@@ -2863,6 +2863,8 @@ export class Engine {
       let entry = this.voiceAudioEls.get(user);
       if (!entry || entry.identity !== p!.identity || entry.track !== remoteTrack || !entry.el.isConnected) {
         this.removeVoiceAudio(user);
+        // Seed the SDK's volume cache before attach creates an audible WebAudio graph.
+        this.applyVolumeToParticipant(p!);
         const el = remoteTrack.attach() as HTMLMediaElement;
         entry = { identity: p!.identity, track: remoteTrack, el };
         this.voiceAudioEls.set(user, entry);
@@ -2888,6 +2890,7 @@ export class Engine {
       const isScreen = pub.source === Track.Source.ScreenShareAudio;
       const u = baseUid(p.identity);
       if (isScreen && room === this.viewRoom) {
+        try { p.setVolume(this.deafened ? 0 : this.streamVolOf(u), Track.Source.ScreenShareAudio); } catch { /**/ }
         const a = track.attach() as HTMLMediaElement; a.autoplay = true; a.setAttribute('data-origin', 'view');
         document.getElementById('audioSink')?.appendChild(a);
         void this.routeAudioElement(a);
@@ -2899,6 +2902,7 @@ export class Engine {
         this.emit(); return;
       } else {
         this.removeVoiceAudio(u);
+        this.applyVolumeToParticipant(p);
         const a = track.attach() as HTMLMediaElement;
         const entry = { identity: p.identity, track, el: a };
         this.voiceAudioEls.set(u, entry);

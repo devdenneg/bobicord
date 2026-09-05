@@ -220,6 +220,105 @@ function installGate(f) {
   return param;
 }
 
+// Audio hardware is stubbed, but these tests execute the actual subscription,
+// playback recovery, saved-volume lookup and source-specific Engine handlers.
+function remotePlayback(f) {
+  const cached = new Map(), expected = new Map(), publications = new Map(), writes = [];
+  f.e.ensureVoiceOutput = () => {};
+  f.document.getElementById = (id) => id === 'audioSink' ? { appendChild(el) { el.isConnected = true; } } : null;
+  const participant = {
+    identity: 'peer#session', attributes: { vc: 'channel' },
+    getTrackPublication(source) { return publications.get(source); },
+    setVolume(value, source = 'microphone') { cached.set(source, value); writes.push({ source, value }); },
+  };
+  f.room.remoteParticipants.set(participant.identity, participant);
+  function addTrack(source) {
+    const elements = [];
+    const track = {
+      kind: 'audio', mediaStreamTrack: new MediaTrack(), attaches: 0, detaches: 0,
+      attach() {
+        assert.ok(expected.has(source), `missing attach expectation for ${source}`);
+        assert.equal(cached.get(source), expected.get(source), `${source} volume must be cached BEFORE attach`);
+        this.attaches++;
+        const el = { isConnected: false, paused: false, attributes: {},
+          setAttribute(name, value) { this.attributes[name] = value; },
+          play() { return Promise.resolve(); }, remove() { this.isConnected = false; },
+        };
+        elements.push(el); return el;
+      },
+      detach(el) { this.detaches++; return el || [...elements]; },
+    };
+    const publication = { source, track, unsubscribed: false, setSubscribed(value) { this.unsubscribed = !value; } };
+    publications.set(source, publication);
+    return { track, publication, elements };
+  }
+  return { participant, cached, expected, writes, addTrack };
+}
+
+// A fresh subscription must not create a full-volume graph and only attenuate it later.
+for (const settings of [
+  { user: .2, master: 25, expected: .05 },
+  { user: .2, master: 100, localMute: true, expected: 0 },
+  { user: 0, master: 100, expected: 0 },
+  { user: .2, master: 0, expected: 0 },
+  { user: 2, master: 100, expected: 2 },
+]) {
+  const f = fixture(); f.activeVoice(null); const remote = remotePlayback(f);
+  const mic = remote.addTrack('microphone'); remote.expected.set('microphone', settings.expected);
+  f.settings.master = settings.master; f.e.volsFor('server').users.peer = settings.user;
+  if (settings.localMute) f.e.muteSet('server').add('peer');
+  // Browsing another server must not replace the live voice server's preference.
+  f.e.viewServerId = 'other'; f.e.volsFor('other').users.peer = 1.7;
+  f.e.viewRoom = { localParticipant: f.room.localParticipant, remoteParticipants: new Map() };
+  f.e.onSub(mic.track, mic.publication, remote.participant, f.room);
+  assert.equal(mic.track.attaches, 1); assert.equal(remote.cached.get('microphone'), settings.expected);
+  assert.equal(f.e.voiceAudioEls.get('peer').track, mic.track);
+  assert.equal(mic.elements[0].attributes['data-origin'], 'voice');
+  f.e.clearVoiceAudio(); assert.equal(mic.track.detaches, 1);
+}
+
+// Watchdog/DOM recovery must seed the current preference, not the previous element's cache.
+for (const localMute of [false, true]) {
+  const f = fixture(); f.activeVoice(null); const remote = remotePlayback(f);
+  const mic = remote.addTrack('microphone');
+  f.settings.master = 50; f.e.volsFor('server').users.peer = .4;
+  remote.expected.set('microphone', .2); f.e.ensureRemoteVoicePlayback('peer');
+  assert.equal(mic.track.attaches, 1);
+  mic.elements[0].isConnected = false;
+  f.e.volsFor('server').users.peer = .04;
+  if (localMute) f.e.muteSet('server').add('peer');
+  remote.expected.set('microphone', localMute ? 0 : .02);
+  f.e.ensureRemoteVoicePlayback('peer');
+  assert.equal(mic.track.attaches, 2); assert.equal(mic.track.detaches, 1);
+  assert.equal(f.e.voiceAudioEls.get('peer').el, mic.elements[1]);
+  f.e.ensureRemoteVoicePlayback('peer');
+  assert.equal(mic.track.attaches, 2, 'healthy watchdog tick does not create another audio graph');
+  f.e.clearVoiceAudio();
+}
+
+// Deafen rejects microphone attachment entirely, including a watchdog recovery attempt.
+{
+  const f = fixture(); f.activeVoice(null); const remote = remotePlayback(f);
+  const mic = remote.addTrack('microphone'); f.e.deafened = true;
+  f.e.onSub(mic.track, mic.publication, remote.participant, f.room);
+  f.e.ensureRemoteVoicePlayback('peer');
+  assert.equal(mic.track.attaches, 0); assert.equal(mic.publication.unsubscribed, true);
+}
+
+// Screen audio has its own source and slider; deafen silences it before attach.
+for (const deafened of [false, true]) {
+  const f = fixture(); f.activeVoice(null); const remote = remotePlayback(f);
+  const screen = remote.addTrack('screen_audio');
+  f.settings.master = 0; f.e.muteSet('server').add('peer');
+  f.e.volsFor('server').streams.peer = .4; f.e.deafened = deafened;
+  remote.cached.set('microphone', .07); remote.expected.set('screen_audio', deafened ? 0 : .4);
+  f.e.onSub(screen.track, screen.publication, remote.participant, f.room);
+  assert.equal(screen.track.attaches, 1);
+  assert.equal(remote.cached.get('microphone'), .07, 'screen source writes must not reset microphone volume');
+  assert.ok(remote.writes.every((write) => write.source === 'screen_audio'));
+  assert.equal(screen.elements[0].attributes['data-origin'], 'view');
+}
+
 // A manual mute closes local audio synchronously while SDK signaling is still pending.
 {
   const f = fixture(); f.activeVoice(); const param = installGate(f); f.e.applyGate();

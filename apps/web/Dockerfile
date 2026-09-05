@@ -2,6 +2,7 @@
 FROM node:20-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
+COPY scripts/patch-livekit-audio.mjs ./scripts/patch-livekit-audio.mjs
 RUN npm ci
 COPY . .
 RUN npm run build
