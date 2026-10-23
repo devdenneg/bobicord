@@ -3189,7 +3189,10 @@ function StreamSourceBadge({ identity }: { identity: string }) {
   const you = topo.nodes.find((n) => n.id === topo.you);
   if (!you) return null;
   const parent = you.parentId ? topo.nodes.find((n) => n.id === you.parentId) : null;
-  const label = !parent ? 'подключение…' : parent.broadcaster ? 'напрямую от вещателя' : (parent.virtual || parent.server) ? 'через сервер' : (members.find((m) => m.username === parent.identity)?.displayName || parent.identity);
+  // В дереве рендишна (1080/720/…) корень помечен broadcaster, но это транскодер на сервере,
+  // а не стример: «напрямую от вещателя» там — неправда. Стример — узел с identity самого эфира.
+  const fromStreamer = !!parent && parent.broadcaster && parent.identity === identity;
+  const label = !parent ? 'подключение…' : fromStreamer ? 'напрямую от вещателя' : (parent.broadcaster || parent.virtual || parent.server) ? 'через сервер' : (members.find((m) => m.username === parent.identity)?.displayName || parent.identity);
   return (
     <div className="srcbadge">
       <Icon name="link" sm />источник: {label}{you.children ? ` · ретрансляция ×${you.children}` : ''}
@@ -3202,7 +3205,7 @@ function TreePeerPanel({ identity, onClose }: { identity: string; onClose: () =>
   const E = getEngine()!;
   const members = useStore((s) => s.members);
   const topo = E.getStreamTopology(identity);
-  const nameOf = (n: { broadcaster: boolean; virtual?: boolean; identity: string }) => n.broadcaster ? 'вещатель' : n.virtual ? 'сервер' : (members.find((m) => m.username === n.identity)?.displayName || n.identity);
+  const nameOf = (n: { broadcaster: boolean; virtual?: boolean; identity: string }) => n.broadcaster ? (n.identity === identity ? 'вещатель' : 'сервер · транскод') : n.virtual ? 'сервер' : (members.find((m) => m.username === n.identity)?.displayName || n.identity);
   const youNode = topo?.nodes.find((n) => n.id === topo.you);
   // Потомки твоего узла: репарент под собственного потомка = цикл (сервер отклонит) — «взять» на них не даём.
   const youDesc = (() => {
