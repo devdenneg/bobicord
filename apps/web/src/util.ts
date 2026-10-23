@@ -1,4 +1,6 @@
-export const AV_COLORS = ['#5865f2', '#3ba55d', '#e0a423', '#eb459e', '#9b6dff', '#00a8b5', '#f47b67', '#f0b232'];
+// Пастельные цвета аватаров/иконок серверов (индекс хранится на сервере — порядок оттенков сохранён).
+// Инициалы поверх них — тёмные (--av-ink), одинаково читаются в обеих темах.
+export const AV_COLORS = ['#afb8e6', '#a8d5b5', '#e9cf8f', '#e8b7c4', '#c8b8e8', '#9ed3d3', '#edb4a3', '#e3d89a'];
 export function hueOf(s: string): number { let h = 0; for (let i = 0; i < (s || '').length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0; return h; }
 export const initial = (n: string) => (n || '?').trim().charAt(0).toUpperCase() || '?';
 export const avColor = (name: string, ci?: number) => AV_COLORS[(ci != null ? ci : hueOf(name)) % AV_COLORS.length];

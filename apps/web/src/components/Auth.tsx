@@ -539,8 +539,8 @@ export function Auth() {
     <main id="auth" className="overlay auth-overlay">
       <section className="card auth-card" aria-labelledby="auth-title" aria-busy={busy || undefined}>
         <div className="brand auth-brand" aria-label="Рилэй">
-          <LogoLoader size={56} animate={false} />
-          <div><span className="wordmark">Рилэй</span><small>Голос, чат и трансляции для своих</small></div>
+          <LogoLoader size={32} animate={false} />
+          <span className="wordmark">Рилэй</span>
         </div>
 
         <div className="auth-heading">
@@ -670,7 +670,7 @@ export function Auth() {
           </div>
         ) : null}
 
-        {screen === 'reset-inspect' ? failure ? <div className="auth-state"><span className="auth-state-icon danger"><Icon name="warn" /></span><p>Не удалось проверить ссылку из-за проблем с соединением.</p><button type="button" className="primary" onClick={() => { setFailure(null); setResetInspectAttempt((value) => value + 1); }}>Повторить</button></div> : <div className="auth-state"><LogoLoader size={72} /><p>Проверяем безопасность ссылки…</p></div> : null}
+        {screen === 'reset-inspect' ? failure ? <div className="auth-state"><span className="auth-state-icon danger"><Icon name="warn" /></span><p>Не удалось проверить ссылку из-за проблем с соединением.</p><button type="button" className="primary" onClick={() => { setFailure(null); setResetInspectAttempt((value) => value + 1); }}>Повторить</button></div> : <div className="auth-state"><LogoLoader size={44} /><p>Проверяем безопасность ссылки…</p></div> : null}
 
         {screen === 'reset' ? (
           <form noValidate onSubmit={submitReset}>

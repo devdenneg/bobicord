@@ -181,8 +181,8 @@ export function Home() {
 
   const header = (
     <header className="nh-hd">
-      <div className="nh-brand"><LogoLoader size={36} animate={false} /><span>Рилэй</span></div>
-      <div className={'nh-online' + (totalOnline ? ' live' : '')} aria-live="polite"><i className="nh-dot" />{totalOnline ? `${totalOnline} онлайн` : 'готов к связи'}</div>
+      <div className="nh-brand"><LogoLoader size={26} animate={false} /><span>Рилэй</span></div>
+      <div className={'nh-online' + (totalOnline ? ' live' : '')} aria-live="polite"><i className="nh-dot" />{totalOnline ? `${totalOnline} онлайн` : 'никого в сети'}</div>
       <div className="nh-actions">
         <button className="nh-btn primary" aria-label="Создать сервер" onClick={() => setModal('create')}><Icon name="plus" sm /><span>Создать</span></button>
         <button className="nh-btn" aria-label="Войти по приглашению" onClick={() => setModal('join')}><Icon name="link" sm /><span>Войти</span></button>
@@ -200,13 +200,13 @@ export function Home() {
           <UpdateBanner />
           <div className="nh-first">
             <div>
-              <h1>Привет, {firstName}.<br />Твой голос. <em>Твои люди.</em></h1>
-              <p className="sub">Создай своё пространство, позови друзей и начинай созвон без лишних экранов.</p>
+              <h1>Привет, {firstName}</h1>
+              <p className="sub">Серверов пока нет. Создай свой или войди по приглашению.</p>
             </div>
             <div className="nh-steps">
-              <div className="nh-step"><span className="snum">01</span><span className="sic"><Icon name="plus" /></span><b>Создай сервер</b><p>Одно пространство для своей компании.</p></div>
+              <div className="nh-step"><span className="snum">01</span><span className="sic"><Icon name="plus" /></span><b>Создай сервер</b><p>Голосовые каналы и общий чат.</p></div>
               <div className="nh-step"><span className="snum">02</span><span className="sic"><Icon name="link" /></span><b>Позови друзей</b><p>Отправь им короткую ссылку.</p></div>
-              <div className="nh-step"><span className="snum">03</span><span className="sic"><Icon name="speaker" /></span><b>Начни созвон</b><p>Голос, чат и экран уже внутри.</p></div>
+              <div className="nh-step"><span className="snum">03</span><span className="sic"><Icon name="speaker" /></span><b>Зайди в голос</b><p>Говори и показывай экран.</p></div>
             </div>
             <div className="cta-row">
               <button className="nh-btn primary" onClick={() => setModal('create')}><Icon name="plus" sm /><span>Создать сервер</span></button>
@@ -240,7 +240,7 @@ export function Home() {
         ) : (
           <div className="nh-quiet">
             <span className="nh-qic"><Icon name="screen" sm /></span>
-            <span>Сейчас никто не в эфире. <b>Тихо и спокойно.</b></span>
+            <span>Сейчас никто не в эфире</span>
             {connectedServer ? <span className="nh-recent"><button className="nh-chip" onClick={() => openServer(connectedServer.id)}><i className="nh-dot" style={{ background: 'var(--accent)' }} />Вернуться в {connectedServer.name}</button></span>
               : recent.length ? <span className="nh-recent">{recent.map((s) => <button key={s.id} className="nh-chip" onClick={() => openServer(s.id)}><span className="nh-ci" style={{ background: faceBg(s.iconUrl, s.name, s.iconColor) }}><Face url={s.iconUrl} name={s.name} color={s.iconColor} /></span>{s.name}</button>)}</span> : null}
           </div>

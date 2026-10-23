@@ -184,32 +184,29 @@ function emailShell({ preheader, eyebrow, title, bodyHtml, actionHtml = '', noti
   <meta name="supported-color-schemes" content="dark">
   <title>${escapeHtml(title)}</title>
 </head>
-<body style="margin:0;padding:0;background:#0d0f16;color:#f4f2f8;font-family:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;">
+<body style="margin:0;padding:0;background:#111312;color:#e7e9e4;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;">
   <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;mso-hide:all;">${safePreheader}</div>
-  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#0d0f16;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#111312;">
     <tr>
       <td align="center" style="padding:32px 14px;">
-        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:560px;background:#191c27;border:1px solid #303544;border-radius:20px;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.35);">
-          <tr>
-            <td style="height:6px;font-size:0;line-height:0;background:linear-gradient(90deg,#8b5cf6,#c95cff 52%,#ff5c96);">&nbsp;</td>
-          </tr>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:560px;background:#171a19;border:1px solid #2a2f2d;border-radius:20px;overflow:hidden;">
           <tr>
             <td style="padding:34px 34px 12px;">
-              <div style="font-size:12px;line-height:16px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:#bd94ff;">${escapeHtml(eyebrow)}</div>
-              <h1 style="margin:10px 0 0;font-size:28px;line-height:34px;letter-spacing:-.02em;color:#ffffff;">${escapeHtml(title)}</h1>
+              <div style="font-size:13px;line-height:18px;font-weight:600;color:#8cc2ae;">${escapeHtml(eyebrow)}</div>
+              <h1 style="margin:10px 0 0;font-size:28px;line-height:34px;letter-spacing:-.02em;font-weight:600;color:#f4f5f1;">${escapeHtml(title)}</h1>
             </td>
           </tr>
           <tr>
-            <td style="padding:10px 34px 8px;font-size:16px;line-height:25px;color:#cbd0dc;">${bodyHtml}</td>
+            <td style="padding:10px 34px 8px;font-size:16px;line-height:25px;color:#e7e9e4;">${bodyHtml}</td>
           </tr>
           ${actionHtml ? `<tr><td style="padding:14px 34px 12px;">${actionHtml}</td></tr>` : ''}
           <tr>
             <td style="padding:12px 34px 34px;">
-              <div style="padding:14px 16px;border-radius:12px;background:#222633;border:1px solid #343949;font-size:13px;line-height:20px;color:#aeb5c4;">${escapeHtml(notice)}</div>
+              <div style="padding:14px 16px;border-radius:12px;background:#1f2321;border:0;font-size:13px;line-height:20px;color:#959c96;">${escapeHtml(notice)}</div>
             </td>
           </tr>
           <tr>
-            <td style="padding:20px 34px;border-top:1px solid #2b2f3c;font-size:12px;line-height:18px;color:#777f91;">
+            <td style="padding:20px 34px;border-top:1px solid #2a2f2d;font-size:12px;line-height:18px;color:#959c96;">
               Это автоматическое письмо от RelayApp. Отвечать на него не нужно.
             </td>
           </tr>
@@ -249,8 +246,8 @@ function buildEmailCodeMessage({ code, purpose, expiresAt } = {}) {
   const expiration = formatExpiry(expiresAt);
   const expirationText = expiration ? `Код действует до ${expiration} по московскому времени.` : 'Срок действия кода ограничен.';
   const bodyHtml = `<p style="margin:0 0 18px;">${escapeHtml(copy.lead)}</p>
-    <div style="padding:20px 18px;border-radius:14px;background:#11141d;border:1px solid #3b4152;text-align:center;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:34px;line-height:42px;font-weight:800;letter-spacing:.28em;color:#ffffff;">${safeCode}</div>
-    <p style="margin:14px 0 0;font-size:13px;line-height:20px;color:#9199aa;">${escapeHtml(expirationText)}</p>`;
+    <div style="padding:20px 18px;border-radius:14px;background:#1f2321;border:0;text-align:center;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:34px;line-height:42px;font-weight:600;letter-spacing:.28em;color:#f4f5f1;">${safeCode}</div>
+    <p style="margin:14px 0 0;font-size:13px;line-height:20px;color:#959c96;">${escapeHtml(expirationText)}</p>`;
   return {
     subject: copy.subject,
     text: `${copy.title}\n\n${copy.lead}\n\nКод: ${plainText(code)}\n${expirationText}\n\nЕсли вы не запрашивали этот код, просто проигнорируйте письмо.`,
@@ -274,11 +271,11 @@ function buildPasswordResetMessage({ username, token, expiresAt, appPublicUrl } 
   const url = resetUrl(appPublicUrl, token);
   const expiration = formatExpiry(expiresAt);
   const expirationText = expiration ? `Ссылка действует до ${expiration} по московскому времени.` : 'Срок действия ссылки ограничен.';
-  const bodyHtml = `<p style="margin:0 0 8px;">Для аккаунта <strong style="color:#ffffff;">${escapeHtml(login)}</strong> запрошено восстановление доступа.</p>
-    <p style="margin:0;font-size:14px;line-height:22px;color:#9199aa;">${escapeHtml(expirationText)} После смены пароля все прежние сессии будут завершены.</p>`;
+  const bodyHtml = `<p style="margin:0 0 8px;">Для аккаунта <strong style="color:#f4f5f1;">${escapeHtml(login)}</strong> запрошено восстановление доступа.</p>
+    <p style="margin:0;font-size:14px;line-height:22px;color:#959c96;">${escapeHtml(expirationText)} После смены пароля все прежние сессии будут завершены.</p>`;
   const safeUrl = escapeHtml(url);
-  const actionHtml = `<table role="presentation" cellspacing="0" cellpadding="0" border="0"><tr><td style="border-radius:12px;background:#9b5cff;"><a href="${safeUrl}" target="_blank" rel="noopener noreferrer" style="display:inline-block;padding:14px 22px;font-size:15px;line-height:20px;font-weight:800;color:#ffffff;text-decoration:none;">Сменить пароль</a></td></tr></table>
-    <p style="margin:14px 0 0;font-size:12px;line-height:18px;color:#777f91;word-break:break-all;">Если кнопка не открывается, скопируйте ссылку:<br><a href="${safeUrl}" style="color:#bd94ff;text-decoration:underline;">${safeUrl}</a></p>`;
+  const actionHtml = `<table role="presentation" cellspacing="0" cellpadding="0" border="0"><tr><td style="border-radius:12px;background:#8cc2ae;"><a href="${safeUrl}" target="_blank" rel="noopener noreferrer" style="display:inline-block;padding:14px 22px;font-size:15px;line-height:20px;font-weight:600;color:#0f1a16;text-decoration:none;">Сменить пароль</a></td></tr></table>
+    <p style="margin:14px 0 0;font-size:12px;line-height:18px;color:#959c96;word-break:break-all;">Если кнопка не открывается, скопируйте ссылку:<br><a href="${safeUrl}" style="color:#8cc2ae;text-decoration:underline;">${safeUrl}</a></p>`;
   return {
     subject: 'Восстановление доступа к RelayApp',
     text: `Восстановление доступа к RelayApp\n\nЛогин: ${login}\n${expirationText}\n\nСменить пароль: ${url}\n\nЕсли вы не запрашивали восстановление, ничего не делайте. Пароль не изменится.`,
@@ -295,7 +292,7 @@ function buildPasswordResetMessage({ username, token, expiresAt, appPublicUrl } 
 
 function buildPasswordChangedMessage({ username } = {}) {
   const login = plainText(username);
-  const bodyHtml = `<p style="margin:0;">Пароль аккаунта <strong style="color:#ffffff;">${escapeHtml(login)}</strong> успешно изменён. Все прежние сессии завершены.</p>`;
+  const bodyHtml = `<p style="margin:0;">Пароль аккаунта <strong style="color:#f4f5f1;">${escapeHtml(login)}</strong> успешно изменён. Все прежние сессии завершены.</p>`;
   return {
     subject: 'Пароль RelayApp изменён',
     text: `Пароль RelayApp изменён\n\nПароль аккаунта ${login} успешно изменён. Все прежние сессии завершены.\n\nЕсли это были не вы, срочно обратитесь к администратору сервера.`,
@@ -311,8 +308,8 @@ function buildPasswordChangedMessage({ username } = {}) {
 
 function buildEmailBoundMessage({ username } = {}) {
   const login = plainText(username);
-  const bodyHtml = `<p style="margin:0;">Электронная почта подтверждена и привязана к аккаунту <strong style="color:#ffffff;">${escapeHtml(login)}</strong>.</p>
-    <p style="margin:12px 0 0;font-size:14px;line-height:22px;color:#9199aa;">Теперь этот адрес можно использовать для безопасного восстановления доступа.</p>`;
+  const bodyHtml = `<p style="margin:0;">Электронная почта подтверждена и привязана к аккаунту <strong style="color:#f4f5f1;">${escapeHtml(login)}</strong>.</p>
+    <p style="margin:12px 0 0;font-size:14px;line-height:22px;color:#959c96;">Теперь этот адрес можно использовать для безопасного восстановления доступа.</p>`;
   return {
     subject: 'Почта привязана к RelayApp',
     text: `Почта привязана к RelayApp\n\nЭлектронная почта подтверждена и привязана к аккаунту ${login}. Теперь этот адрес можно использовать для восстановления доступа.`,

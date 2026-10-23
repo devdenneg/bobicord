@@ -731,7 +731,7 @@ export const useStore = create<AppState>((set, get) => ({
       set({ active, members: d.members, loadingServer: false, loadingServerId: null });
       if (!localStorage.getItem('onboardedSrv')) {
         localStorage.setItem('onboardedSrv', '1');
-        engine?.sysMsg('👋 Ты в чате, но НЕ в голосовом. Нажми «Подключиться», чтобы говорить. Справа — кто в сети и кто в голосовом.');
+        engine?.sysMsg('Ты в чате. Чтобы говорить, зайди в голосовой канал слева.');
       }
       // WebRTC-коннект к НОВОЙ смотримой комнате — В ФОНЕ; гард по эпохе (переживает уход на главную через
       // goHome, который эпоху не бампит). Эпоха сменилась (свитч/выход) — НЕ рвём engine: им уже владеет

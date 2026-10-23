@@ -112,7 +112,7 @@ self.addEventListener('push', (event) => {
       tag,
       renotify: true,
       icon: '/icon-256.png',
-      badge: '/icon-128.png',
+      badge: '/badge-96.png',
       data: {
         serverId: destination?.serverId || '',
         messageId: destination?.messageId,

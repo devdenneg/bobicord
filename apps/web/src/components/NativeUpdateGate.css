@@ -1,15 +1,18 @@
 .native-update-gate{min-height:100dvh;display:grid;place-items:center;padding:32px;background:var(--bg);color:var(--txt)}
-.native-update-card{width:min(480px,100%);display:flex;flex-direction:column;align-items:center;text-align:center;gap:16px;padding:38px 34px;border:1px solid var(--line);border-radius:24px;background:var(--panel);box-shadow:0 20px 60px #0002}
+.native-update-card{width:min(480px,100%);display:flex;flex-direction:column;align-items:center;text-align:center;gap:16px;padding:38px 34px;border:1px solid var(--line);border-radius:var(--r-xl);background:var(--panel);box-shadow:var(--sh-3)}
 .native-update-brand{color:var(--muted);font-size:12px;letter-spacing:.03em}
-.native-update-card h1{margin:0;font-size:26px;line-height:1.25;font-weight:750}
+.native-update-card h1{margin:0;font-size:24px;line-height:1.25;font-weight:600;letter-spacing:-.02em;color:var(--txt-h)}
 .native-update-card p{margin:0;font-size:14px;line-height:1.65;color:var(--muted)}
 .native-update-progress{display:flex;flex-direction:column;gap:10px;width:100%;font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums}
-.native-update-progress progress{width:100%;height:8px;accent-color:var(--accent);border:0;border-radius:8px;overflow:hidden}
-.native-update-card .native-update-error{color:var(--danger,#f2848b);padding:12px 14px;background:color-mix(in srgb,var(--danger,#f2848b) 8%,transparent);border-radius:12px}
+.native-update-progress progress{width:100%;height:8px;appearance:none;-webkit-appearance:none;border:0;border-radius:8px;overflow:hidden;background:var(--panel2);color:var(--accent)}
+.native-update-progress progress::-webkit-progress-bar{background:var(--panel2);border-radius:8px}
+.native-update-progress progress::-webkit-progress-value{background:var(--accent);border-radius:8px}
+.native-update-progress progress::-moz-progress-bar{background:var(--accent);border-radius:8px}
+.native-update-card .native-update-error{color:var(--red);padding:12px 14px;background:var(--live-soft);border-radius:12px}
 .native-update-actions{width:100%;display:flex;flex-direction:column;gap:10px;margin-top:8px}
-.native-update-actions button{min-height:46px;border-radius:12px;padding:10px 18px;font-size:14px;font-weight:650;cursor:pointer}
+.native-update-actions button{min-height:46px;border-radius:12px;padding:10px 18px;font-size:14px;font-weight:600;cursor:pointer}
 .native-update-primary{background:var(--accent);color:var(--accent-fg);border:1px solid transparent}
-.native-update-secondary{background:transparent;color:var(--txt);border:1px solid var(--line)}
+.native-update-secondary{background:var(--panel2);color:var(--txt);border:1px solid transparent}
 .native-update-actions button:hover{filter:brightness(1.1)}
 .native-update-actions button:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 .native-update-status{display:flex;align-items:center;justify-content:center;gap:10px;min-height:46px;color:var(--muted);font-size:13px}

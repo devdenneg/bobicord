@@ -8,7 +8,7 @@ import {
 } from '../store';
 import { getSettings, setSettings, subscribeSettings } from '../settings';
 import { audioDeviceInventory } from '../audioDeviceInventory';
-import { THEMES, getTheme, setTheme } from '../theme';
+import { ACCENTS, THEME_MODES, getAccent, getThemeMode, setAccent, setThemeMode } from '../theme';
 import { playSound } from '../sounds';
 import { Icon } from '../Icon';
 import { MicMeter } from './MicMeter';
@@ -71,7 +71,7 @@ function JoinModal() {
     <div className="fld"><label>Код или ссылка</label><input autoFocus value={code} placeholder="напр. aBc123 или https://.../?invite=..." onChange={(e) => onCode(e.target.value)} /></div>
     {preview ? <div style={{ background: 'var(--bg2)', border: '1px solid var(--line-2)', borderRadius: 'var(--r-md)', padding: 12, marginBottom: 12 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-        <div style={{ width: 40, height: 40, borderRadius: 12, background: avColor(preview.server.name, preview.server.iconColor), display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, color: '#fff' }}>{initial(preview.server.name)}</div>
+        <div style={{ width: 40, height: 40, borderRadius: 12, background: avColor(preview.server.name, preview.server.iconColor), display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 600, color: 'var(--av-ink)' }}>{initial(preview.server.name)}</div>
         <div><b style={{ color: 'var(--txt-h)' }}>{preview.server.name}</b><div style={{ fontSize: 12.5, color: 'var(--muted)' }}>{preview.server.memberCount} участник(ов)</div></div>
       </div>
     </div> : null}
@@ -487,14 +487,15 @@ function InviteModal() {
   return <Backdrop onClose={close} label="Пригласить">
     <h2><Icon name="link" />Пригласить друзей</h2>
     <p className="msub">Ссылка одноразово живёт 30 минут. Просрочилась — жми «Новая ссылка».</p>
-    <div className="invite-box"><input readOnly value={link} /><button aria-label="Копировать ссылку приглашения" data-tip="Копировать" disabled={!link || expired} onClick={() => copy(link)}>📋</button></div>
+    <div className="invite-box"><input readOnly value={link} /><button aria-label="Копировать ссылку приглашения" data-tip="Копировать" disabled={!link || expired} onClick={() => copy(link)}><Icon name="copy" sm /></button></div>
     <div style={{ fontSize: 12.5, color: expired ? 'var(--red)' : 'var(--muted)', margin: '8px 2px 0' }}>{link ? (expired ? 'Ссылка истекла — создай новую' : `Действует ещё: ${left}`) : 'Создаю ссылку…'}</div>
     <button className="ghost" style={{ marginTop: 12 }} disabled={busy} onClick={gen}><Icon name="refresh" sm />Новая ссылка</button>
     <button className="close" onClick={close}>Готово</button>
   </Backdrop>;
 }
 
-const DEFAULT_ROLE_COLORS = ['#5865f2', '#23a559', '#f0b232', '#f23f43', '#eb459e', '#3b9dff', '#9b59b6', '#e67e22'];
+// Пресеты цвета роли — средняя светлота: имя с цветом роли читается и в тёмной, и в светлой теме.
+const DEFAULT_ROLE_COLORS = ['#5f8fbf', '#4f9a76', '#b08a3e', '#c06a55', '#b0688a', '#4f97a3', '#8a76bd', '#b87a4b'];
 
 function ServerSettingsModal() {
   const close = () => useStore.getState().setModal(null);
@@ -624,7 +625,7 @@ function RoleAssignTab({ active, members }: { active: import('../types').ServerD
     {members.map((m) => <div key={m.id} className="assign-row">
       <div className="assign-av" style={{ background: m.avatarUrl ? '#0000' : avColor(m.displayName, m.avatarColor) }}>{m.avatarUrl ? <img className="avimg" src={resolveUploadUrl(m.avatarUrl)} alt="" /> : initial(m.displayName)}</div>
       <div className="assign-main">
-        <div className="assign-nm">{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{busy === m.id ? <span className="spin" style={{ width: 12, height: 12 }} /> : null}</div>
+        <div className="assign-nm">{m.displayName}{m.role === 'owner' ? <span className="rl" title="Владелец"><Icon name="crown" sm /></span> : ''}{busy === m.id ? <span className="spin" style={{ width: 12, height: 12 }} /> : null}</div>
         <div className="assign-roles">{roles.map((r) => { const on = (m.roles || []).some((x) => x.id === r.id); return <button key={r.id} className={'role-chip' + (on ? ' on' : '')} style={on ? { background: r.color || 'var(--accent)', borderColor: r.color || 'var(--accent)' } : { borderColor: (r.color || 'var(--line-2)') + '88', color: r.color || 'var(--muted)' }} onClick={() => toggle(m, r.id)}>{r.name}</button>; })}</div>
       </div>
     </div>)}
@@ -805,15 +806,29 @@ function SettingsModal() {
 
           {tab === 'appearance' && <>
             <h2><Icon name="palette" />Оформление</h2>
-            <div className="fld"><label>Тема оформления</label>
-              <div className="theme-grid" role="group" aria-label="Тема оформления">
-                {THEMES.map((t) => (
-                    <button type="button" key={t.id} aria-pressed={getTheme() === t.id} className={'theme-op' + (getTheme() === t.id ? ' active' : '')} onClick={() => { setTheme(t.id); rerender(); }}>
-                      <span className="theme-sw">{t.swatch.map((c, i) => <i key={i} style={{ background: c }} />)}</span>
-                      <span className="theme-copy"><span className="theme-nm">{t.name}</span><small>{t.description}</small></span>
-                      {getTheme() === t.id ? <Icon name="check" sm /> : null}
-                  </button>
-                ))}
+            <div className="fld"><label>Тема</label>
+              <div className="theme-modes" role="radiogroup" aria-label="Тема">
+                {THEME_MODES.map((m) => {
+                  const on = getThemeMode() === m.id;
+                  return (
+                    <button type="button" role="radio" aria-checked={on} key={m.id} className={'theme-mode' + (on ? ' active' : '')} onClick={() => { setThemeMode(m.id); rerender(); }}>
+                      <span className={'theme-prev ' + m.id} aria-hidden="true"><i /><i /><i /></span>
+                      <span className="theme-nm"><span className="theme-radio" aria-hidden="true" />{m.name}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="fld"><label>Акцент</label>
+              <div className="accent-row" role="radiogroup" aria-label="Акцент">
+                {ACCENTS.map((a) => {
+                  const on = getAccent() === a.id;
+                  return (
+                    <button type="button" role="radio" aria-checked={on} key={a.id} className={'accent-op' + (on ? ' active' : '')} onClick={() => { setAccent(a.id); rerender(); }}>
+                      <i style={{ background: a.swatch }} />{a.name}
+                    </button>
+                  );
+                })}
               </div>
             </div>
           </>}

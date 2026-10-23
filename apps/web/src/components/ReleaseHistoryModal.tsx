@@ -64,7 +64,7 @@ export function ReleaseHistoryModal() {
       <span className="release-history-head-icon" aria-hidden="true"><Icon name="updates" /></span>
       <div>
         <h2>Что нового</h2>
-        <p className="msub">Последние 10 обновлений RelayApp — всё важное в одном месте.</p>
+        <p className="msub">Последние 10 обновлений</p>
       </div>
     </header>
 

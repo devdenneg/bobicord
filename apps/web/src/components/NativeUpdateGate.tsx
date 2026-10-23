@@ -17,7 +17,7 @@ export function NativeUpdateGate({ state }: { state: NativeUpdateState }) {
   return (
     <main className="native-update-gate">
       <section className="native-update-card" aria-labelledby="native-update-title" aria-busy={busy}>
-        <LogoLoader size={112} animate={false} />
+        <LogoLoader size={48} animate={false} />
         <span className="native-update-brand">Рилэй · приложение для компьютера</span>
         <h1 id="native-update-title">{title}</h1>
         <p>{state.version ? `Доступна версия ${state.version}. После обновления приложение перезапустится, и можно будет войти.`

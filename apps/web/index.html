@@ -5,16 +5,19 @@
   <meta name="referrer" content="no-referrer" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
   <title>Рилэй</title>
-  <meta name="theme-color" content="#0b0c0f" />
+  <meta name="theme-color" content="#111312" />
+  <script src="/theme-boot.js"></script>
   <link rel="manifest" href="/manifest.json" />
-  <link rel="icon" href="/icon-256.png" type="image/png" sizes="256x256" />
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
   <link rel="icon" href="/icon-128.png" type="image/png" sizes="128x128" />
-  <link rel="apple-touch-icon" href="/icon-512.png" />
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
   <style>
-    html,body{margin:0;height:100%;background:#0b0c0f}
-    /* boot = просто тёмный экран (без логотипа), чтобы не мелькала маленькая версия
-       до маунта React — сразу за ним появляется анимированный LogoLoader того же размера */
-    #boot{position:fixed;inset:0;background:#0b0c0f;z-index:9999}
+    html,body{margin:0;height:100%;background:#111312}
+    :root[data-theme="light"],:root[data-theme="light"] body{background:#f3f4f1}
+    /* boot = пустой экран цвета темы (без логотипа), чтобы не мелькала маленькая версия
+       до маунта React — сразу за ним появляется LogoLoader того же размера */
+    #boot{position:fixed;inset:0;background:#111312;z-index:9999}
+    :root[data-theme="light"] #boot{background:#f3f4f1}
   </style>
 </head>
 <body>

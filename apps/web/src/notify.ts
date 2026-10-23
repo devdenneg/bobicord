@@ -235,7 +235,7 @@ export async function notify(kind: NotifKind, opts: RelayNotificationOptions): P
     const data: NotificationOptions = {
       body: shownContent.body,
       icon: '/icon-256.png',
-      badge: '/icon-128.png',
+      badge: '/badge-96.png',
       tag: opts.tag,
       data: clickData,
       ...( { renotify: !!opts.tag } as any),

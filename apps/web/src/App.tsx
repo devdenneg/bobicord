@@ -3,7 +3,7 @@ import { useStore, getEngine } from './store';
 import { getSettings, setSettings, subscribeSettings } from './settings';
 import { avColor, initial, normKey } from './util';
 import { api, resolveUploadUrl } from './api';
-import { Icon, IconSprite } from './Icon';
+import { Icon } from './Icon';
 import { Home } from './components/Home';
 import { Auth } from './components/Auth';
 import { AccountEmailGate } from './components/AccountEmailGate';
@@ -74,12 +74,12 @@ function Rail() {
   return (
     <nav id="rail" aria-label="Серверы и разделы">
       <div className="rail-primary">
-        <button className={'railbtn tip-l' + (view === 'home' ? ' active' : '')} aria-label="Домой" aria-current={view === 'home' ? 'page' : undefined} data-tip="Домой" onClick={goHome}><Icon name="home" /></button>
+        <button className={'railbtn rail-home tip-l' + (view === 'home' ? ' active' : '')} aria-label="Домой" aria-current={view === 'home' ? 'page' : undefined} data-tip="Домой" onClick={goHome}><Icon name="home" /></button>
         <div className="rail-sep" />
         {servers.map((s) => {
           const un = activeId === s.id ? 0 : (unread[s.id] || 0); // активный не бейджим (читаем его)
           return (
-          <button key={s.id} className={'railbtn tip-l' + (activeId === s.id ? ' active' : '') + (eng.voiceServerId === s.id && activeId !== s.id ? ' connected' : '') + (un ? ' unread' : '')}
+          <button key={s.id} className={'railbtn rail-srv tip-l' + (activeId === s.id ? ' active' : '') + (eng.voiceServerId === s.id && activeId !== s.id ? ' connected' : '') + (un ? ' unread' : '')}
             aria-label={s.name + (eng.voiceServerId === s.id && activeId !== s.id ? ' — вы в голосовом канале' : '') + (draftServers.has(s.id) ? ' — есть черновик' : '')}
             aria-current={activeId === s.id ? 'page' : undefined}
             data-tip={eng.voiceServerId === s.id && activeId !== s.id ? s.name + ' · в голосе' : s.name}
@@ -361,7 +361,6 @@ function Application() {
 
   return (
     <>
-      <IconSprite />
       <Toasts />
       <TooltipLayer />
       {me ? <ConnectivityBanner /> : null}
@@ -370,7 +369,7 @@ function Application() {
       {me ? <ShortcutHelp open={shortcutHelpOpen} onClose={() => setShortcutHelpOpen(false)} /> : null}
       {accountGate ? <AccountEmailGate /> : view === 'loading' ? (
         <div className="overlay" style={{ background: 'var(--bg)' }}>
-          <LogoLoader size={200} />
+          <LogoLoader size={56} />
         </div>
       ) : view === 'auth' ? <Auth /> : (
         <>

@@ -300,7 +300,7 @@ function ProfileCard({ m, rect, onEnter, onLeave }: { m: Member; rect: DOMRect; 
         <span className={'pcard-presence ' + presenceClass}><i />{presence}</span>
       </div>
       <div className="pcard-identity">
-        <div className="pcard-name">{m.displayName}{m.role === 'owner' ? <span className="rl" title="Владелец">👑</span> : null}</div>
+        <div className="pcard-name">{m.displayName}{m.role === 'owner' ? <span className="rl" title="Владелец"><Icon name="crown" sm /></span> : null}</div>
         <div className="pcard-user">@{m.username}</div>
       </div>
       {streaming ? <div className="pcard-activity live">
@@ -727,7 +727,7 @@ function MemberRow({ m, anim }: { m: Member; anim?: string }) {
         <Avatar name={m.displayName} ci={m.avatarColor} url={m.avatarUrl} size={36} dot={st} live={!!streaming} />
         <div className="pi-main">
           <div className="pi-l1">
-            <div className="nm" style={roleColorOf(m) ? { color: roleColorOf(m) } : undefined}>{m.displayName}{m.role === 'owner' ? <span className="rl">👑</span> : ''}{self ? ' (ты)' : ''}</div>
+            <div className="nm" style={roleColorOf(m) ? { color: roleColorOf(m) } : undefined}>{m.displayName}{m.role === 'owner' ? <span className="rl" title="Владелец"><Icon name="crown" sm /></span> : ''}{self ? ' (ты)' : ''}</div>
           </div>
           {activityName || (m.roles && m.roles.length > 0) ? (
             <div className="pi-l2">
@@ -2705,7 +2705,7 @@ function Chat() {
           <div className="lvlup-card" data-chat-visual-anchor="">
             <span className="lvlup-badge">{m.level ?? '?'}</span>
             <Avatar name={m.who || ''} ci={m.color ?? 0} url={lvAuthor?.avatarUrl} size={30} />
-            <div className="lvlup-txt"><b>{m.who}</b><span>{m.level}-й уровень! 🎉</span></div>
+            <div className="lvlup-txt"><b>{m.who}</b><span>{m.level}-й уровень</span></div>
             <Icon name="trophy" />
           </div>
         </div>
@@ -2730,12 +2730,12 @@ function Chat() {
     const big = !!parts && !hasLink && emoCount >= 1 && emoCount <= 3 && parts.every((p) => typeof p !== 'string' || !p.trim());
     const author = m.who ? byName.get(m.who) : undefined;
     const aRoles = author?.roles || [];
-    const nameColor = (author && roleColorOf(author)) || avColor(m.who || '', m.color);
+    const nameColor = (author && roleColorOf(author)) || undefined; // без роли — цвет текста темы
     // цитата исходного сообщения (reply) — над автором, кликабельна если оригинал загружен
     let replyQuote: JSX.Element | null = null;
     if (m.reply) {
       const rAuthor = (m.reply.uid && byUid.get(m.reply.uid)) || byName.get(m.reply.author);
-      const rColor = (rAuthor && roleColorOf(rAuthor)) || avColor(m.reply.author, rAuthor?.avatarColor ?? 0);
+      const rColor = (rAuthor && roleColorOf(rAuthor)) || 'var(--txt-h)';
       const rep = m.reply;
       replyQuote = (
         <button className="reply-quote jumpable" onClick={() => jumpToReply(rep)}
@@ -2927,7 +2927,7 @@ function Chat() {
       {replyTo ? (
         <div className="reply-bar">
           <Icon name="reply" sm />
-          <span className="rb-to">Ответ <b style={{ color: (byName.get(replyTo.author) && roleColorOf(byName.get(replyTo.author)!)) || avColor(replyTo.author, byName.get(replyTo.author)?.avatarColor ?? 0) }}>{replyTo.author}</b></span>
+          <span className="rb-to">Ответ <b style={{ color: (byName.get(replyTo.author) && roleColorOf(byName.get(replyTo.author)!)) || 'var(--txt-h)' }}>{replyTo.author}</b></span>
           <span className="rb-text">{replySnippet(replyTo)}</span>
           <button className="rb-close" aria-label="Отменить ответ" data-tip="Отменить · Esc" onClick={() => setReplyTo(null)}><Icon name="close" sm /></button>
         </div>
@@ -3087,7 +3087,7 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
       <div className="lbl" title={appName ? `${name} · ${appName}` : name}>
         {appIcon
           ? <img src={`data:image/png;base64,${appIcon}`} width={16} height={16} style={{ borderRadius: 3, verticalAlign: 'text-bottom', marginRight: 4, objectFit: 'contain' }} alt="" />
-          : '🖥 '}
+          : <Icon name="screen" sm />}
         {name}{isLocal ? ' (ты)' : ''}
       </div>
       {!isLocal ? <StreamSourceBadge identity={identity} /> : null}
@@ -3117,7 +3117,7 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
             <input className="vb-vol" aria-label="Громкость трансляции" type="range" min={0} max={100} value={svol} onChange={(e) => setVol(+e.target.value)} />
             <span className="vb-pct">{svol}%</span>
           </>
-        ) : <span className="vb-lbl">🖥 Твоя трансляция</span>}
+        ) : <span className="vb-lbl"><Icon name="screen" sm />Твоя трансляция</span>}
         <div className="vb-sp" />
         {!isLocal ? <button className={'vb-btn' + (qualOpen ? ' active' : '')} aria-label="Выбрать качество трансляции" aria-expanded={qualOpen} data-tip="Качество" onClick={() => setQualOpen((v) => !v)}><Icon name="gear" sm /></button> : null}
         {!isLocal ? <button className={'vb-btn' + (treeOpen ? ' active' : '')} aria-label="Открыть дерево трансляции" aria-expanded={treeOpen} data-tip="Дерево трансляции — выбрать пира" onClick={() => setTreeOpen((v) => !v)}><Icon name="users" sm /></button> : null}
@@ -3149,7 +3149,7 @@ function StreamSourceBadge({ identity }: { identity: string }) {
   const parent = you.parentId ? topo.nodes.find((n) => n.id === you.parentId) : null;
   const label = !parent ? 'подключение…' : parent.broadcaster ? 'напрямую от вещателя' : (parent.virtual || parent.server) ? 'через сервер' : (members.find((m) => m.username === parent.identity)?.displayName || parent.identity);
   return (
-    <div className="srcbadge" style={{ position: 'absolute', top: 8, right: 8, display: 'flex', alignItems: 'center', gap: 4, padding: '3px 8px', borderRadius: 12, fontSize: 11, background: 'rgba(0,0,0,.55)', color: '#fff', pointerEvents: 'none' }}>
+    <div className="srcbadge">
       <Icon name="link" sm />источник: {label}{you.children ? ` · ретрансляция ×${you.children}` : ''}
     </div>
   );
@@ -3160,7 +3160,7 @@ function TreePeerPanel({ identity, onClose }: { identity: string; onClose: () =>
   const E = getEngine()!;
   const members = useStore((s) => s.members);
   const topo = E.getStreamTopology(identity);
-  const nameOf = (n: { broadcaster: boolean; virtual?: boolean; identity: string }) => n.broadcaster ? '📡 вещатель' : n.virtual ? '🖥 Сервер' : (members.find((m) => m.username === n.identity)?.displayName || n.identity);
+  const nameOf = (n: { broadcaster: boolean; virtual?: boolean; identity: string }) => n.broadcaster ? 'вещатель' : n.virtual ? 'сервер' : (members.find((m) => m.username === n.identity)?.displayName || n.identity);
   const youNode = topo?.nodes.find((n) => n.id === topo.you);
   // Потомки твоего узла: репарент под собственного потомка = цикл (сервер отклонит) — «взять» на них не даём.
   const youDesc = (() => {
@@ -3173,8 +3173,7 @@ function TreePeerPanel({ identity, onClose }: { identity: string; onClose: () =>
     return set;
   })();
   return (
-    <div className="treepanel" role="dialog" aria-label="Дерево трансляции" onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}
-      style={{ position: 'absolute', left: '50%', transform: 'translateX(-50%)', bottom: 62, width: 'min(280px, calc(100% - 24px))', maxHeight: 320, overflow: 'auto', background: 'rgba(20,22,28,.96)', backdropFilter: 'blur(16px)', WebkitBackdropFilter: 'blur(16px)', border: '1px solid rgba(255,255,255,.12)', borderRadius: 12, padding: 10, zIndex: 7, color: '#fff', fontSize: 12, boxShadow: '0 10px 30px rgba(0,0,0,.5)' }}>
+    <div className="treepanel" role="dialog" aria-label="Дерево трансляции" onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
         <b>Дерево трансляции</b>
         <button className="vb-btn" aria-label="Закрыть дерево трансляции" onClick={onClose}><Icon name="close" sm /></button>
@@ -3205,11 +3204,11 @@ function TreePeerPanel({ identity, onClose }: { identity: string; onClose: () =>
           const isParent = youNode?.parentId === n.id;
           const pickable = !isYou && !isParent && !youDesc.has(n.id) && n.children < n.capacity;
           return (
-            <div key={n.id} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 0', paddingLeft: n.depth * 10, borderBottom: '1px solid rgba(255,255,255,.05)' }}>
-              <span style={{ flex: 1, fontWeight: isYou ? 700 : 400, color: isParent ? '#8fd3ff' : '#fff' }}>
+            <div key={n.id} className="tp-row" style={{ paddingLeft: n.depth * 10 }}>
+              <span className={'tp-name' + (isYou ? ' you' : '') + (isParent ? ' parent' : '')}>
                 {nameOf(n)}{isYou ? ' (ты)' : ''}{isParent ? ' · источник' : ''}
               </span>
-              <span style={{ opacity: .6, fontSize: 11 }}>гл.{n.depth} · {n.children}/{n.capacity}{n.native ? '' : ' 🌐'}</span>
+              <span style={{ opacity: .6, fontSize: 11 }}>гл.{n.depth} · {n.children}/{n.capacity}{n.native ? '' : ' · браузер'}</span>
               {pickable ? <button className="primary" style={{ margin: 0, padding: '2px 8px', fontSize: 11 }} onClick={() => E.requestReparent(identity, n.id)}>взять</button> : <span style={{ width: 44 }} />}
             </div>
           );
@@ -3218,7 +3217,7 @@ function TreePeerPanel({ identity, onClose }: { identity: string; onClose: () =>
         {/* Э9: ручной фолбэк — сервер поднимет виртуальный relay (если агент запущен) и
             пересадит нас под него; выбор запинен от авто-дренажа, пока не уйдём сами. */}
         {!youNode || !topo.nodes.find((n) => n.id === youNode.parentId)?.virtual
-          ? <button className="ghost" style={{ margin: '6px 0 0', width: '100%' }} onClick={() => E.requestReparent(identity, 'vrelay')}>🖥 Через сервер</button>
+          ? <button className="ghost" style={{ margin: '6px 0 0', width: '100%' }} onClick={() => E.requestReparent(identity, 'vrelay')}>Через сервер</button>
           : null}
       </>}
     </div>
@@ -3241,8 +3240,7 @@ function QualityMenu({ identity, onClose }: { identity: string; onClose: () => v
   const label: Record<string, string> = { source: 'Исходное (source)', '1080': '1080p', '720': '720p', '480': '480p', '360': '360p' };
   const items = onlySource ? ['source'] : ['auto', ...renditions];
   return (
-    <div className="qualpanel" role="dialog" aria-label="Качество трансляции" onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}
-      style={{ position: 'absolute', left: '50%', transform: 'translateX(-50%)', bottom: 62, width: 'min(220px, calc(100% - 24px))', background: 'rgba(20,22,28,.96)', backdropFilter: 'blur(16px)', WebkitBackdropFilter: 'blur(16px)', border: '1px solid rgba(255,255,255,.12)', borderRadius: 12, padding: 10, zIndex: 7, color: '#fff', fontSize: 12, boxShadow: '0 10px 30px rgba(0,0,0,.5)' }}>
+    <div className="qualpanel" role="dialog" aria-label="Качество трансляции" onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
         <b>Качество</b>
         <button className="vb-btn" aria-label="Закрыть выбор качества" onClick={onClose}><Icon name="close" sm /></button>
@@ -3254,8 +3252,7 @@ function QualityMenu({ identity, onClose }: { identity: string; onClose: () => v
       ) : items.map((it) => {
         const active = mode === it;
         return (
-          <button key={it} className="ghost" disabled={active}
-            style={{ margin: '2px 0', width: '100%', textAlign: 'left', fontWeight: active ? 700 : 400, color: active ? '#8fd3ff' : '#fff', opacity: 1 }}
+          <button key={it} className={'ghost qp-item' + (active ? ' on' : '')} disabled={active}
             onClick={() => { E.setStreamQuality(identity, it); onClose(); }}>
             {it === 'auto' ? 'Авто' : (label[it] || `${it}p`)}{active ? ' ·' : ''}
           </button>
