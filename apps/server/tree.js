@@ -1585,7 +1585,14 @@ function attachTreeServer(httpServer, opts) {
     // Агент (пере)подключился — деревья могли ждать фолбэк (сироты/ручные запросы).
     for (const [key, t] of mgr.trees) {
       if (!t.broadcasterId || findVirtual(t)) continue;
-      let needs = !!(t.vrelayPending && t.vrelayPending.size);
+      // server-first: медиаузел — постоянная часть эфира, а не фолбэк. Вернувшийся (или новый)
+      // агент обязан встать в КАЖДЫЙ живой source-эфир, даже если сирот уже нет — зрители успели
+      // пересесть под вещателя и сидят на его аплинке (прод 2026-10-23: перезапуск vrelay посреди
+      // эфира → медиаузел в дерево не вернулся). Метка прошлой активации относится к ушедшему
+      // агенту — сбрасываем, иначе кулдаун requestVrelayActivation молча гасит запрос.
+      const serverFirstSource = t.serverFirst && parseTreeKey(key).rendition === DEFAULT_RENDITION;
+      if (serverFirstSource) t.vrelayActivateAt = 0;
+      let needs = serverFirstSource || !!(t.vrelayPending && t.vrelayPending.size);
       if (!needs) for (const n of t.nodes.values()) { if (n.id !== t.broadcasterId && !n.parent) { needs = true; break; } }
       if (needs) requestVrelayActivation(key); // сам откажет не-source-дереву
     }
@@ -1657,7 +1664,20 @@ function attachTreeServer(httpServer, opts) {
     const p = peers.get(id);
     // Д-фикс: агент vrelay держит control-сокет БЕЗ treeKey (в дерево не joins). Его отвал
     // схлопывает рендишн-лестницу в ['source'] — ре-анонсим, иначе у клиента залипает меню.
-    if (p && p.isVrelayAgent) { tlog(`агент vrelay отключился: ${id} — лестница рендишнов схлопывается в [source]`); peers.delete(id); reannounceRenditions(); return; }
+    if (p && p.isVrelayAgent) {
+      tlog(`агент vrelay отключился: ${id} — лестница рендишнов схлопывается в [source]`);
+      peers.delete(id);
+      // Его ffmpeg-транскоды умерли вместе с ним. Реестр чистим, оставшимся зрителям —
+      // rendition-unavailable (упадут на source): иначе запись «live» переживает агента, и
+      // следующий заход в рендишн считает транскод живым — зритель висит сиротой без корня.
+      for (const [key, t] of mgr.trees) {
+        const { streamId: base, rendition } = parseTreeKey(key);
+        if (rendition !== DEFAULT_RENDITION || !t.renditions || !t.renditions.size) continue;
+        for (const r of [...t.renditions.keys()]) teardownRendition(base, r, 'agent-gone');
+      }
+      reannounceRenditions();
+      return;
+    }
     if (!p || !p.treeKey) { peers.delete(id); return; }
     peers.delete(id);
     const key = p.treeKey;
@@ -1686,6 +1706,11 @@ function attachTreeServer(httpServer, opts) {
       if (p.rendition === DEFAULT_RENDITION) {
         broadcastToServer(p.serverId, { t: 'stream-end', streamId: sid, identity: p.identity });
         teardownRenditionTrees(sid, p.serverId);
+      } else {
+        // Ушёл рендишн-корень (ffmpeg/агент упал) — запись реестра больше не про живой транскод.
+        // Следующий потребитель поднимет его заново через ensureRendition, а не повиснет сиротой.
+        const src = mgr.trees.get(treeKey(sid, DEFAULT_RENDITION));
+        if (src && src.renditions) src.renditions.delete(p.rendition);
       }
       return;
     }
@@ -1878,7 +1903,9 @@ function attachTreeServer(httpServer, opts) {
     return out;
   }
 
-  return { mgr, peers, wss, abrTimer, hbTimer, drainTimer, renditionTimer, liveBroadcastersIn, arbitrateServerSlots, frameDropReparent };
+  return { mgr, peers, wss, abrTimer, hbTimer, drainTimer, renditionTimer, liveBroadcastersIn, arbitrateServerSlots, frameDropReparent,
+    // для регрессионных тестов: подключение/отвал агента vrelay и вход в рендишн
+    _test: { onVrelayHello, onLeave, ensureRendition } };
 }
 
 module.exports = { attachTreeServer, TreeManager, MAX_DEPTH, NATIVE_CAPACITY, BROWSER_CAPACITY, treeKey, parseTreeKey };

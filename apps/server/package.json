@@ -14,6 +14,7 @@
     "test:voice-lease": "node voice-lease-test.js",
     "test:voice-diagnostics": "node --test voiceDiagnostics-test.js",
     "test:tree-ws-error": "node tree-ws-error-test.js",
+    "test:vrelay-reconnect": "node vrelay-reconnect-test.js",
     "test:uploads-gc": "node uploads-gc-test.js"
   },
   "dependencies": {
