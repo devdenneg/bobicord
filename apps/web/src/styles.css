@@ -3297,3 +3297,42 @@ button:focus-visible,a:focus-visible,.sw:focus-visible,[role=button]:focus-visib
 .modal .ghost:disabled{opacity:1;background:transparent;box-shadow:inset 0 0 0 1px var(--line-2);color:var(--muted)}
 .sm-act.danger:hover,.menu-item.danger:hover{filter:none}
 .modal .primary:disabled:has(.spin),.auth-card .primary:disabled:has(.spin){background:var(--accent);color:var(--accent-fg);opacity:.85}
+
+/* Телефон, вкладка «Эфир» (Paper М · Сервер — эфир): видео 16:9 сверху, под ним ряд кнопок,
+   ниже чат. Переключатель «Открыть чат» не нужен — оба видны сразу. */
+@media (max-width:900px){
+  #content.split,#content.split.show-chat{display:flex!important;flex-direction:column;gap:0}
+  #content.split>#stage,#content.split.show-chat>#stage{display:flex!important;flex:0 0 auto;flex-direction:column;height:auto;max-height:none;padding:4px 12px 0;background:transparent}
+  #content.split>#chat,#content.split.show-chat>#chat{display:flex!important;flex:1 1 0;min-height:0;width:auto;border:0}
+  #content.split .mob-chat-toggle,#content.split #chat .chat-head,#content.split #stageMin,#content.split .vinfo{display:none!important}
+  #content.split #grid{height:auto;min-height:0;gap:12px}
+  #content.split .vwrap{display:grid;grid-template-columns:auto minmax(0,1fr);grid-template-rows:auto auto;gap:10px;min-height:0;height:auto;padding:0;border-radius:0;background:transparent;overflow:visible}
+  #content.split .vwrap>video{grid-column:1 / -1;grid-row:1;width:100%;height:auto;aspect-ratio:16/9;border-radius:16px;background:#000;object-fit:contain}
+  #content.split .vwrap>.vtag{top:10px;left:10px}
+  #content.split .vwrap>.emolayer{grid-column:1 / -1;grid-row:1}
+  #content.split .vwrap>.watchers{position:static;grid-column:1;grid-row:2;height:40px;padding:0 12px;border-radius:12px;background:var(--panel2);color:var(--txt-h)}
+  #content.split .vwrap>.watchers .wc{font-size:13px}
+  #content.split .vwrap>.vbar{position:static;grid-column:2;grid-row:2;display:flex;flex-wrap:nowrap;gap:6px;width:auto;max-width:none;padding:0;border-radius:0;background:transparent;opacity:1!important;transform:none!important;overflow-x:auto;scrollbar-width:none}
+  #content.split .vwrap>.vbar::-webkit-scrollbar{display:none}
+  #content.split .vbar .vb-grow,#content.split .vbar .vb-pct{display:none}
+  #content.split .vbar .vb-btn,#content.split .vbar .vb-qual,#content.split .vbar .vb-lat,#content.split .vbar .vb-lbl{flex:0 0 auto;height:40px;min-width:40px;border-radius:12px;background:var(--panel2);color:var(--txt-h)}
+  #content.split .vbar .vb-qual{padding:0 12px;font-size:13px;font-weight:600}
+  #content.split .vbar .vb-lat{padding:0 10px}
+  #content.split .vbar .vb-lbl{display:inline-flex;align-items:center;gap:6px;padding:0 12px;font-size:13px}
+  #content.split .vbar .vb-vol{flex:0 0 72px;align-self:center}
+  #content.split .vstats,#content.split .treepanel,#content.split .qualpanel{grid-row:1}
+}
+.wc-mob{display:none}
+@media (max-width:900px){
+  #content.split .vwrap>.watchers>:not(.wc-mob):not(.wtip){display:none}
+  #content.split .wc-mob{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums}
+}
+/* Поле ввода на телефоне — одной строкой, как на компьютере (Paper М · Сервер — чат) */
+@media (max-width:900px){
+  .chat-in{display:flex!important;align-items:flex-end;gap:2px;padding:6px 6px 6px 4px}
+  .chat-in>*{grid-column:auto!important;grid-row:auto!important}
+  .chat-in #msgIn{flex:1 1 auto;min-width:0;min-height:40px;padding:10px 4px;font-size:16px}
+  .chat-in .emo-toggle{width:40px!important;height:40px!important;min-width:40px;min-height:40px}
+  .chat-in #sendBtn{width:40px!important;height:40px!important;min-width:40px;min-height:40px;margin-left:2px}
+  .composer-shell{border-radius:16px}
+}

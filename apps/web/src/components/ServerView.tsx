@@ -3138,6 +3138,7 @@ function StreamTile({ streamKey, identity, isLocal, appName, appIcon }: { stream
       <div className={'watchers' + (wOpen ? ' open' : '')} role="button" tabIndex={0} aria-label={`Смотрят трансляцию: ${watchers.length}`} aria-expanded={wOpen} onClick={(e) => { e.stopPropagation(); setWOpen((v) => !v); }} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); setWOpen((v) => !v); } }}>
         {watchers.length ? <span className="wstack">{watchers.slice(0, 3).map((w, i) => <div className="wa" key={i} style={{ background: w.avatarUrl ? '#0000' : avColor(w.name, w.color) }} title={w.name}>{w.avatarUrl ? <img className="avimg" src={resolveUploadUrl(w.avatarUrl)} alt="" /> : initial(w.name)}</div>)}</span> : <Icon name="eye" sm />}
         <div className="wc">{watchers.length ? `${watchers.length} ${plural(watchers.length, ['смотрит', 'смотрят', 'смотрят'])}` : 'Никто не смотрит'}</div>
+        <span className="wc-mob"><Icon name="eye" sm />{watchers.length}</span>
         {watchers.length ? (
           <div className="wtip">
             <div className="wtip-h">Смотрят · {watchers.length}</div>
@@ -3457,7 +3458,8 @@ export function ServerView() {
     window.addEventListener(NOTIFICATION_DESTINATION_EVENT, showNotificationChat);
     return () => window.removeEventListener(NOTIFICATION_DESTINATION_EVENT, showNotificationChat);
   }, [active.id, split]);
-  const chatVisible = (!singlePaneWorkspace || mtab === 'main') && (!split || showChat);
+  // на телефоне эфир и чат стоят друг под другом — чат виден и без «Показать чат»
+  const chatVisible = (!singlePaneWorkspace || mtab === 'main') && (!split || showChat || singlePaneWorkspace);
   useEffect(() => {
     sendActiveChat(chatVisible ? active.id : null);
     return () => sendActiveChat(null);
