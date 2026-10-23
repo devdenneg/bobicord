@@ -138,6 +138,12 @@ const RS_STOPPING = 'stopping'; // vrelay-rendition-stop отправлен, д�
 // env-оверрайдабельны (ad-hoc-тест ускоряет гашение; прод-дефолт 30с/5с).
 const RENDITION_IDLE_MS = Number(process.env.TREE_RENDITION_IDLE_MS) || 30_000;
 const RENDITION_TICK_MS = Number(process.env.TREE_RENDITION_TICK_MS) || 5_000;
+// Повторные IDR для старта рендишна. Первый request-keyframe уходит вещателю одновременно с
+// командой агенту, и кадр пролетает vrelay раньше, чем ffmpeg поднимется и займёт входной порт:
+// ffmpeg ждёт следующего планового IDR (GOP вещателя — секунды), а клиентский failsafe за это
+// время откатывает зрителя на source (прод 2026-10-23: первый кадр рендишна через 8с).
+// Повторяем, когда конвейер уже слушает; паузы ≥1с — нативный вещатель не форсит IDR чаще.
+const RENDITION_KF_RETRY_MS = [1_200, 2_600];
 
 // Пер-зрительский ABR (Д4): прямого ребёнка серверного узла (vrelay в source-дереве или
 // рендишн-корня в рендишн-дереве) с плохим линком переводим на рендишн НИЖЕ, с восстановившимся —
@@ -980,10 +986,20 @@ function attachTreeServer(httpServer, opts) {
       return false;
     }
     const presetBitrate = preset || RENDITION_BITRATE[rendition] || 0;
-    srcTree.renditions.set(rendition, { state: RS_STARTING, lastConsumerAt: now, presetBitrate });
+    const entry = { state: RS_STARTING, lastConsumerAt: now, presetBitrate };
+    srcTree.renditions.set(rendition, entry);
     const bc = srcTree.nodes.get(srcTree.broadcasterId);
     send(agent.id, { t: 'vrelay-rendition-start', streamId: baseSid, rendition, presetBitrate, serverId: bc ? bc.serverId : null });
     send(srcTree.broadcasterId, { t: 'request-keyframe', streamId: baseSid }); // IDR для старта ffmpeg
+    for (const delay of RENDITION_KF_RETRY_MS) {
+      const timer = setTimeout(() => {
+        // Только для ЭТОГО запуска: рендишн мог погаснуть или перезапуститься, вещатель — смениться.
+        const t = mgr.trees.get(treeKey(baseSid, DEFAULT_RENDITION));
+        if (!t || !t.broadcasterId || !t.renditions || t.renditions.get(rendition) !== entry || entry.state === RS_STOPPING) return;
+        send(t.broadcasterId, { t: 'request-keyframe', streamId: baseSid });
+      }, delay);
+      timer.unref?.();
+    }
     tlog(`[rendition] ${baseSid}::${rendition} start -> агент ${agent.id} (preset ${Math.round(presetBitrate / 1000)} kbps)`);
     return true;
   }

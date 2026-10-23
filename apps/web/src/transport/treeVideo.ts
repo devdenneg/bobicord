@@ -732,7 +732,9 @@ export class TreeVideoTransport implements VideoTransport {
     // если трек так и не пришёл (рендишн не поднялся / оборвался).
     this.unwatch(streamId, { keepVideo: true });
     this.watch(streamId, quality, pinned);
-    this.armVideoFailsafe(streamId);
+    // Рендишн поднимается с нуля: ffmpeg ждёт IDR вещателя и разбирает поток, первый кадр —
+    // через несколько секунд. 10с на это впритык (прод 2026-10-23: откат на source за 2с до кадра).
+    this.armVideoFailsafe(streamId, quality === 'source' ? 10_000 : 15_000);
   }
   // Текущий режим для подсветки пункта меню. pinned → рендишн; иначе 'auto' (сервер мог
   // авто-двигать между деревьями — в auto показываем «Авто», реальный рендишн прозрачен).
