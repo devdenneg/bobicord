@@ -4,7 +4,7 @@ import { useStore } from '../store';
 import { Icon } from '../Icon';
 import { canViewVoiceDiagnostics } from '../adminDiagnosticsAccess';
 import { AdminVoiceDiagnostics } from './AdminVoiceDiagnostics';
-import { avColor, initial } from '../util';
+import { avColor, initial, plural } from '../util';
 import type { AdminOverview, AdminServer, AdminMember, AdminUser, RegistrationInvite } from '../types';
 
 function RegistrationInviteCard({ invite, now, onReload, onRotate }: {
@@ -44,7 +44,6 @@ function RegistrationInviteCard({ invite, now, onReload, onRotate }: {
 // и выдача админки. Доступ гейтится и на клиенте (me.isAdmin), и на сервере (requireAdmin).
 export function AdminPage() {
   const me = useStore((s) => s.me);
-  const goHome = useStore((s) => s.goHome);
   const toast = useStore((s) => s.toast);
   const [data, setData] = useState<AdminOverview | null>(null);
   const [err, setErr] = useState('');
@@ -120,8 +119,18 @@ export function AdminPage() {
   return (
     <div className="admin">
       <div className="admin-head">
-        <button className="admin-back" onClick={goHome}><Icon name="chevron" sm /> На главную</button>
-        <h1>Админка</h1>
+        <div className="admin-title">
+          <h1>Админка</h1>
+          {data ? <span>{data.stats.servers} {plural(data.stats.servers, ['сервер', 'сервера', 'серверов'])} · {data.stats.users} {plural(data.stats.users, ['пользователь', 'пользователя', 'пользователей'])}</span> : null}
+        </div>
+        {data ? (
+          <div className="admin-tabs" role="tablist" aria-label="Разделы админки">
+            <button role="tab" aria-selected={tab === 'servers'} className={tab === 'servers' ? 'on' : ''} onClick={() => setTab('servers')}>Серверы</button>
+            <button role="tab" aria-selected={tab === 'users'} className={tab === 'users' ? 'on' : ''} onClick={() => setTab('users')}>Пользователи</button>
+            {isBootstrapAdmin ? <button role="tab" aria-selected={tab === 'access'} className={tab === 'access' ? 'on' : ''} onClick={() => setTab('access')}>Доступ</button> : null}
+            {isBootstrapAdmin ? <button role="tab" aria-selected={tab === 'diagnostics'} className={tab === 'diagnostics' ? 'on' : ''} onClick={() => setTab('diagnostics')}>Диагностика</button> : null}
+          </div>
+        ) : null}
         <button className="admin-refresh" aria-label="Обновить данные" onClick={load} data-tip="Обновить"><Icon name="refresh" sm /></button>
       </div>
 
@@ -129,18 +138,6 @@ export function AdminPage() {
       : err ? <div className="admin-msg err">{err}</div>
       : data ? (
         <>
-          <div className="admin-stats">
-            <div className="admin-stat"><b>{data.stats.servers}</b><span>серверов</span></div>
-            <div className="admin-stat"><b>{data.stats.users}</b><span>юзеров</span></div>
-          </div>
-
-          <div className="admin-tabs">
-            <button className={tab === 'servers' ? 'on' : ''} onClick={() => setTab('servers')}>Серверы</button>
-            <button className={tab === 'users' ? 'on' : ''} onClick={() => setTab('users')}>Юзеры</button>
-            {isBootstrapAdmin ? <button className={tab === 'access' ? 'on' : ''} onClick={() => setTab('access')}>Доступ</button> : null}
-            {isBootstrapAdmin ? <button className={tab === 'diagnostics' ? 'on' : ''} onClick={() => setTab('diagnostics')}>Диагностика</button> : null}
-          </div>
-
           {tab === 'servers' ? (
             <div className="admin-list">
               {data.servers.length === 0 ? <div className="admin-msg">Серверов нет</div> : null}

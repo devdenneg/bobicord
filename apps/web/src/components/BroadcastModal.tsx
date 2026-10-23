@@ -215,8 +215,8 @@ export function BroadcastModal() {
 
   if (live) {
     const canApply = !busy && !(cfg.sourceKind === 'window' && cfg.windowHwnd == null) && !(cfg.audioMode === 'include' && cfg.audioPid == null);
-    return <Backdrop onClose={close} label="Трансляция">
-      <h2><Icon name="screen" />Трансляция идёт</h2>
+    return <Backdrop onClose={close} label="Трансляция" boxClass="box-dialog box-broadcast-live">
+      <h2><i className="bc-live-dot" />Ты в эфире</h2>
       {stats ? <div className="dbgstats">
         <div><span>Источник</span><b title={stats.source}>{stats.source}</b></div>
         <div><span>Разрешение</span><b>{stats.width}×{stats.height}</b></div>
@@ -235,67 +235,79 @@ export function BroadcastModal() {
         </div>
       </details>
       <div className="rowbtns">
-        <button className="ghost" style={{ margin: 0 }} onClick={close}>Свернуть</button>
-        <button className="primary" style={{ margin: 0, background: 'var(--red-fill)' }} disabled={busy} onClick={stop}>Остановить трансляцию</button>
+        <button className="ghost" onClick={close}>Свернуть</button>
+        <button className="primary bc-stop" disabled={busy} onClick={stop}>Завершить эфир</button>
       </div>
       <div className="err">{err}</div>
     </Backdrop>;
   }
 
-  return <Backdrop onClose={close} label="Начать трансляцию">
-    <h2><Icon name="screen" />Трансляция экрана</h2>
-    {sourceFields}
-
-    {/* Дискорд-стиль: маленький выбор качества. Битрейт всегда авто (сервер адаптирует), слайдера нет. */}
-    <div className="fld"><label>Качество</label>
-      <div className="seg seg-quality">
-        <button className={cfg.quality === 'auto' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, quality: 'auto' }))}>Авто</button>
-        {FIXED_LABELS.map((l) => (
-          <button key={l} className={cfg.quality === l ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, quality: l }))}>{l}</button>
-        ))}
+  const bcServerName = (eng.voiceServerId && useStore.getState().servers.find((x) => x.id === eng.voiceServerId)?.name) || active.name;
+  const qLabel = (l: string) => l.replace(/^(\d+p)(\d+)$/, '$1 · $2');
+  return <Backdrop onClose={close} label="Начать трансляцию" boxClass="box-broadcast">
+    <div className="bc-head">
+      <span className="bc-ic"><Icon name="screen" /></span>
+      <div className="bc-title"><h2>Начать эфир</h2><span>{bcServerName}</span></div>
+      <div className="seg bc-kind" role="radiogroup" aria-label="Источник">
+        <button role="radio" aria-checked={cfg.sourceKind === 'monitor'} className={cfg.sourceKind === 'monitor' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, sourceKind: 'monitor' }))}>Экран</button>
+        <button role="radio" aria-checked={cfg.sourceKind === 'window'} className={cfg.sourceKind === 'window' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, sourceKind: 'window' }))}>Окно</button>
       </div>
-      <p className="msub" style={{ margin: '8px 0 0' }}>{cfg.quality === 'auto'
-        ? 'Авто (рекомендуется): подбираем разрешение под твою скорость, битрейт держит сервер.'
-        : 'Битрейт подстраивается автоматически; слабым зрителям сервер отдаёт качество пониже.'}</p>
-      {cfg.quality === 'auto' && <div style={{ marginTop: 6 }}>
-        {measuring
-          ? <span className="msub">Замеряю скорость сети… (3–5 с){measurePhase ? ` · ${measurePhase}` : ''}</span>
-          : probe
-            ? <span className="msub">
-                ~{(probe.bweKbps / 1000).toFixed(1)} Мбит/с отдача{probe.symmetricNat ? ' · ⚠ симметричный NAT' : ''}
-                {' '}<button className="linklike" style={{ background: 'none', border: 'none', color: 'var(--accent, #5865f2)', cursor: 'pointer', padding: 0 }} onClick={remeasure}>повторить замер</button>
-              </span>
-            : <button className="ghost" style={{ margin: 0 }} onClick={() => runMeasure(false)}>Замерить скорость</button>}
-      </div>}
     </div>
-    <div style={{ marginTop: 10, padding: '8px 10px', borderRadius: 8, background: 'var(--accent-soft, rgba(88,101,242,.18))', fontSize: 13, fontWeight: 600 }}>{summary}</div>
+    {cfg.sourceKind === 'monitor'
+      ? <div className="fld"><label>Монитор</label>
+          <select value={cfg.monitorIndex} onChange={(e) => setCfg((c) => ({ ...c, monitorIndex: +e.target.value }))}>
+            {monitors.map((m) => <option key={m.index} value={m.index}>{m.name || `Монитор ${m.index}`}</option>)}
+          </select>
+        </div>
+      : <div className="fld"><label>Окно</label>
+          <WindowPicker windows={windows} value={cfg.windowHwnd} onPick={(hwnd) => { const w = windows.find((x) => x.hwnd === hwnd); setCfg((c) => ({ ...c, windowHwnd: hwnd, audioPid: w ? w.pid : c.audioPid })); }} />
+        </div>}
 
-    <div className="fld"><label>Звук</label>
-      <p className="msub" style={{ margin: 0 }}>{cfg.audioMode === 'auto'
-        ? (cfg.sourceKind === 'window'
-            ? 'Авто: звук процесса захватываемого окна — голос войса в стрим не попадёт.'
-            : 'Авто: звук всех приложений/игр, кроме самого RelayApp (голос войса не попадёт).')
-        : cfg.audioMode === 'include'
-            ? 'Ручной режим: только звук выбранного процесса.'
-            : 'Ручной режим: весь звук, кроме RelayApp.'}</p>
+    {/* Битрейт всегда авто (сервер адаптирует) — выбирается только разрешение и частота. */}
+    <div className="bc-sec-h">
+      <span>Качество</span>
+      {measuring
+        ? <span className="bc-net">Замеряю канал… {measurePhase ? `· ${measurePhase}` : ''}</span>
+        : probe
+          ? <button type="button" className="bc-net" onClick={remeasure} data-tip="Повторить замер"><Icon name="signal" sm />Канал ↑ {(probe.bweKbps / 1000).toFixed(1)} Мбит/с{probe.symmetricNat ? ' · симметричный NAT' : ''}</button>
+          : <button type="button" className="bc-net" onClick={() => runMeasure(false)}><Icon name="signal" sm />Замерить канал</button>}
     </div>
+    <div className="bc-quality" role="radiogroup" aria-label="Качество">
+      <button role="radio" aria-checked={cfg.quality === 'auto'} className={'bc-q' + (cfg.quality === 'auto' ? ' active' : '')} onClick={() => setCfg((c) => ({ ...c, quality: 'auto' }))}>
+        <b>Авто</b><span>подстроится под сеть</span>
+      </button>
+      {FIXED_LABELS.map((l) => (
+        <button key={l} role="radio" aria-checked={cfg.quality === l} className={'bc-q' + (cfg.quality === l ? ' active' : '')} onClick={() => setCfg((c) => ({ ...c, quality: l }))}>
+          <b>{qLabel(l)}</b><span className="mono">{(QUALITY_FIXED[l].bitrateKbps / 1000).toFixed(1).replace(/\.0$/, '')} Мбит/с</span>
+        </button>
+      ))}
+    </div>
+    <p className="bc-summary">{summary}</p>
+
+    <div className="bc-audio">
+      <Icon name="speaker" />
+      <div className="bc-audio-txt">
+        <b>Звук игры</b>
+        <span>{cfg.audioMode === 'auto'
+          ? (cfg.sourceKind === 'window' ? 'Звук захватываемого окна.' : 'Всё, кроме Рилэя.')
+          : cfg.audioMode === 'include' ? 'Только выбранный процесс.' : 'Всё, кроме Рилэя.'} Голоса из Рилэя в эфир не попадают.</span>
+      </div>
+      <div className="seg bc-audio-seg" role="radiogroup" aria-label="Источник звука">
+        <button role="radio" aria-checked={cfg.audioMode === 'auto'} className={cfg.audioMode === 'auto' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, audioMode: 'auto' }))}>Авто</button>
+        <button role="radio" aria-checked={cfg.audioMode === 'include'} className={cfg.audioMode === 'include' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, audioMode: 'include' }))}>Только игра</button>
+        <button role="radio" aria-checked={cfg.audioMode === 'exclude'} className={cfg.audioMode === 'exclude' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, audioMode: 'exclude' }))}>Всё, кроме Рилэя</button>
+      </div>
+    </div>
+    {cfg.audioMode === 'include' && <select className="bc-proc" value={cfg.audioPid ?? ''} onChange={(e) => setCfg((c) => ({ ...c, audioPid: +e.target.value }))}>
+      <option value="" disabled>Выбери процесс</option>
+      {windows.map((w) => <option key={w.hwnd} value={w.pid}>{w.title}{w.process ? ` — ${w.process}` : ''}</option>)}
+    </select>}
+    {cfg.audioMode === 'exclude' ? <p className="bc-summary">На части ПК режим «Всё, кроме Рилэя» пропускает голос войса в запись (ограничение WebView2). Надёжнее — «Только игра» или «Авто» при захвате окна.</p> : null}
 
     {/* Дополнительно: звук вручную + прямые подключения (топология). Спрятано ради простоты. */}
-    <details style={{ marginTop: 6 }}>
-      <summary style={{ cursor: 'pointer' }} className="msub">Дополнительно</summary>
-      <div style={{ marginTop: 10 }}>
-        <div className="fld"><label>Источник звука</label>
-          <div className="seg">
-            <button className={cfg.audioMode === 'auto' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, audioMode: 'auto' }))}>Авто</button>
-            <button className={cfg.audioMode === 'exclude' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, audioMode: 'exclude' }))}>Всё, кроме RelayApp</button>
-            <button className={cfg.audioMode === 'include' ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, audioMode: 'include' }))}>Только процесс</button>
-          </div>
-          {cfg.audioMode === 'include' && <select style={{ marginTop: 8 }} value={cfg.audioPid ?? ''} onChange={(e) => setCfg((c) => ({ ...c, audioPid: +e.target.value }))}>
-            <option value="" disabled>Выбери процесс</option>
-            {windows.map((w) => <option key={w.hwnd} value={w.pid}>{w.title}{w.process ? ` — ${w.process}` : ''}</option>)}
-          </select>}
-          <p className="msub" style={{ margin: '8px 0 0' }}>⚠ «Всё кроме RelayApp» на части ПК всё равно пропускает голос войса в запись (ограничение WebView2). Надёжно — «Только процесс» или «Авто» при захвате окна.</p>
-        </div>
+    <details className="bc-more">
+      <summary>Дополнительно</summary>
+      <div>
         <div className="fld"><label>Прямые подключения к тебе</label>
           <div className="seg">
             <button className={!cfg.allowDirectPeers ? 'active' : ''} onClick={() => setCfg((c) => ({ ...c, allowDirectPeers: false }))}>Только через сервер</button>
@@ -312,9 +324,10 @@ export function BroadcastModal() {
       </div>
     </details>
 
-    <div className="rowbtns">
-      <button className="ghost" style={{ margin: 0 }} onClick={close}>Отмена</button>
-      <button className="primary" style={{ margin: 0 }} disabled={busy || (cfg.sourceKind === 'window' && cfg.windowHwnd == null) || (cfg.audioMode === 'include' && cfg.audioPid == null)} onClick={start}>Начать трансляцию</button>
+    <div className="bc-foot">
+      <span>Микрофон в эфир не идёт</span>
+      <button className="ghost" onClick={close}>Отмена</button>
+      <button className="bc-go" disabled={busy || (cfg.sourceKind === 'window' && cfg.windowHwnd == null) || (cfg.audioMode === 'include' && cfg.audioPid == null)} onClick={start}>{busy ? <span className="spin" /> : <i />}Выйти в эфир</button>
     </div>
     <div className="err">{err}</div>
   </Backdrop>;

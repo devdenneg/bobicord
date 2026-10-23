@@ -61,11 +61,8 @@ export function ReleaseHistoryModal() {
   return <Backdrop onClose={close} label="Что нового" boxClass="release-history-modal">
     <button className="settings-x" onClick={close} aria-label="Закрыть"><Icon name="close" /></button>
     <header className="release-history-head">
-      <span className="release-history-head-icon" aria-hidden="true"><Icon name="updates" /></span>
-      <div>
-        <h2>Что нового</h2>
-        <p className="msub">Последние 10 обновлений</p>
-      </div>
+      <h2>Что нового</h2>
+      <p className="msub">Последние 10 обновлений</p>
     </header>
 
     {loading ? <div className="release-history-skeleton" role="status" aria-live="polite" aria-label="Загружаем обновления">
@@ -94,13 +91,12 @@ export function ReleaseHistoryModal() {
           ? release.publishedAt * 1000
           : release.publishedAt;
         return <article className="release-history-entry" key={release.sha}>
-          <div className="release-history-timeline" aria-hidden="true">
-            <span><Icon name={index === 0 ? 'updates' : 'check'} sm /></span>
-          </div>
+          <div className={'release-history-timeline' + (index === 0 ? ' latest' : '')} aria-hidden="true"><span /></div>
           <div className="release-history-card">
             <div className="release-history-meta">
-              <span className="release-history-version">{release.version ? `Версия ${release.version}` : index === 0 ? 'Последнее обновление' : 'Обновление'}</span>
+              <span className="release-history-version">{release.version || (index === 0 ? 'Последнее обновление' : 'Обновление')}</span>
               {date ? <time dateTime={new Date(publishedAt).toISOString()}>{date}</time> : null}
+              {index === 0 ? <span className="release-history-new">Новое</span> : null}
             </div>
             {release.title && release.title !== 'Обновление RelayApp' ? <h3>{release.title}</h3> : null}
             <ul>{release.notes.map((note, noteIndex) => <li key={`${release.sha}:${noteIndex}`}>{note}</li>)}</ul>

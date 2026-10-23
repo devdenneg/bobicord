@@ -3,6 +3,7 @@
 // всех, non-focus, в правом нижнем углу. Здесь — рендер + самоуправление (авто-скрытие с
 // прогресс-баром, пауза на hover, клик → фокус главного). Лёгкая точка входа, без бандла приложения.
 import { getCurrentWindow, Window } from '@tauri-apps/api/window';
+import '@fontsource-variable/onest';
 
 type Kind = 'mention' | 'stream' | 'update';
 const p = new URLSearchParams(location.search);
@@ -58,7 +59,7 @@ document.head.insertAdjacentHTML('beforeend', `<style>
   :root { color-scheme: ${theme.light ? 'light' : 'dark'}; }
   * { margin: 0; box-sizing: border-box; }
   html, body { height: 100%; background: transparent; overflow: hidden; -webkit-user-select: none; user-select: none;
-    font-family: 'Segoe UI Variable', 'Segoe UI', system-ui, -apple-system, sans-serif; cursor: default; }
+    font-family: 'Onest Variable', 'Segoe UI Variable', 'Segoe UI', system-ui, -apple-system, sans-serif; cursor: default; }
   @keyframes in  { from { transform: translateX(24px); opacity: 0 } to { transform: none; opacity: 1 } }
   @keyframes bar { from { transform: scaleX(1) } to { transform: scaleX(0) } }
   #card {

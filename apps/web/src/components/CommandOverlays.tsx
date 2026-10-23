@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Icon } from '../Icon';
 import { getEngine, useStore } from '../store';
+import { avColor, initials2, plural } from '../util';
 import './commandOverlays.css';
 
 const RECENT_DESTINATIONS_KEY = 'relay.quick-switcher.recent.v1';
@@ -24,6 +25,7 @@ interface Destination {
   label: string;
   detail: string;
   icon: string;
+  tint?: string;
   kind: 'section' | 'server' | 'voice';
   keywords: string;
   action: () => void | Promise<void>;
@@ -110,8 +112,9 @@ export function QuickSwitcher({ open, onClose }: { open: boolean; onClose: () =>
     for (const server of rankedServers) items.push({
       id: `server:${server.id}`,
       label: server.name,
-      detail: unread[server.id] ? `Непрочитанных: ${unread[server.id]}` : `${server.memberCount} участников`,
-      icon: 'hash',
+      detail: unread[server.id] ? `${unread[server.id]} ${plural(unread[server.id], ['непрочитанное', 'непрочитанных', 'непрочитанных'])}` : `${server.memberCount} ${plural(server.memberCount, ['участник', 'участника', 'участников'])}`,
+      icon: initials2(server.name),
+      tint: avColor(server.name, server.iconColor),
       kind: 'server',
       keywords: `${server.name} сервер server`,
       action: () => { rememberServerDestination(server.id); return openServer(server.id); },
@@ -119,7 +122,7 @@ export function QuickSwitcher({ open, onClose }: { open: boolean; onClose: () =>
     for (const channel of active?.channels || []) items.push({
       id: `voice:${active!.id}:${channel.id}`,
       label: channel.name,
-      detail: `Голосовой канал · ${active!.name}`,
+      detail: `голосовой · ${active!.name}`,
       icon: 'speaker',
       kind: 'voice',
       keywords: `${channel.name} ${active!.name} голос voice`,
@@ -170,16 +173,17 @@ export function QuickSwitcher({ open, onClose }: { open: boolean; onClose: () =>
               else if (event.key === 'ArrowUp') { event.preventDefault(); setSelected((index) => filtered.length ? (index - 1 + filtered.length) % filtered.length : 0); }
               else if (event.key === 'Enter') { event.preventDefault(); activate(filtered[selected]); }
             }} />
-          <kbd>Esc</kbd>
+          <kbd>Ctrl K</kbd>
         </div>
         <div className="command-results" role="listbox" aria-label="Результаты">
           {filtered.length ? filtered.map((item, index) => (
             <button key={item.id} id={`command-result-${item.id}`} ref={index === selected ? selectedRef : undefined}
               className={'command-result' + (index === selected ? ' selected' : '')} role="option" aria-selected={index === selected}
               onMouseEnter={() => setSelected(index)} onClick={() => activate(item)}>
-              <span className="command-result-icon"><Icon name={item.icon} sm /></span>
+              {item.tint ? <span className="command-result-icon srv" style={{ background: item.tint }}>{item.icon}</span>
+                : <span className="command-result-icon"><Icon name={item.icon} sm /></span>}
               <span><b>{item.label}</b><small>{item.detail}</small></span>
-              <em>{item.kind === 'server' ? '*' : item.kind === 'voice' ? '!' : '↵'}</em>
+              <em>{index === selected ? 'Enter' : ''}</em>
             </button>
           )) : <div className="command-empty">Ничего не найдено</div>}
         </div>
@@ -189,7 +193,7 @@ export function QuickSwitcher({ open, onClose }: { open: boolean; onClose: () =>
   );
 }
 
-const SHORTCUTS = [
+export const SHORTCUTS = [
   ['Ctrl K', 'Быстрый переход'],
   ['Ctrl /', 'Показать эту справку'],
   ['Ctrl ,', 'Открыть настройки'],
@@ -212,9 +216,9 @@ export function ShortcutHelp({ open, onClose }: { open: boolean; onClose: () => 
   return (
     <div className="command-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="shortcut-panel" role="dialog" aria-modal="true" aria-label="Горячие клавиши">
-        <header><span><Icon name="keyboard" /><b>Горячие клавиши</b></span><button ref={closeRef} onClick={onClose} aria-label="Закрыть"><Icon name="close" sm /></button></header>
+        <header><b>Горячие клавиши</b><button ref={closeRef} onClick={onClose} aria-label="Закрыть"><Icon name="close" sm /></button></header>
         <div className="shortcut-list">
-          {SHORTCUTS.map(([combo, label]) => <div className="shortcut-row" key={combo}><span>{label}</span><kbd>{combo}</kbd></div>)}
+          {SHORTCUTS.map(([combo, label]) => <div className="shortcut-row" key={combo}><span>{label}</span><span className="shortcut-keys">{combo.split(' ').map((k, i) => k === '/' && combo.includes('↑') ? <i key={i}>/</i> : <kbd key={i}>{k}</kbd>)}</span></div>)}
         </div>
       </section>
     </div>

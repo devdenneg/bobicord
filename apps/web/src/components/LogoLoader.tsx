@@ -12,3 +12,21 @@ export function LogoLoader({ size = 64, animate = true }: { size?: number; anima
     </svg>
   );
 }
+
+/** Экран загрузки приложения: знак в двух кольцах, имя, бегущая полоса и подпись этапа. */
+export function Splash({ label = 'Подключение…' }: { label?: string }) {
+  return (
+    <div className="splash" role="status" aria-live="polite" aria-label={label}>
+      <div className="splash-mark">
+        <span className="splash-ring outer" aria-hidden="true" />
+        <span className="splash-ring inner" aria-hidden="true" />
+        <LogoLoader size={71} />
+      </div>
+      <div className="splash-txt">
+        <b>Рилэй</b>
+        <span className="splash-bar" aria-hidden="true"><i /></span>
+        <span>{label}</span>
+      </div>
+    </div>
+  );
+}

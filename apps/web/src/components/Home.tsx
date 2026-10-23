@@ -1,109 +1,146 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type CSSProperties, type KeyboardEvent } from 'react';
 import { useStore } from '../store';
 import { useEngine } from '../hooks';
 import { Icon } from '../Icon';
-import { avColor, initial } from '../util';
+import { avColor, initial, initials2, plural } from '../util';
 import { resolveUploadUrl } from '../api';
-import { deriveLiveItems, deriveGames, rankServers, dominant, clusterOrder, type LiveItem, type GameGroup } from '../homeData';
+import { deriveLiveItems, deriveGames, rankServers, clusterOrder, type LiveItem, type GameGroup } from '../homeData';
 import type { ServerSummary, OnlineMember } from '../types';
-import { LogoLoader } from './LogoLoader';
 import { DownloadCard } from './DownloadFab';
 import { applyNativeUpdate } from '../nativeUpdate';
 import './home.css';
 
-// Редизайн главной («пультовая»): вверху — присутствие («что можно сделать сейчас»), затем активность,
-// затем плотный список серверов, второстепенное свёрнуто. Большое приветствие — только в first-run.
-// Каждый живой объект показан РОВНО один раз, действие живёт на его карточке (см. ресёрч-синтез).
+// Главная: заголовок с действиями, «Сейчас в эфире» (эфир — большой карточкой, голос — рядом),
+// сетка серверов с колонкой «Играют сейчас», внизу — загрузка приложения. Каждый живой объект
+// показан ровно один раз, действие живёт на его карточке.
 
-const faceBg = (url: string | undefined, name: string, color: number) => (url ? '#0000' : avColor(name, color));
-const pluralRu = (n: number, one: string, few: string, many: string) => {
-  const mod100 = Math.abs(n) % 100; const mod10 = mod100 % 10;
-  return mod100 > 10 && mod100 < 20 ? many : mod10 === 1 ? one : mod10 > 1 && mod10 < 5 ? few : many;
+const faceBg = (url: string | undefined, name: string, color: number) => (url ? 'transparent' : avColor(name, color));
+const tint = (name: string, color?: number) => ({ '--tint': avColor(name, color) } as CSSProperties);
+const onKeyOpen = (open: () => void) => (e: KeyboardEvent) => {
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
 };
-// картинка или инициал на цветном фоне
-function Face({ url, name }: { url?: string; name: string; color: number }) {
-  return url ? <img className="avimg" src={resolveUploadUrl(url)} alt="" /> : <>{initial(name)}</>;
+
+function Face({ url, name, two }: { url?: string; name: string; two?: boolean }) {
+  return url ? <img className="avimg" src={resolveUploadUrl(url)} alt="" /> : <>{two ? initials2(name) : initial(name)}</>;
 }
 
-// перекрытые лица с кольцами по состоянию (стрим=красное, голос=зелёное, отошёл=жёлтое) + «+N»
-function Cluster({ members, cap = 5 }: { members: OnlineMember[]; cap?: number }) {
+function memberTitle(m: OnlineMember) {
+  return m.displayName + (m.streaming ? ' · в эфире' : m.inVoice ? ' · в голосе' : m.away ? ' · нет на месте' : ' · в сети');
+}
+
+// перекрытые лица; размер задаёт класс контейнера
+function Stack({ members, cap, className }: { members: OnlineMember[]; cap: number; className: string }) {
   const ord = clusterOrder(members);
   const shown = ord.slice(0, cap);
   const extra = ord.length - shown.length;
-  if (!shown.length) return null;
+  if (!shown.length) return <span />;
   return (
-    <div className="nh-cluster">
+    <span className={'hm-stack ' + className}>
       {shown.map((m) => (
-        <span key={m.username} className={'nh-face' + (m.streaming ? ' live' : m.inVoice ? ' voice' : m.away ? ' away' : '')}
-          style={{ background: faceBg(m.avatarUrl, m.displayName, m.avatarColor) }}
-          title={m.displayName + (m.streaming ? ' · трансляция' : m.inVoice ? ' · в голосе' : m.away ? ' · нет на месте' : ' · в сети')}>
-          <Face url={m.avatarUrl} name={m.displayName} color={m.avatarColor} />
+        <span key={m.username} className="hm-face" title={memberTitle(m)} style={{ background: faceBg(m.avatarUrl, m.displayName, m.avatarColor) }}>
+          <Face url={m.avatarUrl} name={m.displayName} />
         </span>
       ))}
-      {extra > 0 ? <span className="more">+{extra}</span> : null}
-    </div>
+      {extra > 0 ? <span className="hm-more">+{extra}</span> : null}
+    </span>
   );
 }
 
-// ровно один доминирующий сигнал карточки сервера
-function DominantBadge({ s, unread }: { s: ServerSummary; unread: Record<string, number> }) {
-  const d = dominant(s, unread);
-  if (d.kind === 'live') return <span className="nh-badge live"><i className="live-dot" />LIVE</span>;
-  if (d.kind === 'voice') return <span className="nh-badge voice"><Icon name="mic-sm" sm />{d.n}</span>;
-  if (d.kind === 'unread') return <span className="nh-badge unread" title={d.n + ' непрочитанных'}><Icon name="chat" sm />{d.n}</span>;
-  if (d.kind === 'online') return <span className="nh-badge online"><i className="dot-green" />{d.n}</span>;
-  return <span className="nh-badge quiet">тихо</span>;
-}
-
-// живая карточка эфира: одно действие (Смотреть/Зайти) прямо на карточке
-function LiveCard({ item, onOpen }: { item: LiveItem; onOpen: () => void }) {
+// эфир: превью-зона (своего кадра у главной нет — тон и лицо ведущего), под ней кто и где
+function StreamCard({ item, onOpen }: { item: LiveItem; onOpen: () => void }) {
   const s = item.server;
-  const hasStream = item.streamers.length > 0;
-  const active = [...item.streamers, ...item.voice];
   const lead = item.streamers[0];
+  const more = item.streamers.length - 1;
+  const title = lead.displayName + (lead.game ? ' играет в ' + lead.game : ' в эфире');
+  const sub = [s.name, more > 0 ? `ещё ${more} в эфире` : '', item.voice.length ? `${item.voice.length} в голосе` : ''].filter(Boolean).join(' · ');
   return (
-    <div className={'nh-card' + (hasStream ? ' stream' : '')}
-      role="button" tabIndex={0} onClick={onOpen}
-      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen(); } }}>
-      <div className="nh-ct">
-        <span className="nh-srvic" style={{ background: faceBg(s.iconUrl, s.name, s.iconColor) }}><Face url={s.iconUrl} name={s.name} color={s.iconColor} /></span>
-        <span className="nh-srvnm">{s.name}</span>
-        <span className="nh-pills">
-          {hasStream ? <span className="nh-pill live"><i className="live-dot" />LIVE</span> : null}
-          {item.voice.length ? <span className="nh-pill voice"><Icon name="mic-sm" sm />{item.voice.length}</span> : null}
+    <div className="hm-stream" role="button" tabIndex={0} aria-label={`Смотреть: ${title}, ${s.name}`}
+      onClick={onOpen} onKeyDown={onKeyOpen(onOpen)} style={tint(lead.displayName, lead.avatarColor)}>
+      <div className="hm-thumb">
+        <span className="hm-thumb-face" style={{ background: faceBg(lead.avatarUrl, lead.displayName, lead.avatarColor) }}>
+          <Face url={lead.avatarUrl} name={lead.displayName} />
         </span>
+        <span className="hm-tag">Эфир</span>
+        {item.streamers.length > 1 ? <span className="hm-thumb-n"><Icon name="screen" sm />{item.streamers.length}</span> : null}
+        {lead.game ? (
+          <span className="hm-thumb-game">
+            {lead.gicon ? <img src={`data:image/png;base64,${lead.gicon}`} alt="" /> : <Icon name="gamepad" sm />}
+            {lead.game}
+          </span>
+        ) : null}
       </div>
-      {lead ? (
-        <div className="nh-lead">
-          <span className="nh-lead-av" style={{ background: faceBg(lead.avatarUrl, lead.displayName, lead.avatarColor) }}><Face url={lead.avatarUrl} name={lead.displayName} color={lead.avatarColor} /></span>
-          <div className="nh-lead-who"><b>{lead.displayName}{item.streamers.length > 1 ? ` +${item.streamers.length - 1}` : ''}</b><span>Трансляция{lead.inVoice ? ' · и в голосе' : ''}</span></div>
-        </div>
-      ) : null}
-      <div className="nh-cf">
-        {active.length ? <Cluster members={active} cap={6} /> : <span />}
-        <span className="nh-cta" aria-hidden="true"><Icon name={hasStream ? 'play' : 'speaker'} sm />{hasStream ? 'Смотреть' : 'Зайти'}</span>
+      <div className="hm-stream-foot">
+        <span className="hm-av36" style={{ background: faceBg(lead.avatarUrl, lead.displayName, lead.avatarColor) }}>
+          <Face url={lead.avatarUrl} name={lead.displayName} />
+        </span>
+        <span className="hm-stream-meta"><b>{title}</b><span>{sub}</span></span>
+        <span className="hm-btn primary sm" aria-hidden="true">Смотреть</span>
       </div>
     </div>
   );
 }
 
-// плотная карточка сервера: один бейдж-сигнал + кластер присутствия
-function ServerCard({ s, unread, connected, onOpen }: { s: ServerSummary; unread: Record<string, number>; connected: boolean; onOpen: () => void }) {
-  const on = s.online || [];
-  const d = dominant(s, unread);
-  const isLive = d.kind === 'live' || d.kind === 'voice';
+// голос без эфира: сервер, кто говорит, войти
+function VoiceCard({ item, onOpen }: { item: LiveItem; onOpen: () => void }) {
+  const s = item.server;
+  const n = item.voice.length;
+  const names = item.voice.slice(0, 3).map((m) => m.displayName).join(', ') + (n > 3 ? ` и ещё ${n - 3}` : '');
   return (
-    <button className={'nh-srv' + (isLive ? ' live' : '') + (connected ? ' connected' : '')} aria-label={`Открыть сервер ${s.name}`} onClick={onOpen}>
-      <div className="nh-sh">
-        <div className="nh-sic" style={{ background: faceBg(s.iconUrl, s.name, s.iconColor) }}><Face url={s.iconUrl} name={s.name} color={s.iconColor} /></div>
-        <div className="nh-smeta">
-          <div className="nh-snm">{s.name}</div>
-          <div className="nh-ssub">{s.memberCount} {pluralRu(s.memberCount, 'участник', 'участника', 'участников')}{s.role === 'owner' ? ' · владелец' : ''}</div>
-        </div>
-        <DominantBadge s={s} unread={unread} />
+    <div className="hm-voicecard" role="button" tabIndex={0} aria-label={`Зайти в голос: ${s.name}`}
+      onClick={onOpen} onKeyDown={onKeyOpen(onOpen)}>
+      <div className="hm-vc-top">
+        <span className="hm-vc-eye"><Icon name="speaker" sm />Голос · {n} {plural(n, ['участник', 'участника', 'участников'])}</span>
+        <b>{s.name}</b>
+        <span className="hm-vc-names">{names}</span>
       </div>
-      <div className="nh-spres">{on.length ? <Cluster members={on} cap={7} /> : <span className="quiet">тихо</span>}</div>
+      <div className="hm-vc-foot">
+        <Stack members={item.voice} cap={5} className="s40" />
+        <span className="hm-btn panel sm" aria-hidden="true">Зайти</span>
+      </div>
+    </div>
+  );
+}
+
+function serverSub(s: ServerSummary, connected: boolean): { text: string; tone?: 'accent' | 'live' } {
+  const on = s.online || [];
+  const str = on.filter((m) => m.streaming).length;
+  const vc = on.filter((m) => m.inVoice && !m.streaming).length;
+  if (connected) return { text: 'Ты здесь' + (str ? ' · эфир' : vc ? ' · голос' : ''), tone: 'accent' };
+  if (str) return { text: str > 1 ? `эфир · ${str}` : 'эфир', tone: 'live' };
+  if (vc) return { text: `голос · ${vc}` };
+  return { text: 'тихо' };
+}
+
+function ServerCard({ s, unread, connected, onOpen }: { s: ServerSummary; unread: number; connected: boolean; onOpen: () => void }) {
+  const on = s.online || [];
+  const onlineN = s.onlineCount ?? on.length;
+  const sub = serverSub(s, connected);
+  return (
+    <button className={'hm-srv' + (connected ? ' on' : '')} aria-label={`Открыть сервер ${s.name}`} onClick={onOpen}>
+      <span className="hm-srv-top">
+        <span className="hm-srv-ic" style={{ background: faceBg(s.iconUrl, s.name, s.iconColor) }}><Face url={s.iconUrl} name={s.name} two /></span>
+        <span className="hm-srv-meta">
+          <b>{s.name}</b>
+          <span className={sub.tone ? 't-' + sub.tone : undefined}>{sub.text}</span>
+        </span>
+        {unread > 0 ? <span className="hm-unread" title={`${unread} ${plural(unread, ['непрочитанное', 'непрочитанных', 'непрочитанных'])}`}>{unread > 99 ? '99+' : unread}</span> : null}
+      </span>
+      <span className="hm-srv-foot">
+        <Stack members={on} cap={6} className="s24" />
+        <span className="hm-srv-on">{onlineN ? `${onlineN} в сети` : 'никого в сети'}</span>
+      </span>
     </button>
+  );
+}
+
+function GameRow({ g }: { g: GameGroup }) {
+  const names = g.players.slice(0, 3).map((p) => p.displayName).join(', ') + (g.players.length > 3 ? ` и ещё ${g.players.length - 3}` : '');
+  return (
+    <div className="hm-game" title={g.players.map((p) => p.displayName).join(', ')} style={tint(g.name)}>
+      <span className="hm-game-ic">{g.icon ? <img src={`data:image/png;base64,${g.icon}`} alt="" /> : <Icon name="gamepad" />}</span>
+      <span className="hm-game-meta"><b>{g.name}</b><span>{names}</span></span>
+      <span className="hm-game-n">{g.players.length}</span>
+    </div>
   );
 }
 
@@ -114,31 +151,22 @@ function UpdateBanner() {
   const toast = useStore((s) => s.toast);
   const [updating, setUpdating] = useState(false);
   if (updateReady) return (
-    <div className="nh-update">
-      <div className="ui"><Icon name="refresh" /></div>
-      <div className="ut"><b>Вышло обновление</b><span>Обнови страницу — <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd></span></div>
-      <button className="ub" onClick={() => location.reload()}><Icon name="refresh" sm />Обновить</button>
+    <div className="hm-banner">
+      <span className="hm-banner-ic"><Icon name="refresh" /></span>
+      <span className="hm-banner-txt"><b>Вышло обновление</b><span>Обнови страницу — <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd></span></span>
+      <button className="hm-btn primary" onClick={() => location.reload()}><Icon name="refresh" sm />Обновить</button>
     </div>
   );
   if (nativeUpdate) return (
-    <div className="nh-update">
-      <div className="ui"><Icon name="refresh" /></div>
-      <div className="ut"><b>Доступна версия {nativeUpdate.version}</b><span>{updating ? 'Устанавливаю — приложение перезапустится…' : 'Обновить до свежей версии'}</span></div>
-      <button className="ub" disabled={updating} onClick={async () => { setUpdating(true); try { await applyNativeUpdate(); } catch (e: any) { setUpdating(false); toast('Не удалось обновить: ' + (e?.message || e), 'err'); } }}>
+    <div className="hm-banner">
+      <span className="hm-banner-ic"><Icon name="refresh" /></span>
+      <span className="hm-banner-txt"><b>Доступна версия {nativeUpdate.version}</b><span>{updating ? 'Устанавливаю — приложение перезапустится…' : 'Обновить до свежей версии'}</span></span>
+      <button className="hm-btn primary" disabled={updating} onClick={async () => { setUpdating(true); try { await applyNativeUpdate(); } catch (e: any) { setUpdating(false); toast('Не удалось обновить: ' + (e?.message || e), 'err'); } }}>
         {updating ? <span className="spin" /> : <Icon name="refresh" sm />}Установить
       </button>
     </div>
   );
   return null;
-}
-
-function SectionHead({ eyebrow, title, detail, tone }: { eyebrow: string; title: string; detail?: string; tone?: 'live' | 'accent' }) {
-  return (
-    <div className={'nh-sec-h' + (tone ? ' ' + tone : '')}>
-      <div><span className="eye">{eyebrow}</span><h2>{title}</h2></div>
-      {detail ? <span className="detail">{detail}</span> : null}
-    </div>
-  );
 }
 
 export function Home() {
@@ -165,134 +193,116 @@ export function Home() {
   const games = useMemo(() => deriveGames(servers), [servers]);
   const ranked = useMemo(() => rankServers(servers, unread), [servers, unread]);
   const shown = useMemo(() => ranked.filter((s) => filter === 'unread' ? (unread[s.id] || 0) > 0 : filter === 'mine' ? s.role === 'owner' : true), [ranked, filter, unread]);
-  const totalOnline = useMemo(() => {
-    const uniq = new Set<string>();
-    for (const s of servers) for (const m of s.online || []) uniq.add(m.username);
-    return uniq.size || servers.reduce((n, s) => n + (s.onlineCount || 0), 0);
-  }, [servers]);
-  const totalUnread = servers.reduce((n, s) => n + (unread[s.id] || 0), 0);
-  const totalLiveServers = servers.filter((s) => (s.online || []).some((m) => m.streaming || m.inVoice)).length; // без кэпа 8 (live обрезан для показа)
-  const gamePlayers = games.reduce((n, g) => n + g.players.length, 0);
-  const waiting = ranked.filter((s) => (unread[s.id] || 0) > 0);
-  const voiceServer = eng.voiceServerId ? servers.find((s) => s.id === eng.voiceServerId) : null;
+  const liveServers = servers.filter((s) => (s.online || []).some((m) => m.streaming || m.inVoice)).length; // без кэпа 8
+  const voiceServer = eng.inVoice && eng.voiceServerId ? servers.find((s) => s.id === eng.voiceServerId) : null;
   const connectedServer = connectedId ? servers.find((s) => s.id === connectedId) : null;
-  const recent = ranked.slice(0, 3);
-  const firstName = me.displayName.split(' ')[0];
+  const recent = connectedServer ? [connectedServer] : ranked.slice(0, 3);
 
-  const header = (
-    <header className="nh-hd">
-      <div className="nh-brand"><LogoLoader size={26} animate={false} /><span>Рилэй</span></div>
-      <div className={'nh-online' + (totalOnline ? ' live' : '')} aria-live="polite"><i className="nh-dot" />{totalOnline ? `${totalOnline} онлайн` : 'никого в сети'}</div>
-      <div className="nh-actions">
-        <button className="nh-btn primary" aria-label="Создать сервер" onClick={() => setModal('create')}><Icon name="plus" sm /><span>Создать</span></button>
-        <button className="nh-btn" aria-label="Войти по приглашению" onClick={() => setModal('join')}><Icon name="link" sm /><span>Войти</span></button>
-        <button className="nh-me" aria-label="Профиль" onClick={() => setModal('profile')} style={{ background: faceBg(me.avatarUrl, me.displayName, me.avatarColor) }}><Face url={me.avatarUrl} name={me.displayName} color={me.avatarColor} /></button>
+  const head = (title: string) => (
+    <header className="hm-head">
+      <h1>{title}</h1>
+      <div className="hm-head-actions">
+        {voiceServer ? (
+          <button className="hm-btn voice" onClick={() => openServer(voiceServer.id)} aria-label={`Вернуться в голос: ${voiceServer.name}`}>
+            <i className="hm-dot" /><span>Ты в голосе · {voiceServer.name}</span>
+          </button>
+        ) : null}
+        <button className="hm-btn" onClick={() => setModal('join')} aria-label="Войти по приглашению"><Icon name="link" sm /><span>По приглашению</span></button>
+        <button className="hm-btn primary" onClick={() => setModal('create')} aria-label="Создать сервер"><Icon name="plus" sm /><span>Создать сервер</span></button>
+        <button className="hm-me" aria-label="Профиль" onClick={() => setModal('profile')} style={{ background: faceBg(me.avatarUrl, me.displayName, me.avatarColor) }}>
+          <Face url={me.avatarUrl} name={me.displayName} />
+        </button>
       </div>
     </header>
   );
 
-  // ---------- Первый запуск: единственное место, где уместно большое приветствие ----------
+  // ---------- Первый запуск ----------
   if (!servers.length) {
     return (
-      <section className="nh">
-        {header}
-        <div className="nh-body"><div className="nh-inner nh-enter">
-          <UpdateBanner />
-          <div className="nh-first">
-            <div>
-              <h1>Привет, {firstName}</h1>
-              <p className="sub">Серверов пока нет. Создай свой или войди по приглашению.</p>
-            </div>
-            <div className="nh-steps">
-              <div className="nh-step"><span className="snum">01</span><span className="sic"><Icon name="plus" /></span><b>Создай сервер</b><p>Голосовые каналы и общий чат.</p></div>
-              <div className="nh-step"><span className="snum">02</span><span className="sic"><Icon name="link" /></span><b>Позови друзей</b><p>Отправь им короткую ссылку.</p></div>
-              <div className="nh-step"><span className="snum">03</span><span className="sic"><Icon name="speaker" /></span><b>Зайди в голос</b><p>Говори и показывай экран.</p></div>
-            </div>
-            <div className="cta-row">
-              <button className="nh-btn primary" onClick={() => setModal('create')}><Icon name="plus" sm /><span>Создать сервер</span></button>
-              <button className="nh-btn" onClick={() => setModal('join')}><Icon name="link" sm /><span>Войти по приглашению</span></button>
-            </div>
+      <section className="hm first">
+        <UpdateBanner />
+        <div className="hm-first">
+          <h1>Серверов пока нет</h1>
+          <p>Создай сервер или войди по приглашению.</p>
+          <div className="hm-first-cta">
+            <button className="hm-btn primary lg" onClick={() => setModal('create')}><Icon name="plus" sm /><span>Создать сервер</span></button>
+            <button className="hm-btn lg" onClick={() => setModal('join')}><Icon name="link" sm /><span>Войти по приглашению</span></button>
           </div>
-          <DownloadCard />
-        </div></div>
+        </div>
       </section>
     );
   }
 
-  // ---------- Возвращающийся пользователь ----------
+  const emptyCopy = filter === 'unread'
+    ? { t: 'Всё прочитано', d: 'Новых сообщений нет.' }
+    : filter === 'mine' ? { t: 'Своих серверов нет', d: 'Создай сервер — он появится здесь.' } : { t: 'Серверов нет', d: 'Создай сервер или войди по приглашению.' };
+
   return (
-    <section className="nh">
-      {header}
-      <div className="nh-body"><div className="nh-inner nh-enter">
-        <UpdateBanner />
+    <section className="hm">
+      {head('Главная')}
+      <UpdateBanner />
 
-        {eng.inVoice && voiceServer ? (
-          <button className="nh-resume" onClick={() => openServer(voiceServer.id)}>
-            <i className="nh-dot" />Вернуться в голос · {voiceServer.name}
-          </button>
-        ) : null}
-
-        {live.length ? (
-          <section className="nh-sec">
-            <SectionHead eyebrow="Живое" title="Сейчас в эфире" tone="live" detail={`${totalLiveServers} ${pluralRu(totalLiveServers, 'активный сервер', 'активных сервера', 'активных серверов')}`} />
-            <div className="nh-live">{live.map((it) => <LiveCard key={it.key} item={it} onOpen={() => openServer(it.server.id, it.streamers[0]?.username)} />)}</div>
-          </section>
-        ) : (
-          <div className="nh-quiet">
-            <span className="nh-qic"><Icon name="screen" sm /></span>
-            <span>Сейчас никто не в эфире</span>
-            {connectedServer ? <span className="nh-recent"><button className="nh-chip" onClick={() => openServer(connectedServer.id)}><i className="nh-dot" style={{ background: 'var(--accent)' }} />Вернуться в {connectedServer.name}</button></span>
-              : recent.length ? <span className="nh-recent">{recent.map((s) => <button key={s.id} className="nh-chip" onClick={() => openServer(s.id)}><span className="nh-ci" style={{ background: faceBg(s.iconUrl, s.name, s.iconColor) }}><Face url={s.iconUrl} name={s.name} color={s.iconColor} /></span>{s.name}</button>)}</span> : null}
+      {live.length ? (
+        <section className="hm-sec">
+          <div className="hm-sec-h"><h2>Сейчас в эфире</h2><span>{liveServers} {plural(liveServers, ['активный сервер', 'активных сервера', 'активных серверов'])}</span></div>
+          <div className="hm-live">
+            {live.map((it) => it.streamers.length
+              ? <StreamCard key={it.key} item={it} onOpen={() => openServer(it.server.id, it.streamers[0]?.username)} />
+              : <VoiceCard key={it.key} item={it} onOpen={() => openServer(it.server.id)} />)}
           </div>
-        )}
+        </section>
+      ) : (
+        <div className="hm-quiet">
+          <span className="hm-quiet-ic"><Icon name="screen" /></span>
+          <span className="hm-quiet-txt"><b>Сейчас никто не в эфире</b>{recent.length ? <span>{connectedServer ? 'Вернуться:' : 'Недавние:'}</span> : null}</span>
+          {recent.length ? (
+            <span className="hm-quiet-chips">
+              {recent.map((s) => (
+                <button key={s.id} className="hm-chip" onClick={() => openServer(s.id)}>
+                  <span className="hm-chip-ic" style={{ background: faceBg(s.iconUrl, s.name, s.iconColor) }}><Face url={s.iconUrl} name={s.name} two /></span>
+                  {s.name}
+                </button>
+              ))}
+            </span>
+          ) : null}
+        </div>
+      )}
 
-        {waiting.length ? (
-          <section className="nh-sec">
-            <SectionHead eyebrow="Непрочитанное" title="Тебя ждут" tone="accent" detail={`${totalUnread} ${pluralRu(totalUnread, 'новое сообщение', 'новых сообщения', 'новых сообщений')}`} />
-            <div className="nh-wait">
-              {waiting.map((s) => (
-                <button key={s.id} className="nh-chip" onClick={() => openServer(s.id, undefined, 'main')}>
-                  <span className="nh-ci" style={{ background: faceBg(s.iconUrl, s.name, s.iconColor) }}><Face url={s.iconUrl} name={s.name} color={s.iconColor} /></span>
-                  {s.name}<span className="nh-cnum">{unread[s.id]}</span>
+      <div className={'hm-split' + (games.length ? ' has-games' : '')}>
+        <section className="hm-sec hm-servers">
+          <div className="hm-sec-h">
+            <h2>Твои серверы</h2>
+            <div className="hm-seg" role="radiogroup" aria-label="Фильтр серверов">
+              {(['all', 'unread', 'mine'] as const).map((f) => (
+                <button key={f} role="radio" aria-checked={filter === f} className={filter === f ? 'on' : undefined} onClick={() => setFilter(f)}>
+                  {f === 'all' ? 'Все' : f === 'unread' ? 'Непрочитанное' : 'Мои'}
                 </button>
               ))}
             </div>
-          </section>
-        ) : null}
-
-        <section className="nh-sec">
-          <SectionHead eyebrow="Пространства" title="Твои серверы" detail={`${shown.length} из ${servers.length}`} />
-          <div className="nh-filters">
-            {(['all', 'unread', 'mine'] as const).map((f) => (
-              <button key={f} className={'nh-fchip' + (filter === f ? ' on' : '')} aria-pressed={filter === f} onClick={() => setFilter(f)}>{f === 'all' ? 'Все' : f === 'unread' ? 'Непрочитанное' : 'Мои'}</button>
-            ))}
           </div>
-          <div className="nh-grid">
-            {shown.length ? shown.map((s) => <ServerCard key={s.id} s={s} unread={unread} connected={connectedId === s.id} onOpen={() => openServer(s.id)} />)
-              : <div className="nh-empty">
-                <span className="nh-eic"><Icon name="search" /></span>
-                <div role="status"><b>{filter === 'unread' ? 'Всё прочитано' : filter === 'mine' ? 'Своих серверов нет' : 'Серверов пока нет'}</b><p>{filter === 'unread' ? 'Новых сообщений сейчас нет.' : 'Создай сервер — он появится здесь.'}</p></div>
-                <button type="button" onClick={() => setFilter('all')}>Показать все</button>
-              </div>}
-          </div>
+          {shown.length ? (
+            <div className="hm-grid">
+              {shown.map((s) => <ServerCard key={s.id} s={s} unread={unread[s.id] || 0} connected={connectedId === s.id} onOpen={() => openServer(s.id)} />)}
+            </div>
+          ) : (
+            <div className="hm-empty" role="status">
+              <span className="hm-empty-ic"><Icon name={filter === 'unread' ? 'check' : 'search'} /></span>
+              <b>{emptyCopy.t}</b>
+              <span>{emptyCopy.d}</span>
+              <button type="button" className="hm-btn" onClick={() => setFilter('all')}>Показать все серверы</button>
+            </div>
+          )}
         </section>
 
         {games.length ? (
-          <details className="nh-games">
-            <summary><Icon name="screen" sm />Играют сейчас<span className="gcount"> · {gamePlayers} {pluralRu(gamePlayers, 'игрок', 'игрока', 'игроков')}</span><span className="chev"><Icon name="chevron" sm /></span></summary>
-            <div className="nh-gamesgrid">
-              {games.map((g: GameGroup) => (
-                <div className="nh-game" key={g.name} title={g.players.map((p) => p.displayName).join(', ')}>
-                  <div className="gi">{g.icon ? <img src={`data:image/png;base64,${g.icon}`} alt="" /> : '🎮'}</div>
-                  <div className="gb"><div className="gn">{g.name}</div><div className="gp"><Cluster members={g.players} cap={5} /><span className="gcnt">{g.players.length}</span></div></div>
-                </div>
-              ))}
-            </div>
-          </details>
+          <section className="hm-sec hm-games-col">
+            <div className="hm-sec-h"><h2>Играют сейчас</h2></div>
+            <div className="hm-games">{games.map((g) => <GameRow key={g.name} g={g} />)}</div>
+          </section>
         ) : null}
+      </div>
 
-        <DownloadCard />
-      </div></div>
+      <DownloadCard />
     </section>
   );
 }

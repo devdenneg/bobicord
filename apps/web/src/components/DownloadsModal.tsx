@@ -66,8 +66,8 @@ export function DownloadsModal() {
   }
 
   return (
-    <Backdrop onClose={close} label="Загрузки">
-      <h2><Icon name="download" />Загрузки</h2>
+    <Backdrop onClose={close} label="Загрузки" boxClass="box-dialog box-downloads">
+      <h2>Загрузки</h2>
       <p className="msub">{isTauri ? 'Файлы, сохранённые из чата. Клик по имени — открыть, значок папки — показать в проводнике.' : 'Файлы, сохранённые из чата на этом устройстве.'}</p>
       {items.length ? (
         <div className="dl-list">
@@ -89,7 +89,7 @@ export function DownloadsModal() {
           })}
         </div>
       ) : <div className="dl-empty">Тут появятся файлы, которые ты сохранишь из чата.</div>}
-      <button className="close" onClick={close}>Готово</button>
+      <button className="primary" onClick={close}>Готово</button>
     </Backdrop>
   );
 }

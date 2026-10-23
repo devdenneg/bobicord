@@ -51,7 +51,8 @@ export function NotificationPermissionPrompt() {
   return (
     <aside className="notification-preprompt" aria-label="Включить уведомления">
       <span className="notification-preprompt-icon"><Icon name="bell" /></span>
-      <div><b>Не пропускай ответы</b><p>RelayApp сможет сообщить об упоминаниях и открыть нужное сообщение. Содержимое можно скрыть в настройках.</p></div>
+      <b>Уведомления</b>
+      <p>Упоминания и начало эфиров — даже когда окно свёрнуто. Текст сообщений можно скрыть в настройках.</p>
       <div className="notification-preprompt-actions">
         <button onClick={dismiss} disabled={requesting}>Не сейчас</button>
         <button className="primary" onClick={() => void enable()} disabled={requesting}>{requesting ? 'Запрашиваем…' : 'Включить'}</button>

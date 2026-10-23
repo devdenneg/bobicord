@@ -265,8 +265,9 @@ function DeviceMenu({ kind, up }: { kind: 'input' | 'output'; up?: boolean }) {
   </>;
 }
 
-// Ряд контролов: мик (+▾ вход), наушники/оглох (+▾ вывод), трансляция, настройки. up — меню вверх (для дока внизу).
-export function VoiceControls({ up }: { up?: boolean }) {
+// Ряд контролов: мик (+▾ вход), наушники/оглох (+▾ вывод), трансляция и последней кнопкой — настройки,
+// а в голосовом доке (dock) — выход из канала. up — меню вверх (для дока внизу).
+export function VoiceControls({ up, dock }: { up?: boolean; dock?: boolean }) {
   const eng = useEngine();
   const E = getEngine()!;
   const mode = getSettings().mode;
@@ -293,7 +294,9 @@ export function VoiceControls({ up }: { up?: boolean }) {
         <DeviceMenu kind="output" up={up} />
       </div>
       {isTauri ? <NativeBroadcastButton /> : <ShareButton />}
-      <button className="vd-btn vd-set" aria-label="Настройки звука" data-tip="Настройки звука" onClick={() => useStore.getState().setModal('settings')}><Icon name="gear" sm /></button>
+      {dock
+        ? <button className="vd-btn vd-leave" aria-label="Выйти из голосового канала" data-tip="Выйти из голосового" onClick={() => E.leaveVoice()}><Icon name="hangup" sm /></button>
+        : <button className="vd-btn vd-set" aria-label="Настройки звука" data-tip="Настройки звука" onClick={() => useStore.getState().setModal('settings')}><Icon name="gear" sm /></button>}
     </div>
   );
 }
@@ -326,20 +329,47 @@ function VoicePanel({ controls }: { controls?: boolean }) {
     : disconnected ? 'нет соединения'
       : q === 'excellent' ? 'отличное' : q === 'good' ? 'хорошее' : q === 'poor' ? 'слабое' : q === 'lost' ? 'потеряно' : 'соединение…';
   const qTip = (connection === 'connected' && eng.voicePing != null ? eng.voicePing + ' мс' : '—') + ' · ' + qLabel;
-  const status = connection === 'reconnecting' ? 'Переподключение…'
+  const status = connection === 'reconnecting' ? 'Восстанавливаем…'
     : disconnected ? 'Нет соединения'
-      : connection === 'connecting' ? 'Подключение…' : 'Голосовая связь подключена';
+      : connection === 'connecting' ? 'Подключение…' : 'Голос подключён';
+  const paused = connection === 'reconnecting' || disconnected;
   return (
-    <div className="vd-panel">
+    <div className={'vd-panel is-' + connection}>
       <div className="vd-status">
         <button className="vd-info" onClick={goToVoice} data-tip={canReconnect ? 'Переподключиться' : 'К голосовому серверу'}>
           <span className="vd-mark"><Icon name="speaker" sm /></span>
-          <div className="vd-txt"><b>{status}</b><span>{chName ? chName + ' · ' : ''}{srvName}</span></div>
+          <div className="vd-txt"><b>{status}</b><span>{paused ? 'Голос на паузе' : (chName ? chName + ' · ' : '') + srvName}</span></div>
         </button>
-        <div className={'conn-ind q-' + q} data-tip={qTip} aria-label={'Качество связи: ' + qTip} tabIndex={0}><i /><i /><i /></div>
-        <button className="vd-btn vd-leave" aria-label={disconnected ? 'Скрыть отключённый голосовой канал' : 'Выйти из голосового канала'} data-tip={disconnected ? 'Скрыть' : 'Выйти из голосового'} onClick={() => disconnected ? E.dismissLostVoice() : E.leaveVoice()}><Icon name="leave" sm /></button>
+        {connection === 'connected' && eng.voicePing != null
+          ? <span className={'vd-ping q-' + q} data-tip={qTip} aria-label={'Качество связи: ' + qTip} tabIndex={0}>{eng.voicePing} мс</span>
+          : <div className={'conn-ind q-' + q} data-tip={qTip} aria-label={'Качество связи: ' + qTip} tabIndex={0}><i /><i /><i /></div>}
+        {/* без контролов (связь потеряна / не в голосе) выход остаётся тут; в голосе он в ряду кнопок */}
+        {!(controls && eng.inVoice)
+          ? <button className="vd-btn vd-leave" aria-label={disconnected ? 'Скрыть отключённый голосовой канал' : 'Выйти из голосового канала'} data-tip={disconnected ? 'Скрыть' : 'Выйти из голосового'} onClick={() => disconnected ? E.dismissLostVoice() : E.leaveVoice()}><Icon name={disconnected ? 'close' : 'hangup'} sm /></button>
+          : null}
       </div>
-      {controls && eng.inVoice ? <VoiceControls up /> : null}
+      {controls && eng.inVoice ? <VoiceControls up dock /> : null}
+    </div>
+  );
+}
+
+// Мобильная полоса голоса (Paper М · Сервер — чат): над вкладками, пока открыт чат или участники.
+// Только самое нужное — мик и выход; полный набор контролов живёт во вкладке «Каналы».
+export function VoiceStrip() {
+  const eng = useEngine();
+  const E = getEngine();
+  const active = useStore((s) => s.active);
+  if (!E || !eng.inVoice || !eng.voiceServerId) return null;
+  const onThisServer = active?.id === eng.voiceServerId;
+  const ch = onThisServer ? active?.channels?.find((c) => c.id === eng.myVoiceChannel)?.name : '';
+  const peers = onThisServer ? Object.values(eng.presence).filter((p) => p?.inVoice).length : 0;
+  const muted = eng.localMicMuted;
+  return (
+    <div className="mob-voice" role="group" aria-label="Голосовой канал">
+      <span className="mv-bars" aria-hidden="true"><i /><i /><i /><i /></span>
+      <span className="mv-txt"><b>В голосе{ch ? ' · ' + ch : ''}</b><span>{peers ? `${peers} ${peers % 10 === 1 && peers % 100 !== 11 ? 'человек' : peers % 10 >= 2 && peers % 10 <= 4 && (peers % 100 < 12 || peers % 100 > 14) ? 'человека' : 'человек'}` : 'голос подключён'}{eng.voicePing != null ? ` · ${eng.voicePing} мс` : ''}</span></span>
+      <button className={'mv-btn' + (muted ? ' on' : '')} aria-pressed={muted} aria-label={muted ? 'Включить микрофон' : 'Выключить микрофон'} onClick={() => E.toggleMic()}><Icon name={muted ? 'mic-off' : 'mic'} sm /></button>
+      <button className="mv-btn leave" aria-label="Выйти из голосового канала" onClick={() => E.leaveVoice()}><Icon name="hangup" sm /></button>
     </div>
   );
 }
@@ -349,8 +379,8 @@ function VoicePanel({ controls }: { controls?: boolean }) {
 export function VoiceDock({ variant }: { variant: 'inline' | 'floating' }) {
   const eng = useEngine();
   if ((!eng.inVoice || !eng.voiceServerId) && !eng.lostVoiceServerId) return null;
-  // inline (server-view): контролы в нижней аккаунт-панели, тут только статус+выход+музыка.
-  // floating (главная): аккаунт-панели нет → контролы здесь.
-  if (variant === 'inline') return <div className="vd-inline"><VoicePanel controls={false} /></div>;
+  // Одна карточка: статус + ряд контролов с выходом (как в макете). Нижняя панель колонки каналов
+  // в голосе не рисуется, чтобы контролы не дублировались (см. Channels).
+  if (variant === 'inline') return <div className="vd-inline"><VoicePanel controls /></div>;
   return <div id="voicedock"><VoicePanel controls /></div>;
 }

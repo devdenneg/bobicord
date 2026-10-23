@@ -12,8 +12,8 @@ export function DownloadCard() {
   return (
     <div className="dl-card">
       <div className="dl-ic"><Icon name="download" /></div>
-      <div className="dl-txt"><b>Рилэй для рабочего стола</b></div>
-      <a className="dl-btn" href={dl.url} download><Icon name="download" sm />Скачать</a>
+      <div className="dl-txt"><b>Рилэй для Windows</b><span>Эфир 1080p60, звук игры, игровой статус</span></div>
+      <a className="dl-btn" href={dl.url} download>Скачать · v{dl.version}</a>
     </div>
   );
 }

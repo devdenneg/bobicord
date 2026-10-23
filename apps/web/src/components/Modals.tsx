@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent as ReactKeyboardEvent } from 'react';
+import { useEffect, useRef, useState, type CSSProperties, type FormEvent, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { api, isApiError, resolveUploadUrl, setToken, webOrigin } from '../api';
 import {
   beginAuthSessionHandoff,
@@ -12,12 +12,13 @@ import { ACCENTS, THEME_MODES, getAccent, getThemeMode, setAccent, setThemeMode 
 import { playSound } from '../sounds';
 import { Icon } from '../Icon';
 import { MicMeter } from './MicMeter';
-import { AV_COLORS, avColor, downscaleImage, initial, keyLabel, comboLabel } from '../util';
+import { AV_COLORS, avColor, downscaleImage, initial, initials2, keyLabel, comboLabel, plural } from '../util';
 import type { AudioSettings, InvitePreview, Role, Member, KeybindAction } from '../types';
 import { PERM, PERM_LIST, hasPerm } from '../types';
 import { Backdrop } from './Backdrop';
 import { BroadcastModal } from './BroadcastModal';
 import { DownloadsModal } from './DownloadsModal';
+import { SHORTCUTS } from './CommandOverlays';
 import { LeaderboardModal } from './Leaderboard';
 import { ReleaseHistoryModal } from './ReleaseHistoryModal';
 import { normalizeProfileBanner, ProfileBannerMedia } from './ProfileBanner';
@@ -40,13 +41,25 @@ function CreateModal() {
     try { const d = await api.createServer(name.trim()); close(); await useStore.getState().loadMe(); await useStore.getState().openServer(d.server.id, undefined, 'channels'); useStore.getState().toast('Сервер создан', 'ok'); }
     catch (e: any) { setErr(e.message); } finally { setBusy(false); }
   }
-  return <Backdrop onClose={close} label="Создать сервер">
-    <h2><Icon name="plus" />Создать сервер</h2>
+  return <Backdrop onClose={close} label="Создать сервер" boxClass="box-dialog">
+    <JoinCreateTabs current="create" />
+    <h2>Новый сервер</h2>
     <p className="msub">Сервер приватный — попасть можно только по приглашению. Пригласишь друзей ссылкой из меню сервера.</p>
-    <div className="fld"><label>Название</label><input autoFocus value={name} maxLength={40} placeholder="Например: Наша тусовка" onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && create()} /></div>
-    <div className="rowbtns"><button className="ghost" style={{ margin: 0 }} onClick={close}>Отмена</button><button className="primary" style={{ margin: 0 }} disabled={busy} onClick={create}>Создать</button></div>
-    <div className="err">{err}</div>
+    <div className="fld"><label htmlFor="create-server-name">Название</label><input id="create-server-name" autoFocus value={name} maxLength={40} placeholder="Например: Наша тусовка" onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && create()} /></div>
+    <div className="rowbtns"><button className="ghost" onClick={close}>Отмена</button><button className="primary" disabled={busy} onClick={create}>{busy ? <span className="spin" /> : null}Создать сервер</button></div>
+    <div className="err" role="alert">{err}</div>
   </Backdrop>;
+}
+
+// Создать / войти по коду — один диалог с переключателем (две модалки store, общий заголовок).
+function JoinCreateTabs({ current }: { current: 'create' | 'join' }) {
+  const setModal = useStore.getState().setModal;
+  return (
+    <div className="tabs2 dlg-tabs" role="tablist" aria-label="Сервер">
+      <button type="button" role="tab" aria-selected={current === 'create'} className={current === 'create' ? 'active' : ''} onClick={() => current !== 'create' && setModal('create')}>Создать</button>
+      <button type="button" role="tab" aria-selected={current === 'join'} className={current === 'join' ? 'active' : ''} onClick={() => current !== 'join' && setModal('join')}>Войти по коду</button>
+    </div>
+  );
 }
 
 function extractCode(v: string) { v = v.trim(); const m = v.match(/[?&]invite=([^&\s]+)/); if (m) return m[1]; return v; }
@@ -65,18 +78,19 @@ function JoinModal() {
     try { const d = await api.joinInvite(cc); close(); await useStore.getState().loadMe(); await useStore.getState().openServer(d.server.id, undefined, 'channels'); useStore.getState().toast('Ты на сервере «' + d.server.name + '»', 'ok'); }
     catch (e: any) { setErr(e.message); } finally { setBusy(false); }
   }
-  return <Backdrop onClose={close} label="Присоединиться">
-    <h2><Icon name="link" />Присоединиться</h2>
-    <p className="msub">Вставь код приглашения или полную ссылку. Ссылка действует 30 минут.</p>
-    <div className="fld"><label>Код или ссылка</label><input autoFocus value={code} placeholder="напр. aBc123 или https://.../?invite=..." onChange={(e) => onCode(e.target.value)} /></div>
-    {preview ? <div style={{ background: 'var(--bg2)', border: '1px solid var(--line-2)', borderRadius: 'var(--r-md)', padding: 12, marginBottom: 12 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-        <div style={{ width: 40, height: 40, borderRadius: 12, background: avColor(preview.server.name, preview.server.iconColor), display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 600, color: 'var(--av-ink)' }}>{initial(preview.server.name)}</div>
-        <div><b style={{ color: 'var(--txt-h)' }}>{preview.server.name}</b><div style={{ fontSize: 12.5, color: 'var(--muted)' }}>{preview.server.memberCount} участник(ов)</div></div>
-      </div>
+  return <Backdrop onClose={close} label="Присоединиться" boxClass="box-dialog">
+    <JoinCreateTabs current="join" />
+    <h2>Вход по приглашению</h2>
+    <p className="msub">Вставь ссылку или код. Ссылка действует 30 минут.</p>
+    <div className="fld"><label htmlFor="join-code" className="sr-only">Код или ссылка</label>
+      <input id="join-code" className="join-code" autoFocus value={code} autoComplete="off" autoCapitalize="none" spellCheck={false} placeholder="Код или ссылка" onChange={(e) => onCode(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && join()} />
+    </div>
+    {preview ? <div className="join-preview">
+      <span className="jp-ic" style={{ background: avColor(preview.server.name, preview.server.iconColor) }}>{initials2(preview.server.name)}</span>
+      <span className="jp-txt"><b>{preview.server.name}</b><i>{preview.server.memberCount} {plural(preview.server.memberCount, ['участник', 'участника', 'участников'])}</i></span>
     </div> : null}
-    <div className="rowbtns"><button className="ghost" style={{ margin: 0 }} onClick={close}>Отмена</button><button className="primary" style={{ margin: 0 }} disabled={busy} onClick={join}>Войти</button></div>
-    <div className="err">{err}</div>
+    <button className="primary" disabled={busy} onClick={join}>{busy ? <span className="spin" /> : null}Присоединиться</button>
+    <div className="err" role="alert">{err}</div>
   </Backdrop>;
 }
 
@@ -438,16 +452,17 @@ function ServerMenuModal() {
     try { if (owner) await api.deleteServer(active.id); else await api.leaveServer(active.id); close(); useStore.getState().toast(owner ? 'Сервер удалён' : 'Ты покинул сервер', 'ok'); useStore.getState().exitServer(); }
     catch (e: any) { setErr(e.message); setBusy(false); }
   }
-  return <Backdrop onClose={close} label="Сервер">
-    <div className="srv-menu-head">
-      <div className="sm-ic" style={{ background: active.iconUrl ? '#0000' : avColor(active.name, active.iconColor) }}>{active.iconUrl ? <img className="avimg" src={resolveUploadUrl(active.iconUrl)} alt="" /> : initial(active.name)}</div>
-      <div><h2 style={{ margin: 0 }}>{active.name}</h2><p className="msub" style={{ margin: '2px 0 0' }}>{active.memberCount} участник(ов){owner ? ' · ты владелец' : ''}</p></div>
+  const go = (m: Parameters<ReturnType<typeof useStore.getState>['setModal']>[0]) => useStore.getState().setModal(m);
+  return <Backdrop onClose={close} label="Меню сервера" boxClass="box-menu">
+    <div className="menu-head">
+      <span className="sm-ic" style={{ background: active.iconUrl ? '#0000' : avColor(active.name, active.iconColor) }}>{active.iconUrl ? <img className="avimg" src={resolveUploadUrl(active.iconUrl)} alt="" /> : initials2(active.name)}</span>
+      <span className="menu-head-txt"><b>{active.name}</b><i>{active.memberCount} {plural(active.memberCount, ['участник', 'участника', 'участников'])}{owner ? ' · ты владелец' : ''}</i></span>
     </div>
-    {active.description ? <p className="msub" style={{ marginTop: 4 }}>{active.description}</p> : null}
-    <div className="rowbtns">
-      <button className="sm-act" onClick={() => useStore.getState().setModal('invite')}><Icon name="link" sm />Пригласить</button>
-      {canManage ? <button className="sm-act accent" onClick={() => useStore.getState().setModal('srvsettings')}><Icon name="gear" sm />Настройки сервера</button> : null}
-    </div>
+    {active.description ? <p className="menu-desc">{active.description}</p> : null}
+    <button className="menu-item" onClick={() => go('invite')}><Icon name="link" sm />Пригласить людей</button>
+    {canManage ? <button className="menu-item" onClick={() => go('srvsettings')}><Icon name="gear" sm />Настройки сервера</button> : null}
+    {active.statsEnabled ? <button className="menu-item" onClick={() => go('leaderboard')}><Icon name="crown" sm />Лидеры недели</button> : null}
+    <div className="menu-sep" />
     {confirming ? (
       <div className="danger-confirm" role="alert">
         <span className="danger-confirm-icon"><Icon name="warn" /></span>
@@ -458,12 +473,9 @@ function ServerMenuModal() {
         </div>
       </div>
     ) : (
-      <div className="rowbtns">
-        <button className="sm-act" onClick={close}>Закрыть</button>
-        <button className="sm-act danger" onClick={() => setConfirming(true)}><Icon name="leave" sm />{owner ? 'Удалить сервер' : 'Покинуть сервер'}</button>
-      </div>
+      <button className="menu-item danger" onClick={() => setConfirming(true)}><Icon name="hangup" sm />{owner ? 'Удалить сервер' : 'Покинуть сервер'}</button>
     )}
-    <div className="err">{err}</div>
+    {err ? <div className="err" role="alert">{err}</div> : null}
   </Backdrop>;
 }
 
@@ -484,13 +496,17 @@ function InviteModal() {
   }, [expires]);
   const copy = (v: string) => { if (v) navigator.clipboard.writeText(v).then(() => useStore.getState().toast('Скопировано', 'ok')); };
   const expired = left === 'истекло';
-  return <Backdrop onClose={close} label="Пригласить">
-    <h2><Icon name="link" />Пригласить друзей</h2>
-    <p className="msub">Ссылка одноразово живёт 30 минут. Просрочилась — жми «Новая ссылка».</p>
-    <div className="invite-box"><input readOnly value={link} /><button aria-label="Копировать ссылку приглашения" data-tip="Копировать" disabled={!link || expired} onClick={() => copy(link)}><Icon name="copy" sm /></button></div>
-    <div style={{ fontSize: 12.5, color: expired ? 'var(--red)' : 'var(--muted)', margin: '8px 2px 0' }}>{link ? (expired ? 'Ссылка истекла — создай новую' : `Действует ещё: ${left}`) : 'Создаю ссылку…'}</div>
-    <button className="ghost" style={{ marginTop: 12 }} disabled={busy} onClick={gen}><Icon name="refresh" sm />Новая ссылка</button>
-    <button className="close" onClick={close}>Готово</button>
+  return <Backdrop onClose={close} label="Пригласить" boxClass="box-dialog">
+    <h2>Пригласить</h2>
+    <p className="msub">Ссылка в «{active.name}» — действует 30 минут, одноразовая.</p>
+    <div className="invite-box">
+      <input readOnly value={link || 'Создаю ссылку…'} aria-label="Ссылка приглашения" onFocus={(e) => e.currentTarget.select()} />
+      <button aria-label="Копировать ссылку приглашения" disabled={!link || expired} onClick={() => copy(link)}><Icon name="link" sm />Копировать</button>
+    </div>
+    <div className="invite-meta">
+      <span className={expired ? 'bad' : undefined}>{link ? (expired ? 'Ссылка истекла — создай новую' : `Действует ещё ${left}`) : ''}</span>
+      <button type="button" className="invite-new" disabled={busy} onClick={gen}><Icon name="refresh" sm />Новая ссылка</button>
+    </div>
   </Backdrop>;
 }
 
@@ -517,15 +533,18 @@ function ServerSettingsModal() {
       <nav className="settings-nav">
         <div className="settings-nav-h" title={active.name} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{active.name}</div>
         {cats.map((c) => (
-          <button key={c.id} className={tab === c.id ? 'active' : ''} onClick={() => setTab(c.id)}><Icon name={c.icon} />{c.label}</button>
+          <button key={c.id} className={tab === c.id ? 'active' : ''} aria-current={tab === c.id ? 'page' : undefined} onClick={() => setTab(c.id)}><Icon name={c.icon} />{c.label}</button>
         ))}
       </nav>
       <div className="settings-main">
-        <button className="settings-x" onClick={close} aria-label="Закрыть"><Icon name="close" /></button>
+        <div className="settings-head">
+          <h2>{tab === 'profile' ? 'Профиль сервера' : tab === 'roles' ? 'Роли' : `Участники · ${members.length}`}</h2>
+          <button className="settings-x" onClick={close} aria-label="Закрыть"><Icon name="close" sm /></button>
+        </div>
         <div className="settings-main-inner">
-          {tab === 'profile' && canServer ? <><h2><Icon name="edit" />Профиль сервера</h2><ServerProfileTab active={active} /></> : null}
-          {tab === 'roles' && canRoles ? <><h2><Icon name="shield" />Роли</h2><RolesTab active={active} /></> : null}
-          {tab === 'members' && canRoles ? <><h2><Icon name="users" />Участники</h2><RoleAssignTab active={active} members={members} /></> : null}
+          {tab === 'profile' && canServer ? <ServerProfileTab active={active} /> : null}
+          {tab === 'roles' && canRoles ? <RolesTab active={active} /> : null}
+          {tab === 'members' && canRoles ? <RoleAssignTab active={active} members={members} /> : null}
         </div>
       </div>
     </div>
@@ -561,9 +580,9 @@ function ServerProfileTab({ active }: { active: import('../types').ServerDetail 
     <div className="fld"><label>Название</label><input value={name} maxLength={40} onChange={(e) => setName(e.target.value)} /></div>
     <div className="fld"><label>Описание</label><textarea value={desc} maxLength={300} rows={2} placeholder="о чём этот сервер" onChange={(e) => setDesc(e.target.value)} /></div>
     <div className="fld"><label>Цвет иконки{iconUrl ? ' (когда без обложки)' : ''}</label><div className="colorpick">{AV_COLORS.map((c, i) => <div key={i} className={'cp' + (i === color ? ' sel' : '')} style={{ background: c }} onClick={() => setColor(i)} />)}</div></div>
-    <div className="fld"><label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
-      <input type="checkbox" checked={statsOn} onChange={(e) => setStatsOn(e.target.checked)} style={{ marginTop: 3, width: 16, height: 16, accentColor: 'var(--accent)', flex: '0 0 auto' }} />
-      <span style={{ display: 'flex', flexDirection: 'column', gap: 2 }}><b style={{ fontSize: 13.5, color: 'var(--txt-h)' }}>Рейтинг и уровни <span style={{ fontSize: 10.5, fontWeight: 700, color: 'var(--accent)', border: '1px solid color-mix(in srgb,var(--accent) 45%,transparent)', borderRadius: 5, padding: '0 5px', marginLeft: 4 }}>ЭКСПЕРИМЕНТ</span></b><span style={{ fontSize: 12, color: 'var(--muted)' }}>Кнопка 🏆 в шапке канала: рейтинг по времени в голосовом и эфире + бесконечные уровни. Считается с момента включения. По умолчанию выключено.</span></span>
+    <div className="set-list"><label className="perm-op">
+      <input type="checkbox" checked={statsOn} onChange={(e) => setStatsOn(e.target.checked)} />
+      <span><b>Рейтинг и уровни <em className="exp-badge">Эксперимент</em></b><i>Кнопка рейтинга в шапке участников: время в голосе и эфире, бесконечные уровни. Считается с момента включения.</i></span>
     </label></div>
     <div className="rowbtns"><span /><button className="primary" style={{ margin: 0 }} disabled={busy} onClick={save}>Сохранить</button></div>
     <div className="err">{err}</div>
@@ -632,7 +651,7 @@ function RoleAssignTab({ active, members }: { active: import('../types').ServerD
   </div>;
 }
 
-const KEYBIND_LABELS: Record<KeybindAction, string> = { muteMic: 'Заглушить микрофон', deafen: 'Заглушить звук' };
+const KEYBIND_LABELS: Record<KeybindAction, string> = { muteMic: 'Выключить микрофон', deafen: 'Выключить звук' };
 
 const NOTIF_KINDS: { key: 'notifMention' | 'notifStream' | 'notifUpdate'; title: string; desc: string }[] = [
   { key: 'notifMention', title: 'Упоминания', desc: 'Когда вас тегнули или ответили в чате' },
@@ -680,6 +699,30 @@ function KeyCaptureDialog({ action, onClose }: { action: KeybindAction; onClose:
   </Backdrop>;
 }
 
+// Карточка аккаунта внизу навигации настроек — отдельный компонент: читает store только при показе.
+function SettingsMe() {
+  const me = useStore((s) => s.me);
+  if (!me) return null;
+  return (
+    <button type="button" className="settings-me" onClick={() => useStore.getState().setModal('profile')} aria-label="Открыть профиль">
+      <span className="settings-me-av" style={{ background: me.avatarUrl ? 'transparent' : avColor(me.displayName, me.avatarColor) }}>
+        {me.avatarUrl ? <img src={resolveUploadUrl(me.avatarUrl)} alt="" /> : initial(me.displayName)}
+      </span>
+      <span className="settings-me-txt"><b>{me.displayName}</b><i>@{me.username}</i></span>
+    </button>
+  );
+}
+
+function NotifStatus() {
+  const perm = notifPermission();
+  return (
+    <div className={'set-status ' + perm}>
+      <i />
+      <span>{perm === 'granted' ? 'Разрешены в системе' : perm === 'denied' ? 'Запрещены в системе — включите их в настройках ОС или браузера' : 'Система ещё не спрашивала разрешение'}</span>
+    </div>
+  );
+}
+
 function SettingsModal() {
   const close = () => useStore.getState().setModal(null);
   const [, force] = useState(0); const rerender = () => force((n) => n + 1);
@@ -703,110 +746,147 @@ function SettingsModal() {
   const cats: { id: Tab; label: string; icon: string }[] = [
     { id: 'voice', label: 'Голос и звук', icon: 'mic-sm' },
     { id: 'notif', label: 'Уведомления', icon: 'bell' },
-    { id: 'appearance', label: 'Оформление', icon: 'palette' },
-    { id: 'keys', label: 'Клавиши', icon: 'keyboard' },
-    ...(isTauri ? [{ id: 'game' as Tab, label: 'Игровой статус', icon: 'cam' }] : []),
+    { id: 'appearance', label: 'Оформление', icon: 'eye' },
+    { id: 'keys', label: 'Клавиши', icon: 'hash' },
+    ...(isTauri ? [{ id: 'game' as Tab, label: 'Игровой статус', icon: 'gamepad' }] : []),
+  ];
+  const toggleRow = (opts: { checked: boolean; disabled?: boolean; title: string; desc?: string; onChange: (on: boolean) => void }) => (
+    <label className={'perm-op' + (opts.disabled ? ' off' : '')}>
+      <input type="checkbox" disabled={opts.disabled} checked={opts.checked} onChange={(e) => opts.onChange(e.target.checked)} />
+      <span><b>{opts.title}</b>{opts.desc ? <i>{opts.desc}</i> : null}</span>
+    </label>
+  );
+  const NS_OPTS: { id: AudioSettings['nsMode']; title: string; desc: string }[] = [
+    { id: 'off', title: 'Выключено', desc: 'Чистый сигнал' },
+    { id: 'basic', title: 'Базовое', desc: 'Встроенное в браузер' },
+    { id: 'rnnoise', title: appleMobile ? 'Системное' : 'Умное · RNNoise', desc: appleMobile ? 'Обработка iOS' : 'Рекомендуем · ~1% CPU' },
   ];
   return <Backdrop onClose={close} label="Настройки" boxClass="box-settings">
     <div className="settings">
       <nav className="settings-nav">
         <div className="settings-nav-h">Настройки</div>
         {cats.map((c) => (
-          <button key={c.id} className={tab === c.id ? 'active' : ''} onClick={() => setTab(c.id)}>
+          <button key={c.id} className={tab === c.id ? 'active' : ''} aria-current={tab === c.id ? 'page' : undefined} onClick={() => setTab(c.id)}>
             <Icon name={c.icon} />{c.label}
           </button>
         ))}
+        <SettingsMe />
       </nav>
       <div className="settings-main">
-        <button className="settings-x" onClick={close} aria-label="Закрыть"><Icon name="close" /></button>
+        <div className="settings-head">
+          <h2>{cats.find((c) => c.id === tab)?.label}</h2>
+          <button className="settings-x" onClick={close} aria-label="Закрыть"><Icon name="close" sm /></button>
+        </div>
         <div className="settings-main-inner">
 
           {tab === 'voice' && <>
-            <h2><Icon name="mic-sm" />Голос и звук</h2>
-            <div className="grp">
-              <div className="gt">Микрофон</div>
-              {!appleMobile ? <div className="fld"><label>Устройство ввода</label><select value={s.input} onFocus={audioDeviceInventory.refresh} onPointerDown={audioDeviceInventory.refresh} onChange={(e) => upd({ input: e.target.value }, () => { void E?.reapplyMic(); E?.restartLevelMeter(); })}><option value="">По умолчанию</option>{ins.map((d) => <option key={d.id} value={d.id} disabled={d.unavailable}>{d.label}</option>)}</select></div>
-                : <div className="mm-hint">На iPhone и iPad микрофон выбирается системой вместе с маршрутом звука.</div>}
-              <div className="fld" style={{ marginTop: 10 }}><label>Шумоподавление</label>
-                <select value={s.nsMode} onChange={(e) => upd({ nsMode: e.target.value as AudioSettings['nsMode'] }, () => { E?.reapplyMic(); E?.restartLevelMeter(); })}>
-                  <option value="rnnoise">{appleMobile ? 'Системное (вместо RNNoise)' : 'RNNoise (нейросеть)'}</option>
-                  <option value="basic">Базовый (браузер)</option>
-                  <option value="off">Нет</option>
-                </select>
-                <div className="mm-hint">{appleMobile
-                  ? 'На iPhone и iPad голос передаётся напрямую. Включённый шумодав использует системную обработку, чтобы отправка не зависела от Web Audio.'
-                  : 'RNNoise — нейросеть, режет фоновый гул (кулеры, гудение); Базовый — встроенный шумодав браузера; Нет — без обработки.'}</div>
+            <section className="set-sec">
+              <div className="set-label">Микрофон</div>
+              <div className="set-devices">
+                {!appleMobile ? (
+                  <label className="set-select">
+                    <Icon name="mic-sm" sm />
+                    <select aria-label="Устройство ввода" value={s.input} onFocus={audioDeviceInventory.refresh} onPointerDown={audioDeviceInventory.refresh} onChange={(e) => upd({ input: e.target.value }, () => { void E?.reapplyMic(); E?.restartLevelMeter(); })}>
+                      <option value="">Микрофон по умолчанию</option>{ins.map((d) => <option key={d.id} value={d.id} disabled={d.unavailable}>{d.label}</option>)}
+                    </select>
+                    <Icon name="chevron" sm />
+                  </label>
+                ) : null}
+                <label className="set-select">
+                  <Icon name="head" sm />
+                  <select aria-label={outputViaInput ? 'Маршрут звука' : 'Устройство вывода'} value={outputViaInput ? s.input : s.output} onFocus={audioDeviceInventory.refresh} onPointerDown={audioDeviceInventory.refresh} onChange={(e) => {
+                    const id = e.target.value;
+                    if (outputViaInput) {
+                      upd({ input: id, output: '' }, () => { void E?.reapplyMic('route').then(() => E.applyOutput()); E?.restartLevelMeter(); });
+                    } else upd({ output: id }, () => { void E?.applyOutput(); });
+                  }}>
+                    <option value="">{outputViaInput ? 'Маршрут: автоматически' : 'Вывод по умолчанию'}</option>
+                    {outs.map((d) => <option key={d.id} value={d.id} disabled={d.unavailable}>{d.label}</option>)}
+                  </select>
+                  <Icon name="chevron" sm />
+                </label>
               </div>
+              {appleMobile ? <div className="mm-hint">На iPhone и iPad микрофон выбирается системой вместе с маршрутом звука.</div> : null}
               <MicMeter />
-              <div className="fld" style={{ marginTop: 10 }}><label>Режим передачи</label>
-                <div className="seg"><button className={s.mode === 'voice' ? 'active' : ''} onClick={() => upd({ mode: 'voice' }, () => E?.onModeChanged())}>Активация голосом</button><button className={s.mode === 'ptt' ? 'active' : ''} onClick={() => upd({ mode: 'ptt' }, () => E?.onModeChanged())}>Push-to-Talk</button></div>
-                {s.mode === 'ptt' ? <div className="ptt-hint">Удерживай <span className="kbd">{keyLabel(s.pttKey)}</span> · <button style={{ padding: '4px 10px', fontSize: 12 }} onClick={() => setBinding(true)}>{binding ? 'Нажми клавишу...' : 'Сменить'}</button></div> : null}
+            </section>
+
+            <section className="set-sec">
+              <div className="set-label">Как включается микрофон</div>
+              <div className="seg" role="radiogroup" aria-label="Режим передачи">
+                <button role="radio" aria-checked={s.mode === 'voice'} className={s.mode === 'voice' ? 'active' : ''} onClick={() => upd({ mode: 'voice' }, () => E?.onModeChanged())}>Голосом</button>
+                <button role="radio" aria-checked={s.mode === 'ptt'} className={s.mode === 'ptt' ? 'active' : ''} onClick={() => upd({ mode: 'ptt' }, () => E?.onModeChanged())}>По кнопке</button>
               </div>
-            </div>
-            <div className="grp"><div className="gt">Звук</div>
-              <div className="fld"><label>{outputViaInput ? 'Маршрут звука' : 'Устройство вывода'}</label>
-                <select value={outputViaInput ? s.input : s.output} onFocus={audioDeviceInventory.refresh} onPointerDown={audioDeviceInventory.refresh} onChange={(e) => {
-                  const id = e.target.value;
-                  if (outputViaInput) {
-                    upd({ input: id, output: '' }, () => { void E?.reapplyMic('route').then(() => E.applyOutput()); E?.restartLevelMeter(); });
-                  } else upd({ output: id }, () => { void E?.applyOutput(); });
-                }}>
-                  <option value="">{outputViaInput ? 'Автоматически' : 'По умолчанию'}</option>
-                  {outs.map((d) => <option key={d.id} value={d.id} disabled={d.unavailable}>{d.label}</option>)}
-                </select>
+              {s.mode === 'ptt' ? <div className="ptt-hint">Удерживай <span className="kbd">{keyLabel(s.pttKey)}</span><button type="button" className="ptt-bind" onClick={() => setBinding(true)}>{binding ? 'Нажми клавишу…' : 'Сменить'}</button></div> : null}
+            </section>
+
+            <section className="set-sec">
+              <div className="set-label">Шумоподавление <span>клавиатура, вентилятор, улица</span></div>
+              <div className="ns-opts" role="radiogroup" aria-label="Шумоподавление">
+                {NS_OPTS.map((o) => (
+                  <button key={o.id} type="button" role="radio" aria-checked={s.nsMode === o.id} className={'ns-op' + (s.nsMode === o.id ? ' active' : '')}
+                    onClick={() => upd({ nsMode: o.id }, () => { E?.reapplyMic(); E?.restartLevelMeter(); })}>
+                    <b>{o.title}</b><span>{o.desc}</span>
+                  </button>
+                ))}
               </div>
-              <div className="fld"><label>Общая громкость: {s.master}%</label><input type="range" min={0} max={100} value={s.master} onChange={(e) => upd({ master: +e.target.value }, () => E?.applyMaster())} /></div>
-              <div className="fld"><label>Громкость уведомлений: {s.notifyVolume}%</label><input type="range" min={0} max={100} value={s.notifyVolume} onChange={(e) => upd({ notifyVolume: +e.target.value })} onMouseUp={() => playSound('system')} /></div>
-            </div>
+              {appleMobile ? <div className="mm-hint">На iPhone и iPad голос передаётся напрямую. Включённый шумодав использует системную обработку, чтобы отправка не зависела от Web Audio.</div> : null}
+            </section>
+
+            <section className="set-sliders">
+              <div className="set-slider">
+                <div className="set-slider-h"><span>Громкость собеседников</span><b>{s.master}%</b></div>
+                <input type="range" min={0} max={100} value={s.master} aria-label="Общая громкость" style={{ '--val': s.master + '%' } as CSSProperties} onChange={(e) => upd({ master: +e.target.value }, () => E?.applyMaster())} />
+              </div>
+              <div className="set-slider">
+                <div className="set-slider-h"><span>Громкость уведомлений</span><b>{s.notifyVolume}%</b></div>
+                <input type="range" min={0} max={100} value={s.notifyVolume} aria-label="Громкость уведомлений" style={{ '--val': s.notifyVolume + '%' } as CSSProperties} onChange={(e) => upd({ notifyVolume: +e.target.value })} onMouseUp={() => playSound('system')} />
+              </div>
+            </section>
           </>}
 
           {tab === 'notif' && <>
-            <h2><Icon name="bell" />Уведомления</h2>
             {!notifSupported() ? (
-              <div className="fld"><label style={{ color: 'var(--txt-dim)' }}>Системные уведомления не поддерживаются на этом устройстве</label></div>
-            ) : <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              <label className="perm-op">
-                <input type="checkbox" checked={s.notif} onChange={async (e) => {
-                  if (e.target.checked) {
-                    localStorage.removeItem('notifOptOut'); // снова хотим уведомления
-                    const ok = await enableNotifications();
-                    if (!ok) useStore.getState().toast(notifPermission() === 'denied'
-                      ? 'Разрешение заблокировано — включите уведомления для приложения в настройках ОС/браузера'
-                      : 'Система не выдала разрешение на уведомления', 'err');
-                  } else {
-                    localStorage.setItem('notifOptOut', '1'); // явный опт-аут: не переспрашиваем при запуске
-                    setSettings({ notif: false });
-                    unsubscribePush(); // снимаем фоновую web-push подписку
-                  }
-                  rerender();
-                }} />
-                <span><b>Системные уведомления</b><i>Упоминания — когда окно не в фокусе; трансляции и обновления — всегда{notifPermission() === 'denied' ? ' · доступ запрещён в системе' : ''}</i></span>
-              </label>
-              <div className={'fld'} style={{ margin: '2px 0 4px', opacity: s.notif ? 1 : .55 }}>
-                <label>Содержимое уведомлений</label>
-                <select
-                  disabled={!s.notif}
-                  value={s.notifPrivacy}
-                  onChange={(e) => upd({ notifPrivacy: e.target.value as AudioSettings['notifPrivacy'] })}
-                >
-                  <option value={'full'}>Отправитель и текст</option>
-                  <option value={'sender'}>Только отправитель</option>
-                  <option value={'hidden'}>Скрыть содержимое</option>
-                </select>
-                <div className={'mm-hint'}>Определяет, что видно на заблокированном экране и в системном баннере.</div>
+              <div className="set-note">Системные уведомления не поддерживаются на этом устройстве.</div>
+            ) : <>
+              <div className="set-list">
+                {toggleRow({
+                  checked: s.notif, title: 'Системные уведомления',
+                  desc: 'Упоминания — когда окно не в фокусе; трансляции и обновления — всегда',
+                  onChange: async (on) => {
+                    if (on) {
+                      localStorage.removeItem('notifOptOut'); // снова хотим уведомления
+                      const ok = await enableNotifications();
+                      if (!ok) useStore.getState().toast(notifPermission() === 'denied'
+                        ? 'Разрешение заблокировано — включите уведомления для приложения в настройках ОС/браузера'
+                        : 'Система не выдала разрешение на уведомления', 'err');
+                    } else {
+                      localStorage.setItem('notifOptOut', '1'); // явный опт-аут: не переспрашиваем при запуске
+                      setSettings({ notif: false });
+                      unsubscribePush(); // снимаем фоновую web-push подписку
+                    }
+                    rerender();
+                  },
+                })}
+                {NOTIF_KINDS.map((o) => <div key={o.key} className="set-list-item">{toggleRow({
+                  checked: s[o.key], disabled: !s.notif, title: o.title, desc: o.desc,
+                  onChange: (on) => { upd({ [o.key]: on } as Partial<AudioSettings>); syncPushPrefs(); },
+                })}</div>)}
               </div>
-              {NOTIF_KINDS.map((o) => (
-                <label key={o.key} className="perm-op" style={{ opacity: s.notif ? 1 : .45, pointerEvents: s.notif ? 'auto' : 'none' }}>
-                  <input type="checkbox" disabled={!s.notif} checked={s[o.key]} onChange={(e) => { upd({ [o.key]: e.target.checked } as Partial<AudioSettings>); syncPushPrefs(); }} />
-                  <span><b>{o.title}</b><i>{o.desc}</i></span>
-                </label>
-              ))}
-            </div>}
+              <section className="set-sec">
+                <div className="set-label">Содержимое уведомлений <span>что видно на заблокированном экране</span></div>
+                <div className="seg" role="radiogroup" aria-label="Содержимое уведомлений">
+                  {([['full', 'Отправитель и текст'], ['sender', 'Только отправитель'], ['hidden', 'Скрыть']] as const).map(([id, label]) => (
+                    <button key={id} role="radio" aria-checked={s.notifPrivacy === id} disabled={!s.notif} className={s.notifPrivacy === id ? 'active' : ''} onClick={() => upd({ notifPrivacy: id })}>{label}</button>
+                  ))}
+                </div>
+              </section>
+              <NotifStatus />
+            </>}
           </>}
 
           {tab === 'appearance' && <>
-            <h2><Icon name="palette" />Оформление</h2>
-            <div className="fld"><label>Тема</label>
+            <section className="set-sec">
+              <div className="set-label">Тема</div>
               <div className="theme-modes" role="radiogroup" aria-label="Тема">
                 {THEME_MODES.map((m) => {
                   const on = getThemeMode() === m.id;
@@ -818,8 +898,9 @@ function SettingsModal() {
                   );
                 })}
               </div>
-            </div>
-            <div className="fld"><label>Акцент</label>
+            </section>
+            <section className="set-sec">
+              <div className="set-label">Акцент</div>
               <div className="accent-row" role="radiogroup" aria-label="Акцент">
                 {ACCENTS.map((a) => {
                   const on = getAccent() === a.id;
@@ -830,31 +911,47 @@ function SettingsModal() {
                   );
                 })}
               </div>
-            </div>
+            </section>
           </>}
 
           {tab === 'keys' && <>
-            <h2><Icon name="keyboard" />Клавиши</h2>
-            {(Object.keys(KEYBIND_LABELS) as KeybindAction[]).map((action) => (
-              <div key={action} className="fld" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
-                <span style={{ fontSize: 13.5, color: 'var(--txt)' }}>{KEYBIND_LABELS[action]}</span>
-                <button style={{ padding: '5px 12px', fontSize: 12.5, width: 'auto', display: 'flex', alignItems: 'center', gap: 8 }} onClick={() => setCaptureAction(action)}>
-                  <span className="kbd">{comboLabel(s.keybinds[action])}</span>Сменить
-                </button>
+            <section className="set-sec">
+              <div className="set-label">Голос</div>
+              <div className="set-list keys">
+                {(Object.keys(KEYBIND_LABELS) as KeybindAction[]).map((action) => {
+                  const combo = s.keybinds[action];
+                  const label = comboLabel(combo);
+                  return (
+                    <div key={action} className="key-row">
+                      <span>{KEYBIND_LABELS[action]}</span>
+                      <button type="button" className="key-bind" onClick={() => setCaptureAction(action)} aria-label={`Назначить: ${KEYBIND_LABELS[action]}`}>
+                        {combo && combo.length ? label.split('+').map((k, i) => <kbd key={i}>{k.trim()}</kbd>) : <em>Назначить</em>}
+                      </button>
+                    </div>
+                  );
+                })}
               </div>
-            ))}
-            {isTauri ? <label className="perm-op" style={{ marginTop: 8 }}>
-              <input type="checkbox" checked={s.disableGlobalHotkeys} onChange={(e) => upd({ disableGlobalHotkeys: e.target.checked }, () => setGlobalHotkeys(getSettings().keybinds, !e.target.checked))} />
-              <span><b>Отключить комбинацию вне приложения</b><i>Клавиши сработают только когда окно RelayApp в фокусе</i></span>
-            </label> : null}
+            </section>
+            {isTauri ? <div className="set-list">{toggleRow({
+              checked: !s.disableGlobalHotkeys, title: 'Работают поверх игры',
+              desc: 'Сочетания срабатывают, когда окно Рилэя не в фокусе',
+              onChange: (on) => upd({ disableGlobalHotkeys: !on }, () => setGlobalHotkeys(getSettings().keybinds, on)),
+            })}</div> : null}
+            <section className="set-sec">
+              <div className="set-label">Навигация · не меняются</div>
+              <div className="key-static">
+                {SHORTCUTS.map(([combo, label]) => <div key={combo} className="key-row"><span>{label}</span><code>{combo}</code></div>)}
+              </div>
+            </section>
           </>}
 
           {tab === 'game' && isTauri && <>
-            <h2><Icon name="cam" />Игровой статус</h2>
-            <label className="perm-op">
-              <input type="checkbox" checked={s.shareGame} onChange={(e) => upd({ shareGame: e.target.checked })} />
-              <span><b>Показывать, во что играю</b><i>Другие увидят название и иконку игры рядом с ником (только полноэкранная игра на переднем плане или распознанная Windows). Читается имя окна и иконка — без доступа к самой игре.</i></span>
-            </label>
+            <div className="set-list">{toggleRow({
+              checked: s.shareGame, title: 'Показывать, во что играю',
+              desc: 'Название и иконка игры под твоим именем',
+              onChange: (on) => upd({ shareGame: on }),
+            })}</div>
+            <p className="set-foot">Учитывается полноэкранная игра на переднем плане или распознанная Windows. Читается только имя окна и иконка — память игры не читается, с античитами конфликтов нет.</p>
           </>}
 
         </div>
@@ -873,15 +970,12 @@ function SwitchServerModal() {
   const target = servers.find((x) => x.id === targetId);
   const cancel = () => useStore.setState({ modal: null, pendingSwitchId: null });
   const confirm = () => useStore.getState().confirmSwitchServer();
-  return <Backdrop onClose={cancel} label="Переключение сервера">
-    <h2><Icon name="leave" />Перейти на другой сервер?</h2>
-    <p className="msub">Ты сейчас подключён к «<b style={{ color: 'var(--txt-h)' }}>{from?.name}</b>». Переход{target ? <> на «<b style={{ color: 'var(--txt-h)' }}>{target.name}</b>»</> : null} отключит тебя от текущего сервера — голос, трансляции и realtime-чат прервутся.</p>
-    <div className="switch-srv-row">
-      <div className="ssr-card"><div className="ssr-ic" style={{ background: from ? avColor(from.name, from.iconColor) : 'var(--panel3)' }}>{from ? initial(from.name) : '—'}</div><span>{from?.name || '—'}</span></div>
-      <Icon name="chevron" />
-      <div className="ssr-card"><div className="ssr-ic" style={{ background: target ? avColor(target.name, target.iconColor) : 'var(--panel3)' }}>{target ? initial(target.name) : '—'}</div><span>{target?.name || '—'}</span></div>
-    </div>
-    <div className="rowbtns"><button className="ghost" style={{ margin: 0 }} onClick={cancel}>Остаться</button><button className="primary" style={{ margin: 0 }} onClick={confirm}>Перейти</button></div>
+  const ic = (x: typeof from) => <span className="ssr-ic" style={{ background: x ? avColor(x.name, x.iconColor) : 'var(--panel3)' }}>{x ? initials2(x.name) : '—'}</span>;
+  return <Backdrop onClose={cancel} label="Переключение сервера" boxClass="box-dialog">
+    <div className="switch-srv-row" aria-hidden="true">{ic(from)}<i />{ic(target)}</div>
+    <h2>{target ? `Перейти в «${target.name}»?` : 'Перейти на другой сервер?'}</h2>
+    <p className="msub">Ты выйдешь из «{from?.name}»: голос, трансляции и чат этого сервера отключатся.</p>
+    <div className="rowbtns"><button className="ghost" onClick={cancel}>Остаться</button><button className="primary" onClick={confirm}>Перейти</button></div>
   </Backdrop>;
 }
 

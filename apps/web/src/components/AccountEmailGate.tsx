@@ -270,8 +270,8 @@ export function AccountEmailGate() {
   return (
     <Backdrop onClose={() => {}} dismissible={false} boxClass="account-email-gate" label="Обязательная привязка электронной почты">
       <div className="gate-head">
-        <span className="gate-icon"><Icon name="shield" /></span>
-        <div><span className="gate-kicker">Защита аккаунта</span><h2>{step === 'email' ? 'Привяжите почту' : 'Подтвердите почту'}</h2></div>
+        <span className="gate-icon"><Icon name="lock" /></span>
+        <h2>{step === 'email' ? 'Защита аккаунта' : 'Подтвердите почту'}</h2>
       </div>
 
       {step === 'email' ? (
@@ -314,9 +314,14 @@ export function AccountEmailGate() {
             ? <>Код из четырёх цифр отправлен на <b>{challenge.emailMasked || email}</b>.</>
             : <>Письмо на <b>{challenge.emailMasked || email}</b> пока не отправлено. Повторите отправку ниже.</>}</p>
           <div className="fld auth-otp-row"><label htmlFor="gate-code">Код из письма</label>
-            <input id="gate-code" className="auth-otp" type="text" inputMode="numeric" pattern="[0-9]*" maxLength={4} autoFocus autoComplete="one-time-code"
-              value={code} aria-invalid={Boolean(fieldError('code')) || undefined} aria-describedby={fieldError('code') ? 'gate-code-error' : 'gate-code-hint'}
-              onChange={(event) => { setCode(event.target.value.replace(/\D/g, '').slice(0, 4)); if (failure) setFailure(null); }} />
+            <div className="auth-otp-wrap">
+              <input id="gate-code" className="auth-otp" type="text" inputMode="numeric" pattern="[0-9]*" maxLength={4} autoFocus autoComplete="one-time-code"
+                value={code} aria-invalid={Boolean(fieldError('code')) || undefined} aria-describedby={fieldError('code') ? 'gate-code-error' : 'gate-code-hint'}
+                onChange={(event) => { setCode(event.target.value.replace(/\D/g, '').slice(0, 4)); if (failure) setFailure(null); }} />
+              <div className="auth-otp-cells" aria-hidden="true">
+                {[0, 1, 2, 3].map((i) => <span key={i} className={'auth-otp-cell' + (i === Math.min(code.length, 3) ? ' cur' : '')}>{code[i] || ''}</span>)}
+              </div>
+            </div>
             <div id="gate-code-hint" className="auth-hint">
               {expired
                 ? 'Срок действия кода истёк — запросите новый.'
@@ -326,16 +331,16 @@ export function AccountEmailGate() {
             </div>
             {fieldError('code') ? <div id="gate-code-error" className="auth-field-error" role="alert">{fieldError('code')}</div> : null}
           </div>
-          <button type="submit" className="primary" disabled={busy || !challenge.delivered || expired || code.length !== 4}>{busy ? <span className="spin" /> : null}Подтвердить и продолжить</button>
           <div className="auth-secondary-row">
             <button type="button" className="link" onClick={changeEmail}>Изменить почту</button>
             <button type="button" className="link" disabled={busy || wait > 0} onClick={resend}>{wait > 0 ? `Новый код через ${formatWait(wait)}` : 'Отправить ещё раз'}</button>
           </div>
+          <button type="submit" className="primary" disabled={busy || !challenge.delivered || expired || code.length !== 4}>{busy ? <span className="spin" /> : null}Подтвердить и продолжить</button>
         </form>
       ) : null}
 
       {generalError ? <div className="auth-form-error" role="alert"><Icon name="warn" sm /><span>{generalError}</span></div> : null}
-      <div className="gate-foot"><span>Можно указать только адрес, к которому у вас есть доступ. Без привязанной почты после выхода восстановить пароль нельзя.</span><button type="button" disabled={busy} onClick={() => { persistChallenge(storageKey, null); logout(); }}>Выйти всё равно</button></div>
+      <div className="gate-foot"><span>Можно указать только адрес, к которому у вас есть доступ. Без привязанной почты после выхода восстановить пароль нельзя.</span><button type="button" disabled={busy} onClick={() => { persistChallenge(storageKey, null); logout(); }}>Выйти из аккаунта</button></div>
       <div className="auth-live" role="status" aria-live="polite">{busy ? 'Запрос выполняется' : ''}</div>
     </Backdrop>
   );

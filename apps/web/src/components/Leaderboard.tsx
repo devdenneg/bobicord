@@ -13,7 +13,6 @@ const CATS: { id: Cat; label: string; icon: string; hint: string }[] = [
   { id: 'voice', label: 'Голосовой', icon: 'mic', hint: 'Больше всех времени в голосовых каналах' },
   { id: 'stream', label: 'Эфир', icon: 'screen', hint: 'Больше всех времени в трансляциях' },
 ];
-const MEDAL = ['🥇', '🥈', '🥉'];
 
 function LbAvatar({ r, size = 36 }: { r: LeaderRow; size?: number }) {
   const url = r.avatarUrl ? resolveUploadUrl(r.avatarUrl) : '';
@@ -60,8 +59,9 @@ export function LeaderboardModal() {
     <Backdrop onClose={close} label="Рейтинг сервера" boxClass="box-lb" wide>
       <div className="lb">
         <div className="lb-head">
-          <div className="lb-title"><Icon name="trophy" /><span>Рейтинг · {active.name}</span><span className="lb-exp">ЭКСПЕРИМЕНТ</span></div>
-          <button className="settings-x" onClick={close} aria-label="Закрыть"><Icon name="close" /></button>
+          <div className="lb-title"><h2>Рейтинг</h2><span className="lb-exp">Эксперимент</span></div>
+          <div className="lb-sub">{active.name} · {catLabel.toLocaleLowerCase('ru')}</div>
+          <button className="settings-x" onClick={close} aria-label="Закрыть"><Icon name="close" sm /></button>
         </div>
 
         {err ? <div className="lb-empty">{err}</div> : !data ? <div className="lb-empty"><span className="spin" /> Загрузка…</div> : data.enabled === false ? (
@@ -92,6 +92,18 @@ export function LeaderboardModal() {
               </div>
             ) : null}
 
+            {/* Пьедестал: первое место в центре и выше остальных */}
+            {rows.length >= 3 ? (
+              <div className="lb-podium" aria-hidden="true">
+                {[1, 0, 2].map((i) => (
+                  <div key={rows[i].uid} className={'lb-pod p' + (i + 1)}>
+                    <LbAvatar r={rows[i]} size={i === 0 ? 44 : 38} />
+                    <div className="lb-pod-block">{i + 1}</div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+
             {/* Рейтинг-лист */}
             {rows.length === 0 ? (
               <div className="lb-empty">Пока пусто — статистика копится с момента включения фичи.</div>
@@ -99,7 +111,7 @@ export function LeaderboardModal() {
               <div className="lb-list">
                 {rows.map((r, i) => (
                   <div key={r.uid} className={'lb-row' + (r.uid === me.id ? ' mine' : '') + (i < 3 ? ' top' : '')}>
-                    <div className="lb-rank">{i < 3 ? <span className="lb-medal">{MEDAL[i]}</span> : <span className="lb-num">{i + 1}</span>}</div>
+                    <div className="lb-rank"><span className="lb-num">{i + 1}</span></div>
                     <LbAvatar r={r} />
                     <div className="lb-who">
                       <span className="lb-nm">{r.displayName}{r.uid === me.id ? ' (ты)' : ''}</span>

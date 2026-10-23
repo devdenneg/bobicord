@@ -20,17 +20,18 @@ export function MicMeter() {
     });
   }, []);
 
+  const toggleAuto = () => { setSettings({ sensitivityAuto: !s.sensitivityAuto }); rerender(); };
   return (
-    <div className="fld" style={{ marginTop: 10 }}>
-      <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <span>Чувствительность ввода</span>
-        <span style={{ display: 'flex', alignItems: 'center', gap: 8, textTransform: 'none', fontWeight: 400 }}>
-          Авто
-          <div className={'sw' + (s.sensitivityAuto ? ' on' : '')} role="switch" aria-checked={s.sensitivityAuto} aria-label="Определять автоматически" tabIndex={0}
-            onClick={() => { setSettings({ sensitivityAuto: !s.sensitivityAuto }); rerender(); }}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setSettings({ sensitivityAuto: !s.sensitivityAuto }); rerender(); } }} />
+    <div className="mic-test">
+      <div className="mic-test-h">
+        <span>Проверка микрофона — скажи что-нибудь</span>
+        <span className="mic-auto">
+          Авто-порог
+          <div className={'sw' + (s.sensitivityAuto ? ' on' : '')} role="switch" aria-checked={s.sensitivityAuto} aria-label="Определять порог автоматически" tabIndex={0}
+            onClick={toggleAuto}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleAuto(); } }} />
         </span>
-      </label>
+      </div>
       <div className={'micmeter' + (s.sensitivityAuto ? ' auto' : '')}>
         <div className="mm-fill" ref={fillRef} />
         <div className="mm-marker" ref={markerRef} />
@@ -41,8 +42,8 @@ export function MicMeter() {
         ) : null}
       </div>
       <div className="mm-hint">
-        {s.sensitivityAuto ? 'Порог подбирается автоматически по шуму фона.' : 'Потяни ползунок — звук ниже порога не будет передаваться.'}
-        {' '}Работает в режиме «Активация голосом».
+        {s.sensitivityAuto ? 'Порог подбирается по шуму фона.' : 'Всё, что тише белой метки, собеседники не услышат — потяни, чтобы сдвинуть.'}
+        {' '}Работает, когда микрофон включается голосом.
       </div>
     </div>
   );

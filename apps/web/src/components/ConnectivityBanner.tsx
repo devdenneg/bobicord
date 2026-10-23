@@ -26,7 +26,7 @@ export function ConnectivityBanner() {
 
   const title = !online ? 'Нет подключения к интернету' : reconnecting ? 'Связь восстанавливается…' : 'Связь с сервером прервана';
   const detail = !online ? 'Сообщения сохранятся в поле ввода. Проверь сеть — RelayApp продолжит автоматически.'
-    : reconnecting ? 'Голос и сообщения временно приостановлены.' : 'Можно повторить подключение, не покидая текущий экран.';
+    : reconnecting ? 'Голос и сообщения на паузе. Черновик сохранён.' : 'Голос и сообщения на паузе. Черновик сохранён.';
   return (
     <div className={'connectivity-banner' + (!online || realtimeLost ? ' danger' : '')} role="status" aria-live="polite">
       <Icon name={!online || realtimeLost ? 'warn' : 'refresh'} sm />

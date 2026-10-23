@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { useStore, getEngine } from './store';
 import { getSettings, setSettings, subscribeSettings } from './settings';
-import { avColor, initial, normKey } from './util';
+import { avColor, initial, initials2, normKey } from './util';
 import { api, resolveUploadUrl } from './api';
 import { Icon } from './Icon';
 import { Home } from './components/Home';
@@ -15,7 +15,7 @@ import { useEngine } from './hooks';
 import { Modals } from './components/Modals';
 import { isTauri, setGlobalHotkeys, onGlobalHotkey, setDetectableGames } from './native';
 import type { ServerSummary, OnlineMember, KeybindAction } from './types';
-import { LogoLoader } from './components/LogoLoader';
+import { LogoLoader, Splash } from './components/LogoLoader';
 import { initNotifications } from './notify';
 import { TooltipLayer } from './components/TooltipLayer';
 import { ConnectivityBanner } from './components/ConnectivityBanner';
@@ -74,6 +74,7 @@ function Rail() {
   return (
     <nav id="rail" aria-label="Серверы и разделы">
       <div className="rail-primary">
+        <div className="rail-logo" aria-hidden="true"><LogoLoader size={29} animate={false} /></div>
         <button className={'railbtn rail-home tip-l' + (view === 'home' ? ' active' : '')} aria-label="Домой" aria-current={view === 'home' ? 'page' : undefined} data-tip="Домой" onClick={goHome}><Icon name="home" /></button>
         <div className="rail-sep" />
         {servers.map((s) => {
@@ -84,7 +85,7 @@ function Rail() {
             aria-current={activeId === s.id ? 'page' : undefined}
             data-tip={eng.voiceServerId === s.id && activeId !== s.id ? s.name + ' · в голосе' : s.name}
             style={{ background: s.iconUrl ? '#0000' : avColor(s.name, s.iconColor) }} onClick={() => openServer(s.id)}>
-            {s.iconUrl ? <img className="avimg" src={resolveUploadUrl(s.iconUrl)} alt="" /> : initial(s.name)}{(s.online || []).some((m) => m.inVoice) ? <span className="dot green" /> : null}
+            {s.iconUrl ? <img className="avimg" src={resolveUploadUrl(s.iconUrl)} alt="" /> : initials2(s.name)}{(s.online || []).some((m) => m.inVoice) ? <span className="dot green" /> : null}
             {un ? <span className="rail-badge">{un > 99 ? '99+' : un}</span> : null}
             {draftServers.has(s.id) ? <span className={'rail-draft-dot'} aria-hidden={true} /> : null}
           </button>
@@ -116,8 +117,8 @@ function Rail() {
 // Ширины берём из тех же localStorage-ключей, что и настоящий ServerView (иначе колонки скакнут).
 function ServerSkeleton() {
   const entryTab = useStore((s) => s.serverEntryTab);
-  const chW = +(localStorage.getItem('w:channels') || 292);
-  const memW = +(localStorage.getItem('w:members') || 304);
+  const chW = +(localStorage.getItem('w:channels') || 272);
+  const memW = +(localStorage.getItem('w:members') || 256);
   const singlePane = window.innerWidth <= 900;
   const compactDesktop = window.innerWidth >= 1241 && window.innerWidth <= 1360;
   const skeletonChW = compactDesktop ? Math.min(chW, 280) : chW;
@@ -140,10 +141,14 @@ function ServerSkeleton() {
       {showMain ? <div className="sk-col sk-main">
         <div className="sk-header"><span className="sk-line" style={{ width: 90 }} /></div>
         <div className="sk-chat">
-          {rows(8).map((_, i) => (
+          {rows(5).map((_, i) => (
             <div className="sk-msg" key={i}>
-              <span className="sk-line sk-who" style={{ width: 66 + (i % 4) * 24 }} />
-              <span className="sk-bubble" style={{ width: `${36 + ((i * 41) % 46)}%` }} />
+              <span className="sk-av" />
+              <span className="sk-msg-body">
+                <span className="sk-line sk-who" style={{ width: 60 + (i % 3) * 20 }} />
+                <span className="sk-line" style={{ width: `${40 + ((i * 37) % 42)}%` }} />
+                {i === 2 ? <span className="sk-bubble" /> : i % 2 ? <span className="sk-line" style={{ width: `${30 + ((i * 23) % 30)}%` }} /> : null}
+              </span>
             </div>
           ))}
         </div>
@@ -156,6 +161,27 @@ function ServerSkeleton() {
         </div>
       ) : null}
     </div>
+  );
+}
+
+const QUICK_SWITCH_EVENT = 'relay:quick-switch';
+
+// Нижняя навигация телефона (Paper М · Главная): рейла на узком экране нет, главная — точка входа.
+function MobileNav() {
+  const view = useStore((s) => s.view);
+  const modal = useStore((s) => s.modal);
+  const setModal = useStore((s) => s.setModal);
+  const goHome = useStore((s) => s.goHome);
+  const releaseUnread = useStore((s) => s.releaseUnread);
+  return (
+    <nav className="mob-nav" aria-label="Навигация">
+      <button className={view === 'home' && !modal ? 'active' : ''} aria-current={view === 'home' ? 'page' : undefined} onClick={goHome}><Icon name="home" />Главная</button>
+      <button onClick={() => window.dispatchEvent(new Event(QUICK_SWITCH_EVENT))}><Icon name="search" />Поиск</button>
+      <button className={modal === 'releaseHistory' ? 'active' : ''} onClick={() => setModal('releaseHistory')}>
+        <span className="mob-nav-ic"><Icon name="bell" />{releaseUnread ? <i aria-hidden="true" /> : null}</span>Что нового
+      </button>
+      <button className={modal === 'settings' ? 'active' : ''} onClick={() => setModal('settings')}><Icon name="gear" />Настройки</button>
+    </nav>
   );
 }
 
@@ -175,6 +201,12 @@ function Application() {
   const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
 
   useEffect(() => { if (activeServerId) rememberServerDestination(activeServerId); }, [activeServerId]);
+  // Мобильная нижняя навигация открывает быстрый переход событием (сам переключатель живёт тут).
+  useEffect(() => {
+    const open = () => setQuickSwitcherOpen(true);
+    window.addEventListener(QUICK_SWITCH_EVENT, open);
+    return () => window.removeEventListener(QUICK_SWITCH_EVENT, open);
+  }, []);
 
   // При запуске лишь подхватываем уже выданное разрешение. Системный prompt открывается
   // только после явного действия в нашем предварительном запросе или в настройках.
@@ -368,9 +400,7 @@ function Application() {
       {me ? <QuickSwitcher open={quickSwitcherOpen} onClose={() => setQuickSwitcherOpen(false)} /> : null}
       {me ? <ShortcutHelp open={shortcutHelpOpen} onClose={() => setShortcutHelpOpen(false)} /> : null}
       {accountGate ? <AccountEmailGate /> : view === 'loading' ? (
-        <div className="overlay" style={{ background: 'var(--bg)' }}>
-          <LogoLoader size={56} />
-        </div>
+        <Splash />
       ) : view === 'auth' ? <Auth /> : (
         <>
           <div id="app" className="on">
@@ -380,6 +410,7 @@ function Application() {
           {/* На сервере голос-панель живёт ВНУТРИ колонки каналов (ServerView, адаптируется по ширине).
               На главной — компактный плавающий док в левом нижнем углу. */}
           {view === 'home' || view === 'admin' ? <VoiceDock variant="floating" /> : null}
+          {view === 'home' || view === 'admin' ? <MobileNav /> : null}
         </>
       )}
       <Modals />

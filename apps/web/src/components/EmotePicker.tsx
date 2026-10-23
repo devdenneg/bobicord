@@ -58,7 +58,7 @@ export function EmotePicker({ anchor, onPick, onClose, sizePicker }: { anchor: D
     <div id="epick" className="show" role="dialog" aria-modal="true" aria-label="7TV эмоуты" style={style} ref={boxRef}
       onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}>
       <div className="epick-h">
-        <input placeholder="Поиск 7TV эмоутов..." autoFocus={typeof matchMedia !== 'undefined' && matchMedia('(hover:hover) and (pointer:fine)').matches} value={q} onChange={(e) => setQ(e.target.value)} />
+        <input aria-label="Поиск эмодзи" placeholder="Найти эмодзи" autoFocus={typeof matchMedia !== 'undefined' && matchMedia('(hover:hover) and (pointer:fine)').matches} value={q} onChange={(e) => setQ(e.target.value)} />
         <button aria-label="Закрыть" onClick={onClose}>✕</button>
       </div>
       {sizePicker ? (

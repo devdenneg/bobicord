@@ -172,7 +172,13 @@ function PasswordInput({
 }
 
 function InlineError({ id, children }: { id: string; children?: string }) {
-  return children ? <div id={id} className="auth-field-error" role="alert">{children}</div> : null;
+  return children ? <div id={id} className="auth-field-error" role="alert"><Icon name="warn" sm /><span>{children}</span></div> : null;
+}
+
+// Индикатор длины пароля: четыре сегмента, без оценки «сложности» — только длина относительно минимума.
+function PasswordStrength({ value }: { value: string }) {
+  const level = !value ? 0 : value.length < PASSWORD_MIN ? 1 : Math.min(4, 2 + Math.floor((value.length - PASSWORD_MIN) / 6));
+  return <div className={'auth-strength l' + level} aria-hidden="true"><i /><i /><i /><i /></div>;
 }
 
 function formatWait(seconds: number) {
@@ -535,6 +541,15 @@ export function Auth() {
     }
   }, [screen]);
 
+  const headIcon: [string, 'accent' | 'danger'] | null = screen === 'forgot' ? ['lock', 'accent']
+    : screen === 'forgot-sent' ? ['mail', 'accent']
+      : screen === 'reset-done' ? ['check', 'accent']
+        : screen === 'reset-invalid' || (screen === 'reset-inspect' && failure) ? ['warn', 'danger']
+          : screen === 'session-retry' ? ['refresh', 'danger'] : null;
+  const subline = screen === 'register' ? 'Шаг 1 из 2'
+    : screen === 'register-verify' ? 'Шаг 2 из 2' + (registrationChallenge?.delivered ? ` · код отправлен на ${registrationChallenge.emailMasked || registerEmail}` : '')
+      : null;
+
   return (
     <main id="auth" className="overlay auth-overlay">
       <section className="card auth-card" aria-labelledby="auth-title" aria-busy={busy || undefined}>
@@ -543,9 +558,10 @@ export function Auth() {
           <span className="wordmark">Рилэй</span>
         </div>
 
-        <div className="auth-heading">
+        <div className={'auth-heading' + (screen === 'login' ? ' is-login' : '') + (headIcon ? ' has-icon' : '')}>
+          {headIcon ? <span className={'auth-head-ic ' + headIcon[1]}><Icon name={headIcon[0]} /></span> : null}
           <h1 id="auth-title" ref={stepHeadingRef} tabIndex={-1}>{title}</h1>
-          {screen === 'register' ? <span className="auth-step">Шаг 1 из 2</span> : screen === 'register-verify' ? <span className="auth-step">Шаг 2 из 2</span> : null}
+          {subline ? <p className="auth-sub">{subline}</p> : null}
         </div>
 
         {(screen === 'login' || screen === 'register') ? (
@@ -557,7 +573,6 @@ export function Auth() {
 
         {screen === 'session-retry' ? (
           <div className="auth-state">
-            <span className="auth-state-icon"><Icon name="refresh" /></span>
             <p>Сохранённый вход не потерян. Проверьте интернет и попробуйте ещё раз.</p>
             <button type="button" className="primary" disabled={busy} onClick={retrySession}>{busy ? <span className="spin" /> : null}Повторить</button>
             <button type="button" className="link" disabled={busy} onClick={() => navigate('login', () => { setToken(null); useStore.setState({ sessionError: '' }); })}>Войти в другой аккаунт</button>
@@ -581,17 +596,25 @@ export function Auth() {
               <InlineError id="auth-login-password-error">{fieldError('password')}</InlineError>
             </div>
             <button type="submit" className="primary" disabled={busy}>{busy ? <span className="spin" /> : null}Войти</button>
+            <button type="button" className="auth-foot" disabled={busy} onClick={() => navigate('register')}>Регистрация — по коду приглашения</button>
           </form>
         ) : null}
 
         {screen === 'register' ? (
           <form noValidate onSubmit={submitRegistration}>
-            <p className="auth-copy">Регистрация доступна по суточному коду приглашения.</p>
+            <div className="auth-grid2">
             <div className="row"><label htmlFor="auth-register-user">Логин</label>
               <input id="auth-register-user" value={registerUser} maxLength={20} autoFocus autoComplete="username" autoCapitalize="none" spellCheck={false}
                 placeholder="3–20: латиница, цифры, _" aria-invalid={Boolean(fieldError('username')) || undefined} aria-describedby={fieldError('username') ? 'auth-register-user-error' : undefined}
                 onChange={(event) => changeRegistration(setRegisterUser, event.target.value)} />
               <InlineError id="auth-register-user-error">{fieldError('username')}</InlineError>
+            </div>
+            <div className="row"><label htmlFor="auth-register-invite">Код приглашения</label>
+              <input id="auth-register-invite" className="auth-code-text" value={registerInvite} maxLength={64} autoComplete="off" autoCapitalize="characters" spellCheck={false}
+                aria-invalid={Boolean(fieldError('inviteCode')) || undefined} aria-describedby={fieldError('inviteCode') ? 'auth-register-invite-error' : undefined}
+                onChange={(event) => changeRegistration(setRegisterInvite, event.target.value.replace(/\s/g, '').toUpperCase())} />
+              <InlineError id="auth-register-invite-error">{fieldError('inviteCode')}</InlineError>
+            </div>
             </div>
             <div className="row"><label htmlFor="auth-register-email">Электронная почта</label>
               <input id="auth-register-email" type="email" inputMode="email" value={registerEmail} maxLength={254} autoComplete="email" autoCapitalize="none" spellCheck={false}
@@ -606,26 +629,25 @@ export function Auth() {
               <div id="auth-register-password-hint" className="auth-hint">От {PASSWORD_MIN} до {PASSWORD_MAX} символов. Лучше использовать длинную парольную фразу.</div>
               <InlineError id="auth-register-password-error">{fieldError('password')}</InlineError>
             </div>
-            <div className="row"><label htmlFor="auth-register-invite">Пригласительный код</label>
-              <input id="auth-register-invite" className="auth-code-text" value={registerInvite} maxLength={64} autoComplete="off" autoCapitalize="characters" spellCheck={false}
-                aria-invalid={Boolean(fieldError('inviteCode')) || undefined} aria-describedby={fieldError('inviteCode') ? 'auth-register-invite-error' : undefined}
-                onChange={(event) => changeRegistration(setRegisterInvite, event.target.value.replace(/\s/g, '').toUpperCase())} />
-              <InlineError id="auth-register-invite-error">{fieldError('inviteCode')}</InlineError>
-            </div>
             <button type="submit" className="primary" disabled={busy}>{busy ? <span className="spin" /> : null}Продолжить</button>
+            <p className="auth-foot">Код приглашения действует сутки.</p>
           </form>
         ) : null}
 
         {screen === 'register-verify' && registrationChallenge ? (
           <form noValidate onSubmit={submitRegistrationCode}>
-            <p className="auth-copy">{registrationChallenge.delivered
-              ? <>Мы отправили код из четырёх цифр на <b>{registrationChallenge.emailMasked || registerEmail}</b>.</>
-              : <>Отправка письма на <b>{registrationChallenge.emailMasked || registerEmail}</b> ещё не подтверждена. Подождите и повторите отправку.</>}</p>
-            <div className="row auth-otp-row"><label htmlFor="auth-register-code">Код из письма</label>
+            {registrationChallenge.delivered ? null
+              : <p className="auth-copy">Отправка письма на <b>{registrationChallenge.emailMasked || registerEmail}</b> ещё не подтверждена. Подождите и повторите отправку.</p>}
+            <div className="row auth-otp-row"><label htmlFor="auth-register-code" className="sr-only">Код из письма</label>
+              <div className="auth-otp-wrap">
               <input id="auth-register-code" className="auth-otp" type="text" inputMode="numeric" pattern="[0-9]*" maxLength={4}
                 autoFocus={registrationChallenge.delivered} disabled={!registrationChallenge.delivered} autoComplete="one-time-code"
                 value={registrationCode} aria-invalid={Boolean(fieldError('code')) || undefined} aria-describedby={fieldError('code') ? 'auth-register-code-error' : 'auth-register-code-hint'}
                 onChange={(event) => { setRegistrationCode(event.target.value.replace(/\D/g, '').slice(0, 4)); if (failure) setFailure(null); }} />
+              <div className="auth-otp-cells" aria-hidden="true">
+                {[0, 1, 2, 3].map((i) => <span key={i} className={'auth-otp-cell' + (i === Math.min(registrationCode.length, 3) ? ' cur' : '')}>{registrationCode[i] || ''}</span>)}
+              </div>
+              </div>
               <div id="auth-register-code-hint" className="auth-hint">
                 {registrationChallenge.attemptsRemaining !== undefined
                   ? `Код действует ограниченное время. Осталось попыток: ${registrationChallenge.attemptsRemaining}.`
@@ -633,7 +655,6 @@ export function Auth() {
               </div>
               <InlineError id="auth-register-code-error">{fieldError('code')}</InlineError>
             </div>
-            <button type="submit" className="primary" disabled={busy || !registrationChallenge.delivered || registrationExpired || registrationCode.length !== 4}>{busy ? <span className="spin" /> : null}Подтвердить и войти</button>
             <div className="auth-secondary-row">
               <button type="button" className="link" disabled={busy} onClick={() => { if (!busyRef.current) restartRegistration(); }}>Изменить данные</button>
               <button type="button" className="link" disabled={busy || registrationWait > 0} onClick={resendRegistrationCode}>
@@ -642,6 +663,8 @@ export function Auth() {
                   : !registrationChallenge.delivered ? 'Повторить отправку' : registrationExpired ? 'Получить новый код' : 'Отправить ещё раз'}
               </button>
             </div>
+            <button type="submit" className="primary" disabled={busy || !registrationChallenge.delivered || registrationExpired || registrationCode.length !== 4}>{busy ? <span className="spin" /> : null}Подтвердить и войти</button>
+            <p className="auth-foot">Письма нет — проверьте «Спам».</p>
           </form>
         ) : null}
 
@@ -661,7 +684,6 @@ export function Auth() {
 
         {screen === 'forgot-sent' ? (
           <div className="auth-state">
-            <span className="auth-state-icon success"><Icon name="check" /></span>
             <p>Если этот адрес зарегистрирован, письмо уже отправлено. Проверьте также папку «Спам».</p>
             <button type="button" className="primary" disabled={busy || forgotWait > 0} onClick={() => sendRecovery()}>
               {forgotWait > 0 ? `Повторить через ${formatWait(forgotWait)}` : busy ? <><span className="spin" />Отправляю</> : 'Отправить ещё раз'}
@@ -670,7 +692,7 @@ export function Auth() {
           </div>
         ) : null}
 
-        {screen === 'reset-inspect' ? failure ? <div className="auth-state"><span className="auth-state-icon danger"><Icon name="warn" /></span><p>Не удалось проверить ссылку из-за проблем с соединением.</p><button type="button" className="primary" onClick={() => { setFailure(null); setResetInspectAttempt((value) => value + 1); }}>Повторить</button></div> : <div className="auth-state"><LogoLoader size={44} /><p>Проверяем безопасность ссылки…</p></div> : null}
+        {screen === 'reset-inspect' ? failure ? <div className="auth-state"><p>Не удалось проверить ссылку из-за проблем с соединением.</p><button type="button" className="primary" onClick={() => { setFailure(null); setResetInspectAttempt((value) => value + 1); }}>Повторить</button></div> : <div className="auth-state is-loading"><LogoLoader size={44} /><p>Проверяем безопасность ссылки…</p></div> : null}
 
         {screen === 'reset' ? (
           <form noValidate onSubmit={submitReset}>
@@ -688,13 +710,13 @@ export function Auth() {
                 onChange={(value) => { setResetPasswordAgain(value); if (failure) setFailure(null); }} />
               <InlineError id="auth-reset-password-again-error">{fieldError('passwordAgain')}</InlineError>
             </div>
+            <PasswordStrength value={resetPassword} />
             <button type="submit" className="primary" disabled={busy}>{busy ? <span className="spin" /> : null}Сменить пароль</button>
           </form>
         ) : null}
 
         {screen === 'reset-done' ? (
           <div className="auth-state">
-            <span className="auth-state-icon success"><Icon name="check" /></span>
             <p>Пароль обновлён. Для безопасности выполнен выход на всех устройствах.</p>
             <button type="button" className="primary" disabled={busy} onClick={() => navigate('login', () => setLoginUser(resetUsername))}>Перейти ко входу</button>
           </div>
@@ -702,7 +724,6 @@ export function Auth() {
 
         {screen === 'reset-invalid' ? (
           <div className="auth-state">
-            <span className="auth-state-icon danger"><Icon name="warn" /></span>
             <p>Ссылка уже использована или срок её действия истёк. Запросите новое письмо.</p>
             <button type="button" className="primary" disabled={busy} onClick={() => navigate('forgot', () => setPasswordResetToken(null))}>Запросить новую ссылку</button>
             {getToken() ? <button type="button" className="link" disabled={busy} onClick={returnToExistingSession}>Вернуться в приложение</button> : null}

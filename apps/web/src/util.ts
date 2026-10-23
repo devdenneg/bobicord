@@ -3,6 +3,16 @@
 export const AV_COLORS = ['#afb8e6', '#a8d5b5', '#e9cf8f', '#e8b7c4', '#c8b8e8', '#9ed3d3', '#edb4a3', '#e3d89a'];
 export function hueOf(s: string): number { let h = 0; for (let i = 0; i < (s || '').length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0; return h; }
 export const initial = (n: string) => (n || '?').trim().charAt(0).toUpperCase() || '?';
+// Иконка сервера: первые буквы двух первых слов («Вечерний сквад» → «ВС»), у одного слова — одна буква.
+export const initials2 = (n: string) => {
+  const w = (n || '').trim().split(/\s+/).filter(Boolean);
+  return w.length > 1 ? (w[0][0] + w[1][0]).toUpperCase() : initial(n);
+};
+// Русское склонение по числу: plural(5, ['участник', 'участника', 'участников']).
+export const plural = (n: number, [one, few, many]: [string, string, string]) => {
+  const m10 = n % 10, m100 = n % 100;
+  return m10 === 1 && m100 !== 11 ? one : m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14) ? few : many;
+};
 export const avColor = (name: string, ci?: number) => AV_COLORS[(ci != null ? ci : hueOf(name)) % AV_COLORS.length];
 export const prefersReducedMotion = () => window.matchMedia('(prefers-reduced-motion:reduce)').matches;
 // LiveKit identity = `username#<nonce>` (уникально на сессию). Базовый username = ключ юзера в UI/presence.
