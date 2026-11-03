@@ -1,0 +1,8 @@
+[Unit]
+Description=RelayApp: поднять vrelay, если резервный медиа-хост выключен
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/relay-vrelay-standby.sh

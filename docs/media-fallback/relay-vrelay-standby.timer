@@ -1,0 +1,10 @@
+[Unit]
+Description=RelayApp: проверка резервного медиа-хоста каждые 30 с
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=30
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target
