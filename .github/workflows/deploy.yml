@@ -244,6 +244,9 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           envs: GHCR_TOKEN
+          # Дефолт экшена — 10m. GHCR отдаёт образы на прод ~1 МБ/с: 2026-11-06 server-образ
+          # (347 МБ) качался 6 минут, web не успел, и сессию убило до `compose up`.
+          command_timeout: 30m
           script: |
             set -e
             candidate_seq=${{ needs.build.outputs.release_sequence }}
@@ -526,6 +529,7 @@ jobs:
           username: ${{ secrets.MEDIA_SSH_USER }}
           key: ${{ secrets.MEDIA_SSH_KEY }}
           envs: GHCR_TOKEN,IMAGE_TAG
+          command_timeout: 30m
           script: |
             set -e
             printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u devdenneg --password-stdin
