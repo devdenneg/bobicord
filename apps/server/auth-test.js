@@ -390,6 +390,32 @@ test('legacy binding requires the current password, resumes active challenge and
   assert.equal(mailer.messages.some((message) => message.kind === 'bound'), true);
 });
 
+test('sessions never expire by time, but session_version still revokes them', async (t) => {
+  const fixture = setup();
+  t.after(() => fixture.close());
+  const { manager, db } = fixture;
+  const user = insertLegacy(db);
+  const fresh = manager.issueSession(user.id);
+  const freshPayload = jwt.decode(fresh);
+  assert.equal(freshPayload.exp, undefined, 'новый токен выдаётся без срока');
+  assert.notEqual(manager.issueSession(user.id), fresh, 'входы в одну секунду дают разные токены (jti)');
+  // Токен, выданный до правки на 30 дней и уже просроченный, продолжает работать.
+  const past = Math.floor(Date.now() / 1000) - 40 * 24 * 3600;
+  const oldExpired = jwt.sign({ id: user.id, sub: user.id, sv: 0, typ: 'session', iat: past, exp: past + 30 * 24 * 3600 },
+    'test-session-secret', { algorithm: 'HS256' });
+  assert.equal(manager.verifySession(oldExpired).user.id, user.id);
+  assert.equal(manager.verifySession(fresh).user.id, user.id);
+  // Короткоживущий access-токен нативного persistent-v1 (sid) по-прежнему истекает.
+  const expiredAccess = jwt.sign({ id: user.id, sub: user.id, sv: 0, sid: 'x', sg: 0, typ: 'session', exp: Math.floor(Date.now() / 1000) - 1 },
+    'test-session-secret', { algorithm: 'HS256' });
+  assert.throws(() => manager.verifySession(expiredAccess), errorCode('UNAUTHORIZED'));
+  // Подпись чужим секретом отвергается как раньше.
+  assert.throws(() => manager.verifySession(jwt.sign({ id: user.id, typ: 'session' }, 'other-secret')), errorCode('UNAUTHORIZED'));
+  db.prepare('UPDATE users SET session_version=session_version+1 WHERE id=?').run(user.id);
+  assert.throws(() => manager.verifySession(oldExpired), errorCode('SESSION_REVOKED'));
+  assert.throws(() => manager.verifySession(fresh), errorCode('SESSION_REVOKED'));
+});
+
 test('new binding intent supersedes the old flow and support recovery is one-use', async (t) => {
   const fixture = setup({ config: { emailEnforcement: 'required' } });
   t.after(() => fixture.close());

@@ -38,7 +38,6 @@ const DEFAULTS = Object.freeze({
   bcryptRounds: 12,
   bcryptConcurrency: 4,
   bcryptQueueLimit: 32,
-  sessionTtl: '30d',
   emailEnforcement: 'optional',
   loginIpLimit: 30,
   loginAccountFailureLimit: 8,
@@ -1172,15 +1171,27 @@ function createAuthManager(options) {
       ? userOrId
       : db.prepare('SELECT * FROM users WHERE id=?').get(String(userOrId || ''));
     if (!user) fail(401, 'UNAUTHORIZED', 'Не авторизован.');
-    return jwt.sign({ id: user.id, sub: user.id, sv: Number(user.session_version) || 0, typ: 'session' },
-      sessionSecret, { algorithm: 'HS256', expiresIn: config.sessionTtl });
+    // Бессрочный токен: вход живёт, пока его явно не отзовут (выход, смена пароля/почты —
+    // session_version, отзыв по хешу в auth_legacy_token_revocations). jti делает токен уникальным:
+    // два входа одного юзера в одну секунду иначе дали бы одинаковую строку, и выход с одного
+    // устройства отозвал бы и второе.
+    return jwt.sign({ id: user.id, sub: user.id, sv: Number(user.session_version) || 0, typ: 'session',
+      jti: crypto.randomBytes(12).toString('base64url') }, sessionSecret, { algorithm: 'HS256' });
   }
 
   function verifySession(token, { requireVerified = false } = {}) {
     if (!sessionSecret) throw new Error('sessionSecret is required to verify sessions');
     let payload;
-    try { payload = jwt.verify(String(token || ''), sessionSecret, { algorithms: ['HS256'] }); }
-    catch { fail(401, 'UNAUTHORIZED', 'Не авторизован.'); }
+    // Срок (`exp`) у обычной сессии не проверяем: раньше токен выдавался на 30 дней без продления,
+    // и всех, кто вошёл в один день, разлогинивало одновременно через месяц. Уже выданные
+    // токены с `exp` так становятся бессрочными. Исключение — access-токены нативного
+    // persistent-v1 (`sid`, 15 мин): их срок — часть протокола обновления, он остаётся.
+    try {
+      payload = jwt.verify(String(token || ''), sessionSecret, { algorithms: ['HS256'], ignoreExpiration: true });
+    } catch { fail(401, 'UNAUTHORIZED', 'Не авторизован.'); }
+    if (payload.sid != null && !(Number.isFinite(payload.exp) && payload.exp * 1000 > Date.now())) {
+      fail(401, 'UNAUTHORIZED', 'Не авторизован.');
+    }
     if (payload.typ && payload.typ !== 'session') fail(401, 'UNAUTHORIZED', 'Не авторизован.');
     let user = null;
     const id = payload.sub || payload.id;

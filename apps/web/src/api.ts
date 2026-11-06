@@ -316,6 +316,9 @@ export const api = {
   // Web Push (фоновые уведомления PWA/браузера)
   pushVapid: () => req<{ enabled: boolean; key: string }>('GET', '/push/vapid'),
   pushSubscribe: (sub: unknown, prefs: { mention: boolean; stream: boolean }) => req<{ ok: boolean }>('POST', '/push/subscribe', { sub, prefs }),
+  // Отзыв текущего токена на сервере: сессии бессрочные, поэтому выход обязан гасить токен,
+  // а не только стирать его локально. Короткий таймаут — выход не должен висеть на мёртвой сети.
+  revokeSession: () => req<{ ok: boolean }>('POST', '/auth/session/logout-legacy', {}, { timeoutMs: 3000 }),
   pushUnsubscribe: (endpoint: string) => req<{ ok: boolean }>('POST', '/push/unsubscribe', { endpoint }),
   // вещатель сообщает серверу о старте трансляции → фоновый push участникам не в комнате
   streamStart: (id: string) => req<{ ok: boolean }>('POST', `/servers/${id}/stream-start`),

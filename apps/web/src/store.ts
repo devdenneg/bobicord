@@ -652,6 +652,9 @@ export const useStore = create<AppState>((set, get) => ({
     // cap 2с, чтобы разлогин не подвисал на мёртвой сети.
     try { await Promise.race([unsubscribePush(), new Promise((r) => setTimeout(r, 2000))]); } catch { /**/ }
     if (generation !== acceptedSessionGeneration || token !== getToken()) return;
+    // Best-effort: офлайн/ошибка не мешают выйти локально.
+    try { await api.revokeSession(); } catch { /**/ }
+    if (generation !== acceptedSessionGeneration || token !== getToken()) return;
     disconnectNotifyWs();
     setToken(null); location.reload();
   },
